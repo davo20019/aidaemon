@@ -1,0 +1,35 @@
+[provider]
+# Provider type is always openai_compatible — works with OpenAI, OpenRouter, Ollama, Google AI Studio, etc.
+api_key = "sk-your-key-here"
+base_url = "https://openrouter.ai/api/v1"
+
+[provider.models]
+primary = "openai/gpt-4o"
+fast = "openai/gpt-4o-mini"
+smart = "anthropic/claude-sonnet-4"
+
+[telegram]
+bot_token = "123456:ABC-DEF..."
+allowed_user_ids = [123456789]
+
+[state]
+db_path = "aidaemon.db"
+working_memory_cap = 50
+
+[terminal]
+# Set to ["*"] to allow all commands (only if you trust the LLM fully)
+allowed_prefixes = ["ls", "cat", "head", "tail", "echo", "date", "whoami", "pwd", "find", "wc", "grep", "tree", "file", "stat", "uname", "df", "du", "ps", "which", "env", "printenv"]
+
+[daemon]
+health_port = 8080
+
+# [triggers.email]
+# host = "imap.gmail.com"
+# port = 993
+# username = "you@gmail.com"
+# password = "app-password"
+# folder = "INBOX"
+
+# [mcp.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]

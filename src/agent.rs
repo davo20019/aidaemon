@@ -1,0 +1,353 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::Utc;
+use serde_json::{json, Value};
+use tokio::sync::RwLock;
+use tracing::{info, warn};
+use uuid::Uuid;
+
+use crate::providers::{ProviderError, ProviderErrorKind};
+use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
+
+const MAX_ITERATIONS: usize = 10;
+
+pub struct Agent {
+    provider: Arc<dyn ModelProvider>,
+    state: Arc<dyn StateStore>,
+    tools: Vec<Arc<dyn Tool>>,
+    model: RwLock<String>,
+    fallback_model: RwLock<String>,
+    system_prompt: String,
+    config_path: PathBuf,
+}
+
+impl Agent {
+    pub fn new(
+        provider: Arc<dyn ModelProvider>,
+        state: Arc<dyn StateStore>,
+        tools: Vec<Arc<dyn Tool>>,
+        model: String,
+        system_prompt: String,
+        config_path: PathBuf,
+    ) -> Self {
+        let fallback = model.clone();
+        Self {
+            provider,
+            state,
+            tools,
+            model: RwLock::new(model),
+            fallback_model: RwLock::new(fallback),
+            system_prompt,
+            config_path,
+        }
+    }
+
+    /// Get the current model name.
+    pub async fn current_model(&self) -> String {
+        self.model.read().await.clone()
+    }
+
+    /// Switch the active model at runtime. Keeps the old model as fallback.
+    pub async fn set_model(&self, model: String) {
+        let mut m = self.model.write().await;
+        let mut fb = self.fallback_model.write().await;
+        info!(old = %*m, new = %model, "Model switched");
+        *fb = m.clone();
+        *m = model;
+    }
+
+    /// List available models from the provider.
+    pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        self.provider.list_models().await
+    }
+
+    /// Stamp the current config as "last known good" — called after a
+    /// successful LLM response proves the config actually works.
+    async fn stamp_lastgood(&self) {
+        let lastgood = self.config_path.with_extension("toml.lastgood");
+        if let Err(e) = tokio::fs::copy(&self.config_path, &lastgood).await {
+            warn!(error = %e, "Failed to stamp lastgood config");
+        }
+    }
+
+    /// Build the OpenAI-format tool definitions.
+    fn tool_definitions(&self) -> Vec<Value> {
+        self.tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": t.schema()
+                })
+            })
+            .collect()
+    }
+
+    /// Attempt an LLM call with error-classified recovery:
+    /// - RateLimit → wait retry_after, retry once
+    /// - Timeout/Network/ServerError → retry once
+    /// - NotFound → fallback to previous model
+    /// - Auth/Billing → return user-facing error immediately
+    async fn call_llm_with_recovery(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tool_defs: &[Value],
+    ) -> anyhow::Result<crate::traits::ProviderResponse> {
+        match self.provider.chat(model, messages, tool_defs).await {
+            Ok(resp) => {
+                // Config works — stamp as last known good (best-effort, non-blocking)
+                self.stamp_lastgood().await;
+                Ok(resp)
+            }
+            Err(e) => {
+                // Try to downcast to our classified ProviderError
+                let provider_err = match e.downcast::<ProviderError>() {
+                    Ok(pe) => pe,
+                    Err(other) => return Err(other), // not a provider error, propagate
+                };
+
+                warn!(
+                    kind = ?provider_err.kind,
+                    status = ?provider_err.status,
+                    "LLM call failed: {}",
+                    provider_err
+                );
+
+                match provider_err.kind {
+                    // --- Non-retryable: tell the user, stop ---
+                    ProviderErrorKind::Auth | ProviderErrorKind::Billing => {
+                        Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                    }
+
+                    // --- Rate limit: wait and retry once ---
+                    ProviderErrorKind::RateLimit => {
+                        let wait = provider_err.retry_after_secs.unwrap_or(5);
+                        let wait = wait.min(60); // cap at 60s
+                        info!(wait_secs = wait, "Rate limited, waiting before retry");
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        self.provider.chat(model, messages, tool_defs).await
+                    }
+
+                    // --- Timeout / Network / Server: retry once ---
+                    ProviderErrorKind::Timeout
+                    | ProviderErrorKind::Network
+                    | ProviderErrorKind::ServerError => {
+                        info!("Retrying after transient error");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        match self.provider.chat(model, messages, tool_defs).await {
+                            Ok(resp) => {
+                                self.stamp_lastgood().await;
+                                Ok(resp)
+                            }
+                            Err(_retry_err) => {
+                                // Second failure — try the fallback model
+                                let fallback = self.fallback_model.read().await.clone();
+                                if fallback != model {
+                                    warn!(fallback = %fallback, "Retry failed, trying fallback model");
+                                    let resp = self
+                                        .provider
+                                        .chat(&fallback, messages, tool_defs)
+                                        .await?;
+                                    *self.model.write().await = fallback;
+                                    Ok(resp)
+                                } else {
+                                    Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                                }
+                            }
+                        }
+                    }
+
+                    // --- NotFound (bad model name): fallback immediately ---
+                    ProviderErrorKind::NotFound => {
+                        let fallback = self.fallback_model.read().await.clone();
+                        if fallback != model {
+                            warn!(
+                                bad_model = model,
+                                fallback = %fallback,
+                                "Model not found, reverting to fallback"
+                            );
+                            *self.model.write().await = fallback.clone();
+                            let resp = self
+                                .provider
+                                .chat(&fallback, messages, tool_defs)
+                                .await?;
+                            self.stamp_lastgood().await;
+                            Ok(resp)
+                        } else {
+                            Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                        }
+                    }
+
+                    // --- Unknown: propagate ---
+                    ProviderErrorKind::Unknown => {
+                        Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run the agentic loop for a user message in the given session.
+    /// Returns the final assistant text response.
+    pub async fn handle_message(
+        &self,
+        session_id: &str,
+        user_text: &str,
+    ) -> anyhow::Result<String> {
+        // 1. Persist the user message
+        let user_msg = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: "user".to_string(),
+            content: Some(user_text.to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: Utc::now(),
+        };
+        self.state.append_message(&user_msg).await?;
+
+        let tool_defs = self.tool_definitions();
+        let model = self.model.read().await.clone();
+
+        // 2. Agentic loop
+        for iteration in 0..MAX_ITERATIONS {
+            info!(iteration, session_id, model = %model, "Agent loop iteration");
+
+            // Build messages array
+            let history = self.state.get_history(session_id, 50).await?;
+            let mut messages = Vec::new();
+
+            // System prompt with facts
+            let facts = self.state.get_facts(None).await?;
+            let mut sys = self.system_prompt.clone();
+            if !facts.is_empty() {
+                sys.push_str("\n\n## Known Facts\n");
+                for f in &facts {
+                    sys.push_str(&format!("- [{}] {}: {}\n", f.category, f.key, f.value));
+                }
+            }
+            messages.push(json!({"role": "system", "content": sys}));
+
+            // Conversation history
+            for msg in &history {
+                let mut m = json!({"role": msg.role});
+                if let Some(ref c) = msg.content {
+                    m["content"] = json!(c);
+                }
+                if let Some(ref tc_json) = msg.tool_calls_json {
+                    if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
+                        let tc_val: Vec<Value> = tcs
+                            .iter()
+                            .map(|tc| {
+                                json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": tc.arguments
+                                    }
+                                })
+                            })
+                            .collect();
+                        m["tool_calls"] = json!(tc_val);
+                        // OpenAI requires content to be null if tool_calls present
+                        if msg.content.is_none() {
+                            m["content"] = Value::Null;
+                        }
+                    }
+                }
+                if let Some(ref tid) = msg.tool_call_id {
+                    m["tool_call_id"] = json!(tid);
+                }
+                if let Some(ref tname) = msg.tool_name {
+                    m["name"] = json!(tname);
+                }
+                messages.push(m);
+            }
+
+            // 3. Call the LLM with error-classified recovery
+            let resp = self
+                .call_llm_with_recovery(&model, &messages, &tool_defs)
+                .await?;
+
+            info!(
+                session_id,
+                has_content = resp.content.is_some(),
+                tool_calls = resp.tool_calls.len(),
+                "LLM response received"
+            );
+
+            // 4. If there are tool calls, execute them
+            if !resp.tool_calls.is_empty() {
+                // Persist assistant message with tool calls
+                let assistant_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "assistant".to_string(),
+                    content: resp.content.clone(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls_json: Some(serde_json::to_string(&resp.tool_calls)?),
+                    created_at: Utc::now(),
+                };
+                self.state.append_message(&assistant_msg).await?;
+
+                // Execute each tool call
+                for tc in &resp.tool_calls {
+                    let result = self.execute_tool(&tc.name, &tc.arguments).await;
+                    let result_text = match result {
+                        Ok(text) => text,
+                        Err(e) => format!("Error: {}", e),
+                    };
+
+                    let tool_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "tool".to_string(),
+                        content: Some(result_text),
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.name.clone()),
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                    };
+                    self.state.append_message(&tool_msg).await?;
+                }
+
+                // Continue the loop to let LLM process tool results
+                continue;
+            }
+
+            // 5. No tool calls — this is the final response
+            let reply = resp.content.unwrap_or_default();
+            let assistant_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "assistant".to_string(),
+                content: Some(reply.clone()),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls_json: None,
+                created_at: Utc::now(),
+            };
+            self.state.append_message(&assistant_msg).await?;
+
+            return Ok(reply);
+        }
+
+        warn!(session_id, "Agent loop hit max iterations");
+        Ok("I've reached the maximum number of steps for this request. Please try again with a simpler query.".to_string())
+    }
+
+    async fn execute_tool(&self, name: &str, arguments: &str) -> anyhow::Result<String> {
+        for tool in &self.tools {
+            if tool.name() == name {
+                return tool.call(arguments).await;
+            }
+        }
+        anyhow::bail!("Unknown tool: {}", name)
+    }
+}
