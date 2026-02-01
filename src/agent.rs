@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::providers::{ProviderError, ProviderErrorKind};
 use crate::skills::{self, Skill};
-use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
+use crate::traits::{Message, ModelProvider, StateStore, Tool};
 
 const MAX_ITERATIONS: usize = 10;
 const DEFAULT_MAX_DEPTH: usize = 3;
@@ -375,23 +375,19 @@ impl Agent {
 
         // 2b. Retrieve Context ONCE (Optimization)
         // Use Tri-Hybrid Retrieval to get relevant history
-        let initial_history = self.state.get_context(session_id, user_text, 50).await?;
+        let mut initial_history = self.state.get_context(session_id, user_text, 50).await?;
 
-        // 2c. Identify "Pinned" Memories (Relevant/Salient but NOT recent) BEFORE the loop
-        // These are messages found by search/salience that are older than the immediate recency window.
-        // We calculate this once to avoid re-scanning/cloning effectively static context.
-        let recency_window_size = 20;
-        let recent_ids: std::collections::HashSet<String> = initial_history
-            .iter()
-            .rev() // Start from newest
-            .take(recency_window_size)
+        // Optimize: Identify "Pinned" memories (Relevant/Salient but old) to avoid re-fetching
+        let recency_window = 20;
+        let recent_ids: std::collections::HashSet<String> = initial_history.iter()
+            .rev()
+            .take(recency_window)
             .map(|m| m.id.clone())
             .collect();
-
+            
         let pinned_memories: Vec<Message> = initial_history
-            .iter()
+            .drain(..)
             .filter(|m| !recent_ids.contains(&m.id))
-            .cloned()
             .collect();
 
         info!(
@@ -403,72 +399,42 @@ impl Agent {
         );
 
         // 3. Agentic loop
+        // 3. Agentic loop
         for iteration in 0..MAX_ITERATIONS {
             info!(iteration, session_id, model = %model, depth = self.depth, "Agent loop iteration");
 
-            // Build messages array
-            let mut messages = Vec::new();
-
-            messages.push(json!({"role": "system", "content": system_prompt}));
-
-            // Fetch fresh recency (tool calls / assistant replies from this loop)
-            let recent_history = self.state.get_history(session_id, recency_window_size).await?;
-
-            // Merge: Pinned Old Memories + Fresh Recent History
-            let mut final_history = pinned_memories.clone();
-            let mut seen_ids: std::collections::HashSet<String> = final_history.iter().map(|m| m.id.clone()).collect();
-
-            for msg in recent_history {
-                if !seen_ids.contains(&msg.id) {
-                    let id = msg.id.clone();
-                    final_history.push(msg);
-                    seen_ids.insert(id);
-                }
-            }
-            // Sort by created_at to ensure valid conversation order
-            final_history.sort_by_key(|m| m.created_at);
-
-            // Conversation history
-            for msg in &final_history {
-                let mut m = json!({"role": msg.role});
-                if let Some(ref c) = msg.content {
-                    m["content"] = json!(c);
-                }
-                if let Some(ref tc_json) = msg.tool_calls_json {
-                    if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
-                        let tc_val: Vec<Value> = tcs
-                            .iter()
-                            .map(|tc| {
-                                let mut val = json!({
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.name,
-                                        "arguments": tc.arguments
-                                    }
-                                });
-                                // Preserve extra_content (Gemini 3 thought signatures, etc.)
-                                if let Some(ref extra) = tc.extra_content {
-                                    val["extra_content"] = extra.clone();
-                                }
-                                val
-                            })
-                            .collect();
-                        m["tool_calls"] = json!(tc_val);
-                        // OpenAI requires content to be null if tool_calls present
-                        if msg.content.is_none() {
-                            m["content"] = Value::Null;
-                        }
+            // Fetch only recent history inside the loop
+            let recent_history = self.state.get_history(session_id, 20).await?;
+            
+            // Merge Pinned + Recent using iterators to avoid cloning the Message structs
+            // We expect no overlap because pinned are strictly older, but we dedup just in case
+            let mut seen_ids: std::collections::HashSet<&String> = std::collections::HashSet::new();
+            
+            let mut messages: Vec<Value> = pinned_memories.iter()
+                .chain(recent_history.iter())
+                .filter(|m| seen_ids.insert(&m.id)) // Dedup
+                .map(|m| {
+                    let mut obj = json!({
+                        "role": m.role,
+                        "content": m.content,
+                    });
+                    if let Some(tc_json) = &m.tool_calls_json {
+                        obj["tool_calls"] = serde_json::from_str::<Value>(tc_json).unwrap_or(json!([]));
                     }
-                }
-                if let Some(ref tid) = msg.tool_call_id {
-                    m["tool_call_id"] = json!(tid);
-                }
-                if let Some(ref tname) = msg.tool_name {
-                    m["name"] = json!(tname);
-                }
-                messages.push(m);
-            }
+                    if let Some(name) = &m.tool_name {
+                        obj["name"] = json!(name);
+                    }
+                    if let Some(tcid) = &m.tool_call_id {
+                        obj["tool_call_id"] = json!(tcid);
+                    }
+                    obj
+                })
+                .collect();
+            
+            messages.insert(0, json!({
+                "role": "system",
+                "content": system_prompt,
+            }));
 
             // 4. Call the LLM with error-classified recovery
             // On the last iteration, omit tools to force a text response
