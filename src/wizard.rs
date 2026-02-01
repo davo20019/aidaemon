@@ -31,9 +31,9 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         name: "Google AI Studio",
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
-        primary: "gemini-2.0-flash",
-        fast: "gemini-2.0-flash-lite",
-        smart: "gemini-2.5-pro-preview-06-05",
+        primary: "gemini-3-flash-preview",
+        fast: "gemini-2.5-flash-lite",
+        smart: "gemini-3-pro-preview",
         needs_key: true,
     },
     ProviderPreset {
