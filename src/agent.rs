@@ -275,19 +275,48 @@ impl Agent {
             }
 
             // 3. Call the LLM with error-classified recovery
+            // On the last iteration, omit tools to force a text response
+            let effective_tools = if iteration >= MAX_ITERATIONS - 1 {
+                info!(session_id, "Last iteration — calling LLM without tools to force summary");
+                &[][..]
+            } else {
+                &tool_defs[..]
+            };
             let resp = self
-                .call_llm_with_recovery(&model, &messages, &tool_defs)
+                .call_llm_with_recovery(&model, &messages, effective_tools)
                 .await?;
 
+            // Log tool call names for debugging
+            let tc_names: Vec<&str> = resp.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
             info!(
                 session_id,
                 has_content = resp.content.is_some(),
                 tool_calls = resp.tool_calls.len(),
+                tool_names = ?tc_names,
                 "LLM response received"
             );
 
             // 4. If there are tool calls, execute them
             if !resp.tool_calls.is_empty() {
+                // Nudge the model to wrap up when approaching the limit
+                if iteration >= MAX_ITERATIONS - 2 {
+                    let nudge = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "user".to_string(),
+                        content: Some(
+                            "[SYSTEM: You are running low on tool call iterations. \
+                            Summarize your findings and respond to the user NOW. \
+                            Do not make any more tool calls.]"
+                                .to_string(),
+                        ),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                    };
+                    self.state.append_message(&nudge).await?;
+                }
                 // Persist assistant message with tool calls
                 let assistant_msg = Message {
                     id: Uuid::new_v4().to_string(),
