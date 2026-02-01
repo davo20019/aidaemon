@@ -297,7 +297,8 @@ impl Agent {
             );
 
             // 4. If there are tool calls, execute them
-            if !resp.tool_calls.is_empty() {
+            // On the last iteration, force a text response even if the model returns tool calls
+            if !resp.tool_calls.is_empty() && iteration < MAX_ITERATIONS - 1 {
                 // Nudge the model to wrap up when approaching the limit
                 if iteration >= MAX_ITERATIONS - 2 {
                     let nudge = Message {
@@ -355,8 +356,16 @@ impl Agent {
                 continue;
             }
 
-            // 5. No tool calls — this is the final response
-            let reply = resp.content.unwrap_or_default();
+            // 5. No tool calls (or last iteration) — this is the final response
+            let reply = resp.content.filter(|s| !s.is_empty()).unwrap_or_else(|| {
+                if iteration >= MAX_ITERATIONS - 1 {
+                    "I used all available tool iterations but couldn't finish the task. \
+                    Please try a simpler or more specific request."
+                        .to_string()
+                } else {
+                    String::new()
+                }
+            });
             let assistant_msg = Message {
                 id: Uuid::new_v4().to_string(),
                 session_id: session_id.to_string(),
