@@ -242,6 +242,30 @@ impl Agent {
         // Use Tri-Hybrid Retrieval to get relevant history
         let initial_history = self.state.get_context(session_id, user_text, 50).await?;
 
+        // 2c. Identify "Pinned" Memories (Relevant/Salient but NOT recent) BEFORE the loop
+        // These are messages found by search/salience that are older than the immediate recency window.
+        // We calculate this once to avoid re-scanning/cloning effectively static context.
+        let recency_window_size = 20;
+        let recent_ids: std::collections::HashSet<String> = initial_history
+            .iter()
+            .rev() // Start from newest
+            .take(recency_window_size)
+            .map(|m| m.id.clone())
+            .collect();
+        
+        let pinned_memories: Vec<Message> = initial_history
+            .iter()
+            .filter(|m| !recent_ids.contains(&m.id))
+            .cloned()
+            .collect();
+            
+        info!(
+            session_id, 
+            total_context = initial_history.len(),
+            pinned_old_memories = pinned_memories.len(),
+            "Context prepared"
+        );
+
         // 3. Agentic loop
         for iteration in 0..MAX_ITERATIONS {
             info!(iteration, session_id, model = %model, "Agent loop iteration");
@@ -250,48 +274,27 @@ impl Agent {
             let mut messages = Vec::new();
 
             messages.push(json!({"role": "system", "content": system_prompt}));
-
-            // Use the retrieved history (which includes recent + relevant messages)
-            // We append the new messages generated within this loop (tool calls etc)
-            // BUT: get_context only returns past messages.
-            // We need to verify if we should refresh history on each loop.
-            // Actually, get_context returns persisted messages.
-            // The tool calls/tool results generated IN THIS LOOP are persisted to state
-            // but might NOT be in `initial_history`.
-            // So we really need: Initial Context + Dynamic New Messages.
             
-            // Re-fetching history is safer for tools, but expensive for vectors.
-            // Compromise: Use get_history for the loop (recency) but prepend the Relevant/Salient messages found initially?
-            // Or just stick to the user's request: Move it out.
-            // If we move it out, we miss the tool calls generated in step 1 when we are in step 2.
-            // FIX: We need to merge `initial_history` (past) with `current_session_new_messages`.
-            // EASIER FIX: `get_context` is heavy. `get_history` is cheap.
-            // We should use `get_context` ONCE to find old relevant stuff.
-            // And use `get_history` inside the loop to get the latest state.
-            // And merge them.
+            // Fetch fresh recency (tool calls / assistant replies from this loop)
+            let recent_history = self.state.get_history(session_id, recency_window_size).await?;
             
-            // For now, let's just use `get_history` inside the loop, but PREPEND the "Relevant/Salient" messages found by `get_context`?
-            // Simpler: Just call `get_context` outside, and in the loop we manually fetch *just* the new messages?
-            // No, that's complex logic.
-            //
-            // Correct approach for V1:
-            // 1. Fetch `relevant_context` (Search results) OUTSIDE loop.
-            // 2. Inside loop, fetch `recent_history` (Recency).
-            // 3. Deduplicate and merge.
+            // Merge: Pinned Old Memories + Fresh Recent History
+            // Since pinned_memories are explicitly "not recent" (older than the window start at time T0),
+            // and recent_history is the NEW window (Time T1), there might be slight overlap if no new messages were added
+            // but effectively we just want to show user: "Here is the relevant old stuff" + "Here is the latest conversation".
+            // We use a deduplication set just in case.
             
-            // Let's implement this "Merge" logic here.
+            let mut final_history = pinned_memories.clone();
+            let mut seen_ids: std::collections::HashSet<String> = final_history.iter().map(|m| m.id.clone()).collect();
             
-            let recent_history = self.state.get_history(session_id, 20).await?; // Fetch latest 20
-            
-            // Combine initial_history (which has high relevance) + recent_history
-            // Deduplicate by ID
-            let mut final_history = initial_history.clone();
             for msg in recent_history {
-                if !final_history.iter().any(|m| m.id == msg.id) {
+                if !seen_ids.contains(&msg.id) {
+                    let id = msg.id.clone();
                     final_history.push(msg);
+                    seen_ids.insert(id);
                 }
             }
-            // Sort by created_at
+            // Sort by created_at to ensure valid conversation order
             final_history.sort_by_key(|m| m.created_at);
 
             // Conversation history
