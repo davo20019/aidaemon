@@ -9,15 +9,17 @@ use tokio::sync::RwLock;
 
 use crate::traits::{Fact, Message, StateStore};
 
+use crate::memory::embeddings::EmbeddingService;
+
 pub struct SqliteStateStore {
     pool: SqlitePool,
-    /// In-memory working memory: session_id -> recent messages.
     working_memory: Arc<RwLock<HashMap<String, VecDeque<Message>>>>,
     cap: usize,
+    embedding_service: Arc<EmbeddingService>,
 }
 
 impl SqliteStateStore {
-    pub async fn new(db_path: &str, cap: usize) -> anyhow::Result<Self> {
+    pub async fn new(db_path: &str, cap: usize, embedding_service: Arc<EmbeddingService>) -> anyhow::Result<Self> {
         let opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
@@ -63,17 +65,49 @@ impl SqliteStateStore {
             .execute(&pool)
             .await?;
 
+        // --- Migrations for Advanced Memory ---
+        // 1. Add importance column
+        let _ = sqlx::query("ALTER TABLE messages ADD COLUMN importance REAL DEFAULT 0.5")
+            .execute(&pool)
+            .await; // Ignore error if exists
+
+        // 2. Add embedding column
+        let _ = sqlx::query("ALTER TABLE messages ADD COLUMN embedding BLOB")
+            .execute(&pool)
+            .await; // Ignore error if exists
+
+        // Add embedding_error column if it doesn't exist
+        let _ = sqlx::query("ALTER TABLE messages ADD COLUMN embedding_error TEXT").execute(&pool).await;
+        
+        // 3. Create macros table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS macros (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trigger_tool TEXT NOT NULL,
+                trigger_args_pattern TEXT, 
+                next_tool TEXT NOT NULL,
+                next_args TEXT NOT NULL,
+                confidence REAL DEFAULT 0.0,
+                used_count INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(Self {
             pool,
             working_memory: Arc::new(RwLock::new(HashMap::new())),
             cap,
+            embedding_service,
         })
     }
 
     /// Hydrate working memory for a session from the database.
     async fn hydrate(&self, session_id: &str) -> anyhow::Result<VecDeque<Message>> {
         let rows = sqlx::query(
-            "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at
+            "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
              FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT ?"
         )
         .bind(session_id)
@@ -88,6 +122,8 @@ impl SqliteStateStore {
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
 
+            let importance: f32 = row.try_get("importance").unwrap_or(0.5);
+
             deque.push_back(Message {
                 id: row.get("id"),
                 session_id: row.get("session_id"),
@@ -97,9 +133,14 @@ impl SqliteStateStore {
                 tool_name: row.get("tool_name"),
                 tool_calls_json: row.get("tool_calls_json"),
                 created_at,
+                importance,
+                embedding: None, // Don't load embeddings into working memory by default
             });
         }
         Ok(deque)
+    }
+    pub fn pool(&self) -> SqlitePool {
+        self.pool.clone()
     }
 }
 
@@ -108,8 +149,8 @@ impl StateStore for SqliteStateStore {
     async fn append_message(&self, msg: &Message) -> anyhow::Result<()> {
         // Persist to DB
         sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO messages (id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance, embedding)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&msg.id)
         .bind(&msg.session_id)
@@ -119,6 +160,12 @@ impl StateStore for SqliteStateStore {
         .bind(&msg.tool_name)
         .bind(&msg.tool_calls_json)
         .bind(msg.created_at.to_rfc3339())
+        .bind(msg.importance)
+        .bind(msg.embedding.as_ref().map(|v| {
+            // Convert Vec<f32> to Vec<u8> (naive)
+            // For now, let's just use JSON for safety/portability if we aren't using sqlite-vec yet
+            serde_json::to_vec(v).unwrap_or_default()
+        }))
         .execute(&self.pool)
         .await?;
 
@@ -211,5 +258,130 @@ impl StateStore for SqliteStateStore {
             });
         }
         Ok(facts)
+    }
+
+    async fn get_context(&self, session_id: &str, query: &str, _limit: usize) -> anyhow::Result<Vec<Message>> {
+        // 1. Recency (Last 10) - Critical for conversational flow
+        let recency_count = 10;
+        let mut messages = self.get_history(session_id, recency_count).await?;
+        let mut seen_ids: std::collections::HashSet<String> = messages.iter().map(|m| m.id.clone()).collect();
+
+        // 2. Salience (Importance >= 0.8) - Critical memory
+        // Added session_id filter to prevent bleeding context from other sessions
+        let limit_salience = 5;
+        let salience = sqlx::query(
+            "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
+             FROM messages 
+             WHERE session_id = ? AND importance >= 0.8 
+             ORDER BY created_at DESC 
+             LIMIT ?"
+        )
+        .bind(session_id)
+        .bind(limit_salience)
+        .fetch_all(&self.pool)
+        .await?;
+        
+        for row in salience {
+             let id: String = row.get("id");
+             if seen_ids.contains(&id) { continue; }
+             
+             let created_str: String = row.get("created_at");
+             let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+             
+             messages.push(Message {
+                id: id.clone(),
+                session_id: row.get("session_id"),
+                role: row.get("role"),
+                content: row.get("content"),
+                tool_call_id: row.get("tool_call_id"),
+                tool_name: row.get("tool_name"),
+                tool_calls_json: row.get("tool_calls_json"),
+                created_at,
+                importance: row.try_get("importance").unwrap_or(0.5),
+                embedding: None,
+             });
+             seen_ids.insert(id);
+        }
+
+        // 3. Relevance (Vector Search)
+        // Only run if we have a query
+        if !query.trim().is_empty() {
+             if let Ok(query_vec) = self.embedding_service.embed(query.to_string()).await {
+                 // Fetch candidate embeddings (limit to recent 2000 to save compute)
+                 // Added session_id filter
+                 let candidates = sqlx::query(
+                    "SELECT id, embedding FROM messages WHERE session_id = ? AND embedding IS NOT NULL ORDER BY created_at DESC LIMIT 2000"
+                 )
+                 .bind(session_id)
+                 .fetch_all(&self.pool)
+                 .await?;
+
+                 let mut scored = Vec::new();
+                 for row in candidates {
+                    let id: String = row.get("id");
+                    if seen_ids.contains(&id) { continue; }
+                    let embedding: Option<Vec<u8>> = row.get("embedding");
+                    
+                    if let Some(blob) = embedding {
+                        if let Ok(vec) = serde_json::from_slice::<Vec<f32>>(&blob) {
+                            let score = crate::memory::math::cosine_similarity(&query_vec, &vec);
+                            if score > 0.65 { // Relevance threshold
+                                scored.push((id, score));
+                            }
+                        }
+                    }
+                 }
+                 // Sort by score DESC
+                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                 
+                 // Take top 5
+                 for (id, _score) in scored.into_iter().take(5) {
+                     // Fetch full message
+                     let row = sqlx::query(
+                        "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
+                         FROM messages WHERE id = ?"
+                     )
+                     .bind(&id)
+                     .fetch_optional(&self.pool)
+                     .await?;
+
+                     if let Some(row) = row {
+                         let created_str: String = row.get("created_at");
+                         let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now());
+
+                         let msg = Message {
+                            id: row.get("id"),
+                            session_id: row.get("session_id"),
+                            role: row.get("role"),
+                            content: row.get("content"),
+                            tool_call_id: row.get("tool_call_id"),
+                            tool_name: row.get("tool_name"),
+                            tool_calls_json: row.get("tool_calls_json"),
+                            created_at,
+                            importance: row.try_get("importance").unwrap_or(0.5),
+                            embedding: None,
+                         };
+                         // (Optional) Append score to content for debugging?
+                         // if let Some(c) = &mut msg.content {
+                         //    *c = format!("(Similarity: {:.2}) {}", score, c);
+                         // }
+                         messages.push(msg);
+                         seen_ids.insert(id);
+                     }
+                 }
+             }
+        }
+
+        // Sort final list by created_at (Chronological)
+        messages.sort_by_key(|m| m.created_at);
+
+        // Enforce limit if we somehow exceeded it (we might have up to 20 now)
+        // But we want to keep *all* relevant context we found, so maybe flexible limit.
+        // We just return what we gathered.
+        Ok(messages)
     }
 }

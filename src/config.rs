@@ -24,12 +24,24 @@ pub struct AppConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProviderConfig {
+    #[serde(default)]
+    pub kind: ProviderKind,
     pub api_key: String,
     #[serde(default = "default_base_url")]
     pub base_url: String,
     #[serde(default)]
     pub models: ModelsConfig,
 }
+
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    #[default]
+    OpenaiCompatible,
+    GoogleGenai,
+    Anthropic,
+}
+
 
 fn default_base_url() -> String {
     "https://api.openai.com/v1".to_string()

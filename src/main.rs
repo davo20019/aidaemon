@@ -4,6 +4,7 @@ mod config;
 mod core;
 mod daemon;
 mod mcp;
+mod memory;
 mod providers;
 mod router;
 mod skills;

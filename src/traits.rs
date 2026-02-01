@@ -14,6 +14,14 @@ pub struct Message {
     pub tool_name: Option<String>,
     pub tool_calls_json: Option<String>, // serialized Vec<ToolCall>
     pub created_at: DateTime<Utc>,
+    #[serde(default = "default_importance")]
+    pub importance: f32,
+    #[serde(skip)] // Don't serialize embedding to JSON (client doesn't need it)
+    pub embedding: Option<Vec<f32>>,
+}
+
+fn default_importance() -> f32 {
+    0.5
 }
 
 /// A single tool call as returned by the LLM.
@@ -91,4 +99,9 @@ pub trait StateStore: Send + Sync {
     async fn upsert_fact(&self, category: &str, key: &str, value: &str, source: &str) -> anyhow::Result<()>;
     /// Get all facts, optionally filtered by category.
     async fn get_facts(&self, category: Option<&str>) -> anyhow::Result<Vec<Fact>>;
+    /// Get context using Tri-Hybrid retrieval (Recency + Vector + Salience).
+    /// Default implementation just calls get_history.
+    async fn get_context(&self, session_id: &str, query: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
+        self.get_history(session_id, limit).await
+    }
 }

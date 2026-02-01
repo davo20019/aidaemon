@@ -211,7 +211,14 @@ impl Agent {
             tool_name: None,
             tool_calls_json: None,
             created_at: Utc::now(),
+            importance: 0.5, // Will be updated by score_message below
+            embedding: None,
         };
+        // Calculate heuristic score immediately
+        let score = crate::memory::scoring::score_message(&user_msg);
+        let mut user_msg = user_msg;
+        user_msg.importance = score;
+
         self.state.append_message(&user_msg).await?;
 
         let tool_defs = self.tool_definitions();
@@ -231,18 +238,64 @@ impl Agent {
             &facts,
         );
 
+        // 2b. Retrieve Context ONCE (Optimization)
+        // Use Tri-Hybrid Retrieval to get relevant history
+        let initial_history = self.state.get_context(session_id, user_text, 50).await?;
+
         // 3. Agentic loop
         for iteration in 0..MAX_ITERATIONS {
             info!(iteration, session_id, model = %model, "Agent loop iteration");
 
             // Build messages array
-            let history = self.state.get_history(session_id, 50).await?;
             let mut messages = Vec::new();
 
             messages.push(json!({"role": "system", "content": system_prompt}));
 
+            // Use the retrieved history (which includes recent + relevant messages)
+            // We append the new messages generated within this loop (tool calls etc)
+            // BUT: get_context only returns past messages.
+            // We need to verify if we should refresh history on each loop.
+            // Actually, get_context returns persisted messages.
+            // The tool calls/tool results generated IN THIS LOOP are persisted to state
+            // but might NOT be in `initial_history`.
+            // So we really need: Initial Context + Dynamic New Messages.
+            
+            // Re-fetching history is safer for tools, but expensive for vectors.
+            // Compromise: Use get_history for the loop (recency) but prepend the Relevant/Salient messages found initially?
+            // Or just stick to the user's request: Move it out.
+            // If we move it out, we miss the tool calls generated in step 1 when we are in step 2.
+            // FIX: We need to merge `initial_history` (past) with `current_session_new_messages`.
+            // EASIER FIX: `get_context` is heavy. `get_history` is cheap.
+            // We should use `get_context` ONCE to find old relevant stuff.
+            // And use `get_history` inside the loop to get the latest state.
+            // And merge them.
+            
+            // For now, let's just use `get_history` inside the loop, but PREPEND the "Relevant/Salient" messages found by `get_context`?
+            // Simpler: Just call `get_context` outside, and in the loop we manually fetch *just* the new messages?
+            // No, that's complex logic.
+            //
+            // Correct approach for V1:
+            // 1. Fetch `relevant_context` (Search results) OUTSIDE loop.
+            // 2. Inside loop, fetch `recent_history` (Recency).
+            // 3. Deduplicate and merge.
+            
+            // Let's implement this "Merge" logic here.
+            
+            let recent_history = self.state.get_history(session_id, 20).await?; // Fetch latest 20
+            
+            // Combine initial_history (which has high relevance) + recent_history
+            // Deduplicate by ID
+            let mut final_history = initial_history.clone();
+            for msg in recent_history {
+                if !final_history.iter().any(|m| m.id == msg.id) {
+                    final_history.push(msg);
+                }
+            }
+            // Sort by created_at
+            final_history.sort_by_key(|m| m.created_at);
+
             // Conversation history
-            for msg in &history {
+            for msg in &final_history {
                 let mut m = json!({"role": msg.role});
                 if let Some(ref c) = msg.content {
                     m["content"] = json!(c);
@@ -324,6 +377,8 @@ impl Agent {
                         tool_name: None,
                         tool_calls_json: None,
                         created_at: Utc::now(),
+                        importance: 0.1,
+                        embedding: None,
                     };
                     self.state.append_message(&nudge).await?;
                 }
@@ -337,6 +392,8 @@ impl Agent {
                     tool_name: None,
                     tool_calls_json: Some(serde_json::to_string(&resp.tool_calls)?),
                     created_at: Utc::now(),
+                    importance: 0.5,
+                    embedding: None,
                 };
                 self.state.append_message(&assistant_msg).await?;
 
@@ -357,6 +414,8 @@ impl Agent {
                         tool_name: Some(tc.name.clone()),
                         tool_calls_json: None,
                         created_at: Utc::now(),
+                        importance: 0.3, // Tool outputs default to lower importance
+                        embedding: None,
                     };
                     self.state.append_message(&tool_msg).await?;
                 }
@@ -384,6 +443,8 @@ impl Agent {
                 tool_name: None,
                 tool_calls_json: None,
                 created_at: Utc::now(),
+                importance: 0.5,
+                embedding: None,
             };
             self.state.append_message(&assistant_msg).await?;
 

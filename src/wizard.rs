@@ -5,6 +5,8 @@ use dialoguer::{Confirm, Input, Select};
 struct ProviderPreset {
     name: &'static str,
     base_url: &'static str,
+    // Kind field for new config
+    kind: &'static str,
     primary: &'static str,
     fast: &'static str,
     smart: &'static str,
@@ -15,46 +17,61 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         name: "OpenAI",
         base_url: "https://api.openai.com/v1",
+        kind: "openai_compatible",
         primary: "gpt-4o",
         fast: "gpt-4o-mini",
         smart: "gpt-4o",
         needs_key: true,
     },
     ProviderPreset {
-        name: "Anthropic (via OpenRouter)",
-        base_url: "https://openrouter.ai/api/v1",
-        primary: "anthropic/claude-sonnet-4",
-        fast: "anthropic/claude-haiku-3.5",
-        smart: "anthropic/claude-sonnet-4",
+        name: "Anthropic (Native)",
+        base_url: "https://api.anthropic.com/v1", // managed by provider but good for documentation
+        kind: "anthropic",
+        primary: "claude-3-5-sonnet-20240620",
+        fast: "claude-3-haiku-20240307",
+        smart: "claude-3-opus-20240229",
         needs_key: true,
     },
     ProviderPreset {
-        name: "Google AI Studio",
-        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
-        primary: "gemini-3-flash-preview",
-        fast: "gemini-2.5-flash-lite",
-        smart: "gemini-3-pro-preview",
+        name: "Anthropic (via OpenRouter)",
+        base_url: "https://openrouter.ai/api/v1",
+        kind: "openai_compatible",
+        primary: "anthropic/claude-3.5-sonnet",
+        fast: "anthropic/claude-3-haiku",
+        smart: "anthropic/claude-3-opus",
+        needs_key: true,
+    },
+    ProviderPreset {
+        name: "Google AI Studio (Native)",
+        base_url: "https://generativelanguage.googleapis.com", 
+        kind: "google_genai",
+        primary: "gemini-1.5-flash",
+        fast: "gemini-1.5-flash-8b",
+        smart: "gemini-1.5-pro",
         needs_key: true,
     },
     ProviderPreset {
         name: "OpenRouter",
         base_url: "https://openrouter.ai/api/v1",
+        kind: "openai_compatible",
         primary: "openai/gpt-4o",
         fast: "openai/gpt-4o-mini",
-        smart: "anthropic/claude-sonnet-4",
+        smart: "anthropic/claude-3.5-sonnet",
         needs_key: true,
     },
     ProviderPreset {
         name: "Ollama (local)",
         base_url: "http://localhost:11434/v1",
+        kind: "openai_compatible",
         primary: "llama3.1",
         fast: "llama3.1",
         smart: "llama3.1",
         needs_key: false,
     },
     ProviderPreset {
-        name: "Custom",
+        name: "Custom (OpenAI Compatible)",
         base_url: "https://api.example.com/v1",
+        kind: "openai_compatible",
         primary: "model-name",
         fast: "model-name",
         smart: "model-name",
@@ -219,6 +236,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<()> {
     // 6. Write config.toml
     let config = format!(
         r#"[provider]
+kind = "{}"
 api_key = "{api_key}"
 base_url = "{base_url}"
 
@@ -254,7 +272,7 @@ health_port = 8080
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 "#
-    );
+    , preset.kind);
 
     std::fs::write(config_path, config)?;
 

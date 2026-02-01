@@ -7,7 +7,10 @@ use crate::channels::TelegramChannel;
 use crate::config::AppConfig;
 use crate::daemon;
 use crate::mcp;
-use crate::providers::OpenAiCompatibleProvider;
+
+use crate::memory::embeddings::EmbeddingService;
+use crate::memory::manager::MemoryManager;
+
 use crate::router::{Router, Tier};
 use crate::skills;
 use crate::state::SqliteStateStore;
@@ -16,17 +19,39 @@ use crate::traits::Tool;
 use crate::triggers::{self, TriggerManager};
 
 pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::Result<()> {
+    // 0. Embeddings (Vector Memory)
+    let embedding_service = Arc::new(
+        EmbeddingService::new().map_err(|e| anyhow::anyhow!("Failed to init embeddings: {}", e))?
+    );
+    info!("Embedding service initialized (AllMiniLML6V2)");
+
     // 1. State store
     let state = Arc::new(
-        SqliteStateStore::new(&config.state.db_path, config.state.working_memory_cap).await?,
+        SqliteStateStore::new(
+            &config.state.db_path,
+            config.state.working_memory_cap,
+            embedding_service.clone()
+        ).await?,
     );
     info!("State store initialized ({})", config.state.db_path);
 
+    // 1b. Memory Manager (Background Tasks)
+    let memory_manager = Arc::new(MemoryManager::new(state.pool(), embedding_service.clone()));
+    memory_manager.start_background_tasks();
+
     // 2. Provider
-    let provider = Arc::new(OpenAiCompatibleProvider::new(
-        &config.provider.base_url,
-        &config.provider.api_key,
-    ));
+    let provider: Arc<dyn crate::traits::ModelProvider> = match config.provider.kind {
+        crate::config::ProviderKind::OpenaiCompatible => Arc::new(crate::providers::OpenAiCompatibleProvider::new(
+            &config.provider.base_url,
+            &config.provider.api_key,
+        )),
+        crate::config::ProviderKind::GoogleGenai => Arc::new(crate::providers::GoogleGenAiProvider::new(
+            &config.provider.api_key,
+        )),
+        crate::config::ProviderKind::Anthropic => Arc::new(crate::providers::AnthropicNativeProvider::new(
+            &config.provider.api_key,
+        )),
+    };
 
     // 3. Router
     let router = Router::new(config.provider.models.clone());

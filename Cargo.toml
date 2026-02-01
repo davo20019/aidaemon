@@ -36,3 +36,4 @@ dialoguer = "0.11"
 chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
 shellexpand = "3"
 dirs = "6"
+fastembed = "4"
