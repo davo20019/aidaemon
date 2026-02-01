@@ -22,9 +22,10 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String, // JSON string
-    /// Gemini 3+ thought signature — must be preserved and sent back.
+    /// Opaque extra fields from the provider (e.g. Gemini 3 thought signatures).
+    /// Preserved and sent back verbatim in conversation history.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thought_signature: Option<String>,
+    pub extra_content: Option<Value>,
 }
 
 /// A fact stored in Layer 2 memory.

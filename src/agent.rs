@@ -251,9 +251,9 @@ impl Agent {
                                         "arguments": tc.arguments
                                     }
                                 });
-                                // Preserve thought_signature for Gemini 3+
-                                if let Some(ref sig) = tc.thought_signature {
-                                    val["thought_signature"] = json!(sig);
+                                // Preserve extra_content (Gemini 3 thought signatures, etc.)
+                                if let Some(ref extra) = tc.extra_content {
+                                    val["extra_content"] = extra.clone();
                                 }
                                 val
                             })

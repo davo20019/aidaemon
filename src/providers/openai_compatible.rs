@@ -72,7 +72,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
             return Err(ProviderError::from_status(status.as_u16(), &text).into());
         }
 
-        debug!("Provider response: {}", &text[..text.len().min(500)]);
+        debug!("Provider response: {}", &text[..text.len().min(2000)]);
 
         let data: Value = serde_json::from_str(&text)?;
         let choice = data["choices"]
@@ -84,7 +84,12 @@ impl ModelProvider for OpenAiCompatibleProvider {
 
         let mut tool_calls = Vec::new();
         if let Some(tcs) = message["tool_calls"].as_array() {
+            debug!("Raw tool_calls from provider: {}", serde_json::to_string(tcs).unwrap_or_default());
             for tc in tcs {
+                let extra_content = tc.get("extra_content")
+                    .filter(|v| !v.is_null())
+                    .cloned();
+
                 tool_calls.push(ToolCall {
                     id: tc["id"].as_str().unwrap_or("").to_string(),
                     name: tc["function"]["name"]
@@ -95,9 +100,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                         .as_str()
                         .unwrap_or("{}")
                         .to_string(),
-                    thought_signature: tc["thought_signature"]
-                        .as_str()
-                        .map(|s| s.to_string()),
+                    extra_content,
                 });
             }
         }
