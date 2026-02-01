@@ -95,6 +95,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
                         .as_str()
                         .unwrap_or("{}")
                         .to_string(),
+                    thought_signature: tc["thought_signature"]
+                        .as_str()
+                        .map(|s| s.to_string()),
                 });
             }
         }

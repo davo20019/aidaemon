@@ -243,14 +243,19 @@ impl Agent {
                         let tc_val: Vec<Value> = tcs
                             .iter()
                             .map(|tc| {
-                                json!({
+                                let mut val = json!({
                                     "id": tc.id,
                                     "type": "function",
                                     "function": {
                                         "name": tc.name,
                                         "arguments": tc.arguments
                                     }
-                                })
+                                });
+                                // Preserve thought_signature for Gemini 3+
+                                if let Some(ref sig) = tc.thought_signature {
+                                    val["thought_signature"] = json!(sig);
+                                }
+                                val
                             })
                             .collect();
                         m["tool_calls"] = json!(tc_val);
