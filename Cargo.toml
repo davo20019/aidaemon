@@ -33,3 +33,6 @@ async-std = { version = "1", features = ["attributes"] }
 futures = "0.3"
 axum = "0.8"
 dialoguer = "0.11"
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+shellexpand = "3"
+dirs = "6"

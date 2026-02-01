@@ -298,7 +298,7 @@ impl Agent {
 
                 // Execute each tool call
                 for tc in &resp.tool_calls {
-                    let result = self.execute_tool(&tc.name, &tc.arguments).await;
+                    let result = self.execute_tool(&tc.name, &tc.arguments, session_id).await;
                     let result_text = match result {
                         Ok(text) => text,
                         Err(e) => format!("Error: {}", e),
@@ -342,10 +342,17 @@ impl Agent {
         Ok("I've reached the maximum number of steps for this request. Please try again with a simpler query.".to_string())
     }
 
-    async fn execute_tool(&self, name: &str, arguments: &str) -> anyhow::Result<String> {
+    async fn execute_tool(&self, name: &str, arguments: &str, session_id: &str) -> anyhow::Result<String> {
+        let enriched_args = match serde_json::from_str::<Value>(arguments) {
+            Ok(Value::Object(mut map)) => {
+                map.insert("_session_id".to_string(), json!(session_id));
+                serde_json::to_string(&map)?
+            }
+            _ => arguments.to_string(),
+        };
         for tool in &self.tools {
             if tool.name() == name {
-                return tool.call(arguments).await;
+                return tool.call(&enriched_args).await;
             }
         }
         anyhow::bail!("Unknown tool: {}", name)

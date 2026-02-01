@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use dialoguer::{Input, Select};
+use dialoguer::{Confirm, Input, Select};
 
 struct ProviderPreset {
     name: &'static str,
@@ -152,7 +152,71 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<()> {
         .parse()
         .expect("already validated");
 
-    // 5. Write config.toml
+    // 5. Browser tool setup
+    println!();
+    let browser_enabled = Confirm::new()
+        .with_prompt("Enable browser tool? (lets the agent browse the web, fill forms, take screenshots)")
+        .default(false)
+        .interact()?;
+
+    let mut browser_section = String::new();
+    if browser_enabled {
+        let mut user_data_dir = String::new();
+        let mut profile_name = String::new();
+
+        // Try to detect Chrome profiles
+        let profiles = discover_chrome_profiles();
+        if !profiles.is_empty() {
+            let use_profile = Confirm::new()
+                .with_prompt("Chrome detected! Use an existing Chrome profile? (inherits your login sessions)")
+                .default(true)
+                .interact()?;
+
+            if use_profile {
+                let display_names: Vec<String> = profiles
+                    .iter()
+                    .map(|p| {
+                        if p.display_name.is_empty() {
+                            p.dir_name.clone()
+                        } else {
+                            format!("{} ({})", p.display_name, p.dir_name)
+                        }
+                    })
+                    .collect();
+
+                let profile_selection = Select::new()
+                    .with_prompt("Select Chrome profile")
+                    .items(&display_names)
+                    .default(0)
+                    .interact()?;
+
+                let selected = &profiles[profile_selection];
+                user_data_dir = selected.user_data_dir.clone();
+                profile_name = selected.dir_name.clone();
+
+                println!();
+                println!("NOTE: Chrome locks its profile while running.");
+                println!("The agent will only be able to use the browser when Chrome is closed,");
+                println!("or you can copy the profile to a separate directory.");
+            }
+        } else {
+            println!("No Chrome installation detected. The browser will use a fresh profile.");
+            println!("You can set user_data_dir in config.toml later to reuse an existing profile.");
+        }
+
+        let headless = Confirm::new()
+            .with_prompt("Run browser in headless mode? (no visible window)")
+            .default(true)
+            .interact()?;
+
+        browser_section = format!("\n[browser]\nenabled = true\nheadless = {headless}\n");
+        if !user_data_dir.is_empty() {
+            browser_section.push_str(&format!("user_data_dir = \"{user_data_dir}\"\n"));
+            browser_section.push_str(&format!("profile = \"{profile_name}\"\n"));
+        }
+    }
+
+    // 6. Write config.toml
     let config = format!(
         r#"[provider]
 api_key = "{api_key}"
@@ -176,7 +240,7 @@ allowed_prefixes = ["ls", "cat", "echo", "date", "whoami", "uname", "df", "du", 
 
 [daemon]
 health_port = 8080
-
+{browser_section}
 # Uncomment to enable email triggers:
 # [triggers.email]
 # host = "imap.gmail.com"
@@ -200,6 +264,90 @@ health_port = 8080
     println!();
 
     Ok(())
+}
+
+struct ChromeProfile {
+    user_data_dir: String,
+    dir_name: String,
+    display_name: String,
+}
+
+/// Auto-detect Chrome profiles on the system.
+fn discover_chrome_profiles() -> Vec<ChromeProfile> {
+    let mut profiles = Vec::new();
+
+    // Known Chrome user data directories per platform
+    let candidates: Vec<PathBuf> = if cfg!(target_os = "macos") {
+        vec![
+            dirs::home_dir()
+                .map(|h| h.join("Library/Application Support/Google/Chrome"))
+                .unwrap_or_default(),
+            dirs::home_dir()
+                .map(|h| h.join("Library/Application Support/Chromium"))
+                .unwrap_or_default(),
+        ]
+    } else if cfg!(target_os = "linux") {
+        vec![
+            dirs::config_dir()
+                .map(|c| c.join("google-chrome"))
+                .unwrap_or_default(),
+            dirs::config_dir()
+                .map(|c| c.join("chromium"))
+                .unwrap_or_default(),
+        ]
+    } else {
+        // Windows or other
+        vec![
+            dirs::data_local_dir()
+                .map(|d| d.join("Google/Chrome/User Data"))
+                .unwrap_or_default(),
+        ]
+    };
+
+    for user_data_dir in candidates {
+        if !user_data_dir.exists() {
+            continue;
+        }
+
+        // Look for profile directories (Default, Profile 1, Profile 2, ...)
+        let entries = match std::fs::read_dir(&user_data_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            if dir_name == "Default" || dir_name.starts_with("Profile ") {
+                let prefs_path = entry.path().join("Preferences");
+                let display_name = read_chrome_profile_name(&prefs_path);
+
+                profiles.push(ChromeProfile {
+                    user_data_dir: user_data_dir.to_string_lossy().to_string(),
+                    dir_name,
+                    display_name,
+                });
+            }
+        }
+    }
+
+    profiles
+}
+
+/// Read the human-readable profile name from Chrome's Preferences JSON.
+fn read_chrome_profile_name(prefs_path: &Path) -> String {
+    let content = match std::fs::read_to_string(prefs_path) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    json.get("profile")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn discover_ollama_models() -> anyhow::Result<Vec<String>> {

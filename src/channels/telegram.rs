@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
 use crate::agent::Agent;
 use crate::config::AppConfig;
+use crate::tools::browser::MediaMessage;
 use crate::tools::terminal::{ApprovalRequest, ApprovalResponse};
 
 pub struct TelegramChannel {
@@ -20,6 +21,7 @@ pub struct TelegramChannel {
     approval_rx: Mutex<mpsc::Receiver<ApprovalRequest>>,
     /// Pending approvals keyed by a unique callback ID.
     pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
+    media_rx: Mutex<mpsc::Receiver<MediaMessage>>,
 }
 
 impl TelegramChannel {
@@ -29,6 +31,7 @@ impl TelegramChannel {
         agent: Arc<Agent>,
         config_path: PathBuf,
         approval_rx: mpsc::Receiver<ApprovalRequest>,
+        media_rx: mpsc::Receiver<MediaMessage>,
     ) -> Self {
         let bot = Bot::new(bot_token);
         Self {
@@ -38,6 +41,7 @@ impl TelegramChannel {
             config_path,
             approval_rx: Mutex::new(approval_rx),
             pending_approvals: Mutex::new(HashMap::new()),
+            media_rx: Mutex::new(media_rx),
         }
     }
 
@@ -79,6 +83,12 @@ impl TelegramChannel {
         let self_for_approvals = Arc::clone(&self);
         tokio::spawn(async move {
             self_for_approvals.approval_listener().await;
+        });
+
+        // Spawn media message listener (screenshots)
+        let self_for_media = Arc::clone(&self);
+        tokio::spawn(async move {
+            self_for_media.media_listener().await;
         });
 
         let handler = dptree::entry()
@@ -176,6 +186,31 @@ impl TelegramChannel {
                 if let Some(tx) = pending.remove(&approval_id) {
                     let _ = tx.send(ApprovalResponse::Deny);
                 }
+            }
+        }
+    }
+
+    /// Listens for media messages (screenshots) and sends them as photos.
+    async fn media_listener(self: Arc<Self>) {
+        loop {
+            let msg = {
+                let mut rx = self.media_rx.lock().await;
+                rx.recv().await
+            };
+
+            let msg = match msg {
+                Some(m) => m,
+                None => break, // channel closed
+            };
+
+            let photo = InputFile::memory(msg.photo_bytes).file_name("screenshot.png");
+            if let Err(e) = self
+                .bot
+                .send_photo(ChatId(msg.chat_id), photo)
+                .caption(msg.caption)
+                .await
+            {
+                warn!("Failed to send screenshot photo: {}", e);
             }
         }
     }

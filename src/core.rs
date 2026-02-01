@@ -10,7 +10,7 @@ use crate::mcp;
 use crate::providers::OpenAiCompatibleProvider;
 use crate::router::{Router, Tier};
 use crate::state::SqliteStateStore;
-use crate::tools::{ConfigManagerTool, RememberFactTool, SystemInfoTool, TerminalTool};
+use crate::tools::{BrowserTool, ConfigManagerTool, RememberFactTool, SystemInfoTool, TerminalTool};
 use crate::traits::Tool;
 use crate::triggers::{self, TriggerManager};
 
@@ -39,12 +39,19 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 4. Tools
     let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(16);
+    let (media_tx, media_rx) = tokio::sync::mpsc::channel(16);
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(SystemInfoTool),
         Arc::new(TerminalTool::new(config.terminal.allowed_prefixes.clone(), approval_tx)),
         Arc::new(RememberFactTool::new(state.clone())),
         Arc::new(ConfigManagerTool::new(config_path.clone())),
     ];
+
+    // Browser tool (conditional)
+    if config.browser.enabled {
+        tools.push(Arc::new(BrowserTool::new(config.browser.clone(), media_tx.clone())));
+        info!("Browser tool enabled");
+    }
 
     // 5. MCP tools
     if !config.mcp.is_empty() {
@@ -69,6 +76,11 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         - `system_info`: Get CPU, memory, and OS information.\n\
         - `remember_fact`: Store important facts about the user for long-term memory.\n\
         - `manage_config`: Read and update your own config.toml. Use this to fix configuration issues.\n\
+        - `browser`: Control a headless browser for web interactions. Actions: navigate (go to URL), \
+        screenshot (capture page and send as photo), click (click element by CSS selector), \
+        fill (type text into input), get_text (extract visible text), execute_js (run JavaScript), \
+        wait (wait for element to appear), close (end browser session). The browser session persists \
+        across tool calls so you can chain multi-step workflows (e.g. navigate -> fill form -> click -> screenshot).\n\
         \n## Self-Maintenance\n\
         You are responsible for your own maintenance. When you encounter errors:\n\
         1. Diagnose the issue using your tools (read logs, check config, test commands).\n\
@@ -106,6 +118,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         Arc::clone(&agent),
         config_path,
         approval_rx,
+        media_rx,
     ));
 
     // 10. Health server

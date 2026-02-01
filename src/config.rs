@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub triggers: TriggersConfig,
     #[serde(default)]
     pub mcp: HashMap<String, McpServerConfig>,
+    #[serde(default)]
+    pub browser: BrowserConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -174,6 +176,47 @@ pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BrowserConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_headless")]
+    pub headless: bool,
+    #[serde(default = "default_screenshot_width")]
+    pub screenshot_width: u32,
+    #[serde(default = "default_screenshot_height")]
+    pub screenshot_height: u32,
+    /// Path to Chrome user data directory to reuse an existing profile's sessions/cookies.
+    /// e.g. "~/Library/Application Support/Google/Chrome"
+    pub user_data_dir: Option<String>,
+    /// Chrome profile directory name within user_data_dir (default: "Default").
+    /// Other profiles are typically "Profile 1", "Profile 2", etc.
+    pub profile: Option<String>,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            headless: default_headless(),
+            screenshot_width: default_screenshot_width(),
+            screenshot_height: default_screenshot_height(),
+            user_data_dir: None,
+            profile: None,
+        }
+    }
+}
+
+fn default_headless() -> bool {
+    true
+}
+fn default_screenshot_width() -> u32 {
+    1280
+}
+fn default_screenshot_height() -> u32 {
+    720
 }
 
 impl AppConfig {

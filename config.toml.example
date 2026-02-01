@@ -23,6 +23,15 @@ allowed_prefixes = ["ls", "cat", "head", "tail", "echo", "date", "whoami", "pwd"
 [daemon]
 health_port = 8080
 
+# [browser]
+# enabled = true
+# headless = true
+# screenshot_width = 1280
+# screenshot_height = 720
+# # Use an existing Chrome profile to inherit cookies/sessions (e.g. Cloudflare, GitHub, AWS)
+# user_data_dir = "~/Library/Application Support/Google/Chrome"
+# profile = "Default"    # or "Profile 1", "Profile 2", etc.
+
 # [triggers.email]
 # host = "imap.gmail.com"
 # port = 993
