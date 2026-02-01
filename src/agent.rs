@@ -13,6 +13,7 @@ use crate::skills::{self, Skill};
 use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
 
 const MAX_ITERATIONS: usize = 10;
+const DEFAULT_MAX_DEPTH: usize = 3;
 
 pub struct Agent {
     provider: Arc<dyn ModelProvider>,
@@ -23,6 +24,10 @@ pub struct Agent {
     system_prompt: String,
     config_path: PathBuf,
     skills: Vec<Skill>,
+    /// Current recursion depth (0 = root agent).
+    depth: usize,
+    /// Maximum allowed recursion depth for sub-agent spawning.
+    max_depth: usize,
 }
 
 impl Agent {
@@ -45,6 +50,136 @@ impl Agent {
             system_prompt,
             config_path,
             skills,
+            depth: 0,
+            max_depth: DEFAULT_MAX_DEPTH,
+        }
+    }
+
+    /// Create an Agent with explicit depth/max_depth (used internally for sub-agents).
+    fn with_depth(
+        provider: Arc<dyn ModelProvider>,
+        state: Arc<dyn StateStore>,
+        tools: Vec<Arc<dyn Tool>>,
+        model: String,
+        system_prompt: String,
+        config_path: PathBuf,
+        skills: Vec<Skill>,
+        depth: usize,
+        max_depth: usize,
+    ) -> Self {
+        let fallback = model.clone();
+        Self {
+            provider,
+            state,
+            tools,
+            model: RwLock::new(model),
+            fallback_model: RwLock::new(fallback),
+            system_prompt,
+            config_path,
+            skills,
+            depth,
+            max_depth,
+        }
+    }
+
+    /// Current recursion depth of this agent.
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Maximum recursion depth allowed.
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
+    /// Spawn a child agent with an incremented depth and a focused mission.
+    ///
+    /// The child runs its own agentic loop in a fresh session and returns the
+    /// final text response. It inherits the parent's provider, state, model,
+    /// and non-spawn tools. If the child hasn't reached max_depth it also gets
+    /// its own `spawn_agent` tool so it can recurse further.
+    pub async fn spawn_child(
+        self: &Arc<Self>,
+        mission: &str,
+        task: &str,
+    ) -> anyhow::Result<String> {
+        if self.depth >= self.max_depth {
+            anyhow::bail!(
+                "Cannot spawn sub-agent: max recursion depth ({}) reached",
+                self.max_depth
+            );
+        }
+
+        let child_depth = self.depth + 1;
+        let model = self.model.read().await.clone();
+
+        // Collect parent's non-spawn tools for the child.
+        let base_tools: Vec<Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .filter(|t| t.name() != "spawn_agent")
+            .cloned()
+            .collect();
+
+        // Build the child's system prompt with the mission context.
+        let child_system_prompt = format!(
+            "{}\n\n## Sub-Agent Context\n\
+            You are a sub-agent (depth {}/{}) spawned to accomplish a specific mission.\n\
+            **Mission:** {}\n\n\
+            Focus exclusively on this mission. Be concise. Return your findings/results \
+            directly — they will be consumed by the parent agent.",
+            self.system_prompt, child_depth, self.max_depth, mission
+        );
+
+        let child_session = format!("sub-{}-{}", child_depth, Uuid::new_v4());
+
+        info!(
+            parent_depth = self.depth,
+            child_depth,
+            child_session = %child_session,
+            mission,
+            "Spawning sub-agent"
+        );
+
+        // If the child can still recurse, give it a spawn tool with a deferred
+        // agent reference (set after wrapping in Arc).
+        if child_depth < self.max_depth {
+            let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred());
+
+            let mut child_tools = base_tools;
+            child_tools.push(spawn_tool.clone());
+
+            let child = Arc::new(Agent::with_depth(
+                self.provider.clone(),
+                self.state.clone(),
+                child_tools,
+                model,
+                child_system_prompt,
+                self.config_path.clone(),
+                self.skills.clone(),
+                child_depth,
+                self.max_depth,
+            ));
+
+            // Close the loop: give the spawn tool a weak ref to the child.
+            spawn_tool.set_agent(Arc::downgrade(&child));
+
+            child.handle_message(&child_session, task).await
+        } else {
+            // At max depth — no spawn tool, no recursion.
+            let child = Arc::new(Agent::with_depth(
+                self.provider.clone(),
+                self.state.clone(),
+                base_tools,
+                model,
+                child_system_prompt,
+                self.config_path.clone(),
+                self.skills.clone(),
+                child_depth,
+                self.max_depth,
+            ));
+
+            child.handle_message(&child_session, task).await
         }
     }
 
@@ -252,41 +387,37 @@ impl Agent {
             .take(recency_window_size)
             .map(|m| m.id.clone())
             .collect();
-        
+
         let pinned_memories: Vec<Message> = initial_history
             .iter()
             .filter(|m| !recent_ids.contains(&m.id))
             .cloned()
             .collect();
-            
+
         info!(
-            session_id, 
+            session_id,
             total_context = initial_history.len(),
             pinned_old_memories = pinned_memories.len(),
+            depth = self.depth,
             "Context prepared"
         );
 
         // 3. Agentic loop
         for iteration in 0..MAX_ITERATIONS {
-            info!(iteration, session_id, model = %model, "Agent loop iteration");
+            info!(iteration, session_id, model = %model, depth = self.depth, "Agent loop iteration");
 
             // Build messages array
             let mut messages = Vec::new();
 
             messages.push(json!({"role": "system", "content": system_prompt}));
-            
+
             // Fetch fresh recency (tool calls / assistant replies from this loop)
             let recent_history = self.state.get_history(session_id, recency_window_size).await?;
-            
+
             // Merge: Pinned Old Memories + Fresh Recent History
-            // Since pinned_memories are explicitly "not recent" (older than the window start at time T0),
-            // and recent_history is the NEW window (Time T1), there might be slight overlap if no new messages were added
-            // but effectively we just want to show user: "Here is the relevant old stuff" + "Here is the latest conversation".
-            // We use a deduplication set just in case.
-            
             let mut final_history = pinned_memories.clone();
             let mut seen_ids: std::collections::HashSet<String> = final_history.iter().map(|m| m.id.clone()).collect();
-            
+
             for msg in recent_history {
                 if !seen_ids.contains(&msg.id) {
                     let id = msg.id.clone();

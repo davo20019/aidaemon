@@ -14,7 +14,7 @@ use crate::memory::manager::MemoryManager;
 use crate::router::{Router, Tier};
 use crate::skills;
 use crate::state::SqliteStateStore;
-use crate::tools::{BrowserTool, ConfigManagerTool, RememberFactTool, SystemInfoTool, TerminalTool};
+use crate::tools::{BrowserTool, ConfigManagerTool, RememberFactTool, SpawnAgentTool, SystemInfoTool, TerminalTool};
 use crate::traits::Tool;
 use crate::triggers::{self, TriggerManager};
 
@@ -103,8 +103,10 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         Vec::new()
     };
 
-    // 7. Agent
+    // 7. Agent (with deferred spawn tool wiring to break the circular dep)
     let base_system_prompt = build_base_system_prompt();
+    let spawn_tool = Arc::new(SpawnAgentTool::new_deferred());
+    tools.push(spawn_tool.clone());
 
     let agent = Arc::new(Agent::new(
         provider,
@@ -115,6 +117,9 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         config_path.clone(),
         loaded_skills,
     ));
+
+    // Close the loop: give the spawn tool a weak reference to the agent.
+    spawn_tool.set_agent(Arc::downgrade(&agent));
 
     // 8. Event bus for triggers
     let (event_tx, mut event_rx) = triggers::event_bus(64);

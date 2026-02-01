@@ -4,3 +4,6 @@
 *.db-wal
 .env
 config.toml
+*.bak
+*.lastgood
+*.html
