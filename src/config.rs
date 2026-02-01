@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub mcp: HashMap<String, McpServerConfig>,
     #[serde(default)]
     pub browser: BrowserConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -217,6 +219,31 @@ fn default_screenshot_width() -> u32 {
 }
 fn default_screenshot_height() -> u32 {
     720
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SkillsConfig {
+    #[serde(default = "default_skills_dir")]
+    pub dir: String,
+    #[serde(default = "default_skills_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_skills_dir(),
+            enabled: default_skills_enabled(),
+        }
+    }
+}
+
+fn default_skills_dir() -> String {
+    "skills".to_string()
+}
+
+fn default_skills_enabled() -> bool {
+    true
 }
 
 impl AppConfig {

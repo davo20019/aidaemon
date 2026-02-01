@@ -6,6 +6,7 @@ mod daemon;
 mod mcp;
 mod providers;
 mod router;
+mod skills;
 mod state;
 mod tools;
 mod traits;

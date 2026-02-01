@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::providers::{ProviderError, ProviderErrorKind};
+use crate::skills::{self, Skill};
 use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
 
 const MAX_ITERATIONS: usize = 10;
@@ -21,6 +22,7 @@ pub struct Agent {
     fallback_model: RwLock<String>,
     system_prompt: String,
     config_path: PathBuf,
+    skills: Vec<Skill>,
 }
 
 impl Agent {
@@ -31,6 +33,7 @@ impl Agent {
         model: String,
         system_prompt: String,
         config_path: PathBuf,
+        skills: Vec<Skill>,
     ) -> Self {
         let fallback = model.clone();
         Self {
@@ -41,6 +44,7 @@ impl Agent {
             fallback_model: RwLock::new(fallback),
             system_prompt,
             config_path,
+            skills,
         }
     }
 
@@ -213,7 +217,21 @@ impl Agent {
         let tool_defs = self.tool_definitions();
         let model = self.model.read().await.clone();
 
-        // 2. Agentic loop
+        // 2. Build system prompt ONCE before the loop: match skills + inject facts
+        let active_skills = skills::match_skills(&self.skills, user_text);
+        if !active_skills.is_empty() {
+            let names: Vec<&str> = active_skills.iter().map(|s| s.name.as_str()).collect();
+            info!(session_id, skills = ?names, "Matched skills for message");
+        }
+        let facts = self.state.get_facts(None).await?;
+        let system_prompt = skills::build_system_prompt(
+            &self.system_prompt,
+            &self.skills,
+            &active_skills,
+            &facts,
+        );
+
+        // 3. Agentic loop
         for iteration in 0..MAX_ITERATIONS {
             info!(iteration, session_id, model = %model, "Agent loop iteration");
 
@@ -221,16 +239,7 @@ impl Agent {
             let history = self.state.get_history(session_id, 50).await?;
             let mut messages = Vec::new();
 
-            // System prompt with facts
-            let facts = self.state.get_facts(None).await?;
-            let mut sys = self.system_prompt.clone();
-            if !facts.is_empty() {
-                sys.push_str("\n\n## Known Facts\n");
-                for f in &facts {
-                    sys.push_str(&format!("- [{}] {}: {}\n", f.category, f.key, f.value));
-                }
-            }
-            messages.push(json!({"role": "system", "content": sys}));
+            messages.push(json!({"role": "system", "content": system_prompt}));
 
             // Conversation history
             for msg in &history {
@@ -274,7 +283,7 @@ impl Agent {
                 messages.push(m);
             }
 
-            // 3. Call the LLM with error-classified recovery
+            // 4. Call the LLM with error-classified recovery
             // On the last iteration, omit tools to force a text response
             let effective_tools = if iteration >= MAX_ITERATIONS - 1 {
                 info!(session_id, "Last iteration — calling LLM without tools to force summary");
@@ -296,7 +305,7 @@ impl Agent {
                 "LLM response received"
             );
 
-            // 4. If there are tool calls, execute them
+            // 5. If there are tool calls, execute them
             // On the last iteration, force a text response even if the model returns tool calls
             if !resp.tool_calls.is_empty() && iteration < MAX_ITERATIONS - 1 {
                 // Nudge the model to wrap up when approaching the limit
@@ -356,7 +365,7 @@ impl Agent {
                 continue;
             }
 
-            // 5. No tool calls (or last iteration) — this is the final response
+            // 6. No tool calls (or last iteration) — this is the final response
             let reply = resp.content.filter(|s| !s.is_empty()).unwrap_or_else(|| {
                 if iteration >= MAX_ITERATIONS - 1 {
                     "I used all available tool iterations but couldn't finish the task. \

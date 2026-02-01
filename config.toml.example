@@ -23,6 +23,10 @@ allowed_prefixes = ["ls", "cat", "head", "tail", "echo", "date", "whoami", "pwd"
 [daemon]
 health_port = 8080
 
+# [skills]
+# enabled = true
+# dir = "skills"    # relative to config.toml location
+
 # [browser]
 # enabled = true
 # headless = true
