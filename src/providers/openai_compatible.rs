@@ -69,6 +69,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
 
         if !status.is_success() {
             error!(status = %status, "Provider API error: {}", text);
+            debug!("Failed request body: {}", serde_json::to_string(&body).unwrap_or_default());
             return Err(ProviderError::from_status(status.as_u16(), &text).into());
         }
 

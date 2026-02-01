@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::providers::{ProviderError, ProviderErrorKind};
 use crate::skills::{self, Skill};
-use crate::traits::{Message, ModelProvider, StateStore, Tool};
+use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
 
 const MAX_ITERATIONS: usize = 10;
 const DEFAULT_MAX_DEPTH: usize = 3;
@@ -410,16 +410,54 @@ impl Agent {
             // We expect no overlap because pinned are strictly older, but we dedup just in case
             let mut seen_ids: std::collections::HashSet<&String> = std::collections::HashSet::new();
             
-            let mut messages: Vec<Value> = pinned_memories.iter()
+            // Deduplicated, ordered message list
+            let deduped_msgs: Vec<&Message> = pinned_memories.iter()
                 .chain(recent_history.iter())
-                .filter(|m| seen_ids.insert(&m.id)) // Dedup
+                .filter(|m| seen_ids.insert(&m.id))
+                .collect();
+
+            // Collect tool_call_ids that have valid tool responses (role=tool with a name)
+            let valid_tool_call_ids: std::collections::HashSet<&str> = deduped_msgs.iter()
+                .filter(|m| m.role == "tool" && m.tool_name.is_some())
+                .filter_map(|m| m.tool_call_id.as_deref())
+                .collect();
+
+            let mut messages: Vec<Value> = deduped_msgs.iter()
+                .filter(|m| !(m.role == "tool" && m.tool_name.is_none())) // Skip broken tool results
                 .map(|m| {
                     let mut obj = json!({
                         "role": m.role,
                         "content": m.content,
                     });
+                    // For assistant messages with tool_calls, convert from ToolCall struct format
+                    // to OpenAI wire format and strip any that lack a matching tool result
                     if let Some(tc_json) = &m.tool_calls_json {
-                        obj["tool_calls"] = serde_json::from_str::<Value>(tc_json).unwrap_or(json!([]));
+                        if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
+                            let filtered: Vec<Value> = tcs.iter()
+                                .filter(|tc| valid_tool_call_ids.contains(tc.id.as_str()))
+                                .map(|tc| {
+                                    let mut val = json!({
+                                        "id": tc.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc.name,
+                                            "arguments": tc.arguments
+                                        }
+                                    });
+                                    if let Some(ref extra) = tc.extra_content {
+                                        val["extra_content"] = extra.clone();
+                                    }
+                                    val
+                                })
+                                .collect();
+                            if !filtered.is_empty() {
+                                obj["tool_calls"] = json!(filtered);
+                                // OpenAI requires content to be null when tool_calls present
+                                if m.content.is_none() {
+                                    obj["content"] = Value::Null;
+                                }
+                            }
+                        }
                     }
                     if let Some(name) = &m.tool_name {
                         obj["name"] = json!(name);
