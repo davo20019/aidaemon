@@ -31,6 +31,7 @@ impl EmbeddingService {
     }
 
     /// Compute embeddings for multiple strings.
+    #[allow(dead_code)]
     pub async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         let model = self.model.clone();
         task::spawn_blocking(move || {

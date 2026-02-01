@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 use crate::providers::ProviderError;
 use crate::traits::{ModelProvider, ProviderResponse, ToolCall};
