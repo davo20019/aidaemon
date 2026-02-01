@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -169,14 +169,16 @@ impl TelegramChannel {
                 ),
             ]]);
 
+            let escaped_cmd = html_escape(&request.command);
             let text = format!(
-                "Command requires approval:\n\n`{}`\n\n[{}]",
-                request.command, short_id
+                "Command requires approval:\n\n<code>{}</code>\n\n[{}]",
+                escaped_cmd, short_id
             );
 
             if let Err(e) = self
                 .bot
-                .send_message(ChatId(chat_id), text)
+                .send_message(ChatId(chat_id), &text)
+                .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
                 .await
             {
@@ -387,9 +389,13 @@ impl TelegramChannel {
 
         match self.agent.handle_message(&session_id, &text).await {
             Ok(reply) => {
+                let html = markdown_to_telegram_html(&reply);
                 // Split long messages (Telegram limit is 4096 chars)
-                for chunk in split_message(&reply, 4096) {
-                    if let Err(e) = bot.send_message(msg.chat.id, chunk).await {
+                let html_chunks = split_message(&html, 4096);
+                let plain_chunks = split_message(&reply, 4096);
+                for (i, html_chunk) in html_chunks.iter().enumerate() {
+                    let plain_chunk = plain_chunks.get(i).map(|s| s.as_str()).unwrap_or(html_chunk.as_str());
+                    if let Err(e) = send_html_or_fallback(&bot, msg.chat.id, html_chunk, plain_chunk).await {
                         warn!("Failed to send Telegram message: {}", e);
                     }
                 }
@@ -405,9 +411,12 @@ impl TelegramChannel {
 
     /// Send a proactive message to a chat (used by triggers/events).
     pub async fn send_to_chat(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
-        self.bot
-            .send_message(ChatId(chat_id), text)
-            .await?;
+        let html = markdown_to_telegram_html(text);
+        for chunk in split_message(&html, 4096) {
+            if let Err(e) = send_html_or_fallback(&self.bot, ChatId(chat_id), &chunk, text).await {
+                warn!("Failed to send proactive message: {}", e);
+            }
+        }
         Ok(())
     }
 }
@@ -432,16 +441,280 @@ fn restart_process() {
     tracing::error!("exec failed: {}", err);
 }
 
-fn split_message(text: &str, max_len: usize) -> Vec<&str> {
+/// Convert common LLM markdown to Telegram-compatible HTML.
+fn markdown_to_telegram_html(md: &str) -> String {
+    let mut result = String::with_capacity(md.len() + md.len() / 4);
+    let lines: Vec<&str> = md.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+
+        // Fenced code blocks: ```lang\n...\n```
+        if line.starts_with("```") {
+            i += 1;
+            let mut code = String::new();
+            while i < lines.len() && !lines[i].starts_with("```") {
+                if !code.is_empty() {
+                    code.push('\n');
+                }
+                code.push_str(lines[i]);
+                i += 1;
+            }
+            if i < lines.len() {
+                i += 1; // skip closing ```
+            }
+            // HTML-escape the code content
+            let escaped = html_escape(&code);
+            result.push_str("<pre><code>");
+            result.push_str(&escaped);
+            result.push_str("</code></pre>");
+            result.push('\n');
+            continue;
+        }
+
+        // Process a non-code line: escape HTML first, then apply inline formatting
+        let escaped = html_escape(line);
+
+        // Heading lines: ### heading → <b>heading</b>
+        if let Some(heading) = strip_heading(&escaped) {
+            result.push_str("<b>");
+            result.push_str(&heading);
+            result.push_str("</b>");
+            result.push('\n');
+            i += 1;
+            continue;
+        }
+
+        // Unordered list markers: "- " or "* " at start → "• "
+        let processed = if escaped.starts_with("- ") {
+            format!("• {}", &escaped[2..])
+        } else if escaped.starts_with("* ") {
+            format!("• {}", &escaped[2..])
+        } else {
+            escaped
+        };
+
+        // Inline formatting
+        let processed = convert_inline_formatting(&processed);
+
+        result.push_str(&processed);
+        result.push('\n');
+        i += 1;
+    }
+
+    // Remove trailing newline
+    if result.ends_with('\n') {
+        result.pop();
+    }
+    result
+}
+
+/// Escape `<`, `>`, `&` for Telegram HTML.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Strip markdown heading prefix (e.g. "### Foo" → "Foo"). Returns None if not a heading.
+fn strip_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        let after_hashes = trimmed.trim_start_matches('#');
+        if after_hashes.starts_with(' ') {
+            return Some(after_hashes.trim_start().to_string());
+        }
+    }
+    None
+}
+
+/// Apply inline markdown formatting: bold, italic, inline code, links.
+fn convert_inline_formatting(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Inline code: `code`
+        if chars[i] == '`' {
+            if let Some(end) = find_char(&chars, '`', i + 1) {
+                result.push_str("<code>");
+                let inner: String = chars[i + 1..end].iter().collect();
+                result.push_str(&inner);
+                result.push_str("</code>");
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // Bold: **text**
+        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
+            if let Some(end) = find_double_char(&chars, '*', i + 2) {
+                result.push_str("<b>");
+                let inner: String = chars[i + 2..end].iter().collect();
+                result.push_str(&inner);
+                result.push_str("</b>");
+                i = end + 2;
+                continue;
+            }
+        }
+
+        // Link: [text](url)
+        if chars[i] == '[' {
+            if let Some((text, url, end)) = parse_link(&chars, i) {
+                result.push_str("<a href=\"");
+                result.push_str(&url);
+                result.push_str("\">");
+                result.push_str(&text);
+                result.push_str("</a>");
+                i = end;
+                continue;
+            }
+        }
+
+        // Italic: _text_ (but not inside words like some_var_name)
+        if chars[i] == '_' && (i == 0 || chars[i - 1] == ' ') {
+            if let Some(end) = find_char(&chars, '_', i + 1) {
+                if end + 1 >= len || chars[end + 1] == ' ' || chars[end + 1] == '.' || chars[end + 1] == ',' {
+                    result.push_str("<i>");
+                    let inner: String = chars[i + 1..end].iter().collect();
+                    result.push_str(&inner);
+                    result.push_str("</i>");
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+
+        // Single *italic* (not **)
+        if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*') {
+            if let Some(end) = find_single_star(&chars, i + 1) {
+                result.push_str("<i>");
+                let inner: String = chars[i + 1..end].iter().collect();
+                result.push_str(&inner);
+                result.push_str("</i>");
+                i = end + 1;
+                continue;
+            }
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
+}
+
+fn find_char(chars: &[char], c: char, start: usize) -> Option<usize> {
+    for j in start..chars.len() {
+        if chars[j] == c {
+            return Some(j);
+        }
+    }
+    None
+}
+
+fn find_double_char(chars: &[char], c: char, start: usize) -> Option<usize> {
+    let mut j = start;
+    while j + 1 < chars.len() {
+        if chars[j] == c && chars[j + 1] == c {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
+fn find_single_star(chars: &[char], start: usize) -> Option<usize> {
+    for j in start..chars.len() {
+        if chars[j] == '*' && (j + 1 >= chars.len() || chars[j + 1] != '*') {
+            return Some(j);
+        }
+    }
+    None
+}
+
+fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+    // [text](url)
+    let close_bracket = find_char(chars, ']', start + 1)?;
+    if close_bracket + 1 >= chars.len() || chars[close_bracket + 1] != '(' {
+        return None;
+    }
+    let close_paren = find_char(chars, ')', close_bracket + 2)?;
+    let text: String = chars[start + 1..close_bracket].iter().collect();
+    let url: String = chars[close_bracket + 2..close_paren].iter().collect();
+    Some((text, url, close_paren + 1))
+}
+
+/// Split a message into chunks respecting Telegram's max length.
+/// Prefers splitting at paragraph boundaries, then line boundaries.
+/// Never splits inside HTML tags or code blocks.
+fn split_message(text: &str, max_len: usize) -> Vec<String> {
     if text.len() <= max_len {
-        return vec![text];
+        return vec![text.to_string()];
     }
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < text.len() {
-        let end = std::cmp::min(start + max_len, text.len());
-        chunks.push(&text[start..end]);
-        start = end;
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        if remaining.len() <= max_len {
+            chunks.push(remaining.to_string());
+            break;
+        }
+
+        let search_region = &remaining[..max_len];
+
+        // Try paragraph boundary first
+        let split_at = search_region.rfind("\n\n")
+            .map(|p| p + 1)  // include first \n, second starts next chunk
+            // Then try line boundary
+            .or_else(|| search_region.rfind('\n'))
+            // Last resort: split at max_len
+            .unwrap_or(max_len);
+
+        // Ensure we don't split inside an HTML tag
+        let split_at = adjust_for_html_tags(search_region, split_at);
+
+        let (chunk, rest) = remaining.split_at(split_at);
+        let chunk = chunk.trim_end();
+        if !chunk.is_empty() {
+            chunks.push(chunk.to_string());
+        }
+        remaining = rest.trim_start_matches('\n');
     }
+
     chunks
+}
+
+/// If the split point is inside an HTML tag, move it before the tag start.
+fn adjust_for_html_tags(text: &str, split_at: usize) -> usize {
+    let bytes = text.as_bytes();
+    // Walk backward from split_at to check if we're inside a tag
+    let mut j = split_at;
+    while j > 0 {
+        j -= 1;
+        if bytes[j] == b'>' {
+            // We're outside a tag, safe to split at original point
+            return split_at;
+        }
+        if bytes[j] == b'<' {
+            // We're inside a tag — split before it
+            return j;
+        }
+    }
+    split_at
+}
+
+/// Send a message with HTML parse mode, falling back to plain text on failure.
+async fn send_html_or_fallback(bot: &Bot, chat_id: ChatId, html: &str, plain: &str) -> Result<(), teloxide::RequestError> {
+    match bot.send_message(chat_id, html).parse_mode(ParseMode::Html).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            warn!("HTML send failed, falling back to plain text: {}", e);
+            bot.send_message(chat_id, plain).await?;
+            Ok(())
+        }
+    }
 }
