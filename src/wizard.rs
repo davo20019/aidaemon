@@ -43,11 +43,11 @@ const PRESETS: &[ProviderPreset] = &[
     },
     ProviderPreset {
         name: "Google AI Studio (Native)",
-        base_url: "https://generativelanguage.googleapis.com", 
+        base_url: "", // not used — GoogleGenAiProvider has its own base URL
         kind: "google_genai",
-        primary: "gemini-1.5-flash",
-        fast: "gemini-1.5-flash-8b",
-        smart: "gemini-1.5-pro",
+        primary: "gemini-3-flash-preview",
+        fast: "gemini-2.5-flash-lite",
+        smart: "gemini-3-pro-preview",
         needs_key: true,
     },
     ProviderPreset {
@@ -234,12 +234,16 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<()> {
     }
 
     // 6. Write config.toml
+    let base_url_line = if base_url.is_empty() {
+        String::new()
+    } else {
+        format!("base_url = \"{base_url}\"\n")
+    };
     let config = format!(
         r#"[provider]
 kind = "{}"
 api_key = "{api_key}"
-base_url = "{base_url}"
-
+{base_url_line}
 [provider.models]
 primary = "{primary}"
 fast = "{fast}"

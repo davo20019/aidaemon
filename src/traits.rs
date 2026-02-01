@@ -101,7 +101,7 @@ pub trait StateStore: Send + Sync {
     async fn get_facts(&self, category: Option<&str>) -> anyhow::Result<Vec<Fact>>;
     /// Get context using Tri-Hybrid retrieval (Recency + Vector + Salience).
     /// Default implementation just calls get_history.
-    async fn get_context(&self, session_id: &str, query: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
+    async fn get_context(&self, session_id: &str, _query: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
         self.get_history(session_id, limit).await
     }
 }

@@ -83,8 +83,8 @@ impl GoogleGenAiProvider {
                 }
                 "tool" => {
                     // Tool response
-                    let tool_call_id = msg["tool_call_id"].as_str().unwrap_or("");
-                    let tool_name = msg["name"].as_str().unwrap_or(""); // OpenAI puts name here? Or in tool_call?
+                    let _tool_call_id = msg["tool_call_id"].as_str().unwrap_or("");
+                    let _tool_name = msg["name"].as_str().unwrap_or(""); // OpenAI puts name here? Or in tool_call?
                     // In our trait Message, we have tool_name. usage in openai_compatible.rs seems to verify this.
                     // But actually OpenAI format for tool response is: { role: tool, tool_call_id: ..., content: ... }
                     // Gemini needs:
