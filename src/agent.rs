@@ -418,13 +418,13 @@ impl Agent {
 
             // Collect tool_call_ids that have valid tool responses (role=tool with a name)
             let valid_tool_call_ids: std::collections::HashSet<&str> = deduped_msgs.iter()
-                .filter(|m| m.role == "tool" && m.tool_name.is_some())
+                .filter(|m| m.role == "tool" && m.tool_name.as_ref().map_or(false, |n| !n.is_empty()))
                 .filter_map(|m| m.tool_call_id.as_deref())
                 .collect();
 
             let mut messages: Vec<Value> = deduped_msgs.iter()
-                .filter(|m| !(m.role == "tool" && m.tool_name.is_none())) // Skip broken tool results
-                .map(|m| {
+                .filter(|m| !(m.role == "tool" && m.tool_name.as_ref().map_or(true, |n| n.is_empty()))) // Skip broken tool results
+                .filter_map(|m| {
                     let mut obj = json!({
                         "role": m.role,
                         "content": m.content,
@@ -452,10 +452,13 @@ impl Agent {
                                 .collect();
                             if !filtered.is_empty() {
                                 obj["tool_calls"] = json!(filtered);
-                                // OpenAI requires content to be null when tool_calls present
                                 if m.content.is_none() {
                                     obj["content"] = Value::Null;
                                 }
+                            } else if m.content.is_none() {
+                                // Assistant message had tool_calls but all were orphaned,
+                                // and no text content — drop it entirely
+                                return None;
                             }
                         }
                     }
@@ -465,7 +468,7 @@ impl Agent {
                     if let Some(tcid) = &m.tool_call_id {
                         obj["tool_call_id"] = json!(tcid);
                     }
-                    obj
+                    Some(obj)
                 })
                 .collect();
             
