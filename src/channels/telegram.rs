@@ -3,25 +3,27 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::agent::Agent;
+use crate::channels::SessionMap;
 use crate::config::AppConfig;
-use crate::tools::terminal::{ApprovalRequest, ApprovalResponse};
-use crate::types::MediaMessage;
+use crate::traits::{Channel, ChannelCapabilities};
+use crate::types::{ApprovalResponse, MediaMessage};
 
 pub struct TelegramChannel {
     bot: Bot,
     allowed_user_ids: Vec<u64>,
     agent: Arc<Agent>,
     config_path: PathBuf,
-    approval_rx: Mutex<mpsc::Receiver<ApprovalRequest>>,
     /// Pending approvals keyed by a unique callback ID.
     pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
-    media_rx: Option<Mutex<mpsc::Receiver<MediaMessage>>>,
+    /// Shared session map — maps session_id to channel name.
+    session_map: SessionMap,
 }
 
 impl TelegramChannel {
@@ -30,8 +32,7 @@ impl TelegramChannel {
         allowed_user_ids: Vec<u64>,
         agent: Arc<Agent>,
         config_path: PathBuf,
-        approval_rx: mpsc::Receiver<ApprovalRequest>,
-        media_rx: Option<mpsc::Receiver<MediaMessage>>,
+        session_map: SessionMap,
     ) -> Self {
         let bot = Bot::new(bot_token);
         Self {
@@ -39,9 +40,8 @@ impl TelegramChannel {
             allowed_user_ids,
             agent,
             config_path,
-            approval_rx: Mutex::new(approval_rx),
             pending_approvals: Mutex::new(HashMap::new()),
-            media_rx: media_rx.map(Mutex::new),
+            session_map,
         }
     }
 
@@ -79,20 +79,6 @@ impl TelegramChannel {
     pub async fn start(self: Arc<Self>) {
         info!("Starting Telegram channel");
 
-        // Spawn approval request listener
-        let self_for_approvals = Arc::clone(&self);
-        tokio::spawn(async move {
-            self_for_approvals.approval_listener().await;
-        });
-
-        // Spawn media message listener (screenshots) — only when browser feature provides media_rx
-        if self.media_rx.is_some() {
-            let self_for_media = Arc::clone(&self);
-            tokio::spawn(async move {
-                self_for_media.media_listener().await;
-            });
-        }
-
         let handler = dptree::entry()
             .branch(
                 Update::filter_message().endpoint({
@@ -124,100 +110,6 @@ impl TelegramChannel {
             .build()
             .dispatch()
             .await;
-    }
-
-    /// Listens for approval requests from the terminal tool and sends
-    /// inline keyboard prompts to the first allowed user.
-    async fn approval_listener(self: Arc<Self>) {
-        loop {
-            let request = {
-                let mut rx = self.approval_rx.lock().await;
-                rx.recv().await
-            };
-
-            let request = match request {
-                Some(r) => r,
-                None => break, // channel closed
-            };
-
-            let approval_id = uuid::Uuid::new_v4().to_string();
-            let short_id = &approval_id[..8];
-
-            // Store the response sender
-            {
-                let mut pending = self.pending_approvals.lock().await;
-                pending.insert(approval_id.clone(), request.response_tx);
-            }
-
-            // Send inline keyboard to the first allowed user
-            let chat_id = self
-                .allowed_user_ids
-                .first()
-                .copied()
-                .unwrap_or(0) as i64;
-
-            let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback(
-                    "Allow Once",
-                    format!("approve:once:{}", approval_id),
-                ),
-                InlineKeyboardButton::callback(
-                    "Allow Always",
-                    format!("approve:always:{}", approval_id),
-                ),
-                InlineKeyboardButton::callback(
-                    "Deny",
-                    format!("approve:deny:{}", approval_id),
-                ),
-            ]]);
-
-            let escaped_cmd = html_escape(&request.command);
-            let text = format!(
-                "Command requires approval:\n\n<code>{}</code>\n\n[{}]",
-                escaped_cmd, short_id
-            );
-
-            if let Err(e) = self
-                .bot
-                .send_message(ChatId(chat_id), &text)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await
-            {
-                warn!("Failed to send approval request: {}", e);
-                // Remove pending approval since we couldn't ask
-                let mut pending = self.pending_approvals.lock().await;
-                if let Some(tx) = pending.remove(&approval_id) {
-                    let _ = tx.send(ApprovalResponse::Deny);
-                }
-            }
-        }
-    }
-
-    /// Listens for media messages (screenshots) and sends them as photos.
-    async fn media_listener(self: Arc<Self>) {
-        let media_rx = self.media_rx.as_ref().expect("media_listener called without media_rx");
-        loop {
-            let msg = {
-                let mut rx = media_rx.lock().await;
-                rx.recv().await
-            };
-
-            let msg = match msg {
-                Some(m) => m,
-                None => break, // channel closed
-            };
-
-            let photo = InputFile::memory(msg.photo_bytes).file_name("screenshot.png");
-            if let Err(e) = self
-                .bot
-                .send_photo(ChatId(msg.chat_id), photo)
-                .caption(msg.caption)
-                .await
-            {
-                warn!("Failed to send screenshot photo: {}", e);
-            }
-        }
     }
 
     /// Handle callback query from inline keyboard buttons.
@@ -401,6 +293,13 @@ impl TelegramChannel {
         // Use chat ID as session ID
         let session_id = msg.chat.id.0.to_string();
 
+        // Register this session with the channel hub so outbound messages
+        // (approvals, media, notifications) route back to Telegram.
+        {
+            let mut map = self.session_map.write().await;
+            map.insert(session_id.clone(), "telegram".to_string());
+        }
+
         info!(session_id, "Received message from user {}", user_id);
 
         // Send typing indicator immediately, then repeat every 4s while agent works.
@@ -443,16 +342,108 @@ impl TelegramChannel {
             }
         }
     }
+}
 
-    /// Send a proactive message to a chat (used by triggers/events).
-    pub async fn send_to_chat(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
+#[async_trait]
+impl Channel for TelegramChannel {
+    fn name(&self) -> &str {
+        "telegram"
+    }
+
+    fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities {
+            markdown: true,
+            inline_buttons: true,
+            media: true,
+            max_message_len: 4096,
+        }
+    }
+
+    async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+        let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
+            self.allowed_user_ids.first().copied().unwrap_or(0) as i64
+        });
         let html = markdown_to_telegram_html(text);
         for chunk in split_message(&html, 4096) {
             if let Err(e) = send_html_or_fallback(&self.bot, ChatId(chat_id), &chunk, text).await {
-                warn!("Failed to send proactive message: {}", e);
+                warn!("Failed to send message: {}", e);
             }
         }
         Ok(())
+    }
+
+    async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
+        let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
+            self.allowed_user_ids.first().copied().unwrap_or(0) as i64
+        });
+        let photo = InputFile::memory(media.photo_bytes.clone()).file_name("screenshot.png");
+        self.bot
+            .send_photo(ChatId(chat_id), photo)
+            .caption(&media.caption)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send photo: {}", e))?;
+        Ok(())
+    }
+
+    async fn request_approval(
+        &self,
+        session_id: &str,
+        command: &str,
+    ) -> anyhow::Result<ApprovalResponse> {
+        let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
+            self.allowed_user_ids.first().copied().unwrap_or(0) as i64
+        });
+
+        let approval_id = uuid::Uuid::new_v4().to_string();
+        let short_id = &approval_id[..8];
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        // Store the response sender
+        {
+            let mut pending = self.pending_approvals.lock().await;
+            pending.insert(approval_id.clone(), response_tx);
+        }
+
+        // Send inline keyboard
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback(
+                "Allow Once",
+                format!("approve:once:{}", approval_id),
+            ),
+            InlineKeyboardButton::callback(
+                "Allow Always",
+                format!("approve:always:{}", approval_id),
+            ),
+            InlineKeyboardButton::callback(
+                "Deny",
+                format!("approve:deny:{}", approval_id),
+            ),
+        ]]);
+
+        let escaped_cmd = html_escape(command);
+        let text = format!(
+            "Command requires approval:\n\n<code>{}</code>\n\n[{}]",
+            escaped_cmd, short_id
+        );
+
+        if let Err(e) = self
+            .bot
+            .send_message(ChatId(chat_id), &text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
+            .await
+        {
+            warn!("Failed to send approval request: {}", e);
+            // Remove pending approval since we couldn't ask
+            let mut pending = self.pending_approvals.lock().await;
+            pending.remove(&approval_id);
+            return Ok(ApprovalResponse::Deny);
+        }
+
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Approval response channel closed"))
     }
 }
 
