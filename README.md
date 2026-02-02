@@ -1,6 +1,6 @@
 # aidaemon
 
-[Website](https://aidaemon.ai/) · [Documentation](https://docs.aidaemon.ai/) · [GitHub](https://github.com/davo20019/aidaemon)
+[Website](https://aidaemon.ai/) · [Documentation](https://docs.aidaemon.ai/) · [GitHub](https://github.com/davo20019/aidaemon) · [𝕏](https://x.com/aidaemon_ai)
 
 A personal AI agent that runs as a background daemon, accessible via Telegram, with tool use, MCP integration, email triggers, and persistent memory.
 
