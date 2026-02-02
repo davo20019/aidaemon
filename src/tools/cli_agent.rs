@@ -29,7 +29,7 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
         ("gemini", "gemini", vec!["-p", "--output-format", "json", "--sandbox=false"], "Gemini CLI — Google's AI coding agent"),
         ("codex", "codex", vec!["exec", "--json", "--full-auto"], "Codex CLI — OpenAI's AI coding agent"),
         ("copilot", "copilot", vec!["-p"], "GitHub Copilot CLI"),
-        ("aider", "aider", vec!["--message", "--yes"], "Aider — AI pair programming"),
+        ("aider", "aider", vec!["--yes", "--message"], "Aider — AI pair programming"),
     ]
 }
 
