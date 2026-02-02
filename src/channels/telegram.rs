@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode};
+use teloxide::types::{ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -387,7 +387,26 @@ impl TelegramChannel {
 
         info!(session_id, "Received message from user {}", user_id);
 
-        match self.agent.handle_message(&session_id, &text).await {
+        // Send typing indicator immediately, then repeat every 4s while agent works.
+        // Telegram's typing indicator expires after ~5s, so 4s keeps it continuous.
+        let typing_bot = bot.clone();
+        let typing_chat_id = msg.chat.id;
+        let typing_cancel = tokio_util::sync::CancellationToken::new();
+        let typing_token = typing_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = typing_bot.send_chat_action(typing_chat_id, ChatAction::Typing).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                    _ = typing_token.cancelled() => break,
+                }
+            }
+        });
+
+        let result = self.agent.handle_message(&session_id, &text).await;
+        typing_cancel.cancel();
+
+        match result {
             Ok(reply) => {
                 let html = markdown_to_telegram_html(&reply);
                 // Split long messages (Telegram limit is 4096 chars)

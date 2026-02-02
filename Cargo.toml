@@ -37,3 +37,4 @@ chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-feature
 shellexpand = "3"
 dirs = "6"
 fastembed = "4"
+tokio-util = "0.7.18"
