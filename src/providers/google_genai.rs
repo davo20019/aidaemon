@@ -69,19 +69,21 @@ impl GoogleGenAiProvider {
                     // Tool calls
                     if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
                         for tc in tool_calls {
-                            let mut function_call = json!({
+                            let function_call = json!({
                                 "name": tc["function"]["name"],
                                 "args": serde_json::from_str::<Value>(tc["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}))
                             });
-                            // Merge extra fields (thought_signature etc.) back into functionCall
+                            // Merge extra fields (thought_signature etc.) as siblings of functionCall in the part
+                            let mut part_obj = json!({ "functionCall": function_call });
                             if let Some(extra) = tc.get("extra_content").and_then(|e| e.as_object()) {
-                                if let Some(fc_obj) = function_call.as_object_mut() {
+                                if let Some(part_map) = part_obj.as_object_mut() {
                                     for (k, v) in extra {
-                                        fc_obj.insert(k.clone(), v.clone());
+                                        part_map.insert(k.clone(), v.clone());
                                     }
                                 }
+
                             }
-                            parts.push(json!({ "functionCall": function_call }));
+                            parts.push(part_obj);
                         }
                     }
                     contents.push(json!({
@@ -200,7 +202,7 @@ impl ModelProvider for GoogleGenAiProvider {
         }
 
         let data: Value = serde_json::from_str(&text)?;
-        
+
         // Parse response
         // { "candidates": [ { "content": { "parts": [ ... ], "role": "model" }, ... } ] }
         let candidate = data["candidates"]
@@ -223,15 +225,17 @@ impl ModelProvider for GoogleGenAiProvider {
                 let args = fc["args"].clone(); // already JSON object
                 let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
 
-                // Capture extra fields (e.g. thought_signature) for round-trip
+                // Capture all extra fields from the Part object (siblings of functionCall)
+                // for round-trip. Gemini 3 puts thoughtSignature here.
                 let mut extra = serde_json::Map::new();
-                if let Some(obj) = fc.as_object() {
+                if let Some(obj) = part.as_object() {
                     for (k, v) in obj {
-                        if k != "name" && k != "args" {
+                        if k != "functionCall" {
                             extra.insert(k.clone(), v.clone());
                         }
                     }
                 }
+
                 let extra_content = if extra.is_empty() { None } else { Some(Value::Object(extra)) };
 
                 tool_calls.push(ToolCall {
