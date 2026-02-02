@@ -219,6 +219,14 @@ impl TelegramChannel {
 
     /// Handle callback query from inline keyboard buttons.
     async fn handle_callback(&self, q: CallbackQuery, bot: Bot) {
+        // Authorization check: only allowed users can approve/deny commands.
+        let user_id = q.from.id.0;
+        if !self.allowed_user_ids.is_empty() && !self.allowed_user_ids.contains(&user_id) {
+            warn!(user_id, "Unauthorized callback from user");
+            let _ = bot.answer_callback_query(q.id).text("Unauthorized.").await;
+            return;
+        }
+
         let data = match q.data {
             Some(ref d) => d.clone(),
             None => return,
