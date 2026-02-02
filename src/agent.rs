@@ -660,42 +660,26 @@ impl Agent {
                 }
             });
 
-            // Fixup: merge consecutive same-role messages to satisfy Gemini's
-            // strict ordering constraint (assistant must follow user or tool).
-            // This can happen when filtering removes tool messages between two
-            // assistant turns, or when pinned memories create adjacency gaps.
-            {
-                let mut i = 1;
-                while i < messages.len() {
-                    let prev_role = messages[i - 1].get("role").and_then(|r| r.as_str()).unwrap_or("");
-                    let curr_role = messages[i].get("role").and_then(|r| r.as_str()).unwrap_or("");
-                    if prev_role == curr_role && (curr_role == "assistant" || curr_role == "user") {
-                        // Merge content of messages[i] into messages[i-1]
-                        let curr_content = messages[i].get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
-                        let prev_content = messages[i - 1].get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
-                        if !curr_content.is_empty() {
-                            let merged = if prev_content.is_empty() {
-                                curr_content
-                            } else {
-                                format!("{}\n{}", prev_content, curr_content)
-                            };
-                            messages[i - 1]["content"] = json!(merged);
-                        }
-                        // Carry over tool_calls from the later message if present
-                        if let Some(tc) = messages[i].get("tool_calls").cloned() {
-                            messages[i - 1]["tool_calls"] = tc;
-                        }
-                        messages.remove(i);
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
+            // Gemini strict-ordering fixups.
+            //
+            // Gemini's native API enforces:
+            //   - function_call (model) must follow user or function_response
+            //   - function_response (user) must follow function_call (model)
+            //   - no consecutive same-role turns
+            //
+            // The context window can break these invariants when it slices
+            // through a tool-call/tool-response pair. We fix this in three
+            // passes: merge → drop orphans → merge again.
 
-            // Drop orphaned tool messages whose parent assistant tool_call
-            // is outside the context window. Gemini requires every
-            // function_response to follow a matching function_call.
+            // Pass 1: merge consecutive same-role messages.
+            merge_consecutive_messages(&mut messages);
+
+            // Pass 2: drop orphaned tool messages (tool result with no
+            // matching assistant tool_call in context) AND strip orphaned
+            // tool_calls from assistant messages (tool_call with no
+            // matching tool result in context).
             {
+                // Collect tool_call IDs present in assistant messages.
                 let assistant_tc_ids: std::collections::HashSet<String> = messages
                     .iter()
                     .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
@@ -706,23 +690,78 @@ impl Agent {
                     .map(|s| s.to_string())
                     .collect();
 
+                // Collect tool_call IDs present in tool result messages.
+                let tool_result_ids: std::collections::HashSet<String> = messages
+                    .iter()
+                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+                    .filter_map(|m| m.get("tool_call_id").and_then(|id| id.as_str()))
+                    .map(|s| s.to_string())
+                    .collect();
+
+                // Drop orphaned tool results.
                 let before = messages.len();
                 messages.retain(|m| {
                     if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
-                        let tc_id = m
-                            .get("tool_call_id")
-                            .and_then(|id| id.as_str())
-                            .unwrap_or("");
+                        let tc_id = m.get("tool_call_id").and_then(|id| id.as_str()).unwrap_or("");
                         assistant_tc_ids.contains(tc_id)
                     } else {
                         true
                     }
                 });
-                let dropped = before - messages.len();
-                if dropped > 0 {
-                    info!(dropped, "Dropped orphaned tool messages (no matching assistant tool_call in context)");
+                let dropped_tools = before - messages.len();
+
+                // Strip orphaned tool_calls from assistant messages.
+                let mut dropped_calls = 0usize;
+                for m in messages.iter_mut() {
+                    if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                        continue;
+                    }
+                    if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()).cloned() {
+                        let filtered: Vec<Value> = tcs
+                            .into_iter()
+                            .filter(|tc| {
+                                tc.get("id")
+                                    .and_then(|id| id.as_str())
+                                    .map_or(false, |id| tool_result_ids.contains(id))
+                            })
+                            .collect();
+                        let diff = m["tool_calls"].as_array().map_or(0, |a| a.len()) - filtered.len();
+                        dropped_calls += diff;
+                        if filtered.is_empty() {
+                            m.as_object_mut().map(|o| o.remove("tool_calls"));
+                        } else {
+                            m["tool_calls"] = json!(filtered);
+                        }
+                    }
                 }
+
+                if dropped_tools > 0 || dropped_calls > 0 {
+                    info!(
+                        dropped_tools,
+                        dropped_calls,
+                        "Dropped orphaned tool messages / assistant tool_calls"
+                    );
+                }
+
+                // Drop assistant messages that became empty (no content, no tool_calls).
+                messages.retain(|m| {
+                    if m.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                        let has_content = m.get("content")
+                            .and_then(|c| c.as_str())
+                            .map_or(false, |s| !s.is_empty());
+                        let has_tool_calls = m.get("tool_calls")
+                            .and_then(|tc| tc.as_array())
+                            .map_or(false, |a| !a.is_empty());
+                        has_content || has_tool_calls
+                    } else {
+                        true
+                    }
+                });
             }
+
+            // Pass 3: merge again — dropping orphans may have created new
+            // consecutive same-role messages.
+            merge_consecutive_messages(&mut messages);
 
             messages.insert(0, json!({
                 "role": "system",
@@ -880,6 +919,62 @@ impl Agent {
             }
         }
         anyhow::bail!("Unknown tool: {}", name)
+    }
+}
+
+/// Merge consecutive same-role messages (assistant or user) to satisfy
+/// provider ordering constraints (Gemini, Anthropic). Combines content
+/// text and tool_calls arrays.
+fn merge_consecutive_messages(messages: &mut Vec<Value>) {
+    let mut i = 1;
+    while i < messages.len() {
+        let prev_role = messages[i - 1]
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        let curr_role = messages[i]
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        if prev_role == curr_role && (curr_role == "assistant" || curr_role == "user") {
+            // Merge content text
+            let curr_content = messages[i]
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            let prev_content = messages[i - 1]
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !curr_content.is_empty() {
+                let merged = if prev_content.is_empty() {
+                    curr_content
+                } else {
+                    format!("{}\n{}", prev_content, curr_content)
+                };
+                messages[i - 1]["content"] = json!(merged);
+            }
+            // Combine tool_calls arrays (not replace)
+            let curr_tcs = messages[i]
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .cloned();
+            if let Some(curr_arr) = curr_tcs {
+                if let Some(prev_arr) = messages[i - 1]
+                    .get_mut("tool_calls")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    prev_arr.extend(curr_arr);
+                } else {
+                    messages[i - 1]["tool_calls"] = json!(curr_arr);
+                }
+            }
+            messages.remove(i);
+        } else {
+            i += 1;
+        }
     }
 }
 
