@@ -249,7 +249,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                         event.source, event.content
                     );
                     match agent_for_events
-                        .handle_message(&event.session_id, &wrapped_content)
+                        .handle_message(&event.session_id, &wrapped_content, None)
                         .await
                     {
                         Ok(reply) => {

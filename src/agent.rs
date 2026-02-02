@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -13,6 +13,79 @@ use crate::providers::{ProviderError, ProviderErrorKind};
 use crate::router::{self, Router};
 use crate::skills::{self, Skill};
 use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
+
+/// Status updates emitted by the agent loop for live feedback to the user.
+#[derive(Debug, Clone)]
+pub enum StatusUpdate {
+    /// Sent before each LLM call (skipped on iteration 0).
+    Thinking(usize),
+    /// Sent before each tool execution.
+    ToolStart { name: String, summary: String },
+}
+
+/// Best-effort send — never blocks the agent loop if the receiver is slow/full.
+fn send_status(tx: &Option<mpsc::Sender<StatusUpdate>>, update: StatusUpdate) {
+    if let Some(ref tx) = tx {
+        let _ = tx.try_send(update);
+    }
+}
+
+/// Extract a brief human-readable summary from tool arguments JSON.
+fn summarize_tool_args(name: &str, arguments: &str) -> String {
+    let val: Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    match name {
+        "terminal" => val
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|cmd| {
+                let truncated: String = cmd.chars().take(60).collect();
+                if cmd.len() > 60 {
+                    format!("`{}...`", truncated)
+                } else {
+                    format!("`{}`", truncated)
+                }
+            })
+            .unwrap_or_default(),
+        "browser" => {
+            let action = val.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            let url = val.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            if !url.is_empty() {
+                format!("{} {}", action, url)
+            } else {
+                action.to_string()
+            }
+        }
+        "spawn_agent" => val
+            .get("mission")
+            .and_then(|v| v.as_str())
+            .map(|m| {
+                let truncated: String = m.chars().take(50).collect();
+                if m.len() > 50 {
+                    format!("{}...", truncated)
+                } else {
+                    truncated
+                }
+            })
+            .unwrap_or_default(),
+        "remember_fact" => val
+            .get("fact")
+            .and_then(|v| v.as_str())
+            .map(|f| {
+                let truncated: String = f.chars().take(40).collect();
+                if f.len() > 40 {
+                    format!("{}...", truncated)
+                } else {
+                    truncated
+                }
+            })
+            .unwrap_or_else(|| "saving to memory".to_string()),
+        _ => String::new(),
+    }
+}
 
 pub struct Agent {
     provider: Arc<dyn ModelProvider>,
@@ -227,7 +300,7 @@ impl Agent {
             // Close the loop: give the spawn tool a weak ref to the child.
             spawn_tool.set_agent(Arc::downgrade(&child));
 
-            child.handle_message(&child_session, task).await
+            child.handle_message(&child_session, task, None).await
         } else {
             // At max depth — no spawn tool, no recursion.
             let child = Arc::new(Agent::with_depth(
@@ -245,7 +318,7 @@ impl Agent {
                 self.timeout_secs,
             ));
 
-            child.handle_message(&child_session, task).await
+            child.handle_message(&child_session, task, None).await
         }
     }
 
@@ -409,6 +482,7 @@ impl Agent {
         &self,
         session_id: &str,
         user_text: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
         // 1. Persist the user message
         let user_msg = Message {
@@ -627,6 +701,11 @@ impl Agent {
                 "content": system_prompt,
             }));
 
+            // Emit "Thinking" status for iterations after the first
+            if iteration > 0 {
+                send_status(&status_tx, StatusUpdate::Thinking(iteration));
+            }
+
             // 4. Call the LLM with error-classified recovery
             // On the last iteration, omit tools to force a text response
             let effective_tools = if iteration >= self.max_iterations - 1 {
@@ -690,6 +769,13 @@ impl Agent {
 
                 // Execute each tool call
                 for tc in &resp.tool_calls {
+                    send_status(
+                        &status_tx,
+                        StatusUpdate::ToolStart {
+                            name: tc.name.clone(),
+                            summary: summarize_tool_args(&tc.name, &tc.arguments),
+                        },
+                    );
                     let result = self.execute_tool(&tc.name, &tc.arguments, session_id).await;
                     let result_text = match result {
                         Ok(text) => text,

@@ -9,7 +9,7 @@ use teloxide::types::{ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, In
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, StatusUpdate};
 use crate::channels::SessionMap;
 use crate::config::AppConfig;
 use crate::traits::{Channel, ChannelCapabilities};
@@ -318,8 +318,37 @@ impl TelegramChannel {
             }
         });
 
-        let result = self.agent.handle_message(&session_id, &text).await;
+        // Status update channel — agent emits updates, we display them rate-limited.
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
+        let status_bot = bot.clone();
+        let status_chat_id = msg.chat.id;
+        let status_task = tokio::spawn(async move {
+            let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
+            let min_interval = Duration::from_secs(3);
+            while let Some(update) = status_rx.recv().await {
+                let now = tokio::time::Instant::now();
+                if now.duration_since(last_sent) < min_interval {
+                    continue;
+                }
+                let text = match &update {
+                    StatusUpdate::Thinking(iter) => format!("Thinking... (step {})", iter + 1),
+                    StatusUpdate::ToolStart { name, summary } => {
+                        if summary.is_empty() {
+                            format!("Using {}...", name)
+                        } else {
+                            format!("Using {}: {}...", name, summary)
+                        }
+                    }
+                };
+                let _ = status_bot.send_message(status_chat_id, text).await;
+                last_sent = tokio::time::Instant::now();
+            }
+        });
+
+        let result = self.agent.handle_message(&session_id, &text, Some(status_tx)).await;
         typing_cancel.cancel();
+        // status_tx is dropped here (moved into handle_message), ending the receiver task.
+        let _ = status_task.await;
 
         match result {
             Ok(reply) => {
