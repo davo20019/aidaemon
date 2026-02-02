@@ -7,18 +7,12 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::info;
 
 use crate::traits::Tool;
+use crate::types::ApprovalResponse;
 
-/// Response to an approval request from the user.
-#[derive(Debug, Clone)]
-pub enum ApprovalResponse {
-    AllowOnce,
-    AllowAlways,
-    Deny,
-}
-
-/// A request sent to the user for command approval.
+/// A request sent to the ChannelHub for command approval.
 pub struct ApprovalRequest {
     pub command: String,
+    pub session_id: String,
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
 }
 
@@ -84,11 +78,12 @@ impl TerminalTool {
         })
     }
 
-    async fn request_approval(&self, command: &str) -> anyhow::Result<ApprovalResponse> {
+    async fn request_approval(&self, session_id: &str, command: &str) -> anyhow::Result<ApprovalResponse> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.approval_tx
             .send(ApprovalRequest {
                 command: command.to_string(),
+                session_id: session_id.to_string(),
                 response_tx,
             })
             .await
@@ -119,6 +114,10 @@ struct TerminalArgs {
     /// (e.g., email trigger) and must always go through user approval.
     #[serde(default)]
     _untrusted_source: bool,
+    /// Session ID injected by the agent, used to route approval requests
+    /// to the correct channel.
+    #[serde(default)]
+    _session_id: String,
 }
 
 #[async_trait]
@@ -161,8 +160,8 @@ impl Tool for TerminalTool {
         };
 
         if needs_approval {
-            // Request approval from the user via Telegram
-            match self.request_approval(&args.command).await {
+            // Request approval from the user via the channel that owns this session
+            match self.request_approval(&args._session_id, &args.command).await {
                 Ok(ApprovalResponse::AllowOnce) => {
                     // proceed below
                 }

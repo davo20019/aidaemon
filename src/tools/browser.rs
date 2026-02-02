@@ -134,7 +134,7 @@ impl BrowserTool {
         Ok(format!("Navigated to {}", url))
     }
 
-    async fn action_screenshot(&self, args: &Value, chat_id: i64) -> Result<String, String> {
+    async fn action_screenshot(&self, args: &Value, session_id: &str) -> Result<String, String> {
         self.ensure_browser().await?;
         let page = self.get_page().await?;
 
@@ -164,7 +164,7 @@ impl BrowserTool {
 
         self.media_tx
             .send(MediaMessage {
-                chat_id,
+                session_id: session_id.to_string(),
                 photo_bytes: png_bytes,
                 caption: caption.clone(),
             })
@@ -414,15 +414,14 @@ impl Tool for BrowserTool {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let chat_id: i64 = args
+        let session_id = args
             .get("_session_id")
             .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or("");
 
         let result = match action {
             "navigate" => self.action_navigate(&args).await,
-            "screenshot" => self.action_screenshot(&args, chat_id).await,
+            "screenshot" => self.action_screenshot(&args, session_id).await,
             "click" => self.action_click(&args).await,
             "fill" => self.action_fill(&args).await,
             "get_text" => self.action_get_text(&args).await,
