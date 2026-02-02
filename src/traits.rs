@@ -3,6 +3,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::types::{ApprovalResponse, MediaMessage};
+
 /// A message in the conversation history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -104,4 +106,48 @@ pub trait StateStore: Send + Sync {
     async fn get_context(&self, session_id: &str, _query: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
         self.get_history(session_id, limit).await
     }
+}
+
+/// Capabilities that vary by channel (Telegram, WhatsApp, SMS, Web, etc.).
+///
+/// Used by the agent and hub to adapt output format for each channel.
+#[derive(Debug, Clone)]
+pub struct ChannelCapabilities {
+    /// Whether the channel supports markdown/rich text formatting.
+    pub markdown: bool,
+    /// Whether the channel supports inline buttons (e.g., Telegram inline keyboards).
+    pub inline_buttons: bool,
+    /// Whether the channel supports sending media (photos, files).
+    pub media: bool,
+    /// Maximum message length in characters. Messages longer than this will be split.
+    pub max_message_len: usize,
+}
+
+/// A communication channel (Telegram, WhatsApp, Web, SMS, etc.).
+///
+/// Each implementation handles transport-specific details for sending messages,
+/// media, and approval requests. New channels (e.g., Discord, Slack, SMS) only
+/// need to implement this trait to integrate with aidaemon.
+#[async_trait]
+pub trait Channel: Send + Sync {
+    /// Unique name for this channel (e.g., "telegram", "web", "sms").
+    fn name(&self) -> &str;
+
+    /// Channel capabilities — used to adapt output format.
+    fn capabilities(&self) -> ChannelCapabilities;
+
+    /// Send a text message to a session.
+    async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()>;
+
+    /// Send media (photo/file) to a session.
+    async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()>;
+
+    /// Request user approval for a command. Blocks until the user responds.
+    /// Channels without inline buttons should fall back to text-based approval
+    /// (e.g., "Reply YES, ALWAYS, or NO").
+    async fn request_approval(
+        &self,
+        session_id: &str,
+        command: &str,
+    ) -> anyhow::Result<ApprovalResponse>;
 }

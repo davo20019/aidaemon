@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::agent::Agent;
-use crate::channels::TelegramChannel;
+use crate::channels::{ChannelHub, SessionMap, TelegramChannel};
 use crate::config::AppConfig;
 use crate::daemon;
 use crate::mcp;
@@ -18,7 +20,7 @@ use crate::state::SqliteStateStore;
 #[cfg(feature = "browser")]
 use crate::tools::BrowserTool;
 use crate::tools::{CliAgentTool, ConfigManagerTool, RememberFactTool, SpawnAgentTool, SystemInfoTool, TerminalTool};
-use crate::traits::Tool;
+use crate::traits::{Channel, Tool};
 use crate::triggers::{self, TriggerManager};
 
 pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::Result<()> {
@@ -174,17 +176,39 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     let trigger_manager = Arc::new(TriggerManager::new(config.triggers.clone(), event_tx));
     trigger_manager.spawn();
 
-    // 10. Telegram channel
+    // 10. Session map (shared between hub and channels for routing)
+    let session_map: SessionMap = Arc::new(RwLock::new(HashMap::new()));
+
+    // 11. Channels — add new channels here (WhatsApp, Web, SMS, etc.)
     let telegram = Arc::new(TelegramChannel::new(
         &config.telegram.bot_token,
         config.telegram.allowed_user_ids.clone(),
         Arc::clone(&agent),
         config_path.clone(),
-        approval_rx,
-        media_rx,
+        session_map.clone(),
     ));
 
-    // 11. Health server
+    let channels: Vec<Arc<dyn Channel>> = vec![telegram.clone() as Arc<dyn Channel>];
+    info!(count = channels.len(), "Channels registered");
+
+    // 12. Channel Hub — routes approvals, media, and notifications
+    let hub = Arc::new(ChannelHub::new(channels, session_map));
+
+    // Start approval listener (routes tool approval requests to the right channel)
+    let hub_for_approvals = hub.clone();
+    tokio::spawn(async move {
+        hub_for_approvals.approval_listener(approval_rx).await;
+    });
+
+    // Start media listener (routes screenshots/photos to the right channel)
+    if let Some(media_rx) = media_rx {
+        let hub_for_media = hub.clone();
+        tokio::spawn(async move {
+            hub_for_media.media_listener(media_rx).await;
+        });
+    }
+
+    // 13. Health server
     let health_port = config.daemon.health_port;
     let health_bind = config.daemon.health_bind.clone();
     tokio::spawn(async move {
@@ -193,10 +217,15 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         }
     });
 
-    // 12. Event listener: route trigger events to agent -> Telegram notification
-    let telegram_for_events = Arc::clone(&telegram);
+    // 14. Event listener: route trigger events to agent -> broadcast via hub
+    let hub_for_events = hub.clone();
     let agent_for_events = Arc::clone(&agent);
-    let notify_chat_ids = config.telegram.allowed_user_ids.clone();
+    let notify_session_ids: Vec<String> = config
+        .telegram
+        .allowed_user_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
     tokio::spawn(async move {
         loop {
             match event_rx.recv().await {
@@ -218,11 +247,9 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                         .await
                     {
                         Ok(reply) => {
-                            for &uid in &notify_chat_ids {
-                                let _ = telegram_for_events
-                                    .send_to_chat(uid as i64, &reply)
-                                    .await;
-                            }
+                            hub_for_events
+                                .broadcast_text(&notify_session_ids, &reply)
+                                .await;
                         }
                         Err(e) => {
                             tracing::error!("Agent error handling trigger event: {}", e);
@@ -239,7 +266,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         }
     });
 
-    // 13. Start Telegram with auto-retry (blocks)
+    // 15. Start Telegram with auto-retry (blocks)
+    // Future channels would be started similarly in their own tasks.
     info!("Starting aidaemon v0.1.0");
     telegram.start_with_retry().await;
 
