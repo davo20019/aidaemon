@@ -612,18 +612,14 @@ impl Agent {
                             let filtered: Vec<Value> = tcs.iter()
                                 .filter(|tc| valid_tool_call_ids.contains(tc.id.as_str()))
                                 .map(|tc| {
-                                    let mut val = json!({
+                                    json!({
                                         "id": tc.id,
                                         "type": "function",
                                         "function": {
                                             "name": tc.name,
                                             "arguments": tc.arguments
                                         }
-                                    });
-                                    if let Some(ref extra) = tc.extra_content {
-                                        val["extra_content"] = extra.clone();
-                                    }
-                                    val
+                                    })
                                 })
                                 .collect();
                             if !filtered.is_empty() {
