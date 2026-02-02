@@ -15,6 +15,7 @@ allowed_user_ids = [123456789]
 [state]
 db_path = "aidaemon.db"
 working_memory_cap = 50
+# consolidation_interval_hours = 6  # How often to run memory consolidation (extract durable facts from conversations)
 
 [terminal]
 # Set to ["*"] to allow all commands (only if you trust the LLM fully)

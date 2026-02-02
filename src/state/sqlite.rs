@@ -78,7 +78,10 @@ impl SqliteStateStore {
 
         // Add embedding_error column if it doesn't exist
         let _ = sqlx::query("ALTER TABLE messages ADD COLUMN embedding_error TEXT").execute(&pool).await;
-        
+
+        // 4. Add consolidated_at column for memory consolidation (Layer 6)
+        let _ = sqlx::query("ALTER TABLE messages ADD COLUMN consolidated_at TEXT").execute(&pool).await;
+
         // 3. Create macros table
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS macros (

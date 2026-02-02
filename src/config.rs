@@ -92,6 +92,8 @@ pub struct StateConfig {
     pub db_path: String,
     #[serde(default = "default_working_memory_cap")]
     pub working_memory_cap: usize,
+    #[serde(default = "default_consolidation_interval_hours")]
+    pub consolidation_interval_hours: u64,
 }
 
 impl Default for StateConfig {
@@ -99,6 +101,7 @@ impl Default for StateConfig {
         Self {
             db_path: default_db_path(),
             working_memory_cap: default_working_memory_cap(),
+            consolidation_interval_hours: default_consolidation_interval_hours(),
         }
     }
 }
@@ -108,6 +111,9 @@ fn default_db_path() -> String {
 }
 fn default_working_memory_cap() -> usize {
     50
+}
+fn default_consolidation_interval_hours() -> u64 {
+    6
 }
 
 #[derive(Debug, Deserialize, Clone)]

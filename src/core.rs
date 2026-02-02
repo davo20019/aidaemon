@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::info;
 
@@ -35,11 +36,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     );
     info!("State store initialized ({})", config.state.db_path);
 
-    // 1b. Memory Manager (Background Tasks)
-    let memory_manager = Arc::new(MemoryManager::new(state.pool(), embedding_service.clone()));
-    memory_manager.start_background_tasks();
-
-    // 2. Provider
+    // 2. Provider (moved before MemoryManager so provider is available)
     let provider: Arc<dyn crate::traits::ModelProvider> = match config.provider.kind {
         crate::config::ProviderKind::OpenaiCompatible => Arc::new(crate::providers::OpenAiCompatibleProvider::new(
             &config.provider.base_url,
@@ -62,6 +59,17 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         smart = router.select(Tier::Smart),
         "Model router configured"
     );
+
+    // 3b. Memory Manager (Background Tasks — needs provider + fast model)
+    let consolidation_interval = Duration::from_secs(config.state.consolidation_interval_hours * 3600);
+    let memory_manager = Arc::new(MemoryManager::new(
+        state.pool(),
+        embedding_service.clone(),
+        provider.clone(),
+        router.select(Tier::Fast).to_string(),
+        consolidation_interval,
+    ));
+    memory_manager.start_background_tasks();
 
     // 4. Tools
     let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(16);
