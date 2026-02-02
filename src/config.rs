@@ -53,32 +53,42 @@ fn default_base_url() -> String {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModelsConfig {
-    #[serde(default = "default_primary_model")]
+    #[serde(default)]
     pub primary: String,
-    #[serde(default = "default_fast_model")]
+    #[serde(default)]
     pub fast: String,
-    #[serde(default = "default_smart_model")]
+    #[serde(default)]
     pub smart: String,
 }
 
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
-            primary: default_primary_model(),
-            fast: default_fast_model(),
-            smart: default_smart_model(),
+            primary: String::new(),
+            fast: String::new(),
+            smart: String::new(),
         }
     }
 }
 
-fn default_primary_model() -> String {
-    "openai/gpt-4o".to_string()
-}
-fn default_fast_model() -> String {
-    "openai/gpt-4o-mini".to_string()
-}
-fn default_smart_model() -> String {
-    "openai/gpt-4o".to_string()
+impl ModelsConfig {
+    /// Fill in unset model tiers. `fast` and `smart` default to `primary`;
+    /// `primary` defaults to a sensible model for the provider kind.
+    pub fn apply_defaults(&mut self, provider_kind: &ProviderKind) {
+        if self.primary.is_empty() {
+            self.primary = match provider_kind {
+                ProviderKind::GoogleGenai => "gemini-2.5-flash".to_string(),
+                ProviderKind::Anthropic => "claude-sonnet-4-20250514".to_string(),
+                ProviderKind::OpenaiCompatible => "openai/gpt-4o".to_string(),
+            };
+        }
+        if self.fast.is_empty() {
+            self.fast = self.primary.clone();
+        }
+        if self.smart.is_empty() {
+            self.smart = self.primary.clone();
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -385,7 +395,8 @@ pub struct CliToolConfig {
 impl AppConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: AppConfig = toml::from_str(&content)?;
+        let mut config: AppConfig = toml::from_str(&content)?;
+        config.provider.models.apply_defaults(&config.provider.kind);
         Ok(config)
     }
 }
