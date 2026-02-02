@@ -12,9 +12,6 @@ use crate::providers::{ProviderError, ProviderErrorKind};
 use crate::skills::{self, Skill};
 use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
 
-const MAX_ITERATIONS: usize = 10;
-const DEFAULT_MAX_DEPTH: usize = 3;
-
 pub struct Agent {
     provider: Arc<dyn ModelProvider>,
     state: Arc<dyn StateStore>,
@@ -28,9 +25,16 @@ pub struct Agent {
     depth: usize,
     /// Maximum allowed recursion depth for sub-agent spawning.
     max_depth: usize,
+    /// Maximum agentic loop iterations per invocation.
+    max_iterations: usize,
+    /// Max chars for sub-agent response truncation.
+    max_response_chars: usize,
+    /// Timeout in seconds for sub-agent execution.
+    timeout_secs: u64,
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Arc<dyn ModelProvider>,
         state: Arc<dyn StateStore>,
@@ -39,6 +43,10 @@ impl Agent {
         system_prompt: String,
         config_path: PathBuf,
         skills: Vec<Skill>,
+        max_depth: usize,
+        max_iterations: usize,
+        max_response_chars: usize,
+        timeout_secs: u64,
     ) -> Self {
         let fallback = model.clone();
         Self {
@@ -51,11 +59,15 @@ impl Agent {
             config_path,
             skills,
             depth: 0,
-            max_depth: DEFAULT_MAX_DEPTH,
+            max_depth,
+            max_iterations,
+            max_response_chars,
+            timeout_secs,
         }
     }
 
     /// Create an Agent with explicit depth/max_depth (used internally for sub-agents).
+    #[allow(clippy::too_many_arguments)]
     fn with_depth(
         provider: Arc<dyn ModelProvider>,
         state: Arc<dyn StateStore>,
@@ -66,6 +78,9 @@ impl Agent {
         skills: Vec<Skill>,
         depth: usize,
         max_depth: usize,
+        max_iterations: usize,
+        max_response_chars: usize,
+        timeout_secs: u64,
     ) -> Self {
         let fallback = model.clone();
         Self {
@@ -79,6 +94,9 @@ impl Agent {
             skills,
             depth,
             max_depth,
+            max_iterations,
+            max_response_chars,
+            timeout_secs,
         }
     }
 
@@ -90,6 +108,12 @@ impl Agent {
     /// Maximum recursion depth allowed.
     pub fn max_depth(&self) -> usize {
         self.max_depth
+    }
+
+    /// Maximum agentic loop iterations per invocation.
+    #[allow(dead_code)]
+    pub fn max_iterations(&self) -> usize {
+        self.max_iterations
     }
 
     /// Spawn a child agent with an incremented depth and a focused mission.
@@ -122,13 +146,20 @@ impl Agent {
             .collect();
 
         // Build the child's system prompt with the mission context.
+        let at_max_depth = child_depth >= self.max_depth;
+        let depth_note = if at_max_depth {
+            "\nYou are at the maximum sub-agent depth. You CANNOT spawn further sub-agents; \
+            the `spawn_agent` tool is not available to you. Complete the task directly."
+        } else {
+            ""
+        };
         let child_system_prompt = format!(
             "{}\n\n## Sub-Agent Context\n\
             You are a sub-agent (depth {}/{}) spawned to accomplish a specific mission.\n\
             **Mission:** {}\n\n\
             Focus exclusively on this mission. Be concise. Return your findings/results \
-            directly — they will be consumed by the parent agent.",
-            self.system_prompt, child_depth, self.max_depth, mission
+            directly — they will be consumed by the parent agent.{}",
+            self.system_prompt, child_depth, self.max_depth, mission, depth_note
         );
 
         let child_session = format!("sub-{}-{}", child_depth, Uuid::new_v4());
@@ -144,7 +175,10 @@ impl Agent {
         // If the child can still recurse, give it a spawn tool with a deferred
         // agent reference (set after wrapping in Arc).
         if child_depth < self.max_depth {
-            let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred());
+            let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(
+                self.max_response_chars,
+                self.timeout_secs,
+            ));
 
             let mut child_tools = base_tools;
             child_tools.push(spawn_tool.clone());
@@ -159,6 +193,9 @@ impl Agent {
                 self.skills.clone(),
                 child_depth,
                 self.max_depth,
+                self.max_iterations,
+                self.max_response_chars,
+                self.timeout_secs,
             ));
 
             // Close the loop: give the spawn tool a weak ref to the child.
@@ -177,6 +214,9 @@ impl Agent {
                 self.skills.clone(),
                 child_depth,
                 self.max_depth,
+                self.max_iterations,
+                self.max_response_chars,
+                self.timeout_secs,
             ));
 
             child.handle_message(&child_session, task).await
@@ -400,7 +440,7 @@ impl Agent {
 
         // 3. Agentic loop
         // 3. Agentic loop
-        for iteration in 0..MAX_ITERATIONS {
+        for iteration in 0..self.max_iterations {
             info!(iteration, session_id, model = %model, depth = self.depth, "Agent loop iteration");
 
             // Fetch only recent history inside the loop
@@ -479,7 +519,7 @@ impl Agent {
 
             // 4. Call the LLM with error-classified recovery
             // On the last iteration, omit tools to force a text response
-            let effective_tools = if iteration >= MAX_ITERATIONS - 1 {
+            let effective_tools = if iteration >= self.max_iterations - 1 {
                 info!(session_id, "Last iteration — calling LLM without tools to force summary");
                 &[][..]
             } else {
@@ -501,9 +541,9 @@ impl Agent {
 
             // 5. If there are tool calls, execute them
             // On the last iteration, force a text response even if the model returns tool calls
-            if !resp.tool_calls.is_empty() && iteration < MAX_ITERATIONS - 1 {
+            if !resp.tool_calls.is_empty() && iteration < self.max_iterations - 1 {
                 // Nudge the model to wrap up when approaching the limit
-                if iteration >= MAX_ITERATIONS - 2 {
+                if iteration >= self.max_iterations - 2 {
                     let nudge = Message {
                         id: Uuid::new_v4().to_string(),
                         session_id: session_id.to_string(),
@@ -567,7 +607,7 @@ impl Agent {
 
             // 6. No tool calls (or last iteration) — this is the final response
             let reply = resp.content.filter(|s| !s.is_empty()).unwrap_or_else(|| {
-                if iteration >= MAX_ITERATIONS - 1 {
+                if iteration >= self.max_iterations - 1 {
                     "I used all available tool iterations but couldn't finish the task. \
                     Please try a simpler or more specific request."
                         .to_string()

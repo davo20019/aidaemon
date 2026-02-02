@@ -104,9 +104,21 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     };
 
     // 7. Agent (with deferred spawn tool wiring to break the circular dep)
-    let base_system_prompt = build_base_system_prompt();
-    let spawn_tool = Arc::new(SpawnAgentTool::new_deferred());
-    tools.push(spawn_tool.clone());
+    let base_system_prompt = build_base_system_prompt(&config);
+
+    // Spawn-agent tool (conditional, like browser)
+    let spawn_tool: Option<Arc<SpawnAgentTool>> = if config.subagents.enabled {
+        let st = Arc::new(SpawnAgentTool::new_deferred(
+            config.subagents.max_response_chars,
+            config.subagents.timeout_secs,
+        ));
+        tools.push(st.clone());
+        info!("Spawn-agent tool enabled");
+        Some(st)
+    } else {
+        info!("Spawn-agent tool disabled");
+        None
+    };
 
     let agent = Arc::new(Agent::new(
         provider,
@@ -116,10 +128,16 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         base_system_prompt,
         config_path.clone(),
         loaded_skills,
+        config.subagents.max_depth,
+        config.subagents.max_iterations,
+        config.subagents.max_response_chars,
+        config.subagents.timeout_secs,
     ));
 
     // Close the loop: give the spawn tool a weak reference to the agent.
-    spawn_tool.set_agent(Arc::downgrade(&agent));
+    if let Some(st) = spawn_tool {
+        st.set_agent(Arc::downgrade(&agent));
+    }
 
     // 8. Event bus for triggers
     let (event_tx, mut event_rx) = triggers::event_bus(64);
@@ -188,8 +206,28 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     Ok(())
 }
 
-fn build_base_system_prompt() -> String {
-    "\
+fn build_base_system_prompt(config: &AppConfig) -> String {
+    let spawn_table_row = if config.subagents.enabled {
+        "\n| Complex sub-tasks needing focused reasoning | spawn_agent | — |"
+    } else {
+        ""
+    };
+
+    let spawn_tool_doc = if config.subagents.enabled {
+        format!(
+            "\n- `spawn_agent`: Spawn a sub-agent to handle a complex sub-task autonomously. \
+            Parameters: `mission` (high-level role, e.g. 'Research assistant for Python packaging') \
+            and `task` (the specific question or job). The sub-agent gets its own reasoning loop \
+            with access to all tools. Use this when a task benefits from isolated, focused context. \
+            Sub-agents can nest up to {} levels deep.",
+            config.subagents.max_depth
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "\
 ## Identity
 You are aidaemon, a personal AI assistant running as a background daemon.
 You have access to tools and should use them proactively to answer questions.
@@ -210,7 +248,7 @@ Narrate your plan before executing — tell the user what you're about to do and
 | Run commands, scripts | terminal | — |
 | Get system specs | system_info | terminal (uname, etc.) |
 | Store user info | remember_fact | — |
-| Fix config | manage_config | terminal (editing files) |
+| Fix config | manage_config | terminal (editing files) |{spawn_table_row}
 
 ## Tools
 - `terminal`: Run ANY command available on this system. This includes shell commands, \
@@ -226,7 +264,7 @@ pre-approved list. The user can allow them with one tap.
 screenshot (capture page and send as photo), click (click element by CSS selector), \
 fill (type text into input), get_text (extract visible text), execute_js (run JavaScript), \
 wait (wait for element to appear), close (end browser session). The browser session persists \
-across tool calls so you can chain multi-step workflows (e.g. navigate -> fill form -> click -> screenshot).
+across tool calls so you can chain multi-step workflows (e.g. navigate -> fill form -> click -> screenshot).{spawn_tool_doc}
 
 ## Self-Maintenance
 You are responsible for your own maintenance. When you encounter errors:
@@ -242,5 +280,5 @@ handles permissions — just call the tool and let the user decide.
 - When you learn important facts about the user, store them with `remember_fact`.
 - Narrate your plan before executing — tell the user what you're about to do and why.
 - Be concise and helpful."
-        .to_string()
+    )
 }

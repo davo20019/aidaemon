@@ -43,6 +43,13 @@ health_port = 8080
 # password = "app-password"
 # folder = "INBOX"
 
+# [subagents]
+# enabled = true
+# max_depth = 3            # max nesting levels for sub-agents
+# max_iterations = 10      # agentic loop iterations per sub-agent
+# max_response_chars = 8000
+# timeout_secs = 300       # 5 minute timeout per sub-agent
+
 # [mcp.filesystem]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]

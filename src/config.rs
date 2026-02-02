@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub browser: BrowserConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
+    #[serde(default)]
+    pub subagents: SubagentsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -256,6 +258,48 @@ fn default_skills_dir() -> String {
 
 fn default_skills_enabled() -> bool {
     true
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SubagentsConfig {
+    #[serde(default = "default_subagents_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_subagents_max_depth")]
+    pub max_depth: usize,
+    #[serde(default = "default_subagents_max_iterations")]
+    pub max_iterations: usize,
+    #[serde(default = "default_subagents_max_response_chars")]
+    pub max_response_chars: usize,
+    #[serde(default = "default_subagents_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for SubagentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_subagents_enabled(),
+            max_depth: default_subagents_max_depth(),
+            max_iterations: default_subagents_max_iterations(),
+            max_response_chars: default_subagents_max_response_chars(),
+            timeout_secs: default_subagents_timeout_secs(),
+        }
+    }
+}
+
+fn default_subagents_enabled() -> bool {
+    true
+}
+fn default_subagents_max_depth() -> usize {
+    3
+}
+fn default_subagents_max_iterations() -> usize {
+    10
+}
+fn default_subagents_max_response_chars() -> usize {
+    8000
+}
+fn default_subagents_timeout_secs() -> u64 {
+    300
 }
 
 impl AppConfig {
