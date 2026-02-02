@@ -33,6 +33,7 @@ impl ChannelHub {
     }
 
     /// Get a reference to the shared session map.
+    #[allow(dead_code)]
     pub fn session_map(&self) -> &SessionMap {
         &self.session_map
     }
@@ -118,6 +119,7 @@ impl ChannelHub {
     }
 
     /// Send text to the channel that owns a specific session.
+    #[allow(dead_code)]
     pub async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
         if let Some(channel) = self.channel_for_session(session_id).await {
             channel.send_text(session_id, text).await
