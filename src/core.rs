@@ -17,7 +17,7 @@ use crate::skills;
 use crate::state::SqliteStateStore;
 #[cfg(feature = "browser")]
 use crate::tools::BrowserTool;
-use crate::tools::{CliAgentTool, ConfigManagerTool, RememberFactTool, SpawnAgentTool, SystemInfoTool, TerminalTool};
+use crate::tools::{CliAgentTool, ConfigManagerTool, RememberFactTool, SpawnAgentTool, SystemInfoTool, TerminalTool, RemoteAgentTool};
 use crate::traits::Tool;
 use crate::triggers::{self, TriggerManager};
 
@@ -112,6 +112,12 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         tools.extend(mcp_tools);
     }
 
+    // 6. Remote Agents
+    if !config.remote_agents.is_empty() {
+        tools.push(Arc::new(RemoteAgentTool::new(config.remote_agents.clone())));
+        info!("Remote agent tool enabled");
+    }
+
     for tool in &tools {
         info!(name = tool.name(), desc = tool.description(), "Registered tool");
     }
@@ -184,12 +190,12 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         media_rx,
     ));
 
-    // 11. Health server
-    let health_port = config.daemon.health_port;
-    let health_bind = config.daemon.health_bind.clone();
+    // 11. API server (Health + Agent)
+    let daemon_config = config.daemon.clone();
+    let agent_for_server = Arc::clone(&agent);
     tokio::spawn(async move {
-        if let Err(e) = daemon::start_health_server(health_port, &health_bind).await {
-            tracing::error!("Health server error: {}", e);
+        if let Err(e) = daemon::start_server(daemon_config, agent_for_server).await {
+            tracing::error!("Server error: {}", e);
         }
     });
 
@@ -259,6 +265,12 @@ fn build_base_system_prompt(config: &AppConfig) -> String {
         ""
     };
 
+    let remote_agent_table_row = if !config.remote_agents.is_empty() {
+        "\n| Coordinate with remote agents | remote_agent | — |"
+    } else {
+        ""
+    };
+
     let spawn_tool_doc = if config.subagents.enabled {
         format!(
             "\n- `spawn_agent`: Spawn a sub-agent to handle a complex sub-task autonomously. \
@@ -298,6 +310,17 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         ""
     };
 
+    let remote_agent_tool_doc = if !config.remote_agents.is_empty() {
+        let agent_names: Vec<String> = config.remote_agents.keys().cloned().collect();
+        format!(
+            "\n- `remote_agent`: Send a message to a remote AI agent (e.g. on another server). \
+            Available agents: {}. Use this to delegate tasks or ask questions to other agents.",
+            agent_names.join(", ")
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         "\
 ## Identity
@@ -319,7 +342,7 @@ Narrate your plan before executing — tell the user what you're about to do and
 {browser_table_row}| Run commands, scripts | terminal | — |
 | Get system specs | system_info | terminal (uname, etc.) |
 | Store user info | remember_fact | — |
-| Fix config | manage_config | terminal (editing files) |{spawn_table_row}{cli_agent_table_row}
+| Fix config | manage_config | terminal (editing files) |{spawn_table_row}{cli_agent_table_row}{remote_agent_table_row}
 
 ## Tools
 - `terminal`: Run ANY command available on this system. This includes shell commands, \
@@ -331,7 +354,7 @@ pre-approved list. The user can allow them with one tap.
 - `system_info`: Get CPU, memory, and OS information.
 - `remember_fact`: Store important facts about the user for long-term memory.
 - `manage_config`: Read and update your own config.toml. Use this to fix configuration issues.
-{browser_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}
+{browser_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}{remote_agent_tool_doc}
 
 ## Self-Maintenance
 You are responsible for your own maintenance. When you encounter errors:

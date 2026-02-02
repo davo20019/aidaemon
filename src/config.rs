@@ -24,6 +24,14 @@ pub struct AppConfig {
     pub subagents: SubagentsConfig,
     #[serde(default)]
     pub cli_agents: CliAgentsConfig,
+    #[serde(default)]
+    pub remote_agents: HashMap<String, RemoteAgentConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RemoteAgentConfig {
+    pub url: String,
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -166,6 +174,7 @@ pub struct DaemonConfig {
     /// Set to "0.0.0.0" to listen on all interfaces.
     #[serde(default = "default_health_bind")]
     pub health_bind: String,
+    pub auth_token: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -173,6 +182,7 @@ impl Default for DaemonConfig {
         Self {
             health_port: default_health_port(),
             health_bind: default_health_bind(),
+            auth_token: None,
         }
     }
 }

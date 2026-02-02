@@ -1,20 +1,46 @@
-use axum::{routing::get, Json, Router};
-use serde_json::json;
-use tracing::info;
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::{get, post},
+    Json, Router,
+};
+use serde_json::{json, Value};
+use tracing::{info, warn};
+use std::sync::Arc;
 
-/// Start the health check HTTP server.
+use crate::agent::Agent;
+use crate::config::DaemonConfig;
+
+#[derive(Clone)]
+struct AppState {
+    agent: Arc<Agent>,
+    auth_token: Option<String>,
+}
+
+/// Start the HTTP server (health check + agent API).
 ///
 /// Binds to `bind_addr` (default "127.0.0.1") to avoid exposing the
 /// endpoint on all interfaces. Set to "0.0.0.0" in config if external
 /// access is needed.
-pub async fn start_health_server(port: u16, bind_addr: &str) -> anyhow::Result<()> {
-    let app = Router::new().route("/health", get(health_handler));
+pub async fn start_server(
+    config: DaemonConfig,
+    agent: Arc<Agent>,
+) -> anyhow::Result<()> {
+    let state = AppState {
+        agent,
+        auth_token: config.auth_token,
+    };
 
-    let ip: std::net::IpAddr = bind_addr
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/agent/message", post(agent_message_handler))
+        .with_state(state);
+
+    let ip: std::net::IpAddr = config.health_bind
         .parse()
         .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    let addr = std::net::SocketAddr::new(ip, port);
-    info!("Health server listening on {}", addr);
+    let addr = std::net::SocketAddr::new(ip, config.health_port);
+    info!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -24,6 +50,43 @@ pub async fn start_health_server(port: u16, bind_addr: &str) -> anyhow::Result<(
 
 async fn health_handler() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
+}
+
+async fn agent_message_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // 1. Auth check
+    if let Some(expected_token) = &state.auth_token {
+        let auth_header = headers.get("Authorization")
+            .and_then(|h| h.to_str().ok());
+
+        let valid = match auth_header {
+            Some(h) if h.starts_with("Bearer ") => &h[7..] == expected_token,
+            _ => false,
+        };
+
+        if !valid {
+            warn!("Unauthorized access attempt to /agent/message");
+            return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+        }
+    }
+
+    // 2. Parse payload
+    let session_id = payload["session_id"].as_str()
+        .ok_or((StatusCode::BAD_REQUEST, "Missing session_id".to_string()))?;
+    let message = payload["message"].as_str()
+        .ok_or((StatusCode::BAD_REQUEST, "Missing message".to_string()))?;
+
+    // 3. Call agent
+    match state.agent.handle_message(session_id, message).await {
+        Ok(response) => Ok(Json(json!({ "response": response }))),
+        Err(e) => {
+            tracing::error!("Agent error handling remote message: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Agent error: {}", e)))
+        }
+    }
 }
 
 /// Generate and write a systemd service file (Linux).
