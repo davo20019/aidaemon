@@ -1,6 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "browser")]
+use std::path::PathBuf;
 
+#[cfg(feature = "browser")]
 use dialoguer::{Confirm, Input, Select};
+#[cfg(not(feature = "browser"))]
+use dialoguer::{Input, Select};
 
 struct ProviderPreset {
     name: &'static str,
@@ -170,67 +175,79 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<()> {
         .expect("already validated");
 
     // 5. Browser tool setup
-    println!();
-    let browser_enabled = Confirm::new()
-        .with_prompt("Enable browser tool? (lets the agent browse the web, fill forms, take screenshots)")
-        .default(false)
-        .interact()?;
+    let browser_section;
+    #[cfg(feature = "browser")]
+    {
+        println!();
+        let browser_enabled = Confirm::new()
+            .with_prompt("Enable browser tool? (lets the agent browse the web, fill forms, take screenshots)")
+            .default(false)
+            .interact()?;
 
-    let mut browser_section = String::new();
-    if browser_enabled {
-        let mut user_data_dir = String::new();
-        let mut profile_name = String::new();
+        browser_section = if browser_enabled {
+            let mut user_data_dir = String::new();
+            let mut profile_name = String::new();
 
-        // Try to detect Chrome profiles
-        let profiles = discover_chrome_profiles();
-        if !profiles.is_empty() {
-            let use_profile = Confirm::new()
-                .with_prompt("Chrome detected! Use an existing Chrome profile? (inherits your login sessions)")
+            // Try to detect Chrome profiles
+            let profiles = discover_chrome_profiles();
+            if !profiles.is_empty() {
+                let use_profile = Confirm::new()
+                    .with_prompt("Chrome detected! Use an existing Chrome profile? (inherits your login sessions)")
+                    .default(true)
+                    .interact()?;
+
+                if use_profile {
+                    let display_names: Vec<String> = profiles
+                        .iter()
+                        .map(|p| {
+                            if p.display_name.is_empty() {
+                                p.dir_name.clone()
+                            } else {
+                                format!("{} ({})", p.display_name, p.dir_name)
+                            }
+                        })
+                        .collect();
+
+                    let profile_selection = Select::new()
+                        .with_prompt("Select Chrome profile")
+                        .items(&display_names)
+                        .default(0)
+                        .interact()?;
+
+                    let selected = &profiles[profile_selection];
+                    user_data_dir = selected.user_data_dir.clone();
+                    profile_name = selected.dir_name.clone();
+
+                    println!();
+                    println!("NOTE: Chrome locks its profile while running.");
+                    println!("The agent will only be able to use the browser when Chrome is closed,");
+                    println!("or you can copy the profile to a separate directory.");
+                }
+            } else {
+                println!("No Chrome installation detected. The browser will use a fresh profile.");
+                println!("You can set user_data_dir in config.toml later to reuse an existing profile.");
+            }
+
+            let headless = Confirm::new()
+                .with_prompt("Run browser in headless mode? (no visible window)")
                 .default(true)
                 .interact()?;
 
-            if use_profile {
-                let display_names: Vec<String> = profiles
-                    .iter()
-                    .map(|p| {
-                        if p.display_name.is_empty() {
-                            p.dir_name.clone()
-                        } else {
-                            format!("{} ({})", p.display_name, p.dir_name)
-                        }
-                    })
-                    .collect();
-
-                let profile_selection = Select::new()
-                    .with_prompt("Select Chrome profile")
-                    .items(&display_names)
-                    .default(0)
-                    .interact()?;
-
-                let selected = &profiles[profile_selection];
-                user_data_dir = selected.user_data_dir.clone();
-                profile_name = selected.dir_name.clone();
-
-                println!();
-                println!("NOTE: Chrome locks its profile while running.");
-                println!("The agent will only be able to use the browser when Chrome is closed,");
-                println!("or you can copy the profile to a separate directory.");
+            let mut section = format!("\n[browser]\nenabled = true\nheadless = {headless}\n");
+            if !user_data_dir.is_empty() {
+                section.push_str(&format!("user_data_dir = \"{user_data_dir}\"\n"));
+                section.push_str(&format!("profile = \"{profile_name}\"\n"));
             }
+            section
         } else {
-            println!("No Chrome installation detected. The browser will use a fresh profile.");
-            println!("You can set user_data_dir in config.toml later to reuse an existing profile.");
-        }
-
-        let headless = Confirm::new()
-            .with_prompt("Run browser in headless mode? (no visible window)")
-            .default(true)
-            .interact()?;
-
-        browser_section = format!("\n[browser]\nenabled = true\nheadless = {headless}\n");
-        if !user_data_dir.is_empty() {
-            browser_section.push_str(&format!("user_data_dir = \"{user_data_dir}\"\n"));
-            browser_section.push_str(&format!("profile = \"{profile_name}\"\n"));
-        }
+            String::new()
+        };
+    }
+    #[cfg(not(feature = "browser"))]
+    {
+        println!();
+        println!("NOTE: Browser tool available with `cargo install aidaemon --features browser`");
+        browser_section = String::new();
     }
 
     // 6. Write config.toml
@@ -288,6 +305,7 @@ health_port = 8080
     Ok(())
 }
 
+#[cfg(feature = "browser")]
 struct ChromeProfile {
     user_data_dir: String,
     dir_name: String,
@@ -295,6 +313,7 @@ struct ChromeProfile {
 }
 
 /// Auto-detect Chrome profiles on the system.
+#[cfg(feature = "browser")]
 fn discover_chrome_profiles() -> Vec<ChromeProfile> {
     let mut profiles = Vec::new();
 
@@ -356,6 +375,7 @@ fn discover_chrome_profiles() -> Vec<ChromeProfile> {
 }
 
 /// Read the human-readable profile name from Chrome's Preferences JSON.
+#[cfg(feature = "browser")]
 fn read_chrome_profile_name(prefs_path: &Path) -> String {
     let content = match std::fs::read_to_string(prefs_path) {
         Ok(c) => c,

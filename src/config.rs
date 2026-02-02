@@ -212,6 +212,7 @@ pub struct McpServerConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
 pub struct BrowserConfig {
     #[serde(default)]
     pub enabled: bool,

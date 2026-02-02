@@ -10,8 +10,8 @@ use tracing::{info, warn};
 
 use crate::agent::Agent;
 use crate::config::AppConfig;
-use crate::tools::browser::MediaMessage;
 use crate::tools::terminal::{ApprovalRequest, ApprovalResponse};
+use crate::types::MediaMessage;
 
 pub struct TelegramChannel {
     bot: Bot,
@@ -21,7 +21,7 @@ pub struct TelegramChannel {
     approval_rx: Mutex<mpsc::Receiver<ApprovalRequest>>,
     /// Pending approvals keyed by a unique callback ID.
     pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
-    media_rx: Mutex<mpsc::Receiver<MediaMessage>>,
+    media_rx: Option<Mutex<mpsc::Receiver<MediaMessage>>>,
 }
 
 impl TelegramChannel {
@@ -31,7 +31,7 @@ impl TelegramChannel {
         agent: Arc<Agent>,
         config_path: PathBuf,
         approval_rx: mpsc::Receiver<ApprovalRequest>,
-        media_rx: mpsc::Receiver<MediaMessage>,
+        media_rx: Option<mpsc::Receiver<MediaMessage>>,
     ) -> Self {
         let bot = Bot::new(bot_token);
         Self {
@@ -41,7 +41,7 @@ impl TelegramChannel {
             config_path,
             approval_rx: Mutex::new(approval_rx),
             pending_approvals: Mutex::new(HashMap::new()),
-            media_rx: Mutex::new(media_rx),
+            media_rx: media_rx.map(Mutex::new),
         }
     }
 
@@ -85,11 +85,13 @@ impl TelegramChannel {
             self_for_approvals.approval_listener().await;
         });
 
-        // Spawn media message listener (screenshots)
-        let self_for_media = Arc::clone(&self);
-        tokio::spawn(async move {
-            self_for_media.media_listener().await;
-        });
+        // Spawn media message listener (screenshots) — only when browser feature provides media_rx
+        if self.media_rx.is_some() {
+            let self_for_media = Arc::clone(&self);
+            tokio::spawn(async move {
+                self_for_media.media_listener().await;
+            });
+        }
 
         let handler = dptree::entry()
             .branch(
@@ -194,9 +196,10 @@ impl TelegramChannel {
 
     /// Listens for media messages (screenshots) and sends them as photos.
     async fn media_listener(self: Arc<Self>) {
+        let media_rx = self.media_rx.as_ref().expect("media_listener called without media_rx");
         loop {
             let msg = {
-                let mut rx = self.media_rx.lock().await;
+                let mut rx = media_rx.lock().await;
                 rx.recv().await
             };
 

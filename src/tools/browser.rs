@@ -11,13 +11,7 @@ use tracing::{info, warn};
 
 use crate::config::BrowserConfig;
 use crate::traits::Tool;
-
-/// A screenshot message to be sent as a photo via Telegram.
-pub struct MediaMessage {
-    pub chat_id: i64,
-    pub photo_bytes: Vec<u8>,
-    pub caption: String,
-}
+use crate::types::MediaMessage;
 
 pub struct BrowserTool {
     browser: Arc<Mutex<Option<Browser>>>,

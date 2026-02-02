@@ -33,8 +33,11 @@ async-std = { version = "1", features = ["attributes"] }
 futures = "0.3"
 axum = "0.8"
 dialoguer = "0.11"
-chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+chromiumoxide = { version = "0.8", features = ["tokio-runtime"], default-features = false, optional = true }
 shellexpand = "3"
 dirs = "6"
 fastembed = "4"
 tokio-util = "0.7.18"
+
+[features]
+browser = ["dep:chromiumoxide"]

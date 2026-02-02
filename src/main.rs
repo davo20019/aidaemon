@@ -11,6 +11,7 @@ mod skills;
 mod state;
 mod tools;
 mod traits;
+mod types;
 mod triggers;
 mod wizard;
 
@@ -25,7 +26,13 @@ fn main() -> anyhow::Result<()> {
     // Tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,chromiumoxide=off")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                if cfg!(feature = "browser") {
+                    EnvFilter::new("info,chromiumoxide=off")
+                } else {
+                    EnvFilter::new("info")
+                }
+            }),
         )
         .init();
 

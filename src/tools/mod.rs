@@ -1,3 +1,4 @@
+#[cfg(feature = "browser")]
 pub mod browser;
 mod cli_agent;
 mod config_manager;
@@ -6,6 +7,7 @@ pub mod spawn;
 mod system;
 pub mod terminal;
 
+#[cfg(feature = "browser")]
 pub use browser::BrowserTool;
 pub use cli_agent::CliAgentTool;
 pub use config_manager::ConfigManagerTool;
