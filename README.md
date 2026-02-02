@@ -1,5 +1,7 @@
 # aidaemon
 
+[Website](https://aidaemon.ai/) · [Documentation](https://docs.aidaemon.ai/) · [GitHub](https://github.com/davo20019/aidaemon)
+
 A personal AI agent that runs as a background daemon, accessible via Telegram, with tool use, MCP integration, email triggers, and persistent memory.
 
 I built this because I wanted to control my computer from my phone, from anywhere. I also wanted it to run on cheap hardware - a Raspberry Pi, an old laptop, a $5/month VPS - without eating all the RAM just to sit idle waiting for messages.
