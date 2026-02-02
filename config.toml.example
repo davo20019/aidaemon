@@ -23,6 +23,15 @@ allowed_prefixes = ["ls", "cat", "head", "tail", "echo", "date", "whoami", "pwd"
 
 [daemon]
 health_port = 8080
+# auth_token = "secret-token-for-remote-access"
+
+# [remote_agents.aws]
+# url = "http://my-aws-server:8080"
+# token = "remote-token"
+
+# [remote_agents.gcp]
+# url = "http://my-gcp-server:8080"
+# token = "remote-token"
 
 # [skills]
 # enabled = true
