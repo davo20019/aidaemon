@@ -21,6 +21,7 @@ use crate::state::SqliteStateStore;
 use crate::tools::BrowserTool;
 use crate::tools::{CliAgentTool, ConfigManagerTool, RememberFactTool, SpawnAgentTool, SystemInfoTool, TerminalTool};
 use crate::traits::{Channel, Tool};
+use crate::tasks::TaskRegistry;
 use crate::triggers::{self, TriggerManager};
 
 pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::Result<()> {
@@ -186,6 +187,9 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // 10. Session map (shared between hub and channels for routing)
     let session_map: SessionMap = Arc::new(RwLock::new(HashMap::new()));
 
+    // 10b. Task registry for tracking background agent work
+    let task_registry = Arc::new(TaskRegistry::new(50));
+
     // 11. Channels — add new channels here (WhatsApp, Web, SMS, etc.)
     let telegram = Arc::new(TelegramChannel::new(
         &config.telegram.bot_token,
@@ -193,6 +197,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         Arc::clone(&agent),
         config_path.clone(),
         session_map.clone(),
+        task_registry,
     ));
 
     let channels: Vec<Arc<dyn Channel>> = vec![telegram.clone() as Arc<dyn Channel>];
@@ -273,7 +278,13 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         }
     });
 
-    // 15. Start Telegram with auto-retry (blocks)
+    // 15. Send startup notification to all allowed users
+    // This lets users know the daemon is back after a /restart.
+    for user_id in &config.telegram.allowed_user_ids {
+        let _ = telegram.send_text(&user_id.to_string(), "aidaemon is online.").await;
+    }
+
+    // 16. Start Telegram with auto-retry (blocks)
     // Future channels would be started similarly in their own tasks.
     info!("Starting aidaemon v0.1.0");
     telegram.start_with_retry().await;
