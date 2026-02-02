@@ -112,6 +112,7 @@ pub trait StateStore: Send + Sync {
 ///
 /// Used by the agent and hub to adapt output format for each channel.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ChannelCapabilities {
     /// Whether the channel supports markdown/rich text formatting.
     pub markdown: bool,
