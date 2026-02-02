@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -16,6 +16,21 @@ const REDACTED: &str = "***REDACTED***";
 
 pub struct ConfigManagerTool {
     config_path: PathBuf,
+}
+
+/// Set file permissions to owner-only read/write (0600) on Unix.
+/// This is a best-effort operation — failures are logged but not fatal.
+#[cfg(unix)]
+fn set_owner_only_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        warn!(path = %path.display(), "Failed to set 0600 permissions: {}", e);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_permissions(_path: &Path) {
+    // No-op on non-Unix platforms
 }
 
 impl ConfigManagerTool {
@@ -40,6 +55,10 @@ impl ConfigManagerTool {
         }
         // Current → .bak
         tokio::fs::copy(&self.config_path, &bak).await?;
+        // Restrict permissions on all backup files (contain secrets)
+        set_owner_only_permissions(&bak);
+        set_owner_only_permissions(&bak1);
+        set_owner_only_permissions(&bak2);
         info!(backup = %bak.display(), "Config backup created (3-deep rotation)");
         Ok(())
     }
@@ -187,6 +206,7 @@ impl Tool for ConfigManagerTool {
                 }
 
                 tokio::fs::write(&self.config_path, &new_content).await?;
+                set_owner_only_permissions(&self.config_path);
 
                 Ok(format!(
                     "Updated {} = {}\n\nBackup saved to config.toml.bak. Config validated and saved. Run /reload to apply changes.",

@@ -3,10 +3,17 @@ use serde_json::json;
 use tracing::info;
 
 /// Start the health check HTTP server.
-pub async fn start_health_server(port: u16) -> anyhow::Result<()> {
+///
+/// Binds to `bind_addr` (default "127.0.0.1") to avoid exposing the
+/// endpoint on all interfaces. Set to "0.0.0.0" in config if external
+/// access is needed.
+pub async fn start_health_server(port: u16, bind_addr: &str) -> anyhow::Result<()> {
     let app = Router::new().route("/health", get(health_handler));
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let ip: std::net::IpAddr = bind_addr
+        .parse()
+        .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let addr = std::net::SocketAddr::new(ip, port);
     info!("Health server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

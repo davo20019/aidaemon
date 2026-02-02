@@ -178,8 +178,9 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 11. Health server
     let health_port = config.daemon.health_port;
+    let health_bind = config.daemon.health_bind.clone();
     tokio::spawn(async move {
-        if let Err(e) = daemon::start_health_server(health_port).await {
+        if let Err(e) = daemon::start_health_server(health_port, &health_bind).await {
             tracing::error!("Health server error: {}", e);
         }
     });

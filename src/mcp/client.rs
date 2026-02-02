@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tracing::warn;
 
 /// JSON-RPC client over stdio for MCP protocol.
 pub struct McpClient {
@@ -20,7 +21,7 @@ impl McpClient {
             .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()?;
 
         let stdin = child
@@ -31,6 +32,29 @@ impl McpClient {
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture MCP server stdout"))?;
+
+        // Log stderr in the background so errors from MCP servers are visible
+        // rather than silently swallowed.
+        if let Some(stderr) = child.stderr.take() {
+            let cmd_name = command.to_string();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            let trimmed = line.trim_end();
+                            if !trimmed.is_empty() {
+                                warn!(mcp_server = %cmd_name, "{}", trimmed);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
 
         let client = Self {
             stdin: Mutex::new(stdin),

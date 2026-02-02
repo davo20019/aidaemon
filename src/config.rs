@@ -162,18 +162,27 @@ fn default_allowed_prefixes() -> Vec<String> {
 pub struct DaemonConfig {
     #[serde(default = "default_health_port")]
     pub health_port: u16,
+    /// IP address to bind the health server to (default: "127.0.0.1").
+    /// Set to "0.0.0.0" to listen on all interfaces.
+    #[serde(default = "default_health_bind")]
+    pub health_bind: String,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             health_port: default_health_port(),
+            health_bind: default_health_bind(),
         }
     }
 }
 
 fn default_health_port() -> u16 {
     8080
+}
+
+fn default_health_bind() -> String {
+    "127.0.0.1".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
