@@ -46,9 +46,11 @@ fn main() -> anyhow::Result<()> {
 
     // Wizard: if no config.toml, run interactive setup
     if !config_path.exists() {
-        wizard::run_wizard(&config_path)?;
-        // If we just created the config, exit so user can review
-        return Ok(());
+        let start_now = wizard::run_wizard(&config_path)?;
+        if !start_now {
+            return Ok(());
+        }
+        // Fall through to load config and start the daemon
     }
 
     // Load config — if corrupted, try restoring from .lastgood first (proven

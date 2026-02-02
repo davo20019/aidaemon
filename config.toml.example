@@ -6,7 +6,7 @@ base_url = "https://openrouter.ai/api/v1"
 [provider.models]
 primary = "openai/gpt-4o"
 fast = "openai/gpt-4o-mini"
-smart = "anthropic/claude-opus-4"
+smart = "anthropic/claude-sonnet-4"
 
 [telegram]
 bot_token = "123456:ABC-DEF..."
@@ -16,6 +16,7 @@ allowed_user_ids = [123456789]
 db_path = "aidaemon.db"
 working_memory_cap = 50
 # consolidation_interval_hours = 6  # How often to run memory consolidation (extract durable facts from conversations)
+# encryption_key = "your-strong-passphrase-here"  # SQLCipher AES-256 encryption (requires: cargo build --features encryption)
 
 [terminal]
 # Set to ["*"] to allow all commands (only if you trust the LLM fully)
