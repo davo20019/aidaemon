@@ -111,6 +111,11 @@ pub struct StateConfig {
     /// If set, all database contents are AES-256 encrypted at rest.
     #[serde(default)]
     pub encryption_key: Option<String>,
+    /// Maximum number of facts to inject into the system prompt.
+    /// Facts are ordered by most recently updated first; older facts
+    /// remain in the database but are not included in the prompt.
+    #[serde(default = "default_max_facts")]
+    pub max_facts: usize,
 }
 
 impl Default for StateConfig {
@@ -120,6 +125,7 @@ impl Default for StateConfig {
             working_memory_cap: default_working_memory_cap(),
             consolidation_interval_hours: default_consolidation_interval_hours(),
             encryption_key: None,
+            max_facts: default_max_facts(),
         }
     }
 }
@@ -132,6 +138,9 @@ fn default_working_memory_cap() -> usize {
 }
 fn default_consolidation_interval_hours() -> u64 {
     6
+}
+fn default_max_facts() -> usize {
+    100
 }
 
 #[derive(Debug, Deserialize, Clone)]

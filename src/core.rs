@@ -168,6 +168,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         config.subagents.max_response_chars,
         config.subagents.timeout_secs,
         config.provider.models.clone(),
+        config.state.max_facts,
     ));
 
     // Close the loop: give the spawn tool a weak reference to the agent.
