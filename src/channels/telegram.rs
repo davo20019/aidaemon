@@ -153,6 +153,8 @@ impl TelegramChannel {
         let mut pending = self.pending_approvals.lock().await;
         if let Some(tx) = pending.remove(approval_id) {
             let _ = tx.send(response);
+        } else {
+            warn!(approval_id, "Stale approval callback (no pending request)");
         }
 
         // Acknowledge the callback and update the message
@@ -345,31 +347,37 @@ impl TelegramChannel {
             }
         });
 
-        let result = self.agent.handle_message(&session_id, &text, Some(status_tx)).await;
-        typing_cancel.cancel();
-        // status_tx is dropped here (moved into handle_message), ending the receiver task.
-        let _ = status_task.await;
+        // Spawn the agent work in a separate task so the dispatcher can continue
+        // processing other updates (especially callback queries for tool approval).
+        let agent = Arc::clone(&self.agent);
+        let chat_id = msg.chat.id;
+        tokio::spawn(async move {
+            let result = agent.handle_message(&session_id, &text, Some(status_tx)).await;
+            typing_cancel.cancel();
+            // status_tx is dropped here (moved into handle_message), ending the receiver task.
+            let _ = status_task.await;
 
-        match result {
-            Ok(reply) => {
-                let html = markdown_to_telegram_html(&reply);
-                // Split long messages (Telegram limit is 4096 chars)
-                let html_chunks = split_message(&html, 4096);
-                let plain_chunks = split_message(&reply, 4096);
-                for (i, html_chunk) in html_chunks.iter().enumerate() {
-                    let plain_chunk = plain_chunks.get(i).map(|s| s.as_str()).unwrap_or(html_chunk.as_str());
-                    if let Err(e) = send_html_or_fallback(&bot, msg.chat.id, html_chunk, plain_chunk).await {
-                        warn!("Failed to send Telegram message: {}", e);
+            match result {
+                Ok(reply) => {
+                    let html = markdown_to_telegram_html(&reply);
+                    // Split long messages (Telegram limit is 4096 chars)
+                    let html_chunks = split_message(&html, 4096);
+                    let plain_chunks = split_message(&reply, 4096);
+                    for (i, html_chunk) in html_chunks.iter().enumerate() {
+                        let plain_chunk = plain_chunks.get(i).map(|s| s.as_str()).unwrap_or(html_chunk.as_str());
+                        if let Err(e) = send_html_or_fallback(&bot, chat_id, html_chunk, plain_chunk).await {
+                            warn!("Failed to send Telegram message: {}", e);
+                        }
                     }
                 }
+                Err(e) => {
+                    warn!("Agent error: {}", e);
+                    let _ = bot
+                        .send_message(chat_id, format!("Error: {}", e))
+                        .await;
+                }
             }
-            Err(e) => {
-                warn!("Agent error: {}", e);
-                let _ = bot
-                    .send_message(msg.chat.id, format!("Error: {}", e))
-                    .await;
-            }
-        }
+        });
     }
 }
 
@@ -423,6 +431,8 @@ impl Channel for TelegramChannel {
             self.allowed_user_ids.first().copied().unwrap_or(0) as i64
         });
 
+        info!(session_id, command, chat_id, "Approval requested for command");
+
         let approval_id = uuid::Uuid::new_v4().to_string();
         let short_id = &approval_id[..8];
 
@@ -432,6 +442,7 @@ impl Channel for TelegramChannel {
         {
             let mut pending = self.pending_approvals.lock().await;
             pending.insert(approval_id.clone(), response_tx);
+            info!(approval_id = %short_id, pending_count = pending.len(), "Stored pending approval");
         }
 
         // Send inline keyboard
@@ -456,20 +467,26 @@ impl Channel for TelegramChannel {
             escaped_cmd, short_id
         );
 
-        if let Err(e) = self
+        match self
             .bot
             .send_message(ChatId(chat_id), &text)
             .parse_mode(ParseMode::Html)
             .reply_markup(keyboard)
             .await
         {
-            warn!("Failed to send approval request: {}", e);
-            // Remove pending approval since we couldn't ask
-            let mut pending = self.pending_approvals.lock().await;
-            pending.remove(&approval_id);
-            return Ok(ApprovalResponse::Deny);
+            Ok(_) => {
+                info!(approval_id = %short_id, "Approval message sent to Telegram");
+            }
+            Err(e) => {
+                warn!("Failed to send approval request: {}", e);
+                // Remove pending approval since we couldn't ask
+                let mut pending = self.pending_approvals.lock().await;
+                pending.remove(&approval_id);
+                return Ok(ApprovalResponse::Deny);
+            }
         }
 
+        info!(approval_id = %short_id, "Waiting for user approval response...");
         response_rx
             .await
             .map_err(|_| anyhow::anyhow!("Approval response channel closed"))
