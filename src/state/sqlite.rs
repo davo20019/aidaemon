@@ -11,6 +11,25 @@ use crate::traits::{Fact, Message, StateStore};
 
 use crate::memory::embeddings::EmbeddingService;
 
+/// Set restrictive file permissions (0600) on the database and WAL files.
+fn set_db_file_permissions(db_path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::Permissions::from_mode(0o600);
+    // Main database file
+    if let Err(e) = std::fs::set_permissions(db_path, mode.clone()) {
+        tracing::warn!("Failed to set permissions on {}: {}", db_path, e);
+    }
+    // WAL and shared-memory files created by SQLite in WAL journal mode
+    for suffix in &["-wal", "-shm"] {
+        let path = format!("{}{}", db_path, suffix);
+        if std::path::Path::new(&path).exists() {
+            if let Err(e) = std::fs::set_permissions(&path, mode.clone()) {
+                tracing::warn!("Failed to set permissions on {}: {}", path, e);
+            }
+        }
+    }
+}
+
 pub struct SqliteStateStore {
     pool: SqlitePool,
     working_memory: Arc<RwLock<HashMap<String, VecDeque<Message>>>>,
@@ -19,7 +38,7 @@ pub struct SqliteStateStore {
 }
 
 impl SqliteStateStore {
-    pub async fn new(db_path: &str, cap: usize, embedding_service: Arc<EmbeddingService>) -> anyhow::Result<Self> {
+    pub async fn new(db_path: &str, cap: usize, encryption_key: Option<&str>, embedding_service: Arc<EmbeddingService>) -> anyhow::Result<Self> {
         let opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
@@ -29,6 +48,33 @@ impl SqliteStateStore {
             .max_connections(5)
             .connect_with(opts)
             .await?;
+
+        // Set restrictive file permissions (owner-only read/write)
+        set_db_file_permissions(db_path);
+
+        // SQLCipher: set encryption key if provided and the feature is enabled
+        #[cfg(feature = "encryption")]
+        if let Some(key) = encryption_key {
+            if !key.is_empty() {
+                // PRAGMA key must be the first statement on a new connection.
+                // With a connection pool we set it here; sqlx runs it on the first acquired connection.
+                sqlx::query(&format!("PRAGMA key = '{}'", key.replace('\'', "''")))
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to set SQLCipher encryption key: {}", e))?;
+                tracing::info!("SQLCipher encryption enabled for database");
+            }
+        }
+
+        #[cfg(not(feature = "encryption"))]
+        if let Some(key) = encryption_key {
+            if !key.is_empty() {
+                anyhow::bail!(
+                    "Database encryption_key is set in config but aidaemon was compiled without the 'encryption' feature. \
+                     Rebuild with: cargo build --features encryption"
+                );
+            }
+        }
 
         // Create tables
         sqlx::query(
