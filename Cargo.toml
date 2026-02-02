@@ -39,6 +39,7 @@ shellexpand = "3"
 dirs = "6"
 fastembed = "4"
 tokio-util = "0.7.18"
+libc = "0.2"
 libsqlite3-sys = { version = "0.30", optional = true }
 
 [features]

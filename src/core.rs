@@ -80,7 +80,12 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(16);
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(SystemInfoTool),
-        Arc::new(TerminalTool::new(config.terminal.allowed_prefixes.clone(), approval_tx)),
+        Arc::new(TerminalTool::new(
+            config.terminal.allowed_prefixes.clone(),
+            approval_tx,
+            config.terminal.initial_timeout_secs,
+            config.terminal.max_output_chars,
+        )),
         Arc::new(RememberFactTool::new(state.clone())),
         Arc::new(ConfigManagerTool::new(config_path.clone())),
     ];

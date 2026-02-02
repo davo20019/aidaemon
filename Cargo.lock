@@ -48,6 +48,7 @@ dependencies = [
  "dotenvy",
  "fastembed",
  "futures",
+ "libc",
  "libsqlite3-sys",
  "reqwest",
  "serde",
