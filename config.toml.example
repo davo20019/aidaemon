@@ -6,7 +6,7 @@ base_url = "https://openrouter.ai/api/v1"
 [provider.models]
 primary = "openai/gpt-4o"
 fast = "openai/gpt-4o-mini"
-smart = "anthropic/claude-opus-4"
+smart = "anthropic/claude-sonnet-4"
 
 [telegram]
 bot_token = "123456:ABC-DEF..."
