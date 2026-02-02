@@ -128,14 +128,27 @@ fn default_consolidation_interval_hours() -> u64 {
 pub struct TerminalConfig {
     #[serde(default = "default_allowed_prefixes")]
     pub allowed_prefixes: Vec<String>,
+    #[serde(default = "default_initial_timeout_secs")]
+    pub initial_timeout_secs: u64,
+    #[serde(default = "default_max_output_chars")]
+    pub max_output_chars: usize,
 }
 
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             allowed_prefixes: default_allowed_prefixes(),
+            initial_timeout_secs: default_initial_timeout_secs(),
+            max_output_chars: default_max_output_chars(),
         }
     }
+}
+
+fn default_initial_timeout_secs() -> u64 {
+    30
+}
+fn default_max_output_chars() -> usize {
+    4000
 }
 
 fn default_allowed_prefixes() -> Vec<String> {
