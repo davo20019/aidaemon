@@ -160,7 +160,17 @@ impl MemoryManager {
         let system_prompt = "You are a memory consolidation system. Given a conversation excerpt, \
             extract durable facts worth remembering long-term. Output ONLY a JSON array: \
             [{\"category\": \"...\", \"key\": \"...\", \"value\": \"...\"}]. \
-            Categories: user, preference, project, technical, relationship. \
+            Categories:\n\
+            - user: Personal info (name, location, job)\n\
+            - preference: Tool, workflow, and communication preferences\n\
+            - project: Projects, tech stacks, goals\n\
+            - technical: Environment details, installed tools\n\
+            - relationship: Communication patterns with the AI\n\
+            - behavior: Observed tool-usage patterns and recurring workflows\n\n\
+            For \"behavior\", look for:\n\
+            - Which tools the user prefers for specific tasks\n\
+            - Recurring workflows or action sequences\n\
+            - Types of tasks frequently delegated\n\n\
             Only extract facts useful in future conversations. If nothing worth remembering, return [].";
 
         for (session_id, messages) in &sessions {

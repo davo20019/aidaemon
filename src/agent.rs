@@ -106,6 +106,8 @@ pub struct Agent {
     max_response_chars: usize,
     /// Timeout in seconds for sub-agent execution.
     timeout_secs: u64,
+    /// Maximum number of facts to inject into the system prompt.
+    max_facts: usize,
     /// Smart router for automatic model tier selection. None for sub-agents
     /// or when all tiers resolve to the same model.
     router: Option<Router>,
@@ -128,6 +130,7 @@ impl Agent {
         max_response_chars: usize,
         timeout_secs: u64,
         models_config: ModelsConfig,
+        max_facts: usize,
     ) -> Self {
         let fallback = model.clone();
         let router = Router::new(models_config);
@@ -157,6 +160,7 @@ impl Agent {
             max_iterations,
             max_response_chars,
             timeout_secs,
+            max_facts,
             router,
             model_override: RwLock::new(false),
         }
@@ -178,6 +182,7 @@ impl Agent {
         max_iterations: usize,
         max_response_chars: usize,
         timeout_secs: u64,
+        max_facts: usize,
     ) -> Self {
         let fallback = model.clone();
         Self {
@@ -194,6 +199,7 @@ impl Agent {
             max_iterations,
             max_response_chars,
             timeout_secs,
+            max_facts,
             router: None,
             model_override: RwLock::new(false),
         }
@@ -295,6 +301,7 @@ impl Agent {
                 self.max_iterations,
                 self.max_response_chars,
                 self.timeout_secs,
+                self.max_facts,
             ));
 
             // Close the loop: give the spawn tool a weak ref to the child.
@@ -316,6 +323,7 @@ impl Agent {
                 self.max_iterations,
                 self.max_response_chars,
                 self.timeout_secs,
+                self.max_facts,
             ));
 
             child.handle_message(&child_session, task, None).await
@@ -527,10 +535,25 @@ impl Agent {
         };
 
         // 2. Build system prompt ONCE before the loop: match skills + inject facts
-        let active_skills = skills::match_skills(&self.skills, user_text);
+        let mut active_skills = skills::match_skills(&self.skills, user_text);
         if !active_skills.is_empty() {
             let names: Vec<&str> = active_skills.iter().map(|s| s.name.as_str()).collect();
             info!(session_id, skills = ?names, "Matched skills for message");
+
+            // LLM confirmation: only when a distinct fast model is available via the router
+            if let Some(ref router) = self.router {
+                let fast_model = router.select(router::Tier::Fast);
+                match skills::confirm_skills(&*self.provider, fast_model, active_skills.clone(), user_text).await {
+                    Ok(confirmed) => {
+                        let confirmed_names: Vec<&str> = confirmed.iter().map(|s| s.name.as_str()).collect();
+                        info!(session_id, confirmed = ?confirmed_names, "LLM-confirmed skills");
+                        active_skills = confirmed;
+                    }
+                    Err(e) => {
+                        warn!("Skill confirmation failed, using keyword matches: {}", e);
+                    }
+                }
+            }
         }
         let facts = self.state.get_facts(None).await?;
         let system_prompt = skills::build_system_prompt(
@@ -538,6 +561,7 @@ impl Agent {
             &self.skills,
             &active_skills,
             &facts,
+            self.max_facts,
         );
 
         // 2b. Retrieve Context ONCE (Optimization)
