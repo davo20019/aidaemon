@@ -463,7 +463,16 @@ impl Agent {
                 .collect();
 
             let mut messages: Vec<Value> = deduped_msgs.iter()
-                .filter(|m| !(m.role == "tool" && m.tool_name.as_ref().map_or(true, |n| n.is_empty()))) // Skip broken tool results
+                // Skip tool results with empty/missing tool_name
+                .filter(|m| !(m.role == "tool" && m.tool_name.as_ref().map_or(true, |n| n.is_empty())))
+                // Skip tool results whose tool_call_id has no matching tool_call in an assistant message
+                .filter(|m| {
+                    if m.role == "tool" {
+                        m.tool_call_id.as_ref().map_or(false, |id| valid_tool_call_ids.contains(id.as_str()))
+                    } else {
+                        true
+                    }
+                })
                 .filter_map(|m| {
                     let mut obj = json!({
                         "role": m.role,
@@ -503,7 +512,9 @@ impl Agent {
                         }
                     }
                     if let Some(name) = &m.tool_name {
-                        obj["name"] = json!(name);
+                        if !name.is_empty() {
+                            obj["name"] = json!(name);
+                        }
                     }
                     if let Some(tcid) = &m.tool_call_id {
                         obj["tool_call_id"] = json!(tcid);
@@ -511,7 +522,21 @@ impl Agent {
                     Some(obj)
                 })
                 .collect();
-            
+
+            // Final safety: drop any tool-role messages that still lack a "name" field
+            messages.retain(|m| {
+                if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
+                    let has_name = m.get("name").and_then(|n| n.as_str()).map_or(false, |n| !n.is_empty());
+                    if !has_name {
+                        warn!("Dropping tool message with missing/empty name: tool_call_id={:?}",
+                            m.get("tool_call_id"));
+                    }
+                    has_name
+                } else {
+                    true
+                }
+            });
+
             messages.insert(0, json!({
                 "role": "system",
                 "content": system_prompt,
