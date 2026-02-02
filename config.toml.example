@@ -51,6 +51,25 @@ health_port = 8080
 # max_response_chars = 8000
 # timeout_secs = 300       # 5 minute timeout per sub-agent
 
+# [cli_agents]
+# enabled = true
+# timeout_secs = 600           # default timeout per invocation
+# max_output_chars = 16000     # max output before truncation
+#
+# # Pre-configured tools (auto-discovered on startup via `which`)
+# # Override or add your own:
+# [cli_agents.tools.claude]
+# command = "claude"
+# args = ["-p", "--output-format", "json"]
+#
+# [cli_agents.tools.gemini]
+# command = "gemini"
+# args = ["-p", "--output-format", "json", "--sandbox=false"]
+#
+# [cli_agents.tools.codex]
+# command = "codex"
+# args = ["exec", "--json", "--full-auto"]
+
 # [mcp.filesystem]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]

@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub skills: SkillsConfig,
     #[serde(default)]
     pub subagents: SubagentsConfig,
+    #[serde(default)]
+    pub cli_agents: CliAgentsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -306,6 +308,49 @@ fn default_subagents_max_response_chars() -> usize {
 }
 fn default_subagents_timeout_secs() -> u64 {
     300
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CliAgentsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cli_agents_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_cli_agents_max_output_chars")]
+    pub max_output_chars: usize,
+    #[serde(default)]
+    pub tools: HashMap<String, CliToolConfig>,
+}
+
+impl Default for CliAgentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_cli_agents_timeout_secs(),
+            max_output_chars: default_cli_agents_max_output_chars(),
+            tools: HashMap::new(),
+        }
+    }
+}
+
+fn default_cli_agents_timeout_secs() -> u64 {
+    600
+}
+fn default_cli_agents_max_output_chars() -> usize {
+    16000
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CliToolConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub max_output_chars: Option<usize>,
 }
 
 impl AppConfig {

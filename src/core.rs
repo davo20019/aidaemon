@@ -15,7 +15,7 @@ use crate::memory::manager::MemoryManager;
 use crate::router::{Router, Tier};
 use crate::skills;
 use crate::state::SqliteStateStore;
-use crate::tools::{BrowserTool, ConfigManagerTool, RememberFactTool, SpawnAgentTool, SystemInfoTool, TerminalTool};
+use crate::tools::{BrowserTool, CliAgentTool, ConfigManagerTool, RememberFactTool, SpawnAgentTool, SystemInfoTool, TerminalTool};
 use crate::traits::Tool;
 use crate::triggers::{self, TriggerManager};
 
@@ -85,6 +85,17 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     if config.browser.enabled {
         tools.push(Arc::new(BrowserTool::new(config.browser.clone(), media_tx.clone())));
         info!("Browser tool enabled");
+    }
+
+    // CLI agent tools (conditional)
+    if config.cli_agents.enabled {
+        let cli_tool = CliAgentTool::discover(config.cli_agents.clone()).await;
+        if cli_tool.has_tools() {
+            tools.push(Arc::new(cli_tool));
+            info!("CLI agent tool enabled");
+        } else {
+            info!("CLI agents enabled but no tools found on system");
+        }
     }
 
     // 5. MCP tools
@@ -222,6 +233,12 @@ fn build_base_system_prompt(config: &AppConfig) -> String {
         ""
     };
 
+    let cli_agent_table_row = if config.cli_agents.enabled {
+        "\n| Coding tasks, refactoring, debugging | cli_agent | terminal (running AI tools manually) |"
+    } else {
+        ""
+    };
+
     let spawn_tool_doc = if config.subagents.enabled {
         format!(
             "\n- `spawn_agent`: Spawn a sub-agent to handle a complex sub-task autonomously. \
@@ -233,6 +250,16 @@ fn build_base_system_prompt(config: &AppConfig) -> String {
         )
     } else {
         String::new()
+    };
+
+    let cli_agent_tool_doc = if config.cli_agents.enabled {
+        "\n- `cli_agent`: Delegate tasks to CLI-based AI coding agents (e.g. Claude Code, Gemini CLI, Codex). \
+        These are full AI agents that can read/write files, run commands, and solve complex coding tasks. \
+        Parameters: `tool` (which agent to use), `prompt` (the task), `working_dir` (optional project directory). \
+        Prefer this over running AI CLI tools via terminal — it handles timeouts, output parsing, and \
+        non-interactive mode automatically."
+    } else {
+        ""
     };
 
     format!(
@@ -257,7 +284,7 @@ Narrate your plan before executing — tell the user what you're about to do and
 | Run commands, scripts | terminal | — |
 | Get system specs | system_info | terminal (uname, etc.) |
 | Store user info | remember_fact | — |
-| Fix config | manage_config | terminal (editing files) |{spawn_table_row}
+| Fix config | manage_config | terminal (editing files) |{spawn_table_row}{cli_agent_table_row}
 
 ## Tools
 - `terminal`: Run ANY command available on this system. This includes shell commands, \
@@ -273,7 +300,7 @@ pre-approved list. The user can allow them with one tap.
 screenshot (capture page and send as photo), click (click element by CSS selector), \
 fill (type text into input), get_text (extract visible text), execute_js (run JavaScript), \
 wait (wait for element to appear), close (end browser session). The browser session persists \
-across tool calls so you can chain multi-step workflows (e.g. navigate -> fill form -> click -> screenshot).{spawn_tool_doc}
+across tool calls so you can chain multi-step workflows (e.g. navigate -> fill form -> click -> screenshot).{spawn_tool_doc}{cli_agent_tool_doc}
 
 ## Self-Maintenance
 You are responsible for your own maintenance. When you encounter errors:
