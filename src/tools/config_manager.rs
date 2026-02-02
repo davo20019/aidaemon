@@ -9,7 +9,7 @@ use crate::config::AppConfig;
 use crate::traits::Tool;
 
 /// Key names that contain secrets and must be redacted before showing to the LLM.
-const SENSITIVE_KEYS: &[&str] = &["api_key", "bot_token", "password"];
+const SENSITIVE_KEYS: &[&str] = &["api_key", "bot_token", "password", "encryption_key"];
 
 /// Placeholder shown instead of actual secret values.
 const REDACTED: &str = "***REDACTED***";

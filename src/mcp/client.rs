@@ -1,10 +1,45 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::warn;
+
+/// Maximum size (in bytes) for a single MCP JSON-RPC response line.
+/// Responses exceeding this are truncated to prevent memory exhaustion.
+const MAX_RESPONSE_BYTES: usize = 512 * 1024; // 512 KiB
+
+/// Timeout for a single JSON-RPC round-trip (request + response).
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Timeout for the initial handshake (initialize + notifications/initialized).
+const INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Environment variables safe to pass to MCP server subprocesses.
+/// Everything else is stripped to prevent credential leakage.
+const SAFE_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "SHELL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_RUNTIME_DIR",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    // Node.js / npm needs these to find global packages
+    "NODE_PATH",
+    "NPM_CONFIG_PREFIX",
+    "NVM_DIR",
+];
 
 /// JSON-RPC client over stdio for MCP protocol.
 pub struct McpClient {
@@ -16,9 +51,19 @@ pub struct McpClient {
 
 impl McpClient {
     /// Spawn an MCP server subprocess and initialize the connection.
+    ///
+    /// The subprocess environment is scrubbed to a safe allowlist to prevent
+    /// credential leakage (API keys, tokens, etc.).
     pub async fn spawn(command: &str, args: &[String]) -> anyhow::Result<Self> {
+        // Build a minimal environment from the safe allowlist
+        let safe_env: Vec<(String, String)> = std::env::vars()
+            .filter(|(k, _)| SAFE_ENV_KEYS.iter().any(|safe| safe == k))
+            .collect();
+
         let mut child = Command::new(command)
             .args(args)
+            .env_clear()
+            .envs(safe_env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -63,20 +108,20 @@ impl McpClient {
             next_id: AtomicU64::new(1),
         };
 
-        // Send initialize request
-        let _resp = client
-            .send_request(
-                "initialize",
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "aidaemon",
-                        "version": "0.1.0"
-                    }
-                }),
-            )
-            .await?;
+        // Send initialize request (with init timeout)
+        let _resp = tokio::time::timeout(INIT_TIMEOUT, client.send_request_inner(
+            "initialize",
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "aidaemon",
+                    "version": "0.1.0"
+                }
+            }),
+        ))
+        .await
+        .map_err(|_| anyhow::anyhow!("MCP server initialization timed out after {:?}", INIT_TIMEOUT))??;
 
         // Send initialized notification
         client.send_notification("notifications/initialized", json!({})).await?;
@@ -84,8 +129,15 @@ impl McpClient {
         Ok(client)
     }
 
-    /// Send a JSON-RPC request and read the response.
-    async fn send_request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+    /// Send a JSON-RPC request with a timeout and read the response.
+    pub async fn send_request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        tokio::time::timeout(RPC_TIMEOUT, self.send_request_inner(method, params))
+            .await
+            .map_err(|_| anyhow::anyhow!("MCP RPC call '{}' timed out after {:?}", method, RPC_TIMEOUT))?
+    }
+
+    /// Inner send without timeout (used by both public send_request and init).
+    async fn send_request_inner(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let request = json!({
             "jsonrpc": "2.0",
@@ -103,11 +155,22 @@ impl McpClient {
             stdin.flush().await?;
         }
 
-        // Read response line
+        // Read response line with size limit to prevent memory exhaustion
         let mut response_line = String::new();
         {
             let mut stdout = self.stdout.lock().await;
-            stdout.read_line(&mut response_line).await?;
+            let bytes_read = stdout.read_line(&mut response_line).await?;
+            if bytes_read == 0 {
+                anyhow::bail!("MCP server closed stdout (empty response)");
+            }
+        }
+
+        if response_line.len() > MAX_RESPONSE_BYTES {
+            anyhow::bail!(
+                "MCP response exceeded size limit ({} > {} bytes)",
+                response_line.len(),
+                MAX_RESPONSE_BYTES
+            );
         }
 
         let response: Value = serde_json::from_str(&response_line)?;
