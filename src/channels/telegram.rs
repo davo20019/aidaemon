@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode};
 use tokio::sync::Mutex;
@@ -12,6 +13,7 @@ use tracing::{info, warn};
 use crate::agent::{Agent, StatusUpdate};
 use crate::channels::SessionMap;
 use crate::config::AppConfig;
+use crate::tasks::TaskRegistry;
 use crate::traits::{Channel, ChannelCapabilities};
 use crate::types::{ApprovalResponse, MediaMessage};
 
@@ -24,6 +26,8 @@ pub struct TelegramChannel {
     pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
     /// Shared session map — maps session_id to channel name.
     session_map: SessionMap,
+    /// Task registry for tracking background agent work.
+    task_registry: Arc<TaskRegistry>,
 }
 
 impl TelegramChannel {
@@ -33,6 +37,7 @@ impl TelegramChannel {
         agent: Arc<Agent>,
         config_path: PathBuf,
         session_map: SessionMap,
+        task_registry: Arc<TaskRegistry>,
     ) -> Self {
         let bot = Bot::new(bot_token);
         Self {
@@ -42,6 +47,7 @@ impl TelegramChannel {
             config_path,
             pending_approvals: Mutex::new(HashMap::new()),
             session_map,
+            task_registry,
         }
     }
 
@@ -247,6 +253,47 @@ impl TelegramChannel {
                 // If exec fails, we're still alive
                 "Restart failed. You may need to restart manually.".to_string()
             }
+            "/tasks" => {
+                let session_id = msg.chat.id.0.to_string();
+                let entries = self.task_registry.list_for_session(&session_id).await;
+                if entries.is_empty() {
+                    "No tasks found.".to_string()
+                } else {
+                    let lines: Vec<String> = entries
+                        .iter()
+                        .map(|e| {
+                            let elapsed = match e.finished_at {
+                                Some(fin) => {
+                                    let d = fin - e.started_at;
+                                    format!("{}s", d.num_seconds())
+                                }
+                                None => {
+                                    let d = Utc::now() - e.started_at;
+                                    format!("{}s elapsed", d.num_seconds())
+                                }
+                            };
+                            format!("#{} [{}] {} ({})", e.id, e.status, e.description, elapsed)
+                        })
+                        .collect();
+                    lines.join("\n")
+                }
+            }
+            "/cancel" => {
+                if arg.is_empty() {
+                    "Usage: /cancel <task-id>\nExample: /cancel 1".to_string()
+                } else {
+                    match arg.parse::<u64>() {
+                        Ok(task_id) => {
+                            if self.task_registry.cancel(task_id).await {
+                                format!("Task #{} cancelled.", task_id)
+                            } else {
+                                format!("Task #{} not found or not running.", task_id)
+                            }
+                        }
+                        Err(_) => "Invalid task ID. Usage: /cancel <task-id>".to_string(),
+                    }
+                }
+            }
             "/help" | "/start" => {
                 "Available commands:\n\
                 /model — Show current model\n\
@@ -255,6 +302,8 @@ impl TelegramChannel {
                 /auto — Re-enable automatic model routing by query complexity\n\
                 /reload — Reload config.toml (applies model changes, re-enables auto-routing)\n\
                 /restart — Restart the daemon (picks up new binary, config, MCP servers)\n\
+                /tasks — List running and recent tasks\n\
+                /cancel <id> — Cancel a running task\n\
                 /help — Show this help message"
                     .to_string()
             }
@@ -347,18 +396,27 @@ impl TelegramChannel {
             }
         });
 
+        // Register this task for tracking and cancellation.
+        let description: String = text.chars().take(80).collect();
+        let (task_id, cancel_token) = self.task_registry.register(&session_id, &description).await;
+        let registry = Arc::clone(&self.task_registry);
+
         // Spawn the agent work in a separate task so the dispatcher can continue
         // processing other updates (especially callback queries for tool approval).
         let agent = Arc::clone(&self.agent);
         let chat_id = msg.chat.id;
         tokio::spawn(async move {
-            let result = agent.handle_message(&session_id, &text, Some(status_tx)).await;
+            let result = tokio::select! {
+                r = agent.handle_message(&session_id, &text, Some(status_tx)) => r,
+                _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
+            };
             typing_cancel.cancel();
             // status_tx is dropped here (moved into handle_message), ending the receiver task.
             let _ = status_task.await;
 
             match result {
                 Ok(reply) => {
+                    registry.complete(task_id).await;
                     let html = markdown_to_telegram_html(&reply);
                     // Split long messages (Telegram limit is 4096 chars)
                     let html_chunks = split_message(&html, 4096);
@@ -371,6 +429,8 @@ impl TelegramChannel {
                     }
                 }
                 Err(e) => {
+                    let error_msg = e.to_string();
+                    registry.fail(task_id, &error_msg).await;
                     warn!("Agent error: {}", e);
                     let _ = bot
                         .send_message(chat_id, format!("Error: {}", e))

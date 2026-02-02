@@ -11,6 +11,7 @@ mod skills;
 mod state;
 mod tools;
 mod traits;
+mod tasks;
 mod types;
 mod triggers;
 mod wizard;
