@@ -590,6 +590,38 @@ impl Agent {
                 }
             });
 
+            // Fixup: merge consecutive same-role messages to satisfy Gemini's
+            // strict ordering constraint (assistant must follow user or tool).
+            // This can happen when filtering removes tool messages between two
+            // assistant turns, or when pinned memories create adjacency gaps.
+            {
+                let mut i = 1;
+                while i < messages.len() {
+                    let prev_role = messages[i - 1].get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    let curr_role = messages[i].get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if prev_role == curr_role && (curr_role == "assistant" || curr_role == "user") {
+                        // Merge content of messages[i] into messages[i-1]
+                        let curr_content = messages[i].get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                        let prev_content = messages[i - 1].get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                        if !curr_content.is_empty() {
+                            let merged = if prev_content.is_empty() {
+                                curr_content
+                            } else {
+                                format!("{}\n{}", prev_content, curr_content)
+                            };
+                            messages[i - 1]["content"] = json!(merged);
+                        }
+                        // Carry over tool_calls from the later message if present
+                        if let Some(tc) = messages[i].get("tool_calls").cloned() {
+                            messages[i - 1]["tool_calls"] = tc;
+                        }
+                        messages.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+
             messages.insert(0, json!({
                 "role": "system",
                 "content": system_prompt,
