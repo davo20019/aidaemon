@@ -750,6 +750,12 @@ impl Agent {
         let enriched_args = match serde_json::from_str::<Value>(arguments) {
             Ok(Value::Object(mut map)) => {
                 map.insert("_session_id".to_string(), json!(session_id));
+                // Mark as untrusted if this session originated from an automated
+                // trigger (e.g., email) rather than direct user interaction.
+                // This forces tools like terminal to require explicit approval.
+                if is_trigger_session(session_id) {
+                    map.insert("_untrusted_source".to_string(), json!(true));
+                }
                 serde_json::to_string(&map)?
             }
             _ => arguments.to_string(),
@@ -761,4 +767,10 @@ impl Agent {
         }
         anyhow::bail!("Unknown tool: {}", name)
     }
+}
+
+/// Check if a session ID indicates it was triggered by an automated source
+/// (e.g., email trigger) rather than direct user interaction via Telegram.
+fn is_trigger_session(session_id: &str) -> bool {
+    session_id.contains("trigger") || session_id.starts_with("event_")
 }

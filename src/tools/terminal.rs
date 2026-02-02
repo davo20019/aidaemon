@@ -27,6 +27,24 @@ pub struct TerminalTool {
     approval_tx: mpsc::Sender<ApprovalRequest>,
 }
 
+/// Check if a command string contains shell operators that could chain
+/// additional commands or redirect I/O in unexpected ways.
+fn contains_shell_operator(cmd: &str) -> bool {
+    // Single-char operators
+    for ch in [';', '|', '`', '\n'] {
+        if cmd.contains(ch) {
+            return true;
+        }
+    }
+    // Multi-char operators
+    for op in ["&&", "||", "$(", ">(", "<("] {
+        if cmd.contains(op) {
+            return true;
+        }
+    }
+    false
+}
+
 impl TerminalTool {
     pub fn new(
         allowed_prefixes: Vec<String>,
@@ -38,15 +56,32 @@ impl TerminalTool {
         }
     }
 
+    /// Check if a command is allowed to run without user approval.
+    ///
+    /// Uses word-boundary matching so that an allowed prefix "ls" matches
+    /// "ls -la" but not "lsblk". Commands containing shell operators
+    /// (`;`, `|`, `&&`, `||`, `$(…)`, backticks) always require approval
+    /// since they can chain arbitrary commands.
     async fn is_allowed(&self, command: &str) -> bool {
         let prefixes = self.allowed_prefixes.read().await;
         if prefixes.iter().any(|p| p == "*") {
             return true;
         }
         let trimmed = command.trim();
-        prefixes
-            .iter()
-            .any(|prefix| trimmed.starts_with(prefix.as_str()))
+
+        // Commands with shell operators can chain arbitrary commands —
+        // always require approval regardless of the base command.
+        if contains_shell_operator(trimmed) {
+            return false;
+        }
+
+        // Match the command against allowed prefixes with word boundary:
+        // prefix must match the full command or be followed by whitespace.
+        prefixes.iter().any(|prefix| {
+            trimmed == prefix.as_str()
+                || trimmed.starts_with(&format!("{} ", prefix))
+                || trimmed.starts_with(&format!("{}\t", prefix))
+        })
     }
 
     async fn request_approval(&self, command: &str) -> anyhow::Result<ApprovalResponse> {
@@ -80,6 +115,10 @@ impl TerminalTool {
 #[derive(Deserialize)]
 struct TerminalArgs {
     command: String,
+    /// When true, the command originates from an untrusted automated source
+    /// (e.g., email trigger) and must always go through user approval.
+    #[serde(default)]
+    _untrusted_source: bool,
 }
 
 #[async_trait]
@@ -112,7 +151,16 @@ impl Tool for TerminalTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: TerminalArgs = serde_json::from_str(arguments)?;
 
-        if !self.is_allowed(&args.command).await {
+        // Untrusted sources (e.g. email triggers) always require approval,
+        // even for commands that would normally be auto-allowed by prefix.
+        let needs_approval = if args._untrusted_source {
+            info!(command = %args.command, "Forcing approval: untrusted source");
+            true
+        } else {
+            !self.is_allowed(&args.command).await
+        };
+
+        if needs_approval {
             // Request approval from the user via Telegram
             match self.request_approval(&args.command).await {
                 Ok(ApprovalResponse::AllowOnce) => {

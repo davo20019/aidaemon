@@ -8,6 +8,12 @@ use tracing::{info, warn};
 use crate::config::AppConfig;
 use crate::traits::Tool;
 
+/// Key names that contain secrets and must be redacted before showing to the LLM.
+const SENSITIVE_KEYS: &[&str] = &["api_key", "bot_token", "password"];
+
+/// Placeholder shown instead of actual secret values.
+const REDACTED: &str = "***REDACTED***";
+
 pub struct ConfigManagerTool {
     config_path: PathBuf,
 }
@@ -126,11 +132,18 @@ impl Tool for ConfigManagerTool {
         match args.action.as_str() {
             "read" => {
                 let content = tokio::fs::read_to_string(&self.config_path).await?;
-                Ok(format!("Current config.toml:\n\n{}", content))
+                let mut doc: toml::Value = content.parse()?;
+                redact_secrets(&mut doc);
+                let redacted = toml::to_string_pretty(&doc)?;
+                Ok(format!("Current config.toml (secrets redacted):\n\n{}", redacted))
             }
             "get" => {
                 if args.key.is_empty() {
                     return Ok("Error: 'key' is required for 'get' action.".to_string());
+                }
+                // Block direct reads of sensitive keys
+                if is_sensitive_key(&args.key) {
+                    return Ok(format!("{} = \"{}\" (redacted for security)", args.key, REDACTED));
                 }
                 let content = tokio::fs::read_to_string(&self.config_path).await?;
                 let doc: toml::Value = content.parse()?;
@@ -219,4 +232,31 @@ fn set_toml_value(table: &mut toml::Table, path: &str, value: toml::Value) -> an
     let last_key = parts.last().unwrap();
     current.insert(last_key.to_string(), value);
     Ok(())
+}
+
+/// Check if the last segment of a dotted key path is a sensitive key name.
+fn is_sensitive_key(path: &str) -> bool {
+    let last = path.rsplit('.').next().unwrap_or(path);
+    SENSITIVE_KEYS.iter().any(|&k| k == last)
+}
+
+/// Recursively walk a TOML value and replace sensitive keys with a redacted placeholder.
+fn redact_secrets(value: &mut toml::Value) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, val) in table.iter_mut() {
+                if SENSITIVE_KEYS.iter().any(|&s| s == key.as_str()) {
+                    *val = toml::Value::String(REDACTED.to_string());
+                } else {
+                    redact_secrets(val);
+                }
+            }
+        }
+        toml::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                redact_secrets(item);
+            }
+        }
+        _ => {}
+    }
 }
