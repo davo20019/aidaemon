@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[cfg(feature = "browser")]
 use dialoguer::{Confirm, Input, Select};
 #[cfg(not(feature = "browser"))]
-use dialoguer::{Input, Select};
+use dialoguer::{Confirm, Input, Select};
 
 struct ProviderPreset {
     name: &'static str,
@@ -16,6 +16,8 @@ struct ProviderPreset {
     fast: &'static str,
     smart: &'static str,
     needs_key: bool,
+    key_url: &'static str,
+    key_hint: &'static str,
 }
 
 const PRESETS: &[ProviderPreset] = &[
@@ -27,33 +29,41 @@ const PRESETS: &[ProviderPreset] = &[
         fast: "gpt-4o-mini",
         smart: "gpt-4o",
         needs_key: true,
+        key_url: "https://platform.openai.com/api-keys",
+        key_hint: "Starts with \"sk-\"",
     },
     ProviderPreset {
         name: "Anthropic (Native)",
-        base_url: "https://api.anthropic.com/v1", // managed by provider but good for documentation
+        base_url: "https://api.anthropic.com/v1",
         kind: "anthropic",
-        primary: "claude-3-5-sonnet-20240620",
-        fast: "claude-3-haiku-20240307",
-        smart: "claude-3-opus-20240229",
+        primary: "claude-sonnet-4-20250514",
+        fast: "claude-haiku-4-20250414",
+        smart: "claude-opus-4-20250414",
         needs_key: true,
+        key_url: "https://console.anthropic.com/settings/keys",
+        key_hint: "Starts with \"sk-ant-\"",
     },
     ProviderPreset {
         name: "Anthropic (via OpenRouter)",
         base_url: "https://openrouter.ai/api/v1",
         kind: "openai_compatible",
-        primary: "anthropic/claude-3.5-sonnet",
-        fast: "anthropic/claude-3-haiku",
-        smart: "anthropic/claude-3-opus",
+        primary: "anthropic/claude-sonnet-4",
+        fast: "anthropic/claude-haiku-4",
+        smart: "anthropic/claude-opus-4",
         needs_key: true,
+        key_url: "https://openrouter.ai/keys",
+        key_hint: "Starts with \"sk-or-\"",
     },
     ProviderPreset {
         name: "Google AI Studio (Native)",
-        base_url: "", // not used — GoogleGenAiProvider has its own base URL
+        base_url: "",
         kind: "google_genai",
         primary: "gemini-3-flash-preview",
         fast: "gemini-2.5-flash-lite",
         smart: "gemini-3-pro-preview",
         needs_key: true,
+        key_url: "https://aistudio.google.com/apikey",
+        key_hint: "Get a free API key from Google AI Studio",
     },
     ProviderPreset {
         name: "OpenRouter",
@@ -61,8 +71,10 @@ const PRESETS: &[ProviderPreset] = &[
         kind: "openai_compatible",
         primary: "openai/gpt-4o",
         fast: "openai/gpt-4o-mini",
-        smart: "anthropic/claude-3.5-sonnet",
+        smart: "anthropic/claude-sonnet-4",
         needs_key: true,
+        key_url: "https://openrouter.ai/keys",
+        key_hint: "Starts with \"sk-or-\". Gives access to many providers in one key.",
     },
     ProviderPreset {
         name: "Ollama (local)",
@@ -72,6 +84,8 @@ const PRESETS: &[ProviderPreset] = &[
         fast: "llama3.1",
         smart: "llama3.1",
         needs_key: false,
+        key_url: "",
+        key_hint: "",
     },
     ProviderPreset {
         name: "Custom (OpenAI Compatible)",
@@ -81,15 +95,25 @@ const PRESETS: &[ProviderPreset] = &[
         fast: "model-name",
         smart: "model-name",
         needs_key: true,
+        key_url: "",
+        key_hint: "",
     },
 ];
 
-pub fn run_wizard(config_path: &Path) -> anyhow::Result<()> {
+/// Returns true if the wizard ran and we should start the daemon immediately.
+pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     println!();
-    println!("=== aidaemon Setup Wizard ===");
+    println!("  Welcome to aidaemon!");
+    println!("  --------------------");
+    println!("  Your personal AI agent that runs 24/7 in the background.");
+    println!("  This wizard will get you up and running in a few steps.");
     println!();
 
-    // 1. Provider selection
+    // ── Step 1: Provider ────────────────────────────────────────────────
+    println!("  STEP 1 of 3 — Choose your AI provider");
+    println!("  ──────────────────────────────────────");
+    println!();
+
     let provider_names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
     let selection = Select::new()
         .with_prompt("Select your LLM provider")
@@ -104,28 +128,51 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<()> {
     let mut smart = preset.smart.to_string();
 
     // Custom base URL
-    if preset.name == "Custom" {
+    if preset.name == "Custom (OpenAI Compatible)" {
         base_url = Input::new()
             .with_prompt("Base URL (OpenAI-compatible endpoint)")
             .default(base_url)
             .interact_text()?;
     }
 
-    // 2. API key
+    // API key with guidance
     let api_key = if preset.needs_key {
-        Input::new()
-            .with_prompt(format!("Paste your API key for {}", preset.name))
-            .interact_text()?
+        println!();
+        if !preset.key_url.is_empty() {
+            println!("  Get your API key here: {}", preset.key_url);
+        }
+        if !preset.key_hint.is_empty() {
+            println!("  Hint: {}", preset.key_hint);
+        }
+        println!();
+
+        let key: String = Input::new()
+            .with_prompt(format!("Paste your {} API key", preset.name))
+            .interact_text()?;
+
+        // Validate API key
+        println!();
+        println!("  Checking API key...");
+        match validate_api_key(&key, preset.kind, &base_url) {
+            Ok(()) => println!("  API key is valid!"),
+            Err(e) => {
+                println!("  Warning: Could not verify API key ({})", e);
+                println!("  The key has been saved — you can fix it later in config.toml.");
+            }
+        }
+
+        key
     } else {
         "ollama".to_string()
     };
 
-    // 3. Ollama auto-discovery
+    // Ollama auto-discovery
     if preset.name == "Ollama (local)" {
-        println!("Checking for local Ollama models...");
+        println!();
+        println!("  Checking for local Ollama models...");
         match discover_ollama_models() {
             Ok(models) if !models.is_empty() => {
-                println!("Found {} model(s):", models.len());
+                println!("  Found {} model(s):", models.len());
                 let model_selection = Select::new()
                     .with_prompt("Select primary model")
                     .items(&models)
@@ -135,13 +182,13 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<()> {
                 fast = primary.clone();
                 smart = primary.clone();
             }
-            Ok(_) => println!("No models found. Using default: {}", primary),
-            Err(e) => println!("Could not reach Ollama: {}. Using default.", e),
+            Ok(_) => println!("  No models found. Using default: {}", primary),
+            Err(e) => println!("  Could not reach Ollama: {}. Using default.", e),
         }
     }
 
     // Custom model names
-    if preset.name == "Custom" {
+    if preset.name == "Custom (OpenAI Compatible)" {
         primary = Input::new()
             .with_prompt("Primary model name")
             .default(primary)
@@ -156,16 +203,51 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<()> {
             .interact_text()?;
     }
 
-    // 4. Telegram setup
+    // ── Step 2: Telegram ────────────────────────────────────────────────
     println!();
+    println!("  STEP 2 of 3 — Connect Telegram");
+    println!("  ───────────────────────────────");
+    println!();
+    println!("  You'll control your AI agent through a Telegram bot.");
+    println!("  Setting this up takes about 60 seconds:");
+    println!();
+    println!("  1. Open Telegram and search for @BotFather");
+    println!("  2. Send /newbot and follow the prompts to name your bot");
+    println!("  3. BotFather will give you a token like 123456:ABC-DEF...");
+    println!();
+
     let bot_token: String = Input::new()
-        .with_prompt("Telegram bot token (from @BotFather)")
+        .with_prompt("Paste your bot token from BotFather")
         .interact_text()?;
 
+    // Validate bot token
+    println!();
+    println!("  Checking bot token...");
+    match validate_bot_token(&bot_token) {
+        Ok(bot_name) => {
+            println!("  Connected to bot @{}", bot_name);
+        }
+        Err(e) => {
+            println!("  Warning: Could not verify bot token ({})", e);
+            println!("  The token has been saved — you can fix it later in config.toml.");
+        }
+    }
+
+    println!();
+    println!("  Now we need your Telegram user ID (a number) so only YOU can");
+    println!("  control the bot. Here's how to find it:");
+    println!();
+    println!("  Option A: Search for @userinfobot on Telegram, send /start");
+    println!("  Option B: Search for @RawDataBot on Telegram, send /start");
+    println!("  Either will reply with your numeric user ID.");
+    println!();
+
     let user_id: u64 = Input::new()
-        .with_prompt("Your Telegram user ID (for authorization, numeric)")
+        .with_prompt("Your Telegram user ID (numeric)")
         .validate_with(|input: &String| -> Result<(), &str> {
-            input.trim().parse::<u64>()
+            input
+                .trim()
+                .parse::<u64>()
                 .map(|_| ())
                 .map_err(|_| "Please enter a valid numeric user ID")
         })
@@ -174,7 +256,11 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<()> {
         .parse()
         .expect("already validated");
 
-    // 5. Browser tool setup
+    // ── Step 3: Browser (optional) ──────────────────────────────────────
+    println!();
+    println!("  STEP 3 of 3 — Optional features");
+    println!("  ────────────────────────────────");
+
     let browser_section;
     #[cfg(feature = "browser")]
     {
@@ -219,13 +305,17 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<()> {
                     profile_name = selected.dir_name.clone();
 
                     println!();
-                    println!("NOTE: Chrome locks its profile while running.");
-                    println!("The agent will only be able to use the browser when Chrome is closed,");
-                    println!("or you can copy the profile to a separate directory.");
+                    println!("  NOTE: Chrome locks its profile while running.");
+                    println!(
+                        "  The agent will only be able to use the browser when Chrome is closed,"
+                    );
+                    println!("  or you can copy the profile to a separate directory.");
                 }
             } else {
-                println!("No Chrome installation detected. The browser will use a fresh profile.");
-                println!("You can set user_data_dir in config.toml later to reuse an existing profile.");
+                println!(
+                    "  No Chrome installation detected. The browser will use a fresh profile."
+                );
+                println!("  You can set user_data_dir in config.toml later to reuse an existing profile.");
             }
 
             let headless = Confirm::new()
@@ -246,11 +336,11 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<()> {
     #[cfg(not(feature = "browser"))]
     {
         println!();
-        println!("NOTE: Browser tool available with `cargo install aidaemon --features browser`");
+        println!("  TIP: Browser tool available with `cargo install aidaemon --features browser`");
         browser_section = String::new();
     }
 
-    // 6. Write config.toml
+    // ── Write config ────────────────────────────────────────────────────
     let base_url_line = if base_url.is_empty() {
         String::new()
     } else {
@@ -292,17 +382,119 @@ health_port = 8080
 # [mcp.filesystem]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-"#
-    , preset.kind);
+"#,
+        preset.kind
+    );
 
-    std::fs::write(config_path, config)?;
+    std::fs::write(config_path, &config)?;
 
     println!();
-    println!("Setup complete! Config written to {}", config_path.display());
-    println!("Run `aidaemon` to start.");
+    println!(
+        "  Setup complete! Config saved to {}",
+        config_path.display()
+    );
+    println!();
+    println!(
+        "  You can edit {} anytime to change settings.",
+        config_path.display()
+    );
+    println!("  Run `aidaemon install-service` to start on boot (systemd/launchd).");
     println!();
 
-    Ok(())
+    // Ask whether to start now
+    let start_now = Confirm::new()
+        .with_prompt("Start aidaemon now?")
+        .default(true)
+        .interact()?;
+
+    if start_now {
+        println!();
+        println!("  Starting... Send a message to your bot on Telegram!");
+        println!();
+    } else {
+        println!();
+        println!("  Run `aidaemon` whenever you're ready to start.");
+        println!();
+    }
+
+    Ok(start_now)
+}
+
+/// Validate an API key by making a lightweight request to the provider.
+fn validate_api_key(key: &str, kind: &str, base_url: &str) -> anyhow::Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    match kind {
+        "anthropic" => {
+            // Anthropic: hit /v1/messages with an empty body to see if auth works.
+            // A 400 (bad request) means the key is valid; 401 means invalid.
+            let resp = client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .body(r#"{"model":"claude-haiku-4-20250414","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+                .send()?;
+            let status = resp.status().as_u16();
+            if status == 401 || status == 403 {
+                anyhow::bail!("invalid API key");
+            }
+            // 200, 400, 429 all mean the key itself is recognized
+            Ok(())
+        }
+        "google_genai" => {
+            // Google AI: list models endpoint
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+                key
+            );
+            let resp = client.get(&url).send()?;
+            let status = resp.status().as_u16();
+            if status == 400 || status == 401 || status == 403 {
+                anyhow::bail!("invalid API key");
+            }
+            Ok(())
+        }
+        _ => {
+            // OpenAI-compatible: hit /models
+            let url = format!("{}/models", base_url.trim_end_matches('/'));
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", key))
+                .send()?;
+            let status = resp.status().as_u16();
+            if status == 401 || status == 403 {
+                anyhow::bail!("invalid API key");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Validate a Telegram bot token by calling getMe. Returns the bot username.
+fn validate_bot_token(token: &str) -> anyhow::Result<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let url = format!("https://api.telegram.org/bot{}/getMe", token);
+    let resp = client.get(&url).send()?;
+    let data: serde_json::Value = resp.json()?;
+
+    if data["ok"].as_bool() != Some(true) {
+        anyhow::bail!(
+            "{}",
+            data["description"].as_str().unwrap_or("invalid token")
+        );
+    }
+
+    let username = data["result"]["username"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    Ok(username)
 }
 
 #[cfg(feature = "browser")]
@@ -338,11 +530,9 @@ fn discover_chrome_profiles() -> Vec<ChromeProfile> {
         ]
     } else {
         // Windows or other
-        vec![
-            dirs::data_local_dir()
-                .map(|d| d.join("Google/Chrome/User Data"))
-                .unwrap_or_default(),
-        ]
+        vec![dirs::data_local_dir()
+            .map(|d| d.join("Google/Chrome/User Data"))
+            .unwrap_or_default()]
     };
 
     for user_data_dir in candidates {

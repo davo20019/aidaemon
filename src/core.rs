@@ -35,6 +35,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         SqliteStateStore::new(
             &config.state.db_path,
             config.state.working_memory_cap,
+            config.state.encryption_key.as_deref(),
             embedding_service.clone()
         ).await?,
     );

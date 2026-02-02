@@ -96,6 +96,11 @@ pub struct StateConfig {
     pub working_memory_cap: usize,
     #[serde(default = "default_consolidation_interval_hours")]
     pub consolidation_interval_hours: u64,
+    /// Encryption key for SQLCipher database encryption.
+    /// Requires the `encryption` cargo feature to be enabled.
+    /// If set, all database contents are AES-256 encrypted at rest.
+    #[serde(default)]
+    pub encryption_key: Option<String>,
 }
 
 impl Default for StateConfig {
@@ -104,6 +109,7 @@ impl Default for StateConfig {
             db_path: default_db_path(),
             working_memory_cap: default_working_memory_cap(),
             consolidation_interval_hours: default_consolidation_interval_hours(),
+            encryption_key: None,
         }
     }
 }
