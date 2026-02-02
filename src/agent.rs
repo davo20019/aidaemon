@@ -696,6 +696,38 @@ impl Agent {
                 }
             }
 
+            // Drop orphaned tool messages whose parent assistant tool_call
+            // is outside the context window. Gemini requires every
+            // function_response to follow a matching function_call.
+            {
+                let assistant_tc_ids: std::collections::HashSet<String> = messages
+                    .iter()
+                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+                    .filter_map(|m| m.get("tool_calls"))
+                    .filter_map(|tcs| tcs.as_array())
+                    .flat_map(|arr| arr.iter())
+                    .filter_map(|tc| tc.get("id").and_then(|id| id.as_str()))
+                    .map(|s| s.to_string())
+                    .collect();
+
+                let before = messages.len();
+                messages.retain(|m| {
+                    if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
+                        let tc_id = m
+                            .get("tool_call_id")
+                            .and_then(|id| id.as_str())
+                            .unwrap_or("");
+                        assistant_tc_ids.contains(tc_id)
+                    } else {
+                        true
+                    }
+                });
+                let dropped = before - messages.len();
+                if dropped > 0 {
+                    info!(dropped, "Dropped orphaned tool messages (no matching assistant tool_call in context)");
+                }
+            }
+
             messages.insert(0, json!({
                 "role": "system",
                 "content": system_prompt,
