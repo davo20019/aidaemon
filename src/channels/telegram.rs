@@ -275,7 +275,7 @@ impl TelegramChannel {
                     format!("Current model: {}\n\nUsage: /model <model-name>\nExample: /model gemini-2.5-pro-preview-06-05", current)
                 } else {
                     self.agent.set_model(arg.to_string()).await;
-                    format!("Model switched to: {}", arg)
+                    format!("Model switched to: {}\nAuto-routing disabled. Use /auto to re-enable.", arg)
                 }
             }
             "/models" => {
@@ -301,15 +301,19 @@ impl TelegramChannel {
                     Err(e) => format!("Failed to list models: {}", e),
                 }
             }
+            "/auto" => {
+                self.agent.clear_model_override().await;
+                "Auto-routing re-enabled. Model will be selected automatically based on query complexity.".to_string()
+            }
             "/reload" => {
                 match AppConfig::load(&self.config_path) {
                     Ok(new_config) => {
                         let new_model = new_config.provider.models.primary.clone();
-                        // Test the new model with a lightweight call
                         let old_model = self.agent.current_model().await;
                         self.agent.set_model(new_model.clone()).await;
+                        self.agent.clear_model_override().await;
                         format!(
-                            "Config reloaded.\nModel: {} -> {}",
+                            "Config reloaded. Auto-routing re-enabled.\nModel: {} -> {}",
                             old_model, new_model
                         )
                     }
@@ -341,9 +345,10 @@ impl TelegramChannel {
             "/help" | "/start" => {
                 "Available commands:\n\
                 /model — Show current model\n\
-                /model <name> — Switch to a different model\n\
+                /model <name> — Switch to a different model (disables auto-routing)\n\
                 /models — List available models from provider\n\
-                /reload — Reload config.toml (applies model changes)\n\
+                /auto — Re-enable automatic model routing by query complexity\n\
+                /reload — Reload config.toml (applies model changes, re-enables auto-routing)\n\
                 /restart — Restart the daemon (picks up new binary, config, MCP servers)\n\
                 /help — Show this help message"
                     .to_string()

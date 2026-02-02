@@ -8,7 +8,9 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::config::ModelsConfig;
 use crate::providers::{ProviderError, ProviderErrorKind};
+use crate::router::{self, Router};
 use crate::skills::{self, Skill};
 use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
 
@@ -31,6 +33,11 @@ pub struct Agent {
     max_response_chars: usize,
     /// Timeout in seconds for sub-agent execution.
     timeout_secs: u64,
+    /// Smart router for automatic model tier selection. None for sub-agents
+    /// or when all tiers resolve to the same model.
+    router: Option<Router>,
+    /// When true, the user has manually set a model via /model — skip auto-routing.
+    model_override: RwLock<bool>,
 }
 
 impl Agent {
@@ -47,8 +54,22 @@ impl Agent {
         max_iterations: usize,
         max_response_chars: usize,
         timeout_secs: u64,
+        models_config: ModelsConfig,
     ) -> Self {
         let fallback = model.clone();
+        let router = Router::new(models_config);
+        let router = if router.is_uniform() {
+            info!("All model tiers identical, auto-routing disabled");
+            None
+        } else {
+            info!(
+                fast = router.select(crate::router::Tier::Fast),
+                primary = router.select(crate::router::Tier::Primary),
+                smart = router.select(crate::router::Tier::Smart),
+                "Smart router enabled"
+            );
+            Some(router)
+        };
         Self {
             provider,
             state,
@@ -63,10 +84,13 @@ impl Agent {
             max_iterations,
             max_response_chars,
             timeout_secs,
+            router,
+            model_override: RwLock::new(false),
         }
     }
 
     /// Create an Agent with explicit depth/max_depth (used internally for sub-agents).
+    /// Sub-agents don't auto-route — they use whatever model was selected by the parent.
     #[allow(clippy::too_many_arguments)]
     fn with_depth(
         provider: Arc<dyn ModelProvider>,
@@ -97,6 +121,8 @@ impl Agent {
             max_iterations,
             max_response_chars,
             timeout_secs,
+            router: None,
+            model_override: RwLock::new(false),
         }
     }
 
@@ -229,12 +255,20 @@ impl Agent {
     }
 
     /// Switch the active model at runtime. Keeps the old model as fallback.
+    /// Also disables auto-routing until `clear_model_override()` is called.
     pub async fn set_model(&self, model: String) {
         let mut m = self.model.write().await;
         let mut fb = self.fallback_model.write().await;
         info!(old = %*m, new = %model, "Model switched");
         *fb = m.clone();
         *m = model;
+        *self.model_override.write().await = true;
+    }
+
+    /// Re-enable auto-routing after a manual model override.
+    pub async fn clear_model_override(&self) {
+        *self.model_override.write().await = false;
+        info!("Model override cleared, auto-routing re-enabled");
     }
 
     /// List available models from the provider.
@@ -397,7 +431,26 @@ impl Agent {
         self.state.append_message(&user_msg).await?;
 
         let tool_defs = self.tool_definitions();
-        let model = self.model.read().await.clone();
+        let model = {
+            let is_override = *self.model_override.read().await;
+            if !is_override {
+                if let Some(ref router) = self.router {
+                    let result = router::classify_query(user_text);
+                    let routed_model = router.select(result.tier).to_string();
+                    info!(
+                        tier = %result.tier,
+                        reason = %result.reason,
+                        model = %routed_model,
+                        "Smart router selected model"
+                    );
+                    routed_model
+                } else {
+                    self.model.read().await.clone()
+                }
+            } else {
+                self.model.read().await.clone()
+            }
+        };
 
         // 2. Build system prompt ONCE before the loop: match skills + inject facts
         let active_skills = skills::match_skills(&self.skills, user_text);
