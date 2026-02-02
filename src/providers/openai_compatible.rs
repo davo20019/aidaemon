@@ -36,9 +36,22 @@ impl ModelProvider for OpenAiCompatibleProvider {
         messages: &[Value],
         tools: &[Value],
     ) -> anyhow::Result<ProviderResponse> {
+        // Strip extra_content from tool_calls before sending — the OpenAI-compatible
+        // endpoint doesn't understand it (it's used internally for Gemini native round-trip).
+        let mut messages_cleaned: Vec<Value> = messages.to_vec();
+        for msg in messages_cleaned.iter_mut() {
+            if let Some(tcs) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+                for tc in tcs.iter_mut() {
+                    if let Some(obj) = tc.as_object_mut() {
+                        obj.remove("extra_content");
+                    }
+                }
+            }
+        }
+
         let mut body = json!({
             "model": model,
-            "messages": messages,
+            "messages": messages_cleaned,
         });
 
         if !tools.is_empty() {

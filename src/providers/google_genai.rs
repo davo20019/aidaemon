@@ -69,10 +69,18 @@ impl GoogleGenAiProvider {
                     // Tool calls
                     if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
                         for tc in tool_calls {
-                            let function_call = json!({
+                            let mut function_call = json!({
                                 "name": tc["function"]["name"],
                                 "args": serde_json::from_str::<Value>(tc["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}))
                             });
+                            // Merge extra fields (thought_signature etc.) back into functionCall
+                            if let Some(extra) = tc.get("extra_content").and_then(|e| e.as_object()) {
+                                if let Some(fc_obj) = function_call.as_object_mut() {
+                                    for (k, v) in extra {
+                                        fc_obj.insert(k.clone(), v.clone());
+                                    }
+                                }
+                            }
                             parts.push(json!({ "functionCall": function_call }));
                         }
                     }
@@ -214,12 +222,23 @@ impl ModelProvider for GoogleGenAiProvider {
                 let name = fc["name"].as_str().unwrap_or("").to_string();
                 let args = fc["args"].clone(); // already JSON object
                 let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
-                
+
+                // Capture extra fields (e.g. thought_signature) for round-trip
+                let mut extra = serde_json::Map::new();
+                if let Some(obj) = fc.as_object() {
+                    for (k, v) in obj {
+                        if k != "name" && k != "args" {
+                            extra.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                let extra_content = if extra.is_empty() { None } else { Some(Value::Object(extra)) };
+
                 tool_calls.push(ToolCall {
-                    id: format!("call_{}", uuid::Uuid::new_v4()), // Gemini doesn't give tool call IDs? Re-check... usually implicit order.
+                    id: format!("call_{}", uuid::Uuid::new_v4()),
                     name,
                     arguments: args_str,
-                    extra_content: None,
+                    extra_content,
                 });
             }
         }
