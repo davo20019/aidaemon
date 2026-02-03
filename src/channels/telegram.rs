@@ -15,10 +15,11 @@ use crate::channels::SessionMap;
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::traits::{Channel, ChannelCapabilities};
-use crate::types::{ApprovalResponse, MediaMessage};
+use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 
 pub struct TelegramChannel {
     bot: Bot,
+    bot_token: String,
     allowed_user_ids: Vec<u64>,
     agent: Arc<Agent>,
     config_path: PathBuf,
@@ -28,6 +29,12 @@ pub struct TelegramChannel {
     session_map: SessionMap,
     /// Task registry for tracking background agent work.
     task_registry: Arc<TaskRegistry>,
+    /// Whether file transfer is enabled.
+    files_enabled: bool,
+    /// Directory for saving inbound files.
+    inbox_dir: PathBuf,
+    /// Max file size in MB for inbound files.
+    max_file_size_mb: u64,
 }
 
 impl TelegramChannel {
@@ -38,16 +45,23 @@ impl TelegramChannel {
         config_path: PathBuf,
         session_map: SessionMap,
         task_registry: Arc<TaskRegistry>,
+        files_enabled: bool,
+        inbox_dir: PathBuf,
+        max_file_size_mb: u64,
     ) -> Self {
         let bot = Bot::new(bot_token);
         Self {
             bot,
+            bot_token: bot_token.to_string(),
             allowed_user_ids,
             agent,
             config_path,
             pending_approvals: Mutex::new(HashMap::new()),
             session_map,
             task_registry,
+            files_enabled,
+            inbox_dir,
+            max_file_size_mb,
         }
     }
 
@@ -313,6 +327,144 @@ impl TelegramChannel {
         let _ = bot.send_message(msg.chat.id, reply).await;
     }
 
+    /// Handle an incoming file/photo/audio/video/voice message.
+    /// Downloads the file, saves to inbox, and returns a context string for the agent.
+    async fn handle_file_message(
+        &self,
+        msg: &teloxide::types::Message,
+        bot: &Bot,
+    ) -> anyhow::Result<String> {
+        // Extract file_id, file_size, filename, and mime_type from the message
+        let (file_id, file_size, filename, mime_type) = if let Some(doc) = msg.document() {
+            (
+                doc.file.id.clone(),
+                doc.file.size as u64,
+                doc.file_name.clone().unwrap_or_else(|| "document".to_string()),
+                doc.mime_type
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+            )
+        } else if let Some(photos) = msg.photo() {
+            // Last photo in the array is the largest
+            let photo = photos.last().ok_or_else(|| anyhow::anyhow!("Empty photo array"))?;
+            (
+                photo.file.id.clone(),
+                photo.file.size as u64,
+                "photo.jpg".to_string(),
+                "image/jpeg".to_string(),
+            )
+        } else if let Some(audio) = msg.audio() {
+            (
+                audio.file.id.clone(),
+                audio.file.size as u64,
+                audio
+                    .file_name
+                    .clone()
+                    .unwrap_or_else(|| "audio.mp3".to_string()),
+                audio
+                    .mime_type
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "audio/mpeg".to_string()),
+            )
+        } else if let Some(video) = msg.video() {
+            (
+                video.file.id.clone(),
+                video.file.size as u64,
+                video
+                    .file_name
+                    .clone()
+                    .unwrap_or_else(|| "video.mp4".to_string()),
+                video
+                    .mime_type
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "video/mp4".to_string()),
+            )
+        } else if let Some(voice) = msg.voice() {
+            (
+                voice.file.id.clone(),
+                voice.file.size as u64,
+                "voice.ogg".to_string(),
+                voice
+                    .mime_type
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "audio/ogg".to_string()),
+            )
+        } else {
+            anyhow::bail!("Unsupported message type. I can process text, files, photos, audio, video, and voice messages.");
+        };
+
+        // Check file size before downloading
+        let max_bytes = self.max_file_size_mb * 1_048_576;
+        if file_size > max_bytes {
+            anyhow::bail!(
+                "File too large ({:.1} MB). Maximum is {} MB.",
+                file_size as f64 / 1_048_576.0,
+                self.max_file_size_mb
+            );
+        }
+
+        // Get file info from Telegram
+        let file = bot.get_file(file_id).await?;
+        let file_path_on_server = file
+            .path;
+
+        // Download via HTTP (simpler than teloxide's Download trait)
+        let download_url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.bot_token, file_path_on_server
+        );
+        let response = reqwest::get(&download_url).await?;
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to download file from Telegram: HTTP {}", response.status());
+        }
+        let bytes = response.bytes().await?;
+
+        // Sanitize filename: strip path separators, null bytes, limit length
+        let sanitized = sanitize_filename(&filename);
+        let uuid_prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let dest_name = format!("{}_{}", uuid_prefix, sanitized);
+        let dest_path = self.inbox_dir.join(&dest_name);
+
+        // Ensure inbox directory exists
+        std::fs::create_dir_all(&self.inbox_dir)?;
+
+        // Write file
+        std::fs::write(&dest_path, &bytes)?;
+
+        info!(
+            file = %dest_path.display(),
+            size = bytes.len(),
+            mime = %mime_type,
+            "Saved inbound file"
+        );
+
+        // Build context string for the agent
+        let size_display = if bytes.len() > 1_048_576 {
+            format!("{:.1} MB", bytes.len() as f64 / 1_048_576.0)
+        } else {
+            format!("{:.0} KB", bytes.len() as f64 / 1024.0)
+        };
+
+        let caption = msg.caption().unwrap_or("");
+        let mut context = format!(
+            "[File received: {} ({}, {})\nSaved to: {}]",
+            sanitized,
+            size_display,
+            mime_type,
+            dest_path.display()
+        );
+        if !caption.is_empty() {
+            context.push('\n');
+            context.push_str(caption);
+        }
+
+        Ok(context)
+    }
+
     async fn handle_message(&self, msg: teloxide::types::Message, bot: Bot) {
         let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
 
@@ -325,14 +477,21 @@ impl TelegramChannel {
             return;
         }
 
-        let text = match msg.text() {
-            Some(t) => t.to_string(),
-            None => {
-                let _ = bot
-                    .send_message(msg.chat.id, "I can only process text messages for now.")
-                    .await;
-                return;
+        let text = if let Some(t) = msg.text() {
+            t.to_string()
+        } else if self.files_enabled {
+            match self.handle_file_message(&msg, &bot).await {
+                Ok(file_text) => file_text,
+                Err(e) => {
+                    let _ = bot.send_message(msg.chat.id, format!("File error: {}", e)).await;
+                    return;
+                }
             }
+        } else {
+            let _ = bot
+                .send_message(msg.chat.id, "I can only process text messages.")
+                .await;
+            return;
         };
 
         // Handle slash commands
@@ -473,12 +632,25 @@ impl Channel for TelegramChannel {
         let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
             self.allowed_user_ids.first().copied().unwrap_or(0) as i64
         });
-        let photo = InputFile::memory(media.photo_bytes.clone()).file_name("screenshot.png");
-        self.bot
-            .send_photo(ChatId(chat_id), photo)
-            .caption(&media.caption)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send photo: {}", e))?;
+        match &media.kind {
+            MediaKind::Photo { data } => {
+                let photo = InputFile::memory(data.clone()).file_name("screenshot.png");
+                self.bot
+                    .send_photo(ChatId(chat_id), photo)
+                    .caption(&media.caption)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to send photo: {}", e))?;
+            }
+            MediaKind::Document { file_path, filename } => {
+                let doc = InputFile::file(file_path).file_name(filename.clone());
+                let mut req = self.bot.send_document(ChatId(chat_id), doc);
+                if !media.caption.is_empty() {
+                    req = req.caption(&media.caption);
+                }
+                req.await
+                    .map_err(|e| anyhow::anyhow!("Failed to send document: {}", e))?;
+            }
+        }
         Ok(())
     }
 
@@ -848,5 +1020,27 @@ async fn send_html_or_fallback(bot: &Bot, chat_id: ChatId, html: &str, plain: &s
             bot.send_message(chat_id, plain).await?;
             Ok(())
         }
+    }
+}
+
+/// Sanitize a filename: remove path separators, null bytes, and limit length.
+fn sanitize_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .filter(|c| *c != '/' && *c != '\\' && *c != '\0')
+        .collect();
+    // Limit to 200 chars, preserving extension
+    if sanitized.len() <= 200 {
+        sanitized
+    } else if let Some(dot_pos) = sanitized.rfind('.') {
+        let ext = &sanitized[dot_pos..];
+        if ext.len() < 20 {
+            let stem_len = 200 - ext.len();
+            format!("{}{}", &sanitized[..stem_len], ext)
+        } else {
+            sanitized[..200].to_string()
+        }
+    } else {
+        sanitized[..200].to_string()
     }
 }

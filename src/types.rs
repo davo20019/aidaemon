@@ -6,9 +6,21 @@ pub enum ApprovalResponse {
     Deny,
 }
 
+/// The kind of media being sent.
+#[allow(dead_code)]
+pub enum MediaKind {
+    /// An in-memory photo (e.g. screenshot).
+    Photo { data: Vec<u8> },
+    /// A file on disk to send as a document.
+    Document {
+        file_path: String,
+        filename: String,
+    },
+}
+
 /// A media message to be sent through a channel.
 pub struct MediaMessage {
     pub session_id: String,
-    pub photo_bytes: Vec<u8>,
     pub caption: String,
+    pub kind: MediaKind,
 }

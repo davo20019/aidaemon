@@ -28,6 +28,8 @@ pub struct AppConfig {
     pub search: SearchConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    #[serde(default)]
+    pub files: FilesConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -328,6 +330,8 @@ pub struct SubagentsConfig {
     pub max_depth: usize,
     #[serde(default = "default_subagents_max_iterations")]
     pub max_iterations: usize,
+    #[serde(default = "default_subagents_max_iterations_cap")]
+    pub max_iterations_cap: usize,
     #[serde(default = "default_subagents_max_response_chars")]
     pub max_response_chars: usize,
     #[serde(default = "default_subagents_timeout_secs")]
@@ -340,6 +344,7 @@ impl Default for SubagentsConfig {
             enabled: default_subagents_enabled(),
             max_depth: default_subagents_max_depth(),
             max_iterations: default_subagents_max_iterations(),
+            max_iterations_cap: default_subagents_max_iterations_cap(),
             max_response_chars: default_subagents_max_response_chars(),
             timeout_secs: default_subagents_timeout_secs(),
         }
@@ -354,6 +359,9 @@ fn default_subagents_max_depth() -> usize {
 }
 fn default_subagents_max_iterations() -> usize {
     10
+}
+fn default_subagents_max_iterations_cap() -> usize {
+    25
 }
 fn default_subagents_max_response_chars() -> usize {
     8000
@@ -448,6 +456,48 @@ pub struct ScheduledTaskConfig {
     pub oneshot: bool,
     #[serde(default)]
     pub trusted: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FilesConfig {
+    #[serde(default = "default_files_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_inbox_dir")]
+    pub inbox_dir: String,
+    #[serde(default = "default_outbox_dirs")]
+    pub outbox_dirs: Vec<String>,
+    #[serde(default = "default_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    #[serde(default = "default_retention_hours")]
+    pub retention_hours: u64,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_files_enabled(),
+            inbox_dir: default_inbox_dir(),
+            outbox_dirs: default_outbox_dirs(),
+            max_file_size_mb: default_max_file_size_mb(),
+            retention_hours: default_retention_hours(),
+        }
+    }
+}
+
+fn default_files_enabled() -> bool {
+    true
+}
+fn default_inbox_dir() -> String {
+    "~/.aidaemon/files/inbox".to_string()
+}
+fn default_outbox_dirs() -> Vec<String> {
+    vec!["~".to_string()]
+}
+fn default_max_file_size_mb() -> u64 {
+    10
+}
+fn default_retention_hours() -> u64 {
+    24
 }
 
 impl AppConfig {
