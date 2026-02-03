@@ -1,0 +1,8 @@
+[target.aarch64-unknown-linux-gnu]
+# Use pre-built image with necessary dependencies
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
+
+[build.env]
+passthrough = [
+    "CARGO_TERM_COLOR",
+]
