@@ -8,5 +8,6 @@ config.toml
 *.bak.*
 *.lastgood
 *.html
+!src/dashboard.html
 .DS_Store
 .fastembed_cache/

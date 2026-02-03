@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aidaemon dashboard</title>
+<style>
+:root {
+  --bg: #fff; --bg2: #f5f5f7; --fg: #1d1d1f; --fg2: #6e6e73;
+  --border: #d2d2d7; --accent: #0071e3; --err: #ff3b30;
+  --card-bg: #fff; --card-shadow: 0 1px 3px rgba(0,0,0,.08);
+  --radius: 8px; --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1e; --bg2: #2c2c2e; --fg: #f5f5f7; --fg2: #98989d;
+    --border: #38383a; --card-bg: #2c2c2e; --card-shadow: 0 1px 3px rgba(0,0,0,.3);
+  }
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: var(--font); background: var(--bg); color: var(--fg); line-height: 1.5; padding: 1rem; max-width: 960px; margin: 0 auto; }
+h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; }
+h2 { font-size: .9rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--fg2); margin-bottom: .5rem; }
+.cards { display: grid; gap: 1rem; grid-template-columns: 1fr; }
+@media (min-width: 600px) { .cards { grid-template-columns: 1fr 1fr; } }
+.card { background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; box-shadow: var(--card-shadow); }
+.card.wide { grid-column: 1 / -1; }
+table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+th { text-align: left; font-weight: 500; color: var(--fg2); border-bottom: 1px solid var(--border); padding: .35rem .5rem; }
+td { padding: .35rem .5rem; border-bottom: 1px solid var(--border); }
+tr:last-child td { border-bottom: none; }
+.mono { font-family: "SF Mono", "Fira Code", "Consolas", monospace; font-size: .8rem; }
+.status-grid { display: grid; grid-template-columns: auto 1fr; gap: .25rem .75rem; font-size: .9rem; }
+.status-grid dt { color: var(--fg2); }
+.badge { display: inline-block; font-size: .75rem; padding: .1rem .4rem; border-radius: 4px; }
+.badge-ok { background: #34c75920; color: #30d158; }
+.badge-paused { background: #ff9f0a20; color: #ff9f0a; }
+.empty { color: var(--fg2); font-style: italic; font-size: .85rem; }
+#auth-overlay { position: fixed; inset: 0; background: var(--bg); display: flex; align-items: center; justify-content: center; z-index: 100; }
+#auth-box { text-align: center; }
+#auth-box input { font-family: var(--font); font-size: .9rem; padding: .5rem .75rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg2); color: var(--fg); width: 300px; margin: .5rem 0; }
+#auth-box button { font-family: var(--font); font-size: .9rem; padding: .5rem 1.25rem; border: none; border-radius: var(--radius); background: var(--accent); color: #fff; cursor: pointer; }
+#auth-box .err { color: var(--err); font-size: .85rem; margin-top: .25rem; }
+.refresh-info { font-size: .75rem; color: var(--fg2); margin-top: 1rem; text-align: center; }
+.truncate { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<div id="auth-overlay">
+  <div id="auth-box">
+    <h1>aidaemon</h1>
+    <p style="color:var(--fg2);margin-bottom:.5rem">Enter dashboard token</p>
+    <div><input id="token-input" type="password" placeholder="Bearer token" autocomplete="off"></div>
+    <div><button onclick="submitToken()">Connect</button></div>
+    <div class="err" id="auth-err"></div>
+  </div>
+</div>
+
+<div id="app" style="display:none">
+  <h1>aidaemon <span style="font-weight:400;color:var(--fg2);font-size:.85rem" id="version"></span></h1>
+  <div class="cards">
+    <div class="card" id="status-card">
+      <h2>Status</h2>
+      <dl class="status-grid" id="status-dl"></dl>
+    </div>
+    <div class="card" id="tasks-card">
+      <h2>Scheduled Tasks</h2>
+      <div id="tasks-body"></div>
+    </div>
+    <div class="card wide" id="usage-card">
+      <h2>Token Usage (7 days)</h2>
+      <div id="usage-body"></div>
+    </div>
+    <div class="card wide" id="sessions-card">
+      <h2>Recent Sessions</h2>
+      <div id="sessions-body"></div>
+    </div>
+  </div>
+  <div class="refresh-info">Auto-refresh every 30s &middot; <a href="#" onclick="fetchAll();return false" style="color:var(--accent)">refresh now</a></div>
+</div>
+
+<script>
+let TOKEN = sessionStorage.getItem('aidaemon_token') || '';
+
+function submitToken() {
+  TOKEN = document.getElementById('token-input').value.trim();
+  if (!TOKEN) return;
+  sessionStorage.setItem('aidaemon_token', TOKEN);
+  tryConnect();
+}
+
+document.getElementById('token-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') submitToken();
+});
+
+async function api(path) {
+  const r = await fetch(path, { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+  if (r.status === 401) { showAuth('Invalid or expired token'); throw new Error('401'); }
+  return r.json();
+}
+
+function showAuth(msg) {
+  document.getElementById('auth-overlay').style.display = 'flex';
+  document.getElementById('app').style.display = 'none';
+  if (msg) document.getElementById('auth-err').textContent = msg;
+}
+
+function showApp() {
+  document.getElementById('auth-overlay').style.display = 'none';
+  document.getElementById('app').style.display = '';
+}
+
+async function tryConnect() {
+  try {
+    await api('/api/status');
+    showApp();
+    fetchAll();
+  } catch { showAuth('Could not connect'); }
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function fmtDuration(secs) {
+  const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
+  if (d > 0) return d + 'd ' + h + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
+
+function fmtNum(n) { return n != null ? n.toLocaleString() : '-'; }
+
+async function fetchStatus() {
+  try {
+    const d = await api('/api/status');
+    document.getElementById('version').textContent = 'v' + esc(d.version);
+    let html = '';
+    const items = [
+      ['Provider', d.provider],
+      ['Primary', d.models.primary],
+      ['Fast', d.models.fast],
+      ['Smart', d.models.smart],
+      ['Uptime', fmtDuration(d.uptime_secs)],
+    ];
+    if (d.daily_token_budget) items.push(['Daily Budget', fmtNum(d.daily_token_budget) + ' tokens']);
+    for (const [k, v] of items) html += '<dt>' + esc(k) + '</dt><dd>' + esc(String(v)) + '</dd>';
+    document.getElementById('status-dl').innerHTML = html;
+  } catch {}
+}
+
+async function fetchUsage() {
+  try {
+    const rows = await api('/api/usage?days=7');
+    if (!rows.length) { document.getElementById('usage-body').innerHTML = '<p class="empty">No usage data</p>'; return; }
+    let html = '<table><tr><th>Date</th><th>Model</th><th>Input</th><th>Output</th><th>Requests</th></tr>';
+    for (const r of rows) html += '<tr><td class="mono">' + esc(r.day) + '</td><td class="truncate">' + esc(r.model) + '</td><td>' + fmtNum(r.input_tokens) + '</td><td>' + fmtNum(r.output_tokens) + '</td><td>' + fmtNum(r.request_count) + '</td></tr>';
+    html += '</table>';
+    document.getElementById('usage-body').innerHTML = html;
+  } catch {}
+}
+
+async function fetchSessions() {
+  try {
+    const rows = await api('/api/sessions?limit=20');
+    if (!rows.length) { document.getElementById('sessions-body').innerHTML = '<p class="empty">No sessions</p>'; return; }
+    let html = '<table><tr><th>Session</th><th>Messages</th><th>First</th><th>Last Activity</th></tr>';
+    for (const r of rows) html += '<tr><td class="mono truncate">' + esc(r.session_id) + '</td><td>' + fmtNum(r.message_count) + '</td><td class="mono">' + esc((r.first_message||'').slice(0,16)) + '</td><td class="mono">' + esc((r.last_activity||'').slice(0,16)) + '</td></tr>';
+    html += '</table>';
+    document.getElementById('sessions-body').innerHTML = html;
+  } catch {}
+}
+
+async function fetchTasks() {
+  try {
+    const rows = await api('/api/tasks');
+    if (!rows.length) { document.getElementById('tasks-body').innerHTML = '<p class="empty">No scheduled tasks</p>'; return; }
+    let html = '<table><tr><th>Name</th><th>Schedule</th><th>Status</th><th>Next Run</th></tr>';
+    for (const r of rows) {
+      const badge = r.is_paused ? '<span class="badge badge-paused">paused</span>' : '<span class="badge badge-ok">active</span>';
+      html += '<tr><td>' + esc(r.name) + '</td><td class="mono">' + esc(r.original_schedule) + '</td><td>' + badge + '</td><td class="mono">' + esc((r.next_run_at||'-').slice(0,16)) + '</td></tr>';
+    }
+    html += '</table>';
+    document.getElementById('tasks-body').innerHTML = html;
+  } catch {}
+}
+
+function fetchAll() { fetchStatus(); fetchUsage(); fetchSessions(); fetchTasks(); }
+
+// Startup
+if (TOKEN) { tryConnect(); } else { showAuth(); }
+setInterval(fetchAll, 30000);
+</script>
+</body>
+</html>

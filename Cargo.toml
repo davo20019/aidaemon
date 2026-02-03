@@ -62,3 +62,19 @@ browser = ["dep:chromiumoxide"]
 discord = ["dep:serenity"]
 slack = ["dep:tokio-tungstenite"]
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/aidaemon-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/aidaemon-linux-x86_64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/aidaemon-linux-aarch64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/aidaemon-macos-x86_64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/aidaemon-macos-aarch64.tar.gz"
