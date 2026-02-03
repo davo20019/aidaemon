@@ -22,6 +22,17 @@ struct ProviderPreset {
 
 const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
+        name: "Google AI Studio — recommended",
+        base_url: "",
+        kind: "google_genai",
+        primary: "gemini-2.5-flash",
+        fast: "gemini-2.5-flash-lite",
+        smart: "gemini-2.5-pro",
+        needs_key: true,
+        key_url: "https://aistudio.google.com/apikey",
+        key_hint: "Get a free API key from Google AI Studio (free tier, includes web grounding)",
+    },
+    ProviderPreset {
         name: "OpenAI",
         base_url: "https://api.openai.com/v1",
         kind: "openai_compatible",
@@ -53,17 +64,6 @@ const PRESETS: &[ProviderPreset] = &[
         needs_key: true,
         key_url: "https://openrouter.ai/keys",
         key_hint: "Starts with \"sk-or-\"",
-    },
-    ProviderPreset {
-        name: "Google AI Studio (Native)",
-        base_url: "",
-        kind: "google_genai",
-        primary: "gemini-3-flash-preview",
-        fast: "gemini-2.5-flash-lite",
-        smart: "gemini-3-pro-preview",
-        needs_key: true,
-        key_url: "https://aistudio.google.com/apikey",
-        key_hint: "Get a free API key from Google AI Studio",
     },
     ProviderPreset {
         name: "OpenRouter",

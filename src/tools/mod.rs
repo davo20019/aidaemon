@@ -6,6 +6,8 @@ mod memory;
 pub mod spawn;
 mod system;
 pub mod terminal;
+pub mod web_fetch;
+mod web_search;
 
 #[cfg(feature = "browser")]
 pub use browser::BrowserTool;
@@ -15,3 +17,5 @@ pub use memory::RememberFactTool;
 pub use spawn::SpawnAgentTool;
 pub use system::SystemInfoTool;
 pub use terminal::TerminalTool;
+pub use web_fetch::WebFetchTool;
+pub use web_search::WebSearchTool;
