@@ -563,6 +563,20 @@ impl StateStore for SqliteStateStore {
         Ok(messages)
     }
 
+    async fn clear_session(&self, session_id: &str) -> anyhow::Result<()> {
+        // Clear working memory
+        {
+            let mut wm = self.working_memory.write().await;
+            wm.remove(session_id);
+        }
+        // Delete messages from DB
+        sqlx::query("DELETE FROM messages WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn record_token_usage(&self, session_id: &str, usage: &TokenUsage) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO token_usage (session_id, model, input_tokens, output_tokens, created_at)

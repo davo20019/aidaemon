@@ -505,6 +505,12 @@ impl DiscordChannel {
                     }
                 }
             }
+            "/clear" => {
+                match self.agent.clear_session(session_id).await {
+                    Ok(_) => "Context cleared. Starting fresh.".to_string(),
+                    Err(e) => format!("Failed to clear context: {}", e),
+                }
+            }
             "/cost" => self.handle_cost_command().await,
             "/help" | "/start" => {
                 "Available commands:\n\
@@ -515,6 +521,7 @@ impl DiscordChannel {
                 /reload — Reload config.toml\n\
                 /tasks — List running and recent tasks\n\
                 /cancel <id> — Cancel a running task\n\
+                /clear — Clear conversation context and start fresh\n\
                 /cost — Show token usage statistics\n\
                 /help — Show this help message"
                     .to_string()
@@ -735,6 +742,7 @@ impl DiscordChannel {
                     )
                     .required(true),
                 ),
+            CreateCommand::new("clear").description("Clear conversation context and start fresh"),
             CreateCommand::new("cost").description("Show token usage statistics"),
             CreateCommand::new("help").description("Show available commands"),
         ];
