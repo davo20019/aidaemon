@@ -119,6 +119,13 @@ pub trait StateStore: Send + Sync {
     async fn upsert_fact(&self, category: &str, key: &str, value: &str, source: &str) -> anyhow::Result<()>;
     /// Get all facts, optionally filtered by category.
     async fn get_facts(&self, category: Option<&str>) -> anyhow::Result<Vec<Fact>>;
+    /// Get facts semantically relevant to a query, falling back to get_facts on error.
+    async fn get_relevant_facts(&self, _query: &str, max: usize) -> anyhow::Result<Vec<Fact>> {
+        // Default: return all facts (capped). Implementations can override with semantic filtering.
+        let mut facts = self.get_facts(None).await?;
+        facts.truncate(max);
+        Ok(facts)
+    }
     /// Get context using Tri-Hybrid retrieval (Recency + Vector + Salience).
     /// Default implementation just calls get_history.
     async fn get_context(&self, session_id: &str, _query: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
