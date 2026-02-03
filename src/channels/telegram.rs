@@ -786,10 +786,21 @@ impl Channel for TelegramChannel {
             }
         }
 
+        // Wait for response with 5-minute timeout to prevent memory leak
         info!(approval_id = %short_id, "Waiting for user approval response...");
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval response channel closed"))
+        match tokio::time::timeout(Duration::from_secs(300), response_rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => {
+                warn!(approval_id = %short_id, "Approval channel closed");
+                Ok(ApprovalResponse::Deny)
+            }
+            Err(_) => {
+                warn!(approval_id = %short_id, "Approval timed out after 5 minutes");
+                let mut pending = self.pending_approvals.lock().await;
+                pending.remove(&approval_id);
+                Ok(ApprovalResponse::Deny)
+            }
+        }
     }
 }
 
