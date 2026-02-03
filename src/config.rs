@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub subagents: SubagentsConfig,
     #[serde(default)]
     pub cli_agents: CliAgentsConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -399,6 +401,22 @@ pub struct CliToolConfig {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub max_output_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SearchConfig {
+    #[serde(default)]
+    pub backend: SearchBackendKind,
+    #[serde(default)]
+    pub api_key: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBackendKind {
+    #[default]
+    DuckDuckGo,
+    Brave,
 }
 
 impl AppConfig {

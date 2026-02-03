@@ -139,20 +139,26 @@ impl GoogleGenAiProvider {
 
     /// Convert OpenAI tool definitions to Gemini "tools"
     fn convert_tools(&self, tools: &[Value]) -> Option<Vec<Value>> {
-        if tools.is_empty() {
-            return None;
-        }
-        let mut function_declarations = Vec::new();
-        for tool in tools {
-            if let Some(func) = tool.get("function") {
-                function_declarations.push(json!({
-                    "name": func["name"],
-                    "description": func.get("description").unwrap_or(&json!("")),
-                    "parameters": func["parameters"]
-                }));
+        let mut gemini_tools = Vec::new();
+
+        if !tools.is_empty() {
+            let mut function_declarations = Vec::new();
+            for tool in tools {
+                if let Some(func) = tool.get("function") {
+                    function_declarations.push(json!({
+                        "name": func["name"],
+                        "description": func.get("description").unwrap_or(&json!("")),
+                        "parameters": func["parameters"]
+                    }));
+                }
             }
+            gemini_tools.push(json!({ "function_declarations": function_declarations }));
         }
-        Some(vec![json!({ "function_declarations": function_declarations })])
+
+        // Google Search grounding — free 500 req/day
+        gemini_tools.push(json!({ "google_search": {} }));
+
+        Some(gemini_tools)
     }
 }
 
@@ -209,9 +215,10 @@ impl ModelProvider for GoogleGenAiProvider {
             .get(0)
             .ok_or_else(|| anyhow::anyhow!("No candidates in Google GenAI response: {}", text))?;
         
+        let empty_parts = vec![];
         let content_parts = candidate["content"]["parts"]
             .as_array()
-            .ok_or_else(|| anyhow::anyhow!("No content parts"))?;
+            .unwrap_or(&empty_parts);
 
         let mut final_text = String::new();
         let mut tool_calls = Vec::new();
@@ -244,6 +251,25 @@ impl ModelProvider for GoogleGenAiProvider {
                     arguments: args_str,
                     extra_content,
                 });
+            }
+        }
+
+        // Extract grounding sources from Google Search
+        if let Some(metadata) = candidate.get("groundingMetadata") {
+            if let Some(chunks) = metadata.get("groundingChunks").and_then(|c| c.as_array()) {
+                let sources: Vec<String> = chunks
+                    .iter()
+                    .filter_map(|chunk| {
+                        let web = chunk.get("web")?;
+                        let uri = web.get("uri")?.as_str()?;
+                        let title = web.get("title").and_then(|t| t.as_str()).unwrap_or(uri);
+                        Some(format!("- [{}]({})", title, uri))
+                    })
+                    .collect();
+                if !sources.is_empty() {
+                    final_text.push_str("\n\nSources:\n");
+                    final_text.push_str(&sources.join("\n"));
+                }
             }
         }
 

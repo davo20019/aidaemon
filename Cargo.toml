@@ -41,6 +41,8 @@ fastembed = "4"
 tokio-util = "0.7.18"
 libc = "0.2"
 libsqlite3-sys = { version = "0.30", optional = true }
+llm_readability = "0.0"
+htmd = "0.1"
 
 [features]
 browser = ["dep:chromiumoxide"]

@@ -19,7 +19,7 @@ use crate::skills;
 use crate::state::SqliteStateStore;
 #[cfg(feature = "browser")]
 use crate::tools::BrowserTool;
-use crate::tools::{CliAgentTool, ConfigManagerTool, RememberFactTool, SpawnAgentTool, SystemInfoTool, TerminalTool};
+use crate::tools::{CliAgentTool, ConfigManagerTool, RememberFactTool, SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool};
 use crate::traits::{Channel, Tool};
 use crate::tasks::TaskRegistry;
 use crate::triggers::{self, TriggerManager};
@@ -89,6 +89,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         )),
         Arc::new(RememberFactTool::new(state.clone())),
         Arc::new(ConfigManagerTool::new(config_path.clone())),
+        Arc::new(WebFetchTool::new()),
+        Arc::new(WebSearchTool::new(&config.search)),
     ];
 
     // Browser tool (conditional — requires "browser" cargo feature)
@@ -362,7 +364,9 @@ Narrate your plan before executing — tell the user what you're about to do and
 ## Tool Selection Guide
 | Task | Correct Tool | WRONG Tool |
 |------|-------------|------------|
-{browser_table_row}| Run commands, scripts | terminal | — |
+{browser_table_row}| Search the web | web_search | browser, terminal (curl) |
+| Read web pages, articles, docs | web_fetch | browser (for public pages) |
+| Run commands, scripts | terminal | — |
 | Get system specs | system_info | terminal (uname, etc.) |
 | Store user info | remember_fact | — |
 | Fix config | manage_config | terminal (editing files) |{spawn_table_row}{cli_agent_table_row}
@@ -377,6 +381,8 @@ pre-approved list. The user can allow them with one tap.
 - `system_info`: Get CPU, memory, and OS information.
 - `remember_fact`: Store important facts about the user for long-term memory.
 - `manage_config`: Read and update your own config.toml. Use this to fix configuration issues.
+- `web_search`: Search the web. Returns titles, URLs, and snippets for your query. Use to find current information, research topics, check facts.
+- `web_fetch`: Fetch a URL and extract its readable content. Strips ads/navigation. For login-required sites, use `browser` instead.
 {browser_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}
 
 ## Self-Maintenance
