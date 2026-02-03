@@ -212,23 +212,26 @@ impl MemoryManager {
                             }
                             Err(e) => {
                                 warn!(
-                                    "Failed to parse consolidation response for session {}: {}",
+                                    "Failed to parse consolidation response for session {}: {} — messages will be retried next cycle",
                                     session_id, e
                                 );
                             }
                         }
                     }
 
-                    // Mark all messages in this batch as consolidated regardless of parse outcome
-                    let now = chrono::Utc::now().to_rfc3339();
-                    for (id, _role, _content) in messages {
-                        let _ = sqlx::query(
-                            "UPDATE messages SET consolidated_at = ? WHERE id = ?"
-                        )
-                        .bind(&now)
-                        .bind(id)
-                        .execute(&self.pool)
-                        .await;
+                    // Only mark messages as consolidated when facts were successfully parsed
+                    // On parse failure, messages remain unconsolidated for retry next cycle
+                    if response.content.as_ref().map_or(false, |text| parse_consolidation_response(text).is_ok()) {
+                        let now = chrono::Utc::now().to_rfc3339();
+                        for (id, _role, _content) in messages {
+                            let _ = sqlx::query(
+                                "UPDATE messages SET consolidated_at = ? WHERE id = ?"
+                            )
+                            .bind(&now)
+                            .bind(id)
+                            .execute(&self.pool)
+                            .await;
+                        }
                     }
                 }
                 Err(e) => {

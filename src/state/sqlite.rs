@@ -368,6 +368,76 @@ impl StateStore for SqliteStateStore {
         Ok(facts)
     }
 
+    async fn get_relevant_facts(&self, query: &str, max: usize) -> anyhow::Result<Vec<Fact>> {
+        let all_facts = self.get_facts(None).await?;
+        if all_facts.is_empty() || query.trim().is_empty() {
+            let mut facts = all_facts;
+            facts.truncate(max);
+            return Ok(facts);
+        }
+
+        // Embed the query
+        let query_vec = match self.embedding_service.embed(query.to_string()).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Failed to embed query for fact filtering, returning all facts: {}", e);
+                let mut facts = all_facts;
+                facts.truncate(max);
+                return Ok(facts);
+            }
+        };
+
+        // Embed each fact's combined text and score by similarity
+        let fact_texts: Vec<String> = all_facts
+            .iter()
+            .map(|f| format!("[{}] {}: {}", f.category, f.key, f.value))
+            .collect();
+
+        let fact_embeddings = match self.embedding_service.embed_batch(fact_texts).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Failed to embed facts for filtering, returning all facts: {}", e);
+                let mut facts = all_facts;
+                facts.truncate(max);
+                return Ok(facts);
+            }
+        };
+
+        // Score and sort by relevance
+        let mut scored: Vec<(usize, f32)> = fact_embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, emb)| (i, crate::memory::math::cosine_similarity(&query_vec, emb)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Take top `max` facts that are above a minimum relevance threshold (0.3)
+        // Low threshold because we still want loosely related facts, just not completely irrelevant ones
+        let relevant: Vec<Fact> = scored
+            .into_iter()
+            .filter(|(_, score)| *score > 0.3)
+            .take(max)
+            .map(|(i, _)| all_facts[i].clone())
+            .collect();
+
+        // If filtering left us with very few facts, pad with most recent ones
+        if relevant.len() < max / 2 && all_facts.len() > relevant.len() {
+            let mut result = relevant;
+            let existing_ids: std::collections::HashSet<i64> = result.iter().map(|f| f.id).collect();
+            for fact in &all_facts {
+                if result.len() >= max {
+                    break;
+                }
+                if !existing_ids.contains(&fact.id) {
+                    result.push(fact.clone());
+                }
+            }
+            return Ok(result);
+        }
+
+        Ok(relevant)
+    }
+
     async fn get_context(&self, session_id: &str, query: &str, _limit: usize) -> anyhow::Result<Vec<Message>> {
         // 1. Recency (Last 10) - Critical for conversational flow
         let recency_count = 10;

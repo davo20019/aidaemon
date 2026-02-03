@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -589,7 +590,7 @@ impl Agent {
                 }
             }
         }
-        let facts = self.state.get_facts(None).await?;
+        let facts = self.state.get_relevant_facts(user_text, self.max_facts).await?;
         let system_prompt = skills::build_system_prompt(
             &self.system_prompt,
             &self.skills,
@@ -626,6 +627,8 @@ impl Agent {
         // 3. Agentic loop — dynamic budget that the agent can extend
         let mut budget: usize = self.max_iterations;
         let mut iteration: usize = 0;
+        let mut tool_failure_count: HashMap<String, usize> = HashMap::new();
+        let mut tool_call_count: HashMap<String, usize> = HashMap::new();
         while iteration < budget {
             info!(iteration, session_id, model = %model, depth = self.depth, "Agent loop iteration");
 
@@ -878,6 +881,65 @@ impl Agent {
                         continue;
                     }
 
+                    // Check if this tool has been called too many times or failed too often
+                    let prior_failures = tool_failure_count.get(&tc.name).copied().unwrap_or(0);
+                    let prior_calls = tool_call_count.get(&tc.name).copied().unwrap_or(0);
+                    let blocked = if prior_failures >= 3 {
+                        Some(format!(
+                            "[SYSTEM] Tool '{}' has encountered {} errors. \
+                             Do not call it again. Use a different approach or \
+                             answer the user with what you have.",
+                            tc.name, prior_failures
+                        ))
+                    } else if prior_calls >= 3 && tc.name != "terminal" {
+                        if tc.name == "web_search" && prior_failures == 0 {
+                            Some(format!(
+                                "[SYSTEM] web_search returned no useful results {} times. \
+                                 The DuckDuckGo backend is likely blocked.\n\n\
+                                 Tell the user web search is not working and suggest they set up Brave Search:\n\
+                                 1. Get a free API key at https://brave.com/search/api/ (free tier = 2000 queries/month)\n\
+                                 2. Paste the API key in this chat\n\n\
+                                 When the user provides a Brave API key, use manage_config to:\n\
+                                 - set search.backend to '\"brave\"'\n\
+                                 - set search.api_key to '\"THEIR_KEY\"'\n\
+                                 Then tell them to type /reload to apply the changes.",
+                                prior_calls
+                            ))
+                        } else {
+                            // terminal is expected to be called many times; others are suspicious
+                            Some(format!(
+                                "[SYSTEM] You have already called '{}' {} times this turn. \
+                                 Do not call it again. Use the results you already have to \
+                                 answer the user's question now.",
+                                tc.name, prior_calls
+                            ))
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(result_text) = blocked {
+                        warn!(
+                            tool = %tc.name,
+                            failures = prior_failures,
+                            calls = prior_calls,
+                            "Blocking repeated tool call"
+                        );
+                        let tool_msg = Message {
+                            id: Uuid::new_v4().to_string(),
+                            session_id: session_id.to_string(),
+                            role: "tool".to_string(),
+                            content: Some(result_text),
+                            tool_call_id: Some(tc.id.clone()),
+                            tool_name: Some(tc.name.clone()),
+                            tool_calls_json: None,
+                            created_at: Utc::now(),
+                            importance: 0.1,
+                            embedding: None,
+                        };
+                        self.state.append_message(&tool_msg).await?;
+                        continue;
+                    }
+
                     send_status(
                         &status_tx,
                         StatusUpdate::ToolStart {
@@ -886,10 +948,29 @@ impl Agent {
                         },
                     );
                     let result = self.execute_tool(&tc.name, &tc.arguments, session_id).await;
-                    let result_text = match result {
+                    let mut result_text = match result {
                         Ok(text) => text,
                         Err(e) => format!("Error: {}", e),
                     };
+
+                    // Track total calls per tool
+                    *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+
+                    // Track tool failures across iterations (actual errors only)
+                    let is_error = result_text.starts_with("ERROR:")
+                        || result_text.starts_with("Error:")
+                        || result_text.starts_with("Failed to ");
+                    if is_error {
+                        let count = tool_failure_count.entry(tc.name.clone()).or_insert(0);
+                        *count += 1;
+                        if *count >= 2 {
+                            result_text = format!(
+                                "{}\n\n⚠ This tool has errored {} times. Do NOT retry it. \
+                                 Use a different approach or respond with what you have.",
+                                result_text, count
+                            );
+                        }
+                    }
 
                     let tool_msg = Message {
                         id: Uuid::new_v4().to_string(),
