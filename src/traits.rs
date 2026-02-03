@@ -83,11 +83,29 @@ pub trait ModelProvider: Send + Sync {
     async fn list_models(&self) -> anyhow::Result<Vec<String>>;
 }
 
+/// Token usage statistics from an LLM API response.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub model: String,
+}
+
 /// The LLM's response: either content text, tool calls, or both.
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<TokenUsage>,
+}
+
+/// A record of token usage from the database.
+#[derive(Debug, Clone)]
+pub struct TokenUsageRecord {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub created_at: String,
 }
 
 /// Persistent state store (SQLite + working memory).
@@ -105,6 +123,14 @@ pub trait StateStore: Send + Sync {
     /// Default implementation just calls get_history.
     async fn get_context(&self, session_id: &str, _query: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
         self.get_history(session_id, limit).await
+    }
+    /// Record token usage from an LLM call.
+    async fn record_token_usage(&self, _session_id: &str, _usage: &TokenUsage) -> anyhow::Result<()> {
+        Ok(()) // default no-op
+    }
+    /// Get token usage records since a given datetime string (ISO 8601).
+    async fn get_token_usage_since(&self, _since: &str) -> anyhow::Result<Vec<TokenUsageRecord>> {
+        Ok(vec![]) // default no-op
     }
 }
 

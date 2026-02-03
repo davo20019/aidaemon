@@ -7,7 +7,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock;
 
-use crate::traits::{Fact, Message, StateStore};
+use crate::traits::{Fact, Message, StateStore, TokenUsage, TokenUsageRecord};
 
 use crate::memory::embeddings::EmbeddingService;
 
@@ -185,6 +185,20 @@ impl SqliteStateStore {
                 used_count INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            )"
+        )
+        .execute(&pool)
+        .await?;
+
+        // Token usage tracking
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )"
         )
         .execute(&pool)
@@ -477,5 +491,40 @@ impl StateStore for SqliteStateStore {
         // But we want to keep *all* relevant context we found, so maybe flexible limit.
         // We just return what we gathered.
         Ok(messages)
+    }
+
+    async fn record_token_usage(&self, session_id: &str, usage: &TokenUsage) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO token_usage (session_id, model, input_tokens, output_tokens, created_at)
+             VALUES (?, ?, ?, ?, datetime('now'))"
+        )
+        .bind(session_id)
+        .bind(&usage.model)
+        .bind(usage.input_tokens as i64)
+        .bind(usage.output_tokens as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_token_usage_since(&self, since: &str) -> anyhow::Result<Vec<TokenUsageRecord>> {
+        let rows = sqlx::query(
+            "SELECT model, input_tokens, output_tokens, created_at
+             FROM token_usage WHERE created_at >= ? ORDER BY created_at DESC"
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            records.push(TokenUsageRecord {
+                model: row.get("model"),
+                input_tokens: row.get("input_tokens"),
+                output_tokens: row.get("output_tokens"),
+                created_at: row.get("created_at"),
+            });
+        }
+        Ok(records)
     }
 }

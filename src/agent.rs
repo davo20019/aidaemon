@@ -115,6 +115,8 @@ pub struct Agent {
     router: Option<Router>,
     /// When true, the user has manually set a model via /model — skip auto-routing.
     model_override: RwLock<bool>,
+    /// Optional daily token budget — rejects LLM calls when exceeded.
+    daily_token_budget: Option<u64>,
 }
 
 impl Agent {
@@ -134,6 +136,7 @@ impl Agent {
         timeout_secs: u64,
         models_config: ModelsConfig,
         max_facts: usize,
+        daily_token_budget: Option<u64>,
     ) -> Self {
         let fallback = model.clone();
         let router = Router::new(models_config);
@@ -167,6 +170,7 @@ impl Agent {
             max_facts,
             router,
             model_override: RwLock::new(false),
+            daily_token_budget,
         }
     }
 
@@ -208,6 +212,7 @@ impl Agent {
             max_facts,
             router: None,
             model_override: RwLock::new(false),
+            daily_token_budget: None,
         }
     }
 
@@ -749,6 +754,20 @@ impl Agent {
                 info!(session_id, iteration, msgs = ?summary, "Message structure before LLM call");
             }
 
+            // Check daily token budget before calling LLM
+            if let Some(budget) = self.daily_token_budget {
+                let today_start = Utc::now().format("%Y-%m-%d 00:00:00").to_string();
+                if let Ok(records) = self.state.get_token_usage_since(&today_start).await {
+                    let total: u64 = records.iter().map(|r| (r.input_tokens + r.output_tokens) as u64).sum();
+                    if total >= budget {
+                        return Err(anyhow::anyhow!(
+                            "Daily token budget of {} exceeded (used: {}). Resets at midnight UTC.",
+                            budget, total
+                        ));
+                    }
+                }
+            }
+
             // 4. Call the LLM with error-classified recovery
             // On the last iteration, omit tools to force a text response
             let effective_tools = if iteration >= budget - 1 {
@@ -760,6 +779,13 @@ impl Agent {
             let resp = self
                 .call_llm_with_recovery(&model, &messages, effective_tools)
                 .await?;
+
+            // Record token usage
+            if let Some(ref usage) = resp.usage {
+                if let Err(e) = self.state.record_token_usage(session_id, usage).await {
+                    warn!(session_id, error = %e, "Failed to record token usage");
+                }
+            }
 
             // Log tool call names for debugging
             let tc_names: Vec<&str> = resp.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
