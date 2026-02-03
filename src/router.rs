@@ -137,13 +137,8 @@ pub fn classify_query(text: &str) -> ClassificationResult {
         };
     }
 
-    // Short messages: <20 chars AND <=3 words
-    if trimmed.len() < 20 && word_count <= 3 {
-        return ClassificationResult {
-            tier: Tier::Fast,
-            reason: format!("short message ({} chars, {} words)", trimmed.len(), word_count),
-        };
-    }
+    // Note: short messages (2-3 words) fall through to Primary by default.
+    // Short ≠ simple — "capital Ecuador" or "explain gravity" need a capable model.
 
     // Simple lookup prefixes
     let fast_prefixes = [
@@ -219,9 +214,11 @@ mod tests {
     }
 
     #[test]
-    fn test_fast_short_message() {
-        assert_eq!(classify("how are you"), Tier::Fast);
-        assert_eq!(classify("what time"), Tier::Fast);
+    fn test_short_message_uses_primary() {
+        // Short messages go to primary — short ≠ simple
+        assert_eq!(classify("how are you"), Tier::Primary);
+        assert_eq!(classify("what time"), Tier::Primary);
+        assert_eq!(classify("capital Ecuador"), Tier::Primary);
     }
 
     #[test]

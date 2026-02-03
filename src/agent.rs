@@ -1104,6 +1104,31 @@ fn fixup_message_ordering(messages: &mut Vec<Value>) {
 
     // Pass 3
     merge_consecutive_messages(messages);
+
+    // Pass 4: Ensure the first non-system message is a user message.
+    // Gemini requires that assistant/tool messages come after a user turn.
+    // If history eviction dropped the original user message but kept later
+    // assistant+tool pairs, we need to drop those leading non-user messages.
+    if let Some(first_non_system) = messages.iter().position(|m| {
+        m.get("role").and_then(|r| r.as_str()) != Some("system")
+    }) {
+        let first_role = messages[first_non_system]
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        if first_role != "user" {
+            if let Some(first_user_rel) = messages[first_non_system..].iter().position(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+            }) {
+                let abs_end = first_non_system + first_user_rel;
+                warn!(
+                    dropped = abs_end - first_non_system,
+                    "Dropping leading non-user messages to satisfy provider ordering"
+                );
+                messages.drain(first_non_system..abs_end);
+            }
+        }
+    }
 }
 
 /// Check if a session ID indicates it was triggered by an automated source

@@ -111,24 +111,21 @@ impl Tool for SendFileTool {
 
     fn schema(&self) -> Value {
         json!({
-            "type": "function",
-            "function": {
-                "name": "send_file",
-                "description": self.description(),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "Absolute path to the file to send"
-                        },
-                        "caption": {
-                            "type": "string",
-                            "description": "Optional caption for the file"
-                        }
+            "name": "send_file",
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the file to send"
                     },
-                    "required": ["file_path"]
-                }
+                    "caption": {
+                        "type": "string",
+                        "description": "Optional caption for the file"
+                    }
+                },
+                "required": ["file_path"]
             }
         })
     }
