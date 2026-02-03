@@ -1,6 +1,26 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
+
+/// Helper to format a redacted secret field for Debug output.
+/// Shows "[REDACTED]" if the value is non-empty, "\"\"" if empty.
+fn redact(secret: &str) -> &'static str {
+    if secret.is_empty() {
+        "\"\""
+    } else {
+        "[REDACTED]"
+    }
+}
+
+/// Helper to format an optional redacted secret field for Debug output.
+fn redact_option(secret: &Option<String>) -> &'static str {
+    match secret {
+        Some(s) if !s.is_empty() => "Some([REDACTED])",
+        Some(_) => "Some(\"\")",
+        None => "None",
+    }
+}
 
 const KEYCHAIN_SERVICE: &str = "aidaemon";
 
@@ -78,7 +98,7 @@ pub struct AppConfig {
     pub files: FilesConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct ProviderConfig {
     #[serde(default)]
     pub kind: ProviderKind,
@@ -87,6 +107,17 @@ pub struct ProviderConfig {
     pub base_url: String,
     #[serde(default)]
     pub models: ModelsConfig,
+}
+
+impl fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("kind", &self.kind)
+            .field("api_key", &redact(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("models", &self.models)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq)]
@@ -143,15 +174,24 @@ impl ModelsConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct TelegramConfig {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_user_ids: Vec<u64>,
 }
 
+impl fmt::Debug for TelegramConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TelegramConfig")
+            .field("bot_token", &redact(&self.bot_token))
+            .field("allowed_user_ids", &self.allowed_user_ids)
+            .finish()
+    }
+}
+
 #[cfg(feature = "discord")]
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone, Default)]
 pub struct DiscordConfig {
     #[serde(default)]
     pub bot_token: String,
@@ -161,8 +201,19 @@ pub struct DiscordConfig {
     pub guild_id: Option<u64>,
 }
 
+#[cfg(feature = "discord")]
+impl fmt::Debug for DiscordConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DiscordConfig")
+            .field("bot_token", &redact(&self.bot_token))
+            .field("allowed_user_ids", &self.allowed_user_ids)
+            .field("guild_id", &self.guild_id)
+            .finish()
+    }
+}
+
 #[cfg(feature = "slack")]
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone, Default)]
 pub struct SlackConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -177,11 +228,24 @@ pub struct SlackConfig {
 }
 
 #[cfg(feature = "slack")]
+impl fmt::Debug for SlackConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlackConfig")
+            .field("enabled", &self.enabled)
+            .field("app_token", &redact(&self.app_token))
+            .field("bot_token", &redact(&self.bot_token))
+            .field("allowed_user_ids", &self.allowed_user_ids)
+            .field("use_threads", &self.use_threads)
+            .finish()
+    }
+}
+
+#[cfg(feature = "slack")]
 fn default_slack_use_threads() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct StateConfig {
     #[serde(default = "default_db_path")]
     pub db_path: String,
@@ -203,6 +267,19 @@ pub struct StateConfig {
     /// once cumulative daily usage exceeds this limit. Resets at midnight UTC.
     #[serde(default)]
     pub daily_token_budget: Option<u64>,
+}
+
+impl fmt::Debug for StateConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StateConfig")
+            .field("db_path", &self.db_path)
+            .field("working_memory_cap", &self.working_memory_cap)
+            .field("consolidation_interval_hours", &self.consolidation_interval_hours)
+            .field("encryption_key", &redact_option(&self.encryption_key))
+            .field("max_facts", &self.max_facts)
+            .field("daily_token_budget", &self.daily_token_budget)
+            .finish()
+    }
 }
 
 impl Default for StateConfig {
@@ -324,7 +401,7 @@ pub struct TriggersConfig {
     pub email: Option<EmailTriggerConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct EmailTriggerConfig {
     pub host: String,
     pub port: u16,
@@ -332,6 +409,18 @@ pub struct EmailTriggerConfig {
     pub password: String,
     #[serde(default = "default_folder")]
     pub folder: String,
+}
+
+impl fmt::Debug for EmailTriggerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EmailTriggerConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &redact(&self.password))
+            .field("folder", &self.folder)
+            .finish()
+    }
 }
 
 fn default_folder() -> String {
@@ -503,12 +592,21 @@ pub struct CliToolConfig {
     pub max_output_chars: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone, Default)]
 pub struct SearchConfig {
     #[serde(default)]
     pub backend: SearchBackendKind,
     #[serde(default)]
     pub api_key: String,
+}
+
+impl fmt::Debug for SearchConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SearchConfig")
+            .field("backend", &self.backend)
+            .field("api_key", &redact(&self.api_key))
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

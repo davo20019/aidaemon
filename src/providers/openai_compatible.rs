@@ -132,7 +132,17 @@ impl ModelProvider for OpenAiCompatibleProvider {
             return Err(ProviderError::from_status(status.as_u16(), &text).into());
         }
 
-        debug!("Provider response: {}", &text[..text.len().min(2000)]);
+        // Safely truncate for debug logging, respecting UTF-8 char boundaries
+        let truncated = if text.len() > 2000 {
+            let mut end = 2000;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
+        } else {
+            &text
+        };
+        debug!("Provider response: {}", truncated);
 
         let data: Value = serde_json::from_str(&text)?;
         let choice = data["choices"]

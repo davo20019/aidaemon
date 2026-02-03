@@ -143,10 +143,17 @@ fn extract_retry_after(body: &str) -> Option<u64> {
         })
 }
 
+/// Truncate a string to at most `max_len` bytes, respecting UTF-8 char boundaries.
+/// Avoids panicking on multi-byte characters.
 fn truncate_body(body: &str) -> String {
-    if body.len() > 300 {
-        format!("{}...", &body[..300])
-    } else {
-        body.to_string()
+    const MAX_LEN: usize = 300;
+    if body.len() <= MAX_LEN {
+        return body.to_string();
     }
+    // Find a valid UTF-8 char boundary at or before MAX_LEN
+    let mut end = MAX_LEN;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &body[..end])
 }
