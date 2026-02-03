@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info};
 
 use crate::providers::ProviderError;
-use crate::traits::{ModelProvider, ProviderResponse, ToolCall};
+use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
 
 pub struct OpenAiCompatibleProvider {
     client: Client,
@@ -119,9 +119,18 @@ impl ModelProvider for OpenAiCompatibleProvider {
             }
         }
 
+        let usage = data.get("usage").and_then(|u| {
+            Some(TokenUsage {
+                input_tokens: u.get("prompt_tokens")?.as_u64()? as u32,
+                output_tokens: u.get("completion_tokens")?.as_u64()? as u32,
+                model: model.to_string(),
+            })
+        });
+
         Ok(ProviderResponse {
             content,
             tool_calls,
+            usage,
         })
     }
 

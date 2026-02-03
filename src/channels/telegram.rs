@@ -14,7 +14,7 @@ use crate::agent::{Agent, StatusUpdate};
 use crate::channels::SessionMap;
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
-use crate::traits::{Channel, ChannelCapabilities};
+use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 
 pub struct TelegramChannel {
@@ -35,6 +35,8 @@ pub struct TelegramChannel {
     inbox_dir: PathBuf,
     /// Max file size in MB for inbound files.
     max_file_size_mb: u64,
+    /// State store for querying token usage.
+    state: Arc<dyn StateStore>,
 }
 
 impl TelegramChannel {
@@ -48,6 +50,7 @@ impl TelegramChannel {
         files_enabled: bool,
         inbox_dir: PathBuf,
         max_file_size_mb: u64,
+        state: Arc<dyn StateStore>,
     ) -> Self {
         let bot = Bot::new(bot_token);
         Self {
@@ -62,6 +65,7 @@ impl TelegramChannel {
             files_enabled,
             inbox_dir,
             max_file_size_mb,
+            state,
         }
     }
 
@@ -308,6 +312,9 @@ impl TelegramChannel {
                     }
                 }
             }
+            "/cost" => {
+                self.handle_cost_command().await
+            }
             "/help" | "/start" => {
                 "Available commands:\n\
                 /model — Show current model\n\
@@ -318,6 +325,7 @@ impl TelegramChannel {
                 /restart — Restart the daemon (picks up new binary, config, MCP servers)\n\
                 /tasks — List running and recent tasks\n\
                 /cancel <id> — Cancel a running task\n\
+                /cost — Show token usage statistics\n\
                 /help — Show this help message"
                     .to_string()
             }
@@ -463,6 +471,56 @@ impl TelegramChannel {
         }
 
         Ok(context)
+    }
+
+    async fn handle_cost_command(&self) -> String {
+        use std::collections::HashMap as StdHashMap;
+
+        let now = Utc::now();
+        let since_24h = (now - chrono::Duration::hours(24)).format("%Y-%m-%d %H:%M:%S").to_string();
+        let since_7d = (now - chrono::Duration::days(7)).format("%Y-%m-%d %H:%M:%S").to_string();
+
+        let records_24h = match self.state.get_token_usage_since(&since_24h).await {
+            Ok(r) => r,
+            Err(e) => return format!("Failed to query token usage: {}", e),
+        };
+        let records_7d = match self.state.get_token_usage_since(&since_7d).await {
+            Ok(r) => r,
+            Err(e) => return format!("Failed to query token usage: {}", e),
+        };
+
+        let (input_24h, output_24h) = records_24h.iter().fold((0i64, 0i64), |(i, o), r| {
+            (i + r.input_tokens, o + r.output_tokens)
+        });
+        let (input_7d, output_7d) = records_7d.iter().fold((0i64, 0i64), |(i, o), r| {
+            (i + r.input_tokens, o + r.output_tokens)
+        });
+
+        // Top models (by total tokens in 7d)
+        let mut model_totals: StdHashMap<&str, i64> = StdHashMap::new();
+        for r in &records_7d {
+            *model_totals.entry(&r.model).or_insert(0) += r.input_tokens + r.output_tokens;
+        }
+        let mut models_sorted: Vec<(&&str, &i64)> = model_totals.iter().collect();
+        models_sorted.sort_by(|a, b| b.1.cmp(a.1));
+
+        let mut reply = format!(
+            "Token usage (last 24h):\n  Input:  {} tokens\n  Output: {} tokens\n\n\
+             Token usage (last 7d):\n  Input:  {} tokens\n  Output: {} tokens",
+            format_number(input_24h),
+            format_number(output_24h),
+            format_number(input_7d),
+            format_number(output_7d),
+        );
+
+        if !models_sorted.is_empty() {
+            reply.push_str("\n\nTop models (7d):");
+            for (model, total) in models_sorted.iter().take(5) {
+                reply.push_str(&format!("\n  {}: {} tokens", model, format_number(**total)));
+            }
+        }
+
+        reply
     }
 
     async fn handle_message(&self, msg: teloxide::types::Message, bot: Bot) {
@@ -1021,6 +1079,19 @@ async fn send_html_or_fallback(bot: &Bot, chat_id: ChatId, html: &str, plain: &s
             Ok(())
         }
     }
+}
+
+/// Format a number with comma separators (e.g. 12450 → "12,450").
+fn format_number(n: i64) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
 }
 
 /// Sanitize a filename: remove path separators, null bytes, and limit length.

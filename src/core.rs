@@ -191,6 +191,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         config.subagents.timeout_secs,
         config.provider.models.clone(),
         config.state.max_facts,
+        config.state.daily_token_budget,
     ));
 
     // Close the loop: give the spawn tool a weak reference to the agent.
@@ -234,6 +235,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         config.files.enabled,
         PathBuf::from(&inbox_dir),
         config.files.max_file_size_mb,
+        state.clone(),
     ));
 
     let channels: Vec<Arc<dyn Channel>> = vec![telegram.clone() as Arc<dyn Channel>];

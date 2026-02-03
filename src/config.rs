@@ -162,6 +162,10 @@ pub struct StateConfig {
     /// remain in the database but are not included in the prompt.
     #[serde(default = "default_max_facts")]
     pub max_facts: usize,
+    /// Optional daily token budget. When set, LLM calls will be rejected
+    /// once cumulative daily usage exceeds this limit. Resets at midnight UTC.
+    #[serde(default)]
+    pub daily_token_budget: Option<u64>,
 }
 
 impl Default for StateConfig {
@@ -172,6 +176,7 @@ impl Default for StateConfig {
             consolidation_interval_hours: default_consolidation_interval_hours(),
             encryption_key: None,
             max_facts: default_max_facts(),
+            daily_token_budget: None,
         }
     }
 }

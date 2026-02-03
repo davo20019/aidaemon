@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use tracing::{error, info};
 
 use crate::providers::ProviderError;
-use crate::traits::{ModelProvider, ProviderResponse, ToolCall};
+use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
 
 pub struct AnthropicNativeProvider {
     client: Client,
@@ -264,9 +264,18 @@ impl ModelProvider for AnthropicNativeProvider {
             }
         }
 
+        let usage = data.get("usage").and_then(|u| {
+            Some(TokenUsage {
+                input_tokens: u.get("input_tokens")?.as_u64()? as u32,
+                output_tokens: u.get("output_tokens")?.as_u64()? as u32,
+                model: model.to_string(),
+            })
+        });
+
         Ok(ProviderResponse {
             content: if final_text.is_empty() { None } else { Some(final_text) },
             tool_calls,
+            usage,
         })
     }
 

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
 use crate::providers::ProviderError;
-use crate::traits::{ModelProvider, ProviderResponse, ToolCall};
+use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
 
 pub struct GoogleGenAiProvider {
     client: Client,
@@ -173,7 +173,7 @@ impl GoogleGenAiProvider {
     }
 
     /// Parse a Gemini generateContent response into a ProviderResponse.
-    fn parse_response(&self, data: &Value) -> anyhow::Result<ProviderResponse> {
+    fn parse_response(&self, data: &Value, model: &str) -> anyhow::Result<ProviderResponse> {
         let candidate = data["candidates"]
             .get(0)
             .ok_or_else(|| anyhow::anyhow!("No candidates in Google GenAI response: {}", data))?;
@@ -234,9 +234,18 @@ impl GoogleGenAiProvider {
             }
         }
 
+        let usage = data.get("usageMetadata").and_then(|u| {
+            Some(TokenUsage {
+                input_tokens: u.get("promptTokenCount")?.as_u64()? as u32,
+                output_tokens: u.get("candidatesTokenCount")?.as_u64()? as u32,
+                model: model.to_string(),
+            })
+        });
+
         Ok(ProviderResponse {
             content: if final_text.is_empty() { None } else { Some(final_text) },
             tool_calls,
+            usage,
         })
     }
 }
@@ -314,7 +323,7 @@ impl ModelProvider for GoogleGenAiProvider {
                 }
 
                 let data: Value = serde_json::from_str(&text2)?;
-                return self.parse_response(&data);
+                return self.parse_response(&data, model);
             }
 
             error!(status = %status, "Google GenAI API error: {}", text);
@@ -322,7 +331,7 @@ impl ModelProvider for GoogleGenAiProvider {
         }
 
         let data: Value = serde_json::from_str(&text)?;
-        self.parse_response(&data)
+        self.parse_response(&data, model)
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
