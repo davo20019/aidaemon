@@ -279,11 +279,19 @@ impl ModelProvider for GoogleGenAiProvider {
             body["tools"] = json!(gt);
         }
 
-        let url = format!("{}/models/{}:generateContent?key={}", self.base_url, model, self.api_key);
+        // Use header-based authentication instead of URL query parameter
+        // to avoid API key exposure in logs, proxies, and error messages
+        let url = format!("{}/models/{}:generateContent", self.base_url, model);
 
         info!(model, url_prefix = %self.base_url, "Calling Google GenAI");
 
-        let resp = match self.client.post(&url).json(&body).send().await {
+        let resp = match self.client
+            .post(&url)
+            .header("x-goog-api-key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 error!("Google GenAI HTTP request failed: {}", e);
@@ -310,7 +318,13 @@ impl ModelProvider for GoogleGenAiProvider {
                     body2["tools"] = json!(gt);
                 }
 
-                let resp2 = match self.client.post(&url).json(&body2).send().await {
+                let resp2 = match self.client
+                    .post(&url)
+                    .header("x-goog-api-key", &self.api_key)
+                    .json(&body2)
+                    .send()
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => {
                         error!("Google GenAI HTTP request failed on retry: {}", e);
@@ -339,8 +353,13 @@ impl ModelProvider for GoogleGenAiProvider {
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        let url = format!("{}/models?key={}&page_size=50", self.base_url, self.api_key);
-        let resp = self.client.get(&url).send().await?;
+        // Use header-based authentication instead of URL query parameter
+        let url = format!("{}/models?page_size=50", self.base_url);
+        let resp = self.client
+            .get(&url)
+            .header("x-goog-api-key", &self.api_key)
+            .send()
+            .await?;
         
         if !resp.status().is_success() {
             anyhow::bail!("Failed to list models: {}", resp.status());

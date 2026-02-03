@@ -140,8 +140,9 @@ impl TelegramChannel {
     /// Handle callback query from inline keyboard buttons.
     async fn handle_callback(&self, q: CallbackQuery, bot: Bot) {
         // Authorization check: only allowed users can approve/deny commands.
+        // Fail-closed: deny if no users configured or user not in list.
         let user_id = q.from.id.0;
-        if !self.allowed_user_ids.is_empty() && !self.allowed_user_ids.contains(&user_id) {
+        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id) {
             warn!(user_id, "Unauthorized callback from user");
             let _ = bot.answer_callback_query(q.id).text("Unauthorized.").await;
             return;
@@ -535,8 +536,8 @@ impl TelegramChannel {
     async fn handle_message(&self, msg: teloxide::types::Message, bot: Bot) {
         let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
 
-        // Authorization check
-        if !self.allowed_user_ids.is_empty() && !self.allowed_user_ids.contains(&user_id) {
+        // Authorization check: fail-closed - deny if no users configured or user not in list
+        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id) {
             warn!(user_id, "Unauthorized user attempted access");
             let _ = bot
                 .send_message(msg.chat.id, "Unauthorized.")

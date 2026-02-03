@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::providers::ProviderError;
 use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
@@ -14,17 +14,63 @@ pub struct OpenAiCompatibleProvider {
     api_key: String,
 }
 
+/// Validate the base URL for security.
+/// - HTTPS is required for remote URLs to protect API keys in transit
+/// - HTTP is allowed only for localhost/127.0.0.1 (local LLM servers)
+fn validate_base_url(base_url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|e| format!("Invalid base_url '{}': {}", base_url, e))?;
+
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or("");
+
+    match scheme {
+        "https" => Ok(()), // HTTPS is always allowed
+        "http" => {
+            // HTTP only allowed for localhost
+            let is_localhost = host == "localhost"
+                || host == "127.0.0.1"
+                || host == "[::1]"
+                || host == "::1";
+
+            if is_localhost {
+                warn!(
+                    "Using unencrypted HTTP for local LLM server at '{}'. \
+                     API key will be transmitted in cleartext.",
+                    base_url
+                );
+                Ok(())
+            } else {
+                Err(format!(
+                    "HTTP is not allowed for remote URLs (base_url: '{}'). \
+                     Use HTTPS to protect your API key in transit. \
+                     HTTP is only permitted for localhost.",
+                    base_url
+                ))
+            }
+        }
+        _ => Err(format!(
+            "Unsupported URL scheme '{}' in base_url '{}'. Only http and https are allowed.",
+            scheme, base_url
+        )),
+    }
+}
+
 impl OpenAiCompatibleProvider {
-    pub fn new(base_url: &str, api_key: &str) -> Self {
+    pub fn new(base_url: &str, api_key: &str) -> Result<Self, String> {
+        // Validate URL security before creating provider
+        validate_base_url(base_url)?;
+
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
-            .expect("failed to build HTTP client");
-        Self {
+            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+        Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
-        }
+        })
     }
 }
 
