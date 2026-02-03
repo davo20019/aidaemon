@@ -19,9 +19,10 @@ use crate::skills;
 use crate::state::SqliteStateStore;
 #[cfg(feature = "browser")]
 use crate::tools::BrowserTool;
-use crate::tools::{CliAgentTool, ConfigManagerTool, RememberFactTool, SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool};
+use crate::tools::{CliAgentTool, ConfigManagerTool, RememberFactTool, SchedulerTool, SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool};
 use crate::traits::{Channel, Tool};
 use crate::tasks::TaskRegistry;
+use crate::scheduler::SchedulerManager;
 use crate::triggers::{self, TriggerManager};
 
 pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::Result<()> {
@@ -117,6 +118,12 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         }
     }
 
+    // Scheduler tool (conditional)
+    if config.scheduler.enabled {
+        tools.push(Arc::new(SchedulerTool::new(state.pool())));
+        info!("Scheduler tool enabled");
+    }
+
     // 5. MCP tools
     if !config.mcp.is_empty() {
         let mcp_tools = mcp::discover_mcp_tools(&config.mcp).await?;
@@ -181,10 +188,22 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 8. Event bus for triggers
     let (event_tx, mut event_rx) = triggers::event_bus(64);
+    let scheduler_event_tx = event_tx.clone();
 
     // 9. Triggers
     let trigger_manager = Arc::new(TriggerManager::new(config.triggers.clone(), event_tx));
     trigger_manager.spawn();
+
+    // 9b. Scheduler
+    if config.scheduler.enabled {
+        let scheduler = Arc::new(SchedulerManager::new(
+            state.pool(),
+            scheduler_event_tx,
+            config.scheduler.tick_interval_secs,
+        ));
+        scheduler.seed_from_config(&config.scheduler.tasks).await;
+        scheduler.spawn();
+    }
 
     // 10. Session map (shared between hub and channels for routing)
     let session_map: SessionMap = Arc::new(RwLock::new(HashMap::new()));
@@ -307,6 +326,22 @@ fn build_base_system_prompt(config: &AppConfig) -> String {
         ""
     };
 
+    let scheduler_table_row = if config.scheduler.enabled {
+        "\n| Schedule tasks, reminders, recurring jobs | scheduler | terminal (crontab) |"
+    } else {
+        ""
+    };
+
+    let scheduler_tool_doc = if config.scheduler.enabled {
+        "\n- `scheduler`: Create, list, delete, pause, and resume scheduled tasks and reminders. \
+        Actions: create (name + schedule + prompt), list, delete (by id), pause (by id), resume (by id). \
+        Supports natural schedule formats: 'daily at 9am', 'every 5m', 'every 2h', 'weekdays at 8:30', \
+        'weekends at 10am', 'in 30m', 'hourly', 'daily', 'weekly', 'monthly', or raw 5-field cron expressions. \
+        Set oneshot=true for one-time reminders. Set trusted=true when the prompt needs terminal access."
+    } else {
+        ""
+    };
+
     let spawn_tool_doc = if config.subagents.enabled {
         format!(
             "\n- `spawn_agent`: Spawn a sub-agent to handle a complex sub-task autonomously. \
@@ -369,7 +404,7 @@ Narrate your plan before executing — tell the user what you're about to do and
 | Run commands, scripts | terminal | — |
 | Get system specs | system_info | terminal (uname, etc.) |
 | Store user info | remember_fact | — |
-| Fix config | manage_config | terminal (editing files) |{spawn_table_row}{cli_agent_table_row}
+| Fix config | manage_config | terminal (editing files) |{spawn_table_row}{cli_agent_table_row}{scheduler_table_row}
 
 ## Tools
 - `terminal`: Run ANY command available on this system. This includes shell commands, \
@@ -383,7 +418,7 @@ pre-approved list. The user can allow them with one tap.
 - `manage_config`: Read and update your own config.toml. Use this to fix configuration issues.
 - `web_search`: Search the web. Returns titles, URLs, and snippets for your query. Use to find current information, research topics, check facts.
 - `web_fetch`: Fetch a URL and extract its readable content. Strips ads/navigation. For login-required sites, use `browser` instead.
-{browser_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}
+{browser_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}{scheduler_tool_doc}
 
 ## Self-Maintenance
 You are responsible for your own maintenance. When you encounter errors:
