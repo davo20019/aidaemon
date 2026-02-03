@@ -327,6 +327,133 @@ pub(crate) fn format_number(n: i64) -> String {
     result.chars().rev().collect()
 }
 
+/// Convert common LLM markdown to Slack mrkdwn format.
+///
+/// Slack mrkdwn differs from standard markdown:
+/// - Bold: `*bold*` (single asterisk, not double)
+/// - Italic: `_italic_`
+/// - Code: `` `code` `` (same)
+/// - Code block: ``` ```code``` ``` (same)
+/// - Links: `<url|text>` instead of `[text](url)`
+/// - Headings: `*Heading*` (bold, no # prefix)
+/// - Lists: use `•` for unordered
+#[cfg(feature = "slack")]
+pub(crate) fn markdown_to_slack_mrkdwn(md: &str) -> String {
+    let mut result = String::with_capacity(md.len() + md.len() / 4);
+    let lines: Vec<&str> = md.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+
+        // Fenced code blocks: ```lang\n...\n``` — pass through as-is
+        if line.starts_with("```") {
+            result.push_str(line);
+            result.push('\n');
+            i += 1;
+            while i < lines.len() && !lines[i].starts_with("```") {
+                result.push_str(lines[i]);
+                result.push('\n');
+                i += 1;
+            }
+            if i < lines.len() {
+                result.push_str(lines[i]);
+                result.push('\n');
+                i += 1;
+            }
+            continue;
+        }
+
+        // Heading lines: ### heading → *heading* (bold in Slack)
+        if line.starts_with('#') {
+            let trimmed = line.trim_start_matches('#').trim_start();
+            if !trimmed.is_empty() {
+                result.push('*');
+                result.push_str(&convert_slack_inline(trimmed));
+                result.push('*');
+                result.push('\n');
+                i += 1;
+                continue;
+            }
+        }
+
+        // Unordered list markers: "- " or "* " at start → "• "
+        let processed = if line.starts_with("- ") {
+            format!("• {}", &line[2..])
+        } else if line.starts_with("* ") {
+            format!("• {}", &line[2..])
+        } else {
+            line.to_string()
+        };
+
+        // Apply inline formatting conversions
+        let processed = convert_slack_inline(&processed);
+
+        result.push_str(&processed);
+        result.push('\n');
+        i += 1;
+    }
+
+    // Remove trailing newline
+    if result.ends_with('\n') {
+        result.pop();
+    }
+    result
+}
+
+/// Convert inline markdown to Slack mrkdwn.
+/// - `**bold**` → `*bold*`
+/// - `[text](url)` → `<url|text>`
+/// - Inline code stays the same
+#[cfg(feature = "slack")]
+fn convert_slack_inline(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Inline code: `code` — pass through
+        if chars[i] == '`' {
+            if let Some(end) = find_char(&chars, '`', i + 1) {
+                let span: String = chars[i..=end].iter().collect();
+                result.push_str(&span);
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // Bold: **text** → *text*
+        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
+            if let Some(end) = find_double_char(&chars, '*', i + 2) {
+                result.push('*');
+                let inner: String = chars[i + 2..end].iter().collect();
+                result.push_str(&inner);
+                result.push('*');
+                i = end + 2;
+                continue;
+            }
+        }
+
+        // Link: [text](url) → <url|text>
+        if chars[i] == '[' {
+            if let Some((text, url, end)) = parse_link(&chars, i) {
+                result.push('<');
+                result.push_str(&url);
+                result.push('|');
+                result.push_str(&text);
+                result.push('>');
+                i = end;
+                continue;
+            }
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
+}
+
 /// Sanitize a filename: remove path separators, null bytes, and limit length.
 pub(crate) fn sanitize_filename(name: &str) -> String {
     let sanitized: String = name

@@ -8,6 +8,10 @@ use tracing::info;
 
 use crate::agent::Agent;
 use crate::channels::{ChannelHub, SessionMap, TelegramChannel};
+#[cfg(feature = "discord")]
+use crate::channels::DiscordChannel;
+#[cfg(feature = "slack")]
+use crate::channels::SlackChannel;
 use crate::config::AppConfig;
 use crate::daemon;
 use crate::mcp;
@@ -231,14 +235,67 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         Arc::clone(&agent),
         config_path.clone(),
         session_map.clone(),
-        task_registry,
+        task_registry.clone(),
         config.files.enabled,
         PathBuf::from(&inbox_dir),
         config.files.max_file_size_mb,
         state.clone(),
     ));
 
-    let channels: Vec<Arc<dyn Channel>> = vec![telegram.clone() as Arc<dyn Channel>];
+    #[cfg(feature = "discord")]
+    let discord: Option<Arc<DiscordChannel>> = if !config.discord.bot_token.is_empty() {
+        let dc = Arc::new(DiscordChannel::new(
+            &config.discord.bot_token,
+            config.discord.allowed_user_ids.clone(),
+            config.discord.guild_id,
+            Arc::clone(&agent),
+            config_path.clone(),
+            session_map.clone(),
+            task_registry.clone(),
+            config.files.enabled,
+            PathBuf::from(&inbox_dir),
+            config.files.max_file_size_mb,
+            state.clone(),
+        ));
+        Some(dc)
+    } else {
+        None
+    };
+
+    #[cfg(feature = "slack")]
+    let slack: Option<Arc<SlackChannel>> = if config.slack.enabled
+        && !config.slack.bot_token.is_empty()
+        && !config.slack.app_token.is_empty()
+    {
+        let sc = Arc::new(SlackChannel::new(
+            &config.slack.app_token,
+            &config.slack.bot_token,
+            config.slack.allowed_user_ids.clone(),
+            config.slack.use_threads,
+            Arc::clone(&agent),
+            config_path.clone(),
+            session_map.clone(),
+            task_registry.clone(),
+            config.files.enabled,
+            PathBuf::from(&inbox_dir),
+            config.files.max_file_size_mb,
+            state.clone(),
+        ));
+        Some(sc)
+    } else {
+        None
+    };
+
+    #[allow(unused_mut)]
+    let mut channels: Vec<Arc<dyn Channel>> = vec![telegram.clone() as Arc<dyn Channel>];
+    #[cfg(feature = "discord")]
+    if let Some(ref dc) = discord {
+        channels.push(dc.clone() as Arc<dyn Channel>);
+    }
+    #[cfg(feature = "slack")]
+    if let Some(ref sc) = slack {
+        channels.push(sc.clone() as Arc<dyn Channel>);
+    }
     info!(count = channels.len(), "Channels registered");
 
     // 12. Channel Hub — routes approvals, media, and notifications
@@ -280,12 +337,27 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // 14. Event listener: route trigger events to agent -> broadcast via hub
     let hub_for_events = hub.clone();
     let agent_for_events = Arc::clone(&agent);
-    let notify_session_ids: Vec<String> = config
+    #[allow(unused_mut)]
+    let mut notify_session_ids: Vec<String> = config
         .telegram
         .allowed_user_ids
         .iter()
         .map(|id| id.to_string())
         .collect();
+    #[cfg(feature = "discord")]
+    if discord.is_some() {
+        for uid in &config.discord.allowed_user_ids {
+            notify_session_ids.push(format!("discord:dm:{}", uid));
+        }
+    }
+    #[cfg(feature = "slack")]
+    if slack.is_some() {
+        // Slack user IDs are strings — DM channels are opened lazily,
+        // so we add them as slack:dm:{user_id} placeholders for broadcast.
+        for uid in &config.slack.allowed_user_ids {
+            notify_session_ids.push(format!("slack:{}", uid));
+        }
+    }
     tokio::spawn(async move {
         loop {
             match event_rx.recv().await {
@@ -332,9 +404,25 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         let _ = telegram.send_text(&user_id.to_string(), "aidaemon is online.").await;
     }
 
-    // 16. Start Telegram with auto-retry (blocks)
-    // Future channels would be started similarly in their own tasks.
+    // 16. Start channels
     info!("Starting aidaemon v0.1.0");
+
+    // Spawn Discord and Slack as background tasks (non-blocking), then run Telegram (blocking).
+    #[cfg(feature = "discord")]
+    if let Some(dc) = discord {
+        tokio::spawn(async move {
+            dc.start_with_retry().await;
+        });
+    }
+
+    #[cfg(feature = "slack")]
+    if let Some(sc) = slack {
+        tokio::spawn(async move {
+            sc.start_with_retry().await;
+        });
+    }
+
+    // Telegram blocks (last channel to start).
     telegram.start_with_retry().await;
 
     Ok(())
