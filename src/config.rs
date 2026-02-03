@@ -2,6 +2,46 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+const KEYCHAIN_SERVICE: &str = "aidaemon";
+
+/// Expand `${ENV_VAR}` references in a string.
+/// Returns an error listing all undefined variables (does not fail on first miss).
+pub fn expand_env_vars(content: &str) -> anyhow::Result<String> {
+    let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap();
+    let mut missing: Vec<String> = Vec::new();
+    let result = re.replace_all(content, |caps: &regex::Captures| {
+        let var_name = &caps[1];
+        match std::env::var(var_name) {
+            Ok(val) => val,
+            Err(_) => {
+                missing.push(var_name.to_string());
+                caps[0].to_string()
+            }
+        }
+    });
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Config references undefined environment variable(s): {}",
+            missing.join(", ")
+        );
+    }
+    Ok(result.into_owned())
+}
+
+fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
+    entry
+        .get_password()
+        .map_err(|e| anyhow::anyhow!("Failed to read '{}' from OS keychain: {}", field_name, e))
+}
+
+/// Store a secret in the OS keychain under the `aidaemon` service.
+pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
+    entry.set_password(value)?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub provider: ProviderConfig,
@@ -503,8 +543,94 @@ fn default_retention_hours() -> u64 {
 impl AppConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let mut config: AppConfig = toml::from_str(&content)?;
+        let expanded = expand_env_vars(&content)?;
+        let mut config: AppConfig = toml::from_str(&expanded)?;
         config.provider.models.apply_defaults(&config.provider.kind);
+        config.resolve_secrets()?;
         Ok(config)
+    }
+
+    /// Resolve fields set to `"keychain"` by reading them from the OS credential store.
+    fn resolve_secrets(&mut self) -> anyhow::Result<()> {
+        if self.provider.api_key == "keychain" {
+            self.provider.api_key = resolve_from_keychain("api_key")?;
+        }
+        if self.telegram.bot_token == "keychain" {
+            self.telegram.bot_token = resolve_from_keychain("bot_token")?;
+        }
+        if let Some(ref email) = self.triggers.email {
+            if email.password == "keychain" {
+                let password = resolve_from_keychain("email_password")?;
+                let mut email = email.clone();
+                email.password = password;
+                self.triggers.email = Some(email);
+            }
+        }
+        if let Some(ref key) = self.state.encryption_key {
+            if key == "keychain" {
+                self.state.encryption_key = Some(resolve_from_keychain("encryption_key")?);
+            }
+        }
+        if self.search.api_key == "keychain" {
+            self.search.api_key = resolve_from_keychain("search_api_key")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_env_vars_replaces_set_variable() {
+        std::env::set_var("AIDAEMON_TEST_VAR", "hello");
+        let result = expand_env_vars("key = \"${AIDAEMON_TEST_VAR}\"").unwrap();
+        assert_eq!(result, "key = \"hello\"");
+        std::env::remove_var("AIDAEMON_TEST_VAR");
+    }
+
+    #[test]
+    fn expand_env_vars_errors_on_missing() {
+        std::env::remove_var("AIDAEMON_MISSING_VAR");
+        let result = expand_env_vars("key = \"${AIDAEMON_MISSING_VAR}\"");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("AIDAEMON_MISSING_VAR"));
+    }
+
+    #[test]
+    fn expand_env_vars_leaves_plain_strings() {
+        let input = "key = \"sk-hardcoded-value\"";
+        let result = expand_env_vars(input).unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn expand_env_vars_handles_multiple() {
+        std::env::set_var("AIDAEMON_TEST_A", "aaa");
+        std::env::set_var("AIDAEMON_TEST_B", "bbb");
+        let result = expand_env_vars("a = \"${AIDAEMON_TEST_A}\"\nb = \"${AIDAEMON_TEST_B}\"").unwrap();
+        assert_eq!(result, "a = \"aaa\"\nb = \"bbb\"");
+        std::env::remove_var("AIDAEMON_TEST_A");
+        std::env::remove_var("AIDAEMON_TEST_B");
+    }
+
+    #[test]
+    fn expand_env_vars_ignores_bare_dollar() {
+        let input = "path = \"$HOME/something\"";
+        let result = expand_env_vars(input).unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn expand_env_vars_reports_all_missing() {
+        std::env::remove_var("AIDAEMON_MISS_X");
+        std::env::remove_var("AIDAEMON_MISS_Y");
+        let result = expand_env_vars("a = \"${AIDAEMON_MISS_X}\"\nb = \"${AIDAEMON_MISS_Y}\"");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("AIDAEMON_MISS_X"));
+        assert!(msg.contains("AIDAEMON_MISS_Y"));
     }
 }

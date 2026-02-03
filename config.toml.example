@@ -1,6 +1,16 @@
+# aidaemon configuration
+#
+# Secrets resolution order:
+#   1. "keychain"    → reads from OS credential store (macOS Keychain, etc.)
+#   2. "${ENV_VAR}"  → reads from environment variable (for Docker/CI)
+#   3. "plain-value" → used as-is (not recommended for production)
+#
+# The setup wizard stores secrets in the OS keychain automatically.
+
 [provider]
-# Provider type is always openai_compatible — works with OpenAI, OpenRouter, Ollama, Google AI Studio, etc.
-api_key = "sk-your-key-here"
+# Provider type: openai_compatible, google_genai, or anthropic
+api_key = "keychain"
+# api_key = "${AIDAEMON_API_KEY}"
 base_url = "https://openrouter.ai/api/v1"
 
 [provider.models]
@@ -9,14 +19,16 @@ fast = "openai/gpt-4o-mini"
 smart = "anthropic/claude-sonnet-4"
 
 [telegram]
-bot_token = "123456:ABC-DEF..."
+bot_token = "keychain"
+# bot_token = "${TELOXIDE_TOKEN}"
 allowed_user_ids = [123456789]
 
 [state]
 db_path = "aidaemon.db"
 working_memory_cap = 50
 # consolidation_interval_hours = 6  # How often to run memory consolidation (extract durable facts from conversations)
-# encryption_key = "your-strong-passphrase-here"  # SQLCipher AES-256 encryption (requires: cargo build --features encryption)
+# encryption_key = "keychain"       # SQLCipher AES-256 encryption (requires: cargo build --features encryption)
+# encryption_key = "${AIDAEMON_ENCRYPTION_KEY}"
 
 [terminal]
 # Set to ["*"] to allow all commands (only if you trust the LLM fully)
@@ -42,8 +54,14 @@ health_port = 8080
 # host = "imap.gmail.com"
 # port = 993
 # username = "you@gmail.com"
-# password = "app-password"
+# password = "keychain"
+# # password = "${AIDAEMON_EMAIL_PASSWORD}"
 # folder = "INBOX"
+
+# [search]
+# backend = "brave"
+# api_key = "keychain"
+# # api_key = "${AIDAEMON_SEARCH_API_KEY}"
 
 # [subagents]
 # enabled = true

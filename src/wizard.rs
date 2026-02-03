@@ -340,6 +340,39 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
         browser_section = String::new();
     }
 
+    // ── Store secrets in OS keychain if available ───────────────────────
+    let (api_key_config, bot_token_config) = {
+        let mut api_val = format!("\"{}\"", api_key);
+        let mut bot_val = format!("\"{}\"", bot_token);
+
+        match crate::config::store_in_keychain("api_key", &api_key) {
+            Ok(()) => {
+                api_val = "\"keychain\"".to_string();
+                println!("  API key stored in OS keychain.");
+            }
+            Err(e) => {
+                tracing::debug!("Keychain unavailable for api_key: {}", e);
+            }
+        }
+        match crate::config::store_in_keychain("bot_token", &bot_token) {
+            Ok(()) => {
+                bot_val = "\"keychain\"".to_string();
+                println!("  Bot token stored in OS keychain.");
+            }
+            Err(e) => {
+                tracing::debug!("Keychain unavailable for bot_token: {}", e);
+            }
+        }
+
+        if api_val == "\"keychain\"" || bot_val == "\"keychain\"" {
+            println!();
+            println!("  Secrets stored in OS keychain (not in config file).");
+            println!("  To move to a different machine, use environment variables instead.");
+        }
+
+        (api_val, bot_val)
+    };
+
     // ── Write config ────────────────────────────────────────────────────
     let base_url_line = if base_url.is_empty() {
         String::new()
@@ -349,7 +382,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     let config = format!(
         r#"[provider]
 kind = "{}"
-api_key = "{api_key}"
+api_key = {api_key_config}
 {base_url_line}
 [provider.models]
 primary = "{primary}"
@@ -357,7 +390,7 @@ fast = "{fast}"
 smart = "{smart}"
 
 [telegram]
-bot_token = "{bot_token}"
+bot_token = {bot_token_config}
 allowed_user_ids = [{user_id}]
 
 [state]

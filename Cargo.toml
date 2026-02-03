@@ -46,6 +46,15 @@ htmd = "0.1"
 croner = "3"
 regex = "1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
 [features]
 browser = ["dep:chromiumoxide"]
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
