@@ -158,7 +158,9 @@ impl DiscordChannel {
     }
 
     fn is_authorized(&self, user_id: u64) -> bool {
-        self.allowed_user_ids.is_empty() || self.allowed_user_ids.contains(&user_id)
+        // Fail-closed: deny access if no users configured or user not in list.
+        // Users must be explicitly allowed via allowed_user_ids in config.
+        !self.allowed_user_ids.is_empty() && self.allowed_user_ids.contains(&user_id)
     }
 
     /// Build a session ID from a Discord message.

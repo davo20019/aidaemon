@@ -50,10 +50,12 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 2. Provider (moved before MemoryManager so provider is available)
     let provider: Arc<dyn crate::traits::ModelProvider> = match config.provider.kind {
-        crate::config::ProviderKind::OpenaiCompatible => Arc::new(crate::providers::OpenAiCompatibleProvider::new(
-            &config.provider.base_url,
-            &config.provider.api_key,
-        )),
+        crate::config::ProviderKind::OpenaiCompatible => Arc::new(
+            crate::providers::OpenAiCompatibleProvider::new(
+                &config.provider.base_url,
+                &config.provider.api_key,
+            ).map_err(|e| anyhow::anyhow!("{}", e))?
+        ),
         crate::config::ProviderKind::GoogleGenai => Arc::new(crate::providers::GoogleGenAiProvider::new(
             &config.provider.api_key,
         )),

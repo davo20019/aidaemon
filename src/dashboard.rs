@@ -47,14 +47,18 @@ pub fn get_or_create_dashboard_token() -> anyhow::Result<String> {
                 if let Err(e) = entry.set_password(&tok) {
                     warn!("Could not store dashboard token in keychain: {e}");
                 }
-                info!("Dashboard token created: {tok}");
+                // Only log a prefix to avoid exposing the full token in logs
+                let prefix = tok.get(..8).unwrap_or("????????");
+                info!("Dashboard token created (prefix: {}...)", prefix);
                 Ok(tok)
             }
         },
         Err(e) => {
             warn!("Keychain unavailable for dashboard token: {e}");
             let tok = uuid::Uuid::new_v4().to_string();
-            info!("Ephemeral dashboard token (not persisted): {tok}");
+            // Only log a prefix to avoid exposing the full token in logs
+            let prefix = tok.get(..8).unwrap_or("????????");
+            info!("Ephemeral dashboard token created (prefix: {}..., not persisted)", prefix);
             Ok(tok)
         }
     }

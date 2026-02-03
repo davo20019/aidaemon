@@ -63,6 +63,11 @@ WantedBy=multi-user.target
 pub fn install_service() -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let working_dir = std::env::current_dir()?;
+    let home = std::env::var("HOME")?;
+
+    // Use user-private log directory instead of world-readable /tmp
+    let log_dir = format!("{}/Library/Logs/aidaemon", home);
+    std::fs::create_dir_all(&log_dir)?;
 
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -82,20 +87,22 @@ pub fn install_service() -> anyhow::Result<()> {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/aidaemon.stdout.log</string>
+    <string>{}/stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/aidaemon.stderr.log</string>
+    <string>{}/stderr.log</string>
 </dict>
 </plist>
 "#,
         exe.display(),
-        working_dir.display()
+        working_dir.display(),
+        log_dir,
+        log_dir
     );
 
-    let home = std::env::var("HOME")?;
     let path = format!("{}/Library/LaunchAgents/ai.aidaemon.plist", home);
     std::fs::write(&path, plist)?;
     println!("Plist written to {}", path);
+    println!("Logs will be written to {}/", log_dir);
     println!("Run: launchctl load {}", path);
     Ok(())
 }

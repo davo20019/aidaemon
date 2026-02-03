@@ -318,8 +318,8 @@ impl SlackChannel {
             }
         }
 
-        // Authorization check
-        if !self.allowed_user_ids.is_empty() && !self.allowed_user_ids.contains(&user) {
+        // Authorization check: fail-closed - deny if no users configured or user not in list
+        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user) {
             warn!(user_id = %user, "Unauthorized Slack user attempted access");
             if let Some(channel) = event.get("channel").and_then(|v| v.as_str()) {
                 let _ = self.post_message(channel, "Unauthorized.", None).await;
@@ -499,8 +499,8 @@ impl SlackChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Authorization check
-        if !self.allowed_user_ids.is_empty() && !self.allowed_user_ids.contains(&user_id.to_string()) {
+        // Authorization check: fail-closed - deny if no users configured or user not in list
+        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id.to_string()) {
             warn!(user_id, "Unauthorized Slack interactive action");
             return;
         }
@@ -565,7 +565,8 @@ impl SlackChannel {
         let command = payload.get("command").and_then(|v| v.as_str()).unwrap_or("");
         let text_arg = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
-        if !self.allowed_user_ids.is_empty() && !self.allowed_user_ids.contains(&user_id.to_string()) {
+        // Authorization check: fail-closed - deny if no users configured or user not in list
+        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id.to_string()) {
             warn!(user_id, "Unauthorized Slack slash command");
             return;
         }
