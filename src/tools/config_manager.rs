@@ -86,14 +86,20 @@ impl ConfigManagerTool {
     }
 
     /// Validate that a config string parses correctly as AppConfig.
+    /// Expands `${ENV_VAR}` references before structural validation but does
+    /// NOT resolve `"keychain"` sentinels (the value may not be stored yet).
     fn validate_config(content: &str) -> Result<(), String> {
         // First check it's valid TOML
         let _doc: toml::Table = content
             .parse()
             .map_err(|e| format!("Invalid TOML syntax: {}", e))?;
 
+        // Expand env vars so "${VAR}" values don't break type validation
+        let expanded =
+            crate::config::expand_env_vars(content).map_err(|e| format!("{}", e))?;
+
         // Then check it deserializes into our AppConfig
-        toml::from_str::<AppConfig>(content)
+        toml::from_str::<AppConfig>(&expanded)
             .map_err(|e| format!("Invalid config structure: {}", e))?;
 
         Ok(())
