@@ -5,10 +5,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::SqlitePool;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::traits::Tool;
 use crate::types::ApprovalResponse;
@@ -39,6 +40,7 @@ pub struct TerminalTool {
     running: Arc<Mutex<HashMap<u32, RunningProcess>>>,
     initial_timeout: Duration,
     max_output_chars: usize,
+    pool: Option<SqlitePool>,
 }
 
 /// Check if a command string contains shell operators that could chain
@@ -109,18 +111,41 @@ fn send_sigkill(pid: u32) -> bool {
 }
 
 impl TerminalTool {
-    pub fn new(
+    pub async fn new(
         allowed_prefixes: Vec<String>,
         approval_tx: mpsc::Sender<ApprovalRequest>,
         initial_timeout_secs: u64,
         max_output_chars: usize,
+        pool: SqlitePool,
     ) -> Self {
+        // Load persisted prefixes from DB and merge with config defaults
+        let mut merged = allowed_prefixes;
+        match sqlx::query_scalar::<_, String>(
+            "SELECT prefix FROM terminal_allowed_prefixes"
+        )
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(persisted) => {
+                for p in persisted {
+                    if !merged.contains(&p) {
+                        info!(prefix = %p, "Loaded persisted allowed prefix");
+                        merged.push(p);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load persisted terminal prefixes: {}", e);
+            }
+        }
+
         Self {
-            allowed_prefixes: Arc::new(RwLock::new(allowed_prefixes)),
+            allowed_prefixes: Arc::new(RwLock::new(merged)),
             approval_tx,
             running: Arc::new(Mutex::new(HashMap::new())),
             initial_timeout: Duration::from_secs(initial_timeout_secs),
             max_output_chars,
+            pool: Some(pool),
         }
     }
 
@@ -162,8 +187,21 @@ impl TerminalTool {
             .unwrap_or(command.trim());
         let mut prefixes = self.allowed_prefixes.write().await;
         if !prefixes.contains(&prefix.to_string()) {
-            info!(prefix, "Adding to allowed command prefixes");
+            info!(prefix, "Adding to allowed command prefixes (persistent)");
             prefixes.push(prefix.to_string());
+
+            // Persist to SQLite
+            if let Some(ref pool) = self.pool {
+                if let Err(e) = sqlx::query(
+                    "INSERT OR IGNORE INTO terminal_allowed_prefixes (prefix) VALUES (?)"
+                )
+                .bind(prefix)
+                .execute(pool)
+                .await
+                {
+                    warn!(prefix, "Failed to persist allowed prefix: {}", e);
+                }
+            }
         }
     }
 

@@ -128,6 +128,16 @@ impl SqliteStateStore {
         // 4. Add consolidated_at column for memory consolidation (Layer 6)
         let _ = sqlx::query("ALTER TABLE messages ADD COLUMN consolidated_at TEXT").execute(&pool).await;
 
+        // Terminal allowed prefixes (persisted "Allow Always" approvals)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS terminal_allowed_prefixes (
+                prefix TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )"
+        )
+        .execute(&pool)
+        .await?;
+
         // Scheduled tasks table
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS scheduled_tasks (
