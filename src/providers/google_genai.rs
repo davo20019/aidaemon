@@ -260,9 +260,13 @@ impl ModelProvider for GoogleGenAiProvider {
     ) -> anyhow::Result<ProviderResponse> {
         let (system_instruction, contents) = self.convert_messages(messages);
 
-        // Include google_search grounding unless this model is known to reject it
-        let grounding_ok = !self.no_grounding_models.lock().unwrap().contains(model);
-        let gemini_tools = self.convert_tools(tools, grounding_ok);
+        // Include google_search grounding. Models that reject grounding+function_calling
+        // are cached, but we still enable grounding when no function-calling tools are present
+        // (e.g. the final forced-summary iteration).
+        let has_function_tools = !tools.is_empty();
+        let model_rejects_combo = self.no_grounding_models.lock().unwrap().contains(model);
+        let include_grounding = !model_rejects_combo || !has_function_tools;
+        let gemini_tools = self.convert_tools(tools, include_grounding);
 
         let mut body = json!({
             "contents": contents,
@@ -293,7 +297,7 @@ impl ModelProvider for GoogleGenAiProvider {
         if !status.is_success() {
             // If grounding was included and the error is about unsupported tool use,
             // cache this model and retry without grounding.
-            if grounding_ok && status.as_u16() == 400 && text.contains("Tool use with function calling is unsupported") {
+            if include_grounding && status.as_u16() == 400 && text.contains("Tool use with function calling is unsupported") {
                 warn!(model, "Model doesn't support google_search with function calling, retrying without grounding");
                 self.no_grounding_models.lock().unwrap().insert(model.to_string());
 

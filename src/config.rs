@@ -292,6 +292,9 @@ pub struct DaemonConfig {
     /// Set to "0.0.0.0" to listen on all interfaces.
     #[serde(default = "default_health_bind")]
     pub health_bind: String,
+    /// Enable the embedded web dashboard on the health server port (default: true).
+    #[serde(default = "default_dashboard_enabled")]
+    pub dashboard_enabled: bool,
 }
 
 impl Default for DaemonConfig {
@@ -299,6 +302,7 @@ impl Default for DaemonConfig {
         Self {
             health_port: default_health_port(),
             health_bind: default_health_bind(),
+            dashboard_enabled: default_dashboard_enabled(),
         }
     }
 }
@@ -309,6 +313,10 @@ fn default_health_port() -> u16 {
 
 fn default_health_bind() -> String {
     "127.0.0.1".to_string()
+}
+
+fn default_dashboard_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
