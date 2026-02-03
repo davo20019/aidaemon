@@ -91,13 +91,13 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         Arc::new(SystemInfoTool),
         Arc::new(TerminalTool::new(
             config.terminal.allowed_prefixes.clone(),
-            approval_tx,
+            approval_tx.clone(),
             config.terminal.initial_timeout_secs,
             config.terminal.max_output_chars,
             state.pool(),
         ).await),
         Arc::new(RememberFactTool::new(state.clone())),
-        Arc::new(ConfigManagerTool::new(config_path.clone())),
+        Arc::new(ConfigManagerTool::new(config_path.clone(), approval_tx)),
         Arc::new(WebFetchTool::new()),
         Arc::new(WebSearchTool::new(&config.search)),
     ];

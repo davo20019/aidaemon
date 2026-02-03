@@ -3,19 +3,34 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::AppConfig;
+use crate::tools::terminal::ApprovalRequest;
 use crate::traits::Tool;
+use crate::types::ApprovalResponse;
 
 /// Key names that contain secrets and must be redacted before showing to the LLM.
-const SENSITIVE_KEYS: &[&str] = &["api_key", "bot_token", "password", "encryption_key"];
+const SENSITIVE_KEYS: &[&str] = &["api_key", "bot_token", "app_token", "password", "encryption_key"];
+
+/// Key names that are security-sensitive and require user approval to modify.
+/// This includes secrets plus keys that control security behavior.
+const APPROVAL_REQUIRED_KEYS: &[&str] = &[
+    // Secrets
+    "api_key", "bot_token", "app_token", "password", "encryption_key",
+    // Security-sensitive settings
+    "allowed_prefixes", "allowed_user_ids", "allowed_command_prefixes",
+    "base_url", // Could redirect API traffic
+    "trusted",  // Scheduler trusted flag
+];
 
 /// Placeholder shown instead of actual secret values.
 const REDACTED: &str = "***REDACTED***";
 
 pub struct ConfigManagerTool {
     config_path: PathBuf,
+    approval_tx: mpsc::Sender<ApprovalRequest>,
 }
 
 /// Set file permissions to owner-only read/write (0600) on Unix.
@@ -34,8 +49,30 @@ fn set_owner_only_permissions(_path: &Path) {
 }
 
 impl ConfigManagerTool {
-    pub fn new(config_path: PathBuf) -> Self {
-        Self { config_path }
+    pub fn new(config_path: PathBuf, approval_tx: mpsc::Sender<ApprovalRequest>) -> Self {
+        Self { config_path, approval_tx }
+    }
+
+    /// Check if a key path requires user approval to modify.
+    fn requires_approval(key_path: &str) -> bool {
+        let last = key_path.rsplit('.').next().unwrap_or(key_path);
+        APPROVAL_REQUIRED_KEYS.iter().any(|&k| k == last)
+    }
+
+    /// Request user approval for a config change.
+    async fn request_approval(&self, session_id: &str, description: &str) -> anyhow::Result<ApprovalResponse> {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.approval_tx
+            .send(ApprovalRequest {
+                command: description.to_string(),
+                session_id: session_id.to_string(),
+                response_tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Approval response channel closed"))
     }
 
     /// Rotate backups (3-deep ring) and create a new .bak from current config.
@@ -113,6 +150,9 @@ struct ConfigArgs {
     key: String,
     #[serde(default)]
     value: String,
+    /// Session ID for routing approval requests (injected by agent).
+    #[serde(default)]
+    _session_id: String,
 }
 
 #[async_trait]
@@ -181,6 +221,29 @@ impl Tool for ConfigManagerTool {
             "set" => {
                 if args.key.is_empty() || args.value.is_empty() {
                     return Ok("Error: 'key' and 'value' are required for 'set' action.".to_string());
+                }
+
+                // Require user approval for security-sensitive keys
+                if Self::requires_approval(&args.key) {
+                    // Show redacted value for secrets, actual value for other sensitive keys
+                    let display_value = if is_sensitive_key(&args.key) {
+                        "[REDACTED]".to_string()
+                    } else {
+                        args.value.clone()
+                    };
+                    let description = format!("Config change: {} = {}", args.key, display_value);
+
+                    match self.request_approval(&args._session_id, &description).await {
+                        Ok(ApprovalResponse::AllowOnce) | Ok(ApprovalResponse::AllowAlways) => {
+                            info!(key = %args.key, "Config change approved by user");
+                        }
+                        Ok(ApprovalResponse::Deny) => {
+                            return Ok("Config change denied by user.".to_string());
+                        }
+                        Err(e) => {
+                            return Ok(format!("Could not get approval: {}", e));
+                        }
+                    }
                 }
 
                 let content = tokio::fs::read_to_string(&self.config_path).await?;
