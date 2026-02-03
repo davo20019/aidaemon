@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use crate::skills;
 use crate::state::SqliteStateStore;
 #[cfg(feature = "browser")]
 use crate::tools::BrowserTool;
-use crate::tools::{CliAgentTool, ConfigManagerTool, RememberFactTool, SchedulerTool, SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool};
+use crate::tools::{CliAgentTool, ConfigManagerTool, RememberFactTool, SchedulerTool, SendFileTool, SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool};
 use crate::traits::{Channel, Tool};
 use crate::tasks::TaskRegistry;
 use crate::scheduler::SchedulerManager;
@@ -95,18 +96,27 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         Arc::new(WebSearchTool::new(&config.search)),
     ];
 
+    // Media channel — shared by browser tool, send_file tool, etc.
+    let (media_tx, media_rx) = tokio::sync::mpsc::channel::<crate::types::MediaMessage>(16);
+
     // Browser tool (conditional — requires "browser" cargo feature)
     #[cfg(feature = "browser")]
-    let media_rx = {
-        let (media_tx, media_rx) = tokio::sync::mpsc::channel(16);
-        if config.browser.enabled {
-            tools.push(Arc::new(BrowserTool::new(config.browser.clone(), media_tx.clone())));
-            info!("Browser tool enabled");
-        }
-        Some(media_rx)
-    };
-    #[cfg(not(feature = "browser"))]
-    let media_rx: Option<tokio::sync::mpsc::Receiver<crate::types::MediaMessage>> = None;
+    if config.browser.enabled {
+        tools.push(Arc::new(BrowserTool::new(config.browser.clone(), media_tx.clone())));
+        info!("Browser tool enabled");
+    }
+
+    // File transfer tool (conditional)
+    let inbox_dir = shellexpand::tilde(&config.files.inbox_dir).to_string();
+    if config.files.enabled {
+        std::fs::create_dir_all(&inbox_dir)?;
+        tools.push(Arc::new(SendFileTool::new(
+            media_tx.clone(),
+            &config.files.outbox_dirs,
+            &inbox_dir,
+        )));
+        info!("Send-file tool enabled");
+    }
 
     // CLI agent tools (conditional)
     if config.cli_agents.enabled {
@@ -220,6 +230,9 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         config_path.clone(),
         session_map.clone(),
         task_registry,
+        config.files.enabled,
+        PathBuf::from(&inbox_dir),
+        config.files.max_file_size_mb,
     ));
 
     let channels: Vec<Arc<dyn Channel>> = vec![telegram.clone() as Arc<dyn Channel>];
@@ -234,11 +247,21 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         hub_for_approvals.approval_listener(approval_rx).await;
     });
 
-    // Start media listener (routes screenshots/photos to the right channel)
-    if let Some(media_rx) = media_rx {
-        let hub_for_media = hub.clone();
+    // Start media listener (routes screenshots/photos/files to the right channel)
+    let hub_for_media = hub.clone();
+    tokio::spawn(async move {
+        hub_for_media.media_listener(media_rx).await;
+    });
+
+    // Spawn inbox cleanup task (hourly, removes files older than retention_hours)
+    if config.files.enabled {
+        let cleanup_dir = inbox_dir.clone();
+        let retention = Duration::from_secs(config.files.retention_hours * 3600);
         tokio::spawn(async move {
-            hub_for_media.media_listener(media_rx).await;
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                cleanup_inbox(&cleanup_dir, retention);
+            }
         });
     }
 
@@ -314,6 +337,23 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     Ok(())
 }
 
+fn cleanup_inbox(dir: &str, retention: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now() - retention;
+    for entry in entries.flatten() {
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if modified < cutoff {
+                    let _ = std::fs::remove_file(entry.path());
+                    tracing::info!(file = %entry.path().display(), "Cleaned up expired inbox file");
+                }
+            }
+        }
+    }
+}
+
 fn build_base_system_prompt(config: &AppConfig) -> String {
     let spawn_table_row = if config.subagents.enabled {
         "\n| Complex sub-tasks needing focused reasoning | spawn_agent | — |"
@@ -323,6 +363,12 @@ fn build_base_system_prompt(config: &AppConfig) -> String {
 
     let cli_agent_table_row = if config.cli_agents.enabled {
         "\n| Coding tasks, refactoring, debugging | cli_agent | terminal (running AI tools manually) |"
+    } else {
+        ""
+    };
+
+    let send_file_table_row = if config.files.enabled {
+        "\n| Send a file to the user | send_file | terminal (manual upload) |"
     } else {
         ""
     };
@@ -372,6 +418,15 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         ""
     };
 
+    let send_file_tool_doc = if config.files.enabled {
+        "\n- `send_file`: Send a file to the user via Telegram. Parameters: `file_path` (absolute path to the file), \
+        `caption` (optional description). The file must be within allowed directories. Sensitive files (.ssh, .env, \
+        credentials, etc.) are blocked. When the user sends you a file, it's saved to the inbox directory and you \
+        can process it with terminal commands (cat, pdftotext, etc.), then send results back with this tool."
+    } else {
+        ""
+    };
+
     let cli_agent_tool_doc = if config.cli_agents.enabled {
         "\n- `cli_agent`: Delegate tasks to CLI-based AI coding agents (e.g. Claude Code, Gemini CLI, Codex). \
         These are full AI agents that can read/write files, run commands, and solve complex coding tasks. \
@@ -405,7 +460,7 @@ Narrate your plan before executing — tell the user what you're about to do and
 | Run commands, scripts | terminal | — |
 | Get system specs | system_info | terminal (uname, etc.) |
 | Store user info | remember_fact | — |
-| Fix config | manage_config | terminal (editing files) |{spawn_table_row}{cli_agent_table_row}{scheduler_table_row}
+| Fix config | manage_config | terminal (editing files) |{send_file_table_row}{spawn_table_row}{cli_agent_table_row}{scheduler_table_row}
 
 ## Tools
 - `terminal`: Run ANY command available on this system. This includes shell commands, \
@@ -419,7 +474,7 @@ pre-approved list. The user can allow them with one tap.
 - `manage_config`: Read and update your own config.toml. Use this to fix configuration issues.
 - `web_search`: Search the web. Returns titles, URLs, and snippets for your query. Use to find current information, research topics, check facts.
 - `web_fetch`: Fetch a URL and extract its readable content. Strips ads/navigation. For login-required sites, use `browser` instead.
-{browser_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}{scheduler_tool_doc}
+{browser_tool_doc}{send_file_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}{scheduler_tool_doc}
 
 ## Self-Maintenance
 You are responsible for your own maintenance. When you encounter errors:

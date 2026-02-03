@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use crate::config::BrowserConfig;
 use crate::traits::Tool;
-use crate::types::MediaMessage;
+use crate::types::{MediaKind, MediaMessage};
 
 pub struct BrowserTool {
     browser: Arc<Mutex<Option<Browser>>>,
@@ -165,8 +165,8 @@ impl BrowserTool {
         self.media_tx
             .send(MediaMessage {
                 session_id: session_id.to_string(),
-                photo_bytes: png_bytes,
                 caption: caption.clone(),
+                kind: MediaKind::Photo { data: png_bytes },
             })
             .await
             .map_err(|e| format!("Failed to send screenshot to Telegram: {}", e))?;
