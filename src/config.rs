@@ -46,6 +46,12 @@ pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
 pub struct AppConfig {
     pub provider: ProviderConfig,
     pub telegram: TelegramConfig,
+    #[cfg(feature = "discord")]
+    #[serde(default)]
+    pub discord: DiscordConfig,
+    #[cfg(feature = "slack")]
+    #[serde(default)]
+    pub slack: SlackConfig,
     #[serde(default)]
     pub state: StateConfig,
     #[serde(default)]
@@ -142,6 +148,37 @@ pub struct TelegramConfig {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_user_ids: Vec<u64>,
+}
+
+#[cfg(feature = "discord")]
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct DiscordConfig {
+    #[serde(default)]
+    pub bot_token: String,
+    #[serde(default)]
+    pub allowed_user_ids: Vec<u64>,
+    #[serde(default)]
+    pub guild_id: Option<u64>,
+}
+
+#[cfg(feature = "slack")]
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SlackConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_token: String,
+    #[serde(default)]
+    pub bot_token: String,
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+    #[serde(default = "default_slack_use_threads")]
+    pub use_threads: bool,
+}
+
+#[cfg(feature = "slack")]
+fn default_slack_use_threads() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -578,6 +615,19 @@ impl AppConfig {
         }
         if self.search.api_key == "keychain" {
             self.search.api_key = resolve_from_keychain("search_api_key")?;
+        }
+        #[cfg(feature = "discord")]
+        if self.discord.bot_token == "keychain" {
+            self.discord.bot_token = resolve_from_keychain("discord_bot_token")?;
+        }
+        #[cfg(feature = "slack")]
+        {
+            if self.slack.app_token == "keychain" {
+                self.slack.app_token = resolve_from_keychain("slack_app_token")?;
+            }
+            if self.slack.bot_token == "keychain" {
+                self.slack.bot_token = resolve_from_keychain("slack_bot_token")?;
+            }
         }
         Ok(())
     }

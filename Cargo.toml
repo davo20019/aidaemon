@@ -45,6 +45,8 @@ llm_readability = "0.0"
 htmd = "0.1"
 croner = "3"
 regex = "1"
+serenity = { version = "0.12", features = ["client", "gateway", "model", "cache", "rustls_backend"], default-features = false, optional = true }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
@@ -57,4 +59,6 @@ keyring = { version = "3", features = ["windows-native"] }
 
 [features]
 browser = ["dep:chromiumoxide"]
+discord = ["dep:serenity"]
+slack = ["dep:tokio-tungstenite"]
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
