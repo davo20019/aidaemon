@@ -69,6 +69,7 @@ impl SchedulerManager {
                    prompt = excluded.prompt,
                    is_oneshot = excluded.is_oneshot,
                    is_trusted = excluded.is_trusted,
+                   next_run_at = excluded.next_run_at,
                    updated_at = excluded.updated_at"
             )
             .bind(&id)

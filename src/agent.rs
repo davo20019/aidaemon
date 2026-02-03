@@ -100,8 +100,10 @@ pub struct Agent {
     depth: usize,
     /// Maximum allowed recursion depth for sub-agent spawning.
     max_depth: usize,
-    /// Maximum agentic loop iterations per invocation.
+    /// Maximum agentic loop iterations per invocation (initial budget).
     max_iterations: usize,
+    /// Hard cap on iterations — `request_more_iterations` cannot exceed this.
+    max_iterations_cap: usize,
     /// Max chars for sub-agent response truncation.
     max_response_chars: usize,
     /// Timeout in seconds for sub-agent execution.
@@ -127,6 +129,7 @@ impl Agent {
         skills: Vec<Skill>,
         max_depth: usize,
         max_iterations: usize,
+        max_iterations_cap: usize,
         max_response_chars: usize,
         timeout_secs: u64,
         models_config: ModelsConfig,
@@ -158,6 +161,7 @@ impl Agent {
             depth: 0,
             max_depth,
             max_iterations,
+            max_iterations_cap,
             max_response_chars,
             timeout_secs,
             max_facts,
@@ -180,6 +184,7 @@ impl Agent {
         depth: usize,
         max_depth: usize,
         max_iterations: usize,
+        max_iterations_cap: usize,
         max_response_chars: usize,
         timeout_secs: u64,
         max_facts: usize,
@@ -197,6 +202,7 @@ impl Agent {
             depth,
             max_depth,
             max_iterations,
+            max_iterations_cap,
             max_response_chars,
             timeout_secs,
             max_facts,
@@ -299,6 +305,7 @@ impl Agent {
                 child_depth,
                 self.max_depth,
                 self.max_iterations,
+                self.max_iterations_cap,
                 self.max_response_chars,
                 self.timeout_secs,
                 self.max_facts,
@@ -321,6 +328,7 @@ impl Agent {
                 child_depth,
                 self.max_depth,
                 self.max_iterations,
+                self.max_iterations_cap,
                 self.max_response_chars,
                 self.timeout_secs,
                 self.max_facts,
@@ -368,7 +376,7 @@ impl Agent {
 
     /// Build the OpenAI-format tool definitions.
     fn tool_definitions(&self) -> Vec<Value> {
-        self.tools
+        let mut defs: Vec<Value> = self.tools
             .iter()
             .map(|t| {
                 json!({
@@ -376,7 +384,28 @@ impl Agent {
                     "function": t.schema()
                 })
             })
-            .collect()
+            .collect();
+
+        // Built-in: request_more_iterations
+        defs.push(json!({
+            "type": "function",
+            "function": {
+                "name": "request_more_iterations",
+                "description": "Request additional tool-call iterations when the current budget is insufficient to complete the task. Use this when you have a clear plan for what remains but will run out of iterations. Extends the budget by 10 iterations (up to a hard cap).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "Brief explanation of why more iterations are needed and what remains to be done"
+                        }
+                    },
+                    "required": ["reason"]
+                }
+            }
+        }));
+
+        defs
     }
 
     /// Attempt an LLM call with error-classified recovery:
@@ -589,9 +618,10 @@ impl Agent {
             "Context prepared"
         );
 
-        // 3. Agentic loop
-        // 3. Agentic loop
-        for iteration in 0..self.max_iterations {
+        // 3. Agentic loop — dynamic budget that the agent can extend
+        let mut budget: usize = self.max_iterations;
+        let mut iteration: usize = 0;
+        while iteration < budget {
             info!(iteration, session_id, model = %model, depth = self.depth, "Agent loop iteration");
 
             // Fetch only recent history inside the loop
@@ -721,8 +751,8 @@ impl Agent {
 
             // 4. Call the LLM with error-classified recovery
             // On the last iteration, omit tools to force a text response
-            let effective_tools = if iteration >= self.max_iterations - 1 {
-                info!(session_id, "Last iteration — calling LLM without tools to force summary");
+            let effective_tools = if iteration >= budget - 1 {
+                info!(session_id, budget, "Last iteration — calling LLM without tools to force summary");
                 &[][..]
             } else {
                 &tool_defs[..]
@@ -743,9 +773,9 @@ impl Agent {
 
             // 5. If there are tool calls, execute them
             // On the last iteration, force a text response even if the model returns tool calls
-            if !resp.tool_calls.is_empty() && iteration < self.max_iterations - 1 {
+            if !resp.tool_calls.is_empty() && iteration < budget - 1 {
                 // Nudge the model to wrap up when approaching the limit
-                if iteration >= self.max_iterations - 2 {
+                if iteration >= budget - 2 {
                     let nudge = Message {
                         id: Uuid::new_v4().to_string(),
                         session_id: session_id.to_string(),
@@ -782,6 +812,46 @@ impl Agent {
 
                 // Execute each tool call
                 for tc in &resp.tool_calls {
+                    // Built-in: request_more_iterations — extends the budget
+                    if tc.name == "request_more_iterations" {
+                        let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+                        let reason = args["reason"].as_str().unwrap_or("(no reason given)");
+                        let result_text = if budget >= self.max_iterations_cap {
+                            let msg = format!(
+                                "Cannot extend further — already at hard cap of {} iterations.",
+                                self.max_iterations_cap
+                            );
+                            warn!(session_id, budget, cap = self.max_iterations_cap, "Budget extension denied");
+                            msg
+                        } else {
+                            let old_budget = budget;
+                            budget = (budget + 10).min(self.max_iterations_cap);
+                            info!(
+                                session_id, old_budget, new_budget = budget,
+                                cap = self.max_iterations_cap, reason,
+                                "Iteration budget extended"
+                            );
+                            format!(
+                                "Budget extended from {} to {} iterations (cap: {}). Continue working.",
+                                old_budget, budget, self.max_iterations_cap
+                            )
+                        };
+                        let tool_msg = Message {
+                            id: Uuid::new_v4().to_string(),
+                            session_id: session_id.to_string(),
+                            role: "tool".to_string(),
+                            content: Some(result_text),
+                            tool_call_id: Some(tc.id.clone()),
+                            tool_name: Some(tc.name.clone()),
+                            tool_calls_json: None,
+                            created_at: Utc::now(),
+                            importance: 0.1,
+                            embedding: None,
+                        };
+                        self.state.append_message(&tool_msg).await?;
+                        continue;
+                    }
+
                     send_status(
                         &status_tx,
                         StatusUpdate::ToolStart {
@@ -811,12 +881,13 @@ impl Agent {
                 }
 
                 // Continue the loop to let LLM process tool results
+                iteration += 1;
                 continue;
             }
 
             // 6. No tool calls (or last iteration) — this is the final response
             let reply = resp.content.filter(|s| !s.is_empty()).unwrap_or_else(|| {
-                if iteration >= self.max_iterations - 1 {
+                if iteration >= budget - 1 {
                     "I used all available tool iterations but couldn't finish the task. \
                     Please try a simpler or more specific request."
                         .to_string()
