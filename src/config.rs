@@ -123,7 +123,7 @@ impl ModelsConfig {
     pub fn apply_defaults(&mut self, provider_kind: &ProviderKind) {
         if self.primary.is_empty() {
             self.primary = match provider_kind {
-                ProviderKind::GoogleGenai => "gemini-2.5-flash".to_string(),
+                ProviderKind::GoogleGenai => "gemini-3-flash-preview".to_string(),
                 ProviderKind::Anthropic => "claude-sonnet-4-20250514".to_string(),
                 ProviderKind::OpenaiCompatible => "openai/gpt-4o".to_string(),
             };

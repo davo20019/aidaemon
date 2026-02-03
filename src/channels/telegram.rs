@@ -201,7 +201,7 @@ impl TelegramChannel {
             "/model" => {
                 if arg.is_empty() {
                     let current = self.agent.current_model().await;
-                    format!("Current model: {}\n\nUsage: /model <model-name>\nExample: /model gemini-2.5-pro-preview-06-05", current)
+                    format!("Current model: {}\n\nUsage: /model <model-name>\nExample: /model gemini-3-pro-preview", current)
                 } else {
                     self.agent.set_model(arg.to_string()).await;
                     format!("Model switched to: {}\nAuto-routing disabled. Use /auto to re-enable.", arg)
