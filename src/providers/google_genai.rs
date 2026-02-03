@@ -1,9 +1,11 @@
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::providers::ProviderError;
 use crate::traits::{ModelProvider, ProviderResponse, ToolCall};
@@ -12,6 +14,8 @@ pub struct GoogleGenAiProvider {
     client: Client,
     base_url: String,
     api_key: String,
+    /// Models that don't support google_search alongside function calling.
+    no_grounding_models: Mutex<HashSet<String>>,
 }
 
 impl GoogleGenAiProvider {
@@ -24,6 +28,7 @@ impl GoogleGenAiProvider {
             client,
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             api_key: api_key.to_string(),
+            no_grounding_models: Mutex::new(HashSet::new()),
         }
     }
 
@@ -137,8 +142,9 @@ impl GoogleGenAiProvider {
         (system_instruction, contents)
     }
 
-    /// Convert OpenAI tool definitions to Gemini "tools"
-    fn convert_tools(&self, tools: &[Value]) -> Option<Vec<Value>> {
+    /// Convert OpenAI tool definitions to Gemini "tools".
+    /// When `include_grounding` is true, appends Google Search grounding.
+    fn convert_tools(&self, tools: &[Value], include_grounding: bool) -> Option<Vec<Value>> {
         let mut gemini_tools = Vec::new();
 
         if !tools.is_empty() {
@@ -155,66 +161,23 @@ impl GoogleGenAiProvider {
             gemini_tools.push(json!({ "function_declarations": function_declarations }));
         }
 
-        // Google Search grounding — free 500 req/day
-        gemini_tools.push(json!({ "google_search": {} }));
+        if include_grounding {
+            gemini_tools.push(json!({ "google_search": {} }));
+        }
 
-        Some(gemini_tools)
+        if gemini_tools.is_empty() {
+            None
+        } else {
+            Some(gemini_tools)
+        }
     }
-}
 
-#[async_trait]
-impl ModelProvider for GoogleGenAiProvider {
-    async fn chat(
-        &self,
-        model: &str,
-        messages: &[Value],
-        tools: &[Value],
-    ) -> anyhow::Result<ProviderResponse> {
-        let (system_instruction, contents) = self.convert_messages(messages);
-        let gemini_tools = self.convert_tools(tools);
-
-        let mut body = json!({
-            "contents": contents,
-        });
-
-        if let Some(sys) = system_instruction {
-            body["system_instruction"] = sys;
-        }
-        if let Some(gt) = gemini_tools {
-            body["tools"] = json!(gt);
-        }
-
-        // Endpoint: models/{model}:generateContent
-        // Model name might be "gemini-1.5-flash". 
-        // If user passes full "google/gemini..." we might need to strip prefix, but AgentZero seems to pass raw names from config.
-        let url = format!("{}/models/{}:generateContent?key={}", self.base_url, model, self.api_key);
-        
-        info!(model, url_prefix = %self.base_url, "Calling Google GenAI");
-
-        let resp = match self.client.post(&url).json(&body).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Google GenAI HTTP request failed: {}", e);
-                return Err(ProviderError::network(&e).into());
-            }
-        };
-
-        let status = resp.status();
-        let text = resp.text().await?;
-
-        if !status.is_success() {
-            error!(status = %status, "Google GenAI API error: {}", text);
-            return Err(ProviderError::from_status(status.as_u16(), &text).into());
-        }
-
-        let data: Value = serde_json::from_str(&text)?;
-
-        // Parse response
-        // { "candidates": [ { "content": { "parts": [ ... ], "role": "model" }, ... } ] }
+    /// Parse a Gemini generateContent response into a ProviderResponse.
+    fn parse_response(&self, data: &Value) -> anyhow::Result<ProviderResponse> {
         let candidate = data["candidates"]
             .get(0)
-            .ok_or_else(|| anyhow::anyhow!("No candidates in Google GenAI response: {}", text))?;
-        
+            .ok_or_else(|| anyhow::anyhow!("No candidates in Google GenAI response: {}", data))?;
+
         let empty_parts = vec![];
         let content_parts = candidate["content"]["parts"]
             .as_array()
@@ -229,11 +192,9 @@ impl ModelProvider for GoogleGenAiProvider {
             }
             if let Some(fc) = part.get("functionCall") {
                 let name = fc["name"].as_str().unwrap_or("").to_string();
-                let args = fc["args"].clone(); // already JSON object
+                let args = fc["args"].clone();
                 let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
 
-                // Capture all extra fields from the Part object (siblings of functionCall)
-                // for round-trip. Gemini 3 puts thoughtSignature here.
                 let mut extra = serde_json::Map::new();
                 if let Some(obj) = part.as_object() {
                     for (k, v) in obj {
@@ -277,6 +238,91 @@ impl ModelProvider for GoogleGenAiProvider {
             content: if final_text.is_empty() { None } else { Some(final_text) },
             tool_calls,
         })
+    }
+}
+
+#[async_trait]
+impl ModelProvider for GoogleGenAiProvider {
+    async fn chat(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+    ) -> anyhow::Result<ProviderResponse> {
+        let (system_instruction, contents) = self.convert_messages(messages);
+
+        // Include google_search grounding unless this model is known to reject it
+        let grounding_ok = !self.no_grounding_models.lock().unwrap().contains(model);
+        let gemini_tools = self.convert_tools(tools, grounding_ok);
+
+        let mut body = json!({
+            "contents": contents,
+        });
+
+        if let Some(ref sys) = system_instruction {
+            body["system_instruction"] = sys.clone();
+        }
+        if let Some(ref gt) = gemini_tools {
+            body["tools"] = json!(gt);
+        }
+
+        let url = format!("{}/models/{}:generateContent?key={}", self.base_url, model, self.api_key);
+
+        info!(model, url_prefix = %self.base_url, "Calling Google GenAI");
+
+        let resp = match self.client.post(&url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Google GenAI HTTP request failed: {}", e);
+                return Err(ProviderError::network(&e).into());
+            }
+        };
+
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if !status.is_success() {
+            // If grounding was included and the error is about unsupported tool use,
+            // cache this model and retry without grounding.
+            if grounding_ok && status.as_u16() == 400 && text.contains("Tool use with function calling is unsupported") {
+                warn!(model, "Model doesn't support google_search with function calling, retrying without grounding");
+                self.no_grounding_models.lock().unwrap().insert(model.to_string());
+
+                let gemini_tools_no_grounding = self.convert_tools(tools, false);
+                let mut body2 = json!({ "contents": contents });
+                if let Some(ref sys) = system_instruction {
+                    body2["system_instruction"] = sys.clone();
+                }
+                if let Some(ref gt) = gemini_tools_no_grounding {
+                    body2["tools"] = json!(gt);
+                }
+
+                let resp2 = match self.client.post(&url).json(&body2).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("Google GenAI HTTP request failed on retry: {}", e);
+                        return Err(ProviderError::network(&e).into());
+                    }
+                };
+
+                let status2 = resp2.status();
+                let text2 = resp2.text().await?;
+
+                if !status2.is_success() {
+                    error!(status = %status2, "Google GenAI API error (retry): {}", text2);
+                    return Err(ProviderError::from_status(status2.as_u16(), &text2).into());
+                }
+
+                let data: Value = serde_json::from_str(&text2)?;
+                return self.parse_response(&data);
+            }
+
+            error!(status = %status, "Google GenAI API error: {}", text);
+            return Err(ProviderError::from_status(status.as_u16(), &text).into());
+        }
+
+        let data: Value = serde_json::from_str(&text)?;
+        self.parse_response(&data)
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
