@@ -7,6 +7,7 @@ mod mcp;
 mod memory;
 mod providers;
 mod router;
+mod scheduler;
 mod skills;
 mod state;
 mod tools;

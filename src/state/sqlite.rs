@@ -128,6 +128,41 @@ impl SqliteStateStore {
         // 4. Add consolidated_at column for memory consolidation (Layer 6)
         let _ = sqlx::query("ALTER TABLE messages ADD COLUMN consolidated_at TEXT").execute(&pool).await;
 
+        // Scheduled tasks table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                cron_expr TEXT NOT NULL,
+                original_schedule TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'tool',
+                is_oneshot INTEGER NOT NULL DEFAULT 0,
+                is_paused INTEGER NOT NULL DEFAULT 0,
+                is_trusted INTEGER NOT NULL DEFAULT 0,
+                last_run_at TEXT,
+                next_run_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_next_run
+                ON scheduled_tasks(next_run_at) WHERE is_paused = 0"
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_tasks_name_source
+                ON scheduled_tasks(name) WHERE source = 'config'"
+        )
+        .execute(&pool)
+        .await?;
+
         // 3. Create macros table
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS macros (

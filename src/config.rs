@@ -26,6 +26,8 @@ pub struct AppConfig {
     pub cli_agents: CliAgentsConfig,
     #[serde(default)]
     pub search: SearchConfig,
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -417,6 +419,35 @@ pub enum SearchBackendKind {
     #[default]
     DuckDuckGo,
     Brave,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SchedulerConfig {
+    #[serde(default = "default_scheduler_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_tick_interval_secs")]
+    pub tick_interval_secs: u64,
+    #[serde(default)]
+    pub tasks: Vec<ScheduledTaskConfig>,
+}
+
+fn default_scheduler_enabled() -> bool {
+    true
+}
+
+fn default_tick_interval_secs() -> u64 {
+    30
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ScheduledTaskConfig {
+    pub name: String,
+    pub schedule: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub oneshot: bool,
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 impl AppConfig {
