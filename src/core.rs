@@ -325,14 +325,43 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         });
     }
 
-    // 13. Health server
+    // 13. Health / Dashboard server
     let health_port = config.daemon.health_port;
     let health_bind = config.daemon.health_bind.clone();
-    tokio::spawn(async move {
-        if let Err(e) = daemon::start_health_server(health_port, &health_bind).await {
-            tracing::error!("Health server error: {}", e);
+    if config.daemon.dashboard_enabled {
+        match crate::dashboard::get_or_create_dashboard_token() {
+            Ok(dashboard_token) => {
+                let ds = crate::dashboard::DashboardState {
+                    pool: state.pool(),
+                    provider_kind: format!("{:?}", config.provider.kind),
+                    models: config.provider.models.clone(),
+                    started_at: std::time::Instant::now(),
+                    dashboard_token,
+                    daily_token_budget: config.state.daily_token_budget,
+                };
+                let bind = health_bind.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::dashboard::start_dashboard_server(ds, health_port, &bind).await {
+                        tracing::error!("Dashboard server error: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!("Dashboard token init failed ({e}), falling back to health-only server");
+                tokio::spawn(async move {
+                    if let Err(e) = daemon::start_health_server(health_port, &health_bind).await {
+                        tracing::error!("Health server error: {}", e);
+                    }
+                });
+            }
         }
-    });
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = daemon::start_health_server(health_port, &health_bind).await {
+                tracing::error!("Health server error: {}", e);
+            }
+        });
+    }
 
     // 14. Event listener: route trigger events to agent -> broadcast via hub
     let hub_for_events = hub.clone();

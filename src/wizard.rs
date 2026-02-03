@@ -77,6 +77,17 @@ const PRESETS: &[ProviderPreset] = &[
         key_hint: "Starts with \"sk-or-\". Gives access to many providers in one key.",
     },
     ProviderPreset {
+        name: "DeepSeek",
+        base_url: "https://api.deepseek.com",
+        kind: "openai_compatible",
+        primary: "deepseek-chat",
+        fast: "deepseek-chat",
+        smart: "deepseek-reasoner",
+        needs_key: true,
+        key_url: "https://platform.deepseek.com/api_keys",
+        key_hint: "Starts with \"sk-\". Affordable pricing with strong reasoning models.",
+    },
+    ProviderPreset {
         name: "Ollama (local)",
         base_url: "http://localhost:11434/v1",
         kind: "openai_compatible",

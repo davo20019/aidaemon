@@ -168,6 +168,43 @@ fn extract_jsonl_content(raw: &str) -> Option<String> {
     last_content
 }
 
+/// Combine stdout and stderr into a single raw output string.
+fn format_raw_output(stdout: &str, stderr: &str) -> String {
+    let mut raw = String::new();
+    if !stdout.is_empty() {
+        raw.push_str(stdout);
+    }
+    if !stderr.is_empty() {
+        if !raw.is_empty() {
+            raw.push_str("\n--- stderr ---\n");
+        }
+        raw.push_str(stderr);
+    }
+    if raw.is_empty() {
+        raw.push_str("(no output)");
+    }
+    raw
+}
+
+/// Truncate a string to at most `max_chars`, returning a new string.
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.len() > max_chars {
+        let mut t = s[..max_chars].to_string();
+        t.push_str("\n... (truncated)");
+        t
+    } else {
+        s.to_string()
+    }
+}
+
+/// Truncate a string in place to at most `max_chars`.
+fn truncate_in_place(s: &mut String, max_chars: usize) {
+    if s.len() > max_chars {
+        s.truncate(max_chars);
+        s.push_str("\n... (truncated)");
+    }
+}
+
 #[async_trait]
 impl Tool for CliAgentTool {
     fn name(&self) -> &str {
@@ -281,6 +318,12 @@ impl Tool for CliAgentTool {
                 exit_code = ?output.status.code(),
                 "CLI agent exited with non-zero status"
             );
+            let code = output.status.code().map_or("unknown".to_string(), |c| c.to_string());
+            let combined = format_raw_output(&stdout, &stderr);
+            return Ok(format!(
+                "ERROR: CLI agent '{}' exited with code {}. Do NOT retry this tool with the same agent.\n\nOutput:\n{}",
+                args.tool, code, truncate(&combined, entry.max_output_chars)
+            ));
         }
 
         // Try to extract structured content from JSON/JSONL output
@@ -289,28 +332,11 @@ impl Tool for CliAgentTool {
         } else if let Some(content) = extract_jsonl_content(&stdout) {
             content
         } else {
-            // Fall back to raw output
-            let mut raw = String::new();
-            if !stdout.is_empty() {
-                raw.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !raw.is_empty() {
-                    raw.push_str("\n--- stderr ---\n");
-                }
-                raw.push_str(&stderr);
-            }
-            if raw.is_empty() {
-                raw.push_str("(no output)");
-            }
-            raw
+            format_raw_output(&stdout, &stderr)
         };
 
         // Truncate to max output chars
-        if result_text.len() > entry.max_output_chars {
-            result_text.truncate(entry.max_output_chars);
-            result_text.push_str("\n... (truncated)");
-        }
+        truncate_in_place(&mut result_text, entry.max_output_chars);
 
         Ok(result_text)
     }

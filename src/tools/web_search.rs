@@ -236,7 +236,7 @@ impl Tool for WebSearchTool {
     fn schema(&self) -> Value {
         json!({
             "name": "web_search",
-            "description": "Search the web. Returns titles, URLs, and snippets for your query. Use to find current information, research topics, check facts.",
+            "description": "Search the web. Returns titles, URLs, and snippets for your query. Use to find current information, research topics, check facts. If results are consistently empty, the search backend may be blocked — suggest the user set up Brave Search via manage_config (search.backend = 'brave' + search.api_key).",
             "parameters": {
                 "type": "object",
                 "properties": {

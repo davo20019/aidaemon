@@ -3,6 +3,7 @@ mod channels;
 mod config;
 mod core;
 mod daemon;
+mod dashboard;
 mod mcp;
 mod memory;
 mod providers;
