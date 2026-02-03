@@ -186,6 +186,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         loaded_skills,
         config.subagents.max_depth,
         config.subagents.max_iterations,
+        config.subagents.max_iterations_cap,
         config.subagents.max_response_chars,
         config.subagents.timeout_secs,
         config.provider.models.clone(),

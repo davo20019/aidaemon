@@ -103,7 +103,12 @@ impl Tool for WebFetchTool {
 
         let mut result = format!("Content from {}:\n\n", url);
         if text.len() > max_chars {
-            result.push_str(&text[..max_chars]);
+            // Find a valid UTF-8 char boundary at or before max_chars
+            let mut end = max_chars;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            result.push_str(&text[..end]);
             result.push_str("\n\n[Truncated]");
         } else {
             result.push_str(&text);
