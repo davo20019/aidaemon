@@ -366,6 +366,11 @@ impl Agent {
         info!("Model override cleared, auto-routing re-enabled");
     }
 
+    /// Clear conversation history for a session, preserving facts.
+    pub async fn clear_session(&self, session_id: &str) -> anyhow::Result<()> {
+        self.state.clear_session(session_id).await
+    }
+
     /// List available models from the provider.
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         self.provider.list_models().await

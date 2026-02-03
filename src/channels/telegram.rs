@@ -313,6 +313,13 @@ impl TelegramChannel {
                     }
                 }
             }
+            "/clear" => {
+                let session_id = msg.chat.id.0.to_string();
+                match self.agent.clear_session(&session_id).await {
+                    Ok(_) => "Context cleared. Starting fresh.".to_string(),
+                    Err(e) => format!("Failed to clear context: {}", e),
+                }
+            }
             "/cost" => {
                 self.handle_cost_command().await
             }
@@ -326,6 +333,7 @@ impl TelegramChannel {
                 /restart — Restart the daemon (picks up new binary, config, MCP servers)\n\
                 /tasks — List running and recent tasks\n\
                 /cancel <id> — Cancel a running task\n\
+                /clear — Clear conversation context and start fresh\n\
                 /cost — Show token usage statistics\n\
                 /help — Show this help message"
                     .to_string()

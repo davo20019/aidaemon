@@ -131,6 +131,9 @@ pub trait StateStore: Send + Sync {
     async fn get_context(&self, session_id: &str, _query: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
         self.get_history(session_id, limit).await
     }
+    /// Clear conversation history for a session (working memory + DB messages).
+    /// Facts are preserved.
+    async fn clear_session(&self, session_id: &str) -> anyhow::Result<()>;
     /// Record token usage from an LLM call.
     async fn record_token_usage(&self, _session_id: &str, _usage: &TokenUsage) -> anyhow::Result<()> {
         Ok(()) // default no-op
