@@ -2,7 +2,10 @@ use std::path::Path;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::traits::{Fact, ModelProvider};
+use crate::traits::{
+    BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, ModelProvider, Procedure,
+    UserProfile,
+};
 
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -253,6 +256,195 @@ pub fn build_system_prompt(
     prompt
 }
 
+/// Extended context for memory-rich system prompts.
+#[derive(Default)]
+pub struct MemoryContext<'a> {
+    pub facts: &'a [Fact],
+    pub episodes: &'a [Episode],
+    pub goals: &'a [Goal],
+    pub patterns: &'a [BehaviorPattern],
+    pub procedures: &'a [Procedure],
+    pub error_solutions: &'a [ErrorSolution],
+    pub expertise: &'a [Expertise],
+    pub profile: Option<&'a UserProfile>,
+}
+
+/// Build the complete system prompt with all memory components.
+///
+/// This extended version injects episodic memory, goals, procedures, expertise,
+/// and behavior patterns in addition to facts and skills.
+pub fn build_system_prompt_with_memory(
+    base: &str,
+    skills: &[Skill],
+    active: &[&Skill],
+    memory: &MemoryContext,
+    max_facts: usize,
+) -> String {
+    let mut prompt = base.to_string();
+
+    // 1. Communication Style (from user profile)
+    if let Some(profile) = memory.profile {
+        prompt.push_str("\n\n## Communication Preferences\n");
+        prompt.push_str(&format!(
+            "- Verbosity: {}\n- Tone: {}\n- Explanation depth: {}\n",
+            profile.verbosity_preference, profile.tone_preference, profile.explanation_depth
+        ));
+        if profile.likes_suggestions {
+            prompt.push_str("- User appreciates proactive suggestions\n");
+        }
+        if !profile.prefers_explanations {
+            prompt.push_str("- Keep explanations brief — user prefers direct answers\n");
+        }
+    }
+
+    // 2. Expertise Levels
+    if !memory.expertise.is_empty() {
+        prompt.push_str("\n\n## Your Expertise Levels\n");
+        prompt.push_str("| Domain | Level | Confidence |\n|--------|-------|------------|\n");
+        for exp in memory.expertise.iter().take(10) {
+            prompt.push_str(&format!(
+                "| {} | {} | {:.0}% |\n",
+                exp.domain,
+                exp.current_level,
+                exp.confidence_score * 100.0
+            ));
+        }
+    }
+
+    // 3. Known Procedures (high success rate)
+    let good_procedures: Vec<&Procedure> = memory
+        .procedures
+        .iter()
+        .filter(|p| p.success_count > p.failure_count && p.success_count >= 2)
+        .take(5)
+        .collect();
+    if !good_procedures.is_empty() {
+        prompt.push_str("\n\n## Known Procedures\n");
+        prompt.push_str("I've successfully used these approaches before:\n");
+        for proc in good_procedures {
+            let success_rate = proc.success_count as f32
+                / (proc.success_count + proc.failure_count) as f32
+                * 100.0;
+            prompt.push_str(&format!(
+                "- **{}** (trigger: '{}', {:.0}% success): {}\n",
+                proc.name,
+                truncate(&proc.trigger_pattern, 30),
+                success_rate,
+                proc.steps.first().map(|s| s.as_str()).unwrap_or("...")
+            ));
+        }
+    }
+
+    // 4. Known Error Fixes (high success rate)
+    let good_solutions: Vec<&ErrorSolution> = memory
+        .error_solutions
+        .iter()
+        .filter(|s| s.success_count > s.failure_count && s.success_count >= 2)
+        .take(5)
+        .collect();
+    if !good_solutions.is_empty() {
+        prompt.push_str("\n\n## Known Error Solutions\n");
+        prompt.push_str("I've resolved these types of errors before:\n");
+        for sol in good_solutions {
+            prompt.push_str(&format!(
+                "- **{}**: {} ({}x successful)\n",
+                truncate(&sol.error_pattern, 50),
+                sol.solution_summary,
+                sol.success_count
+            ));
+        }
+    }
+
+    // 5. Active Goals
+    let active_goals: Vec<&Goal> = memory
+        .goals
+        .iter()
+        .filter(|g| g.status == "active")
+        .take(5)
+        .collect();
+    if !active_goals.is_empty() {
+        prompt.push_str("\n\n## Active Goals\n");
+        prompt.push_str("The user is working toward:\n");
+        for goal in active_goals {
+            let priority_marker = match goal.priority.as_str() {
+                "high" => "🔴",
+                "medium" => "🟡",
+                _ => "⚪",
+            };
+            prompt.push_str(&format!("- {} {}\n", priority_marker, goal.description));
+        }
+    }
+
+    // 6. Known Facts (with history indication)
+    let capped_facts = if memory.facts.len() > max_facts {
+        &memory.facts[..max_facts]
+    } else {
+        memory.facts
+    };
+    if !capped_facts.is_empty() {
+        prompt.push_str("\n\n## Known Facts\n");
+        for f in capped_facts {
+            let history_marker = if f.recall_count > 3 { " (frequently used)" } else { "" };
+            prompt.push_str(&format!(
+                "- [{}] {}: {}{}\n",
+                f.category, f.key, f.value, history_marker
+            ));
+        }
+    }
+
+    // 7. Relevant Past Experiences
+    if !memory.episodes.is_empty() {
+        prompt.push_str("\n\n## Relevant Past Sessions\n");
+        for ep in memory.episodes.iter().take(3) {
+            let tone = ep.emotional_tone.as_deref().unwrap_or("neutral");
+            let outcome = ep.outcome.as_deref().unwrap_or("unknown");
+            prompt.push_str(&format!(
+                "- {} (tone: {}, outcome: {})\n",
+                truncate(&ep.summary, 100),
+                tone,
+                outcome
+            ));
+        }
+    }
+
+    // 8. Behavior Patterns (high confidence)
+    let confident_patterns: Vec<&BehaviorPattern> = memory
+        .patterns
+        .iter()
+        .filter(|p| p.confidence >= 0.7)
+        .take(3)
+        .collect();
+    if !confident_patterns.is_empty() {
+        prompt.push_str("\n\n## Observed Patterns\n");
+        for pattern in confident_patterns {
+            prompt.push_str(&format!("- {}\n", pattern.description));
+        }
+    }
+
+    // 9. Available Skills
+    if !skills.is_empty() {
+        prompt.push_str("\n\n## Available Skills\n");
+        for skill in skills {
+            prompt.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
+        }
+    }
+
+    // Active skill bodies
+    for skill in active {
+        prompt.push_str(&format!("\n\n## Active Skill: {}\n{}", skill.name, skill.body));
+    }
+
+    prompt
+}
+
+fn truncate(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +561,9 @@ mod tests {
             source: "test".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            superseded_at: None,
+            recall_count: 0,
+            last_recalled_at: None,
         }
     }
 

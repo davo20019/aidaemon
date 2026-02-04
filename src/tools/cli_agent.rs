@@ -94,7 +94,7 @@ pub struct CliAgentTool {
 /// Default tool definitions when the user enables cli_agents but doesn't specify tools.
 fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static str>, &'static str)> {
     vec![
-        ("claude", "claude", vec!["-p", "--dangerously-skip-permissions"], "Claude Code — Anthropic's AI coding agent (auto-approve mode)"),
+        ("claude", "claude", vec!["-p", "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"], "Claude Code — Anthropic's AI coding agent (auto-approve mode)"),
         ("gemini", "gemini", vec!["-p", "--sandbox=false", "--auto-approve"], "Gemini CLI — Google's AI coding agent (auto-approve mode)"),
         ("codex", "codex", vec!["exec", "--json", "--full-auto"], "Codex CLI — OpenAI's AI coding agent"),
         ("copilot", "copilot", vec!["-p", "--allow-all-tools", "--allow-all-paths"], "GitHub Copilot CLI (auto-approve mode)"),
@@ -257,9 +257,11 @@ impl CliAgentTool {
             let mut stdout_reader = BufReader::new(stdout).lines();
             let mut stderr_reader = BufReader::new(stderr).lines();
             let mut last_progress = Instant::now();
+            let started_at = Instant::now();
             let mut pending_lines: Vec<String> = Vec::new();
             let mut stdout_done = false;
             let mut stderr_done = false;
+            let mut last_parsed_action: Option<String> = None;
 
             loop {
                 if stdout_done && stderr_done {
@@ -310,29 +312,39 @@ impl CliAgentTool {
 
                 // Emit progress updates at intervals
                 // Parse JSON lines to extract meaningful progress, filter raw JSON
-                if last_progress.elapsed() >= PROGRESS_INTERVAL && !pending_lines.is_empty() {
+                if last_progress.elapsed() >= PROGRESS_INTERVAL {
                     if let Some(ref tx) = status_tx_clone {
                         let mut progress_items: Vec<String> = Vec::new();
                         for line in &pending_lines {
                             if looks_like_json(line) {
                                 // Try to extract meaningful progress from JSON
                                 if let Some(progress) = extract_progress_from_json(line) {
-                                    progress_items.push(progress);
+                                    progress_items.push(progress.clone());
+                                    last_parsed_action = Some(progress);
                                 }
                             } else {
                                 // Non-JSON line, include as-is
                                 progress_items.push(line.clone());
                             }
                         }
-                        if !progress_items.is_empty() {
+
+                        let elapsed_secs = started_at.elapsed().as_secs();
+                        let chunk = if !progress_items.is_empty() {
                             // Deduplicate consecutive items
                             progress_items.dedup();
-                            let chunk = progress_items.join("\n");
-                            let _ = tx.try_send(StatusUpdate::ToolProgress {
-                                name: tool_name_owned.clone(),
-                                chunk: truncate_string(&chunk, 500),
-                            });
-                        }
+                            progress_items.join("\n")
+                        } else if let Some(ref action) = last_parsed_action {
+                            // No new progress, but we have a last action - show heartbeat
+                            format!("⏳ {} ({}s)", action, elapsed_secs)
+                        } else {
+                            // No parsed progress at all - show generic heartbeat
+                            format!("⏳ Working... ({}s)", elapsed_secs)
+                        };
+
+                        let _ = tx.try_send(StatusUpdate::ToolProgress {
+                            name: tool_name_owned.clone(),
+                            chunk: truncate_string(&chunk, 500),
+                        });
                     }
                     pending_lines.clear();
                     last_progress = Instant::now();
@@ -602,14 +614,62 @@ fn extract_progress_from_json(line: &str) -> Option<String> {
     if let Some(event_type) = v.get("type").and_then(|t| t.as_str()) {
         match event_type {
             "assistant" => {
-                // Assistant is thinking/responding
+                // Assistant is thinking/responding - extract tool use details
                 if let Some(content) = v.get("message").and_then(|m| m.get("content")) {
                     if let Some(arr) = content.as_array() {
                         for item in arr {
                             if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                                if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                                    return Some(format!("🔧 Using: {}", name));
-                                }
+                                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                                let input = item.get("input");
+
+                                // Extract details based on tool type
+                                let detail = match name {
+                                    "Bash" | "bash" | "terminal" => {
+                                        input.and_then(|i| i.get("command"))
+                                            .and_then(|c| c.as_str())
+                                            .map(|cmd| {
+                                                let short: String = cmd.chars().take(50).collect();
+                                                format!("⚡ {}", short)
+                                            })
+                                    }
+                                    "Read" | "read" => {
+                                        input.and_then(|i| i.get("file_path"))
+                                            .and_then(|p| p.as_str())
+                                            .map(|path| {
+                                                let short: String = path.chars().rev().take(40).collect::<String>().chars().rev().collect();
+                                                format!("📖 ...{}", short)
+                                            })
+                                    }
+                                    "Write" | "write" | "Edit" | "edit" => {
+                                        input.and_then(|i| i.get("file_path"))
+                                            .and_then(|p| p.as_str())
+                                            .map(|path| {
+                                                let short: String = path.chars().rev().take(40).collect::<String>().chars().rev().collect();
+                                                format!("✏️ ...{}", short)
+                                            })
+                                    }
+                                    "Glob" | "glob" => {
+                                        input.and_then(|i| i.get("pattern"))
+                                            .and_then(|p| p.as_str())
+                                            .map(|pat| format!("🔍 {}", pat))
+                                    }
+                                    "Grep" | "grep" => {
+                                        input.and_then(|i| i.get("pattern"))
+                                            .and_then(|p| p.as_str())
+                                            .map(|pat| {
+                                                let short: String = pat.chars().take(30).collect();
+                                                format!("🔍 grep: {}", short)
+                                            })
+                                    }
+                                    "Task" => {
+                                        input.and_then(|i| i.get("description"))
+                                            .and_then(|d| d.as_str())
+                                            .map(|desc| format!("🚀 {}", desc))
+                                    }
+                                    _ => None,
+                                };
+
+                                return Some(detail.unwrap_or_else(|| format!("🔧 {}", name)));
                             }
                         }
                     }
