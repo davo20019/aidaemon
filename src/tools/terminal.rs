@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,8 @@ use tracing::{info, warn};
 use crate::traits::Tool;
 use crate::types::ApprovalResponse;
 
+use super::command_risk::{classify_command, PermissionMode, RiskLevel};
+
 /// Max bytes per stream buffer (1 MB) to prevent unbounded memory growth.
 const BUFFER_CAP: usize = 1_048_576;
 
@@ -21,6 +23,9 @@ const BUFFER_CAP: usize = 1_048_576;
 pub struct ApprovalRequest {
     pub command: String,
     pub session_id: String,
+    pub risk_level: RiskLevel,
+    pub warnings: Vec<String>,
+    pub permission_mode: PermissionMode,
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
 }
 
@@ -35,7 +40,12 @@ struct RunningProcess {
 }
 
 pub struct TerminalTool {
+    /// Permanently allowed prefixes (from config + DB)
     allowed_prefixes: Arc<RwLock<Vec<String>>>,
+    /// Session-only allowed prefixes (cleared on restart)
+    session_approved: Arc<RwLock<HashSet<String>>>,
+    /// Permission persistence mode
+    permission_mode: PermissionMode,
     approval_tx: mpsc::Sender<ApprovalRequest>,
     running: Arc<Mutex<HashMap<u32, RunningProcess>>>,
     initial_timeout: Duration,
@@ -116,8 +126,22 @@ impl TerminalTool {
         approval_tx: mpsc::Sender<ApprovalRequest>,
         initial_timeout_secs: u64,
         max_output_chars: usize,
+        permission_mode: PermissionMode,
         pool: SqlitePool,
     ) -> Self {
+        // Log permission mode on startup
+        match permission_mode {
+            PermissionMode::Yolo => {
+                warn!("⚠️  YOLO mode enabled: all command approvals persist forever, including critical commands");
+            }
+            PermissionMode::Cautious => {
+                info!("Cautious mode: all command approvals are session-only");
+            }
+            PermissionMode::Default => {
+                info!("Default permission mode: critical commands require per-session approval");
+            }
+        }
+
         // Load persisted prefixes from DB and merge with config defaults
         let mut merged = allowed_prefixes;
         match sqlx::query_scalar::<_, String>(
@@ -141,6 +165,8 @@ impl TerminalTool {
 
         Self {
             allowed_prefixes: Arc::new(RwLock::new(merged)),
+            session_approved: Arc::new(RwLock::new(HashSet::new())),
+            permission_mode,
             approval_tx,
             running: Arc::new(Mutex::new(HashMap::new())),
             initial_timeout: Duration::from_secs(initial_timeout_secs),
@@ -158,19 +184,54 @@ impl TerminalTool {
         if contains_shell_operator(trimmed) {
             return false;
         }
-        prefixes.iter().any(|prefix| {
+
+        // Check permanent prefixes
+        let matches_permanent = prefixes.iter().any(|prefix| {
+            trimmed == prefix.as_str()
+                || trimmed.starts_with(&format!("{} ", prefix))
+                || trimmed.starts_with(&format!("{}\t", prefix))
+        });
+
+        if matches_permanent {
+            return true;
+        }
+
+        // Check session-approved prefixes
+        let session = self.session_approved.read().await;
+        session.iter().any(|prefix| {
             trimmed == prefix.as_str()
                 || trimmed.starts_with(&format!("{} ", prefix))
                 || trimmed.starts_with(&format!("{}\t", prefix))
         })
     }
 
-    async fn request_approval(&self, session_id: &str, command: &str) -> anyhow::Result<ApprovalResponse> {
+    /// Add a prefix to session-only approved list (cleared on restart).
+    async fn add_session_prefix(&self, command: &str) {
+        let prefix = command
+            .split_whitespace()
+            .next()
+            .unwrap_or(command.trim());
+        let mut session = self.session_approved.write().await;
+        if session.insert(prefix.to_string()) {
+            info!(prefix, "Added to session-approved prefixes (will reset on restart)");
+        }
+    }
+
+    async fn request_approval(
+        &self,
+        session_id: &str,
+        command: &str,
+        risk_level: RiskLevel,
+        warnings: Vec<String>,
+    ) -> anyhow::Result<ApprovalResponse> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.approval_tx
             .send(ApprovalRequest {
                 command: command.to_string(),
                 session_id: session_id.to_string(),
+                risk_level,
+                warnings,
+                permission_mode: self.permission_mode,
                 response_tx,
             })
             .await
@@ -201,6 +262,60 @@ impl TerminalTool {
                 {
                     warn!(prefix, "Failed to persist allowed prefix: {}", e);
                 }
+            }
+        }
+    }
+
+    /// Enable trust-all mode: auto-approve all commands without prompting.
+    /// Requires user approval since this is a security-sensitive action.
+    async fn handle_trust_all(&self, session_id: &str) -> anyhow::Result<String> {
+        // Check if already in trust-all mode
+        {
+            let prefixes = self.allowed_prefixes.read().await;
+            if prefixes.iter().any(|p| p == "*") {
+                return Ok("Trust-all mode is already enabled. All commands are auto-approved.".to_string());
+            }
+        }
+
+        // Request user approval
+        match self.request_approval(
+            session_id,
+            "ENABLE TRUST-ALL MODE",
+            RiskLevel::Critical,
+            vec![
+                "All future commands will run without approval".to_string(),
+                "This includes dangerous commands (rm, sudo, etc.)".to_string(),
+                "Persists across restarts".to_string(),
+            ],
+        ).await {
+            Ok(ApprovalResponse::AllowOnce)
+            | Ok(ApprovalResponse::AllowSession)
+            | Ok(ApprovalResponse::AllowAlways) => {
+                // Add * to allowed prefixes
+                let mut prefixes = self.allowed_prefixes.write().await;
+                if !prefixes.iter().any(|p| p == "*") {
+                    prefixes.push("*".to_string());
+                    info!("Trust-all mode enabled: all commands will be auto-approved");
+
+                    // Persist to database
+                    if let Some(ref pool) = self.pool {
+                        if let Err(e) = sqlx::query(
+                            "INSERT OR IGNORE INTO terminal_allowed_prefixes (prefix) VALUES ('*')"
+                        )
+                        .execute(pool)
+                        .await
+                        {
+                            warn!("Failed to persist trust-all mode: {}", e);
+                        }
+                    }
+                }
+                Ok("Trust-all mode enabled. All commands will now run without approval prompts.".to_string())
+            }
+            Ok(ApprovalResponse::Deny) => {
+                Ok("Trust-all mode was denied. Commands will continue to require approval.".to_string())
+            }
+            Err(e) => {
+                Ok(format!("Could not get approval for trust-all mode: {}", e))
             }
         }
     }
@@ -456,8 +571,8 @@ impl Tool for TerminalTool {
                     },
                     "action": {
                         "type": "string",
-                        "enum": ["run", "check", "kill"],
-                        "description": "Action to perform: \"run\" (default) executes a command, \"check\" shows output of a background process, \"kill\" stops a background process"
+                        "enum": ["run", "check", "kill", "trust_all"],
+                        "description": "Action to perform: \"run\" (default) executes a command, \"check\" shows output of a background process, \"kill\" stops a background process, \"trust_all\" enables auto-approval for all commands (requires user confirmation)"
                     },
                     "pid": {
                         "type": "integer",
@@ -484,23 +599,52 @@ impl Tool for TerminalTool {
                 let pid = args.pid.ok_or_else(|| anyhow::anyhow!("pid is required for action=\"kill\""))?;
                 self.handle_kill(pid).await
             }
+            "trust_all" => {
+                self.handle_trust_all(&args._session_id).await
+            }
             _ => {
                 // "run" or default
                 let command = args.command
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("command is required for action=\"run\""))?;
 
+                // Classify command risk
+                let assessment = classify_command(command);
+
+                // Check if this is a trusted scheduled session (auto-approve)
+                let is_trusted_session = args._session_id.starts_with("scheduled_");
+
+                // Determine if approval is needed
+                // Note: is_allowed() checks both permanent AND session-approved prefixes
                 let needs_approval = if args._untrusted_source {
-                    info!(command = %command, "Forcing approval: untrusted source");
+                    // External triggers always need approval regardless of mode
+                    info!(command = %command, risk = %assessment.level, "Forcing approval: untrusted source");
                     true
+                } else if is_trusted_session {
+                    // Trusted scheduled tasks bypass approval
+                    info!(command = %command, session = %args._session_id, "Auto-approved: trusted scheduled task");
+                    false
                 } else {
+                    // Check if already approved (permanent or session)
                     !self.is_allowed(command).await
                 };
 
                 if needs_approval {
-                    match self.request_approval(&args._session_id, command).await {
-                        Ok(ApprovalResponse::AllowOnce) => {}
+                    match self.request_approval(
+                        &args._session_id,
+                        command,
+                        assessment.level,
+                        assessment.warnings.clone(),
+                    ).await {
+                        Ok(ApprovalResponse::AllowOnce) => {
+                            // Just run this once, don't save
+                        }
+                        Ok(ApprovalResponse::AllowSession) => {
+                            // Save to session-only storage (cleared on restart)
+                            self.add_session_prefix(command).await;
+                        }
                         Ok(ApprovalResponse::AllowAlways) => {
+                            // Save to permanent storage (DB)
                             self.add_prefix(command).await;
                         }
                         Ok(ApprovalResponse::Deny) => {

@@ -2,18 +2,50 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 use crate::scheduler::{compute_next_run, parse_schedule};
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
+use crate::tools::terminal::ApprovalRequest;
 use crate::traits::Tool;
+use crate::types::ApprovalResponse;
 
 pub struct SchedulerTool {
     pool: SqlitePool,
+    approval_tx: mpsc::Sender<ApprovalRequest>,
 }
 
 impl SchedulerTool {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(pool: SqlitePool, approval_tx: mpsc::Sender<ApprovalRequest>) -> Self {
+        Self { pool, approval_tx }
+    }
+
+    /// Request user approval for creating a trusted scheduled task.
+    async fn request_approval(&self, session_id: &str, task_name: &str, prompt: &str) -> anyhow::Result<ApprovalResponse> {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let description = format!(
+            "Create TRUSTED scheduled task '{}'\nPrompt: {}",
+            task_name,
+            if prompt.len() > 100 { format!("{}...", &prompt[..100]) } else { prompt.to_string() }
+        );
+        self.approval_tx
+            .send(ApprovalRequest {
+                command: description,
+                session_id: session_id.to_string(),
+                risk_level: RiskLevel::High,
+                warnings: vec![
+                    "Trusted tasks run commands without approval".to_string(),
+                    "Commands will execute even when you're offline".to_string(),
+                ],
+                permission_mode: PermissionMode::Default,
+                response_tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Approval response channel closed"))
     }
 }
 
@@ -28,6 +60,8 @@ struct SchedulerArgs {
     #[serde(default)]
     trusted: bool,
     id: Option<String>,
+    #[serde(default)]
+    _session_id: String,
 }
 
 #[async_trait]
@@ -113,6 +147,24 @@ impl SchedulerTool {
         let prompt = args.prompt.as_deref().unwrap_or("").trim();
         if prompt.is_empty() {
             return Ok("Error: 'prompt' is required for create".to_string());
+        }
+
+        // If trusted=true, require user approval before creating
+        if args.trusted {
+            match self.request_approval(&args._session_id, name, prompt).await {
+                Ok(ApprovalResponse::AllowOnce)
+                | Ok(ApprovalResponse::AllowSession)
+                | Ok(ApprovalResponse::AllowAlways) => {
+                    info!(name = %name, "Trusted task creation approved by user");
+                }
+                Ok(ApprovalResponse::Deny) => {
+                    warn!(name = %name, "Trusted task creation denied by user");
+                    return Ok("Trusted task creation denied by user. You can create the task with trusted=false instead (commands will require approval).".to_string());
+                }
+                Err(e) => {
+                    return Ok(format!("Could not get approval for trusted task: {}", e));
+                }
+            }
         }
 
         let cron_expr = match parse_schedule(schedule) {

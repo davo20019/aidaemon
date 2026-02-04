@@ -14,18 +14,11 @@ use crate::providers::{ProviderError, ProviderErrorKind};
 use crate::router::{self, Router};
 use crate::skills::{self, Skill};
 use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
-
-/// Status updates emitted by the agent loop for live feedback to the user.
-#[derive(Debug, Clone)]
-pub enum StatusUpdate {
-    /// Sent before each LLM call (skipped on iteration 0).
-    Thinking(usize),
-    /// Sent before each tool execution.
-    ToolStart { name: String, summary: String },
-}
+// Re-export StatusUpdate from types for backwards compatibility
+pub use crate::types::StatusUpdate;
 
 /// Best-effort send — never blocks the agent loop if the receiver is slow/full.
-fn send_status(tx: &Option<mpsc::Sender<StatusUpdate>>, update: StatusUpdate) {
+pub fn send_status(tx: &Option<mpsc::Sender<StatusUpdate>>, update: StatusUpdate) {
     if let Some(ref tx) = tx {
         let _ = tx.try_send(update);
     }
@@ -952,7 +945,7 @@ impl Agent {
                             summary: summarize_tool_args(&tc.name, &tc.arguments),
                         },
                     );
-                    let result = self.execute_tool(&tc.name, &tc.arguments, session_id).await;
+                    let result = self.execute_tool(&tc.name, &tc.arguments, session_id, status_tx.clone()).await;
                     let mut result_text = match result {
                         Ok(text) => text,
                         Err(e) => format!("Error: {}", e),
@@ -1028,7 +1021,13 @@ impl Agent {
         Ok("I've reached the maximum number of steps for this request. Please try again with a simpler query.".to_string())
     }
 
-    async fn execute_tool(&self, name: &str, arguments: &str, session_id: &str) -> anyhow::Result<String> {
+    async fn execute_tool(
+        &self,
+        name: &str,
+        arguments: &str,
+        session_id: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
         let enriched_args = match serde_json::from_str::<Value>(arguments) {
             Ok(Value::Object(mut map)) => {
                 map.insert("_session_id".to_string(), json!(session_id));
@@ -1044,7 +1043,7 @@ impl Agent {
         };
         for tool in &self.tools {
             if tool.name() == name {
-                return tool.call(&enriched_args).await;
+                return tool.call_with_status(&enriched_args, status_tx).await;
             }
         }
         anyhow::bail!("Unknown tool: {}", name)

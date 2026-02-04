@@ -94,10 +94,11 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             approval_tx.clone(),
             config.terminal.initial_timeout_secs,
             config.terminal.max_output_chars,
+            config.terminal.permission_mode,
             state.pool(),
         ).await),
         Arc::new(RememberFactTool::new(state.clone())),
-        Arc::new(ConfigManagerTool::new(config_path.clone(), approval_tx)),
+        Arc::new(ConfigManagerTool::new(config_path.clone(), approval_tx.clone())),
         Arc::new(WebFetchTool::new()),
         Arc::new(WebSearchTool::new(&config.search)),
     ];
@@ -137,7 +138,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // Scheduler tool (conditional)
     if config.scheduler.enabled {
-        tools.push(Arc::new(SchedulerTool::new(state.pool())));
+        tools.push(Arc::new(SchedulerTool::new(state.pool(), approval_tx.clone())));
         info!("Scheduler tool enabled");
     }
 

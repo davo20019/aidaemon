@@ -11,3 +11,4 @@ config.toml
 !src/dashboard.html
 .DS_Store
 .fastembed_cache/
+moltbook_bot.py
