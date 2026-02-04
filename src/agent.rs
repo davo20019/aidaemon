@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::config::ModelsConfig;
 use crate::providers::{ProviderError, ProviderErrorKind};
 use crate::router::{self, Router};
-use crate::skills::{self, Skill};
+use crate::skills::{self, MemoryContext, Skill};
 use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
 // Re-export StatusUpdate from types for backwards compatibility
 pub use crate::types::StatusUpdate;
@@ -567,7 +567,7 @@ impl Agent {
             }
         };
 
-        // 2. Build system prompt ONCE before the loop: match skills + inject facts
+        // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
         let mut active_skills = skills::match_skills(&self.skills, user_text);
         if !active_skills.is_empty() {
             let names: Vec<&str> = active_skills.iter().map(|s| s.name.as_str()).collect();
@@ -588,13 +588,46 @@ impl Agent {
                 }
             }
         }
+
+        // Fetch all memory components for rich context
         let facts = self.state.get_relevant_facts(user_text, self.max_facts).await?;
-        let system_prompt = skills::build_system_prompt(
+        let episodes = self.state.get_relevant_episodes(user_text, 3).await.unwrap_or_default();
+        let goals = self.state.get_active_goals().await.unwrap_or_default();
+        let patterns = self.state.get_behavior_patterns(0.5).await.unwrap_or_default();
+        let procedures = self.state.get_relevant_procedures(user_text, 5).await.unwrap_or_default();
+        let error_solutions = self.state.get_relevant_error_solutions(user_text, 5).await.unwrap_or_default();
+        let expertise = self.state.get_all_expertise().await.unwrap_or_default();
+        let profile = self.state.get_user_profile().await.ok().flatten();
+
+        // Build extended system prompt with all memory components
+        let memory_context = MemoryContext {
+            facts: &facts,
+            episodes: &episodes,
+            goals: &goals,
+            patterns: &patterns,
+            procedures: &procedures,
+            error_solutions: &error_solutions,
+            expertise: &expertise,
+            profile: profile.as_ref(),
+        };
+
+        let system_prompt = skills::build_system_prompt_with_memory(
             &self.system_prompt,
             &self.skills,
             &active_skills,
-            &facts,
+            &memory_context,
             self.max_facts,
+        );
+
+        info!(
+            session_id,
+            facts = facts.len(),
+            episodes = episodes.len(),
+            goals = goals.len(),
+            patterns = patterns.len(),
+            procedures = procedures.len(),
+            expertise = expertise.len(),
+            "Memory context loaded"
         );
 
         // 2b. Retrieve Context ONCE (Optimization)

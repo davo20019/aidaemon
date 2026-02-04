@@ -1,4 +1,80 @@
+use chrono::{DateTime, Utc};
 use crate::traits::Message;
+
+/// Calculate a memory score that combines similarity, recency, and recall patterns.
+///
+/// This function implements a decay-and-reinforcement model where:
+/// - Recent memories are more accessible
+/// - Frequently recalled memories are stronger
+/// - Recently recalled memories get a boost
+///
+/// Returns a score between 0.0 and 1.0+ (can exceed 1.0 with high recall counts).
+pub fn memory_score(
+    similarity: f32,
+    created_at: DateTime<Utc>,
+    recall_count: i32,
+    last_recalled: Option<DateTime<Utc>>,
+) -> f32 {
+    let now = Utc::now();
+
+    // Recency decay: memories lose relevance over time
+    // Half-life of roughly 10 days
+    let days_since_created = (now - created_at).num_hours() as f32 / 24.0;
+    let recency_decay = 1.0 / (1.0 + days_since_created * 0.1);
+
+    // Recall boost: frequently recalled memories are stronger
+    // Capped at 50% boost (after 5 recalls)
+    let recall_boost = 1.0 + (recall_count as f32 * 0.1).min(0.5);
+
+    // Recall recency: recently recalled memories get an additional boost
+    // Decays over time since last recall
+    let recall_recency = last_recalled
+        .map(|t| {
+            let days_since_recall = (now - t).num_hours() as f32 / 24.0;
+            1.0 / (1.0 + days_since_recall * 0.05)
+        })
+        .unwrap_or(1.0);
+
+    similarity * recency_decay * recall_boost * recall_recency
+}
+
+/// Calculate episode importance based on various factors.
+pub fn calculate_episode_importance(
+    message_count: i32,
+    has_errors: bool,
+    has_decisions: bool,
+    has_goals: bool,
+    emotional_intensity: f32, // 0.0-1.0 scale
+) -> f32 {
+    let mut importance = 0.5; // Base importance
+
+    // More messages = more substantial session
+    if message_count > 20 {
+        importance += 0.2;
+    } else if message_count > 10 {
+        importance += 0.1;
+    }
+
+    // Error resolution is important to remember
+    if has_errors {
+        importance += 0.15;
+    }
+
+    // Decisions made during session
+    if has_decisions {
+        importance += 0.1;
+    }
+
+    // Goals mentioned or worked on
+    if has_goals {
+        importance += 0.1;
+    }
+
+    // Emotional sessions (frustration, excitement) are memorable
+    importance += emotional_intensity * 0.2;
+
+    importance.clamp(0.1, 1.0)
+}
 
 /// Calculate importance score (0.0 - 1.0) based on heuristics.
 pub fn score_message(msg: &Message) -> f32 {
