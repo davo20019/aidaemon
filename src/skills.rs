@@ -218,6 +218,7 @@ pub async fn confirm_skills<'a>(
 ///
 /// `max_facts` caps the number of facts injected into the prompt. Facts are
 /// assumed to arrive ordered by most-recently-updated first (from `get_facts()`).
+#[allow(dead_code)] // Reserved for future use - replaced by build_system_prompt_with_memory
 pub fn build_system_prompt(
     base: &str,
     skills: &[Skill],

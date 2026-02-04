@@ -2,6 +2,7 @@
 //!
 //! This module analyzes patterns, goals, and past experiences to generate
 //! contextually relevant suggestions.
+#![allow(dead_code)] // Reserved for future proactive suggestion feature
 
 use crate::traits::{BehaviorPattern, Episode, Goal, Procedure, UserProfile};
 

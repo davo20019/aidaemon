@@ -402,8 +402,10 @@ impl SqliteStateStore {
     }
 
     // ==================== Episode Methods ====================
+    // Note: These advanced memory methods are reserved for future integration.
 
     /// Insert a new episode and return its ID.
+    #[allow(dead_code)]
     pub async fn insert_episode(&self, episode: &Episode) -> anyhow::Result<i64> {
         let topics_json = episode.topics.as_ref().map(|t| serde_json::to_string(t).unwrap_or_default());
         let result = sqlx::query(
@@ -493,6 +495,7 @@ impl SqliteStateStore {
     }
 
     /// Increment recall count for an episode.
+    #[allow(dead_code)]
     pub async fn increment_episode_recall(&self, episode_id: i64) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query("UPDATE episodes SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?")
@@ -504,6 +507,7 @@ impl SqliteStateStore {
     }
 
     /// Update episode embedding.
+    #[allow(dead_code)]
     pub async fn update_episode_embedding(&self, episode_id: i64, embedding: &[f32]) -> anyhow::Result<()> {
         let blob = serde_json::to_vec(embedding)?;
         sqlx::query("UPDATE episodes SET embedding = ? WHERE id = ?")
@@ -543,6 +547,7 @@ impl SqliteStateStore {
     // ==================== Goal Methods ====================
 
     /// Insert a new goal.
+    #[allow(dead_code)]
     pub async fn insert_goal(&self, goal: &Goal) -> anyhow::Result<i64> {
         let progress_notes_json = goal.progress_notes.as_ref().map(|p| serde_json::to_string(p).unwrap_or_default());
         let result = sqlx::query(
@@ -580,6 +585,7 @@ impl SqliteStateStore {
     }
 
     /// Update goal status and optionally add a progress note.
+    #[allow(dead_code)]
     pub async fn update_goal(&self, goal_id: i64, status: Option<&str>, progress_note: Option<&str>) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
 
@@ -620,6 +626,7 @@ impl SqliteStateStore {
     }
 
     /// Find a goal similar to the given description using embeddings.
+    #[allow(dead_code)]
     pub async fn find_similar_goal(&self, description: &str) -> anyhow::Result<Option<Goal>> {
         let goals = self.get_active_goals().await?;
         if goals.is_empty() {
@@ -720,6 +727,7 @@ impl SqliteStateStore {
     }
 
     /// Update user profile fields.
+    #[allow(dead_code)]
     pub async fn update_user_profile(&self, profile: &UserProfile) -> anyhow::Result<()> {
         let active_hours_json = profile.active_hours.as_ref().map(|h| serde_json::to_string(h).unwrap_or_default());
         let workflows_json = profile.common_workflows.as_ref().map(|w| serde_json::to_string(w).unwrap_or_default());
@@ -748,6 +756,7 @@ impl SqliteStateStore {
     // ==================== BehaviorPattern Methods ====================
 
     /// Insert a new behavior pattern.
+    #[allow(dead_code)]
     pub async fn insert_behavior_pattern(&self, pattern: &BehaviorPattern) -> anyhow::Result<i64> {
         let result = sqlx::query(
             "INSERT INTO behavior_patterns (pattern_type, description, trigger_context, action, confidence, occurrence_count, last_seen_at, created_at)
@@ -797,6 +806,7 @@ impl SqliteStateStore {
     }
 
     /// Update pattern occurrence and confidence.
+    #[allow(dead_code)]
     pub async fn update_behavior_pattern(&self, pattern_id: i64, confidence_delta: f32) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
@@ -813,6 +823,7 @@ impl SqliteStateStore {
     // ==================== Procedure Methods ====================
 
     /// Insert a new procedure.
+    #[allow(dead_code)]
     pub async fn insert_procedure(&self, procedure: &Procedure) -> anyhow::Result<i64> {
         let steps_json = serde_json::to_string(&procedure.steps)?;
         let result = sqlx::query(
@@ -893,6 +904,7 @@ impl SqliteStateStore {
     }
 
     /// Update procedure success/failure and optionally update steps.
+    #[allow(dead_code)]
     pub async fn update_procedure(&self, procedure_id: i64, success: bool, new_steps: Option<&[String]>, duration_secs: Option<f32>) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
 
@@ -960,6 +972,7 @@ impl SqliteStateStore {
     // ==================== Expertise Methods ====================
 
     /// Get or create expertise for a domain.
+    #[allow(dead_code)]
     pub async fn get_or_create_expertise(&self, domain: &str) -> anyhow::Result<Expertise> {
         let row = sqlx::query(
             "SELECT id, domain, tasks_attempted, tasks_succeeded, tasks_failed, current_level, confidence_score, common_errors, last_task_at, created_at, updated_at
@@ -1016,6 +1029,7 @@ impl SqliteStateStore {
     }
 
     /// Increment expertise counters and update level.
+    #[allow(dead_code)]
     pub async fn increment_expertise(&self, domain: &str, success: bool, error: Option<&str>) -> anyhow::Result<()> {
         let _ = self.get_or_create_expertise(domain).await?; // Ensure exists
         let now = Utc::now().to_rfc3339();
@@ -1101,6 +1115,7 @@ impl SqliteStateStore {
     // ==================== ErrorSolution Methods ====================
 
     /// Insert a new error solution.
+    #[allow(dead_code)]
     pub async fn insert_error_solution(&self, solution: &ErrorSolution) -> anyhow::Result<i64> {
         let steps_json = solution.solution_steps.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default());
         let result = sqlx::query(
@@ -1179,6 +1194,7 @@ impl SqliteStateStore {
     }
 
     /// Update error solution success/failure.
+    #[allow(dead_code)]
     pub async fn update_error_solution(&self, solution_id: i64, success: bool) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
         if success {
@@ -1219,6 +1235,7 @@ impl SqliteStateStore {
     // ==================== Fact History Methods ====================
 
     /// Get the history of a fact (all versions including superseded).
+    #[allow(dead_code)]
     pub async fn get_fact_history(&self, category: &str, key: &str) -> anyhow::Result<Vec<Fact>> {
         let rows = sqlx::query(
             "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at
@@ -1237,6 +1254,7 @@ impl SqliteStateStore {
     }
 
     /// Increment recall count for a fact.
+    #[allow(dead_code)]
     pub async fn increment_fact_recall(&self, fact_id: i64) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query("UPDATE facts SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?")
@@ -1247,6 +1265,7 @@ impl SqliteStateStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn row_to_fact_with_history(&self, row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Fact> {
         let created_str: String = row.get("created_at");
         let updated_str: String = row.get("updated_at");

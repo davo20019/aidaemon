@@ -249,6 +249,7 @@ pub struct ProviderResponse {
 
 /// A record of token usage from the database.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields used for database mapping
 pub struct TokenUsageRecord {
     pub model: String,
     pub input_tokens: i64,

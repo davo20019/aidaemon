@@ -4,6 +4,7 @@
 //! - Learning successful action sequences from task completions
 //! - Generalizing procedures to be reusable
 //! - Error-solution pair learning
+#![allow(dead_code)] // Reserved for future procedural learning feature
 
 use regex::Regex;
 use crate::traits::{ErrorSolution, Message, Procedure};
