@@ -2,8 +2,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc;
 
-use crate::types::{ApprovalResponse, MediaMessage};
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
+use crate::types::{ApprovalResponse, MediaMessage, StatusUpdate};
 
 /// A message in the conversation history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +69,18 @@ pub trait Tool: Send + Sync {
     fn schema(&self) -> Value;
     /// Execute the tool with the given JSON arguments string, returns result text.
     async fn call(&self, arguments: &str) -> anyhow::Result<String>;
+
+    /// Execute the tool with access to a status update channel for streaming feedback.
+    /// Default implementation just calls `call()` - override for tools that emit progress.
+    async fn call_with_status(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
+        // Default: ignore status channel and just call the basic method
+        let _ = status_tx;
+        self.call(arguments).await
+    }
 }
 
 /// Model provider — sends messages + tool defs to an LLM, gets back response.
@@ -182,9 +196,15 @@ pub trait Channel: Send + Sync {
     /// Request user approval for a command. Blocks until the user responds.
     /// Channels without inline buttons should fall back to text-based approval
     /// (e.g., "Reply YES, ALWAYS, or NO").
+    ///
+    /// The `risk_level`, `warnings`, and `permission_mode` parameters provide
+    /// context about why approval is being requested and which buttons to show.
     async fn request_approval(
         &self,
         session_id: &str,
         command: &str,
+        risk_level: RiskLevel,
+        warnings: &[String],
+        permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse>;
 }

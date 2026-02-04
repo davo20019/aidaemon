@@ -10,13 +10,14 @@ use teloxide::types::{ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, In
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::agent::{Agent, StatusUpdate};
+use crate::agent::Agent;
 use crate::channels::SessionMap;
 use super::formatting::{markdown_to_telegram_html, html_escape, split_message, format_number, sanitize_filename};
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
-use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
+use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 
 pub struct TelegramChannel {
     bot: Bot,
@@ -153,7 +154,7 @@ impl TelegramChannel {
             None => return,
         };
 
-        // Parse callback data: "approve:{once|always|deny}:{id}"
+        // Parse callback data: "approve:{once|session|always|deny}:{id}"
         let parts: Vec<&str> = data.splitn(3, ':').collect();
         if parts.len() != 3 || parts[0] != "approve" {
             return;
@@ -164,6 +165,7 @@ impl TelegramChannel {
 
         let response = match action {
             "once" => ApprovalResponse::AllowOnce,
+            "session" => ApprovalResponse::AllowSession,
             "always" => ApprovalResponse::AllowAlways,
             "deny" => ApprovalResponse::Deny,
             _ => return,
@@ -171,6 +173,7 @@ impl TelegramChannel {
 
         let label = match &response {
             ApprovalResponse::AllowOnce => "Allowed (once)",
+            ApprovalResponse::AllowSession => "Allowed (this session)",
             ApprovalResponse::AllowAlways => "Allowed (always)",
             ApprovalResponse::Deny => "Denied",
         };
@@ -617,6 +620,20 @@ impl TelegramChannel {
                             format!("Using {}: {}...", name, summary)
                         }
                     }
+                    StatusUpdate::ToolProgress { name, chunk } => {
+                        let preview: String = chunk.chars().take(100).collect();
+                        if chunk.len() > 100 {
+                            format!("📤 {}: {}...", name, preview)
+                        } else {
+                            format!("📤 {}: {}", name, preview)
+                        }
+                    }
+                    StatusUpdate::ToolComplete { name, summary } => {
+                        format!("✓ {}: {}", name, summary)
+                    }
+                    StatusUpdate::ToolCancellable { name, task_id } => {
+                        format!("⏳ {} started (task_id: {})", name, task_id)
+                    }
                 };
                 let _ = status_bot.send_message(status_chat_id, text).await;
                 last_sent = tokio::time::Instant::now();
@@ -726,12 +743,15 @@ impl Channel for TelegramChannel {
         &self,
         session_id: &str,
         command: &str,
+        risk_level: RiskLevel,
+        warnings: &[String],
+        permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse> {
         let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
             self.allowed_user_ids.first().copied().unwrap_or(0) as i64
         });
 
-        info!(session_id, command, chat_id, "Approval requested for command");
+        info!(session_id, command, chat_id, risk = %risk_level, mode = %permission_mode, "Approval requested");
 
         let approval_id = uuid::Uuid::new_v4().to_string();
         let short_id = &approval_id[..8];
@@ -745,27 +765,78 @@ impl Channel for TelegramChannel {
             info!(approval_id = %short_id, pending_count = pending.len(), "Stored pending approval");
         }
 
-        // Send inline keyboard
-        let keyboard = InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback(
-                "Allow Once",
-                format!("approve:once:{}", approval_id),
-            ),
-            InlineKeyboardButton::callback(
-                "Allow Always",
-                format!("approve:always:{}", approval_id),
-            ),
-            InlineKeyboardButton::callback(
-                "Deny",
-                format!("approve:deny:{}", approval_id),
-            ),
-        ]]);
+        // Determine which buttons to show based on permission_mode and risk_level
+        // - Default mode: Critical gets [Once, Session, Deny], others get [Once, Always, Deny]
+        // - Cautious mode: All get [Once, Session, Deny]
+        // - YOLO mode: All get [Once, Always, Deny]
+        let use_session_button = match permission_mode {
+            PermissionMode::Cautious => true,
+            PermissionMode::Default => risk_level >= RiskLevel::Critical,
+            PermissionMode::Yolo => false,
+        };
+
+        let keyboard = if use_session_button {
+            InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback(
+                    "Allow Once",
+                    format!("approve:once:{}", approval_id),
+                ),
+                InlineKeyboardButton::callback(
+                    "Allow Session",
+                    format!("approve:session:{}", approval_id),
+                ),
+                InlineKeyboardButton::callback(
+                    "Deny",
+                    format!("approve:deny:{}", approval_id),
+                ),
+            ]])
+        } else {
+            InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback(
+                    "Allow Once",
+                    format!("approve:once:{}", approval_id),
+                ),
+                InlineKeyboardButton::callback(
+                    "Allow Always",
+                    format!("approve:always:{}", approval_id),
+                ),
+                InlineKeyboardButton::callback(
+                    "Deny",
+                    format!("approve:deny:{}", approval_id),
+                ),
+            ]])
+        };
 
         let escaped_cmd = html_escape(command);
-        let text = format!(
-            "Command requires approval:\n\n<code>{}</code>\n\n[{}]",
-            escaped_cmd, short_id
+
+        // Build message with risk info
+        let (risk_icon, risk_label) = match risk_level {
+            RiskLevel::Safe => ("ℹ️", "New command"),
+            RiskLevel::Medium => ("⚠️", "Medium risk"),
+            RiskLevel::High => ("🔶", "High risk"),
+            RiskLevel::Critical => ("🚨", "Critical risk"),
+        };
+
+        let mut text = format!(
+            "{} <b>{}</b>\n\n<code>{}</code>",
+            risk_icon, risk_label, escaped_cmd
         );
+
+        if !warnings.is_empty() {
+            text.push_str("\n");
+            for warning in warnings {
+                text.push_str(&format!("\n• {}", html_escape(warning)));
+            }
+        }
+
+        // Add explanation based on which button is shown
+        if use_session_button {
+            text.push_str("\n\n<i>\"Allow Session\" approves this command type until restart.</i>");
+        } else {
+            text.push_str("\n\n<i>\"Allow Always\" permanently approves this command type.</i>");
+        }
+
+        text.push_str(&format!("\n\n<i>[{}]</i>", short_id));
 
         match self
             .bot

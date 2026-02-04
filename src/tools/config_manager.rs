@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::AppConfig;
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::traits::Tool;
 use crate::types::ApprovalResponse;
@@ -66,6 +67,9 @@ impl ConfigManagerTool {
             .send(ApprovalRequest {
                 command: description.to_string(),
                 session_id: session_id.to_string(),
+                risk_level: RiskLevel::High,
+                warnings: vec!["Modifying security-sensitive configuration".to_string()],
+                permission_mode: PermissionMode::Default,
                 response_tx,
             })
             .await
@@ -234,7 +238,9 @@ impl Tool for ConfigManagerTool {
                     let description = format!("Config change: {} = {}", args.key, display_value);
 
                     match self.request_approval(&args._session_id, &description).await {
-                        Ok(ApprovalResponse::AllowOnce) | Ok(ApprovalResponse::AllowAlways) => {
+                        Ok(ApprovalResponse::AllowOnce)
+                        | Ok(ApprovalResponse::AllowSession)
+                        | Ok(ApprovalResponse::AllowAlways) => {
                             info!(key = %args.key, "Config change approved by user");
                         }
                         Ok(ApprovalResponse::Deny) => {

@@ -23,3 +23,4 @@ pub use system::SystemInfoTool;
 pub use terminal::TerminalTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
+pub mod command_risk;

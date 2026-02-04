@@ -67,7 +67,13 @@ impl ChannelHub {
                 let response = match channel {
                     Some(ch) => {
                         match ch
-                            .request_approval(&request.session_id, &request.command)
+                            .request_approval(
+                                &request.session_id,
+                                &request.command,
+                                request.risk_level,
+                                &request.warnings,
+                                request.permission_mode,
+                            )
                             .await
                         {
                             Ok(resp) => resp,

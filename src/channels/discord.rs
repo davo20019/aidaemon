@@ -18,10 +18,12 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::formatting::{format_number, sanitize_filename, split_message};
-use crate::agent::{Agent, StatusUpdate};
+use crate::agent::Agent;
+use crate::types::StatusUpdate;
 use crate::channels::SessionMap;
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 
@@ -282,6 +284,20 @@ impl DiscordChannel {
                         } else {
                             format!("Using {}: {}...", name, summary)
                         }
+                    }
+                    StatusUpdate::ToolProgress { name, chunk } => {
+                        let preview: String = chunk.chars().take(100).collect();
+                        if chunk.len() > 100 {
+                            format!("📤 {}: {}...", name, preview)
+                        } else {
+                            format!("📤 {}: {}", name, preview)
+                        }
+                    }
+                    StatusUpdate::ToolComplete { name, summary } => {
+                        format!("✓ {}: {}", name, summary)
+                    }
+                    StatusUpdate::ToolCancellable { name, task_id } => {
+                        format!("⏳ {} started (task_id: {})", name, task_id)
                     }
                 };
                 let _ = status_channel_id.say(&status_http, &text).await;
@@ -677,6 +693,7 @@ impl DiscordChannel {
 
         let response = match action {
             "once" => ApprovalResponse::AllowOnce,
+            "session" => ApprovalResponse::AllowSession,
             "always" => ApprovalResponse::AllowAlways,
             "deny" => ApprovalResponse::Deny,
             _ => return,
@@ -684,6 +701,7 @@ impl DiscordChannel {
 
         let label = match &response {
             ApprovalResponse::AllowOnce => "Allowed (once)",
+            ApprovalResponse::AllowSession => "Allowed (this session)",
             ApprovalResponse::AllowAlways => "Allowed (always)",
             ApprovalResponse::Deny => "Denied",
         };
@@ -835,6 +853,9 @@ impl Channel for DiscordChannel {
         &self,
         session_id: &str,
         command: &str,
+        risk_level: RiskLevel,
+        warnings: &[String],
+        permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse> {
         let http = self.get_http().await?;
         let channel_id = self.resolve_channel_id(session_id).await?;
@@ -850,26 +871,73 @@ impl Channel for DiscordChannel {
             info!(
                 approval_id = %short_id,
                 pending_count = pending.len(),
+                risk = %risk_level,
+                mode = %permission_mode,
                 "Stored pending Discord approval"
             );
         }
 
-        let buttons = CreateActionRow::Buttons(vec![
-            CreateButton::new(format!("approve:once:{}", approval_id))
-                .label("Allow Once")
-                .style(ButtonStyle::Primary),
-            CreateButton::new(format!("approve:always:{}", approval_id))
-                .label("Allow Always")
-                .style(ButtonStyle::Success),
-            CreateButton::new(format!("approve:deny:{}", approval_id))
-                .label("Deny")
-                .style(ButtonStyle::Danger),
-        ]);
+        // Determine which buttons to show based on permission_mode and risk_level
+        let use_session_button = match permission_mode {
+            PermissionMode::Cautious => true,
+            PermissionMode::Default => risk_level >= RiskLevel::Critical,
+            PermissionMode::Yolo => false,
+        };
 
-        let text = format!(
-            "Command requires approval:\n\n```\n{}\n```\n\n[{}]",
-            command, short_id
+        let buttons = if use_session_button {
+            CreateActionRow::Buttons(vec![
+                CreateButton::new(format!("approve:once:{}", approval_id))
+                    .label("Allow Once")
+                    .style(ButtonStyle::Primary),
+                CreateButton::new(format!("approve:session:{}", approval_id))
+                    .label("Allow Session")
+                    .style(ButtonStyle::Success),
+                CreateButton::new(format!("approve:deny:{}", approval_id))
+                    .label("Deny")
+                    .style(ButtonStyle::Danger),
+            ])
+        } else {
+            CreateActionRow::Buttons(vec![
+                CreateButton::new(format!("approve:once:{}", approval_id))
+                    .label("Allow Once")
+                    .style(ButtonStyle::Primary),
+                CreateButton::new(format!("approve:always:{}", approval_id))
+                    .label("Allow Always")
+                    .style(ButtonStyle::Success),
+                CreateButton::new(format!("approve:deny:{}", approval_id))
+                    .label("Deny")
+                    .style(ButtonStyle::Danger),
+            ])
+        };
+
+        // Build message with risk info
+        let (risk_icon, risk_label) = match risk_level {
+            RiskLevel::Safe => ("ℹ️", "New command"),
+            RiskLevel::Medium => ("⚠️", "Medium risk"),
+            RiskLevel::High => ("🔶", "High risk"),
+            RiskLevel::Critical => ("🚨", "Critical risk"),
+        };
+
+        let mut text = format!(
+            "{} **{}**\n\n```\n{}\n```",
+            risk_icon, risk_label, command
         );
+
+        if !warnings.is_empty() {
+            text.push_str("\n");
+            for warning in warnings {
+                text.push_str(&format!("\n• {}", warning));
+            }
+        }
+
+        // Add explanation based on which button is shown
+        if use_session_button {
+            text.push_str("\n\n*\"Allow Session\" approves this command type until restart.*");
+        } else {
+            text.push_str("\n\n*\"Allow Always\" permanently approves this command type.*");
+        }
+
+        text.push_str(&format!("\n\n*[{}]*", short_id));
 
         let msg = CreateMessage::new()
             .content(&text)

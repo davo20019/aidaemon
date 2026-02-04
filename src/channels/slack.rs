@@ -12,10 +12,12 @@ use tokio::sync::Mutex;
 use tracing::{info, warn, debug};
 
 use super::formatting::{format_number, markdown_to_slack_mrkdwn, sanitize_filename, split_message};
-use crate::agent::{Agent, StatusUpdate};
+use crate::agent::Agent;
+use crate::types::StatusUpdate;
 use crate::channels::SessionMap;
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 
@@ -432,6 +434,20 @@ impl SlackChannel {
                             format!("_Using {}: {}..._", name, summary)
                         }
                     }
+                    StatusUpdate::ToolProgress { name, chunk } => {
+                        let preview: String = chunk.chars().take(100).collect();
+                        if chunk.len() > 100 {
+                            format!("_📤 {}: {}..._", name, preview)
+                        } else {
+                            format!("_📤 {}: {}_", name, preview)
+                        }
+                    }
+                    StatusUpdate::ToolComplete { name, summary } => {
+                        format!("_✓ {}: {}_", name, summary)
+                    }
+                    StatusUpdate::ToolCancellable { name, task_id } => {
+                        format!("_⏳ {} started (task_id: {})_", name, task_id)
+                    }
                 };
                 let _ = status_self.post_message(&status_channel, &text, status_thread.as_deref()).await;
                 last_sent = tokio::time::Instant::now();
@@ -522,6 +538,7 @@ impl SlackChannel {
 
             let response = match action_type {
                 "once" => ApprovalResponse::AllowOnce,
+                "session" => ApprovalResponse::AllowSession,
                 "always" => ApprovalResponse::AllowAlways,
                 "deny" => ApprovalResponse::Deny,
                 _ => continue,
@@ -529,6 +546,7 @@ impl SlackChannel {
 
             let label = match &response {
                 ApprovalResponse::AllowOnce => "Allowed (once)",
+                ApprovalResponse::AllowSession => "Allowed (this session)",
                 ApprovalResponse::AllowAlways => "Allowed (always)",
                 ApprovalResponse::Deny => "Denied",
             };
@@ -1095,6 +1113,9 @@ impl Channel for SlackChannel {
         &self,
         session_id: &str,
         command: &str,
+        risk_level: RiskLevel,
+        warnings: &[String],
+        permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse> {
         let (channel_id, thread_ts) = Self::parse_session_id(session_id);
 
@@ -1109,46 +1130,108 @@ impl Channel for SlackChannel {
             info!(
                 approval_id = %short_id,
                 pending_count = pending.len(),
+                risk = %risk_level,
+                mode = %permission_mode,
                 "Stored pending Slack approval"
             );
         }
 
+        // Determine which buttons to show based on permission_mode and risk_level
+        let use_session_button = match permission_mode {
+            PermissionMode::Cautious => true,
+            PermissionMode::Default => risk_level >= RiskLevel::Critical,
+            PermissionMode::Yolo => false,
+        };
+
+        // Build message with risk info
+        let (risk_icon, risk_label) = match risk_level {
+            RiskLevel::Safe => ("ℹ️", "New command"),
+            RiskLevel::Medium => ("⚠️", "Medium risk"),
+            RiskLevel::High => ("🔶", "High risk"),
+            RiskLevel::Critical => ("🚨", "Critical risk"),
+        };
+
+        let mut message_text = format!(
+            "{} *{}*\n```{}```",
+            risk_icon, risk_label, command
+        );
+
+        if !warnings.is_empty() {
+            message_text.push_str("\n");
+            for warning in warnings {
+                message_text.push_str(&format!("\n• {}", warning));
+            }
+        }
+
+        // Add explanation based on which button is shown
+        if use_session_button {
+            message_text.push_str("\n\n_\"Allow Session\" approves this command type until restart._");
+        } else {
+            message_text.push_str("\n\n_\"Allow Always\" permanently approves this command type._");
+        }
+
+        message_text.push_str(&format!("\n_[{}]_", short_id));
+
         // Build Block Kit message with approval buttons
+        let action_buttons = if use_session_button {
+            serde_json::json!([
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Allow Once" },
+                    "action_id": format!("approve:once:{}", approval_id),
+                    "style": "primary"
+                },
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Allow Session" },
+                    "action_id": format!("approve:session:{}", approval_id)
+                },
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Deny" },
+                    "action_id": format!("approve:deny:{}", approval_id),
+                    "style": "danger"
+                }
+            ])
+        } else {
+            serde_json::json!([
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Allow Once" },
+                    "action_id": format!("approve:once:{}", approval_id),
+                    "style": "primary"
+                },
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Allow Always" },
+                    "action_id": format!("approve:always:{}", approval_id)
+                },
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Deny" },
+                    "action_id": format!("approve:deny:{}", approval_id),
+                    "style": "danger"
+                }
+            ])
+        };
+
         let blocks = serde_json::json!([
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": format!("Command requires approval:\n```{}```\n[{}]", command, short_id)
+                    "text": message_text
                 }
             },
             {
                 "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": { "type": "plain_text", "text": "Allow Once" },
-                        "action_id": format!("approve:once:{}", approval_id),
-                        "style": "primary"
-                    },
-                    {
-                        "type": "button",
-                        "text": { "type": "plain_text", "text": "Allow Always" },
-                        "action_id": format!("approve:always:{}", approval_id),
-                    },
-                    {
-                        "type": "button",
-                        "text": { "type": "plain_text", "text": "Deny" },
-                        "action_id": format!("approve:deny:{}", approval_id),
-                        "style": "danger"
-                    }
-                ]
+                "elements": action_buttons
             }
         ]);
 
         let mut body = serde_json::json!({
             "channel": channel_id,
-            "text": format!("Command requires approval: `{}`", command),
+            "text": format!("{} {} - Command requires approval: `{}`", risk_icon, risk_label, command),
             "blocks": blocks,
         });
         if let Some(ts) = &thread_ts {

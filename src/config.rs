@@ -308,6 +308,9 @@ fn default_max_facts() -> usize {
     100
 }
 
+/// Permission mode re-exported for config deserialization.
+pub use crate::tools::command_risk::PermissionMode;
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct TerminalConfig {
     #[serde(default = "default_allowed_prefixes")]
@@ -316,6 +319,12 @@ pub struct TerminalConfig {
     pub initial_timeout_secs: u64,
     #[serde(default = "default_max_output_chars")]
     pub max_output_chars: usize,
+    /// Permission persistence mode:
+    /// - "default": Critical commands per-session, others persist forever
+    /// - "cautious": All approvals per-session only (resets on restart)
+    /// - "yolo": All approvals persist forever, including critical commands
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
 }
 
 impl Default for TerminalConfig {
@@ -324,6 +333,7 @@ impl Default for TerminalConfig {
             allowed_prefixes: default_allowed_prefixes(),
             initial_timeout_secs: default_initial_timeout_secs(),
             max_output_chars: default_max_output_chars(),
+            permission_mode: PermissionMode::default(),
         }
     }
 }
