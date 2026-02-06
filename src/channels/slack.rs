@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,10 +11,10 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn, debug};
 
-use super::formatting::{format_number, markdown_to_slack_mrkdwn, sanitize_filename, split_message};
+use super::formatting::{build_help_text, format_number, markdown_to_slack_mrkdwn, sanitize_filename, split_message};
 use crate::agent::Agent;
 use crate::types::StatusUpdate;
-use crate::channels::SessionMap;
+use crate::channels::{ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
@@ -27,6 +27,9 @@ const MAX_MESSAGE_LEN: usize = 39_000;
 /// Slack channel implementation using Socket Mode (WebSocket) for receiving
 /// events and the Web API (HTTP) for sending messages.
 pub struct SlackChannel {
+    /// Bot name fetched from Slack API (e.g., "my_bot").
+    /// Populated on first connection.
+    bot_name: std::sync::RwLock<String>,
     app_token: String,
     bot_token: String,
     allowed_user_ids: Vec<String>,
@@ -44,6 +47,8 @@ pub struct SlackChannel {
     http: reqwest::Client,
     /// Our own bot user ID, resolved on first connection.
     bot_user_id: Mutex<Option<String>>,
+    /// Reference to the channel hub for dynamic bot registration.
+    channel_hub: std::sync::RwLock<Option<Weak<ChannelHub>>>,
 }
 
 impl SlackChannel {
@@ -62,6 +67,7 @@ impl SlackChannel {
         state: Arc<dyn StateStore>,
     ) -> Self {
         Self {
+            bot_name: std::sync::RwLock::new("slack".to_string()),
             app_token: app_token.to_string(),
             bot_token: bot_token.to_string(),
             allowed_user_ids,
@@ -77,6 +83,46 @@ impl SlackChannel {
             state,
             http: reqwest::Client::new(),
             bot_user_id: Mutex::new(None),
+            channel_hub: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Set the channel hub reference for dynamic bot registration.
+    pub fn set_channel_hub(&self, hub: Weak<ChannelHub>) {
+        if let Ok(mut guard) = self.channel_hub.write() {
+            *guard = Some(hub);
+        }
+    }
+
+    /// Get the bot's name (cached after first connection).
+    fn get_bot_name(&self) -> String {
+        self.bot_name.read().unwrap().clone()
+    }
+
+    /// Set the bot's name (called during start() after fetching from API).
+    fn set_bot_name(&self, name: String) {
+        if let Ok(mut guard) = self.bot_name.write() {
+            *guard = name;
+        }
+    }
+
+    /// Build the session ID, prefixing with bot name if not "slack".
+    fn session_id(&self, base_id: &str) -> String {
+        let name = self.get_bot_name();
+        if name == "slack" {
+            base_id.to_string()
+        } else {
+            format!("{}:{}", name, base_id)
+        }
+    }
+
+    /// Get the channel identifier for the session map.
+    fn channel_name(&self) -> String {
+        let name = self.get_bot_name();
+        if name == "slack" {
+            "slack".to_string()
+        } else {
+            format!("slack:{}", name)
         }
     }
 
@@ -112,7 +158,7 @@ impl SlackChannel {
     /// Open a Socket Mode connection and process events.
     async fn start(self: Arc<Self>) -> anyhow::Result<()> {
         // Resolve our own bot user ID (for filtering self-messages)
-        self.resolve_bot_user_id().await;
+        self.resolve_bot_info().await;
 
         // Request a WebSocket URL from Slack
         let wss_url = self.open_connection().await?;
@@ -206,18 +252,22 @@ impl SlackChannel {
             .ok_or_else(|| anyhow::anyhow!("No URL in apps.connections.open response"))
     }
 
-    /// Resolve the bot's own user ID via `auth.test`.
-    async fn resolve_bot_user_id(&self) {
+    /// Resolve the bot's own user ID and name via `auth.test`.
+    async fn resolve_bot_info(&self) {
         match self.slack_api_get("auth.test").await {
             Ok(resp) => {
                 if let Some(user_id) = resp.get("user_id").and_then(|v| v.as_str()) {
                     let mut guard = self.bot_user_id.lock().await;
                     *guard = Some(user_id.to_string());
-                    info!(user_id, "Resolved Slack bot user ID");
+                }
+                // Extract bot name from response (field is "user")
+                if let Some(bot_name) = resp.get("user").and_then(|v| v.as_str()) {
+                    self.set_bot_name(bot_name.to_string());
+                    info!(bot_name, "Resolved Slack bot info");
                 }
             }
             Err(e) => {
-                warn!("Failed to resolve bot user ID: {}", e);
+                warn!("Failed to resolve bot info: {}", e);
             }
         }
     }
@@ -393,7 +443,7 @@ impl SlackChannel {
         // Register this session with the channel hub
         {
             let mut map = self.session_map.write().await;
-            map.insert(session_id.clone(), "slack".to_string());
+            map.insert(session_id.clone(), self.channel_name());
         }
 
         info!(session_id, user_id = %user, "Received Slack message");
@@ -447,6 +497,40 @@ impl SlackChannel {
                     }
                     StatusUpdate::ToolCancellable { name, task_id } => {
                         format!("_⏳ {} started (task_id: {})_", name, task_id)
+                    }
+                    StatusUpdate::ProgressSummary { elapsed_mins, summary } => {
+                        format!("_📊 Progress ({} min): {}_", elapsed_mins, summary)
+                    }
+                    StatusUpdate::IterationWarning { current, threshold } => {
+                        format!("_⚠️ Approaching soft limit: {} of {} iterations_", current, threshold)
+                    }
+                    StatusUpdate::PlanCreated { description, total_steps, .. } => {
+                        format!("_📋 Plan created: {} ({} steps)_", description, total_steps)
+                    }
+                    StatusUpdate::PlanStepStart { step_index, total_steps, description, .. } => {
+                        format!("_▶️ Step {}/{}: {}_", step_index + 1, total_steps, description)
+                    }
+                    StatusUpdate::PlanStepComplete { step_index, total_steps, description, summary, .. } => {
+                        let base = format!("_✅ Step {}/{} done: {}", step_index + 1, total_steps, description);
+                        if let Some(s) = summary {
+                            format!("{} - {}_", base, s)
+                        } else {
+                            format!("{}_", base)
+                        }
+                    }
+                    StatusUpdate::PlanStepFailed { step_index, description, error, .. } => {
+                        format!("_❌ Step {} failed: {} - {}_", step_index + 1, description, error)
+                    }
+                    StatusUpdate::PlanComplete { description, total_steps, duration_secs, .. } => {
+                        let mins = duration_secs / 60;
+                        let secs = duration_secs % 60;
+                        format!("_🎉 Plan complete: {} ({} steps in {}m {}s)_", description, total_steps, mins, secs)
+                    }
+                    StatusUpdate::PlanAbandoned { description, .. } => {
+                        format!("_🚫 Plan abandoned: {}_", description)
+                    }
+                    StatusUpdate::PlanRevised { description, reason, new_total_steps, .. } => {
+                        format!("_🔄 Plan revised: {} ({} steps) - {}_", description, new_total_steps, reason)
                     }
                 };
                 let _ = status_self.post_message(&status_channel, &text, status_thread.as_deref()).await;
@@ -725,19 +809,7 @@ impl SlackChannel {
             }
             "/cost" => self.handle_cost_command().await,
             "/help" | "/start" => {
-                "Available commands:\n\
-                /model — Show current model\n\
-                /model <name> — Switch to a different model\n\
-                /models — List available models from provider\n\
-                /auto — Re-enable automatic model routing\n\
-                /reload — Reload config.toml\n\
-                /restart — Restart the daemon\n\
-                /tasks — List running and recent tasks\n\
-                /cancel <id> — Cancel a running task\n\
-                /clear — Clear conversation context and start fresh\n\
-                /cost — Show token usage statistics\n\
-                /help — Show this help message"
-                    .to_string()
+                build_help_text(true, false)
             }
             _ => format!("Unknown command: {}\nType /help for available commands.", cmd),
         }
@@ -796,10 +868,11 @@ impl SlackChannel {
 
     /// Build a session ID from channel and thread.
     fn build_session_id(&self, channel_id: &str, thread_ts: Option<&str>) -> String {
-        match thread_ts {
+        let base = match thread_ts {
             Some(ts) if self.use_threads => format!("slack:{}:{}", channel_id, ts),
             _ => format!("slack:{}", channel_id),
-        }
+        };
+        self.session_id(&base)
     }
 
     /// Determine the thread_ts to use when replying.
@@ -949,9 +1022,16 @@ impl SlackChannel {
     }
 
     /// Parse a session ID to get (channel_id, thread_ts).
-    fn parse_session_id(session_id: &str) -> (String, Option<String>) {
+    fn parse_session_id(&self, session_id: &str) -> (String, Option<String>) {
+        // Strip bot name prefix if present: "{bot_name}:slack:..." -> "slack:..."
+        let without_prefix = if self.name() != "default" {
+            session_id.strip_prefix(&format!("{}:", self.name())).unwrap_or(session_id)
+        } else {
+            session_id
+        };
+
         // Format: "slack:{channel_id}:{thread_ts}" or "slack:{channel_id}"
-        let stripped = session_id.strip_prefix("slack:").unwrap_or(session_id);
+        let stripped = without_prefix.strip_prefix("slack:").unwrap_or(without_prefix);
         let parts: Vec<&str> = stripped.splitn(2, ':').collect();
         let channel_id = parts[0].to_string();
         let thread_ts = parts.get(1).map(|s| s.to_string());
@@ -1058,8 +1138,8 @@ async fn slack_post_message(
 
 #[async_trait]
 impl Channel for SlackChannel {
-    fn name(&self) -> &str {
-        "slack"
+    fn name(&self) -> String {
+        self.channel_name()
     }
 
     fn capabilities(&self) -> ChannelCapabilities {
@@ -1072,7 +1152,7 @@ impl Channel for SlackChannel {
     }
 
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
-        let (channel_id, thread_ts) = Self::parse_session_id(session_id);
+        let (channel_id, thread_ts) = self.parse_session_id(session_id);
         let mrkdwn = markdown_to_slack_mrkdwn(text);
         for chunk in split_message(&mrkdwn, MAX_MESSAGE_LEN) {
             self.post_message(&channel_id, &chunk, thread_ts.as_deref()).await?;
@@ -1081,7 +1161,7 @@ impl Channel for SlackChannel {
     }
 
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
-        let (channel_id, thread_ts) = Self::parse_session_id(session_id);
+        let (channel_id, thread_ts) = self.parse_session_id(session_id);
         match &media.kind {
             MediaKind::Photo { data } => {
                 self.upload_file(
@@ -1117,7 +1197,7 @@ impl Channel for SlackChannel {
         warnings: &[String],
         permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse> {
-        let (channel_id, thread_ts) = Self::parse_session_id(session_id);
+        let (channel_id, thread_ts) = self.parse_session_id(session_id);
 
         let approval_id = uuid::Uuid::new_v4().to_string();
         let short_id = &approval_id[..8];
@@ -1285,4 +1365,12 @@ fn restart_process() {
 
     let err = std::process::Command::new(&exe).args(&args).exec();
     tracing::error!("exec failed: {}", err);
+}
+
+/// Spawn a SlackChannel in a background task.
+/// This is a separate function to avoid async type inference cycles.
+pub fn spawn_slack_channel(channel: Arc<SlackChannel>) {
+    tokio::spawn(async move {
+        channel.start_with_retry().await;
+    });
 }

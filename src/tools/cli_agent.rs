@@ -13,12 +13,73 @@ use uuid::Uuid;
 use crate::config::CliAgentsConfig;
 use crate::traits::Tool;
 use crate::types::StatusUpdate;
+use crate::utils::{truncate_str, truncate_with_note};
 
 /// Max bytes for output buffer (1 MB) to prevent unbounded memory growth.
 const BUFFER_CAP: usize = 1_048_576;
 
 /// Interval for emitting progress updates (avoid spamming the channel).
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Loop detection: window size for tracking recent lines
+const LOOP_DETECTION_WINDOW: usize = 100;
+
+/// Loop detection: threshold - if same line appears this many times in window, it's a loop
+const LOOP_DETECTION_THRESHOLD: usize = 50;
+
+/// Tracks recent output lines to detect infinite loops
+struct LoopDetector {
+    recent_lines: Vec<u64>, // Store hashes to save memory
+    line_counts: HashMap<u64, usize>,
+}
+
+impl LoopDetector {
+    fn new() -> Self {
+        Self {
+            recent_lines: Vec::with_capacity(LOOP_DETECTION_WINDOW),
+            line_counts: HashMap::new(),
+        }
+    }
+
+    /// Add a line and return true if an infinite loop is detected
+    fn add_line(&mut self, line: &str) -> bool {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // Hash the line (normalized - trim whitespace)
+        let normalized = line.trim();
+        if normalized.is_empty() {
+            return false; // Don't count empty lines
+        }
+
+        let mut hasher = DefaultHasher::new();
+        normalized.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Add to window
+        self.recent_lines.push(hash);
+        *self.line_counts.entry(hash).or_insert(0) += 1;
+
+        // Remove old lines if window is full
+        if self.recent_lines.len() > LOOP_DETECTION_WINDOW {
+            let old_hash = self.recent_lines.remove(0);
+            if let Some(count) = self.line_counts.get_mut(&old_hash) {
+                *count -= 1;
+                if *count == 0 {
+                    self.line_counts.remove(&old_hash);
+                }
+            }
+        }
+
+        // Check if any line appears too frequently
+        self.line_counts.values().any(|&count| count >= LOOP_DETECTION_THRESHOLD)
+    }
+
+    /// Get the most repeated line pattern for error reporting
+    fn get_loop_pattern(&self) -> Option<usize> {
+        self.line_counts.values().max().copied()
+    }
+}
 
 /// Check if a process is still alive.
 #[cfg(unix)]
@@ -83,6 +144,8 @@ struct RunningCliAgent {
     stdout_buf: Arc<Mutex<String>>,
     /// Process ID for status display and killing
     child_id: u32,
+    /// Session ID for filtering cancel_all by session
+    session_id: String,
 }
 
 pub struct CliAgentTool {
@@ -196,6 +259,7 @@ impl CliAgentTool {
         tool_name: &str,
         prompt: &str,
         working_dir: Option<&str>,
+        session_id: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
         let entry = self.tools.get(tool_name)
@@ -249,10 +313,12 @@ impl CliAgentTool {
         let status_tx_clone = status_tx.clone();
         let tool_name_owned = tool_name.to_string();
 
-        // Create completion channel
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<Option<i32>>();
+        // Create completion channel - includes loop detection info
+        // Result: (exit_code, was_killed_for_loop, loop_repetition_count)
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<(Option<i32>, bool, Option<usize>)>();
 
         // Spawn a task to read stdout/stderr, emit progress updates, and signal completion
+        let pid_for_kill = pid;
         tokio::spawn(async move {
             let mut stdout_reader = BufReader::new(stdout).lines();
             let mut stderr_reader = BufReader::new(stderr).lines();
@@ -262,9 +328,23 @@ impl CliAgentTool {
             let mut stdout_done = false;
             let mut stderr_done = false;
             let mut last_parsed_action: Option<String> = None;
+            let mut loop_detector = LoopDetector::new();
+            let mut loop_detected = false;
+            let mut loop_pattern_count: Option<usize> = None;
 
             loop {
                 if stdout_done && stderr_done {
+                    break;
+                }
+
+                // Check for loop detection and kill if needed
+                if loop_detected {
+                    info!(
+                        pid = pid_for_kill,
+                        pattern_count = ?loop_pattern_count,
+                        "Infinite loop detected in CLI agent output, killing process"
+                    );
+                    kill_process(pid_for_kill).await;
                     break;
                 }
 
@@ -272,6 +352,12 @@ impl CliAgentTool {
                     line = stdout_reader.next_line(), if !stdout_done => {
                         match line {
                             Ok(Some(text)) => {
+                                // Check for infinite loop pattern
+                                if loop_detector.add_line(&text) && !loop_detected {
+                                    loop_detected = true;
+                                    loop_pattern_count = loop_detector.get_loop_pattern();
+                                }
+
                                 // Write to stdout buffer (for JSON extraction)
                                 {
                                     let mut buf = stdout_buf_writer.lock().await;
@@ -296,6 +382,12 @@ impl CliAgentTool {
                     line = stderr_reader.next_line(), if !stderr_done => {
                         match line {
                             Ok(Some(text)) => {
+                                // Check for infinite loop pattern in stderr too
+                                if loop_detector.add_line(&text) && !loop_detected {
+                                    loop_detected = true;
+                                    loop_pattern_count = loop_detector.get_loop_pattern();
+                                }
+
                                 // Only write to display buffer with [stderr] prefix
                                 let mut buf = display_buf_writer.lock().await;
                                 if buf.len() < BUFFER_CAP {
@@ -343,7 +435,7 @@ impl CliAgentTool {
 
                         let _ = tx.try_send(StatusUpdate::ToolProgress {
                             name: tool_name_owned.clone(),
-                            chunk: truncate_string(&chunk, 500),
+                            chunk: truncate_with_note(&chunk, 500),
                         });
                     }
                     pending_lines.clear();
@@ -369,18 +461,23 @@ impl CliAgentTool {
                         let chunk = progress_items.join("\n");
                         let _ = tx.try_send(StatusUpdate::ToolProgress {
                             name: tool_name_owned.clone(),
-                            chunk: truncate_string(&chunk, 500),
+                            chunk: truncate_with_note(&chunk, 500),
                         });
                     }
                 }
             }
 
             // Wait for process to complete and signal via channel
-            let exit_code = match child.wait().await {
-                Ok(status) => status.code(),
-                Err(_) => None,
+            let exit_code = if loop_detected {
+                // Process was killed due to loop detection
+                None
+            } else {
+                match child.wait().await {
+                    Ok(status) => status.code(),
+                    Err(_) => None,
+                }
             };
-            let _ = completion_tx.send(exit_code);
+            let _ = completion_tx.send((exit_code, loop_detected, loop_pattern_count));
         });
 
         // Wait for completion with timeout
@@ -390,21 +487,54 @@ impl CliAgentTool {
         let result = tokio::time::timeout(timeout, completion_rx).await;
 
         match result {
-            Ok(Ok(exit_code)) => {
-                // Completed within timeout
+            Ok(Ok((exit_code, was_loop_killed, loop_count))) => {
+                // Check if killed due to infinite loop
+                if was_loop_killed {
+                    let display_output = display_buf.lock().await.clone();
+                    let last_lines: String = display_output
+                        .lines()
+                        .rev()
+                        .take(10)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    // Emit error status
+                    if let Some(ref tx) = status_tx {
+                        let _ = tx.try_send(StatusUpdate::ToolComplete {
+                            name: "cli_agent".to_string(),
+                            summary: format!("{} killed - infinite loop detected", tool_name),
+                        });
+                    }
+
+                    return Ok(format!(
+                        "ERROR: CLI agent '{}' was automatically killed - INFINITE LOOP DETECTED.\n\n\
+                         The same output line repeated {} times in the last 100 lines.\n\
+                         This is a known bug in some CLI agent versions where they get stuck.\n\n\
+                         Last 10 lines before kill:\n{}\n\n\
+                         Do NOT retry with the same agent. Try a different approach or use a different tool.",
+                        tool_name,
+                        loop_count.unwrap_or(0),
+                        last_lines
+                    ));
+                }
+
+                // Completed within timeout normally
                 // Use stdout_buf for JSON extraction (clean, no stderr prefixes)
                 let stdout_output = stdout_buf.lock().await.clone();
                 info!(
                     tool = %tool_name,
                     stdout_len = stdout_output.len(),
-                    stdout_preview = %truncate_string(&stdout_output, 200),
+                    stdout_preview = %truncate_str(&stdout_output, 200),
                     "CLI agent stdout captured"
                 );
                 let result_text = extract_meaningful_output(&stdout_output, max_output);
                 info!(
                     tool = %tool_name,
                     result_len = result_text.len(),
-                    result_preview = %truncate_string(&result_text, 200),
+                    result_preview = %truncate_str(&result_text, 200),
                     "CLI agent result extracted"
                 );
 
@@ -426,7 +556,7 @@ impl CliAgentTool {
                     let display_output = display_buf.lock().await.clone();
                     return Ok(format!(
                         "ERROR: CLI agent '{}' exited with code {:?}. Do NOT retry with same agent.\n\nOutput:\n{}",
-                        tool_name, exit_code, truncate_string(&display_output, max_output)
+                        tool_name, exit_code, truncate_with_note(&display_output, max_output)
                     ));
                 }
 
@@ -442,7 +572,7 @@ impl CliAgentTool {
                 let elapsed = timeout.as_secs();
                 let partial_output = {
                     let buf = display_buf.lock().await;
-                    truncate_string(&buf, 1000)
+                    truncate_with_note(&buf, 1000)
                 };
 
                 // Store the running agent for later checking/cancellation
@@ -453,6 +583,7 @@ impl CliAgentTool {
                     display_buf,
                     stdout_buf,
                     child_id: pid,
+                    session_id: session_id.to_string(),
                 };
                 self.running.lock().await.insert(task_id.clone(), agent);
 
@@ -500,7 +631,7 @@ impl CliAgentTool {
                 agent.child_id,
                 agent.prompt_summary,
                 display_output.len(),
-                truncate_string(&display_output, 5000)
+                truncate_with_note(&display_output, 5000)
             ))
         }
     }
@@ -523,7 +654,36 @@ impl CliAgentTool {
             "Cancelled CLI agent '{}' (was running for {}s).\n\nOutput before cancellation:\n{}",
             agent.tool_name,
             elapsed,
-            truncate_string(&display_output, 5000)
+            truncate_with_note(&display_output, 5000)
+        ))
+    }
+
+    /// Cancel all CLI agent tasks for a specific session.
+    async fn handle_cancel_all(&self, session_id: &str) -> anyhow::Result<String> {
+        let mut running = self.running.lock().await;
+
+        // Find all tasks matching this session
+        let to_cancel: Vec<String> = running.iter()
+            .filter(|(_, agent)| agent.session_id == session_id)
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+
+        if to_cancel.is_empty() {
+            return Ok("No running CLI agents for this session.".to_string());
+        }
+
+        let mut cancelled = Vec::new();
+        for task_id in to_cancel {
+            if let Some(agent) = running.remove(&task_id) {
+                kill_process(agent.child_id).await;
+                cancelled.push(format!("{} ({})", agent.tool_name, task_id));
+            }
+        }
+
+        Ok(format!(
+            "Cancelled {} CLI agent(s): {}",
+            cancelled.len(),
+            cancelled.join(", ")
         ))
     }
 
@@ -561,6 +721,9 @@ struct CliAgentArgs {
     prompt: Option<String>,
     working_dir: Option<String>,
     task_id: Option<String>,
+    /// Injected by agent - session ID for cancel_all filtering
+    #[serde(default)]
+    _session_id: Option<String>,
 }
 
 /// Check if a string looks like JSON (starts with { or [).
@@ -695,12 +858,12 @@ fn extract_progress_from_json(line: &str) -> Option<String> {
 fn extract_meaningful_output(raw: &str, max_chars: usize) -> String {
     // Try JSON extraction first
     if let Some(content) = extract_json_content(raw) {
-        return truncate_string(&content, max_chars);
+        return truncate_with_note(&content, max_chars);
     }
     if let Some(content) = extract_jsonl_content(raw) {
-        return truncate_string(&content, max_chars);
+        return truncate_with_note(&content, max_chars);
     }
-    truncate_string(raw, max_chars)
+    truncate_with_note(raw, max_chars)
 }
 
 /// Try to extract content from JSON output.
@@ -754,17 +917,6 @@ fn extract_jsonl_content(raw: &str) -> Option<String> {
         }
     }
     last_content
-}
-
-/// Truncate a string to at most `max_chars`.
-fn truncate_string(s: &str, max_chars: usize) -> String {
-    if s.len() > max_chars {
-        let mut t = s[..max_chars].to_string();
-        t.push_str("\n... (truncated)");
-        t
-    } else {
-        s.to_string()
-    }
 }
 
 #[async_trait]
@@ -849,13 +1001,15 @@ impl Tool for CliAgentTool {
 
         let action = args.action.as_deref().unwrap_or("run");
 
+        let session_id = args._session_id.clone().unwrap_or_default();
+
         match action {
             "run" => {
                 let tool = args.tool.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Missing 'tool' parameter for action=run"))?;
                 let prompt = args.prompt.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter for action=run"))?;
-                self.handle_run(tool, prompt, args.working_dir.as_deref(), status_tx).await
+                self.handle_run(tool, prompt, args.working_dir.as_deref(), &session_id, status_tx).await
             }
             "check" => {
                 let task_id = args.task_id.as_ref()
@@ -867,11 +1021,14 @@ impl Tool for CliAgentTool {
                     .ok_or_else(|| anyhow::anyhow!("Missing 'task_id' parameter for action=cancel"))?;
                 self.handle_cancel(task_id).await
             }
+            "cancel_all" => {
+                self.handle_cancel_all(&session_id).await
+            }
             "list" => {
                 self.handle_list().await
             }
             _ => {
-                Ok(format!("Unknown action '{}'. Use run, check, cancel, or list.", action))
+                Ok(format!("Unknown action '{}'. Use run, check, cancel, cancel_all, or list.", action))
             }
         }
     }

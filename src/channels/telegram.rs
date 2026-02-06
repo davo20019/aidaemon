@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,8 +11,12 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::agent::Agent;
-use crate::channels::SessionMap;
-use super::formatting::{markdown_to_telegram_html, html_escape, split_message, format_number, sanitize_filename};
+use crate::channels::{ChannelHub, SessionMap};
+#[cfg(feature = "discord")]
+use crate::channels::{DiscordChannel, spawn_discord_channel};
+#[cfg(feature = "slack")]
+use crate::channels::{SlackChannel, spawn_slack_channel};
+use super::formatting::{build_help_text, markdown_to_telegram_html, html_escape, split_message, format_number, sanitize_filename};
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
@@ -20,6 +24,11 @@ use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 
 pub struct TelegramChannel {
+    /// Bot username fetched from Telegram API (e.g., "coding_bot", "debug_bot").
+    /// Populated on first start() call via getMe. Uses StdRwLock for sync access in trait methods.
+    bot_username: StdRwLock<String>,
+    /// Cached channel name for the trait's name() method (e.g., "telegram" or "telegram:my_bot").
+    cached_channel_name: StdRwLock<String>,
     bot: Bot,
     bot_token: String,
     allowed_user_ids: Vec<u64>,
@@ -39,6 +48,9 @@ pub struct TelegramChannel {
     max_file_size_mb: u64,
     /// State store for querying token usage.
     state: Arc<dyn StateStore>,
+    /// Reference to the channel hub for dynamic bot registration.
+    /// Set after construction via set_channel_hub().
+    channel_hub: StdRwLock<Option<Weak<ChannelHub>>>,
 }
 
 impl TelegramChannel {
@@ -56,6 +68,8 @@ impl TelegramChannel {
     ) -> Self {
         let bot = Bot::new(bot_token);
         Self {
+            bot_username: StdRwLock::new("telegram".to_string()),
+            cached_channel_name: StdRwLock::new("telegram".to_string()),
             bot,
             bot_token: bot_token.to_string(),
             allowed_user_ids,
@@ -68,6 +82,73 @@ impl TelegramChannel {
             inbox_dir,
             max_file_size_mb,
             state,
+            channel_hub: StdRwLock::new(None),
+        }
+    }
+
+    /// Set the channel hub reference for dynamic bot registration.
+    /// Called after the hub is constructed in core.rs.
+    pub fn set_channel_hub(&self, hub: Weak<ChannelHub>) {
+        if let Ok(mut guard) = self.channel_hub.write() {
+            *guard = Some(hub);
+        }
+    }
+
+    /// Get the bot's username, fetching from Telegram API if not cached.
+    async fn get_bot_username(&self) -> String {
+        // Check if already fetched (not the default "telegram" placeholder)
+        {
+            let guard = self.bot_username.read().unwrap();
+            if *guard != "telegram" {
+                return guard.clone();
+            }
+        }
+
+        // Fetch from Telegram API
+        match self.bot.get_me().await {
+            Ok(me) => {
+                let username = me.username.clone().unwrap_or_else(|| "telegram".to_string());
+                // Update both bot_username and cached_channel_name
+                if let Ok(mut guard) = self.bot_username.write() {
+                    *guard = username.clone();
+                }
+                // Channel name is "telegram" for single bot or "telegram:{username}" for multi-bot
+                let channel_name = if username == "telegram" {
+                    "telegram".to_string()
+                } else {
+                    format!("telegram:{}", username)
+                };
+                if let Ok(mut guard) = self.cached_channel_name.write() {
+                    *guard = channel_name;
+                }
+                info!(username = %username, "Fetched bot username from Telegram");
+                username
+            }
+            Err(e) => {
+                warn!("Failed to fetch bot username: {}, using 'telegram'", e);
+                "telegram".to_string()
+            }
+        }
+    }
+
+    /// Build the session ID for a chat, prefixing with bot username.
+    /// Single bot setups use just the chat_id for backward compatibility.
+    async fn session_id(&self, chat_id: i64) -> String {
+        let username = self.get_bot_username().await;
+        if username == "default" {
+            chat_id.to_string()
+        } else {
+            format!("{}:{}", username, chat_id)
+        }
+    }
+
+    /// Get the channel identifier for the session map.
+    async fn channel_name(&self) -> String {
+        let username = self.get_bot_username().await;
+        if username == "default" {
+            "telegram".to_string()
+        } else {
+            format!("telegram:{}", username)
         }
     }
 
@@ -75,13 +156,16 @@ impl TelegramChannel {
     /// Uses exponential backoff: 5s → 10s → 20s → 40s → 60s cap.
     /// Resets backoff to initial after a stable run (60s+).
     pub async fn start_with_retry(self: Arc<Self>) {
+        // Fetch bot username once at startup
+        let bot_username = self.get_bot_username().await;
+
         let initial_backoff = Duration::from_secs(5);
         let max_backoff = Duration::from_secs(60);
         let stable_threshold = Duration::from_secs(60);
         let mut backoff = initial_backoff;
 
         loop {
-            info!("Starting Telegram dispatcher");
+            info!(name = %bot_username, "Starting Telegram dispatcher");
             let started = tokio::time::Instant::now();
             self.clone().start().await;
             let ran_for = started.elapsed();
@@ -93,6 +177,7 @@ impl TelegramChannel {
             }
 
             warn!(
+                name = %bot_username,
                 backoff_secs = backoff.as_secs(),
                 ran_for_secs = ran_for.as_secs(),
                 "Telegram dispatcher stopped, restarting"
@@ -103,7 +188,8 @@ impl TelegramChannel {
     }
 
     pub async fn start(self: Arc<Self>) {
-        info!("Starting Telegram channel");
+        let bot_username = self.get_bot_username().await;
+        info!(name = %bot_username, "Starting Telegram channel");
 
         let handler = dptree::entry()
             .branch(
@@ -277,7 +363,7 @@ impl TelegramChannel {
                 "Restart failed. You may need to restart manually.".to_string()
             }
             "/tasks" => {
-                let session_id = msg.chat.id.0.to_string();
+                let session_id = self.session_id(msg.chat.id.0).await;
                 let entries = self.task_registry.list_for_session(&session_id).await;
                 if entries.is_empty() {
                     "No tasks found.".to_string()
@@ -318,7 +404,7 @@ impl TelegramChannel {
                 }
             }
             "/clear" => {
-                let session_id = msg.chat.id.0.to_string();
+                let session_id = self.session_id(msg.chat.id.0).await;
                 match self.agent.clear_session(&session_id).await {
                     Ok(_) => "Context cleared. Starting fresh.".to_string(),
                     Err(e) => format!("Failed to clear context: {}", e),
@@ -327,20 +413,14 @@ impl TelegramChannel {
             "/cost" => {
                 self.handle_cost_command().await
             }
+            "/connect" => {
+                self.handle_connect_command(arg, msg.from.as_ref().map(|u| u.id.0).unwrap_or(0)).await
+            }
+            "/bots" => {
+                self.handle_bots_command().await
+            }
             "/help" | "/start" => {
-                "Available commands:\n\
-                /model — Show current model\n\
-                /model <name> — Switch to a different model (disables auto-routing)\n\
-                /models — List available models from provider\n\
-                /auto — Re-enable automatic model routing by query complexity\n\
-                /reload — Reload config.toml (applies model changes, re-enables auto-routing)\n\
-                /restart — Restart the daemon (picks up new binary, config, MCP servers)\n\
-                /tasks — List running and recent tasks\n\
-                /cancel <id> — Cancel a running task\n\
-                /clear — Clear conversation context and start fresh\n\
-                /cost — Show token usage statistics\n\
-                /help — Show this help message"
-                    .to_string()
+                build_help_text(true, true)
             }
             _ => format!("Unknown command: {}\nType /help for available commands.", cmd),
         };
@@ -536,6 +616,485 @@ impl TelegramChannel {
         reply
     }
 
+    /// Handle /connect command - add a new bot dynamically.
+    /// Usage: /connect telegram <bot_token>
+    ///        /connect discord <bot_token>
+    ///        /connect slack <bot_token> <app_token>
+    async fn handle_connect_command(&self, arg: &str, user_id: u64) -> String {
+        let parts: Vec<&str> = arg.split_whitespace().collect();
+
+        if parts.is_empty() {
+            return "Add a new bot to this agent.\n\n\
+                Usage:\n\
+                /connect telegram <bot_token>\n\
+                /connect discord <bot_token>\n\
+                /connect slack <bot_token> <app_token>\n\n\
+                The new bot will use the same allowed users as this bot.\n\
+                After adding, run /restart to activate the new bot."
+                .to_string();
+        }
+
+        let channel_type = parts[0].to_lowercase();
+
+        match channel_type.as_str() {
+            "telegram" => {
+                if parts.len() < 2 {
+                    return "Usage: /connect telegram <bot_token>\n\n\
+                        Get a token from @BotFather on Telegram."
+                        .to_string();
+                }
+                let token = parts[1];
+                self.connect_telegram_bot(token, user_id).await
+            }
+            "discord" => {
+                if parts.len() < 2 {
+                    return "Usage: /connect discord <bot_token>\n\n\
+                        Get a token from Discord Developer Portal."
+                        .to_string();
+                }
+                let token = parts[1];
+                self.connect_discord_bot(token, user_id).await
+            }
+            "slack" => {
+                if parts.len() < 3 {
+                    return "Usage: /connect slack <bot_token> <app_token>\n\n\
+                        Get tokens from Slack App Management."
+                        .to_string();
+                }
+                let bot_token = parts[1];
+                let app_token = parts[2];
+                self.connect_slack_bot(bot_token, app_token, user_id).await
+            }
+            _ => {
+                format!(
+                    "Unknown channel type: {}\n\n\
+                    Supported types: telegram, discord, slack",
+                    channel_type
+                )
+            }
+        }
+    }
+
+    /// Connect a new Telegram bot by validating its token.
+    async fn connect_telegram_bot(&self, token: &str, user_id: u64) -> String {
+        // Validate the token by calling getMe
+        let test_bot = Bot::new(token);
+        let me = match test_bot.get_me().await {
+            Ok(me) => me,
+            Err(e) => {
+                return format!("Invalid token: {}\n\nMake sure you copied the full token from @BotFather.", e);
+            }
+        };
+
+        let bot_username = me.username.clone().unwrap_or_else(|| "unknown".to_string());
+
+        // Check if this bot is already connected
+        match self.state.get_dynamic_bots().await {
+            Ok(bots) => {
+                for existing in &bots {
+                    if existing.channel_type == "telegram" && existing.bot_token == token {
+                        return format!(
+                            "Bot @{} is already connected.\n\nUse /bots to see all connected bots.",
+                            bot_username
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to check existing bots: {}", e);
+            }
+        }
+
+        // Save the new bot with same allowed users as current bot
+        let allowed_user_ids_str: Vec<String> = self.allowed_user_ids.iter().map(|id| id.to_string()).collect();
+
+        let new_bot = crate::traits::DynamicBot {
+            id: 0, // Will be set by database
+            channel_type: "telegram".to_string(),
+            bot_token: token.to_string(),
+            app_token: None,
+            allowed_user_ids: allowed_user_ids_str,
+            extra_config: "{}".to_string(),
+            created_at: String::new(), // Will be set by database
+        };
+
+        let db_id = match self.state.add_dynamic_bot(&new_bot).await {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("Failed to save bot: {}", e);
+                return format!("Failed to save bot configuration: {}", e);
+            }
+        };
+
+        info!(
+            bot = %bot_username,
+            id = db_id,
+            added_by = user_id,
+            "New Telegram bot connected"
+        );
+
+        // Try to spawn the bot immediately if we have a hub reference
+        let hub_ref = self.channel_hub.read().ok().and_then(|g| g.clone());
+        if let Some(weak_hub) = hub_ref {
+            if let Some(hub) = weak_hub.upgrade() {
+                // Create the new channel with same config as this one
+                let new_channel = Arc::new(TelegramChannel::new(
+                    token,
+                    self.allowed_user_ids.clone(),
+                    Arc::clone(&self.agent),
+                    self.config_path.clone(),
+                    self.session_map.clone(),
+                    Arc::clone(&self.task_registry),
+                    self.files_enabled,
+                    self.inbox_dir.clone(),
+                    self.max_file_size_mb,
+                    Arc::clone(&self.state),
+                ));
+
+                // Give the new channel a reference to the hub too
+                new_channel.set_channel_hub(weak_hub);
+
+                // Register with the hub
+                let channel_name = hub.register_channel(new_channel.clone() as Arc<dyn Channel>).await;
+                info!(channel = %channel_name, "Registered new Telegram bot with hub");
+
+                // Spawn the bot in the background using helper to avoid type cycles
+                spawn_telegram_channel(new_channel);
+
+                return format!(
+                    "✓ Bot @{} connected and started!\n\n\
+                    The bot is now active and ready to receive messages.\n\
+                    Use /bots to see all connected bots.",
+                    bot_username
+                );
+            }
+        }
+
+        // Fallback: hub not available, require restart
+        format!(
+            "✓ Bot @{} connected!\n\n\
+            Run /restart to activate the new bot.\n\
+            Use /bots to see all connected bots.",
+            bot_username
+        )
+    }
+
+    /// Connect a new Discord bot by validating its token.
+    #[cfg(feature = "discord")]
+    async fn connect_discord_bot(&self, token: &str, user_id: u64) -> String {
+        // Validate the token by making a test API call
+        let client = reqwest::Client::new();
+        let response = client
+            .get("https://discord.com/api/v10/users/@me")
+            .header("Authorization", format!("Bot {}", token))
+            .send()
+            .await;
+
+        let bot_name = match response {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => json["username"].as_str().unwrap_or("unknown").to_string(),
+                    Err(_) => "unknown".to_string(),
+                }
+            }
+            Ok(resp) => {
+                return format!(
+                    "Invalid Discord token (HTTP {}). Make sure you copied the bot token from Discord Developer Portal.",
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                return format!("Failed to validate token: {}", e);
+            }
+        };
+
+        // Check if already connected
+        match self.state.get_dynamic_bots().await {
+            Ok(bots) => {
+                for existing in &bots {
+                    if existing.channel_type == "discord" && existing.bot_token == token {
+                        return format!(
+                            "Bot {} is already connected.\n\nUse /bots to see all connected bots.",
+                            bot_name
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to check existing bots: {}", e);
+            }
+        }
+
+        // Discord uses user IDs differently - for now, use current user_id
+        let allowed_user_ids_str = vec![user_id.to_string()];
+
+        let new_bot = crate::traits::DynamicBot {
+            id: 0,
+            channel_type: "discord".to_string(),
+            bot_token: token.to_string(),
+            app_token: None,
+            allowed_user_ids: allowed_user_ids_str,
+            extra_config: "{}".to_string(),
+            created_at: String::new(),
+        };
+
+        let db_id = match self.state.add_dynamic_bot(&new_bot).await {
+            Ok(id) => id,
+            Err(e) => {
+                return format!("Failed to save bot configuration: {}", e);
+            }
+        };
+
+        info!(
+            bot = %bot_name,
+            id = db_id,
+            added_by = user_id,
+            "New Discord bot connected"
+        );
+
+        // Try to spawn the bot immediately if we have a hub reference
+        let hub_ref = self.channel_hub.read().ok().and_then(|g| g.clone());
+        if let Some(weak_hub) = hub_ref {
+            if let Some(hub) = weak_hub.upgrade() {
+                // Create the new Discord channel with same config as this Telegram channel
+                let new_channel = Arc::new(DiscordChannel::new(
+                    token,
+                    vec![user_id], // Discord uses u64 user IDs
+                    None,          // No guild_id for dynamic bots
+                    Arc::clone(&self.agent),
+                    self.config_path.clone(),
+                    self.session_map.clone(),
+                    Arc::clone(&self.task_registry),
+                    self.files_enabled,
+                    self.inbox_dir.clone(),
+                    self.max_file_size_mb,
+                    Arc::clone(&self.state),
+                ));
+
+                // Give the new channel a reference to the hub
+                new_channel.set_channel_hub(weak_hub);
+
+                // Register with the hub
+                let channel_name = hub.register_channel(new_channel.clone() as Arc<dyn Channel>).await;
+                info!(channel = %channel_name, "Registered new Discord bot with hub");
+
+                // Spawn the bot in the background
+                spawn_discord_channel(new_channel);
+
+                return format!(
+                    "✓ Discord bot {} connected and started!\n\n\
+                    The bot is now active and ready to receive messages.\n\
+                    Use /bots to see all connected bots.",
+                    bot_name
+                );
+            }
+        }
+
+        // Fallback: hub not available, require restart
+        format!(
+            "✓ Discord bot {} connected!\n\n\
+            Run /restart to activate the new bot.\n\
+            Use /bots to see all connected bots.",
+            bot_name
+        )
+    }
+
+    /// Connect a new Discord bot (stub when feature disabled).
+    #[cfg(not(feature = "discord"))]
+    async fn connect_discord_bot(&self, _token: &str, _user_id: u64) -> String {
+        "Discord support is not enabled in this build.\n\n\
+        Rebuild with `cargo build --features discord` to enable Discord bots."
+            .to_string()
+    }
+
+    /// Connect a new Slack bot.
+    /// Connect a new Slack bot.
+    #[cfg(feature = "slack")]
+    async fn connect_slack_bot(&self, bot_token: &str, app_token: &str, user_id: u64) -> String {
+        // Validate the bot token by calling auth.test
+        let client = reqwest::Client::new();
+        let response = client
+            .get("https://slack.com/api/auth.test")
+            .header("Authorization", format!("Bearer {}", bot_token))
+            .send()
+            .await;
+
+        let (bot_name, team_name) = match response {
+            Ok(resp) => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if json["ok"].as_bool() != Some(true) {
+                            return format!(
+                                "Invalid Slack token: {}\n\nMake sure you have the correct bot token.",
+                                json["error"].as_str().unwrap_or("unknown error")
+                            );
+                        }
+                        (
+                            json["user"].as_str().unwrap_or("unknown").to_string(),
+                            json["team"].as_str().unwrap_or("unknown").to_string(),
+                        )
+                    }
+                    Err(e) => {
+                        return format!("Failed to parse Slack response: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                return format!("Failed to validate Slack token: {}", e);
+            }
+        };
+
+        // Check if already connected
+        match self.state.get_dynamic_bots().await {
+            Ok(bots) => {
+                for existing in &bots {
+                    if existing.channel_type == "slack" && existing.bot_token == bot_token {
+                        return format!(
+                            "Slack bot {} ({}) is already connected.\n\nUse /bots to see all connected bots.",
+                            bot_name, team_name
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to check existing bots: {}", e);
+            }
+        }
+
+        let allowed_user_ids_str = vec![user_id.to_string()];
+
+        let new_bot = crate::traits::DynamicBot {
+            id: 0,
+            channel_type: "slack".to_string(),
+            bot_token: bot_token.to_string(),
+            app_token: Some(app_token.to_string()),
+            allowed_user_ids: allowed_user_ids_str.clone(),
+            extra_config: "{}".to_string(),
+            created_at: String::new(),
+        };
+
+        let db_id = match self.state.add_dynamic_bot(&new_bot).await {
+            Ok(id) => id,
+            Err(e) => {
+                return format!("Failed to save bot configuration: {}", e);
+            }
+        };
+
+        info!(
+            bot = %bot_name,
+            team = %team_name,
+            id = db_id,
+            added_by = user_id,
+            "New Slack bot connected"
+        );
+
+        // Try to spawn the bot immediately if we have a hub reference
+        let hub_ref = self.channel_hub.read().ok().and_then(|g| g.clone());
+        if let Some(weak_hub) = hub_ref {
+            if let Some(hub) = weak_hub.upgrade() {
+                // Create the new Slack channel with same config as this Telegram channel
+                let new_channel = Arc::new(SlackChannel::new(
+                    app_token,
+                    bot_token,
+                    allowed_user_ids_str, // Slack uses String user IDs
+                    false,                // use_threads default
+                    Arc::clone(&self.agent),
+                    self.config_path.clone(),
+                    self.session_map.clone(),
+                    Arc::clone(&self.task_registry),
+                    self.files_enabled,
+                    self.inbox_dir.clone(),
+                    self.max_file_size_mb,
+                    Arc::clone(&self.state),
+                ));
+
+                // Give the new channel a reference to the hub
+                new_channel.set_channel_hub(weak_hub);
+
+                // Register with the hub
+                let channel_name = hub.register_channel(new_channel.clone() as Arc<dyn Channel>).await;
+                info!(channel = %channel_name, "Registered new Slack bot with hub");
+
+                // Spawn the bot in the background
+                spawn_slack_channel(new_channel);
+
+                return format!(
+                    "✓ Slack bot {} ({}) connected and started!\n\n\
+                    The bot is now active and ready to receive messages.\n\
+                    Use /bots to see all connected bots.",
+                    bot_name, team_name
+                );
+            }
+        }
+
+        // Fallback: hub not available, require restart
+        format!(
+            "✓ Slack bot {} ({}) connected!\n\n\
+            Run /restart to activate the new bot.\n\
+            Use /bots to see all connected bots.",
+            bot_name, team_name
+        )
+    }
+
+    /// Connect a new Slack bot (stub when feature disabled).
+    #[cfg(not(feature = "slack"))]
+    async fn connect_slack_bot(&self, _bot_token: &str, _app_token: &str, _user_id: u64) -> String {
+        "Slack support is not enabled in this build.\n\n\
+        Rebuild with `cargo build --features slack` to enable Slack bots."
+            .to_string()
+    }
+
+    /// Handle /bots command - list all connected bots.
+    async fn handle_bots_command(&self) -> String {
+        let mut bots_list = vec![];
+
+        // Add current bot (from config)
+        let current_username = self.get_bot_username().await;
+        bots_list.push(format!("• telegram:@{} (this bot, from config)", current_username));
+
+        // Add dynamic bots from database
+        match self.state.get_dynamic_bots().await {
+            Ok(bots) => {
+                for bot in bots {
+                    let bot_info = match bot.channel_type.as_str() {
+                        "telegram" => {
+                            // Try to get username for display
+                            let test_bot = Bot::new(&bot.bot_token);
+                            match test_bot.get_me().await {
+                                Ok(me) => {
+                                    let username = me.username.clone().unwrap_or_else(|| "unknown".to_string());
+                                    format!("• telegram:@{} (id: {})", username, bot.id)
+                                }
+                                Err(_) => format!("• telegram:<invalid token> (id: {})", bot.id),
+                            }
+                        }
+                        "discord" => format!("• discord (id: {})", bot.id),
+                        "slack" => format!("• slack (id: {})", bot.id),
+                        other => format!("• {} (id: {})", other, bot.id),
+                    };
+                    bots_list.push(bot_info);
+                }
+            }
+            Err(e) => {
+                return format!("Failed to list bots: {}", e);
+            }
+        }
+
+        if bots_list.len() == 1 {
+            format!(
+                "Connected bots:\n{}\n\nUse /connect to add more bots.",
+                bots_list.join("\n")
+            )
+        } else {
+            format!(
+                "Connected bots ({}):\n{}\n\n\
+                Tip: Dynamic bots activate after /restart.",
+                bots_list.len(),
+                bots_list.join("\n")
+            )
+        }
+    }
+
     async fn handle_message(&self, msg: teloxide::types::Message, bot: Bot) {
         let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
 
@@ -571,14 +1130,47 @@ impl TelegramChannel {
             return;
         }
 
-        // Use chat ID as session ID
-        let session_id = msg.chat.id.0.to_string();
+        // Use chat ID as session ID, prefixed with bot name if multi-bot
+        let session_id = self.session_id(msg.chat.id.0).await;
 
         // Register this session with the channel hub so outbound messages
-        // (approvals, media, notifications) route back to Telegram.
+        // (approvals, media, notifications) route back to this Telegram bot.
         {
             let mut map = self.session_map.write().await;
-            map.insert(session_id.clone(), "telegram".to_string());
+            map.insert(session_id.clone(), self.channel_name().await);
+        }
+
+        // Handle cancel/stop commands - these bypass the queue
+        let text_lower = text.to_lowercase();
+        if text_lower == "cancel" || text_lower == "stop" {
+            let cancelled = self.task_registry.cancel_running_for_session(&session_id).await;
+            self.task_registry.clear_queue(&session_id).await;
+            if cancelled.is_empty() {
+                let _ = bot.send_message(msg.chat.id, "No running task to cancel.").await;
+            } else {
+                let desc = cancelled.first().map(|(_, d)| d.as_str()).unwrap_or("unknown");
+                let queue_cleared = self.task_registry.queue_len(&session_id).await;
+                let mut response = format!("⏹️ Cancelled: {}", desc);
+                if queue_cleared > 0 {
+                    response.push_str(&format!(" (+{} queued messages cleared)", queue_cleared));
+                }
+                let _ = bot.send_message(msg.chat.id, response).await;
+            }
+            return;
+        }
+
+        // Check if a task is already running - if so, queue this message
+        if self.task_registry.has_running_task(&session_id).await {
+            let queue_pos = self.task_registry.queue_message(&session_id, &text).await;
+            let current_task = self.task_registry.get_running_task_description(&session_id).await
+                .unwrap_or_else(|| "processing".to_string());
+            let preview: String = text.chars().take(50).collect();
+            let suffix = if text.len() > 50 { "..." } else { "" };
+            let _ = bot.send_message(
+                msg.chat.id,
+                format!("📥 Queued ({}): \"{}{}\" | Currently: {}", queue_pos, preview, suffix, current_task)
+            ).await;
+            return;
         }
 
         info!(session_id, "Received message from user {}", user_id);
@@ -634,6 +1226,40 @@ impl TelegramChannel {
                     StatusUpdate::ToolCancellable { name, task_id } => {
                         format!("⏳ {} started (task_id: {})", name, task_id)
                     }
+                    StatusUpdate::ProgressSummary { elapsed_mins, summary } => {
+                        format!("📊 Progress ({} min): {}", elapsed_mins, summary)
+                    }
+                    StatusUpdate::IterationWarning { current, threshold } => {
+                        format!("⚠️ Approaching soft limit: {} of {} iterations", current, threshold)
+                    }
+                    StatusUpdate::PlanCreated { description, total_steps, .. } => {
+                        format!("📋 Plan created: {} ({} steps)", description, total_steps)
+                    }
+                    StatusUpdate::PlanStepStart { step_index, total_steps, description, .. } => {
+                        format!("▶️ Step {}/{}: {}", step_index + 1, total_steps, description)
+                    }
+                    StatusUpdate::PlanStepComplete { step_index, total_steps, description, summary, .. } => {
+                        let base = format!("✅ Step {}/{} done: {}", step_index + 1, total_steps, description);
+                        if let Some(s) = summary {
+                            format!("{} - {}", base, s)
+                        } else {
+                            base
+                        }
+                    }
+                    StatusUpdate::PlanStepFailed { step_index, description, error, .. } => {
+                        format!("❌ Step {} failed: {} - {}", step_index + 1, description, error)
+                    }
+                    StatusUpdate::PlanComplete { description, total_steps, duration_secs, .. } => {
+                        let mins = duration_secs / 60;
+                        let secs = duration_secs % 60;
+                        format!("🎉 Plan complete: {} ({} steps in {}m {}s)", description, total_steps, mins, secs)
+                    }
+                    StatusUpdate::PlanAbandoned { description, .. } => {
+                        format!("🚫 Plan abandoned: {}", description)
+                    }
+                    StatusUpdate::PlanRevised { description, reason, new_total_steps, .. } => {
+                        format!("🔄 Plan revised: {} ({} steps) - {}", description, new_total_steps, reason)
+                    }
                 };
                 let _ = status_bot.send_message(status_chat_id, text).await;
                 last_sent = tokio::time::Instant::now();
@@ -650,35 +1276,114 @@ impl TelegramChannel {
         let agent = Arc::clone(&self.agent);
         let chat_id = msg.chat.id;
         tokio::spawn(async move {
-            let result = tokio::select! {
-                r = agent.handle_message(&session_id, &text, Some(status_tx)) => r,
-                _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
-            };
-            typing_cancel.cancel();
-            // status_tx is dropped here (moved into handle_message), ending the receiver task.
-            let _ = status_task.await;
+            let mut current_text = text;
+            let mut current_task_id = task_id;
+            let mut current_cancel_token = cancel_token;
+            let mut current_status_tx = status_tx;
+            let mut current_typing_cancel = typing_cancel;
+            let mut current_status_task = status_task;
 
-            match result {
-                Ok(reply) => {
-                    registry.complete(task_id).await;
-                    let html = markdown_to_telegram_html(&reply);
-                    // Split long messages (Telegram limit is 4096 chars)
-                    let html_chunks = split_message(&html, 4096);
-                    let plain_chunks = split_message(&reply, 4096);
-                    for (i, html_chunk) in html_chunks.iter().enumerate() {
-                        let plain_chunk = plain_chunks.get(i).map(|s| s.as_str()).unwrap_or(html_chunk.as_str());
-                        if let Err(e) = send_html_or_fallback(&bot, chat_id, html_chunk, plain_chunk).await {
-                            warn!("Failed to send Telegram message: {}", e);
+            loop {
+                let result = tokio::select! {
+                    r = agent.handle_message(&session_id, &current_text, Some(current_status_tx)) => r,
+                    _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
+                };
+                current_typing_cancel.cancel();
+                let _ = current_status_task.await;
+
+                match result {
+                    Ok(reply) => {
+                        registry.complete(current_task_id).await;
+                        // Skip sending empty replies (e.g., scheduled tasks with no output)
+                        if !reply.trim().is_empty() {
+                            let html = markdown_to_telegram_html(&reply);
+                            // Split long messages (Telegram limit is 4096 chars)
+                            let html_chunks = split_message(&html, 4096);
+                            let plain_chunks = split_message(&reply, 4096);
+                            for (i, html_chunk) in html_chunks.iter().enumerate() {
+                                let plain_chunk = plain_chunks.get(i).map(|s| s.as_str()).unwrap_or(html_chunk.as_str());
+                                if let Err(e) = send_html_or_fallback(&bot, chat_id, html_chunk, plain_chunk).await {
+                                    warn!("Failed to send Telegram message: {}", e);
+                                }
+                            }
                         }
                     }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        registry.fail(current_task_id, &error_msg).await;
+                        // Don't notify user about task cancellation
+                        if error_msg == "Task cancelled" {
+                            info!("Task #{} cancelled", current_task_id);
+                            return; // Exit loop on cancellation
+                        }
+                        warn!("Agent error: {}", e);
+                        let _ = bot
+                            .send_message(chat_id, format!("Error: {}", e))
+                            .await;
+                    }
                 }
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    registry.fail(task_id, &error_msg).await;
-                    warn!("Agent error: {}", e);
-                    let _ = bot
-                        .send_message(chat_id, format!("Error: {}", e))
-                        .await;
+
+                // Check if there are queued messages to process
+                if let Some(queued) = registry.pop_queued_message(&session_id).await {
+                    // Small delay to ensure previous message is fully committed to DB
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+
+                    info!(session_id, "Processing queued message: {}", queued.text.chars().take(50).collect::<String>());
+                    let _ = bot.send_message(chat_id, format!("▶️ Processing queued: \"{}\"",
+                        queued.text.chars().take(50).collect::<String>())).await;
+
+                    // Set up for next iteration
+                    current_text = queued.text;
+                    let desc: String = current_text.chars().take(80).collect();
+                    let (new_task_id, new_cancel_token) = registry.register(&session_id, &desc).await;
+                    current_task_id = new_task_id;
+                    current_cancel_token = new_cancel_token;
+
+                    // Create new status channel and typing indicator
+                    let (new_status_tx, mut new_status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
+                    current_status_tx = new_status_tx;
+
+                    let status_bot = bot.clone();
+                    current_status_task = tokio::spawn(async move {
+                        let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
+                        let min_interval = Duration::from_secs(3);
+                        while let Some(update) = new_status_rx.recv().await {
+                            let now = tokio::time::Instant::now();
+                            if now.duration_since(last_sent) < min_interval {
+                                continue;
+                            }
+                            let text = match &update {
+                                StatusUpdate::Thinking(iter) => format!("Thinking... (step {})", iter + 1),
+                                StatusUpdate::ToolStart { name, summary } => {
+                                    if summary.is_empty() {
+                                        format!("Using {}...", name)
+                                    } else {
+                                        format!("Using {}: {}...", name, summary)
+                                    }
+                                }
+                                _ => continue, // Skip other status updates for queued messages
+                            };
+                            let _ = status_bot.send_message(chat_id, text).await;
+                            last_sent = tokio::time::Instant::now();
+                        }
+                    });
+
+                    // New typing indicator
+                    let typing_bot = bot.clone();
+                    let new_typing_cancel = tokio_util::sync::CancellationToken::new();
+                    current_typing_cancel = new_typing_cancel.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let _ = typing_bot.send_chat_action(chat_id, ChatAction::Typing).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                                _ = new_typing_cancel.cancelled() => break,
+                            }
+                        }
+                    });
+                } else {
+                    // No more queued messages, exit loop
+                    break;
                 }
             }
         });
@@ -687,8 +1392,8 @@ impl TelegramChannel {
 
 #[async_trait]
 impl Channel for TelegramChannel {
-    fn name(&self) -> &str {
-        "telegram"
+    fn name(&self) -> String {
+        self.cached_channel_name.read().unwrap().clone()
     }
 
     fn capabilities(&self) -> ChannelCapabilities {
@@ -905,4 +1610,12 @@ async fn send_html_or_fallback(bot: &Bot, chat_id: ChatId, html: &str, plain: &s
             Ok(())
         }
     }
+}
+
+/// Spawn a TelegramChannel in a background task.
+/// This is a separate function to avoid async type inference cycles.
+pub fn spawn_telegram_channel(channel: Arc<TelegramChannel>) {
+    tokio::spawn(async move {
+        channel.start_with_retry().await;
+    });
 }

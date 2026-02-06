@@ -454,6 +454,80 @@ fn convert_slack_inline(s: &str) -> String {
     result
 }
 
+/// Build the /help response text.
+///
+/// `include_restart`: whether to show the /restart command (Telegram, Slack)
+/// `include_connect`: whether to show /connect and /bots (Telegram only)
+pub(crate) fn build_help_text(include_restart: bool, include_connect: bool) -> String {
+    let mut text = String::from(
+        "**What I can do**\n\
+         \n\
+         **Schedule recurring tasks**\n\
+         _\"Check my disk space every 6 hours\"_\n\
+         _\"Remind me to review PRs on weekdays at 9am\"_\n\
+         \n\
+         **Search & browse the web**\n\
+         _\"What's the latest on Rust 2024 edition?\"_\n\
+         _\"Summarize this article: <url>\"_\n\
+         \n\
+         **Run commands & manage your system**\n\
+         _\"Show me docker container status\"_\n\
+         _\"Deploy the staging branch\"_\n\
+         \n\
+         **Remember things about you**\n\
+         _\"I prefer dark mode and vim keybindings\"_\n\
+         _\"My deploy server is 10.0.1.50\"_\n\
+         \n\
+         **Track your goals**\n\
+         _\"I want to finish the API migration this month\"_\n\
+         _\"How's my progress on learning Rust?\"_\n\
+         \n\
+         **Delegate coding tasks**\n\
+         _\"Refactor the auth module to use JWT\"_\n\
+         _\"Fix the failing tests in src/parser\"_\n\
+         \n\
+         **Send & receive files**\n\
+         _\"Send me the latest log file\"_\n\
+         _\"Analyze this CSV I'm uploading\"_\n\
+         \n\
+         Just ask in plain language — I'll pick the right tools.\n\
+         \n\
+         **Commands**",
+    );
+
+    text.push_str(
+        "\n\
+         `/model` — Show or switch AI model\n\
+         `/models` — List available models\n\
+         `/auto` — Re-enable automatic model routing\n\
+         `/reload` — Reload configuration",
+    );
+
+    if include_restart {
+        text.push_str("\n`/restart` — Restart the daemon");
+    }
+
+    text.push_str(
+        "\n\
+         `/tasks` — List running tasks\n\
+         `/cancel <id>` — Cancel a running task\n\
+         `/clear` — Start fresh conversation\n\
+         `/cost` — Show token usage stats",
+    );
+
+    if include_connect {
+        text.push_str(
+            "\n\
+             `/connect` — Add a new bot\n\
+             `/bots` — List connected bots",
+        );
+    }
+
+    text.push_str("\n`/help` — Show this message");
+
+    text
+}
+
 /// Sanitize a filename: remove path separators, null bytes, and limit length.
 pub(crate) fn sanitize_filename(name: &str) -> String {
     let sanitized: String = name

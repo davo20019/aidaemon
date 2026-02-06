@@ -1,9 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+
+/// A queued message waiting to be processed.
+#[derive(Clone, Debug)]
+pub struct QueuedMessage {
+    pub text: String,
+    pub queued_at: DateTime<Utc>,
+}
 
 #[derive(Clone, Debug)]
 pub enum TaskStatus {
@@ -43,6 +50,8 @@ pub struct TaskRegistry {
     tasks: RwLock<HashMap<u64, TaskHandle>>,
     next_id: AtomicU64,
     max_completed: usize,
+    /// Message queues per session - messages wait here when a task is running.
+    queues: RwLock<HashMap<String, VecDeque<QueuedMessage>>>,
 }
 
 impl TaskRegistry {
@@ -51,6 +60,7 @@ impl TaskRegistry {
             tasks: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             max_completed,
+            queues: RwLock::new(HashMap::new()),
         }
     }
 
@@ -108,6 +118,23 @@ impl TaskRegistry {
         false
     }
 
+    /// Cancel all running tasks for a session. Returns cancelled task (ID, description) pairs.
+    pub async fn cancel_running_for_session(&self, session_id: &str) -> Vec<(u64, String)> {
+        let mut tasks = self.tasks.write().await;
+        let mut cancelled = Vec::new();
+        for (id, handle) in tasks.iter_mut() {
+            if handle.entry.session_id == session_id
+                && matches!(handle.entry.status, TaskStatus::Running)
+            {
+                handle.cancel_token.cancel();
+                handle.entry.status = TaskStatus::Cancelled;
+                handle.entry.finished_at = Some(Utc::now());
+                cancelled.push((*id, handle.entry.description.clone()));
+            }
+        }
+        cancelled
+    }
+
     /// List all tasks for a given session, sorted by ID.
     pub async fn list_for_session(&self, session_id: &str) -> Vec<TaskEntry> {
         let tasks = self.tasks.read().await;
@@ -137,6 +164,56 @@ impl TaskRegistry {
         let to_remove = finished.len() - max_completed;
         for &id in finished.iter().take(to_remove) {
             tasks.remove(&id);
+        }
+    }
+
+    /// Check if a session has a running task.
+    pub async fn has_running_task(&self, session_id: &str) -> bool {
+        let tasks = self.tasks.read().await;
+        tasks.values().any(|h| {
+            h.entry.session_id == session_id && matches!(h.entry.status, TaskStatus::Running)
+        })
+    }
+
+    /// Get the description of the currently running task for a session (if any).
+    pub async fn get_running_task_description(&self, session_id: &str) -> Option<String> {
+        let tasks = self.tasks.read().await;
+        tasks
+            .values()
+            .find(|h| {
+                h.entry.session_id == session_id && matches!(h.entry.status, TaskStatus::Running)
+            })
+            .map(|h| h.entry.description.clone())
+    }
+
+    /// Queue a message for later processing.
+    pub async fn queue_message(&self, session_id: &str, text: &str) -> usize {
+        let mut queues = self.queues.write().await;
+        let queue = queues.entry(session_id.to_string()).or_default();
+        queue.push_back(QueuedMessage {
+            text: text.to_string(),
+            queued_at: Utc::now(),
+        });
+        queue.len()
+    }
+
+    /// Pop the next queued message for a session.
+    pub async fn pop_queued_message(&self, session_id: &str) -> Option<QueuedMessage> {
+        let mut queues = self.queues.write().await;
+        queues.get_mut(session_id).and_then(|q| q.pop_front())
+    }
+
+    /// Get the number of queued messages for a session.
+    pub async fn queue_len(&self, session_id: &str) -> usize {
+        let queues = self.queues.read().await;
+        queues.get(session_id).map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Clear all queued messages for a session.
+    pub async fn clear_queue(&self, session_id: &str) {
+        let mut queues = self.queues.write().await;
+        if let Some(queue) = queues.get_mut(session_id) {
+            queue.clear();
         }
     }
 }

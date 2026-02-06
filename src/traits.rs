@@ -249,11 +249,11 @@ pub struct ProviderResponse {
 
 /// A record of token usage from the database.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used for database mapping
 pub struct TokenUsageRecord {
     pub model: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    #[allow(dead_code)] // Used for database queries
     pub created_at: String,
 }
 
@@ -330,6 +330,116 @@ pub trait StateStore: Send + Sync {
     async fn get_user_profile(&self) -> anyhow::Result<Option<UserProfile>> {
         Ok(None)
     }
+
+    /// Get trusted command patterns for AI context.
+    /// Returns patterns with 3+ approvals, ordered by approval count.
+    async fn get_trusted_command_patterns(&self) -> anyhow::Result<Vec<(String, i32)>> {
+        Ok(vec![])
+    }
+
+    // ==================== Write Methods for Learning System ====================
+    // These have default no-op implementations for backwards compatibility.
+
+    /// Increment expertise counters and update level for a domain.
+    async fn increment_expertise(&self, _domain: &str, _success: bool, _error: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Insert or update a procedure.
+    async fn upsert_procedure(&self, _procedure: &Procedure) -> anyhow::Result<i64> {
+        Ok(0)
+    }
+
+    /// Update procedure outcome after execution.
+    #[allow(dead_code)] // Reserved for procedure feedback loop
+    async fn update_procedure_outcome(&self, _procedure_id: i64, _success: bool, _duration: Option<f32>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Insert a new error-solution pair.
+    async fn insert_error_solution(&self, _solution: &ErrorSolution) -> anyhow::Result<i64> {
+        Ok(0)
+    }
+
+    /// Update error solution outcome.
+    #[allow(dead_code)] // Reserved for error solution feedback loop
+    async fn update_error_solution_outcome(&self, _solution_id: i64, _success: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    // ==================== Dynamic Bots Methods ====================
+    // For runtime bot management via /connect command.
+
+    /// Store a dynamically added bot configuration.
+    async fn add_dynamic_bot(&self, _bot: &DynamicBot) -> anyhow::Result<i64> {
+        Ok(0)
+    }
+
+    /// Get all dynamically added bots.
+    async fn get_dynamic_bots(&self) -> anyhow::Result<Vec<DynamicBot>> {
+        Ok(vec![])
+    }
+
+    /// Delete a dynamic bot by ID.
+    #[allow(dead_code)]
+    async fn delete_dynamic_bot(&self, _id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    // ==================== Dynamic Skills Methods ====================
+    // For runtime skill management via manage_skills tool.
+
+    /// Store a dynamically added skill.
+    async fn add_dynamic_skill(&self, _skill: &DynamicSkill) -> anyhow::Result<i64> {
+        Ok(0)
+    }
+
+    /// Get all dynamic skills.
+    async fn get_dynamic_skills(&self) -> anyhow::Result<Vec<DynamicSkill>> {
+        Ok(vec![])
+    }
+
+    /// Delete a dynamic skill by ID.
+    async fn delete_dynamic_skill(&self, _id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Update the enabled flag of a dynamic skill.
+    async fn update_dynamic_skill_enabled(&self, _id: i64, _enabled: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Get procedures eligible for skill promotion (success_count >= min_success, success rate >= min_rate).
+    async fn get_promotable_procedures(&self, _min_success: i32, _min_rate: f32) -> anyhow::Result<Vec<Procedure>> {
+        Ok(vec![])
+    }
+}
+
+/// A dynamically added skill (stored in database).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicSkill {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub triggers_json: String, // JSON array of trigger strings
+    pub body: String,
+    pub source: String,        // "url", "inline", "auto", "registry"
+    pub source_url: Option<String>,
+    pub enabled: bool,
+    pub version: Option<String>,
+    pub created_at: String,
+}
+
+/// A dynamically added bot configuration (stored in database).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicBot {
+    pub id: i64,
+    pub channel_type: String,    // "telegram", "discord", "slack"
+    pub bot_token: String,
+    pub app_token: Option<String>, // Only for Slack
+    pub allowed_user_ids: Vec<String>, // Stored as JSON
+    pub extra_config: String,    // JSON for channel-specific settings
+    pub created_at: String,
 }
 
 /// Capabilities that vary by channel (Telegram, WhatsApp, SMS, Web, etc.).
@@ -355,8 +465,9 @@ pub struct ChannelCapabilities {
 /// need to implement this trait to integrate with aidaemon.
 #[async_trait]
 pub trait Channel: Send + Sync {
-    /// Unique name for this channel (e.g., "telegram", "web", "sms").
-    fn name(&self) -> &str;
+    /// Unique name for this channel (e.g., "telegram", "telegram:my_bot", "discord").
+    /// For multi-bot setups, includes the bot username (e.g., "telegram:coding_bot").
+    fn name(&self) -> String;
 
     /// Channel capabilities — used to adapt output format.
     fn capabilities(&self) -> ChannelCapabilities;

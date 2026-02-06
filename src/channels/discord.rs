@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,10 +17,10 @@ use serenity::Client;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use super::formatting::{format_number, sanitize_filename, split_message};
+use super::formatting::{build_help_text, format_number, sanitize_filename, split_message};
 use crate::agent::Agent;
 use crate::types::StatusUpdate;
-use crate::channels::SessionMap;
+use crate::channels::{ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
@@ -29,6 +29,9 @@ use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 
 /// Discord channel implementation using the serenity library.
 pub struct DiscordChannel {
+    /// Bot username fetched from Discord API (e.g., "my_bot").
+    /// Populated on first start() call.
+    bot_username: std::sync::RwLock<String>,
     bot_token: String,
     allowed_user_ids: Vec<u64>,
     guild_id: Option<u64>,
@@ -43,6 +46,8 @@ pub struct DiscordChannel {
     state: Arc<dyn StateStore>,
     /// Stored after the client starts so we can send messages via the REST API.
     http: Mutex<Option<Arc<serenity::http::Http>>>,
+    /// Reference to the channel hub for dynamic bot registration.
+    channel_hub: std::sync::RwLock<Option<Weak<ChannelHub>>>,
 }
 
 impl DiscordChannel {
@@ -60,6 +65,7 @@ impl DiscordChannel {
         state: Arc<dyn StateStore>,
     ) -> Self {
         Self {
+            bot_username: std::sync::RwLock::new("discord".to_string()),
             bot_token: bot_token.to_string(),
             allowed_user_ids,
             guild_id,
@@ -73,6 +79,46 @@ impl DiscordChannel {
             max_file_size_mb,
             state,
             http: Mutex::new(None),
+            channel_hub: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Set the channel hub reference for dynamic bot registration.
+    pub fn set_channel_hub(&self, hub: Weak<ChannelHub>) {
+        if let Ok(mut guard) = self.channel_hub.write() {
+            *guard = Some(hub);
+        }
+    }
+
+    /// Get the bot's username (cached after first start).
+    fn get_bot_username(&self) -> String {
+        self.bot_username.read().unwrap().clone()
+    }
+
+    /// Set the bot's username (called during start() after fetching from API).
+    fn set_bot_username(&self, username: String) {
+        if let Ok(mut guard) = self.bot_username.write() {
+            *guard = username;
+        }
+    }
+
+    /// Build the session ID for a channel/user, prefixing with bot name if not "discord".
+    fn session_id(&self, base_id: &str) -> String {
+        let username = self.get_bot_username();
+        if username == "discord" {
+            base_id.to_string()
+        } else {
+            format!("{}:{}", username, base_id)
+        }
+    }
+
+    /// Get the channel identifier for the session map.
+    fn channel_name(&self) -> String {
+        let username = self.get_bot_username();
+        if username == "discord" {
+            "discord".to_string()
+        } else {
+            format!("discord:{}", username)
         }
     }
 
@@ -137,14 +183,21 @@ impl DiscordChannel {
 
     /// Resolve a session ID to a ChannelId we can send messages to.
     async fn resolve_channel_id(&self, session_id: &str) -> anyhow::Result<ChannelId> {
-        // Session ID format: "discord:dm:{user_id}" or "discord:ch:{channel_id}"
+        // Session ID format: "{bot_name}:discord:dm:{user_id}" or "discord:dm:{user_id}" (for default)
+        // Strip the bot name prefix if present
+        let base_session_id = if self.name() != "default" {
+            session_id.strip_prefix(&format!("{}:", self.name())).unwrap_or(session_id)
+        } else {
+            session_id
+        };
+
         let http = self.get_http().await?;
-        if let Some(user_id_str) = session_id.strip_prefix("discord:dm:") {
+        if let Some(user_id_str) = base_session_id.strip_prefix("discord:dm:") {
             let user_id: u64 = user_id_str.parse()?;
             let user = serenity::model::id::UserId::new(user_id);
             let dm_channel = user.create_dm_channel(&http).await?;
             Ok(dm_channel.id)
-        } else if let Some(channel_id_str) = session_id.strip_prefix("discord:ch:") {
+        } else if let Some(channel_id_str) = base_session_id.strip_prefix("discord:ch:") {
             let channel_id: u64 = channel_id_str.parse()?;
             Ok(ChannelId::new(channel_id))
         } else {
@@ -166,12 +219,13 @@ impl DiscordChannel {
     }
 
     /// Build a session ID from a Discord message.
-    fn session_id_from_message(msg: &SerenityMessage) -> String {
-        if msg.guild_id.is_some() {
+    fn session_id_from_message(&self, msg: &SerenityMessage) -> String {
+        let base = if msg.guild_id.is_some() {
             format!("discord:ch:{}", msg.channel_id)
         } else {
             format!("discord:dm:{}", msg.author.id)
-        }
+        };
+        self.session_id(&base)
     }
 
     /// Handle an incoming Discord message.
@@ -239,12 +293,12 @@ impl DiscordChannel {
             return;
         }
 
-        let session_id = Self::session_id_from_message(&msg);
+        let session_id = self.session_id_from_message(&msg);
 
         // Register this session with the channel hub
         {
             let mut map = self.session_map.write().await;
-            map.insert(session_id.clone(), "discord".to_string());
+            map.insert(session_id.clone(), self.channel_name());
         }
 
         info!(session_id, "Received Discord message from user {}", user_id);
@@ -299,11 +353,52 @@ impl DiscordChannel {
                     StatusUpdate::ToolCancellable { name, task_id } => {
                         format!("⏳ {} started (task_id: {})", name, task_id)
                     }
+                    StatusUpdate::ProgressSummary { elapsed_mins, summary } => {
+                        format!("📊 Progress ({} min): {}", elapsed_mins, summary)
+                    }
+                    StatusUpdate::IterationWarning { current, threshold } => {
+                        format!("⚠️ Approaching soft limit: {} of {} iterations", current, threshold)
+                    }
+                    StatusUpdate::PlanCreated { description, total_steps, .. } => {
+                        format!("📋 Plan created: {} ({} steps)", description, total_steps)
+                    }
+                    StatusUpdate::PlanStepStart { step_index, total_steps, description, .. } => {
+                        format!("▶️ Step {}/{}: {}", step_index + 1, total_steps, description)
+                    }
+                    StatusUpdate::PlanStepComplete { step_index, total_steps, description, summary, .. } => {
+                        let base = format!("✅ Step {}/{} done: {}", step_index + 1, total_steps, description);
+                        if let Some(s) = summary {
+                            format!("{} - {}", base, s)
+                        } else {
+                            base
+                        }
+                    }
+                    StatusUpdate::PlanStepFailed { step_index, description, error, .. } => {
+                        format!("❌ Step {} failed: {} - {}", step_index + 1, description, error)
+                    }
+                    StatusUpdate::PlanComplete { description, total_steps, duration_secs, .. } => {
+                        let mins = duration_secs / 60;
+                        let secs = duration_secs % 60;
+                        format!("🎉 Plan complete: {} ({} steps in {}m {}s)", description, total_steps, mins, secs)
+                    }
+                    StatusUpdate::PlanAbandoned { description, .. } => {
+                        format!("🚫 Plan abandoned: {}", description)
+                    }
+                    StatusUpdate::PlanRevised { description, reason, new_total_steps, .. } => {
+                        format!("🔄 Plan revised: {} ({} steps) - {}", description, new_total_steps, reason)
+                    }
                 };
                 let _ = status_channel_id.say(&status_http, &text).await;
                 last_sent = tokio::time::Instant::now();
             }
         });
+
+        // Cancel any stale running tasks for this session before starting a new one.
+        let cancelled = self.task_registry.cancel_running_for_session(&session_id).await;
+        if !cancelled.is_empty() {
+            let cancelled_descriptions: Vec<_> = cancelled.iter().map(|(id, desc)| format!("#{}: {}", id, desc)).collect();
+            info!(session_id, cancelled = ?cancelled_descriptions, "Cancelled stale tasks for new message");
+        }
 
         // Register task for tracking
         let description: String = text.chars().take(80).collect();
@@ -335,6 +430,11 @@ impl DiscordChannel {
                 Err(e) => {
                     let error_msg = e.to_string();
                     registry.fail(task_id, &error_msg).await;
+                    // Don't notify user about task cancellation - it's expected when they send a new message
+                    if error_msg == "Task cancelled" {
+                        info!("Task #{} cancelled (new message received)", task_id);
+                        return;
+                    }
                     warn!("Agent error: {}", e);
                     let _ = channel_id
                         .say(&http, format!("Error: {}", e))
@@ -351,7 +451,7 @@ impl DiscordChannel {
         msg: &SerenityMessage,
         text: &str,
     ) {
-        let reply = self.dispatch_command(text, &Self::session_id_from_message(msg)).await;
+        let reply = self.dispatch_command(text, &self.session_id_from_message(msg)).await;
         let chunks = split_message(&reply, 2000);
         for chunk in &chunks {
             let _ = msg.channel_id.say(&ctx.http, chunk).await;
@@ -385,11 +485,12 @@ impl DiscordChannel {
             )
             .await;
 
-        let session_id = if command.guild_id.is_some() {
+        let base_session = if command.guild_id.is_some() {
             format!("discord:ch:{}", command.channel_id)
         } else {
             format!("discord:dm:{}", command.user.id)
         };
+        let session_id = self.session_id(&base_session);
 
         let arg = command
             .data
@@ -531,18 +632,7 @@ impl DiscordChannel {
             }
             "/cost" => self.handle_cost_command().await,
             "/help" | "/start" => {
-                "Available commands:\n\
-                /model — Show current model\n\
-                /model <name> — Switch to a different model\n\
-                /models — List available models from provider\n\
-                /auto — Re-enable automatic model routing\n\
-                /reload — Reload config.toml\n\
-                /tasks — List running and recent tasks\n\
-                /cancel <id> — Cancel a running task\n\
-                /clear — Clear conversation context and start fresh\n\
-                /cost — Show token usage statistics\n\
-                /help — Show this help message"
-                    .to_string()
+                build_help_text(false, false)
             }
             _ => format!(
                 "Unknown command: {}\nType /help for available commands.",
@@ -788,8 +878,8 @@ impl DiscordChannel {
 
 #[async_trait]
 impl Channel for DiscordChannel {
-    fn name(&self) -> &str {
-        "discord"
+    fn name(&self) -> String {
+        self.channel_name()
     }
 
     fn capabilities(&self) -> ChannelCapabilities {
@@ -981,7 +1071,9 @@ struct DiscordHandler {
 #[async_trait]
 impl EventHandler for DiscordHandler {
     async fn ready(&self, ctx: Context, ready: Ready) {
-        info!("Discord bot connected as {}", ready.user.name);
+        let username = ready.user.name.clone();
+        info!(username = %username, "Discord bot connected");
+        self.channel.set_bot_username(username);
         self.channel.register_commands(&ctx).await;
     }
 
@@ -1002,4 +1094,12 @@ impl EventHandler for DiscordHandler {
             _ => {}
         }
     }
+}
+
+/// Spawn a DiscordChannel in a background task.
+/// This is a separate function to avoid async type inference cycles.
+pub fn spawn_discord_channel(channel: Arc<DiscordChannel>) {
+    tokio::spawn(async move {
+        channel.start_with_retry().await;
+    });
 }

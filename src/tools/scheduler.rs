@@ -71,7 +71,9 @@ impl Tool for SchedulerTool {
     }
 
     fn description(&self) -> &str {
-        "Create, list, delete, pause, and resume scheduled tasks and reminders"
+        "Create, list, delete, pause, and resume scheduled tasks and reminders. \
+         IMPORTANT: ALWAYS ask the user for confirmation before creating a new scheduled task. \
+         Never create schedules automatically or assume the user wants something scheduled."
     }
 
     fn schema(&self) -> Value {
