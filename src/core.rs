@@ -436,7 +436,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     ));
 
     // Close the loop: give the spawn tool a weak reference to the agent.
-    if let Some(st) = spawn_tool {
+    if let Some(ref st) = spawn_tool {
         st.set_agent(Arc::downgrade(&agent));
     }
 
@@ -673,6 +673,11 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 12. Channel Hub — routes approvals, media, and notifications
     let hub = Arc::new(ChannelHub::new(channels, session_map));
+
+    // Give the spawn tool a reference to the hub for background mode notifications.
+    if let Some(st) = spawn_tool {
+        st.set_hub(Arc::downgrade(&hub));
+    }
 
     // Give all channels a reference to the hub for dynamic bot registration
     let weak_hub = Arc::downgrade(&hub);
@@ -1047,9 +1052,12 @@ fn build_base_system_prompt(config: &AppConfig) -> String {
     let spawn_tool_doc = if config.subagents.enabled {
         format!(
             "\n- `spawn_agent`: Spawn a sub-agent to handle a complex sub-task autonomously. \
-            Parameters: `mission` (high-level role, e.g. 'Research assistant for Python packaging') \
-            and `task` (the specific question or job). The sub-agent gets its own reasoning loop \
-            with access to all tools. Use this when a task benefits from isolated, focused context. \
+            Parameters: `mission` (high-level role, e.g. 'Research assistant for Python packaging'), \
+            `task` (the specific question or job), and optional `background` (boolean, default false). \
+            The sub-agent gets its own reasoning loop with access to all tools. \
+            Use this when a task benefits from isolated, focused context. \
+            Set `background: true` for long-running tasks — the agent returns immediately and \
+            the result is sent as a message when the sub-agent finishes. \
             Sub-agents can nest up to {} levels deep.",
             config.subagents.max_depth
         )

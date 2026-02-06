@@ -15,6 +15,7 @@ use crate::events::{
     EventStore, EventType, TaskStatus,
     TaskStartData, TaskEndData, ThinkingStartData, ToolCallData, ToolResultData,
     UserMessageData, AssistantResponseData, ToolCallInfo, ErrorData,
+    SubAgentSpawnData, SubAgentCompleteData,
 };
 use crate::plans::{PlanStore, StepTracker};
 use crate::providers::{ProviderError, ProviderErrorKind};
@@ -308,6 +309,7 @@ impl Agent {
         self: &Arc<Self>,
         mission: &str,
         task: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
         if self.depth >= self.max_depth {
             anyhow::bail!(
@@ -354,9 +356,31 @@ impl Agent {
             "Spawning sub-agent"
         );
 
+        // Emit SubAgentSpawn event
+        {
+            let emitter = crate::events::EventEmitter::new(
+                self.event_store.clone(),
+                child_session.clone(),
+            );
+            let _ = emitter
+                .emit(
+                    EventType::SubAgentSpawn,
+                    SubAgentSpawnData {
+                        child_session_id: child_session.clone(),
+                        mission: mission.to_string(),
+                        task: task.chars().take(500).collect(),
+                        depth: child_depth as u32,
+                        parent_task_id: None,
+                    },
+                )
+                .await;
+        }
+
+        let start = std::time::Instant::now();
+
         // If the child can still recurse, give it a spawn tool with a deferred
         // agent reference (set after wrapping in Arc).
-        if child_depth < self.max_depth {
+        let result = if child_depth < self.max_depth {
             let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(
                 self.max_response_chars,
                 self.timeout_secs,
@@ -389,7 +413,9 @@ impl Agent {
             // Close the loop: give the spawn tool a weak ref to the child.
             spawn_tool.set_agent(Arc::downgrade(&child));
 
-            child.handle_message(&child_session, task, None).await
+            child
+                .handle_message(&child_session, task, status_tx)
+                .await
         } else {
             // At max depth — no spawn tool, no recursion.
             let child = Arc::new(Agent::with_depth(
@@ -413,8 +439,38 @@ impl Agent {
                 self.task_token_budget,
             ));
 
-            child.handle_message(&child_session, task, None).await
+            child
+                .handle_message(&child_session, task, status_tx)
+                .await
+        };
+
+        let duration = start.elapsed();
+
+        // Emit SubAgentComplete event
+        {
+            let emitter = crate::events::EventEmitter::new(
+                self.event_store.clone(),
+                child_session.clone(),
+            );
+            let (success, summary) = match &result {
+                Ok(response) => (true, response.chars().take(200).collect()),
+                Err(e) => (false, format!("{}", e)),
+            };
+            let _ = emitter
+                .emit(
+                    EventType::SubAgentComplete,
+                    SubAgentCompleteData {
+                        child_session_id: child_session,
+                        success,
+                        result_summary: summary,
+                        duration_secs: duration.as_secs(),
+                        parent_task_id: None,
+                    },
+                )
+                .await;
         }
+
+        result
     }
 
     /// Get the current model name.

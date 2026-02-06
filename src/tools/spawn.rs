@@ -1,12 +1,14 @@
-use std::sync::{OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{error, info};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, StatusUpdate};
+use crate::channels::ChannelHub;
 use crate::traits::Tool;
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
@@ -20,6 +22,7 @@ use crate::traits::Tool;
 /// after the owning `Arc<Agent>` is constructed.
 pub struct SpawnAgentTool {
     agent: OnceLock<Weak<Agent>>,
+    hub: OnceLock<Weak<ChannelHub>>,
     max_response_chars: usize,
     timeout_secs: u64,
 }
@@ -32,6 +35,7 @@ impl SpawnAgentTool {
         let _ = lock.set(agent);
         Self {
             agent: lock,
+            hub: OnceLock::new(),
             max_response_chars,
             timeout_secs,
         }
@@ -42,6 +46,7 @@ impl SpawnAgentTool {
     pub fn new_deferred(max_response_chars: usize, timeout_secs: u64) -> Self {
         Self {
             agent: OnceLock::new(),
+            hub: OnceLock::new(),
             max_response_chars,
             timeout_secs,
         }
@@ -62,6 +67,15 @@ impl SpawnAgentTool {
             .ok_or_else(|| anyhow::anyhow!("SpawnAgentTool: agent reference not set"))?;
         weak.upgrade()
             .ok_or_else(|| anyhow::anyhow!("SpawnAgentTool: parent agent has been dropped"))
+    }
+
+    /// Set the channel hub reference for background mode notifications.
+    pub fn set_hub(&self, hub: Weak<ChannelHub>) {
+        let _ = self.hub.set(hub);
+    }
+
+    fn get_hub(&self) -> Option<Arc<ChannelHub>> {
+        self.hub.get().and_then(|w| w.upgrade())
     }
 }
 
@@ -87,6 +101,12 @@ struct SpawnArgs {
     mission: String,
     /// The concrete task or question the sub-agent should work on.
     task: String,
+    /// When true, spawn the sub-agent in the background and return immediately.
+    #[serde(default)]
+    background: bool,
+    /// Session ID injected by execute_tool — used for background completion notifications.
+    #[serde(default)]
+    _session_id: Option<String>,
 }
 
 #[async_trait]
@@ -118,6 +138,13 @@ impl Tool for SpawnAgentTool {
                     "task": {
                         "type": "string",
                         "description": "The specific task or question the sub-agent should accomplish"
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "When true, spawn the sub-agent in the background and return immediately. \
+                            The result will be sent as a message when the sub-agent finishes. \
+                            Use this for long-running tasks where the user doesn't need to wait.",
+                        "default": false
                     }
                 },
                 "required": ["mission", "task"]
@@ -126,6 +153,14 @@ impl Tool for SpawnAgentTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.call_with_status(arguments, None).await
+    }
+
+    async fn call_with_status(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
         let args: SpawnArgs = serde_json::from_str(arguments)?;
         let agent = self.get_agent()?;
 
@@ -133,15 +168,98 @@ impl Tool for SpawnAgentTool {
             depth = agent.depth(),
             max_depth = agent.max_depth(),
             mission = %args.mission,
+            background = args.background,
             "spawn_agent tool invoked"
         );
 
+        if !args.background {
+            return self.run_sync(agent, &args.mission, &args.task, status_tx).await;
+        }
+
+        // Background mode: need hub + session_id, fall back to sync if unavailable
+        let hub = match self.get_hub() {
+            Some(h) => h,
+            None => {
+                info!("Background mode requested but hub not available, falling back to sync");
+                return self.run_sync(agent, &args.mission, &args.task, status_tx).await;
+            }
+        };
+        let session_id = match args._session_id {
+            Some(ref id) if !id.is_empty() => id.clone(),
+            _ => {
+                info!("Background mode requested but no session_id, falling back to sync");
+                return self.run_sync(agent, &args.mission, &args.task, status_tx).await;
+            }
+        };
+
+        let mission = args.mission.clone();
+        let timeout_secs = self.timeout_secs;
+        let max_response_chars = self.max_response_chars;
+
+        tokio::spawn(async move {
+            let timeout_duration = Duration::from_secs(timeout_secs);
+            let result = tokio::time::timeout(
+                timeout_duration,
+                agent.spawn_child(&mission, &args.task, status_tx),
+            )
+            .await;
+
+            let message = match result {
+                Ok(Ok(response)) => {
+                    let text = if response.len() > max_response_chars {
+                        truncate_utf8(&response, max_response_chars).to_string()
+                    } else {
+                        response
+                    };
+                    format!(
+                        "\u{2705} Background task complete\nMission: {}\n\n{}",
+                        mission, text
+                    )
+                }
+                Ok(Err(e)) => {
+                    format!(
+                        "\u{274c} Background task failed\nMission: {}\nError: {}",
+                        mission, e
+                    )
+                }
+                Err(_) => {
+                    format!(
+                        "\u{23f1} Background task timed out\nMission: {}\nTimed out after {}s",
+                        mission, timeout_secs
+                    )
+                }
+            };
+
+            if let Err(e) = hub.send_text(&session_id, &message).await {
+                error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to send background task result"
+                );
+            }
+        });
+
+        Ok(format!(
+            "Sub-agent spawned in background for mission: \"{}\". \
+             The result will be sent as a message when it completes.",
+            args.mission
+        ))
+    }
+}
+
+impl SpawnAgentTool {
+    /// Run the sub-agent synchronously (blocking until completion or timeout).
+    async fn run_sync(
+        &self,
+        agent: Arc<Agent>,
+        mission: &str,
+        task: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
-        let result = tokio::time::timeout(
-            timeout_duration,
-            agent.spawn_child(&args.mission, &args.task),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(timeout_duration, agent.spawn_child(mission, task, status_tx))
+                .await;
 
         match result {
             Ok(Ok(response)) => {
@@ -224,5 +342,28 @@ mod tests {
         assert_eq!(cfg.max_iterations, 10);
         assert_eq!(cfg.max_response_chars, 8000);
         assert_eq!(cfg.timeout_secs, 300);
+    }
+
+    #[test]
+    fn deferred_hub_not_set() {
+        let tool = SpawnAgentTool::new_deferred(8000, 300);
+        assert!(tool.get_hub().is_none());
+    }
+
+    #[test]
+    fn spawn_args_background_default() {
+        let json = r#"{"mission": "test", "task": "do stuff"}"#;
+        let args: SpawnArgs = serde_json::from_str(json).unwrap();
+        assert!(!args.background);
+        assert!(args._session_id.is_none());
+    }
+
+    #[test]
+    fn spawn_args_background_true() {
+        let json =
+            r#"{"mission": "test", "task": "do stuff", "background": true, "_session_id": "tg:123"}"#;
+        let args: SpawnArgs = serde_json::from_str(json).unwrap();
+        assert!(args.background);
+        assert_eq!(args._session_id.as_deref(), Some("tg:123"));
     }
 }
