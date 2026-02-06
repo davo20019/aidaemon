@@ -67,6 +67,14 @@ If you don't care about resource usage and want more channels (WhatsApp, Signal,
 
 ## Quick Start
 
+### One-line install (any VPS / Linux / macOS)
+
+```bash
+curl -sSfL https://get.aidaemon.ai | bash
+```
+
+Downloads the latest binary, verifies its SHA256 checksum, and installs to `/usr/local/bin`.
+
 ### Homebrew (macOS / Linux)
 
 ```bash
@@ -342,7 +350,7 @@ Both projects share the same goal: a self-hosted AI assistant you control. The k
 | **Config** | Single `config.toml` with keychain secrets | JSON5 config with hot-reload and file watching |
 | **Error recovery** | Inline error classification per HTTP status, model fallback, config backup rotation | Multi-layer retry policies, auth profile cooldowns, provider rotation, restart sentinels |
 | **State** | SQLite + in-memory working memory (optional encryption) | Pluggable storage with session management |
-| **Install** | `cargo install aidaemon` | npm/Docker |
+| **Install** | `curl -sSfL https://get.aidaemon.ai \| bash` | npm/Docker |
 | **Dependencies** | ~30 crates, single static binary | Node.js ecosystem |
 
 aidaemon is designed for users who want a lightweight daemon in Rust with essential features. If you need more channels (WhatsApp, Signal, iMessage) or a richer plugin ecosystem, check out OpenClaw.
