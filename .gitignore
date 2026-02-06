@@ -11,4 +11,12 @@ config.toml
 !src/dashboard.html
 .DS_Store
 .fastembed_cache/
-moltbook_bot.py
+
+# Personal/temp files — not part of aidaemon
+*.py
+*.json
+!package.json
+*.png
+projects/
+sh-vs-ch-pronunciation-guide/
+PLAN_*.md
