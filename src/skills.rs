@@ -1,5 +1,8 @@
 use std::path::Path;
+use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::traits::{
@@ -7,12 +10,81 @@ use crate::traits::{
     UserProfile,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub triggers: Vec<String>,
     pub body: String,
+    /// Where this skill came from: "filesystem", "url", "inline", "auto"
+    #[serde(default)]
+    pub source: Option<String>,
+    /// URL this skill was fetched from (if source is "url")
+    #[serde(default)]
+    pub source_url: Option<String>,
+    /// Database ID for dynamic skills (None for filesystem skills)
+    #[serde(default)]
+    pub id: Option<i64>,
+    /// Whether the skill is enabled (defaults to true)
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// Thread-safe, shared skill registry. Used by Agent, UseSkillTool, and ManageSkillsTool.
+#[derive(Clone)]
+pub struct SharedSkillRegistry {
+    inner: Arc<RwLock<Vec<Skill>>>,
+}
+
+impl SharedSkillRegistry {
+    pub fn new(skills: Vec<Skill>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(skills)),
+        }
+    }
+
+    /// Add a skill to the registry.
+    pub async fn add(&self, skill: Skill) {
+        self.inner.write().await.push(skill);
+    }
+
+    /// Remove a skill by name. Returns true if found and removed.
+    pub async fn remove(&self, name: &str) -> bool {
+        let mut skills = self.inner.write().await;
+        let len_before = skills.len();
+        skills.retain(|s| s.name != name);
+        skills.len() < len_before
+    }
+
+    /// Get a snapshot of all enabled skills.
+    pub async fn snapshot(&self) -> Vec<Skill> {
+        self.inner.read().await.iter().filter(|s| s.enabled).cloned().collect()
+    }
+
+    /// Get a snapshot of all skills (including disabled).
+    pub async fn snapshot_all(&self) -> Vec<Skill> {
+        self.inner.read().await.clone()
+    }
+
+    /// Find a skill by name (among enabled skills).
+    pub async fn find(&self, name: &str) -> Option<Skill> {
+        self.inner.read().await.iter().find(|s| s.name == name && s.enabled).cloned()
+    }
+
+    /// Set the enabled flag for a skill by name. Returns true if found.
+    pub async fn set_enabled(&self, name: &str, enabled: bool) -> bool {
+        let mut skills = self.inner.write().await;
+        if let Some(skill) = skills.iter_mut().find(|s| s.name == name) {
+            skill.enabled = enabled;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Skill {
@@ -61,6 +133,10 @@ impl Skill {
             description: description.unwrap_or_default(),
             triggers,
             body,
+            source: None,
+            source_url: None,
+            id: None,
+            enabled: true,
         })
     }
 }
@@ -218,7 +294,7 @@ pub async fn confirm_skills<'a>(
 ///
 /// `max_facts` caps the number of facts injected into the prompt. Facts are
 /// assumed to arrive ordered by most-recently-updated first (from `get_facts()`).
-#[allow(dead_code)] // Reserved for future use - replaced by build_system_prompt_with_memory
+#[allow(dead_code)] // Kept for backwards compatibility, use build_system_prompt_with_memory instead
 pub fn build_system_prompt(
     base: &str,
     skills: &[Skill],
@@ -268,6 +344,8 @@ pub struct MemoryContext<'a> {
     pub error_solutions: &'a [ErrorSolution],
     pub expertise: &'a [Expertise],
     pub profile: Option<&'a UserProfile>,
+    /// Trusted command patterns (pattern string, approval count)
+    pub trusted_command_patterns: &'a [(String, i32)],
 }
 
 /// Build the complete system prompt with all memory components.
@@ -280,6 +358,7 @@ pub fn build_system_prompt_with_memory(
     active: &[&Skill],
     memory: &MemoryContext,
     max_facts: usize,
+    suggestions: Option<&[crate::memory::proactive::Suggestion]>,
 ) -> String {
     let mut prompt = base.to_string();
 
@@ -422,7 +501,29 @@ pub fn build_system_prompt_with_memory(
         }
     }
 
-    // 9. Available Skills
+    // 9. Trusted Command Patterns
+    if !memory.trusted_command_patterns.is_empty() {
+        prompt.push_str("\n\n## Trusted Command Patterns\n");
+        prompt.push_str("These command patterns have been approved multiple times and will have reduced approval friction:\n");
+        for (pattern, count) in memory.trusted_command_patterns.iter().take(10) {
+            prompt.push_str(&format!("- `{}` (approved {}x)\n", pattern, count));
+        }
+        prompt.push_str("\nWhen suggesting terminal commands, prefer simpler commands over complex pipelines. ");
+        prompt.push_str("If a pipeline is necessary, explain why each part is needed.\n");
+    }
+
+    // 10. Contextual Suggestions (if user likes them)
+    if let Some(suggestions) = suggestions {
+        if !suggestions.is_empty() {
+            prompt.push_str("\n\n## Contextual Suggestions\n");
+            prompt.push_str("Consider these if relevant (do not force):\n");
+            for s in suggestions.iter().take(3) {
+                prompt.push_str(&format!("- {}\n", s.text));
+            }
+        }
+    }
+
+    // 10. Available Skills
     if !skills.is_empty() {
         prompt.push_str("\n\n## Available Skills\n");
         for skill in skills {
@@ -521,6 +622,10 @@ mod tests {
             description: format!("{} skill", name),
             triggers: triggers.iter().map(|t| t.to_lowercase()).collect(),
             body: String::new(),
+            source: None,
+            source_url: None,
+            id: None,
+            enabled: true,
         }
     }
 

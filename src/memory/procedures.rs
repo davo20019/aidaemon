@@ -4,9 +4,9 @@
 //! - Learning successful action sequences from task completions
 //! - Generalizing procedures to be reusable
 //! - Error-solution pair learning
-#![allow(dead_code)] // Reserved for future procedural learning feature
 
 use regex::Regex;
+#[allow(unused_imports)]
 use crate::traits::{ErrorSolution, Message, Procedure};
 use chrono::Utc;
 use std::sync::OnceLock;
@@ -28,6 +28,7 @@ fn line_num_regex() -> &'static Regex {
 }
 
 /// Extract action sequence from a conversation (tool calls made).
+#[allow(dead_code)] // Reserved for advanced procedure extraction from full conversation
 pub fn extract_action_sequence(messages: &[Message]) -> Vec<String> {
     let mut actions = Vec::new();
 
@@ -50,6 +51,7 @@ pub fn extract_action_sequence(messages: &[Message]) -> Vec<String> {
 }
 
 /// Summarize tool arguments into a brief representation.
+#[allow(dead_code)] // Used by extract_action_sequence
 fn summarize_tool_args(tool_name: &str, args_json: &str) -> String {
     let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
 

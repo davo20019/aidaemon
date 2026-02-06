@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::tools::terminal::ApprovalRequest;
 use crate::traits::Channel;
@@ -20,16 +20,28 @@ pub type SessionMap = Arc<RwLock<HashMap<String, String>>>;
 /// If the session's channel is unknown, it falls back to the first
 /// registered channel.
 pub struct ChannelHub {
-    channels: Vec<Arc<dyn Channel>>,
+    /// Registered channels. Uses RwLock to support dynamic registration.
+    channels: RwLock<Vec<Arc<dyn Channel>>>,
     session_map: SessionMap,
 }
 
 impl ChannelHub {
     pub fn new(channels: Vec<Arc<dyn Channel>>, session_map: SessionMap) -> Self {
         Self {
-            channels,
+            channels: RwLock::new(channels),
             session_map,
         }
+    }
+
+    /// Register a new channel dynamically.
+    /// Returns the channel name after registration.
+    #[allow(dead_code)]
+    pub async fn register_channel(&self, channel: Arc<dyn Channel>) -> String {
+        let name = channel.name();
+        let mut channels = self.channels.write().await;
+        channels.push(channel);
+        info!(channel = %name, total = channels.len(), "Registered new channel");
+        name
     }
 
     /// Get a reference to the shared session map.
@@ -41,13 +53,14 @@ impl ChannelHub {
     /// Find the channel that owns a session, falling back to the first channel.
     async fn channel_for_session(&self, session_id: &str) -> Option<Arc<dyn Channel>> {
         let map = self.session_map.read().await;
+        let channels = self.channels.read().await;
         if let Some(channel_name) = map.get(session_id) {
-            if let Some(ch) = self.channels.iter().find(|c| c.name() == channel_name) {
+            if let Some(ch) = channels.iter().find(|c| &c.name() == channel_name) {
                 return Some(ch.clone());
             }
         }
         // Fallback: first registered channel
-        self.channels.first().cloned()
+        channels.first().cloned()
     }
 
     /// Route approval requests from tools to the appropriate channel.

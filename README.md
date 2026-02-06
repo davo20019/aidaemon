@@ -10,7 +10,7 @@ I built this because I wanted to control my computer from my phone, from anywher
 
 aidaemon runs 24/7 as a background daemon. It needs to be small, fast, and run on anything:
 
-- **Runs on cheap/old hardware** - ~10 MB idle memory. A Node.js process sits at 50-80 MB doing nothing. On a Raspberry Pi or a $5 VPS with 512 MB RAM, that difference is the difference between running and not running.
+- **Runs on cheap/old hardware** - a lightweight Rust binary. On a Raspberry Pi or a $5 VPS with 512 MB RAM, it runs comfortably where heavier runtimes won't.
 - **Single binary, zero runtime** - `cargo install aidaemon` gives you one binary. No Node.js, no Python, no Docker. Copy it to any machine and run it.
 - **Startup in milliseconds** - restarts after a crash are near-instant, which matters for the auto-recovery retry loop.
 - **No garbage collector** - predictable latency. No GC pauses between receiving the LLM response and sending the reply.

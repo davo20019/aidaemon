@@ -173,35 +173,54 @@ impl SearchBackend for BraveBackend {
             &[("q", query), ("count", &max_results.to_string())],
         )?
         .to_string();
-        let resp = self
-            .client
-            .get(&url)
-            .header("X-Subscription-Token", &self.api_key)
-            .header("Accept", "application/json")
-            .send()
-            .await?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!("Brave search API error: HTTP {}", resp.status());
+        // Retry with exponential backoff for rate limiting (429)
+        let max_retries = 3;
+        let mut last_status = reqwest::StatusCode::OK;
+
+        for attempt in 0..max_retries {
+            let resp = self
+                .client
+                .get(&url)
+                .header("X-Subscription-Token", &self.api_key)
+                .header("Accept", "application/json")
+                .send()
+                .await?;
+
+            last_status = resp.status();
+
+            if resp.status().is_success() {
+                let data: Value = resp.json().await?;
+                let empty = vec![];
+                let web_results = data["web"]["results"].as_array().unwrap_or(&empty);
+
+                let results = web_results
+                    .iter()
+                    .take(max_results)
+                    .filter_map(|r| {
+                        Some(SearchResult {
+                            title: r["title"].as_str()?.to_string(),
+                            url: r["url"].as_str()?.to_string(),
+                            snippet: r["description"].as_str().unwrap_or("").to_string(),
+                        })
+                    })
+                    .collect();
+
+                return Ok(results);
+            }
+
+            // Retry on 429 (rate limited) with exponential backoff
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < max_retries - 1 {
+                let delay_secs = 2u64.pow(attempt as u32); // 1s, 2s, 4s
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                continue;
+            }
+
+            // Non-retryable error or exhausted retries
+            break;
         }
 
-        let data: Value = resp.json().await?;
-        let empty = vec![];
-        let web_results = data["web"]["results"].as_array().unwrap_or(&empty);
-
-        let results = web_results
-            .iter()
-            .take(max_results)
-            .filter_map(|r| {
-                Some(SearchResult {
-                    title: r["title"].as_str()?.to_string(),
-                    url: r["url"].as_str()?.to_string(),
-                    snippet: r["description"].as_str().unwrap_or("").to_string(),
-                })
-            })
-            .collect();
-
-        Ok(results)
+        anyhow::bail!("Brave search API error: HTTP {}", last_status)
     }
 }
 

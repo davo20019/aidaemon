@@ -4,8 +4,14 @@ mod config;
 mod core;
 mod daemon;
 mod dashboard;
+#[allow(dead_code)]
+mod events;
+#[allow(dead_code)]
+mod health;
 mod mcp;
 mod memory;
+#[allow(dead_code)]
+mod plans;
 mod providers;
 mod router;
 mod scheduler;
@@ -16,6 +22,8 @@ mod traits;
 mod tasks;
 mod types;
 mod triggers;
+mod updater;
+pub mod utils;
 mod wizard;
 
 use std::path::PathBuf;
@@ -55,6 +63,7 @@ fn main() -> anyhow::Result<()> {
                 println!("Usage: aidaemon [COMMAND]\n");
                 println!("Commands:");
                 println!("  install-service  Install as a system service (launchd/systemd)");
+                println!("  check-update     Check for available updates");
                 println!("\nOptions:");
                 println!("  -h, --help       Print help");
                 println!("  -V, --version    Print version");
@@ -62,6 +71,29 @@ fn main() -> anyhow::Result<()> {
             }
             "install-service" => {
                 return daemon::install_service();
+            }
+            "check-update" => {
+                println!("Checking for updates...");
+                match updater::Updater::check_for_update() {
+                    Ok(Some((version, _notes))) => {
+                        println!(
+                            "Update available: v{} -> v{}",
+                            env!("CARGO_PKG_VERSION"),
+                            version
+                        );
+                    }
+                    Ok(None) => {
+                        println!(
+                            "aidaemon is up to date (v{}).",
+                            env!("CARGO_PKG_VERSION")
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Update check failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
             }
             _ => {}
         }

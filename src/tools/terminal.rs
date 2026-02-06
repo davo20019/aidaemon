@@ -14,6 +14,7 @@ use tracing::{info, warn};
 use crate::traits::Tool;
 use crate::types::ApprovalResponse;
 
+use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
 use super::command_risk::{classify_command, PermissionMode, RiskLevel};
 
 /// Max bytes per stream buffer (1 MB) to prevent unbounded memory growth.
@@ -53,8 +54,9 @@ pub struct TerminalTool {
     pool: Option<SqlitePool>,
 }
 
-/// Check if a command string contains shell operators that could chain
-/// additional commands or redirect I/O in unexpected ways.
+/// Check if a command string contains shell operators.
+/// Used for prefix matching - we don't allow prefix matches for commands with operators
+/// since "cargo" shouldn't match "cargo test | bash".
 fn contains_shell_operator(cmd: &str) -> bool {
     for ch in [';', '|', '`', '\n'] {
         if cmd.contains(ch) {
@@ -144,6 +146,11 @@ impl TerminalTool {
 
         // Load persisted prefixes from DB and merge with config defaults
         let mut merged = allowed_prefixes;
+
+        // YOLO mode: auto-approve everything
+        if permission_mode == PermissionMode::Yolo && !merged.contains(&"*".to_string()) {
+            merged.push("*".to_string());
+        }
         match sqlx::query_scalar::<_, String>(
             "SELECT prefix FROM terminal_allowed_prefixes"
         )
@@ -246,6 +253,10 @@ impl TerminalTool {
             .split_whitespace()
             .next()
             .unwrap_or(command.trim());
+        if prefix == "*" {
+            warn!("Refusing to add wildcard '*' as permanent prefix");
+            return;
+        }
         let mut prefixes = self.allowed_prefixes.write().await;
         if !prefixes.contains(&prefix.to_string()) {
             info!(prefix, "Adding to allowed command prefixes (persistent)");
@@ -609,13 +620,49 @@ impl Tool for TerminalTool {
                     .ok_or_else(|| anyhow::anyhow!("command is required for action=\"run\""))?;
 
                 // Classify command risk
-                let assessment = classify_command(command);
+                let mut assessment = classify_command(command);
+
+                // Check for learned patterns and potentially lower risk
+                if let Some(ref pool) = self.pool {
+                    if let Ok(Some((pattern, similarity))) = find_matching_pattern(pool, command).await {
+                        if pattern.is_trusted() && similarity >= 0.9 {
+                            // Trusted pattern with high similarity - lower risk by one level
+                            let original_level = assessment.level;
+                            assessment.level = match assessment.level {
+                                RiskLevel::Critical => RiskLevel::High,
+                                RiskLevel::High => RiskLevel::Medium,
+                                RiskLevel::Medium => RiskLevel::Safe,
+                                RiskLevel::Safe => RiskLevel::Safe,
+                            };
+                            if assessment.level != original_level {
+                                assessment.warnings.push(format!(
+                                    "Risk lowered: similar to trusted pattern '{}' (approved {}x)",
+                                    pattern.pattern, pattern.approval_count
+                                ));
+                                info!(
+                                    command = %command,
+                                    pattern = %pattern.pattern,
+                                    original_risk = %original_level,
+                                    new_risk = %assessment.level,
+                                    "Lowered risk based on learned pattern"
+                                );
+                            }
+                        } else if pattern.denial_count > pattern.approval_count {
+                            // Pattern is frequently denied - add warning
+                            assessment.warnings.push(format!(
+                                "Similar commands have been denied {}x",
+                                pattern.denial_count
+                            ));
+                        }
+                    }
+                }
 
                 // Check if this is a trusted scheduled session (auto-approve)
                 let is_trusted_session = args._session_id.starts_with("scheduled_");
 
                 // Determine if approval is needed
                 // Note: is_allowed() checks both permanent AND session-approved prefixes
+                let is_allowed = self.is_allowed(command).await;
                 let needs_approval = if args._untrusted_source {
                     // External triggers always need approval regardless of mode
                     info!(command = %command, risk = %assessment.level, "Forcing approval: untrusted source");
@@ -624,9 +671,14 @@ impl Tool for TerminalTool {
                     // Trusted scheduled tasks bypass approval
                     info!(command = %command, session = %args._session_id, "Auto-approved: trusted scheduled task");
                     false
+                } else if !is_allowed {
+                    true
+                } else if assessment.level == RiskLevel::Critical && self.permission_mode != PermissionMode::Yolo {
+                    // Even with wildcard/prefix approval, Critical commands require explicit approval
+                    info!(command = %command, risk = %assessment.level, "Forcing approval: critical command despite prefix match");
+                    true
                 } else {
-                    // Check if already approved (permanent or session)
-                    !self.is_allowed(command).await
+                    false
                 };
 
                 if needs_approval {
@@ -637,17 +689,30 @@ impl Tool for TerminalTool {
                         assessment.warnings.clone(),
                     ).await {
                         Ok(ApprovalResponse::AllowOnce) => {
-                            // Just run this once, don't save
+                            // Just run this once, but still learn from it
+                            if let Some(ref pool) = self.pool {
+                                let _ = record_approval(pool, command).await;
+                            }
                         }
                         Ok(ApprovalResponse::AllowSession) => {
                             // Save to session-only storage (cleared on restart)
                             self.add_session_prefix(command).await;
+                            if let Some(ref pool) = self.pool {
+                                let _ = record_approval(pool, command).await;
+                            }
                         }
                         Ok(ApprovalResponse::AllowAlways) => {
                             // Save to permanent storage (DB)
                             self.add_prefix(command).await;
+                            if let Some(ref pool) = self.pool {
+                                let _ = record_approval(pool, command).await;
+                            }
                         }
                         Ok(ApprovalResponse::Deny) => {
+                            // Record denial for learning
+                            if let Some(ref pool) = self.pool {
+                                let _ = record_denial(pool, command).await;
+                            }
                             return Ok("Command denied by user.".to_string());
                         }
                         Err(e) => {

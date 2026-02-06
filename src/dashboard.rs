@@ -9,10 +9,12 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
 use crate::config::ModelsConfig;
+use crate::health::HealthProbeStore;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 const KEYCHAIN_FIELD: &str = "dashboard_token";
@@ -29,6 +31,7 @@ pub struct DashboardState {
     pub started_at: Instant,
     pub dashboard_token: String,
     pub daily_token_budget: Option<u64>,
+    pub health_store: Option<Arc<HealthProbeStore>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +77,9 @@ pub fn build_router(state: DashboardState) -> Router {
         .route("/api/usage", get(api_usage))
         .route("/api/sessions", get(api_sessions))
         .route("/api/tasks", get(api_tasks))
+        .route("/api/health/probes", get(api_health_probes))
+        .route("/api/health/history", get(api_health_history))
+        .route("/api/health/summary", get(api_health_summary))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -283,6 +289,203 @@ struct TaskRow {
     is_trusted: i64,
     last_run_at: Option<String>,
     next_run_at: String,
+}
+
+// ---------------------------------------------------------------------------
+// Health Probe API Endpoints
+// ---------------------------------------------------------------------------
+
+async fn api_health_probes(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let Some(store) = &state.health_store else {
+        return Json(json!({
+            "error": "Health probes not enabled",
+            "probes": []
+        }));
+    };
+
+    let probes = store.list_probes().await.unwrap_or_default();
+
+    let mut probe_data = Vec::new();
+    for probe in probes {
+        let latest = store.get_latest_result(&probe.id).await.unwrap_or(None);
+        let consecutive_failures = store
+            .count_consecutive_failures(&probe.id)
+            .await
+            .unwrap_or(0);
+
+        probe_data.push(json!({
+            "id": probe.id,
+            "name": probe.name,
+            "description": probe.description,
+            "type": probe.probe_type.as_str(),
+            "target": probe.target,
+            "schedule": probe.schedule,
+            "source": probe.source,
+            "is_paused": probe.is_paused,
+            "consecutive_failures_alert": probe.consecutive_failures_alert,
+            "latency_threshold_ms": probe.latency_threshold_ms,
+            "last_run_at": probe.last_run_at.map(|t| t.to_rfc3339()),
+            "next_run_at": probe.next_run_at.to_rfc3339(),
+            "last_status": latest.as_ref().map(|r| r.status.as_str()),
+            "last_latency_ms": latest.as_ref().and_then(|r| r.latency_ms),
+            "last_checked": latest.as_ref().map(|r| r.checked_at.to_rfc3339()),
+            "consecutive_failures": consecutive_failures,
+        }));
+    }
+
+    Json(serde_json::Value::Array(probe_data))
+}
+
+#[derive(Deserialize)]
+struct HealthHistoryQuery {
+    probe: String,
+    #[serde(default = "default_history_hours")]
+    hours: u32,
+}
+
+fn default_history_hours() -> u32 {
+    24
+}
+
+async fn api_health_history(
+    State(state): State<DashboardState>,
+    Query(q): Query<HealthHistoryQuery>,
+) -> Json<serde_json::Value> {
+    let Some(store) = &state.health_store else {
+        return Json(json!({
+            "error": "Health probes not enabled",
+            "results": []
+        }));
+    };
+
+    // Find probe by ID or name
+    let probe = store.get_probe(&q.probe).await.ok().flatten()
+        .or_else(|| {
+            // Try by name synchronously is tricky; we'll use a future
+            None
+        });
+
+    let probe_id = if let Some(p) = probe {
+        p.id
+    } else {
+        // Try by name
+        match store.get_probe_by_name(&q.probe).await {
+            Ok(Some(p)) => p.id,
+            _ => {
+                return Json(json!({
+                    "error": format!("Probe not found: {}", q.probe),
+                    "results": []
+                }));
+            }
+        }
+    };
+
+    let hours = q.hours.min(168); // Max 7 days
+    let end = chrono::Utc::now();
+    let start = end - chrono::Duration::hours(hours as i64);
+
+    let results = store
+        .get_results_in_range(&probe_id, start, end)
+        .await
+        .unwrap_or_default();
+
+    let result_data: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "status": r.status.as_str(),
+                "latency_ms": r.latency_ms,
+                "error_message": r.error_message,
+                "checked_at": r.checked_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "probe_id": probe_id,
+        "hours": hours,
+        "count": result_data.len(),
+        "results": result_data
+    }))
+}
+
+async fn api_health_summary(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let Some(store) = &state.health_store else {
+        return Json(json!({
+            "error": "Health probes not enabled",
+            "total": 0,
+            "healthy": 0,
+            "unhealthy": 0,
+            "paused": 0,
+            "probes": []
+        }));
+    };
+
+    let probes = store.list_probes().await.unwrap_or_default();
+    let stats_map = store.get_all_probe_stats(24).await.unwrap_or_default();
+
+    let mut total = 0u32;
+    let mut healthy = 0u32;
+    let mut unhealthy = 0u32;
+    let mut paused = 0u32;
+
+    let mut probe_summaries = Vec::new();
+
+    for probe in probes {
+        total += 1;
+
+        if probe.is_paused {
+            paused += 1;
+            probe_summaries.push(json!({
+                "id": probe.id,
+                "name": probe.name,
+                "status": "paused",
+                "health_score": null,
+            }));
+            continue;
+        }
+
+        let latest = store.get_latest_result(&probe.id).await.unwrap_or(None);
+        let is_healthy = latest.as_ref().map(|r| r.status.is_healthy()).unwrap_or(true);
+
+        if is_healthy {
+            healthy += 1;
+        } else {
+            unhealthy += 1;
+        }
+
+        let stats = stats_map.get(&probe.id);
+        let health_score = stats.map(|s| crate::health::TrendAnalyzer::health_score(s));
+        let uptime = stats.map(|s| s.uptime_percent);
+        let avg_latency = stats.and_then(|s| s.avg_latency_ms);
+
+        probe_summaries.push(json!({
+            "id": probe.id,
+            "name": probe.name,
+            "status": if is_healthy { "healthy" } else { "unhealthy" },
+            "health_score": health_score,
+            "uptime_percent": uptime,
+            "avg_latency_ms": avg_latency,
+        }));
+    }
+
+    // Calculate overall health score
+    let overall_score = if total > paused {
+        let active = total - paused;
+        ((healthy as f64 / active as f64) * 100.0) as u32
+    } else {
+        100 // No active probes = healthy
+    };
+
+    Json(json!({
+        "total": total,
+        "healthy": healthy,
+        "unhealthy": unhealthy,
+        "paused": paused,
+        "overall_health_score": overall_score,
+        "probes": probe_summaries
+    }))
 }
 
 // ---------------------------------------------------------------------------

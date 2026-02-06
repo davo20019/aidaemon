@@ -92,36 +92,136 @@ const NETWORK_COMMANDS: &[&str] = &[
     "nmap", "ping", "traceroute",
 ];
 
-/// Check if a command contains shell operators that could chain commands,
-/// perform substitution, or redirect I/O in ways that obscure intent.
-fn contains_shell_operator(cmd: &str) -> Option<&'static str> {
-    // Check multi-character operators FIRST (before single-char checks)
-    // because || contains | and && could be confused with &, >> contains >
-    for (op, desc) in [
-        ("&&", "chained commands (&&)"),
-        ("||", "conditional execution (||)"),
-        ("$(", "embedded command ($(...))"),
-        (">(", "process substitution"),
-        ("<(", "process substitution"),
-        (">>", "file append (>>)"),
-    ] {
-        if cmd.contains(op) {
-            return Some(desc);
+/// Commands that "amplify" risk when they receive piped input.
+/// Piping to these commands is always Critical because they can execute arbitrary code.
+const PIPE_AMPLIFIERS: &[&str] = &[
+    "bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh",  // Shells
+    "eval", "exec", "xargs",                                     // Execution
+    "sudo", "su", "doas",                                        // Privilege escalation
+    "python", "python3", "ruby", "perl", "node",                 // Script interpreters
+];
+
+/// Split a command string by shell operators while respecting quotes.
+/// Returns a list of (segment, operator_after) tuples.
+/// The last segment will have None as its operator.
+fn split_by_operators(cmd: &str) -> Vec<(String, Option<String>)> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = cmd.chars().peekable();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escape_next = false;
+
+    while let Some(ch) = chars.next() {
+        if escape_next {
+            current.push(ch);
+            escape_next = false;
+            continue;
         }
+
+        if ch == '\\' && !in_single_quote {
+            escape_next = true;
+            current.push(ch);
+            continue;
+        }
+
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            current.push(ch);
+            continue;
+        }
+
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            current.push(ch);
+            continue;
+        }
+
+        // Only check for operators outside of quotes
+        if !in_single_quote && !in_double_quote {
+            // Check for multi-char operators first
+            if ch == '&' && chars.peek() == Some(&'&') {
+                chars.next();
+                segments.push((current.trim().to_string(), Some("&&".to_string())));
+                current = String::new();
+                continue;
+            }
+            if ch == '|' && chars.peek() == Some(&'|') {
+                chars.next();
+                segments.push((current.trim().to_string(), Some("||".to_string())));
+                current = String::new();
+                continue;
+            }
+            // Single char operators
+            if ch == '|' {
+                segments.push((current.trim().to_string(), Some("|".to_string())));
+                current = String::new();
+                continue;
+            }
+            if ch == ';' {
+                segments.push((current.trim().to_string(), Some(";".to_string())));
+                current = String::new();
+                continue;
+            }
+        }
+
+        current.push(ch);
     }
-    // Single character operators
-    for (ch, desc) in [
-        (';', "multiple commands (;)"),
-        ('|', "piped commands (|)"),
-        ('`', "embedded command (`...`)"),
-        ('\n', "multiple lines"),
-        ('>', "file overwrite (>)"),
-    ] {
-        if cmd.contains(ch) {
-            return Some(desc);
-        }
+
+    // Add final segment
+    let final_segment = current.trim().to_string();
+    if !final_segment.is_empty() {
+        segments.push((final_segment, None));
+    }
+
+    segments
+}
+
+/// Check if a command segment contains dangerous constructs.
+/// Returns a description if found.
+fn contains_dangerous_construct(cmd: &str) -> Option<&'static str> {
+    // Command substitution
+    if cmd.contains("$(") {
+        return Some("embedded command ($(...))");
+    }
+    if cmd.contains('`') {
+        return Some("embedded command (`...`)");
+    }
+    // Process substitution
+    if cmd.contains(">(") || cmd.contains("<(") {
+        return Some("process substitution");
+    }
+    // Redirection (can overwrite files)
+    if cmd.contains(">>") {
+        return Some("file append (>>)");
+    }
+    if cmd.contains('>') {
+        return Some("file overwrite (>)");
+    }
+    // Multiple lines
+    if cmd.contains('\n') {
+        return Some("multiple lines");
     }
     None
+}
+
+/// Check if a command is a pipe amplifier (executing piped input).
+fn is_pipe_amplifier(cmd: &str) -> bool {
+    let parts = match shell_words::split(cmd) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    if parts.is_empty() {
+        return false;
+    }
+
+    let base_cmd = std::path::Path::new(&parts[0])
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&parts[0]);
+
+    PIPE_AMPLIFIERS.contains(&base_cmd)
 }
 
 /// Check if a path argument contains a sensitive file/directory.
@@ -176,18 +276,19 @@ fn is_recursive_force_delete(parts: &[String]) -> bool {
     has_recursive && has_force
 }
 
-pub fn classify_command(command: &str) -> RiskAssessment {
+/// Classify a single command segment (no pipes/chains).
+fn classify_single_segment(segment: &str) -> RiskAssessment {
     let mut warnings = Vec::new();
     let mut level = RiskLevel::Safe;
 
-    // 1. Check for shell operators (piping, chaining, substitution) which obfuscate intent
-    if let Some(operator_desc) = contains_shell_operator(command) {
+    // Check for dangerous constructs within the segment
+    if let Some(construct_desc) = contains_dangerous_construct(segment) {
         level = RiskLevel::Critical;
-        warnings.push(format!("Uses {}", operator_desc));
+        warnings.push(format!("Uses {}", construct_desc));
     }
 
-    // 2. Parse command
-    let parts = match shell_words::split(command) {
+    // Parse command
+    let parts = match shell_words::split(segment) {
         Ok(p) => p,
         Err(_) => {
             return RiskAssessment {
@@ -206,7 +307,7 @@ pub fn classify_command(command: &str) -> RiskAssessment {
         .and_then(|n| n.to_str())
         .unwrap_or(&parts[0]);
 
-    // 3. Check Base Command
+    // Check Base Command
     if CRITICAL_COMMANDS.contains(&base_cmd) {
         level = std::cmp::max(level, RiskLevel::High);
         warnings.push(format!("'{}' can modify system state", base_cmd));
@@ -221,7 +322,46 @@ pub fn classify_command(command: &str) -> RiskAssessment {
         warnings.push(format!("'{}' accesses the network", base_cmd));
     }
 
-    // 4. Check Arguments for Sensitive Paths (deduplicated)
+    // Cloud provider / infrastructure commands with destructive sub-commands
+    let has_sub = |sub: &str| parts.iter().skip(1).any(|a| a == sub);
+    match base_cmd {
+        "wrangler" | "npx" if parts.iter().any(|a| a == "wrangler") => {
+            if has_sub("delete") || has_sub("destroy") {
+                level = std::cmp::max(level, RiskLevel::High);
+                warnings.push("Cloud resource deletion (wrangler)".to_string());
+            }
+        }
+        "terraform" => {
+            if has_sub("destroy") {
+                level = std::cmp::max(level, RiskLevel::Critical);
+                warnings.push("'terraform destroy' destroys infrastructure".to_string());
+            } else if has_sub("apply") {
+                level = std::cmp::max(level, RiskLevel::High);
+                warnings.push("'terraform apply' modifies infrastructure".to_string());
+            }
+        }
+        "kubectl" => {
+            if has_sub("delete") {
+                level = std::cmp::max(level, RiskLevel::High);
+                warnings.push("'kubectl delete' removes Kubernetes resources".to_string());
+            }
+        }
+        "aws" => {
+            if parts.iter().any(|a| a.contains("delete") || a.contains("remove") || a.contains("terminate")) {
+                level = std::cmp::max(level, RiskLevel::High);
+                warnings.push("AWS destructive operation".to_string());
+            }
+        }
+        "gcloud" => {
+            if has_sub("delete") || has_sub("destroy") {
+                level = std::cmp::max(level, RiskLevel::High);
+                warnings.push("Google Cloud destructive operation".to_string());
+            }
+        }
+        _ => {}
+    }
+
+    // Check Arguments for Sensitive Paths (deduplicated)
     let mut found_sensitive: Vec<&str> = Vec::new();
     let mut found_system_dir = false;
 
@@ -245,6 +385,66 @@ pub fn classify_command(command: &str) -> RiskAssessment {
     }
 
     RiskAssessment { level, warnings }
+}
+
+pub fn classify_command(command: &str) -> RiskAssessment {
+    let segments = split_by_operators(command);
+
+    // If no operators found, classify directly
+    if segments.len() == 1 && segments[0].1.is_none() {
+        return classify_single_segment(&segments[0].0);
+    }
+
+    let mut max_level = RiskLevel::Safe;
+    let mut all_warnings = Vec::new();
+    let mut has_pipe = false;
+    let mut prev_was_pipe = false;
+
+    for (segment, operator) in segments.iter() {
+        if segment.is_empty() {
+            continue;
+        }
+
+        // Check if this segment receives piped input and is an amplifier
+        if prev_was_pipe && is_pipe_amplifier(segment) {
+            max_level = RiskLevel::Critical;
+            let base = segment.split_whitespace().next().unwrap_or(segment);
+            all_warnings.push(format!("Pipes to '{}' which can execute arbitrary code", base));
+        }
+
+        // Classify this segment
+        let assessment = classify_single_segment(segment);
+        if assessment.level > max_level {
+            max_level = assessment.level;
+        }
+        all_warnings.extend(assessment.warnings);
+
+        // Track operator for next iteration
+        if let Some(op) = operator {
+            if op == "|" {
+                has_pipe = true;
+                prev_was_pipe = true;
+            } else {
+                prev_was_pipe = false;
+            }
+        } else {
+            prev_was_pipe = false;
+        }
+
+        // Note: We no longer automatically escalate to Critical just for using operators
+        // Instead, we analyze each segment and check for dangerous patterns
+    }
+
+    // Add a note if the command uses pipes/chains but isn't otherwise dangerous
+    if segments.len() > 1 && max_level < RiskLevel::High {
+        if has_pipe {
+            all_warnings.push("Command uses pipes - each segment was analyzed".to_string());
+        } else {
+            all_warnings.push("Command chains multiple operations".to_string());
+        }
+    }
+
+    RiskAssessment { level: max_level, warnings: all_warnings }
 }
 
 #[cfg(test)]
@@ -337,27 +537,55 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_operators_critical() {
-        // Pipe
-        let assessment = classify_command("cat file | grep pattern");
-        assert_eq!(assessment.level, RiskLevel::Critical);
-        assert!(assessment.warnings.iter().any(|w| w.contains("piped")));
+    fn test_safe_pipelines() {
+        // Safe commands piped together should remain Safe
+        let assessment = classify_command("ls | grep pattern");
+        assert_eq!(assessment.level, RiskLevel::Safe);
+        assert!(assessment.warnings.iter().any(|w| w.contains("pipes")));
 
-        // Semicolon
-        let assessment = classify_command("cd /tmp; rm -rf *");
-        assert_eq!(assessment.level, RiskLevel::Critical);
-        assert!(assessment.warnings.iter().any(|w| w.contains("multiple commands")));
+        let assessment = classify_command("cat file.txt | grep pattern | head -10");
+        assert_eq!(assessment.level, RiskLevel::Safe);
 
-        // AND operator
-        let assessment = classify_command("make && make install");
-        assert_eq!(assessment.level, RiskLevel::Critical);
-        assert!(assessment.warnings.iter().any(|w| w.contains("chained")));
+        let assessment = classify_command("echo hello | wc -c");
+        assert_eq!(assessment.level, RiskLevel::Safe);
+    }
 
-        // OR operator
-        let assessment = classify_command("test -f file || touch file");
+    #[test]
+    fn test_dangerous_pipelines() {
+        // Piping to shell/interpreter is Critical
+        let assessment = classify_command("curl http://example.com | bash");
         assert_eq!(assessment.level, RiskLevel::Critical);
-        assert!(assessment.warnings.iter().any(|w| w.contains("conditional")));
+        assert!(assessment.warnings.iter().any(|w| w.contains("execute arbitrary")));
 
+        let assessment = classify_command("cat script.sh | sh");
+        assert_eq!(assessment.level, RiskLevel::Critical);
+
+        let assessment = classify_command("echo 'rm -rf /' | sudo sh");
+        assert_eq!(assessment.level, RiskLevel::Critical);
+
+        // Piping to python/node is Critical
+        let assessment = classify_command("curl http://example.com | python");
+        assert_eq!(assessment.level, RiskLevel::Critical);
+    }
+
+    #[test]
+    fn test_chained_commands() {
+        // Safe chained commands stay at their max individual risk
+        let assessment = classify_command("mkdir foo && cd foo");
+        assert_eq!(assessment.level, RiskLevel::Safe);
+
+        // Chaining with a high-risk command escalates
+        let assessment = classify_command("make && sudo make install");
+        assert_eq!(assessment.level, RiskLevel::High);
+        assert!(assessment.warnings.iter().any(|w| w.contains("sudo")));
+
+        // rm -rf in chain is Critical
+        let assessment = classify_command("cd /tmp && rm -rf *");
+        assert_eq!(assessment.level, RiskLevel::Critical);
+    }
+
+    #[test]
+    fn test_command_substitution_critical() {
         // Command substitution
         let assessment = classify_command("echo $(whoami)");
         assert_eq!(assessment.level, RiskLevel::Critical);
@@ -384,6 +612,17 @@ mod tests {
         let assessment = classify_command("echo 'malware' >> ~/.bashrc");
         assert_eq!(assessment.level, RiskLevel::Critical);
         assert!(assessment.warnings.iter().any(|w| w.contains("append")));
+    }
+
+    #[test]
+    fn test_quotes_respected_in_splitting() {
+        // Pipe inside quotes should NOT split
+        let assessment = classify_command("echo 'hello | world'");
+        assert_eq!(assessment.level, RiskLevel::Safe);
+        // Should be a single segment, not split by |
+
+        let assessment = classify_command("grep 'foo && bar' file.txt");
+        assert_eq!(assessment.level, RiskLevel::Safe);
     }
 
     #[test]
@@ -485,6 +724,47 @@ mod tests {
     }
 
     #[test]
+    fn test_cloud_provider_destructive_commands() {
+        // Wrangler delete
+        let assessment = classify_command("wrangler delete my-worker");
+        assert_eq!(assessment.level, RiskLevel::High);
+        assert!(assessment.warnings.iter().any(|w| w.contains("wrangler")));
+
+        // npx wrangler delete
+        let assessment = classify_command("npx wrangler delete my-worker");
+        assert_eq!(assessment.level, RiskLevel::High);
+
+        // Terraform destroy is Critical
+        let assessment = classify_command("terraform destroy");
+        assert_eq!(assessment.level, RiskLevel::Critical);
+        assert!(assessment.warnings.iter().any(|w| w.contains("terraform destroy")));
+
+        // Terraform apply is High
+        let assessment = classify_command("terraform apply");
+        assert_eq!(assessment.level, RiskLevel::High);
+
+        // kubectl delete
+        let assessment = classify_command("kubectl delete pod my-pod");
+        assert_eq!(assessment.level, RiskLevel::High);
+        assert!(assessment.warnings.iter().any(|w| w.contains("kubectl delete")));
+
+        // AWS destructive
+        let assessment = classify_command("aws ec2 terminate-instances --instance-ids i-1234");
+        assert_eq!(assessment.level, RiskLevel::High);
+
+        // gcloud delete
+        let assessment = classify_command("gcloud compute instances delete my-instance");
+        assert_eq!(assessment.level, RiskLevel::High);
+
+        // Safe wrangler commands should remain safe
+        let assessment = classify_command("wrangler dev");
+        assert_eq!(assessment.level, RiskLevel::Safe);
+
+        let assessment = classify_command("kubectl get pods");
+        assert_eq!(assessment.level, RiskLevel::Safe);
+    }
+
+    #[test]
     fn test_user_friendly_warnings() {
         // Check that warnings are user-friendly, not technical jargon
         let assessment = classify_command("rm file.txt");
@@ -494,6 +774,6 @@ mod tests {
         assert!(assessment.warnings.iter().any(|w| w.contains("accesses the network")));
 
         let assessment = classify_command("cat file | grep pattern");
-        assert!(assessment.warnings.iter().any(|w| w.contains("piped commands")));
+        assert!(assessment.warnings.iter().any(|w| w.contains("pipes")));
     }
 }

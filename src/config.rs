@@ -65,13 +65,26 @@ pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub provider: ProviderConfig,
-    pub telegram: TelegramConfig,
+    /// Legacy single Telegram bot config (for backward compatibility).
+    #[serde(default)]
+    pub telegram: Option<TelegramConfig>,
+    /// Array of named Telegram bots (preferred for multi-bot setups).
+    #[serde(default)]
+    pub telegram_bots: Vec<TelegramBotConfig>,
     #[cfg(feature = "discord")]
     #[serde(default)]
-    pub discord: DiscordConfig,
+    pub discord: Option<DiscordConfig>,
+    /// Array of named Discord bots (preferred for multi-bot setups).
+    #[cfg(feature = "discord")]
+    #[serde(default)]
+    pub discord_bots: Vec<DiscordBotConfig>,
     #[cfg(feature = "slack")]
     #[serde(default)]
-    pub slack: SlackConfig,
+    pub slack: Option<SlackConfig>,
+    /// Array of named Slack bots (preferred for multi-bot setups).
+    #[cfg(feature = "slack")]
+    #[serde(default)]
+    pub slack_bots: Vec<SlackBotConfig>,
     #[serde(default)]
     pub state: StateConfig,
     #[serde(default)]
@@ -96,6 +109,10 @@ pub struct AppConfig {
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub files: FilesConfig,
+    #[serde(default)]
+    pub health: HealthConfig,
+    #[serde(default)]
+    pub updates: UpdateConfig,
 }
 
 #[derive(Deserialize, Clone)]
@@ -134,7 +151,7 @@ fn default_base_url() -> String {
     "https://api.openai.com/v1".to_string()
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct ModelsConfig {
     #[serde(default)]
     pub primary: String,
@@ -142,16 +159,6 @@ pub struct ModelsConfig {
     pub fast: String,
     #[serde(default)]
     pub smart: String,
-}
-
-impl Default for ModelsConfig {
-    fn default() -> Self {
-        Self {
-            primary: String::new(),
-            fast: String::new(),
-            smart: String::new(),
-        }
-    }
 }
 
 impl ModelsConfig {
@@ -174,6 +181,7 @@ impl ModelsConfig {
     }
 }
 
+/// Single Telegram bot configuration (legacy format).
 #[derive(Deserialize, Clone)]
 pub struct TelegramConfig {
     pub bot_token: String,
@@ -184,6 +192,24 @@ pub struct TelegramConfig {
 impl fmt::Debug for TelegramConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TelegramConfig")
+            .field("bot_token", &redact(&self.bot_token))
+            .field("allowed_user_ids", &self.allowed_user_ids)
+            .finish()
+    }
+}
+
+/// Telegram bot configuration for multi-bot support.
+/// Bot username is auto-detected from Telegram API at startup.
+#[derive(Deserialize, Clone)]
+pub struct TelegramBotConfig {
+    pub bot_token: String,
+    #[serde(default)]
+    pub allowed_user_ids: Vec<u64>,
+}
+
+impl fmt::Debug for TelegramBotConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TelegramBotConfig")
             .field("bot_token", &redact(&self.bot_token))
             .field("allowed_user_ids", &self.allowed_user_ids)
             .finish()
@@ -205,6 +231,29 @@ pub struct DiscordConfig {
 impl fmt::Debug for DiscordConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DiscordConfig")
+            .field("bot_token", &redact(&self.bot_token))
+            .field("allowed_user_ids", &self.allowed_user_ids)
+            .field("guild_id", &self.guild_id)
+            .finish()
+    }
+}
+
+/// Discord bot configuration for multi-bot support.
+/// Bot username is auto-detected from Discord API at startup.
+#[cfg(feature = "discord")]
+#[derive(Deserialize, Clone)]
+pub struct DiscordBotConfig {
+    pub bot_token: String,
+    #[serde(default)]
+    pub allowed_user_ids: Vec<u64>,
+    #[serde(default)]
+    pub guild_id: Option<u64>,
+}
+
+#[cfg(feature = "discord")]
+impl fmt::Debug for DiscordBotConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DiscordBotConfig")
             .field("bot_token", &redact(&self.bot_token))
             .field("allowed_user_ids", &self.allowed_user_ids)
             .field("guild_id", &self.guild_id)
@@ -243,6 +292,31 @@ impl fmt::Debug for SlackConfig {
 #[cfg(feature = "slack")]
 fn default_slack_use_threads() -> bool {
     true
+}
+
+/// Slack bot configuration for multi-bot support.
+/// Bot name is auto-detected from Slack API at startup.
+#[cfg(feature = "slack")]
+#[derive(Deserialize, Clone)]
+pub struct SlackBotConfig {
+    pub app_token: String,
+    pub bot_token: String,
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+    #[serde(default = "default_slack_use_threads")]
+    pub use_threads: bool,
+}
+
+#[cfg(feature = "slack")]
+impl fmt::Debug for SlackBotConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlackBotConfig")
+            .field("app_token", &redact(&self.app_token))
+            .field("bot_token", &redact(&self.bot_token))
+            .field("allowed_user_ids", &self.allowed_user_ids)
+            .field("use_threads", &self.use_threads)
+            .finish()
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -492,6 +566,9 @@ pub struct SkillsConfig {
     pub dir: String,
     #[serde(default = "default_skills_enabled")]
     pub enabled: bool,
+    /// URLs of skill registries (JSON manifests) to browse and install from.
+    #[serde(default)]
+    pub registries: Vec<String>,
 }
 
 impl Default for SkillsConfig {
@@ -499,6 +576,7 @@ impl Default for SkillsConfig {
         Self {
             dir: default_skills_dir(),
             enabled: default_skills_enabled(),
+            registries: Vec::new(),
         }
     }
 }
@@ -511,20 +589,77 @@ fn default_skills_enabled() -> bool {
     true
 }
 
+/// Iteration limit configuration for agent loops.
+/// Controls how iteration limits are enforced (or not enforced).
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum IterationLimitConfig {
+    /// No iteration limit - run until natural completion, token budget, or timeout.
+    /// This is the recommended default for complex tasks.
+    #[default]
+    Unlimited,
+    /// Soft limit with warnings but no forced termination.
+    /// Agent will be warned at `warn_at` iterations and continue until natural completion.
+    Soft {
+        threshold: usize,
+        warn_at: usize,
+    },
+    /// Legacy hard limit behavior (backward compatibility).
+    /// Agent will be forced to stop at `cap` iterations.
+    Hard {
+        initial: usize,
+        cap: usize,
+    },
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct SubagentsConfig {
     #[serde(default = "default_subagents_enabled")]
     pub enabled: bool,
     #[serde(default = "default_subagents_max_depth")]
     pub max_depth: usize,
+    /// Legacy field - use iteration_limit instead. Kept for backward compatibility.
     #[serde(default = "default_subagents_max_iterations")]
     pub max_iterations: usize,
+    /// Legacy field - use iteration_limit instead. Kept for backward compatibility.
     #[serde(default = "default_subagents_max_iterations_cap")]
     pub max_iterations_cap: usize,
     #[serde(default = "default_subagents_max_response_chars")]
     pub max_response_chars: usize,
     #[serde(default = "default_subagents_timeout_secs")]
     pub timeout_secs: u64,
+    /// Iteration limit configuration. Defaults to Unlimited.
+    /// If not set but max_iterations/max_iterations_cap are set, auto-migrates to Hard mode.
+    #[serde(default)]
+    pub iteration_limit: IterationLimitConfig,
+    /// Optional time limit per task in seconds. Default: 1800 (30 minutes).
+    #[serde(default = "default_task_timeout_secs")]
+    pub task_timeout_secs: Option<u64>,
+    /// Optional token budget per task. When exceeded, agent gracefully summarizes and stops.
+    #[serde(default)]
+    pub task_token_budget: Option<u64>,
+}
+
+impl SubagentsConfig {
+    /// Returns the effective iteration limit config, handling backward compatibility.
+    /// If iteration_limit is Unlimited but legacy max_iterations fields are set to
+    /// non-default values, automatically migrates to Hard mode.
+    pub fn effective_iteration_limit(&self) -> IterationLimitConfig {
+        // Check if using non-default legacy values
+        let legacy_initial_changed = self.max_iterations != default_subagents_max_iterations();
+        let legacy_cap_changed = self.max_iterations_cap != default_subagents_max_iterations_cap();
+
+        match &self.iteration_limit {
+            IterationLimitConfig::Unlimited if legacy_initial_changed || legacy_cap_changed => {
+                // Auto-migrate legacy config to Hard mode
+                IterationLimitConfig::Hard {
+                    initial: self.max_iterations,
+                    cap: self.max_iterations_cap,
+                }
+            }
+            other => other.clone(),
+        }
+    }
 }
 
 impl Default for SubagentsConfig {
@@ -536,6 +671,9 @@ impl Default for SubagentsConfig {
             max_iterations_cap: default_subagents_max_iterations_cap(),
             max_response_chars: default_subagents_max_response_chars(),
             timeout_secs: default_subagents_timeout_secs(),
+            iteration_limit: IterationLimitConfig::default(),
+            task_timeout_secs: default_task_timeout_secs(),
+            task_token_budget: None,
         }
     }
 }
@@ -557,6 +695,9 @@ fn default_subagents_max_response_chars() -> usize {
 }
 fn default_subagents_timeout_secs() -> u64 {
     300
+}
+fn default_task_timeout_secs() -> Option<u64> {
+    Some(1800) // 30 minutes default
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -656,6 +797,114 @@ pub struct ScheduledTaskConfig {
     pub trusted: bool,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct HealthConfig {
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_health_tick_interval_secs")]
+    pub tick_interval_secs: u64,
+    #[serde(default = "default_health_result_retention_days")]
+    pub result_retention_days: u32,
+    #[serde(default)]
+    pub probes: Vec<HealthProbeConfig>,
+}
+
+fn default_health_enabled() -> bool {
+    true
+}
+
+fn default_health_tick_interval_secs() -> u64 {
+    30
+}
+
+fn default_health_result_retention_days() -> u32 {
+    7
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HealthProbeConfig {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub probe_type: String,
+    pub target: String,
+    pub schedule: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub config: HealthProbeConfigOptions,
+    #[serde(default)]
+    pub consecutive_failures_alert: Option<u32>,
+    #[serde(default)]
+    pub latency_threshold_ms: Option<u32>,
+    #[serde(default)]
+    pub alert_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct HealthProbeConfigOptions {
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub expected_status: Option<u16>,
+    #[serde(default)]
+    pub expected_body: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub headers: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    pub max_age_secs: Option<u64>,
+    #[serde(default)]
+    pub expected_exit_code: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    /// Automatically download and apply updates, then restart.
+    Enable,
+    /// Check for updates and notify the user; wait for confirmation before applying.
+    #[default]
+    CheckOnly,
+    /// Do not check for updates at all.
+    Disable,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct UpdateConfig {
+    /// Update behavior mode: "enable", "check_only", or "disable".
+    #[serde(default)]
+    pub mode: UpdateMode,
+    /// How often to check for updates, in hours. Default: 24.
+    #[serde(default = "default_update_check_interval_hours")]
+    pub check_interval_hours: u64,
+    /// Specific UTC hour to check (0-23). If set, overrides interval-based checks.
+    #[serde(default)]
+    pub check_at_utc_hour: Option<u8>,
+    /// How long to wait for user confirmation in check_only mode, in minutes. Default: 60.
+    #[serde(default = "default_update_confirmation_timeout_mins")]
+    pub confirmation_timeout_mins: u64,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            mode: UpdateMode::default(),
+            check_interval_hours: default_update_check_interval_hours(),
+            check_at_utc_hour: None,
+            confirmation_timeout_mins: default_update_confirmation_timeout_mins(),
+        }
+    }
+}
+
+fn default_update_check_interval_hours() -> u64 {
+    24
+}
+
+fn default_update_confirmation_timeout_mins() -> u64 {
+    60
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct FilesConfig {
     #[serde(default = "default_files_enabled")]
@@ -708,14 +957,82 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// Get all Telegram bot configurations (merges legacy single + array).
+    /// Legacy `[telegram]` becomes a bot named "default".
+    pub fn all_telegram_bots(&self) -> Vec<TelegramBotConfig> {
+        let mut bots = self.telegram_bots.clone();
+
+        // Add legacy config as "default" if present and has a token
+        if let Some(ref legacy) = self.telegram {
+            if !legacy.bot_token.is_empty() {
+                bots.push(TelegramBotConfig {
+                    bot_token: legacy.bot_token.clone(),
+                    allowed_user_ids: legacy.allowed_user_ids.clone(),
+                });
+            }
+        }
+
+        bots
+    }
+
+    /// Get all Discord bot configurations (merges legacy single + array).
+    #[cfg(feature = "discord")]
+    pub fn all_discord_bots(&self) -> Vec<DiscordBotConfig> {
+        let mut bots = self.discord_bots.clone();
+
+        if let Some(ref legacy) = self.discord {
+            if !legacy.bot_token.is_empty() {
+                bots.push(DiscordBotConfig {
+                    bot_token: legacy.bot_token.clone(),
+                    allowed_user_ids: legacy.allowed_user_ids.clone(),
+                    guild_id: legacy.guild_id,
+                });
+            }
+        }
+
+        bots
+    }
+
+    /// Get all Slack bot configurations (merges legacy single + array).
+    #[cfg(feature = "slack")]
+    pub fn all_slack_bots(&self) -> Vec<SlackBotConfig> {
+        let mut bots = self.slack_bots.clone();
+
+        if let Some(ref legacy) = self.slack {
+            if legacy.enabled && !legacy.bot_token.is_empty() && !legacy.app_token.is_empty() {
+                bots.push(SlackBotConfig {
+                    app_token: legacy.app_token.clone(),
+                    bot_token: legacy.bot_token.clone(),
+                    allowed_user_ids: legacy.allowed_user_ids.clone(),
+                    use_threads: legacy.use_threads,
+                });
+            }
+        }
+
+        bots
+    }
+
     /// Resolve fields set to `"keychain"` by reading them from the OS credential store.
     fn resolve_secrets(&mut self) -> anyhow::Result<()> {
         if self.provider.api_key == "keychain" {
             self.provider.api_key = resolve_from_keychain("api_key")?;
         }
-        if self.telegram.bot_token == "keychain" {
-            self.telegram.bot_token = resolve_from_keychain("bot_token")?;
+
+        // Legacy telegram config
+        if let Some(ref mut telegram) = self.telegram {
+            if telegram.bot_token == "keychain" {
+                telegram.bot_token = resolve_from_keychain("bot_token")?;
+            }
         }
+
+        // Telegram bots array
+        for (i, bot) in self.telegram_bots.iter_mut().enumerate() {
+            if bot.bot_token == "keychain" {
+                let key = if i == 0 { "bot_token".to_string() } else { format!("telegram_bot_token_{}", i) };
+                bot.bot_token = resolve_from_keychain(&key)?;
+            }
+        }
+
         if let Some(ref email) = self.triggers.email {
             if email.password == "keychain" {
                 let password = resolve_from_keychain("email_password")?;
@@ -732,19 +1049,44 @@ impl AppConfig {
         if self.search.api_key == "keychain" {
             self.search.api_key = resolve_from_keychain("search_api_key")?;
         }
+
         #[cfg(feature = "discord")]
-        if self.discord.bot_token == "keychain" {
-            self.discord.bot_token = resolve_from_keychain("discord_bot_token")?;
+        {
+            if let Some(ref mut discord) = self.discord {
+                if discord.bot_token == "keychain" {
+                    discord.bot_token = resolve_from_keychain("discord_bot_token")?;
+                }
+            }
+            for (i, bot) in self.discord_bots.iter_mut().enumerate() {
+                if bot.bot_token == "keychain" {
+                    let key = if i == 0 { "discord_bot_token".to_string() } else { format!("discord_bot_token_{}", i) };
+                    bot.bot_token = resolve_from_keychain(&key)?;
+                }
+            }
         }
+
         #[cfg(feature = "slack")]
         {
-            if self.slack.app_token == "keychain" {
-                self.slack.app_token = resolve_from_keychain("slack_app_token")?;
+            if let Some(ref mut slack) = self.slack {
+                if slack.app_token == "keychain" {
+                    slack.app_token = resolve_from_keychain("slack_app_token")?;
+                }
+                if slack.bot_token == "keychain" {
+                    slack.bot_token = resolve_from_keychain("slack_bot_token")?;
+                }
             }
-            if self.slack.bot_token == "keychain" {
-                self.slack.bot_token = resolve_from_keychain("slack_bot_token")?;
+            for (i, bot) in self.slack_bots.iter_mut().enumerate() {
+                if bot.app_token == "keychain" {
+                    let key = if i == 0 { "slack_app_token".to_string() } else { format!("slack_app_token_{}", i) };
+                    bot.app_token = resolve_from_keychain(&key)?;
+                }
+                if bot.bot_token == "keychain" {
+                    let key = if i == 0 { "slack_bot_token".to_string() } else { format!("slack_bot_token_{}", i) };
+                    bot.bot_token = resolve_from_keychain(&key)?;
+                }
             }
         }
+
         Ok(())
     }
 }
@@ -803,5 +1145,59 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("AIDAEMON_MISS_X"));
         assert!(msg.contains("AIDAEMON_MISS_Y"));
+    }
+
+    #[test]
+    fn iteration_limit_default_is_unlimited() {
+        let config = SubagentsConfig::default();
+        assert!(matches!(config.iteration_limit, IterationLimitConfig::Unlimited));
+    }
+
+    #[test]
+    fn iteration_limit_effective_returns_unlimited_when_defaults_unchanged() {
+        let config = SubagentsConfig::default();
+        assert!(matches!(config.effective_iteration_limit(), IterationLimitConfig::Unlimited));
+    }
+
+    #[test]
+    fn iteration_limit_effective_migrates_legacy_config() {
+        let mut config = SubagentsConfig::default();
+        // Simulate old config with custom values
+        config.max_iterations = 15;
+        config.max_iterations_cap = 30;
+
+        match config.effective_iteration_limit() {
+            IterationLimitConfig::Hard { initial, cap } => {
+                assert_eq!(initial, 15);
+                assert_eq!(cap, 30);
+            }
+            _ => panic!("Expected Hard mode migration"),
+        }
+    }
+
+    #[test]
+    fn iteration_limit_explicit_soft_preserved() {
+        let mut config = SubagentsConfig::default();
+        config.iteration_limit = IterationLimitConfig::Soft {
+            threshold: 50,
+            warn_at: 40,
+        };
+        // Even with legacy values set, explicit config takes precedence
+        config.max_iterations = 15;
+        config.max_iterations_cap = 30;
+
+        match config.effective_iteration_limit() {
+            IterationLimitConfig::Soft { threshold, warn_at } => {
+                assert_eq!(threshold, 50);
+                assert_eq!(warn_at, 40);
+            }
+            _ => panic!("Expected Soft mode to be preserved"),
+        }
+    }
+
+    #[test]
+    fn task_timeout_default_is_30_minutes() {
+        let config = SubagentsConfig::default();
+        assert_eq!(config.task_timeout_secs, Some(1800));
     }
 }

@@ -107,7 +107,13 @@ impl GoogleGenAiProvider {
                     // Note: Gemini API requires previous message to be "model" with "functionCall".
                     
                     let content_str = msg["content"].as_str().unwrap_or("");
-                    let response_json = serde_json::from_str::<Value>(content_str).unwrap_or(json!({ "result": content_str }));
+                    // Gemini's functionResponse.response maps to protobuf Struct,
+                    // which must be a JSON object — never an array or primitive.
+                    let response_json = match serde_json::from_str::<Value>(content_str) {
+                        Ok(Value::Object(obj)) => Value::Object(obj),
+                        Ok(other) => json!({ "result": other }),
+                        Err(_) => json!({ "result": content_str }),
+                    };
 
                     // Hack: We need the tool name. OpenAI format msg has it sometimes?
                     // Our internal Message struct has it. The `messages` passed here are straight JSON from agent.rs.

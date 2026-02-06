@@ -1,5 +1,4 @@
 //! Expertise tracking module for calculating skill levels based on task performance.
-#![allow(dead_code)] // Functions reserved for future memory system integration
 
 /// Calculate expertise level based on success/failure counts.
 ///
