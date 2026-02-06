@@ -67,14 +67,24 @@ If you don't care about resource usage and want more channels (WhatsApp, Signal,
 
 ## Quick Start
 
+### Homebrew (macOS / Linux)
+
 ```bash
-# Build
+brew install davo20019/tap/aidaemon
+aidaemon  # launches the setup wizard on first run
+```
+
+### Cargo
+
+```bash
+cargo install aidaemon
+aidaemon
+```
+
+### Build from source
+
+```bash
 cargo build --release
-
-# First run - launches the setup wizard
-./target/release/aidaemon
-
-# After setup, run the daemon
 ./target/release/aidaemon
 ```
 
