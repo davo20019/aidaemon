@@ -84,4 +84,29 @@ Keyring crate uses platform-native backends: `apple-native` (macOS), `sync-secre
 
 ### Testing
 
-Tests are spread across ~25 files as `#[cfg(test)]` modules. Key test areas: router tier classification, memory/embedding math, plan detection, event context, command risk patterns, skill matching, scheduler parsing. No integration test suite — validation is primarily via runtime.
+Tests are spread across ~25 files as `#[cfg(test)]` modules. Key test areas: router tier classification, memory/embedding math, plan detection, event context, command risk patterns, skill matching, scheduler parsing.
+
+#### Integration Tests
+
+Integration tests exercise the real agent loop (`Agent::handle_message`) with a mock LLM provider and temp-file SQLite DB. They verify the same code path all channels use.
+
+```bash
+cargo test integration_tests          # run integration tests only
+cargo test test_tool_execution        # run a single integration test
+```
+
+**What they test:** Agent loop, tool execution, memory/state persistence, multi-turn history, session isolation, event sourcing.
+
+**Test infrastructure** (`src/testing.rs`):
+- **`MockProvider`** — mock `ModelProvider` with scripted responses and call logging. Use `MockProvider::new()` for default "Mock response", or `MockProvider::with_responses(vec![...])` for scripted sequences. Helpers: `text_response()`, `tool_call_response()`.
+- **`TestChannel`** — mock `Channel` that captures outgoing messages. Not wired to ChannelHub — tests call `agent.handle_message()` directly.
+- **`setup_test_agent(provider)`** — creates a fully wired `Agent` with real `SqliteStateStore` (temp file), real `EventStore`/`PlanStore`, real `EmbeddingService`, and `SystemInfoTool` only. Returns `TestHarness { agent, state, provider, channel }`. Each call creates an isolated DB for safe parallel execution.
+
+**Test cases** (`src/integration_tests.rs`):
+1. `test_basic_message_response` — send message, get mock response, verify provider called once
+2. `test_tool_execution` — scripted tool call + final response, verify 2 LLM calls
+3. `test_memory_persistence` — verify user + assistant messages stored in state
+4. `test_multi_turn_conversation` — second call includes first turn's history
+5. `test_session_isolation` — different session IDs don't cross-contaminate
+
+First run downloads the fastembed model (~25MB, cached in `~/.cache/`).

@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::{IterationLimitConfig, ModelsConfig};
+use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 use crate::events::{
     EventStore, EventType, TaskStatus,
     TaskStartData, TaskEndData, ThinkingStartData, ToolCallData, ToolResultData,
@@ -21,6 +22,7 @@ use crate::plans::{PlanStore, StepTracker};
 use crate::providers::{ProviderError, ProviderErrorKind};
 use crate::router::{self, Router};
 use crate::skills::{self, MemoryContext, SharedSkillRegistry};
+use crate::tools::VerificationTracker;
 use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
 // Re-export StatusUpdate from types for backwards compatibility
 pub use crate::types::StatusUpdate;
@@ -148,6 +150,9 @@ pub struct Agent {
     task_timeout: Option<Duration>,
     /// Optional token budget per task.
     task_token_budget: Option<u64>,
+    /// Path verification tracker — gates file-modifying commands on unverified paths.
+    /// None for sub-agents (they inherit parent context).
+    verification_tracker: Option<Arc<VerificationTracker>>,
 }
 
 impl Agent {
@@ -228,6 +233,7 @@ impl Agent {
             daily_token_budget,
             task_timeout: task_timeout_secs.map(Duration::from_secs),
             task_token_budget,
+            verification_tracker: Some(Arc::new(VerificationTracker::new())),
         }
     }
 
@@ -280,6 +286,7 @@ impl Agent {
             daily_token_budget: None,
             task_timeout,
             task_token_budget,
+            verification_tracker: None, // Sub-agents skip path verification
         }
     }
 
@@ -310,6 +317,7 @@ impl Agent {
         mission: &str,
         task: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        channel_ctx: ChannelContext,
     ) -> anyhow::Result<String> {
         if self.depth >= self.max_depth {
             anyhow::bail!(
@@ -414,7 +422,7 @@ impl Agent {
             spawn_tool.set_agent(Arc::downgrade(&child));
 
             child
-                .handle_message(&child_session, task, status_tx)
+                .handle_message(&child_session, task, status_tx, UserRole::Owner, channel_ctx)
                 .await
         } else {
             // At max depth — no spawn tool, no recursion.
@@ -440,7 +448,7 @@ impl Agent {
             ));
 
             child
-                .handle_message(&child_session, task, status_tx)
+                .handle_message(&child_session, task, status_tx, UserRole::Owner, channel_ctx)
                 .await
         };
 
@@ -527,9 +535,32 @@ impl Agent {
             .collect()
     }
 
+    /// Pick a fallback model: stored fallback if different from `failed_model`,
+    /// otherwise ask the router for any tier model that differs.
+    async fn pick_fallback(&self, failed_model: &str) -> Option<String> {
+        let stored = self.fallback_model.read().await.clone();
+        if stored != failed_model {
+            return Some(stored);
+        }
+        // Stored fallback is the same model — try the router tiers
+        if let Some(ref router) = self.router {
+            for tier in &[
+                crate::router::Tier::Primary,
+                crate::router::Tier::Smart,
+                crate::router::Tier::Fast,
+            ] {
+                let candidate = router.select(*tier).to_string();
+                if candidate != failed_model {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
     /// Attempt an LLM call with error-classified recovery:
-    /// - RateLimit → wait retry_after, retry once
-    /// - Timeout/Network/ServerError → retry once
+    /// - RateLimit → wait retry_after, retry once, then fallback
+    /// - Timeout/Network/ServerError → retry once, then fallback
     /// - NotFound → fallback to previous model
     /// - Auth/Billing → return user-facing error immediately
     async fn call_llm_with_recovery(
@@ -564,13 +595,32 @@ impl Agent {
                         Err(anyhow::anyhow!("{}", provider_err.user_message()))
                     }
 
-                    // --- Rate limit: wait and retry once ---
+                    // --- Rate limit: wait, retry once, then fallback ---
                     ProviderErrorKind::RateLimit => {
                         let wait = provider_err.retry_after_secs.unwrap_or(5);
                         let wait = wait.min(60); // cap at 60s
                         info!(wait_secs = wait, "Rate limited, waiting before retry");
                         tokio::time::sleep(Duration::from_secs(wait)).await;
-                        self.provider.chat(model, messages, tool_defs).await
+                        match self.provider.chat(model, messages, tool_defs).await {
+                            Ok(resp) => {
+                                self.stamp_lastgood().await;
+                                Ok(resp)
+                            }
+                            Err(_retry_err) => {
+                                // Still rate-limited — try a fallback model
+                                if let Some(fallback) = self.pick_fallback(model).await {
+                                    warn!(fallback = %fallback, "Rate limit retry failed, trying fallback model");
+                                    let resp = self
+                                        .provider
+                                        .chat(&fallback, messages, tool_defs)
+                                        .await?;
+                                    *self.model.write().await = fallback;
+                                    Ok(resp)
+                                } else {
+                                    Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                                }
+                            }
+                        }
                     }
 
                     // --- Timeout / Network / Server: retry once ---
@@ -585,9 +635,8 @@ impl Agent {
                                 Ok(resp)
                             }
                             Err(_retry_err) => {
-                                // Second failure — try the fallback model
-                                let fallback = self.fallback_model.read().await.clone();
-                                if fallback != model {
+                                // Second failure — try a fallback model
+                                if let Some(fallback) = self.pick_fallback(model).await {
                                     warn!(fallback = %fallback, "Retry failed, trying fallback model");
                                     let resp = self
                                         .provider
@@ -604,8 +653,7 @@ impl Agent {
 
                     // --- NotFound (bad model name): fallback immediately ---
                     ProviderErrorKind::NotFound => {
-                        let fallback = self.fallback_model.read().await.clone();
-                        if fallback != model {
+                        if let Some(fallback) = self.pick_fallback(model).await {
                             warn!(
                                 bad_model = model,
                                 fallback = %fallback,
@@ -639,6 +687,8 @@ impl Agent {
         session_id: &str,
         user_text: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        user_role: UserRole,
+        channel_ctx: ChannelContext,
     ) -> anyhow::Result<String> {
         // Generate task ID for this request
         let task_id = Uuid::new_v4().to_string();
@@ -708,6 +758,7 @@ impl Agent {
                 &format!(r#"{{"action": "cancel_all"}}"#),
                 session_id,
                 status_tx.clone(),
+                channel_ctx.visibility,
             ).await;
             if let Ok(msg) = cancel_result {
                 if !msg.contains("No running CLI agents") {
@@ -727,7 +778,11 @@ impl Agent {
             completed_naturally: false,
         };
 
-        let tool_defs = self.tool_definitions();
+        let tool_defs = if user_role == UserRole::Public {
+            vec![]
+        } else {
+            self.tool_definitions()
+        };
         let model = {
             let is_override = *self.model_override.read().await;
             if !is_override {
@@ -772,18 +827,44 @@ impl Agent {
             }
         }
 
-        // Fetch all memory components for rich context
-        let facts = self.state.get_relevant_facts(user_text, self.max_facts).await?;
-        let episodes = self.state.get_relevant_episodes(user_text, 3).await.unwrap_or_default();
-        let goals = self.state.get_active_goals().await.unwrap_or_default();
-        let patterns = self.state.get_behavior_patterns(0.5).await.unwrap_or_default();
+        // Fetch memory components — skip personal memory in public/group channels
+        let inject_personal = channel_ctx.should_inject_personal_memory();
+        let facts = if inject_personal {
+            self.state.get_relevant_facts(user_text, self.max_facts).await?
+        } else {
+            vec![]
+        };
+        let episodes = if inject_personal {
+            self.state.get_relevant_episodes(user_text, 3).await.unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let goals = if inject_personal {
+            self.state.get_active_goals().await.unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let patterns = if inject_personal {
+            self.state.get_behavior_patterns(0.5).await.unwrap_or_default()
+        } else {
+            vec![]
+        };
+        // Procedures, error solutions, and expertise are operational — always load
         let procedures = self.state.get_relevant_procedures(user_text, 5).await.unwrap_or_default();
         let error_solutions = self.state.get_relevant_error_solutions(user_text, 5).await.unwrap_or_default();
         let expertise = self.state.get_all_expertise().await.unwrap_or_default();
-        let profile = self.state.get_user_profile().await.ok().flatten();
+        let profile = if inject_personal {
+            self.state.get_user_profile().await.ok().flatten()
+        } else {
+            None
+        };
 
-        // Get trusted command patterns for AI context
-        let trusted_patterns = self.state.get_trusted_command_patterns().await.unwrap_or_default();
+        // Get trusted command patterns for AI context (skip in public channels)
+        let trusted_patterns = if inject_personal {
+            self.state.get_trusted_command_patterns().await.unwrap_or_default()
+        } else {
+            vec![]
+        };
 
         // Build extended system prompt with all memory components
         let memory_context = MemoryContext {
@@ -836,6 +917,62 @@ impl Agent {
             self.max_facts,
             if suggestions.is_empty() { None } else { Some(&suggestions) },
         );
+
+        // Inject user role context
+        system_prompt = format!(
+            "{}\n\n[User Role: {}]{}",
+            system_prompt,
+            user_role,
+            match user_role {
+                UserRole::Guest => {
+                    " The current user is a guest. Be cautious with destructive actions, \
+                     sensitive data, and system configuration changes."
+                }
+                UserRole::Public => {
+                    " You have NO tools available. Respond conversationally only. \
+                     If the user asks you to perform actions that would require tools \
+                     (running commands, reading files, browsing the web, etc.), politely \
+                     explain that tool-based actions are not available for public users."
+                }
+                _ => "",
+            }
+        );
+
+        // Inject channel context for non-private channels
+        match channel_ctx.visibility {
+            ChannelVisibility::Public => {
+                let ch_label = channel_ctx
+                    .channel_name
+                    .as_deref()
+                    .map(|n| format!(" \"{}\"", n))
+                    .unwrap_or_default();
+                system_prompt = format!(
+                    "{}\n\n[Channel Context: PUBLIC {} channel{}]\n\
+                     You are responding in a public channel visible to many people. Rules:\n\
+                     - Do NOT reference private information, personal facts, goals, or memory from DMs.\n\
+                     - If the user asks about something that requires private context, suggest continuing in a DM.\n\
+                     - Be professional and concise. Assume others are reading.\n\
+                     - Do not mention the user's personal projects, habits, or preferences.",
+                    system_prompt, channel_ctx.platform, ch_label
+                );
+            }
+            ChannelVisibility::PrivateGroup => {
+                let ch_label = channel_ctx
+                    .channel_name
+                    .as_deref()
+                    .map(|n| format!(" \"{}\"", n))
+                    .unwrap_or_default();
+                system_prompt = format!(
+                    "{}\n\n[Channel Context: PRIVATE GROUP on {}{}]\n\
+                     You are in a private group chat. Be cautious about sharing highly \
+                     sensitive personal information. If asked about something very private, \
+                     suggest continuing in a direct message.",
+                    system_prompt, channel_ctx.platform, ch_label
+                );
+            }
+            // Private and Internal: no additional injection (current behavior)
+            _ => {}
+        }
 
         // Inject session context if present
         if !session_context_str.is_empty() {
@@ -1257,10 +1394,26 @@ impl Agent {
 
             // === NATURAL COMPLETION: No tool calls ===
             if resp.tool_calls.is_empty() {
-                // If LLM returns empty content with no tool calls, complete silently
-                // (don't spam users with "I've completed the task" for every scheduled job)
                 let reply = resp.content.filter(|s| !s.is_empty()).unwrap_or_default();
                 if reply.is_empty() {
+                    // If the agent actually did work (iteration > 1 means tool calls happened)
+                    // and this is the top-level agent (depth 0), send a brief completion note
+                    // so the user knows the task finished. Without this, the user gets silence
+                    // because the LLM decided the tool output already communicated the answer.
+                    if iteration > 1 && self.depth == 0 {
+                        let task_hint: String = learning_ctx.user_text.chars().take(80).collect();
+                        let task_hint = task_hint.trim();
+                        let reply = if task_hint.is_empty() {
+                            "Done.".to_string()
+                        } else if learning_ctx.user_text.len() > 80 {
+                            format!("Done — {}...", task_hint)
+                        } else {
+                            format!("Done — {}", task_hint)
+                        };
+                        info!(session_id, iteration, "Agent completed with synthesized completion message");
+                        return Ok(reply);
+                    }
+                    // No work was done (first iteration) or sub-agent — stay silent
                     info!(session_id, iteration, "Agent completed with empty response");
                     return Ok(String::new());
                 }
@@ -1340,6 +1493,36 @@ impl Agent {
                     output_tokens: resp.usage.as_ref().map(|u| u.output_tokens as u32),
                 },
             ).await;
+
+            // Intent gate: on first iteration, require narration before tool calls.
+            // Forces the agent to "show its work" so the user can catch misunderstandings.
+            if iteration == 1
+                && self.depth == 0
+                && !resp.tool_calls.is_empty()
+                && resp.content.as_ref().map_or(true, |c| c.trim().len() < 20)
+            {
+                info!(session_id, "Intent gate: requiring narration before tool execution");
+                for tc in &resp.tool_calls {
+                    let result_text = "[SYSTEM] Before executing tools, briefly state what you \
+                        understand the user is asking and what you plan to do. \
+                        Then re-issue the tool calls."
+                        .to_string();
+                    let tool_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "tool".to_string(),
+                        content: Some(result_text),
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.name.clone()),
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.3,
+                        embedding: None,
+                    };
+                    self.state.append_message(&tool_msg).await?;
+                }
+                continue; // Skip to next iteration — agent will narrate then retry
+            }
 
             let mut successful_tool_calls = 0;
 
@@ -1452,7 +1635,7 @@ impl Agent {
                     let _ = st.record_tool_call(session_id, &tc.name, &tc.id).await;
                 }
 
-                let result = self.execute_tool(&tc.name, &tc.arguments, session_id, status_tx.clone()).await;
+                let result = self.execute_tool(&tc.name, &tc.arguments, session_id, status_tx.clone(), channel_ctx.visibility).await;
                 let mut result_text = match result {
                     Ok(text) => text,
                     Err(e) => format!("Error: {}", e),
@@ -1828,10 +2011,15 @@ impl Agent {
         arguments: &str,
         session_id: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        channel_visibility: ChannelVisibility,
     ) -> anyhow::Result<String> {
         let enriched_args = match serde_json::from_str::<Value>(arguments) {
             Ok(Value::Object(mut map)) => {
                 map.insert("_session_id".to_string(), json!(session_id));
+                map.insert(
+                    "_channel_visibility".to_string(),
+                    json!(channel_visibility.to_string()),
+                );
                 // Mark as untrusted if this session originated from an automated
                 // trigger (e.g., email) rather than direct user interaction.
                 // This forces tools like terminal to require explicit approval.
@@ -1842,9 +2030,47 @@ impl Agent {
             }
             _ => arguments.to_string(),
         };
+
+        // Path verification pre-check: gate file-modifying terminal commands
+        if name == "terminal" {
+            if let Some(ref tracker) = self.verification_tracker {
+                if let Some(cmd) = extract_command_from_args(&enriched_args) {
+                    if let Some(warning) = tracker.check_modifying_command(session_id, &cmd).await {
+                        return Ok(format!(
+                            "[VERIFICATION WARNING] {}\nUnverified paths: {}\n\
+                             Verify targets exist using 'ls' or 'stat' first, then retry.",
+                            warning.message,
+                            warning.unverified_paths.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+
         for tool in &self.tools {
             if tool.name() == name {
-                return tool.call_with_status(&enriched_args, status_tx).await;
+                let result = tool.call_with_status(&enriched_args, status_tx).await;
+
+                // Post-execution: record seen paths from successful commands
+                if result.is_ok() {
+                    if let Some(ref tracker) = self.verification_tracker {
+                        match name {
+                            "terminal" => {
+                                if let Some(cmd) = extract_command_from_args(&enriched_args) {
+                                    tracker.record_from_command(session_id, &cmd).await;
+                                }
+                            }
+                            "send_file" => {
+                                if let Some(path) = extract_file_path_from_args(&enriched_args) {
+                                    tracker.record_seen_path(session_id, &path).await;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                return result;
             }
         }
         anyhow::bail!("Unknown tool: {}", name)
@@ -2375,6 +2601,20 @@ fn fixup_message_ordering(messages: &mut Vec<Value>) {
         }
         i += 1;
     }
+}
+
+/// Extract the "command" field from tool arguments JSON (for terminal tool).
+fn extract_command_from_args(args_json: &str) -> Option<String> {
+    serde_json::from_str::<Value>(args_json)
+        .ok()
+        .and_then(|v| v.get("command")?.as_str().map(String::from))
+}
+
+/// Extract the "file_path" field from tool arguments JSON (for send_file tool).
+fn extract_file_path_from_args(args_json: &str) -> Option<String> {
+    serde_json::from_str::<Value>(args_json)
+        .ok()
+        .and_then(|v| v.get("file_path")?.as_str().map(String::from))
 }
 
 /// Check if a session ID indicates it was triggered by an automated source

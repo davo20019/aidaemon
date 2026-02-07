@@ -13,7 +13,7 @@ use tracing::{info, warn, debug};
 
 use super::formatting::{build_help_text, format_number, markdown_to_slack_mrkdwn, sanitize_filename, split_message};
 use crate::agent::Agent;
-use crate::types::StatusUpdate;
+use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 use crate::channels::{ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
@@ -348,7 +348,7 @@ impl SlackChannel {
         };
 
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if event_type != "message" {
+        if event_type != "message" && event_type != "app_mention" {
             return;
         }
 
@@ -370,29 +370,55 @@ impl SlackChannel {
             }
         }
 
-        // Authorization check: fail-closed - deny if no users configured or user not in list
-        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user) {
-            warn!(user_id = %user, "Unauthorized Slack user attempted access");
-            if let Some(channel) = event.get("channel").and_then(|v| v.as_str()) {
-                let _ = self.post_message(channel, "Unauthorized.", None).await;
-            }
-            return;
-        }
-
         let channel_id = match event.get("channel").and_then(|v| v.as_str()) {
             Some(c) => c.to_string(),
             None => return,
         };
 
-        let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let raw_text = event.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let channel_type = event.get("channel_type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Determine user role: Owner if whitelisted, Public if @mention/DM, otherwise ignore
+        let is_whitelisted = !self.allowed_user_ids.is_empty() && self.allowed_user_ids.contains(&user);
+        let user_role = if is_whitelisted {
+            UserRole::Owner
+        } else {
+            // Check if user @mentioned the bot or sent a DM
+            let bot_id_guard = self.bot_user_id.lock().await;
+            let is_mention = if let Some(ref bid) = *bot_id_guard {
+                raw_text.contains(&format!("<@{}>", bid))
+            } else {
+                false
+            };
+            drop(bot_id_guard);
+            let is_dm = channel_type == "im";
+
+            if is_mention || is_dm {
+                UserRole::Public
+            } else {
+                // Non-whitelisted user, no @mention, not a DM — silently ignore
+                return;
+            }
+        };
+
+        // Strip bot @mention from text before processing
+        let text = {
+            let bot_id_guard = self.bot_user_id.lock().await;
+            if let Some(ref bid) = *bot_id_guard {
+                raw_text.replace(&format!("<@{}>", bid), "").trim().to_string()
+            } else {
+                raw_text.clone()
+            }
+        };
+
         let ts = event.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let thread_ts = event
             .get("thread_ts")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        // Check for file attachments
-        let file_context = if self.files_enabled {
+        // Check for file attachments (skip for Public users)
+        let file_context = if self.files_enabled && user_role != UserRole::Public {
             if let Some(files) = event.get("files").and_then(|v| v.as_array()) {
                 match self.handle_incoming_files(files).await {
                     Ok(ctx) => Some(ctx),
@@ -417,8 +443,13 @@ impl SlackChannel {
             None => text.clone(),
         };
 
-        // Handle slash commands sent as text
+        // Handle slash commands sent as text (block Public users)
         if agent_text.starts_with('/') {
+            if user_role == UserRole::Public {
+                let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
+                let _ = self.post_message(&channel_id, "Commands are not available for public users.", reply_thread.as_deref()).await;
+                return;
+            }
             let session_id = self.build_session_id(&channel_id, thread_ts.as_deref());
             let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
             let reply = self.dispatch_command(&agent_text, &session_id).await;
@@ -445,6 +476,20 @@ impl SlackChannel {
             let mut map = self.session_map.write().await;
             map.insert(session_id.clone(), self.channel_name());
         }
+
+        // Build channel context from Slack channel type
+        let channel_ctx = {
+            let visibility = match channel_type {
+                "im" => ChannelVisibility::Private,
+                "mpim" | "group" => ChannelVisibility::PrivateGroup,
+                _ => ChannelVisibility::Public, // "channel" or unknown defaults to public
+            };
+            ChannelContext {
+                visibility,
+                platform: "slack".to_string(),
+                channel_name: None, // Slack events don't include channel name
+            }
+        };
 
         info!(session_id, user_id = %user, "Received Slack message");
 
@@ -550,7 +595,7 @@ impl SlackChannel {
         let http = self.http.clone();
         tokio::spawn(async move {
             let result = tokio::select! {
-                r = agent.handle_message(&session_id, &agent_text, Some(status_tx)) => r,
+                r = agent.handle_message(&session_id, &agent_text, Some(status_tx), user_role, channel_ctx) => r,
                 _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
             };
             typing_cancel.cancel();

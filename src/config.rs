@@ -113,6 +113,8 @@ pub struct AppConfig {
     pub health: HealthConfig,
     #[serde(default)]
     pub updates: UpdateConfig,
+    #[serde(default)]
+    pub users: UsersConfig,
 }
 
 #[derive(Deserialize, Clone)]
@@ -903,6 +905,12 @@ fn default_update_check_interval_hours() -> u64 {
 
 fn default_update_confirmation_timeout_mins() -> u64 {
     60
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct UsersConfig {
+    #[serde(default)]
+    pub owner_ids: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

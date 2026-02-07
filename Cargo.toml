@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "A personal AI agent that runs as a background daemon, accessible via Telegram, with tool use, MCP integration, email triggers, and persistent memory"
 license = "MIT"
@@ -65,6 +65,9 @@ browser = ["dep:chromiumoxide"]
 discord = ["dep:serenity"]
 slack = ["dep:tokio-tungstenite"]
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
+
+[dev-dependencies]
+tempfile = "3"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/aidaemon-{ target }{ archive-suffix }"

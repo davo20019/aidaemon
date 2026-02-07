@@ -104,7 +104,7 @@ const PIPE_AMPLIFIERS: &[&str] = &[
 /// Split a command string by shell operators while respecting quotes.
 /// Returns a list of (segment, operator_after) tuples.
 /// The last segment will have None as its operator.
-fn split_by_operators(cmd: &str) -> Vec<(String, Option<String>)> {
+pub fn split_by_operators(cmd: &str) -> Vec<(String, Option<String>)> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut chars = cmd.chars().peekable();

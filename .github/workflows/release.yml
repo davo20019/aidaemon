@@ -58,7 +58,7 @@ jobs:
 
       - name: Build (native)
         if: '!matrix.cross'
-        run: cargo build --release --target ${{ matrix.target }} --features browser
+        run: cargo build --release --target ${{ matrix.target }} --features "browser,slack,discord"
 
       - name: Build (cross)
         if: matrix.cross

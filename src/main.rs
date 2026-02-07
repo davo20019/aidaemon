@@ -26,6 +26,11 @@ mod updater;
 pub mod utils;
 mod wizard;
 
+#[cfg(test)]
+mod testing;
+#[cfg(test)]
+mod integration_tests;
+
 use std::path::PathBuf;
 
 use tracing_subscriber::EnvFilter;

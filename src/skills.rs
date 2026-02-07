@@ -375,6 +375,10 @@ pub fn build_system_prompt_with_memory(
         if !profile.prefers_explanations {
             prompt.push_str("- Keep explanations brief — user prefers direct answers\n");
         }
+        if profile.asks_before_acting {
+            prompt.push_str("- User prefers to be asked before significant actions are taken. \
+                For multi-step tasks, briefly state your plan and confirm before executing.\n");
+        }
     }
 
     // 2. Expertise Levels

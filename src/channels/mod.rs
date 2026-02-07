@@ -1,6 +1,6 @@
 mod formatting;
 mod hub;
-mod telegram;
+pub(crate) mod telegram;
 #[cfg(feature = "discord")]
 mod discord;
 #[cfg(feature = "slack")]

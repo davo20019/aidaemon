@@ -10,6 +10,7 @@ use tracing::{error, info};
 use crate::agent::{Agent, StatusUpdate};
 use crate::channels::ChannelHub;
 use crate::traits::Tool;
+use crate::types::{ChannelContext, ChannelVisibility};
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
 ///
@@ -107,6 +108,9 @@ struct SpawnArgs {
     /// Session ID injected by execute_tool — used for background completion notifications.
     #[serde(default)]
     _session_id: Option<String>,
+    /// Channel visibility injected by execute_tool — propagated to child agents.
+    #[serde(default)]
+    _channel_visibility: Option<String>,
 }
 
 #[async_trait]
@@ -172,8 +176,24 @@ impl Tool for SpawnAgentTool {
             "spawn_agent tool invoked"
         );
 
+        // Reconstruct channel context from injected visibility string
+        let channel_ctx = {
+            let visibility = args
+                ._channel_visibility
+                .as_deref()
+                .map(ChannelVisibility::from_str_lossy)
+                .unwrap_or(ChannelVisibility::Internal);
+            ChannelContext {
+                visibility,
+                platform: "internal".to_string(),
+                channel_name: None,
+            }
+        };
+
         if !args.background {
-            return self.run_sync(agent, &args.mission, &args.task, status_tx).await;
+            return self
+                .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx)
+                .await;
         }
 
         // Background mode: need hub + session_id, fall back to sync if unavailable
@@ -181,14 +201,18 @@ impl Tool for SpawnAgentTool {
             Some(h) => h,
             None => {
                 info!("Background mode requested but hub not available, falling back to sync");
-                return self.run_sync(agent, &args.mission, &args.task, status_tx).await;
+                return self
+                    .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx)
+                    .await;
             }
         };
         let session_id = match args._session_id {
             Some(ref id) if !id.is_empty() => id.clone(),
             _ => {
                 info!("Background mode requested but no session_id, falling back to sync");
-                return self.run_sync(agent, &args.mission, &args.task, status_tx).await;
+                return self
+                    .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx)
+                    .await;
             }
         };
 
@@ -200,7 +224,7 @@ impl Tool for SpawnAgentTool {
             let timeout_duration = Duration::from_secs(timeout_secs);
             let result = tokio::time::timeout(
                 timeout_duration,
-                agent.spawn_child(&mission, &args.task, status_tx),
+                agent.spawn_child(&mission, &args.task, status_tx, channel_ctx),
             )
             .await;
 
@@ -255,11 +279,14 @@ impl SpawnAgentTool {
         mission: &str,
         task: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        channel_ctx: ChannelContext,
     ) -> anyhow::Result<String> {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
-        let result =
-            tokio::time::timeout(timeout_duration, agent.spawn_child(mission, task, status_tx))
-                .await;
+        let result = tokio::time::timeout(
+            timeout_duration,
+            agent.spawn_child(mission, task, status_tx, channel_ctx),
+        )
+        .await;
 
         match result {
             Ok(Ok(response)) => {
@@ -356,6 +383,7 @@ mod tests {
         let args: SpawnArgs = serde_json::from_str(json).unwrap();
         assert!(!args.background);
         assert!(args._session_id.is_none());
+        assert!(args._channel_visibility.is_none());
     }
 
     #[test]
@@ -365,5 +393,12 @@ mod tests {
         let args: SpawnArgs = serde_json::from_str(json).unwrap();
         assert!(args.background);
         assert_eq!(args._session_id.as_deref(), Some("tg:123"));
+    }
+
+    #[test]
+    fn spawn_args_with_channel_visibility() {
+        let json = r#"{"mission": "test", "task": "do stuff", "_channel_visibility": "public"}"#;
+        let args: SpawnArgs = serde_json::from_str(json).unwrap();
+        assert_eq!(args._channel_visibility.as_deref(), Some("public"));
     }
 }

@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 use super::formatting::{build_help_text, format_number, sanitize_filename, split_message};
 use crate::agent::Agent;
-use crate::types::StatusUpdate;
+use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate};
 use crate::channels::{ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
@@ -405,12 +405,23 @@ impl DiscordChannel {
         let (task_id, cancel_token) = self.task_registry.register(&session_id, &description).await;
         let registry = Arc::clone(&self.task_registry);
 
+        // Build channel context from Discord message
+        let channel_ctx = if msg.guild_id.is_some() {
+            ChannelContext {
+                visibility: ChannelVisibility::Public,
+                platform: "discord".to_string(),
+                channel_name: None,
+            }
+        } else {
+            ChannelContext::private("discord")
+        };
+
         let agent = Arc::clone(&self.agent);
         let channel_id = msg.channel_id;
         let http = ctx.http.clone();
         tokio::spawn(async move {
             let result = tokio::select! {
-                r = agent.handle_message(&session_id, &text, Some(status_tx)) => r,
+                r = agent.handle_message(&session_id, &text, Some(status_tx), crate::types::UserRole::Owner, channel_ctx) => r,
                 _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
             };
             typing_cancel.cancel();

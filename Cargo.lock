@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -76,6 +76,7 @@ dependencies = [
  "shellexpand",
  "sqlx",
  "teloxide",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.24.0",

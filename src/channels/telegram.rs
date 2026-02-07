@@ -21,7 +21,7 @@ use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
-use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
+use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, MediaKind, MediaMessage, StatusUpdate, UserRole};
 
 pub struct TelegramChannel {
     /// Bot username fetched from Telegram API (e.g., "coding_bot", "debug_bot").
@@ -31,7 +31,9 @@ pub struct TelegramChannel {
     cached_channel_name: StdRwLock<String>,
     bot: Bot,
     bot_token: String,
-    allowed_user_ids: Vec<u64>,
+    allowed_user_ids: StdRwLock<Vec<u64>>,
+    /// Telegram user IDs recognized as owners (from `users.owner_ids.telegram`).
+    owner_user_ids: Vec<u64>,
     agent: Arc<Agent>,
     config_path: PathBuf,
     /// Pending approvals keyed by a unique callback ID.
@@ -57,6 +59,7 @@ impl TelegramChannel {
     pub fn new(
         bot_token: &str,
         allowed_user_ids: Vec<u64>,
+        owner_user_ids: Vec<u64>,
         agent: Arc<Agent>,
         config_path: PathBuf,
         session_map: SessionMap,
@@ -72,7 +75,8 @@ impl TelegramChannel {
             cached_channel_name: StdRwLock::new("telegram".to_string()),
             bot,
             bot_token: bot_token.to_string(),
-            allowed_user_ids,
+            allowed_user_ids: StdRwLock::new(allowed_user_ids),
+            owner_user_ids,
             agent,
             config_path,
             pending_approvals: Mutex::new(HashMap::new()),
@@ -92,6 +96,39 @@ impl TelegramChannel {
         if let Ok(mut guard) = self.channel_hub.write() {
             *guard = Some(hub);
         }
+    }
+
+    /// Persist the current allowed_user_ids list to config.toml.
+    /// Handles both `[telegram]` and `[[telegram_bots]]` config formats.
+    async fn persist_allowed_user_ids(&self, ids: &[u64]) -> anyhow::Result<()> {
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let mut doc: toml::Table = content.parse()?;
+
+        let ids_toml = toml::Value::Array(
+            ids.iter().map(|&id| toml::Value::Integer(id as i64)).collect(),
+        );
+
+        // Update whichever config format exists: [telegram] or [[telegram_bots]]
+        let mut updated = false;
+        if let Some(telegram) = doc.get_mut("telegram").and_then(|v| v.as_table_mut()) {
+            telegram.insert("allowed_user_ids".to_string(), ids_toml.clone());
+            updated = true;
+        }
+        if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut()) {
+            if let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
+                first.insert("allowed_user_ids".to_string(), ids_toml);
+                updated = true;
+            }
+        }
+
+        if !updated {
+            anyhow::bail!("No [telegram] or [[telegram_bots]] section found in config");
+        }
+
+        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
+        tokio::fs::write(&self.config_path, &new_content).await?;
+        info!("Persisted allowed_user_ids to config.toml");
+        Ok(())
     }
 
     /// Get the bot's username, fetching from Telegram API if not cached.
@@ -229,9 +266,13 @@ impl TelegramChannel {
         // Authorization check: only allowed users can approve/deny commands.
         // Fail-closed: deny if no users configured or user not in list.
         let user_id = q.from.id.0;
-        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id) {
+        let is_authorized = {
+            let allowed = self.allowed_user_ids.read().unwrap();
+            !allowed.is_empty() && allowed.contains(&user_id)
+        };
+        if !is_authorized {
             warn!(user_id, "Unauthorized callback from user");
-            let _ = bot.answer_callback_query(q.id).text("Unauthorized.").await;
+            let _ = bot.answer_callback_query(q.id).text(format!("Unauthorized. Your ID: {}", user_id)).await;
             return;
         }
 
@@ -706,7 +747,7 @@ impl TelegramChannel {
         }
 
         // Save the new bot with same allowed users as current bot
-        let allowed_user_ids_str: Vec<String> = self.allowed_user_ids.iter().map(|id| id.to_string()).collect();
+        let allowed_user_ids_str: Vec<String> = self.allowed_user_ids.read().unwrap().iter().map(|id| id.to_string()).collect();
 
         let new_bot = crate::traits::DynamicBot {
             id: 0, // Will be set by database
@@ -740,7 +781,8 @@ impl TelegramChannel {
                 // Create the new channel with same config as this one
                 let new_channel = Arc::new(TelegramChannel::new(
                     token,
-                    self.allowed_user_ids.clone(),
+                    self.allowed_user_ids.read().unwrap().clone(),
+                    self.owner_user_ids.clone(),
                     Arc::clone(&self.agent),
                     self.config_path.clone(),
                     self.session_map.clone(),
@@ -1098,14 +1140,60 @@ impl TelegramChannel {
     async fn handle_message(&self, msg: teloxide::types::Message, bot: Bot) {
         let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
 
-        // Authorization check: fail-closed - deny if no users configured or user not in list
-        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id) {
-            warn!(user_id, "Unauthorized user attempted access");
-            let _ = bot
-                .send_message(msg.chat.id, "Unauthorized.")
-                .await;
-            return;
+        // Authorization check with first-user auto-claim.
+        let auth_result = {
+            let allowed = self.allowed_user_ids.read().unwrap();
+            if allowed.is_empty() {
+                drop(allowed);
+                let mut allowed = self.allowed_user_ids.write().unwrap();
+                check_auth(&mut allowed, user_id)
+            } else if allowed.contains(&user_id) {
+                AuthResult::Authorized
+            } else {
+                AuthResult::Unauthorized
+            }
+        };
+
+        match auth_result {
+            AuthResult::AutoClaimed => {
+                // Persist to config.toml so it survives restarts
+                let ids = self.allowed_user_ids.read().unwrap().clone();
+                if let Err(e) = self.persist_allowed_user_ids(&ids).await {
+                    warn!(user_id, "Failed to persist auto-claimed user ID to config: {}", e);
+                }
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        format!(
+                            "Welcome! You're the first user — your Telegram ID \
+                             (<code>{}</code>) has been saved as owner.",
+                            user_id
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await;
+                // Fall through to process the message normally
+            }
+            AuthResult::Unauthorized => {
+                warn!(user_id, "Unauthorized user attempted access");
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        format!(
+                            "Unauthorized. Your Telegram user ID is <code>{}</code>.\n\n\
+                             To grant access, add it to <code>allowed_user_ids</code> in config.toml:\n\
+                             <pre>[telegram]\nallowed_user_ids = [{}]</pre>",
+                            user_id, user_id
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await;
+                return;
+            }
+            AuthResult::Authorized => {} // continue
         }
+
+        let user_role = determine_role(&self.owner_user_ids, user_id);
 
         let text = if let Some(t) = msg.text() {
             t.to_string()
@@ -1139,6 +1227,30 @@ impl TelegramChannel {
             let mut map = self.session_map.write().await;
             map.insert(session_id.clone(), self.channel_name().await);
         }
+
+        // Build channel context from Telegram chat type
+        let channel_ctx = {
+            use teloxide::types::{ChatKind, PublicChatKind};
+            let visibility = match &msg.chat.kind {
+                ChatKind::Private(_) => ChannelVisibility::Private,
+                ChatKind::Public(public) => match &public.kind {
+                    PublicChatKind::Group => ChannelVisibility::PrivateGroup,
+                    PublicChatKind::Supergroup(sg) => {
+                        if sg.username.is_some() {
+                            ChannelVisibility::Public
+                        } else {
+                            ChannelVisibility::PrivateGroup
+                        }
+                    }
+                    PublicChatKind::Channel(_) => ChannelVisibility::Public,
+                },
+            };
+            ChannelContext {
+                visibility,
+                platform: "telegram".to_string(),
+                channel_name: msg.chat.title().map(|s| s.to_string()),
+            }
+        };
 
         // Handle cancel/stop commands - these bypass the queue
         let text_lower = text.to_lowercase();
@@ -1285,7 +1397,7 @@ impl TelegramChannel {
 
             loop {
                 let result = tokio::select! {
-                    r = agent.handle_message(&session_id, &current_text, Some(current_status_tx)) => r,
+                    r = agent.handle_message(&session_id, &current_text, Some(current_status_tx), user_role, channel_ctx.clone()) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
                 };
                 current_typing_cancel.cancel();
@@ -1407,7 +1519,7 @@ impl Channel for TelegramChannel {
 
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
         let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
-            self.allowed_user_ids.first().copied().unwrap_or(0) as i64
+            self.allowed_user_ids.read().unwrap().first().copied().unwrap_or(0) as i64
         });
         let html = markdown_to_telegram_html(text);
         for chunk in split_message(&html, 4096) {
@@ -1420,7 +1532,7 @@ impl Channel for TelegramChannel {
 
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
         let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
-            self.allowed_user_ids.first().copied().unwrap_or(0) as i64
+            self.allowed_user_ids.read().unwrap().first().copied().unwrap_or(0) as i64
         });
         match &media.kind {
             MediaKind::Photo { data } => {
@@ -1453,7 +1565,7 @@ impl Channel for TelegramChannel {
         permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse> {
         let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
-            self.allowed_user_ids.first().copied().unwrap_or(0) as i64
+            self.allowed_user_ids.read().unwrap().first().copied().unwrap_or(0) as i64
         });
 
         info!(session_id, command, chat_id, risk = %risk_level, mode = %permission_mode, "Approval requested");
@@ -1618,4 +1730,164 @@ pub fn spawn_telegram_channel(channel: Arc<TelegramChannel>) {
     tokio::spawn(async move {
         channel.start_with_retry().await;
     });
+}
+
+/// Result of the authorization check for an incoming message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthResult {
+    /// User is in the allow list — proceed normally.
+    Authorized,
+    /// No users were configured and this user was auto-claimed as owner.
+    AutoClaimed,
+    /// User is not allowed.
+    Unauthorized,
+}
+
+/// Pure authorization check against the allow list with first-user auto-claim.
+/// When `allowed` is empty, pushes `user_id` into it and returns `AutoClaimed`.
+pub fn check_auth(allowed: &mut Vec<u64>, user_id: u64) -> AuthResult {
+    if allowed.is_empty() {
+        allowed.push(user_id);
+        AuthResult::AutoClaimed
+    } else if allowed.contains(&user_id) {
+        AuthResult::Authorized
+    } else {
+        AuthResult::Unauthorized
+    }
+}
+
+/// Pure role determination: Owner when `owner_ids` is empty (all allowed users
+/// are owners) or when the user is explicitly listed; Guest otherwise.
+pub fn determine_role(owner_ids: &[u64], user_id: u64) -> UserRole {
+    if owner_ids.is_empty() || owner_ids.contains(&user_id) {
+        UserRole::Owner
+    } else {
+        UserRole::Guest
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- check_auth ---
+
+    #[test]
+    fn auth_empty_list_auto_claims_first_user() {
+        let mut allowed = vec![];
+        assert_eq!(check_auth(&mut allowed, 111), AuthResult::AutoClaimed);
+        assert_eq!(allowed, vec![111]);
+    }
+
+    #[test]
+    fn auth_allowed_user_is_authorized() {
+        let mut allowed = vec![111, 222];
+        assert_eq!(check_auth(&mut allowed, 222), AuthResult::Authorized);
+    }
+
+    #[test]
+    fn auth_unknown_user_is_unauthorized() {
+        let mut allowed = vec![111];
+        assert_eq!(check_auth(&mut allowed, 999), AuthResult::Unauthorized);
+        // List should not be modified
+        assert_eq!(allowed, vec![111]);
+    }
+
+    #[test]
+    fn auth_second_user_after_auto_claim_is_unauthorized() {
+        let mut allowed = vec![];
+        assert_eq!(check_auth(&mut allowed, 111), AuthResult::AutoClaimed);
+        assert_eq!(check_auth(&mut allowed, 222), AuthResult::Unauthorized);
+    }
+
+    #[test]
+    fn auth_same_user_after_auto_claim_is_authorized() {
+        let mut allowed = vec![];
+        assert_eq!(check_auth(&mut allowed, 111), AuthResult::AutoClaimed);
+        assert_eq!(check_auth(&mut allowed, 111), AuthResult::Authorized);
+    }
+
+    // --- determine_role ---
+
+    #[test]
+    fn role_no_owner_ids_defaults_to_owner() {
+        assert_eq!(determine_role(&[], 111), UserRole::Owner);
+    }
+
+    #[test]
+    fn role_user_in_owner_ids_is_owner() {
+        assert_eq!(determine_role(&[111, 222], 111), UserRole::Owner);
+    }
+
+    #[test]
+    fn role_user_not_in_owner_ids_is_guest() {
+        assert_eq!(determine_role(&[111], 222), UserRole::Guest);
+    }
+
+    // --- persist_allowed_user_ids (config file update) ---
+
+    #[tokio::test]
+    async fn persist_updates_legacy_telegram_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let initial = r#"
+[telegram]
+bot_token = "test-token"
+allowed_user_ids = []
+"#;
+        tokio::fs::write(&config_path, initial).await.unwrap();
+
+        // Parse and re-write with the helper logic
+        let content = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let mut doc: toml::Table = content.parse().unwrap();
+        let ids = vec![12345u64];
+        let ids_toml = toml::Value::Array(
+            ids.iter().map(|&id| toml::Value::Integer(id as i64)).collect(),
+        );
+        if let Some(tg) = doc.get_mut("telegram").and_then(|v| v.as_table_mut()) {
+            tg.insert("allowed_user_ids".to_string(), ids_toml);
+        }
+        let new_content = toml::to_string_pretty(&toml::Value::Table(doc)).unwrap();
+        tokio::fs::write(&config_path, &new_content).await.unwrap();
+
+        // Verify
+        let saved = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let doc: toml::Table = saved.parse().unwrap();
+        let ids_val = doc["telegram"]["allowed_user_ids"].as_array().unwrap();
+        assert_eq!(ids_val.len(), 1);
+        assert_eq!(ids_val[0].as_integer().unwrap(), 12345);
+    }
+
+    #[tokio::test]
+    async fn persist_updates_telegram_bots_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let initial = r#"
+[[telegram_bots]]
+bot_token = "test-token"
+allowed_user_ids = []
+"#;
+        tokio::fs::write(&config_path, initial).await.unwrap();
+
+        let content = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let mut doc: toml::Table = content.parse().unwrap();
+        let ids = vec![67890u64];
+        let ids_toml = toml::Value::Array(
+            ids.iter().map(|&id| toml::Value::Integer(id as i64)).collect(),
+        );
+        if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut()) {
+            if let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
+                first.insert("allowed_user_ids".to_string(), ids_toml);
+            }
+        }
+        let new_content = toml::to_string_pretty(&toml::Value::Table(doc)).unwrap();
+        tokio::fs::write(&config_path, &new_content).await.unwrap();
+
+        let saved = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let doc: toml::Table = saved.parse().unwrap();
+        let bots = doc["telegram_bots"].as_array().unwrap();
+        let ids_val = bots[0]["allowed_user_ids"].as_array().unwrap();
+        assert_eq!(ids_val.len(), 1);
+        assert_eq!(ids_val[0].as_integer().unwrap(), 67890);
+    }
 }
