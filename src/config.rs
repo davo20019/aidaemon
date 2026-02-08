@@ -343,7 +343,60 @@ pub struct StateConfig {
     /// once cumulative daily usage exceeds this limit. Resets at midnight UTC.
     #[serde(default)]
     pub daily_token_budget: Option<u64>,
+    /// Retention policies for automatic cleanup of old data.
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
+
+/// Retention policies for automatic cleanup of old data.
+/// All fields are in days. Set to 0 to disable cleanup for that table.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RetentionConfig {
+    /// Delete consolidated messages older than N days (default: 90)
+    #[serde(default = "default_retention_90")]
+    pub messages_days: u32,
+    /// Delete superseded fact versions older than N days (default: 90)
+    #[serde(default = "default_retention_90")]
+    pub superseded_facts_days: u32,
+    /// Aggregate raw token_usage into daily summaries after N days (default: 30)
+    #[serde(default = "default_retention_30")]
+    pub token_usage_aggregate_days: u32,
+    /// Delete episodes with recall_count=0 older than N days (default: 365)
+    #[serde(default = "default_retention_365")]
+    pub episodes_days: u32,
+    /// Delete behavior patterns at confidence floor older than N days (default: 90)
+    #[serde(default = "default_retention_90")]
+    pub behavior_patterns_days: u32,
+    /// Delete completed/abandoned goals older than N days (default: 180)
+    #[serde(default = "default_retention_180")]
+    pub goals_days: u32,
+    /// Delete zero-success procedures older than N days (default: 180)
+    #[serde(default = "default_retention_180")]
+    pub procedures_days: u32,
+    /// Delete net-negative error solutions older than N days (default: 90)
+    #[serde(default = "default_retention_90")]
+    pub error_solutions_days: u32,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            messages_days: 90,
+            superseded_facts_days: 90,
+            token_usage_aggregate_days: 30,
+            episodes_days: 365,
+            behavior_patterns_days: 90,
+            goals_days: 180,
+            procedures_days: 180,
+            error_solutions_days: 90,
+        }
+    }
+}
+
+fn default_retention_30() -> u32 { 30 }
+fn default_retention_90() -> u32 { 90 }
+fn default_retention_180() -> u32 { 180 }
+fn default_retention_365() -> u32 { 365 }
 
 impl fmt::Debug for StateConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -354,6 +407,7 @@ impl fmt::Debug for StateConfig {
             .field("encryption_key", &redact_option(&self.encryption_key))
             .field("max_facts", &self.max_facts)
             .field("daily_token_budget", &self.daily_token_budget)
+            .field("retention", &self.retention)
             .finish()
     }
 }
@@ -367,6 +421,7 @@ impl Default for StateConfig {
             encryption_key: None,
             max_facts: default_max_facts(),
             daily_token_budget: None,
+            retention: RetentionConfig::default(),
         }
     }
 }
@@ -381,7 +436,7 @@ fn default_consolidation_interval_hours() -> u64 {
     6
 }
 fn default_max_facts() -> usize {
-    100
+    20
 }
 
 /// Permission mode re-exported for config deserialization.
@@ -448,6 +503,38 @@ fn default_allowed_prefixes() -> Vec<String> {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct WatchdogConfig {
+    #[serde(default = "default_watchdog_enabled")]
+    pub enabled: bool,
+    /// Seconds of no heartbeat before declaring stuck (default: 300 = 5 min).
+    #[serde(default = "default_watchdog_stale_secs")]
+    pub stale_threshold_secs: u64,
+    /// Per-LLM-call timeout in seconds (default: 300 = 5 min).
+    #[serde(default = "default_llm_call_timeout_secs")]
+    pub llm_call_timeout_secs: u64,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_watchdog_enabled(),
+            stale_threshold_secs: default_watchdog_stale_secs(),
+            llm_call_timeout_secs: default_llm_call_timeout_secs(),
+        }
+    }
+}
+
+fn default_watchdog_enabled() -> bool {
+    true
+}
+fn default_watchdog_stale_secs() -> u64 {
+    300
+}
+fn default_llm_call_timeout_secs() -> u64 {
+    300
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct DaemonConfig {
     #[serde(default = "default_health_port")]
     pub health_port: u16,
@@ -458,6 +545,9 @@ pub struct DaemonConfig {
     /// Enable the embedded web dashboard on the health server port (default: true).
     #[serde(default = "default_dashboard_enabled")]
     pub dashboard_enabled: bool,
+    /// Watchdog configuration for detecting stuck agent tasks.
+    #[serde(default)]
+    pub watchdog: WatchdogConfig,
 }
 
 impl Default for DaemonConfig {
@@ -466,6 +556,7 @@ impl Default for DaemonConfig {
             health_port: default_health_port(),
             health_bind: default_health_bind(),
             dashboard_enabled: default_dashboard_enabled(),
+            watchdog: WatchdogConfig::default(),
         }
     }
 }
@@ -518,6 +609,8 @@ pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

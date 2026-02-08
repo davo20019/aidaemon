@@ -116,15 +116,15 @@ impl ProactiveEngine {
             let matches = match pattern.pattern_type.as_str() {
                 "sequence" => {
                     // Sequence patterns: check if last action matches trigger
-                    pattern.trigger_context.as_ref().map_or(false, |trigger| {
-                        context.last_action.as_ref().map_or(false, |action| {
+                    pattern.trigger_context.as_ref().is_some_and(|trigger| {
+                        context.last_action.as_ref().is_some_and(|action| {
                             action.to_lowercase().contains(&trigger.to_lowercase())
                         })
                     })
                 }
                 "trigger" => {
                     // Trigger patterns: check user message
-                    pattern.trigger_context.as_ref().map_or(false, |trigger| {
+                    pattern.trigger_context.as_ref().is_some_and(|trigger| {
                         context.user_message.to_lowercase().contains(&trigger.to_lowercase())
                     })
                 }
@@ -160,8 +160,8 @@ impl ProactiveEngine {
             }
 
             // Check if current context relates to the goal
-            let relevant = context.user_message.to_lowercase().contains(&goal.description.to_lowercase().split_whitespace().next().unwrap_or(""))
-                || context.current_topic.as_ref().map_or(false, |topic| {
+            let relevant = context.user_message.to_lowercase().contains(goal.description.to_lowercase().split_whitespace().next().unwrap_or(""))
+                || context.current_topic.as_ref().is_some_and(|topic| {
                     goal.description.to_lowercase().contains(&topic.to_lowercase())
                 });
 
@@ -217,7 +217,7 @@ impl ProactiveEngine {
 
         for episode in &self.recent_episodes {
             // Check if topics overlap
-            let topic_match = episode.topics.as_ref().map_or(false, |topics| {
+            let topic_match = episode.topics.as_ref().is_some_and(|topics| {
                 topics.iter().any(|t| context.user_message.to_lowercase().contains(&t.to_lowercase()))
             });
 

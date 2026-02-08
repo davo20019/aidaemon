@@ -169,11 +169,10 @@ pub fn score_message(msg: &Message) -> f32 {
         }
 
         // 9. Structured data (JSON objects/arrays)
-        if (text.contains('{') && text.contains('}')) || (text.contains('[') && text.contains(']')) {
-            if len > 50 {
+        if ((text.contains('{') && text.contains('}')) || (text.contains('[') && text.contains(']')))
+            && len > 50 {
                 score += 0.1;
             }
-        }
 
         // 10. Negative signals (Chit-chat / acknowledgements)
         if len < 15 && (

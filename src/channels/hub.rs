@@ -162,3 +162,211 @@ impl ChannelHub {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    use async_trait::async_trait;
+    use tokio::sync::Mutex;
+
+    use crate::tools::command_risk::{PermissionMode, RiskLevel};
+    use crate::traits::{Channel, ChannelCapabilities};
+    use crate::types::{ApprovalResponse, MediaMessage};
+
+    /// A test channel with a configurable name, used to verify routing.
+    struct NamedTestChannel {
+        channel_name: String,
+        messages: Mutex<Vec<(String, String)>>, // (session_id, text)
+    }
+
+    impl NamedTestChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                messages: Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn captured_messages(&self) -> Vec<(String, String)> {
+            self.messages.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl Channel for NamedTestChannel {
+        fn name(&self) -> String {
+            self.channel_name.clone()
+        }
+
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities {
+                markdown: true,
+                inline_buttons: false,
+                media: false,
+                max_message_len: 4096,
+            }
+        }
+
+        async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+            self.messages
+                .lock()
+                .await
+                .push((session_id.to_string(), text.to_string()));
+            Ok(())
+        }
+
+        async fn send_media(
+            &self,
+            _session_id: &str,
+            _media: &MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _session_id: &str,
+            _command: &str,
+            _risk_level: RiskLevel,
+            _warnings: &[String],
+            _permission_mode: PermissionMode,
+        ) -> anyhow::Result<ApprovalResponse> {
+            Ok(ApprovalResponse::AllowOnce)
+        }
+    }
+
+    fn empty_session_map() -> SessionMap {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    fn session_map_with(entries: Vec<(&str, &str)>) -> SessionMap {
+        let mut map = HashMap::new();
+        for (session, channel) in entries {
+            map.insert(session.to_string(), channel.to_string());
+        }
+        Arc::new(RwLock::new(map))
+    }
+
+    #[tokio::test]
+    async fn test_channel_for_session_known() {
+        let ch_telegram: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("telegram"));
+        let ch_slack: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("slack"));
+
+        let session_map = session_map_with(vec![("sess_1", "slack")]);
+        let hub = ChannelHub::new(vec![ch_telegram, ch_slack], session_map);
+
+        let found = hub.channel_for_session("sess_1").await;
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name(), "slack");
+    }
+
+    #[tokio::test]
+    async fn test_channel_for_session_fallback() {
+        let ch_telegram: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("telegram"));
+        let ch_slack: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("slack"));
+
+        let session_map = empty_session_map();
+        let hub = ChannelHub::new(vec![ch_telegram, ch_slack], session_map);
+
+        // Unknown session should fall back to the first channel
+        let found = hub.channel_for_session("unknown_session").await;
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name(), "telegram");
+    }
+
+    #[tokio::test]
+    async fn test_channel_for_session_empty() {
+        let session_map = empty_session_map();
+        let hub = ChannelHub::new(vec![], session_map);
+
+        let found = hub.channel_for_session("any_session").await;
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_send_text_routes_correctly() {
+        let ch_telegram = Arc::new(NamedTestChannel::new("telegram"));
+        let ch_slack = Arc::new(NamedTestChannel::new("slack"));
+
+        let ch_telegram_dyn: Arc<dyn Channel> = ch_telegram.clone();
+        let ch_slack_dyn: Arc<dyn Channel> = ch_slack.clone();
+
+        let session_map = session_map_with(vec![("sess_1", "slack")]);
+        let hub = ChannelHub::new(vec![ch_telegram_dyn, ch_slack_dyn], session_map);
+
+        hub.send_text("sess_1", "Hello Slack!").await.unwrap();
+
+        // Slack channel should have the message
+        let slack_msgs = ch_slack.captured_messages().await;
+        assert_eq!(slack_msgs.len(), 1);
+        assert_eq!(slack_msgs[0].0, "sess_1");
+        assert_eq!(slack_msgs[0].1, "Hello Slack!");
+
+        // Telegram channel should have no messages
+        let telegram_msgs = ch_telegram.captured_messages().await;
+        assert_eq!(telegram_msgs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_send_text_no_channels_errors() {
+        let session_map = empty_session_map();
+        let hub = ChannelHub::new(vec![], session_map);
+
+        let result = hub.send_text("sess_1", "Hello?").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No channel found"),
+            "Expected 'No channel found' error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_sends_to_all() {
+        let ch_telegram = Arc::new(NamedTestChannel::new("telegram"));
+        let ch_slack = Arc::new(NamedTestChannel::new("slack"));
+
+        let ch_telegram_dyn: Arc<dyn Channel> = ch_telegram.clone();
+        let ch_slack_dyn: Arc<dyn Channel> = ch_slack.clone();
+
+        let session_map = session_map_with(vec![
+            ("sess_telegram", "telegram"),
+            ("sess_slack", "slack"),
+        ]);
+        let hub = ChannelHub::new(vec![ch_telegram_dyn, ch_slack_dyn], session_map);
+
+        let ids = vec!["sess_telegram".to_string(), "sess_slack".to_string()];
+        hub.broadcast_text(&ids, "Broadcast!").await;
+
+        let telegram_msgs = ch_telegram.captured_messages().await;
+        assert_eq!(telegram_msgs.len(), 1);
+        assert_eq!(telegram_msgs[0].1, "Broadcast!");
+
+        let slack_msgs = ch_slack.captured_messages().await;
+        assert_eq!(slack_msgs.len(), 1);
+        assert_eq!(slack_msgs[0].1, "Broadcast!");
+    }
+
+    #[tokio::test]
+    async fn test_register_channel_dynamically() {
+        let session_map = session_map_with(vec![("sess_1", "discord")]);
+        let hub = ChannelHub::new(vec![], session_map);
+
+        // Initially no channels, so send_text should fail
+        assert!(hub.send_text("sess_1", "test").await.is_err());
+
+        // Register a channel dynamically
+        let ch_discord: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("discord"));
+        let name = hub.register_channel(ch_discord).await;
+        assert_eq!(name, "discord");
+
+        // Now send_text should succeed
+        let result = hub.send_text("sess_1", "Hello Discord!").await;
+        assert!(result.is_ok());
+    }
+}

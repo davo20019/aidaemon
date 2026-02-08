@@ -83,6 +83,8 @@ const CRITICAL_COMMANDS: &[&str] = &[
     "useradd", "userdel", "usermod", "passwd",
     // Network/firewall
     "iptables", "ufw", "firewall-cmd",
+    // Indirect execution (can bypass safety checks via indirection)
+    "eval", "exec", "source",
 ];
 
 const NETWORK_COMMANDS: &[&str] = &[
@@ -191,13 +193,6 @@ fn contains_dangerous_construct(cmd: &str) -> Option<&'static str> {
     if cmd.contains(">(") || cmd.contains("<(") {
         return Some("process substitution");
     }
-    // Redirection (can overwrite files)
-    if cmd.contains(">>") {
-        return Some("file append (>>)");
-    }
-    if cmd.contains('>') {
-        return Some("file overwrite (>)");
-    }
     // Multiple lines
     if cmd.contains('\n') {
         return Some("multiple lines");
@@ -209,7 +204,7 @@ fn contains_dangerous_construct(cmd: &str) -> Option<&'static str> {
 fn is_pipe_amplifier(cmd: &str) -> bool {
     let parts = match shell_words::split(cmd) {
         Ok(p) => p,
-        Err(_) => return false,
+        Err(_) => return true, // Treat unparseable commands as amplifiers (conservative)
     };
 
     if parts.is_empty() {
@@ -285,6 +280,15 @@ fn classify_single_segment(segment: &str) -> RiskAssessment {
     if let Some(construct_desc) = contains_dangerous_construct(segment) {
         level = RiskLevel::Critical;
         warnings.push(format!("Uses {}", construct_desc));
+    }
+
+    // Redirection is medium risk (not critical like command substitution)
+    if segment.contains(">>") {
+        level = std::cmp::max(level, RiskLevel::Medium);
+        warnings.push("Uses file append (>>)".to_string());
+    } else if segment.contains('>') {
+        level = std::cmp::max(level, RiskLevel::Medium);
+        warnings.push("Uses file overwrite (>)".to_string());
     }
 
     // Parse command
@@ -602,15 +606,15 @@ mod tests {
     }
 
     #[test]
-    fn test_redirection_operators_critical() {
-        // File overwrite
-        let assessment = classify_command("echo 'malware' > ~/.bashrc");
-        assert_eq!(assessment.level, RiskLevel::Critical);
+    fn test_redirection_operators_medium_risk() {
+        // File overwrite — Medium, not Critical
+        let assessment = classify_command("echo 'hello' > output.txt");
+        assert_eq!(assessment.level, RiskLevel::Medium);
         assert!(assessment.warnings.iter().any(|w| w.contains("overwrite")));
 
-        // File append
-        let assessment = classify_command("echo 'malware' >> ~/.bashrc");
-        assert_eq!(assessment.level, RiskLevel::Critical);
+        // File append — Medium, not Critical
+        let assessment = classify_command("echo 'hello' >> output.txt");
+        assert_eq!(assessment.level, RiskLevel::Medium);
         assert!(assessment.warnings.iter().any(|w| w.contains("append")));
     }
 
@@ -775,5 +779,32 @@ mod tests {
 
         let assessment = classify_command("cat file | grep pattern");
         assert!(assessment.warnings.iter().any(|w| w.contains("pipes")));
+    }
+
+    mod proptest_command_risk {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn classify_never_panics(cmd in ".*") {
+                let _ = classify_command(&cmd);
+            }
+
+            #[test]
+            fn risk_level_always_valid(cmd in "[a-zA-Z0-9 /_.-]{0,200}") {
+                let assessment = classify_command(&cmd);
+                assert!(matches!(
+                    assessment.level,
+                    RiskLevel::Safe | RiskLevel::Medium | RiskLevel::High | RiskLevel::Critical
+                ));
+            }
+
+            #[test]
+            fn empty_whitespace_is_safe(ws in r"\s{0,20}") {
+                let assessment = classify_command(&ws);
+                assert_eq!(assessment.level, RiskLevel::Safe);
+            }
+        }
     }
 }

@@ -57,7 +57,7 @@ impl ConfigManagerTool {
     /// Check if a key path requires user approval to modify.
     fn requires_approval(key_path: &str) -> bool {
         let last = key_path.rsplit('.').next().unwrap_or(key_path);
-        APPROVAL_REQUIRED_KEYS.iter().any(|&k| k == last)
+        APPROVAL_REQUIRED_KEYS.contains(&last)
     }
 
     /// Request user approval for a config change.
@@ -74,9 +74,17 @@ impl ConfigManagerTool {
             })
             .await
             .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval response channel closed"))
+        match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => {
+                tracing::warn!(description, "Approval response channel closed");
+                Ok(ApprovalResponse::Deny)
+            }
+            Err(_) => {
+                tracing::warn!(description, "Approval request timed out (300s), auto-denying");
+                Ok(ApprovalResponse::Deny)
+            }
+        }
     }
 
     /// Rotate backups (3-deep ring) and create a new .bak from current config.
@@ -332,7 +340,7 @@ fn set_toml_value(table: &mut toml::Table, path: &str, value: toml::Value) -> an
 /// Check if the last segment of a dotted key path is a sensitive key name.
 fn is_sensitive_key(path: &str) -> bool {
     let last = path.rsplit('.').next().unwrap_or(path);
-    SENSITIVE_KEYS.iter().any(|&k| k == last)
+    SENSITIVE_KEYS.contains(&last)
 }
 
 /// Recursively walk a TOML value and replace sensitive keys with a redacted placeholder.
@@ -340,7 +348,7 @@ fn redact_secrets(value: &mut toml::Value) {
     match value {
         toml::Value::Table(table) => {
             for (key, val) in table.iter_mut() {
-                if SENSITIVE_KEYS.iter().any(|&s| s == key.as_str()) {
+                if SENSITIVE_KEYS.contains(&key.as_str()) {
                     *val = toml::Value::String(REDACTED.to_string());
                 } else {
                     redact_secrets(val);

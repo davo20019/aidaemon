@@ -187,6 +187,10 @@ impl Tool for SpawnAgentTool {
                 visibility,
                 platform: "internal".to_string(),
                 channel_name: None,
+                channel_id: None,
+                sender_name: None,
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
             }
         };
 

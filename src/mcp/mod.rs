@@ -1,4 +1,5 @@
 mod client;
+pub mod registry;
 
 use std::sync::Arc;
 
@@ -10,22 +11,44 @@ use crate::config::McpServerConfig;
 use crate::traits::Tool;
 
 pub use client::McpClient;
+pub use registry::McpRegistry;
 
 /// A tool proxied from an MCP server.
 pub struct McpTool {
+    /// The name advertised to the LLM (may be prefixed for namespacing).
     tool_name: String,
+    /// The raw name used when calling the MCP server (always unprefixed).
+    server_tool_name: String,
     tool_schema: Value,
     client: Arc<McpClient>,
 }
 
 impl McpTool {
+    #[allow(dead_code)] // Used by discover_mcp_tools for static configs
     pub fn new(
         tool_name: String,
         tool_schema: Value,
         client: Arc<McpClient>,
     ) -> Self {
+        let server_tool_name = tool_name.clone();
         Self {
             tool_name,
+            server_tool_name,
+            tool_schema,
+            client,
+        }
+    }
+
+    /// Create a tool with a prefixed name for the LLM but a raw name for the server.
+    pub fn with_prefix(
+        server_tool_name: String,
+        prefixed_name: String,
+        tool_schema: Value,
+        client: Arc<McpClient>,
+    ) -> Self {
+        Self {
+            tool_name: prefixed_name,
+            server_tool_name,
             tool_schema,
             client,
         }
@@ -61,7 +84,7 @@ impl Tool for McpTool {
         info!(mcp_tool = %self.tool_name, args = %args_preview, "MCP tool call started");
 
         let start = std::time::Instant::now();
-        let result = self.client.call_tool(&self.tool_name, args).await;
+        let result = self.client.call_tool(&self.server_tool_name, args).await;
         let elapsed = start.elapsed();
 
         match &result {
@@ -91,6 +114,7 @@ impl Tool for McpTool {
 }
 
 /// Discover and register all tools from configured MCP servers.
+#[allow(dead_code)] // Kept for backward compatibility; static configs now go through McpRegistry
 pub async fn discover_mcp_tools(
     mcp_configs: &std::collections::HashMap<String, McpServerConfig>,
 ) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
@@ -99,7 +123,7 @@ pub async fn discover_mcp_tools(
     for (server_name, config) in mcp_configs {
         info!(server_name, command = %config.command, "Connecting to MCP server");
 
-        match McpClient::spawn(&config.command, &config.args).await {
+        match McpClient::spawn(&config.command, &config.args, &config.env).await {
             Ok(client) => {
                 let client = Arc::new(client);
 
@@ -108,7 +132,11 @@ pub async fn discover_mcp_tools(
                         for td in tool_defs {
                             let name = td["name"].as_str().unwrap_or("unknown").to_string();
                             let desc = td["description"].as_str().unwrap_or("").to_string();
-                            let schema = td["inputSchema"].clone();
+                            let mut schema = td["inputSchema"].clone();
+                            // Strip $schema — Google Gemini API rejects it
+                            if let Some(obj) = schema.as_object_mut() {
+                                obj.remove("$schema");
+                            }
 
                             let tool_schema = serde_json::json!({
                                 "name": name,

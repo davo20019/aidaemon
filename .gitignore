@@ -12,6 +12,15 @@ config.toml
 .DS_Store
 .fastembed_cache/
 
+# Coverage output
+lcov.info
+*.profraw
+*.profdata
+tarpaulin-report.html
+
+# Test artifacts
+proptest-regressions/
+
 # Personal/temp files — not part of aidaemon
 *.py
 *.json

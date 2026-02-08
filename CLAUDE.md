@@ -49,6 +49,41 @@ Four core traits drive the architecture:
 - **`StateStore`** — persistence layer (SQLite impl in `state/sqlite.rs`)
 - **`ModelProvider`** — LLM backends (`chat()`, `list_models()`)
 
+#### Tool Schema Format (IMPORTANT)
+
+`schema()` must return the **full OpenAI function object** with `name`, `description`, and `parameters`. Do NOT return just the parameters object — the LLM won't know what the tool is called or what it does.
+
+```rust
+// CORRECT — includes name, description, and parameters wrapper
+fn schema(&self) -> Value {
+    json!({
+        "name": "my_tool",
+        "description": "What this tool does and when to use it",
+        "parameters": {
+            "type": "object",
+            "properties": { ... },
+            "additionalProperties": false
+        }
+    })
+}
+
+// WRONG — missing name/description, LLM can't identify or select this tool
+fn schema(&self) -> Value {
+    json!({
+        "type": "object",
+        "properties": { ... }
+    })
+}
+```
+
+#### Dynamic Bots (IMPORTANT)
+
+Bots can be added two ways: **config-based** (in `config.toml`) or **dynamic** (added via `/connect` command, stored in `dynamic_bots` SQLite table). When registering tools or features that depend on channel tokens (e.g., `ReadChannelHistoryTool` needs Slack bot_tokens), you MUST check BOTH sources:
+- `config.all_slack_bots()` — config-based bots only
+- `state.get_dynamic_bots().await` — dynamic bots from DB
+
+Failing to check dynamic bots will cause features to silently not register even though the channel is connected and working.
+
 ### Module Map
 
 - **`core.rs`** — orchestrates startup: creates state store, event store, provider, router, tools, agent, channels, dashboard. Handles the deferred wiring for `SpawnAgentTool` (circular dep: Agent ↔ SpawnAgentTool resolved via weak reference + `set_agent()`).
@@ -84,7 +119,36 @@ Keyring crate uses platform-native backends: `apple-native` (macOS), `sync-secre
 
 ### Testing
 
-Tests are spread across ~25 files as `#[cfg(test)]` modules. Key test areas: router tier classification, memory/embedding math, plan detection, event context, command risk patterns, skill matching, scheduler parsing.
+Tests are spread across 40+ files as `#[cfg(test)]` modules, totaling 400+ tests. Key test areas:
+
+- **Unit tests:** router tier classification, memory/embedding math, plan detection, event context, command risk patterns, skill matching, scheduler parsing, SQLite state store CRUD, provider message conversion, terminal output formatting, channel hub routing, content sanitization, markdown formatting
+- **Integration tests:** 60+ tests exercising the full agent loop with mock LLM
+- **Property-based tests:** `proptest` for fuzz-testing command risk classification, string truncation, content sanitization, and markdown formatting
+- **Dev-dependencies:** `tempfile`, `proptest`, `insta` (with `yaml` feature)
+
+```bash
+cargo test                           # run all tests
+cargo test integration_tests         # run integration tests only
+cargo test test_tool_execution       # run a single test by name
+cargo test --lib memory              # run memory-related tests only
+cargo test proptest                  # run property-based tests
+```
+
+#### CI/CD
+
+The project uses GitHub Actions for continuous integration and release gating.
+
+**CI pipeline** (`.github/workflows/ci.yml`) — runs on push to `master` and all PRs:
+- `check` job: `cargo fmt --check` (continue-on-error) + `cargo clippy --all-features -- -D warnings`
+- `test` job: `cargo test --all-features` on ubuntu-latest and macos-14
+- `build-check` job: `cargo build --release --features "browser,slack,discord"`
+- `coverage` job: `cargo-llvm-cov` → Codecov (continue-on-error, visibility only)
+
+**Release gating** (`.github/workflows/release.yml`):
+- `quality-gate` job runs `cargo test --all-features` before any build/release job
+- All downstream jobs (build, GitHub Release, crates.io, Homebrew) are blocked if tests fail
+
+To generate local coverage: `cargo llvm-cov --all-features --lcov --output-path lcov.info`
 
 #### Integration Tests
 
@@ -95,18 +159,11 @@ cargo test integration_tests          # run integration tests only
 cargo test test_tool_execution        # run a single integration test
 ```
 
-**What they test:** Agent loop, tool execution, memory/state persistence, multi-turn history, session isolation, event sourcing.
+**What they test:** Agent loop, tool execution, memory/state persistence, multi-turn history, session isolation, channel auth simulation, memory privacy (channel-scoped, private, global), security (sanitization, prompt injection defense), stall detection, multi-step workflows, system prompt structure.
 
 **Test infrastructure** (`src/testing.rs`):
 - **`MockProvider`** — mock `ModelProvider` with scripted responses and call logging. Use `MockProvider::new()` for default "Mock response", or `MockProvider::with_responses(vec![...])` for scripted sequences. Helpers: `text_response()`, `tool_call_response()`.
 - **`TestChannel`** — mock `Channel` that captures outgoing messages. Not wired to ChannelHub — tests call `agent.handle_message()` directly.
 - **`setup_test_agent(provider)`** — creates a fully wired `Agent` with real `SqliteStateStore` (temp file), real `EventStore`/`PlanStore`, real `EmbeddingService`, and `SystemInfoTool` only. Returns `TestHarness { agent, state, provider, channel }`. Each call creates an isolated DB for safe parallel execution.
-
-**Test cases** (`src/integration_tests.rs`):
-1. `test_basic_message_response` — send message, get mock response, verify provider called once
-2. `test_tool_execution` — scripted tool call + final response, verify 2 LLM calls
-3. `test_memory_persistence` — verify user + assistant messages stored in state
-4. `test_multi_turn_conversation` — second call includes first turn's history
-5. `test_session_isolation` — different session IDs don't cross-contaminate
 
 First run downloads the fastembed model (~25MB, cached in `~/.cache/`).

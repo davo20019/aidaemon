@@ -170,7 +170,8 @@ impl CliAgentTool {
         let default_timeout = Duration::from_secs(config.timeout_secs);
         let default_max_output = config.max_output_chars;
 
-        let mut candidates: Vec<(String, String, Vec<String>, String, Option<u64>, Option<usize>)> = Vec::new();
+        type ToolCandidate = (String, String, Vec<String>, String, Option<u64>, Option<usize>);
+        let mut candidates: Vec<ToolCandidate> = Vec::new();
 
         if config.tools.is_empty() {
             for (name, cmd, args, desc) in default_tool_definitions() {

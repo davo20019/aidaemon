@@ -54,11 +54,20 @@ impl McpClient {
     ///
     /// The subprocess environment is scrubbed to a safe allowlist to prevent
     /// credential leakage (API keys, tokens, etc.).
-    pub async fn spawn(command: &str, args: &[String]) -> anyhow::Result<Self> {
+    pub async fn spawn(
+        command: &str,
+        args: &[String],
+        extra_env: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<Self> {
         // Build a minimal environment from the safe allowlist
-        let safe_env: Vec<(String, String)> = std::env::vars()
+        let mut safe_env: Vec<(String, String)> = std::env::vars()
             .filter(|(k, _)| SAFE_ENV_KEYS.iter().any(|safe| safe == k))
             .collect();
+
+        // Merge extra env vars (e.g. API keys resolved from keychain)
+        for (k, v) in extra_env {
+            safe_env.push((k.clone(), v.clone()));
+        }
 
         let mut child = Command::new(command)
             .args(args)
@@ -208,6 +217,12 @@ impl McpClient {
             .cloned()
             .unwrap_or_default();
         Ok(tools)
+    }
+
+    /// Shut down the MCP server subprocess.
+    pub async fn shutdown(&self) {
+        let mut child = self._child.lock().await;
+        let _ = child.kill().await;
     }
 
     /// Call a tool on the MCP server.

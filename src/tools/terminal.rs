@@ -243,9 +243,17 @@ impl TerminalTool {
             })
             .await
             .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval response channel closed"))
+        match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => {
+                tracing::warn!(command, "Approval response channel closed");
+                Ok(ApprovalResponse::Deny)
+            }
+            Err(_) => {
+                tracing::warn!(command, "Approval request timed out (300s), auto-denying");
+                Ok(ApprovalResponse::Deny)
+            }
+        }
     }
 
     async fn add_prefix(&self, command: &str) {
@@ -724,5 +732,78 @@ impl Tool for TerminalTool {
                 self.handle_run(command).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── contains_shell_operator tests ──
+
+    #[test]
+    fn test_shell_operator_semicolon() {
+        assert!(contains_shell_operator("ls; rm -rf"));
+    }
+
+    #[test]
+    fn test_shell_operator_pipe() {
+        assert!(contains_shell_operator("cat file | grep pattern"));
+    }
+
+    #[test]
+    fn test_shell_operator_backtick() {
+        assert!(contains_shell_operator("echo `whoami`"));
+    }
+
+    #[test]
+    fn test_shell_operator_and() {
+        assert!(contains_shell_operator("cmd1 && cmd2"));
+    }
+
+    #[test]
+    fn test_shell_operator_subshell() {
+        assert!(contains_shell_operator("echo $(whoami)"));
+    }
+
+    #[test]
+    fn test_no_shell_operator_clean() {
+        assert!(!contains_shell_operator("cargo build --release"));
+    }
+
+    #[test]
+    fn test_no_shell_operator_flags() {
+        assert!(!contains_shell_operator("ls -la /tmp"));
+    }
+
+    // ── format_output tests ──
+
+    #[test]
+    fn test_format_stdout_only() {
+        let result = format_output("hello", "", 1000);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_format_stderr_appended() {
+        let result = format_output("out", "err", 1000);
+        assert_eq!(result, "out\n--- stderr ---\nerr");
+    }
+
+    #[test]
+    fn test_format_empty_no_output() {
+        let result = format_output("", "", 1000);
+        assert_eq!(result, "(no output)");
+    }
+
+    #[test]
+    fn test_format_truncation() {
+        let long_output = "a".repeat(200);
+        let result = format_output(&long_output, "", 100);
+        assert!(result.len() > 100, "truncated output should include the suffix");
+        assert!(result.ends_with("\n... (truncated)"));
+        // The content portion before the suffix should be exactly max_chars long
+        let prefix = &result[..100];
+        assert_eq!(prefix, "a".repeat(100));
     }
 }

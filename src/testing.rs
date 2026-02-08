@@ -290,6 +290,8 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         IterationLimitConfig::Unlimited,
         None,  // task_timeout_secs
         None,  // task_token_budget
+        None,  // llm_call_timeout_secs
+        None,  // mcp_registry
     );
 
     // Channel (not wired to hub — tests call agent.handle_message directly)

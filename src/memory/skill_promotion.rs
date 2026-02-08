@@ -72,6 +72,7 @@ impl SkillPromoter {
                         enabled: true,
                         version: None,
                         created_at: String::new(),
+                        resources_json: "[]".to_string(),
                     };
                     let db_id = self.state.add_dynamic_skill(&dynamic).await?;
 

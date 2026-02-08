@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{error, info};
+use zeroize::Zeroize;
 
 use crate::providers::ProviderError;
 use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
@@ -12,6 +13,12 @@ pub struct AnthropicNativeProvider {
     client: Client,
     base_url: String,
     api_key: String,
+}
+
+impl Drop for AnthropicNativeProvider {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
+    }
 }
 
 impl AnthropicNativeProvider {
@@ -288,5 +295,201 @@ impl ModelProvider for AnthropicNativeProvider {
             "claude-3-sonnet-20240229".to_string(),
             "claude-3-haiku-20240307".to_string(),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn provider() -> AnthropicNativeProvider {
+        AnthropicNativeProvider::new("test-key")
+    }
+
+    #[test]
+    fn test_system_message_extracted() {
+        let p = provider();
+        let messages = vec![
+            json!({"role": "system", "content": "You are helpful."}),
+            json!({"role": "user", "content": "Hello"}),
+        ];
+
+        let (system, msgs) = p.convert_messages(&messages);
+        assert_eq!(system, Some("You are helpful.".to_string()));
+        // System message should not appear in the converted messages
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+    }
+
+    #[test]
+    fn test_multiple_system_messages_merged() {
+        let p = provider();
+        let messages = vec![
+            json!({"role": "system", "content": "You are helpful."}),
+            json!({"role": "system", "content": "Be concise."}),
+            json!({"role": "user", "content": "Hello"}),
+        ];
+
+        let (system, _msgs) = p.convert_messages(&messages);
+        let system_text = system.unwrap();
+        assert!(
+            system_text.contains("You are helpful."),
+            "System prompt should contain first system message"
+        );
+        assert!(
+            system_text.contains("Be concise."),
+            "System prompt should contain second system message"
+        );
+        assert!(
+            system_text.contains("\n\n"),
+            "System messages should be joined with double newline"
+        );
+        assert_eq!(system_text, "You are helpful.\n\nBe concise.");
+    }
+
+    #[test]
+    fn test_assistant_tool_calls_converted() {
+        let p = provider();
+        let messages = vec![
+            json!({"role": "user", "content": "What time is it?"}),
+            json!({
+                "role": "assistant",
+                "content": "Let me check.",
+                "tool_calls": [{
+                    "id": "call_123",
+                    "function": {
+                        "name": "get_time",
+                        "arguments": "{\"timezone\": \"UTC\"}"
+                    }
+                }]
+            }),
+        ];
+
+        let (_system, msgs) = p.convert_messages(&messages);
+        assert_eq!(msgs.len(), 2);
+
+        // The assistant message should have content blocks
+        let assistant_msg = &msgs[1];
+        assert_eq!(assistant_msg["role"], "assistant");
+        let content = assistant_msg["content"].as_array().unwrap();
+
+        // Should have a text block and a tool_use block
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Let me check.");
+        assert_eq!(content[1]["type"], "tool_use");
+        assert_eq!(content[1]["id"], "call_123");
+        assert_eq!(content[1]["name"], "get_time");
+        assert_eq!(content[1]["input"]["timezone"], "UTC");
+    }
+
+    #[test]
+    fn test_tool_result_as_user_message() {
+        let p = provider();
+        let messages = vec![
+            json!({"role": "user", "content": "Hello"}),
+            json!({
+                "role": "assistant",
+                "content": "Calling tool.",
+                "tool_calls": [{
+                    "id": "call_abc",
+                    "function": {
+                        "name": "my_tool",
+                        "arguments": "{}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_abc",
+                "content": "tool output here"
+            }),
+        ];
+
+        let (_system, msgs) = p.convert_messages(&messages);
+        assert_eq!(msgs.len(), 3);
+
+        // Tool result should become a user message with tool_result content block
+        let tool_msg = &msgs[2];
+        assert_eq!(tool_msg["role"], "user");
+        let content = tool_msg["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[0]["tool_use_id"], "call_abc");
+        assert_eq!(content[0]["content"], "tool output here");
+    }
+
+    #[test]
+    fn test_consecutive_same_role_merged() {
+        let p = provider();
+        // Two tool results in a row: both become "user" role messages
+        // which must be merged to satisfy Anthropic's alternating role requirement
+        let messages = vec![
+            json!({"role": "user", "content": "Do two things"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "tool_a", "arguments": "{}"}
+                    },
+                    {
+                        "id": "call_2",
+                        "function": {"name": "tool_b", "arguments": "{}"}
+                    }
+                ]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "result A"
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "result B"
+            }),
+        ];
+
+        let (_system, msgs) = p.convert_messages(&messages);
+
+        // The two tool results (both user role) should be merged into one user message
+        // Expected: user, assistant, user (merged tool results)
+        assert_eq!(msgs.len(), 3, "Two tool results should be merged into one user message");
+
+        let merged_user = &msgs[2];
+        assert_eq!(merged_user["role"], "user");
+        let content = merged_user["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "Merged message should have 2 content blocks");
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[0]["tool_use_id"], "call_1");
+        assert_eq!(content[1]["type"], "tool_result");
+        assert_eq!(content[1]["tool_use_id"], "call_2");
+    }
+
+    #[test]
+    fn test_empty_content_skipped() {
+        let p = provider();
+        // Assistant message with empty content and no tool_calls should produce no message
+        let messages = vec![
+            json!({"role": "user", "content": "Hello"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+            }),
+        ];
+
+        let (_system, msgs) = p.convert_messages(&messages);
+
+        // The empty assistant message should be skipped (no content blocks)
+        assert_eq!(
+            msgs.len(),
+            1,
+            "Empty assistant message should be skipped, got {} messages",
+            msgs.len()
+        );
+        assert_eq!(msgs[0]["role"], "user");
     }
 }

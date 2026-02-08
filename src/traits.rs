@@ -5,7 +5,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::types::{ApprovalResponse, MediaMessage, StatusUpdate};
+use crate::types::{ApprovalResponse, ChannelVisibility, FactPrivacy, MediaMessage, StatusUpdate};
 
 /// A message in the conversation history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +56,16 @@ pub struct Fact {
     pub recall_count: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_recalled_at: Option<DateTime<Utc>>,
+    /// Channel where this fact originated (e.g., "slack:C12345"). None for legacy/global facts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    /// Privacy level controlling where this fact can be recalled.
+    #[serde(default = "default_fact_privacy")]
+    pub privacy: FactPrivacy,
+}
+
+fn default_fact_privacy() -> FactPrivacy {
+    FactPrivacy::Global
 }
 
 /// An episode representing a session summary (episodic memory).
@@ -78,6 +88,9 @@ pub struct Episode {
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// Channel where this episode occurred. None for legacy episodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
 }
 
 /// A goal being tracked over time.
@@ -264,8 +277,16 @@ pub trait StateStore: Send + Sync {
     async fn append_message(&self, msg: &Message) -> anyhow::Result<()>;
     /// Get recent messages for a session from working memory.
     async fn get_history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<Message>>;
-    /// Upsert a fact.
-    async fn upsert_fact(&self, category: &str, key: &str, value: &str, source: &str) -> anyhow::Result<()>;
+    /// Upsert a fact with channel provenance and privacy level.
+    async fn upsert_fact(
+        &self,
+        category: &str,
+        key: &str,
+        value: &str,
+        source: &str,
+        channel_id: Option<&str>,
+        privacy: FactPrivacy,
+    ) -> anyhow::Result<()>;
     /// Get all facts, optionally filtered by category.
     async fn get_facts(&self, category: Option<&str>) -> anyhow::Result<Vec<Fact>>;
     /// Get facts semantically relevant to a query, falling back to get_facts on error.
@@ -274,6 +295,46 @@ pub trait StateStore: Send + Sync {
         let mut facts = self.get_facts(None).await?;
         facts.truncate(max);
         Ok(facts)
+    }
+    /// Get facts for a specific channel context, respecting privacy levels.
+    async fn get_relevant_facts_for_channel(
+        &self,
+        _query: &str,
+        max: usize,
+        _channel_id: Option<&str>,
+        _visibility: ChannelVisibility,
+    ) -> anyhow::Result<Vec<Fact>> {
+        self.get_relevant_facts(_query, max).await
+    }
+    /// Get cross-channel hints: channel-scoped facts from OTHER channels relevant to the query.
+    async fn get_cross_channel_hints(
+        &self,
+        _query: &str,
+        _current_channel_id: &str,
+        _max: usize,
+    ) -> anyhow::Result<Vec<Fact>> {
+        Ok(vec![])
+    }
+    /// Update a fact's privacy level (e.g., channel → global after approval).
+    async fn update_fact_privacy(&self, _fact_id: i64, _privacy: FactPrivacy) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Soft-delete a fact by superseding it.
+    async fn delete_fact(&self, _fact_id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Get all active facts with provenance info for memory management display.
+    async fn get_all_facts_with_provenance(&self) -> anyhow::Result<Vec<Fact>> {
+        self.get_facts(None).await
+    }
+    /// Get episodes for a specific channel context.
+    async fn get_relevant_episodes_for_channel(
+        &self,
+        _query: &str,
+        _limit: usize,
+        _channel_id: Option<&str>,
+    ) -> anyhow::Result<Vec<Episode>> {
+        Ok(vec![])
     }
     /// Get context using Tri-Hybrid retrieval (Recency + Vector + Salience).
     /// Default implementation just calls get_history.
@@ -304,6 +365,11 @@ pub trait StateStore: Send + Sync {
     /// Get active goals.
     async fn get_active_goals(&self) -> anyhow::Result<Vec<Goal>> {
         Ok(vec![])
+    }
+
+    /// Update a goal's status and/or add a progress note.
+    async fn update_goal(&self, _goal_id: i64, _status: Option<&str>, _progress_note: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Get behavior patterns above a confidence threshold.
@@ -413,6 +479,29 @@ pub trait StateStore: Send + Sync {
     async fn get_promotable_procedures(&self, _min_success: i32, _min_rate: f32) -> anyhow::Result<Vec<Procedure>> {
         Ok(vec![])
     }
+
+    // ==================== Dynamic MCP Servers Methods ====================
+    // For runtime MCP server management via manage_mcp tool.
+
+    /// Store a dynamically added MCP server.
+    async fn save_dynamic_mcp_server(&self, _server: &DynamicMcpServer) -> anyhow::Result<i64> {
+        Ok(0)
+    }
+
+    /// Get all dynamic MCP servers.
+    async fn list_dynamic_mcp_servers(&self) -> anyhow::Result<Vec<DynamicMcpServer>> {
+        Ok(vec![])
+    }
+
+    /// Delete a dynamic MCP server by ID.
+    async fn delete_dynamic_mcp_server(&self, _id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Update a dynamic MCP server.
+    async fn update_dynamic_mcp_server(&self, _server: &DynamicMcpServer) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// A dynamically added skill (stored in database).
@@ -428,6 +517,13 @@ pub struct DynamicSkill {
     pub enabled: bool,
     pub version: Option<String>,
     pub created_at: String,
+    /// JSON-serialized Vec<ResourceEntry> for directory-based skills
+    #[serde(default = "default_empty_json")]
+    pub resources_json: String,
+}
+
+fn default_empty_json() -> String {
+    "[]".to_string()
 }
 
 /// A dynamically added bot configuration (stored in database).
@@ -439,6 +535,19 @@ pub struct DynamicBot {
     pub app_token: Option<String>, // Only for Slack
     pub allowed_user_ids: Vec<String>, // Stored as JSON
     pub extra_config: String,    // JSON for channel-specific settings
+    pub created_at: String,
+}
+
+/// A dynamically added MCP server configuration (stored in database).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicMcpServer {
+    pub id: i64,
+    pub name: String,
+    pub command: String,
+    pub args_json: String,          // JSON array of argument strings
+    pub env_keys_json: String,      // JSON array of env var key names (values in keychain)
+    pub triggers_json: String,      // JSON array of trigger keywords
+    pub enabled: bool,
     pub created_at: String,
 }
 

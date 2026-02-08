@@ -141,7 +141,7 @@ fn extract_json_array(text: &str) -> anyhow::Result<String> {
 pub fn extract_plan_description(user_message: &str) -> String {
     // Take first sentence or first 100 chars, whichever is shorter
     let first_sentence_end = user_message
-        .find(|c| c == '.' || c == '!' || c == '?')
+        .find(['.', '!', '?'])
         .map(|i| i + 1)
         .unwrap_or(user_message.len());
 

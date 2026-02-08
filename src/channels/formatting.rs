@@ -94,10 +94,8 @@ pub(crate) fn markdown_to_telegram_html(md: &str) -> String {
         }
 
         // Unordered list markers: "- " or "* " at start → "• "
-        let processed = if escaped.starts_with("- ") {
-            format!("• {}", &escaped[2..])
-        } else if escaped.starts_with("* ") {
-            format!("• {}", &escaped[2..])
+        let processed = if let Some(rest) = escaped.strip_prefix("- ").or_else(|| escaped.strip_prefix("* ")) {
+            format!("• {}", rest)
         } else {
             escaped
         };
@@ -214,12 +212,7 @@ fn convert_inline_formatting(s: &str) -> String {
 }
 
 fn find_char(chars: &[char], c: char, start: usize) -> Option<usize> {
-    for j in start..chars.len() {
-        if chars[j] == c {
-            return Some(j);
-        }
-    }
-    None
+    (start..chars.len()).find(|&j| chars[j] == c)
 }
 
 fn find_double_char(chars: &[char], c: char, start: usize) -> Option<usize> {
@@ -234,12 +227,7 @@ fn find_double_char(chars: &[char], c: char, start: usize) -> Option<usize> {
 }
 
 fn find_single_star(chars: &[char], start: usize) -> Option<usize> {
-    for j in start..chars.len() {
-        if chars[j] == '*' && (j + 1 >= chars.len() || chars[j + 1] != '*') {
-            return Some(j);
-        }
-    }
-    None
+    (start..chars.len()).find(|&j| chars[j] == '*' && (j + 1 >= chars.len() || chars[j + 1] != '*'))
 }
 
 fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
@@ -271,18 +259,33 @@ pub(crate) fn split_message(text: &str, max_len: usize) -> Vec<String> {
             break;
         }
 
-        let search_region = &remaining[..max_len];
+        // Find the largest char boundary at or before max_len to avoid
+        // slicing in the middle of a multi-byte UTF-8 character.
+        let mut boundary = max_len;
+        while boundary > 0 && !remaining.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+
+        let search_region = &remaining[..boundary];
 
         // Try paragraph boundary first
         let split_at = search_region.rfind("\n\n")
             .map(|p| p + 1)  // include first \n, second starts next chunk
             // Then try line boundary
             .or_else(|| search_region.rfind('\n'))
-            // Last resort: split at max_len
-            .unwrap_or(max_len);
+            // Last resort: split at char boundary
+            .unwrap_or(boundary);
 
         // Ensure we don't split inside an HTML tag
         let split_at = adjust_for_html_tags(search_region, split_at);
+
+        // Safety: if split_at is 0 (e.g. max_len=0), force progress by
+        // advancing one character to avoid an infinite loop.
+        let split_at = if split_at == 0 {
+            remaining.char_indices().nth(1).map_or(remaining.len(), |(i, _)| i)
+        } else {
+            split_at
+        };
 
         let (chunk, rest) = remaining.split_at(split_at);
         let chunk = chunk.trim_end();
@@ -378,10 +381,8 @@ pub(crate) fn markdown_to_slack_mrkdwn(md: &str) -> String {
         }
 
         // Unordered list markers: "- " or "* " at start → "• "
-        let processed = if line.starts_with("- ") {
-            format!("• {}", &line[2..])
-        } else if line.starts_with("* ") {
-            format!("• {}", &line[2..])
+        let processed = if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+            format!("• {}", rest)
         } else {
             line.to_string()
         };
@@ -534,6 +535,8 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
         .chars()
         .filter(|c| *c != '/' && *c != '\\' && *c != '\0')
         .collect();
+    // Strip path traversal sequences
+    let sanitized = sanitized.replace("..", "");
     // Limit to 200 chars, preserving extension
     if sanitized.len() <= 200 {
         sanitized
@@ -547,5 +550,112 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
         }
     } else {
         sanitized[..200].to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_markdown_to_telegram_heading() {
+        let result = markdown_to_telegram_html("### My Heading");
+        assert!(result.contains("<b>My Heading</b>"));
+    }
+
+    #[test]
+    fn test_markdown_to_telegram_bold() {
+        let result = markdown_to_telegram_html("This is **bold** text");
+        assert!(result.contains("<b>bold</b>"));
+    }
+
+    #[test]
+    fn test_markdown_to_telegram_code_block() {
+        let result = markdown_to_telegram_html("```rust\nfn main() {}\n```");
+        assert!(result.contains("<pre><code>"));
+        assert!(result.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_markdown_to_telegram_inline_code() {
+        let result = markdown_to_telegram_html("Use `cargo build` to compile");
+        assert!(result.contains("<code>cargo build</code>"));
+    }
+
+    #[test]
+    fn test_markdown_to_telegram_list() {
+        let result = markdown_to_telegram_html("- item one\n- item two");
+        assert!(result.contains("• item one"));
+        assert!(result.contains("• item two"));
+    }
+
+    #[test]
+    fn test_markdown_to_telegram_link() {
+        let result = markdown_to_telegram_html("[click here](https://example.com)");
+        assert!(result.contains("<a href=\"https://example.com\">click here</a>"));
+    }
+
+    #[test]
+    fn test_html_escape() {
+        assert_eq!(html_escape("a < b & c > d"), "a &lt; b &amp; c &gt; d");
+    }
+
+    #[test]
+    fn test_split_message_no_split() {
+        let msgs = split_message("short", 4096);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0], "short");
+    }
+
+    #[test]
+    fn test_split_message_long() {
+        let long = "a".repeat(5000);
+        let msgs = split_message(&long, 4096);
+        assert!(msgs.len() >= 2);
+        for msg in &msgs {
+            assert!(msg.len() <= 4096 + 50); // small tolerance for split logic
+        }
+    }
+
+    #[test]
+    fn test_format_number() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1000), "1,000");
+        assert_eq!(format_number(12450), "12,450");
+        assert_eq!(format_number(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn test_sanitize_filename() {
+        assert_eq!(sanitize_filename("test.txt"), "test.txt");
+        assert_eq!(sanitize_filename("path/to/file.txt"), "pathtofile.txt");
+        assert_eq!(sanitize_filename("a\0b"), "ab");
+    }
+
+    #[test]
+    fn test_sanitize_filename_long() {
+        let long = "a".repeat(250) + ".txt";
+        let result = sanitize_filename(&long);
+        assert!(result.len() <= 200);
+        assert!(result.ends_with(".txt"));
+    }
+
+    mod proptest_formatting {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn markdown_to_telegram_never_panics(md in "\\PC{0,500}") {
+                let _ = markdown_to_telegram_html(&md);
+            }
+
+            #[test]
+            fn split_message_never_panics(text in "\\PC{0,2000}", max_len in 100usize..5000) {
+                let parts = split_message(&text, max_len);
+                assert!(!parts.is_empty());
+            }
+        }
     }
 }

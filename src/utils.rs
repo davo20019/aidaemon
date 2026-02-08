@@ -152,4 +152,31 @@ mod tests {
         assert!(result.contains("🦀"));
         assert!(result.ends_with("\n... (truncated)"));
     }
+
+    mod proptest_truncate {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn truncate_result_within_limit(s in ".*", n in 0usize..500) {
+                let result = truncate_str(&s, n);
+                assert!(result.chars().count() <= n.max(1));
+            }
+
+            #[test]
+            fn no_truncation_when_fits(s in "[a-z]{0,50}", n in 50usize..200) {
+                let result = truncate_str(&s, n);
+                if s.chars().count() <= n {
+                    assert_eq!(result, s);
+                }
+            }
+
+            #[test]
+            fn truncate_never_panics(s in "\\PC{0,500}", n in 0usize..1000) {
+                let _ = truncate_str(&s, n);
+                let _ = truncate_with_note(&s, n);
+            }
+        }
+    }
 }

@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::StreamExt;
 use futures::SinkExt;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn, debug};
 
 use super::formatting::{build_help_text, format_number, markdown_to_slack_mrkdwn, sanitize_filename, split_message};
@@ -49,9 +50,18 @@ pub struct SlackChannel {
     bot_user_id: Mutex<Option<String>>,
     /// Reference to the channel hub for dynamic bot registration.
     channel_hub: std::sync::RwLock<Option<Weak<ChannelHub>>>,
+    /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
+    watchdog_stale_threshold_secs: u64,
+    /// Cache of resolved Slack user IDs to display names.
+    user_cache: RwLock<HashMap<String, String>>,
+    /// Cache of channel ID → channel name (process-lifetime; channel names rarely change).
+    channel_name_cache: RwLock<HashMap<String, String>>,
+    /// Cache of channel ID → (member display names, fetched_at). TTL: 10 minutes.
+    channel_members_cache: RwLock<HashMap<String, (Vec<String>, Instant)>>,
 }
 
 impl SlackChannel {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         app_token: &str,
         bot_token: &str,
@@ -65,6 +75,7 @@ impl SlackChannel {
         inbox_dir: PathBuf,
         max_file_size_mb: u64,
         state: Arc<dyn StateStore>,
+        watchdog_stale_threshold_secs: u64,
     ) -> Self {
         Self {
             bot_name: std::sync::RwLock::new("slack".to_string()),
@@ -84,6 +95,10 @@ impl SlackChannel {
             http: reqwest::Client::new(),
             bot_user_id: Mutex::new(None),
             channel_hub: std::sync::RwLock::new(None),
+            watchdog_stale_threshold_secs,
+            user_cache: RwLock::new(HashMap::new()),
+            channel_name_cache: RwLock::new(HashMap::new()),
+            channel_members_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -196,7 +211,7 @@ impl SlackChannel {
                     // Acknowledge the envelope immediately
                     if let Some(envelope_id) = envelope.get("envelope_id").and_then(|v| v.as_str()) {
                         let ack = serde_json::json!({ "envelope_id": envelope_id });
-                        let ack_msg = tokio_tungstenite::tungstenite::Message::Text(ack.to_string().into());
+                        let ack_msg = tokio_tungstenite::tungstenite::Message::Text(ack.to_string());
                         if let Err(e) = ws_tx.send(ack_msg).await {
                             warn!("Failed to ack envelope: {}", e);
                         }
@@ -270,6 +285,196 @@ impl SlackChannel {
                 warn!("Failed to resolve bot info: {}", e);
             }
         }
+    }
+
+    /// Resolve a Slack user ID to a display name via the `users.info` API.
+    /// Results are cached in memory for the process lifetime.
+    async fn resolve_user_name(&self, user_id: &str) -> Option<String> {
+        // Check cache first
+        if let Some(name) = self.user_cache.read().await.get(user_id) {
+            return Some(name.clone());
+        }
+
+        // Call users.info API
+        let resp = self
+            .http
+            .get("https://slack.com/api/users.info")
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .query(&[("user", user_id)])
+            .send()
+            .await
+            .ok()?;
+        let json: Value = resp.json().await.ok()?;
+        if json.get("ok")?.as_bool()? {
+            let user = json.get("user")?;
+            let name = user
+                .pointer("/profile/display_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    user.pointer("/profile/real_name")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+                .or_else(|| user.get("name").and_then(|v| v.as_str()))?;
+            self.user_cache
+                .write()
+                .await
+                .insert(user_id.to_string(), name.to_string());
+            Some(name.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Resolve all `<@USERID>` mentions in a text string to display names.
+    /// Replaces e.g. `<@U04FL1J2V6>` with `@Alice` (or leaves unchanged if unresolvable).
+    async fn resolve_user_mentions(&self, text: &str) -> String {
+        let mut result = text.to_string();
+        // Find all <@UXXXXX> patterns
+        let mut start = 0;
+        while let Some(open) = result[start..].find("<@U") {
+            let abs_open = start + open;
+            if let Some(close) = result[abs_open..].find('>') {
+                let abs_close = abs_open + close;
+                let user_id = &result[abs_open + 2..abs_close]; // strip <@ and >
+                if let Some(name) = self.resolve_user_name(user_id).await {
+                    let mention = format!("<@{}>", user_id);
+                    let replacement = format!("@{}", name);
+                    result = result.replacen(&mention, &replacement, 1);
+                    start = abs_open + replacement.len();
+                } else {
+                    start = abs_close + 1;
+                }
+            } else {
+                break;
+            }
+        }
+        result
+    }
+
+    /// Resolve a channel ID to a human-readable name via `conversations.info`.
+    /// Results are cached for the process lifetime (channel names rarely change).
+    async fn resolve_channel_name(&self, channel_id: &str) -> Option<String> {
+        // Check cache first
+        if let Some(name) = self.channel_name_cache.read().await.get(channel_id) {
+            return Some(name.clone());
+        }
+
+        // Call conversations.info API
+        let resp = self
+            .http
+            .get("https://slack.com/api/conversations.info")
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .query(&[("channel", channel_id)])
+            .send()
+            .await
+            .ok()?;
+        let json: Value = resp.json().await.ok()?;
+        if json.get("ok")?.as_bool()? {
+            let name = json
+                .pointer("/channel/name")
+                .and_then(|v| v.as_str())?
+                .to_string();
+            let display_name = format!("#{}", name);
+            self.channel_name_cache
+                .write()
+                .await
+                .insert(channel_id.to_string(), display_name.clone());
+            Some(display_name)
+        } else {
+            debug!(
+                channel_id,
+                error = json.get("error").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                "Failed to resolve channel name"
+            );
+            None
+        }
+    }
+
+    /// Resolve the display names of members in a channel via `conversations.members` + `users.info`.
+    /// Results are cached with a 10-minute TTL. Limited to first 50 members.
+    async fn resolve_channel_member_names(&self, channel_id: &str) -> Vec<String> {
+        const MEMBERS_TTL: Duration = Duration::from_secs(600); // 10 minutes
+
+        // Check cache (with TTL)
+        if let Some((names, fetched_at)) = self.channel_members_cache.read().await.get(channel_id) {
+            if fetched_at.elapsed() < MEMBERS_TTL {
+                return names.clone();
+            }
+        }
+
+        // Call conversations.members API (limit 50)
+        let resp = match self
+            .http
+            .get("https://slack.com/api/conversations.members")
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .query(&[("channel", channel_id), ("limit", "50")])
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(error = %e, "Failed to fetch channel members");
+                return vec![];
+            }
+        };
+
+        let json: Value = match resp.json().await {
+            Ok(j) => j,
+            Err(_) => return vec![],
+        };
+
+        if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let error = json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            if error == "channel_not_found" || error == "method_not_allowed_for_channel_type" {
+                warn!(
+                    channel_id,
+                    error,
+                    "Failed to fetch channel members — for private channels, \
+                     the bot needs the `groups:read` scope in addition to `channels:read`"
+                );
+            } else {
+                debug!(channel_id, error, "Failed to fetch channel members");
+            }
+            return vec![];
+        }
+
+        let member_ids: Vec<String> = json
+            .get("members")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Filter out our own bot user ID
+        let bot_id = self.bot_user_id.lock().await.clone();
+        let filtered_ids: Vec<String> = member_ids
+            .into_iter()
+            .filter(|id| bot_id.as_deref() != Some(id.as_str()))
+            .collect();
+
+        // Resolve each user ID to a display name
+        let mut names = Vec::with_capacity(filtered_ids.len());
+        for uid in &filtered_ids {
+            if let Some(name) = self.resolve_user_name(uid).await {
+                names.push(name);
+            }
+        }
+
+        // Cache the result
+        self.channel_members_cache
+            .write()
+            .await
+            .insert(channel_id.to_string(), (names.clone(), Instant::now()));
+
+        names
     }
 
     /// Make a GET-style Slack API call (actually POST with empty body).
@@ -404,11 +609,14 @@ impl SlackChannel {
         // Strip bot @mention from text before processing
         let text = {
             let bot_id_guard = self.bot_user_id.lock().await;
-            if let Some(ref bid) = *bot_id_guard {
+            let stripped = if let Some(ref bid) = *bot_id_guard {
                 raw_text.replace(&format!("<@{}>", bid), "").trim().to_string()
             } else {
                 raw_text.clone()
-            }
+            };
+            drop(bot_id_guard);
+            // Resolve remaining <@USERID> mentions to display names
+            self.resolve_user_mentions(&stripped).await
         };
 
         let ts = event.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -484,14 +692,34 @@ impl SlackChannel {
                 "mpim" | "group" => ChannelVisibility::PrivateGroup,
                 _ => ChannelVisibility::Public, // "channel" or unknown defaults to public
             };
+            let sender_name = self.resolve_user_name(&user).await;
+            let is_dm = channel_type == "im";
+            let (channel_name, channel_member_names) = if !is_dm {
+                let name = self.resolve_channel_name(&channel_id).await;
+                let members = self.resolve_channel_member_names(&channel_id).await;
+                (name, members)
+            } else {
+                (None, vec![])
+            };
+            // Snapshot current user_cache as user_id_map for resolving IDs in facts
+            let user_id_map = self.user_cache.read().await.clone();
             ChannelContext {
                 visibility,
                 platform: "slack".to_string(),
-                channel_name: None, // Slack events don't include channel name
+                channel_name,
+                channel_id: Some(format!("slack:{}", channel_id)),
+                sender_name,
+                channel_member_names,
+                user_id_map,
             }
         };
 
         info!(session_id, user_id = %user, "Received Slack message");
+
+        // Create heartbeat for watchdog — agent bumps this on every activity point.
+        let heartbeat = Arc::new(AtomicU64::new(
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        ));
 
         // Typing indicator via reaction
         let typing_channel = channel_id.clone();
@@ -507,15 +735,63 @@ impl SlackChannel {
             let _ = typing_self.remove_reaction(&typing_channel, &typing_ts, "hourglass_flowing_sand").await;
         });
 
+        // Watchdog: periodically check heartbeat staleness
+        let stale_threshold_secs = self.watchdog_stale_threshold_secs;
+        if stale_threshold_secs > 0 {
+            let watchdog_heartbeat = heartbeat.clone();
+            let watchdog_cancel = typing_cancel.clone();
+            let watchdog_channel = channel_id.clone();
+            let watchdog_thread = reply_thread.clone();
+            let watchdog_self = self.clone_for_status();
+            let watchdog_ts = ts.clone();
+            let watchdog_typing_self = self.clone_for_typing();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                            let last_hb = watchdog_heartbeat.load(Ordering::Relaxed);
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH)
+                                .unwrap_or_default().as_secs();
+                            if now.saturating_sub(last_hb) > stale_threshold_secs {
+                                let stale_mins = (now - last_hb) / 60;
+                                // Swap hourglass for warning
+                                let _ = watchdog_typing_self.remove_reaction(
+                                    &watchdog_channel, &watchdog_ts, "hourglass_flowing_sand"
+                                ).await;
+                                let _ = watchdog_typing_self.add_reaction(
+                                    &watchdog_channel, &watchdog_ts, "warning"
+                                ).await;
+                                let _ = watchdog_self.post_message(
+                                    &watchdog_channel,
+                                    &format!(
+                                        "⚠️ No activity for {} minutes. The task may be stuck.",
+                                        stale_mins
+                                    ),
+                                    watchdog_thread.as_deref(),
+                                ).await;
+                                break;
+                            }
+                        }
+                        _ = watchdog_cancel.cancelled() => break,
+                    }
+                }
+            });
+        }
+
         // Status updates
         let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
         let status_channel = channel_id.clone();
         let status_thread = reply_thread.clone();
         let status_self = self.clone_for_status();
+        let is_dm = channel_ctx.visibility == ChannelVisibility::Private;
         let status_task = tokio::spawn(async move {
             let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
             let min_interval = Duration::from_secs(3);
             while let Some(update) = status_rx.recv().await {
+                // In non-DM channels: hourglass reaction is sufficient, skip status messages
+                if !is_dm {
+                    continue;
+                }
                 let now = tokio::time::Instant::now();
                 if now.duration_since(last_sent) < min_interval {
                     continue;
@@ -595,7 +871,7 @@ impl SlackChannel {
         let http = self.http.clone();
         tokio::spawn(async move {
             let result = tokio::select! {
-                r = agent.handle_message(&session_id, &agent_text, Some(status_tx), user_role, channel_ctx) => r,
+                r = agent.handle_message(&session_id, &agent_text, Some(status_tx), user_role, channel_ctx, Some(heartbeat)) => r,
                 _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
             };
             typing_cancel.cancel();
@@ -1282,7 +1558,7 @@ impl Channel for SlackChannel {
         );
 
         if !warnings.is_empty() {
-            message_text.push_str("\n");
+            message_text.push('\n');
             for warning in warnings {
                 message_text.push_str(&format!("\n• {}", warning));
             }

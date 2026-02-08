@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -48,9 +49,12 @@ pub struct DiscordChannel {
     http: Mutex<Option<Arc<serenity::http::Http>>>,
     /// Reference to the channel hub for dynamic bot registration.
     channel_hub: std::sync::RwLock<Option<Weak<ChannelHub>>>,
+    /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
+    watchdog_stale_threshold_secs: u64,
 }
 
 impl DiscordChannel {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bot_token: &str,
         allowed_user_ids: Vec<u64>,
@@ -63,6 +67,7 @@ impl DiscordChannel {
         inbox_dir: PathBuf,
         max_file_size_mb: u64,
         state: Arc<dyn StateStore>,
+        watchdog_stale_threshold_secs: u64,
     ) -> Self {
         Self {
             bot_username: std::sync::RwLock::new("discord".to_string()),
@@ -80,6 +85,7 @@ impl DiscordChannel {
             state,
             http: Mutex::new(None),
             channel_hub: std::sync::RwLock::new(None),
+            watchdog_stale_threshold_secs,
         }
     }
 
@@ -248,7 +254,7 @@ impl DiscordChannel {
         let text = if msg.content.is_empty() && !msg.attachments.is_empty() {
             // File message
             if self.files_enabled {
-                match self.handle_file_message(&ctx, &msg).await {
+                match self.handle_file_message(ctx, &msg).await {
                     Ok(file_text) => file_text,
                     Err(e) => {
                         let _ = msg
@@ -269,7 +275,7 @@ impl DiscordChannel {
             // Text might be accompanied by attachments
             let mut text = msg.content.clone();
             if self.files_enabled && !msg.attachments.is_empty() {
-                match self.handle_file_message(&ctx, &msg).await {
+                match self.handle_file_message(ctx, &msg).await {
                     Ok(file_text) => {
                         text = format!("{}\n{}", file_text, text);
                     }
@@ -289,7 +295,7 @@ impl DiscordChannel {
 
         // Handle slash-style commands (text commands starting with /)
         if text.starts_with('/') {
-            self.handle_text_command(&ctx, &msg, &text).await;
+            self.handle_text_command(ctx, &msg, &text).await;
             return;
         }
 
@@ -303,16 +309,39 @@ impl DiscordChannel {
 
         info!(session_id, "Received Discord message from user {}", user_id);
 
+        // Create heartbeat for watchdog — agent bumps this on every activity point.
+        let heartbeat = Arc::new(AtomicU64::new(
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        ));
+
         // Typing indicator — Discord shows "Bot is typing..." while we hold this.
+        // Also monitors the heartbeat: if it goes stale, notify user and stop typing.
         let typing_channel = msg.channel_id;
         let typing_http = ctx.http.clone();
         let typing_cancel = tokio_util::sync::CancellationToken::new();
         let typing_token = typing_cancel.clone();
+        let heartbeat_for_typing = heartbeat.clone();
+        let stale_threshold_secs = self.watchdog_stale_threshold_secs;
         tokio::spawn(async move {
             loop {
                 let _ = typing_channel.broadcast_typing(&typing_http).await;
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(8)) => {}
+                    _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                        if stale_threshold_secs > 0 {
+                            let last_hb = heartbeat_for_typing.load(Ordering::Relaxed);
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH)
+                                .unwrap_or_default().as_secs();
+                            if now.saturating_sub(last_hb) > stale_threshold_secs {
+                                let stale_mins = (now - last_hb) / 60;
+                                let _ = typing_channel.say(&typing_http, format!(
+                                    "⚠️ No activity for {} minutes. The task may be stuck. \
+                                     Type `cancel` to stop it, or wait for it to recover.",
+                                    stale_mins
+                                )).await;
+                                break; // Stop typing indicator
+                            }
+                        }
+                    }
                     _ = typing_token.cancelled() => break,
                 }
             }
@@ -322,10 +351,23 @@ impl DiscordChannel {
         let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
         let status_http = ctx.http.clone();
         let status_channel_id = msg.channel_id;
+        let is_dm = msg.guild_id.is_none();
         let status_task = tokio::spawn(async move {
             let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
             let min_interval = Duration::from_secs(3);
+            let mut sent_thinking = false;
             while let Some(update) = status_rx.recv().await {
+                // In non-DM channels: only send one "Thinking..." then suppress
+                if !is_dm {
+                    if !sent_thinking
+                        && matches!(update, StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. })
+                    {
+                        let _ = status_channel_id.say(&status_http, "Thinking...").await;
+                        sent_thinking = true;
+                        last_sent = tokio::time::Instant::now();
+                    }
+                    continue;
+                }
                 let now = tokio::time::Instant::now();
                 if now.duration_since(last_sent) < min_interval {
                     continue;
@@ -411,9 +453,21 @@ impl DiscordChannel {
                 visibility: ChannelVisibility::Public,
                 platform: "discord".to_string(),
                 channel_name: None,
+                channel_id: Some(format!("discord:{}", msg.channel_id)),
+                sender_name: None,
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
             }
         } else {
-            ChannelContext::private("discord")
+            ChannelContext {
+                visibility: ChannelVisibility::Private,
+                platform: "discord".to_string(),
+                channel_name: None,
+                channel_id: Some(format!("discord:dm:{}", msg.author.id)),
+                sender_name: None,
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
+            }
         };
 
         let agent = Arc::clone(&self.agent);
@@ -421,7 +475,7 @@ impl DiscordChannel {
         let http = ctx.http.clone();
         tokio::spawn(async move {
             let result = tokio::select! {
-                r = agent.handle_message(&session_id, &text, Some(status_tx), crate::types::UserRole::Owner, channel_ctx) => r,
+                r = agent.handle_message(&session_id, &text, Some(status_tx), crate::types::UserRole::Owner, channel_ctx, Some(heartbeat)) => r,
                 _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
             };
             typing_cancel.cancel();
@@ -1025,7 +1079,7 @@ impl Channel for DiscordChannel {
         );
 
         if !warnings.is_empty() {
-            text.push_str("\n");
+            text.push('\n');
             for warning in warnings {
                 text.push_str(&format!("\n• {}", warning));
             }

@@ -4,14 +4,41 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{error, info};
+use zeroize::Zeroize;
 
 use crate::providers::ProviderError;
 use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
+
+/// Recursively strip fields unsupported by Gemini API from a JSON value.
+/// Google Gemini rejects `$schema` and `additionalProperties` in function parameter schemas.
+fn strip_unsupported_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("$schema");
+            map.remove("additionalProperties");
+            for v in map.values_mut() {
+                strip_unsupported_fields(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                strip_unsupported_fields(v);
+            }
+        }
+        _ => {}
+    }
+}
 
 pub struct GoogleGenAiProvider {
     client: Client,
     base_url: String,
     api_key: String,
+}
+
+impl Drop for GoogleGenAiProvider {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
+    }
 }
 
 impl GoogleGenAiProvider {
@@ -158,10 +185,12 @@ impl GoogleGenAiProvider {
             let mut function_declarations = Vec::new();
             for tool in tools {
                 if let Some(func) = tool.get("function") {
+                    let mut params = func["parameters"].clone();
+                    strip_unsupported_fields(&mut params);
                     function_declarations.push(json!({
                         "name": func["name"],
                         "description": func.get("description").unwrap_or(&json!("")),
-                        "parameters": func["parameters"]
+                        "parameters": params
                     }));
                 }
             }
@@ -346,5 +375,181 @@ impl ModelProvider for GoogleGenAiProvider {
             .unwrap_or_default();
             
         Ok(models)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn provider() -> GoogleGenAiProvider {
+        GoogleGenAiProvider::new("fake-key")
+    }
+
+    /// Helper: build an OpenAI-format tool definition from a parameters object.
+    fn openai_tool(name: &str, params: Value) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "test tool",
+                "parameters": params
+            }
+        })
+    }
+
+    /// Recursively check that no object in `value` contains a `$schema` key.
+    fn assert_no_schema_field(value: &Value, path: &str) {
+        match value {
+            Value::Object(map) => {
+                assert!(
+                    !map.contains_key("$schema"),
+                    "Found '$schema' at path: {}",
+                    path
+                );
+                for (k, v) in map {
+                    assert_no_schema_field(v, &format!("{}.{}", path, k));
+                }
+            }
+            Value::Array(arr) => {
+                for (i, v) in arr.iter().enumerate() {
+                    assert_no_schema_field(v, &format!("{}[{}]", path, i));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_strips_top_level_schema() {
+        let p = provider();
+        let tools = vec![openai_tool("mytool", json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" }
+            }
+        }))];
+
+        let result = p.convert_tools_for_test(&tools, false).unwrap();
+        assert_no_schema_field(&json!(result), "tools");
+    }
+
+    #[test]
+    fn test_strips_nested_schema() {
+        let p = provider();
+        let tools = vec![openai_tool("mytool", json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "$schema": "http://json-schema.org/draft-07/schema#",
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        }))];
+
+        let result = p.convert_tools_for_test(&tools, false).unwrap();
+        assert_no_schema_field(&json!(result), "tools");
+    }
+
+    #[test]
+    fn test_preserves_valid_fields() {
+        let p = provider();
+        let tools = vec![openai_tool("mytool", json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "The name" },
+                "count": { "type": "integer" }
+            },
+            "required": ["name"]
+        }))];
+
+        let result = p.convert_tools_for_test(&tools, false).unwrap();
+        let params = &result[0]["function_declarations"][0]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["properties"]["name"]["type"], "string");
+        assert_eq!(params["properties"]["count"]["type"], "integer");
+        assert_eq!(params["required"][0], "name");
+    }
+
+    #[test]
+    fn test_multiple_tools_all_stripped() {
+        let p = provider();
+        let tools = vec![
+            openai_tool("clean_tool", json!({
+                "type": "object",
+                "properties": { "a": { "type": "string" } }
+            })),
+            openai_tool("dirty_tool", json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": { "b": { "type": "string" } }
+            })),
+        ];
+
+        let result = p.convert_tools_for_test(&tools, false).unwrap();
+        assert_no_schema_field(&json!(result), "tools");
+
+        // Both tools should still be present
+        let decls = result[0]["function_declarations"].as_array().unwrap();
+        assert_eq!(decls.len(), 2);
+        assert_eq!(decls[0]["name"], "clean_tool");
+        assert_eq!(decls[1]["name"], "dirty_tool");
+    }
+
+    /// Simulates an MCP tool schema as returned by a real MCP server.
+    #[test]
+    fn test_mcp_style_schema_stripped() {
+        let p = provider();
+        let tools = vec![openai_tool("mcp__server__read_file", json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file path to read"
+                }
+            },
+            "required": ["path"]
+        }))];
+
+        let result = p.convert_tools_for_test(&tools, false).unwrap();
+        assert_no_schema_field(&json!(result), "tools");
+        assert_no_additional_properties(&json!(result), "tools");
+    }
+
+    /// Recursively check that no object in `value` contains an `additionalProperties` key.
+    fn assert_no_additional_properties(value: &Value, path: &str) {
+        match value {
+            Value::Object(map) => {
+                assert!(
+                    !map.contains_key("additionalProperties"),
+                    "Found 'additionalProperties' at path: {}",
+                    path
+                );
+                for (k, v) in map {
+                    assert_no_additional_properties(v, &format!("{}.{}", path, k));
+                }
+            }
+            Value::Array(arr) => {
+                for (i, v) in arr.iter().enumerate() {
+                    assert_no_additional_properties(v, &format!("{}[{}]", path, i));
+                }
+            }
+            _ => {}
+        }
     }
 }

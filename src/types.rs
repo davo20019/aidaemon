@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+
 /// Visibility level of the channel the message originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelVisibility {
@@ -7,8 +10,42 @@ pub enum ChannelVisibility {
     PrivateGroup,
     /// Public channel visible to many users. No personal memory injected.
     Public,
+    /// Untrusted public platform (Twitter, public APIs). Hardened security, minimal memory.
+    PublicExternal,
     /// Internal/system-initiated (scheduler, triggers, sub-agents default). Full memory.
     Internal,
+}
+
+/// Privacy level for facts stored in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FactPrivacy {
+    /// Accessible everywhere (user's name, timezone, general preferences).
+    Global,
+    /// Accessible only in originating channel + DMs.
+    Channel,
+    /// DM-only, never shared in channels, never hinted.
+    Private,
+}
+
+impl std::fmt::Display for FactPrivacy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FactPrivacy::Global => write!(f, "global"),
+            FactPrivacy::Channel => write!(f, "channel"),
+            FactPrivacy::Private => write!(f, "private"),
+        }
+    }
+}
+
+impl FactPrivacy {
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "global" => Self::Global,
+            "channel" => Self::Channel,
+            "private" => Self::Private,
+            _ => Self::Global,
+        }
+    }
 }
 
 impl std::fmt::Display for ChannelVisibility {
@@ -17,6 +54,7 @@ impl std::fmt::Display for ChannelVisibility {
             ChannelVisibility::Private => write!(f, "private"),
             ChannelVisibility::PrivateGroup => write!(f, "private_group"),
             ChannelVisibility::Public => write!(f, "public"),
+            ChannelVisibility::PublicExternal => write!(f, "public_external"),
             ChannelVisibility::Internal => write!(f, "internal"),
         }
     }
@@ -29,6 +67,7 @@ impl ChannelVisibility {
             "private" => Self::Private,
             "private_group" => Self::PrivateGroup,
             "public" => Self::Public,
+            "public_external" => Self::PublicExternal,
             "internal" => Self::Internal,
             _ => Self::Internal,
         }
@@ -44,15 +83,29 @@ pub struct ChannelContext {
     pub platform: String,
     /// Human-readable channel name, if available (e.g., "#general", "Team Chat")
     pub channel_name: Option<String>,
+    /// Stable channel identifier for memory scoping (e.g., "slack:C12345", "telegram:67890")
+    pub channel_id: Option<String>,
+    /// Display name of the message sender, if resolved (e.g., "Alice", "Bob Smith")
+    pub sender_name: Option<String>,
+    /// Display names of members in the channel (for group channels; empty for DMs)
+    pub channel_member_names: Vec<String>,
+    /// User ID → display name lookup (e.g., "U04S8KSS932" → "Alice") for resolving IDs in facts
+    pub user_id_map: HashMap<String, String>,
 }
 
 impl ChannelContext {
     /// Default context for private DMs.
+    /// Used by integration tests.
+    #[cfg(test)]
     pub fn private(platform: &str) -> Self {
         Self {
             visibility: ChannelVisibility::Private,
             platform: platform.to_string(),
             channel_name: None,
+            channel_id: None,
+            sender_name: None,
+            channel_member_names: vec![],
+            user_id_map: HashMap::new(),
         }
     }
 
@@ -62,10 +115,15 @@ impl ChannelContext {
             visibility: ChannelVisibility::Internal,
             platform: "internal".to_string(),
             channel_name: None,
+            channel_id: None,
+            sender_name: None,
+            channel_member_names: vec![],
+            user_id_map: HashMap::new(),
         }
     }
 
-    /// Whether personal memory (facts, episodes, goals, etc.) should be injected.
+    /// Whether deeply personal memory (goals, patterns, profile) should be injected.
+    /// Facts and episodes now use channel-scoped retrieval instead.
     pub fn should_inject_personal_memory(&self) -> bool {
         matches!(
             self.visibility,

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -53,9 +54,12 @@ pub struct TelegramChannel {
     /// Reference to the channel hub for dynamic bot registration.
     /// Set after construction via set_channel_hub().
     channel_hub: StdRwLock<Option<Weak<ChannelHub>>>,
+    /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
+    watchdog_stale_threshold_secs: u64,
 }
 
 impl TelegramChannel {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bot_token: &str,
         allowed_user_ids: Vec<u64>,
@@ -68,6 +72,7 @@ impl TelegramChannel {
         inbox_dir: PathBuf,
         max_file_size_mb: u64,
         state: Arc<dyn StateStore>,
+        watchdog_stale_threshold_secs: u64,
     ) -> Self {
         let bot = Bot::new(bot_token);
         Self {
@@ -87,6 +92,7 @@ impl TelegramChannel {
             max_file_size_mb,
             state,
             channel_hub: StdRwLock::new(None),
+            watchdog_stale_threshold_secs,
         }
     }
 
@@ -791,6 +797,7 @@ impl TelegramChannel {
                     self.inbox_dir.clone(),
                     self.max_file_size_mb,
                     Arc::clone(&self.state),
+                    self.watchdog_stale_threshold_secs,
                 ));
 
                 // Give the new channel a reference to the hub too
@@ -911,6 +918,7 @@ impl TelegramChannel {
                     self.inbox_dir.clone(),
                     self.max_file_size_mb,
                     Arc::clone(&self.state),
+                    self.watchdog_stale_threshold_secs,
                 ));
 
                 // Give the new channel a reference to the hub
@@ -1048,6 +1056,7 @@ impl TelegramChannel {
                     self.inbox_dir.clone(),
                     self.max_file_size_mb,
                     Arc::clone(&self.state),
+                    self.watchdog_stale_threshold_secs,
                 ));
 
                 // Give the new channel a reference to the hub
@@ -1249,6 +1258,10 @@ impl TelegramChannel {
                 visibility,
                 platform: "telegram".to_string(),
                 channel_name: msg.chat.title().map(|s| s.to_string()),
+                channel_id: Some(format!("telegram:{}", msg.chat.id.0)),
+                sender_name: None,
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
             }
         };
 
@@ -1287,17 +1300,40 @@ impl TelegramChannel {
 
         info!(session_id, "Received message from user {}", user_id);
 
+        // Create heartbeat for watchdog — agent bumps this on every activity point.
+        let heartbeat = Arc::new(AtomicU64::new(
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        ));
+
         // Send typing indicator immediately, then repeat every 4s while agent works.
         // Telegram's typing indicator expires after ~5s, so 4s keeps it continuous.
+        // Also monitors the heartbeat: if it goes stale, notify user and stop typing.
         let typing_bot = bot.clone();
         let typing_chat_id = msg.chat.id;
         let typing_cancel = tokio_util::sync::CancellationToken::new();
         let typing_token = typing_cancel.clone();
+        let heartbeat_for_typing = heartbeat.clone();
+        let stale_threshold_secs = self.watchdog_stale_threshold_secs;
         tokio::spawn(async move {
             loop {
                 let _ = typing_bot.send_chat_action(typing_chat_id, ChatAction::Typing).await;
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                    _ = tokio::time::sleep(Duration::from_secs(4)) => {
+                        if stale_threshold_secs > 0 {
+                            let last_hb = heartbeat_for_typing.load(Ordering::Relaxed);
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH)
+                                .unwrap_or_default().as_secs();
+                            if now.saturating_sub(last_hb) > stale_threshold_secs {
+                                let stale_mins = (now - last_hb) / 60;
+                                let _ = typing_bot.send_message(typing_chat_id, format!(
+                                    "⚠️ No activity for {} minutes. The task may be stuck. \
+                                     Send /cancel to stop it, or wait for it to recover.",
+                                    stale_mins
+                                )).await;
+                                break; // Stop typing indicator
+                            }
+                        }
+                    }
                     _ = typing_token.cancelled() => break,
                 }
             }
@@ -1307,10 +1343,23 @@ impl TelegramChannel {
         let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
         let status_bot = bot.clone();
         let status_chat_id = msg.chat.id;
+        let is_dm = channel_ctx.visibility == ChannelVisibility::Private;
         let status_task = tokio::spawn(async move {
             let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
             let min_interval = Duration::from_secs(3);
+            let mut sent_thinking = false;
             while let Some(update) = status_rx.recv().await {
+                // In non-DM channels: only send one "Thinking..." then suppress
+                if !is_dm {
+                    if !sent_thinking
+                        && matches!(update, StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. })
+                    {
+                        let _ = status_bot.send_message(status_chat_id, "Thinking...").await;
+                        sent_thinking = true;
+                        last_sent = tokio::time::Instant::now();
+                    }
+                    continue;
+                }
                 let now = tokio::time::Instant::now();
                 if now.duration_since(last_sent) < min_interval {
                     continue;
@@ -1394,10 +1443,11 @@ impl TelegramChannel {
             let mut current_status_tx = status_tx;
             let mut current_typing_cancel = typing_cancel;
             let mut current_status_task = status_task;
+            let mut current_heartbeat = heartbeat;
 
             loop {
                 let result = tokio::select! {
-                    r = agent.handle_message(&session_id, &current_text, Some(current_status_tx), user_role, channel_ctx.clone()) => r,
+                    r = agent.handle_message(&session_id, &current_text, Some(current_status_tx), user_role, channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
                 };
                 current_typing_cancel.cancel();
@@ -1459,7 +1509,19 @@ impl TelegramChannel {
                     current_status_task = tokio::spawn(async move {
                         let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
                         let min_interval = Duration::from_secs(3);
+                        let mut sent_thinking = false;
                         while let Some(update) = new_status_rx.recv().await {
+                            // In non-DM channels: only send one "Thinking..." then suppress
+                            if !is_dm {
+                                if !sent_thinking
+                                    && matches!(update, StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. })
+                                {
+                                    let _ = status_bot.send_message(chat_id, "Thinking...").await;
+                                    sent_thinking = true;
+                                    last_sent = tokio::time::Instant::now();
+                                }
+                                continue;
+                            }
                             let now = tokio::time::Instant::now();
                             if now.duration_since(last_sent) < min_interval {
                                 continue;
@@ -1480,15 +1542,37 @@ impl TelegramChannel {
                         }
                     });
 
-                    // New typing indicator
+                    // Fresh heartbeat for queued message
+                    let new_heartbeat = Arc::new(AtomicU64::new(
+                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                    ));
+                    current_heartbeat = new_heartbeat.clone();
+
+                    // New typing indicator with watchdog
                     let typing_bot = bot.clone();
                     let new_typing_cancel = tokio_util::sync::CancellationToken::new();
                     current_typing_cancel = new_typing_cancel.clone();
+                    let heartbeat_for_queued = new_heartbeat;
                     tokio::spawn(async move {
                         loop {
                             let _ = typing_bot.send_chat_action(chat_id, ChatAction::Typing).await;
                             tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                                _ = tokio::time::sleep(Duration::from_secs(4)) => {
+                                    if stale_threshold_secs > 0 {
+                                        let last_hb = heartbeat_for_queued.load(Ordering::Relaxed);
+                                        let now = SystemTime::now().duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default().as_secs();
+                                        if now.saturating_sub(last_hb) > stale_threshold_secs {
+                                            let stale_mins = (now - last_hb) / 60;
+                                            let _ = typing_bot.send_message(chat_id, format!(
+                                                "⚠️ No activity for {} minutes. The task may be stuck. \
+                                                 Send /cancel to stop it, or wait for it to recover.",
+                                                stale_mins
+                                            )).await;
+                                            break;
+                                        }
+                                    }
+                                }
                                 _ = new_typing_cancel.cancelled() => break,
                             }
                         }
@@ -1640,7 +1724,7 @@ impl Channel for TelegramChannel {
         );
 
         if !warnings.is_empty() {
-            text.push_str("\n");
+            text.push('\n');
             for warning in warnings {
                 text.push_str(&format!("\n• {}", html_escape(warning)));
             }

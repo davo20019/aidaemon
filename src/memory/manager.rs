@@ -6,9 +6,12 @@ use tracing::{error, info, warn};
 use serde::Deserialize;
 use serde_json::json;
 use chrono::{DateTime, Utc};
+use crate::events::Consolidator;
+use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::scoring::calculate_episode_importance;
 use crate::traits::{BehaviorPattern, Message, ModelProvider, UserProfile};
+use crate::types::FactPrivacy;
 
 pub struct MemoryManager {
     pool: SqlitePool,
@@ -16,6 +19,7 @@ pub struct MemoryManager {
     provider: Arc<dyn ModelProvider>,
     fast_model: String,
     consolidation_interval: Duration,
+    consolidator: Option<Arc<Consolidator>>,
 }
 
 impl MemoryManager {
@@ -25,6 +29,7 @@ impl MemoryManager {
         provider: Arc<dyn ModelProvider>,
         fast_model: String,
         consolidation_interval: Duration,
+        consolidator: Option<Arc<Consolidator>>,
     ) -> Self {
         Self {
             pool,
@@ -32,6 +37,7 @@ impl MemoryManager {
             provider,
             fast_model,
             consolidation_interval,
+            consolidator,
         }
     }
 
@@ -137,8 +143,7 @@ impl MemoryManager {
             if let Some(text) = content {
                 match self.embedding_service.embed(text).await {
                     Ok(embedding) => {
-                        // Serialize to JSON bytes
-                        let blob = serde_json::to_vec(&embedding)?;
+                        let blob = encode_embedding(&embedding);
                         sqlx::query(
                             "UPDATE messages SET embedding = ? WHERE id = ?"
                         )
@@ -212,7 +217,7 @@ impl MemoryManager {
 
         let system_prompt = "You are a memory consolidation system. Given a conversation excerpt, \
             extract durable facts worth remembering long-term. Output ONLY a JSON array: \
-            [{\"category\": \"...\", \"key\": \"...\", \"value\": \"...\"}]. \
+            [{\"category\": \"...\", \"key\": \"...\", \"value\": \"...\", \"privacy\": \"...\"}]. \
             Categories:\n\
             - user: Personal info (name, location, job)\n\
             - preference: Tool, workflow, and communication preferences\n\
@@ -224,6 +229,11 @@ impl MemoryManager {
             - Which tools the user prefers for specific tasks\n\
             - Recurring workflows or action sequences\n\
             - Types of tasks frequently delegated\n\n\
+            Also classify each fact's privacy:\n\
+            - \"global\": General facts useful anywhere (name, job, timezone, tech preferences)\n\
+            - \"channel\": Context-specific facts from this conversation\n\
+            - \"private\": Sensitive personal info the user would want kept private\n\
+            Default to \"channel\" if unsure.\n\n\
             Only extract facts useful in future conversations. If nothing worth remembering, return [].";
 
         for (session_id, messages) in &sessions {
@@ -245,11 +255,17 @@ impl MemoryManager {
                     if let Some(text) = &response.content {
                         match parse_consolidation_response(text) {
                             Ok(facts) => {
+                                let ch_id = derive_channel_id_from_session(session_id);
                                 for fact in &facts {
+                                    let privacy = fact.privacy.as_deref()
+                                        .map(FactPrivacy::from_str_lossy)
+                                        .unwrap_or(FactPrivacy::Channel);
                                     if let Err(e) = self.upsert_fact(
                                         &fact.category,
                                         &fact.key,
                                         &fact.value,
+                                        ch_id.as_deref(),
+                                        privacy,
                                     ).await {
                                         warn!(
                                             "Failed to upsert consolidated fact [{}/{}]: {}",
@@ -274,7 +290,7 @@ impl MemoryManager {
 
                     // Only mark messages as consolidated when facts were successfully parsed
                     // On parse failure, messages remain unconsolidated for retry next cycle
-                    if response.content.as_ref().map_or(false, |text| parse_consolidation_response(text).is_ok()) {
+                    if response.content.as_ref().is_some_and(|text| parse_consolidation_response(text).is_ok()) {
                         let now = chrono::Utc::now().to_rfc3339();
                         for (id, _role, _content) in messages {
                             let _ = sqlx::query(
@@ -297,11 +313,30 @@ impl MemoryManager {
             }
         }
 
+        // After fact extraction, run event-based extraction (procedures, errors, expertise)
+        // via the Consolidator. This unifies both pipelines into a single cycle.
+        if let Some(ref consolidator) = self.consolidator {
+            let session_ids: Vec<String> = sessions.keys().cloned().collect();
+            for session_id in &session_ids {
+                if let Err(e) = consolidator.consolidate_session(session_id).await {
+                    warn!("Event consolidation failed for session {}: {}", session_id, e);
+                }
+            }
+        }
+
         Ok(())
     }
 
-    async fn upsert_fact(&self, category: &str, key: &str, value: &str) -> anyhow::Result<()> {
+    async fn upsert_fact(
+        &self,
+        category: &str,
+        key: &str,
+        value: &str,
+        channel_id: Option<&str>,
+        privacy: FactPrivacy,
+    ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
+        let privacy_str = privacy.to_string();
 
         // Use supersession logic: find existing current fact
         let existing = sqlx::query(
@@ -326,28 +361,47 @@ impl MemoryManager {
 
                 // Insert new fact
                 sqlx::query(
-                    "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count)
-                     VALUES (?, ?, ?, 'consolidation', ?, ?, 0)"
+                    "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy)
+                     VALUES (?, ?, ?, 'consolidation', ?, ?, 0, ?, ?)"
                 )
                 .bind(category)
                 .bind(key)
                 .bind(value)
                 .bind(&now)
                 .bind(&now)
+                .bind(channel_id)
+                .bind(&privacy_str)
                 .execute(&self.pool)
                 .await?;
             }
         } else {
+            // Check for previously-deleted (superseded) fact — don't re-create via consolidation.
+            // This respects the user's explicit deletion. They can still re-add facts
+            // explicitly via the remember_fact tool which uses StateStore::upsert_fact.
+            let was_deleted = sqlx::query(
+                "SELECT id FROM facts WHERE category = ? AND key = ? AND superseded_at IS NOT NULL LIMIT 1",
+            )
+            .bind(category)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if was_deleted.is_some() {
+                return Ok(());
+            }
+
             // No existing fact - insert new
             sqlx::query(
-                "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count)
-                 VALUES (?, ?, ?, 'consolidation', ?, ?, 0)"
+                "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy)
+                 VALUES (?, ?, ?, 'consolidation', ?, ?, 0, ?, ?)"
             )
             .bind(category)
             .bind(key)
             .bind(value)
             .bind(&now)
             .bind(&now)
+            .bind(channel_id)
+            .bind(&privacy_str)
             .execute(&self.pool)
             .await?;
         }
@@ -423,12 +477,12 @@ impl MemoryManager {
 
         // Calculate importance
         let has_errors = messages.iter().any(|m| {
-            m.content.as_ref().map_or(false, |c| {
+            m.content.as_ref().is_some_and(|c| {
                 c.to_lowercase().contains("error") || c.to_lowercase().contains("failed")
             })
         });
         let has_decisions = messages.iter().any(|m| {
-            m.content.as_ref().map_or(false, |c| {
+            m.content.as_ref().is_some_and(|c| {
                 let lower = c.to_lowercase();
                 lower.contains("decided") || lower.contains("let's go with") || lower.contains("i'll use")
             })
@@ -471,7 +525,7 @@ impl MemoryManager {
 
         // Generate and store embedding for the summary
         if let Ok(embedding) = self.embedding_service.embed(analysis.summary.clone()).await {
-            let blob = serde_json::to_vec(&embedding)?;
+            let blob = encode_embedding(&embedding);
             sqlx::query("UPDATE episodes SET embedding = ? WHERE id = ?")
                 .bind(blob)
                 .bind(episode_id)
@@ -556,9 +610,9 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
 
     /// Extract or update a goal from episode analysis.
     async fn extract_goal(&self, goal_text: &str, source_episode_id: i64) -> anyhow::Result<()> {
-        // Check for similar existing goal
+        // Check for similar existing goal (including abandoned/completed to prevent resurrection)
         let existing = sqlx::query(
-            "SELECT id, description FROM goals WHERE status = 'active'"
+            "SELECT id, description, status FROM goals WHERE status IN ('active', 'abandoned', 'completed')"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -568,6 +622,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         for row in existing {
             let id: i64 = row.get("id");
             let description: String = row.get("description");
+            let status: String = row.get("status");
             let desc_lower = description.to_lowercase();
 
             // Check for word overlap
@@ -577,7 +632,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             let union = goal_words.union(&desc_words).count();
 
             if union > 0 && (intersection as f32 / union as f32) > 0.5 {
-                // Similar goal exists - add progress note
+                // Similar goal found — if abandoned or completed, respect that and skip
+                if status != "active" {
+                    return Ok(());
+                }
+
+                // Active goal — add progress note
                 let now = Utc::now().to_rfc3339();
                 let note = format!("Referenced in episode {}", source_episode_id);
 
@@ -1064,6 +1124,36 @@ struct ExtractedFact {
     category: String,
     key: String,
     value: String,
+    privacy: Option<String>,
+}
+
+/// Derive a channel_id from a session_id string.
+/// Session IDs follow patterns like:
+///   - "slack:CHANNEL_ID:thread_ts" or "slack:CHANNEL_ID"
+///   - "bot:telegram:CHAT_ID" or "telegram:CHAT_ID" or just "CHAT_ID"
+///   - "discord:ch:ID" or "discord:dm:ID"
+fn derive_channel_id_from_session(session_id: &str) -> Option<String> {
+    if session_id.starts_with("slack:") {
+        // "slack:C12345" or "slack:C12345:ts123" → "slack:C12345"
+        let parts: Vec<&str> = session_id.splitn(3, ':').collect();
+        if parts.len() >= 2 {
+            return Some(format!("slack:{}", parts[1]));
+        }
+    }
+    if session_id.starts_with("discord:") {
+        // "discord:ch:123" or "discord:dm:456" → keep as-is
+        return Some(session_id.to_string());
+    }
+    // Telegram patterns: "bot:telegram:CHAT_ID", "bot:CHAT_ID", "telegram:CHAT_ID", or just numeric
+    let stripped = session_id.strip_prefix("bot:").unwrap_or(session_id);
+    if stripped.starts_with("telegram:") {
+        return Some(stripped.to_string());
+    }
+    // Bare numeric chat ID → assume telegram
+    if stripped.chars().all(|c| c.is_ascii_digit() || c == '-') && !stripped.is_empty() {
+        return Some(format!("telegram:{}", stripped));
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]

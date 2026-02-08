@@ -35,8 +35,7 @@ impl EmbeddingService {
     pub async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         let model = self.model.clone();
         task::spawn_blocking(move || {
-            model.embed(texts, None).map_err(anyhow::Error::from)
-        })
+            model.embed(texts, None)})
         .await?
     }
 }

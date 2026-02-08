@@ -3,16 +3,23 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::RwLock;
 
 use crate::traits::{StateStore, Tool};
+use crate::types::FactPrivacy;
 
 pub struct RememberFactTool {
     state: Arc<dyn StateStore>,
+    /// Current channel_id set by the agent before tool execution.
+    pub(crate) current_channel_id: Arc<RwLock<Option<String>>>,
 }
 
 impl RememberFactTool {
     pub fn new(state: Arc<dyn StateStore>) -> Self {
-        Self { state }
+        Self {
+            state,
+            current_channel_id: Arc::new(RwLock::new(None)),
+        }
     }
 }
 
@@ -60,8 +67,17 @@ impl Tool for RememberFactTool {
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: RememberArgs = serde_json::from_str(arguments)?;
+        let channel_id = self.current_channel_id.read().await.clone();
+        // When explicitly remembered by the agent, default to global privacy
         self.state
-            .upsert_fact(&args.category, &args.key, &args.value, "agent")
+            .upsert_fact(
+                &args.category,
+                &args.key,
+                &args.value,
+                "agent",
+                channel_id.as_deref(),
+                FactPrivacy::Global,
+            )
             .await?;
         Ok(format!(
             "Remembered: [{}] {} = {}",

@@ -76,6 +76,8 @@ mod tests {
             source_url: None,
             id: None,
             enabled: true,
+            dir_path: None,
+            resources: vec![],
         }
     }
 

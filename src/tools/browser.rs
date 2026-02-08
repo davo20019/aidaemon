@@ -81,7 +81,7 @@ impl BrowserTool {
                 })?;
 
         let handle = tokio::spawn(async move {
-            while let Some(_) = handler.next().await {}
+            while handler.next().await.is_some() {}
         });
 
         info!("Browser launched successfully");

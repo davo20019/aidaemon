@@ -12,7 +12,7 @@ pub async fn start_health_server(port: u16, bind_addr: &str) -> anyhow::Result<(
 
     let ip: std::net::IpAddr = bind_addr
         .parse()
-        .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let addr = std::net::SocketAddr::new(ip, port);
     info!("Health server listening on {}", addr);
 

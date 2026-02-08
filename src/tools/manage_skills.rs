@@ -60,9 +60,17 @@ impl ManageSkillsTool {
             })
             .await
             .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval response channel closed"))
+        match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => {
+                tracing::warn!(description, "Approval response channel closed");
+                Ok(ApprovalResponse::Deny)
+            }
+            Err(_) => {
+                tracing::warn!(description, "Approval request timed out (300s), auto-denying");
+                Ok(ApprovalResponse::Deny)
+            }
+        }
     }
 
     async fn handle_add_url(&self, url: &str) -> anyhow::Result<String> {
@@ -119,6 +127,7 @@ impl ManageSkillsTool {
             enabled: true,
             version,
             created_at: String::new(),
+            resources_json: serde_json::to_string(&skill.resources).unwrap_or_else(|_| "[]".to_string()),
         };
         let db_id = self.state.add_dynamic_skill(&dynamic).await?;
 
@@ -150,6 +159,18 @@ impl ManageSkillsTool {
             ));
             if !skill.triggers.is_empty() {
                 output.push_str(&format!("  triggers: {}\n", skill.triggers.join(", ")));
+            }
+            if !skill.resources.is_empty() {
+                let mut by_category: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for r in &skill.resources {
+                    *by_category.entry(r.category.as_str()).or_insert(0) += 1;
+                }
+                let summary: Vec<String> = by_category
+                    .iter()
+                    .map(|(k, v)| format!("{} {}(s)", v, k))
+                    .collect();
+                output.push_str(&format!("  resources: {}\n", summary.join(", ")));
             }
         }
         Ok(output)

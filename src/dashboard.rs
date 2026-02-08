@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse},
@@ -9,8 +9,11 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::config::ModelsConfig;
@@ -18,6 +21,12 @@ use crate::health::HealthProbeStore;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 const KEYCHAIN_FIELD: &str = "dashboard_token";
+/// Dashboard token TTL: 24 hours.
+const TOKEN_TTL_SECS: u64 = 86400;
+/// Max failed auth attempts before rate limiting kicks in.
+const MAX_FAILED_ATTEMPTS: u32 = 10;
+/// Rate limit window: 15 minutes.
+const RATE_LIMIT_WINDOW_SECS: u64 = 900;
 
 // ---------------------------------------------------------------------------
 // State
@@ -30,41 +39,42 @@ pub struct DashboardState {
     pub models: ModelsConfig,
     pub started_at: Instant,
     pub dashboard_token: String,
+    pub token_created_at: Instant,
     pub daily_token_budget: Option<u64>,
     pub health_store: Option<Arc<HealthProbeStore>>,
+    /// Rate limiter: maps IP address to (failure_count, first_failure_time).
+    pub auth_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
 }
 
 // ---------------------------------------------------------------------------
 // Token management
 // ---------------------------------------------------------------------------
 
-pub fn get_or_create_dashboard_token() -> anyhow::Result<String> {
+/// Token with creation timestamp for expiration checks.
+pub struct DashboardToken {
+    pub token: String,
+    pub created_at: Instant,
+}
+
+pub fn get_or_create_dashboard_token() -> anyhow::Result<DashboardToken> {
+    // Always generate a fresh token on startup (enforces TTL on restart)
+    let tok = uuid::Uuid::new_v4().to_string();
     match keyring::Entry::new("aidaemon", KEYCHAIN_FIELD) {
-        Ok(entry) => match entry.get_password() {
-            Ok(tok) if !tok.is_empty() => {
-                info!("Dashboard token loaded from keychain");
-                Ok(tok)
+        Ok(entry) => {
+            if let Err(e) = entry.set_password(&tok) {
+                warn!("Could not store dashboard token in keychain: {e}");
             }
-            _ => {
-                let tok = uuid::Uuid::new_v4().to_string();
-                if let Err(e) = entry.set_password(&tok) {
-                    warn!("Could not store dashboard token in keychain: {e}");
-                }
-                // Only log a prefix to avoid exposing the full token in logs
-                let prefix = tok.get(..8).unwrap_or("????????");
-                info!("Dashboard token created (prefix: {}...)", prefix);
-                Ok(tok)
-            }
-        },
+        }
         Err(e) => {
             warn!("Keychain unavailable for dashboard token: {e}");
-            let tok = uuid::Uuid::new_v4().to_string();
-            // Only log a prefix to avoid exposing the full token in logs
-            let prefix = tok.get(..8).unwrap_or("????????");
-            info!("Ephemeral dashboard token created (prefix: {}..., not persisted)", prefix);
-            Ok(tok)
         }
     }
+    let prefix = tok.get(..8).unwrap_or("????????");
+    info!("Dashboard token created (prefix: {}..., expires in 24h)", prefix);
+    Ok(DashboardToken {
+        token: tok,
+        created_at: Instant::now(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -98,10 +108,36 @@ pub fn build_router(state: DashboardState) -> Router {
 
 async fn auth_middleware(
     State(state): State<DashboardState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     request: axum::extract::Request,
     next: Next,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let client_ip = addr.ip().to_string();
+
+    // Rate limiting: check if this IP has too many recent failures
+    {
+        let mut failures = state.auth_failures.lock().await;
+        if let Some((count, first_failure)) = failures.get(&client_ip) {
+            if first_failure.elapsed().as_secs() < RATE_LIMIT_WINDOW_SECS
+                && *count >= MAX_FAILED_ATTEMPTS
+            {
+                warn!(ip = %client_ip, "Rate limited: too many failed auth attempts");
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+            // Reset window if expired
+            if first_failure.elapsed().as_secs() >= RATE_LIMIT_WINDOW_SECS {
+                failures.remove(&client_ip);
+            }
+        }
+    }
+
+    // Check token expiration
+    if state.token_created_at.elapsed().as_secs() > TOKEN_TTL_SECS {
+        warn!("Dashboard token expired (>24h). Restart the daemon to generate a new token.");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -109,6 +145,13 @@ async fn auth_middleware(
         .unwrap_or("");
 
     if token != state.dashboard_token {
+        // Track failed attempt
+        let mut failures = state.auth_failures.lock().await;
+        let entry = failures
+            .entry(client_ip.clone())
+            .or_insert((0, Instant::now()));
+        entry.0 += 1;
+        warn!(ip = %client_ip, attempts = entry.0, "Failed dashboard auth attempt");
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -360,7 +403,7 @@ async fn api_health_history(
 
     // Find probe by ID or name
     let probe = store.get_probe(&q.probe).await.ok().flatten()
-        .or_else(|| {
+        .or({
             // Try by name synchronously is tricky; we'll use a future
             None
         });
@@ -456,7 +499,7 @@ async fn api_health_summary(State(state): State<DashboardState>) -> Json<serde_j
         }
 
         let stats = stats_map.get(&probe.id);
-        let health_score = stats.map(|s| crate::health::TrendAnalyzer::health_score(s));
+        let health_score = stats.map(crate::health::TrendAnalyzer::health_score);
         let uptime = stats.map(|s| s.uptime_percent);
         let avg_latency = stats.and_then(|s| s.avg_latency_ms);
 
@@ -497,11 +540,11 @@ pub async fn start_dashboard_server(
     port: u16,
     bind_addr: &str,
 ) -> anyhow::Result<()> {
-    let app = build_router(state);
+    let app = build_router(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let ip: std::net::IpAddr = bind_addr
         .parse()
-        .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let addr = std::net::SocketAddr::new(ip, port);
     info!("Dashboard server listening on http://{}", addr);
 

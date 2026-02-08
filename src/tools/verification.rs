@@ -167,7 +167,7 @@ impl VerificationTracker {
 }
 
 /// Check if any ancestor of `path` is in the seen set.
-fn ancestors_seen(path: &PathBuf, seen: &HashSet<PathBuf>) -> bool {
+fn ancestors_seen(path: &std::path::Path, seen: &HashSet<PathBuf>) -> bool {
     let mut current = path.parent();
     while let Some(ancestor) = current {
         if seen.contains(ancestor) {

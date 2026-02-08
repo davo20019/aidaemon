@@ -11,7 +11,9 @@ use crate::traits::{
     BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, Message, Procedure,
     StateStore, TokenUsage, TokenUsageRecord, UserProfile,
 };
+use crate::types::{ChannelVisibility, FactPrivacy};
 
+use crate::memory::binary::{decode_embedding, encode_embedding};
 use crate::memory::embeddings::EmbeddingService;
 use crate::utils::truncate_str;
 
@@ -60,9 +62,16 @@ impl SqliteStateStore {
         #[cfg(feature = "encryption")]
         if let Some(key) = encryption_key {
             if !key.is_empty() {
+                // Validate key contains only safe characters (prevent SQL injection via PRAGMA)
+                if !key.chars().all(|c| c.is_ascii_alphanumeric() || "!@#$%^&*_+-=.".contains(c)) {
+                    anyhow::bail!(
+                        "Encryption key contains invalid characters. Only alphanumeric and !@#$%^&*_+-=. are allowed."
+                    );
+                }
                 // PRAGMA key must be the first statement on a new connection.
-                // With a connection pool we set it here; sqlx runs it on the first acquired connection.
-                sqlx::query(&format!("PRAGMA key = '{}'", key.replace('\'', "''")))
+                // Use hex-encoded format for robustness against injection.
+                let hex_key: String = key.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+                sqlx::query(&format!("PRAGMA key = \"x'{}'\"", hex_key))
                     .execute(&pool)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to set SQLCipher encryption key: {}", e))?;
@@ -371,6 +380,21 @@ impl SqliteStateStore {
         .execute(&pool)
         .await?;
 
+        // Token usage daily aggregates (for retention cleanup)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS token_usage_daily (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                model TEXT NOT NULL,
+                total_input_tokens INTEGER NOT NULL,
+                total_output_tokens INTEGER NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(date, model)
+            )"
+        )
+        .execute(&pool)
+        .await?;
+
         // Dynamic bots table - stores bot tokens added via /connect command
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS dynamic_bots (
@@ -403,6 +427,41 @@ impl SqliteStateStore {
         )
         .execute(&pool)
         .await?;
+
+        // Migration: add resources_json column if missing
+        sqlx::query("ALTER TABLE dynamic_skills ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]'")
+            .execute(&pool)
+            .await
+            .ok();
+
+        // Dynamic MCP servers table - stores MCP servers added via manage_mcp tool
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS dynamic_mcp_servers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                command TEXT NOT NULL,
+                args_json TEXT NOT NULL DEFAULT '[]',
+                env_keys_json TEXT NOT NULL DEFAULT '[]',
+                triggers_json TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )"
+        )
+        .execute(&pool)
+        .await?;
+
+        // --- Channel-Scoped Memory Migrations ---
+        // Add channel_id and privacy columns to facts table
+        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN channel_id TEXT").execute(&pool).await;
+        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN privacy TEXT DEFAULT 'global'").execute(&pool).await;
+        let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_facts_channel ON facts(channel_id)").execute(&pool).await;
+        let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_facts_privacy ON facts(privacy)").execute(&pool).await;
+        // Add channel_id column to episodes table
+        let _ = sqlx::query("ALTER TABLE episodes ADD COLUMN channel_id TEXT").execute(&pool).await;
+
+        // --- Binary Embedding Storage Migration ---
+        // Add embedding column to facts table for pre-computed embeddings
+        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN embedding BLOB").execute(&pool).await;
 
         Ok(Self {
             pool,
@@ -509,7 +568,7 @@ impl SqliteStateStore {
         for row in rows {
             let embedding: Option<Vec<u8>> = row.get("embedding");
             if let Some(blob) = embedding {
-                if let Ok(vec) = serde_json::from_slice::<Vec<f32>>(&blob) {
+                if let Ok(vec) = decode_embedding(&blob) {
                     let similarity = crate::memory::math::cosine_similarity(&query_vec, &vec);
                     let episode = self.row_to_episode(&row)?;
                     let score = crate::memory::scoring::memory_score(
@@ -573,7 +632,7 @@ impl SqliteStateStore {
     /// Update episode embedding.
     #[allow(dead_code)]
     pub async fn update_episode_embedding(&self, episode_id: i64, embedding: &[f32]) -> anyhow::Result<()> {
-        let blob = serde_json::to_vec(embedding)?;
+        let blob = encode_embedding(embedding);
         sqlx::query("UPDATE episodes SET embedding = ? WHERE id = ?")
             .bind(blob)
             .bind(episode_id)
@@ -604,7 +663,7 @@ impl SqliteStateStore {
 
             match self.embedding_service.embed(summary).await {
                 Ok(embedding) => {
-                    let blob = serde_json::to_vec(&embedding)?;
+                    let blob = encode_embedding(&embedding);
                     sqlx::query("UPDATE episodes SET embedding = ? WHERE id = ?")
                         .bind(blob)
                         .bind(id)
@@ -622,6 +681,80 @@ impl SqliteStateStore {
         Ok(backfilled)
     }
 
+    /// Backfill missing fact embeddings.
+    /// Called on startup to ensure all active facts have pre-computed embeddings.
+    pub async fn backfill_fact_embeddings(&self) -> anyhow::Result<usize> {
+        let rows: Vec<sqlx::sqlite::SqliteRow> = sqlx::query(
+            "SELECT id, category, key, value FROM facts WHERE embedding IS NULL AND superseded_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        tracing::info!(count = rows.len(), "Backfilling missing fact embeddings");
+
+        let mut backfilled = 0;
+        for row in rows {
+            let id: i64 = row.get("id");
+            let category: String = row.get("category");
+            let key: String = row.get("key");
+            let value: String = row.get("value");
+            let fact_text = format!("[{}] {}: {}", category, key, value);
+
+            match self.embedding_service.embed(fact_text).await {
+                Ok(embedding) => {
+                    let blob = encode_embedding(&embedding);
+                    sqlx::query("UPDATE facts SET embedding = ? WHERE id = ?")
+                        .bind(blob)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await?;
+                    backfilled += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(fact_id = id, error = %e, "Failed to generate embedding for fact");
+                }
+            }
+        }
+
+        tracing::info!(backfilled, "Fact embedding backfill complete");
+        Ok(backfilled)
+    }
+
+    fn row_to_fact(row: &sqlx::sqlite::SqliteRow) -> Fact {
+        let created_str: String = row.get("created_at");
+        let updated_str: String = row.get("updated_at");
+        let superseded_str: Option<String> = row.get("superseded_at");
+        let last_recalled_str: Option<String> = row.get("last_recalled_at");
+        let privacy_str: Option<String> = row.try_get("privacy").unwrap_or(None);
+        let channel_id: Option<String> = row.try_get("channel_id").unwrap_or(None);
+
+        let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+
+        Fact {
+            id: row.get("id"),
+            category: row.get("category"),
+            key: row.get("key"),
+            value: row.get("value"),
+            source: row.get("source"),
+            created_at,
+            updated_at,
+            superseded_at: superseded_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
+            recall_count: row.try_get("recall_count").unwrap_or(0),
+            last_recalled_at: last_recalled_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
+            channel_id,
+            privacy: privacy_str.map(|s| FactPrivacy::from_str_lossy(&s)).unwrap_or(FactPrivacy::Global),
+        }
+    }
+
     fn row_to_episode(&self, row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Episode> {
         let topics_json: Option<String> = row.get("topics");
         let topics = topics_json.and_then(|j| serde_json::from_str(&j).ok());
@@ -630,6 +763,7 @@ impl SqliteStateStore {
         let end_str: String = row.get("end_time");
         let created_str: String = row.get("created_at");
         let last_recalled_str: Option<String> = row.get("last_recalled_at");
+        let channel_id: Option<String> = row.try_get("channel_id").unwrap_or(None);
 
         Ok(Episode {
             id: row.get("id"),
@@ -645,6 +779,7 @@ impl SqliteStateStore {
             start_time: chrono::DateTime::parse_from_rfc3339(&start_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
             end_time: chrono::DateTime::parse_from_rfc3339(&end_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
             created_at: chrono::DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+            channel_id,
         })
     }
 
@@ -690,7 +825,6 @@ impl SqliteStateStore {
     }
 
     /// Update goal status and optionally add a progress note.
-    #[allow(dead_code)]
     pub async fn update_goal(&self, goal_id: i64, status: Option<&str>, progress_note: Option<&str>) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
 
@@ -745,11 +879,10 @@ impl SqliteStateStore {
         let mut best_match: Option<(usize, f32)> = None;
         for (i, emb) in goal_embeddings.iter().enumerate() {
             let score = crate::memory::math::cosine_similarity(&query_vec, emb);
-            if score > 0.75 {
-                if best_match.is_none() || score > best_match.unwrap().1 {
+            if score > 0.75
+                && (best_match.is_none() || score > best_match.unwrap().1) {
                     best_match = Some((i, score));
                 }
-            }
         }
 
         Ok(best_match.map(|(i, _)| goals[i].clone()))
@@ -984,7 +1117,7 @@ impl SqliteStateStore {
             let procedure = self.row_to_procedure(&row)?;
 
             let score = if let Some(blob) = embedding {
-                if let Ok(vec) = serde_json::from_slice::<Vec<f32>>(&blob) {
+                if let Ok(vec) = decode_embedding(&blob) {
                     crate::memory::math::cosine_similarity(&query_vec, &vec)
                 } else {
                     0.0
@@ -1285,7 +1418,7 @@ impl SqliteStateStore {
             let solution = self.row_to_error_solution(&row)?;
 
             let score = if let Some(blob) = embedding {
-                if let Ok(vec) = serde_json::from_slice::<Vec<f32>>(&blob) {
+                if let Ok(vec) = decode_embedding(&blob) {
                     crate::memory::math::cosine_similarity(&query_vec, &vec)
                 } else {
                     0.0
@@ -1382,23 +1515,7 @@ impl SqliteStateStore {
 
     #[allow(dead_code)]
     fn row_to_fact_with_history(&self, row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Fact> {
-        let created_str: String = row.get("created_at");
-        let updated_str: String = row.get("updated_at");
-        let superseded_str: Option<String> = row.get("superseded_at");
-        let last_recalled_str: Option<String> = row.get("last_recalled_at");
-
-        Ok(Fact {
-            id: row.get("id"),
-            category: row.get("category"),
-            key: row.get("key"),
-            value: row.get("value"),
-            source: row.get("source"),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-            superseded_at: superseded_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-            recall_count: row.try_get("recall_count").unwrap_or(0),
-            last_recalled_at: last_recalled_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-        })
+        Ok(Self::row_to_fact(row))
     }
 }
 
@@ -1419,11 +1536,7 @@ impl StateStore for SqliteStateStore {
         .bind(&msg.tool_calls_json)
         .bind(msg.created_at.to_rfc3339())
         .bind(msg.importance)
-        .bind(msg.embedding.as_ref().map(|v| {
-            // Convert Vec<f32> to Vec<u8> (naive)
-            // For now, let's just use JSON for safety/portability if we aren't using sqlite-vec yet
-            serde_json::to_vec(v).unwrap_or_default()
-        }))
+        .bind(msg.embedding.as_ref().map(|v| encode_embedding(v)))
         .execute(&self.pool)
         .await?;
 
@@ -1544,12 +1657,30 @@ impl StateStore for SqliteStateStore {
         Ok(result)
     }
 
-    async fn upsert_fact(&self, category: &str, key: &str, value: &str, source: &str) -> anyhow::Result<()> {
+    async fn upsert_fact(
+        &self,
+        category: &str,
+        key: &str,
+        value: &str,
+        source: &str,
+        channel_id: Option<&str>,
+        privacy: FactPrivacy,
+    ) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
+        let privacy_str = privacy.to_string();
+
+        // Pre-compute embedding for the fact text
+        let fact_text = format!("[{}] {}: {}", category, key, value);
+        let embedding_blob = self
+            .embedding_service
+            .embed(fact_text)
+            .await
+            .ok()
+            .map(|v| encode_embedding(&v));
 
         // Find existing current fact (not superseded)
         let existing = sqlx::query(
-            "SELECT id, value FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL"
+            "SELECT id, value FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL",
         )
         .bind(category)
         .bind(key)
@@ -1568,10 +1699,10 @@ impl StateStore for SqliteStateStore {
                     .execute(&self.pool)
                     .await?;
 
-                // Insert new fact
+                // Insert new fact with embedding
                 sqlx::query(
-                    "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count)
-                     VALUES (?, ?, ?, ?, ?, ?, 0)"
+                    "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy, embedding)
+                     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                 )
                 .bind(category)
                 .bind(key)
@@ -1579,22 +1710,28 @@ impl StateStore for SqliteStateStore {
                 .bind(source)
                 .bind(&now)
                 .bind(&now)
+                .bind(channel_id)
+                .bind(&privacy_str)
+                .bind(&embedding_blob)
                 .execute(&self.pool)
                 .await?;
             } else {
-                // Same value - just update the timestamp and source
-                sqlx::query("UPDATE facts SET source = ?, updated_at = ? WHERE id = ?")
-                    .bind(source)
-                    .bind(&now)
-                    .bind(old_id)
-                    .execute(&self.pool)
-                    .await?;
+                // Same value - update timestamp/source and backfill embedding if missing
+                sqlx::query(
+                    "UPDATE facts SET source = ?, updated_at = ?, embedding = COALESCE(embedding, ?) WHERE id = ?",
+                )
+                .bind(source)
+                .bind(&now)
+                .bind(&embedding_blob)
+                .bind(old_id)
+                .execute(&self.pool)
+                .await?;
             }
         } else {
-            // No existing fact - insert new
+            // No existing fact - insert new with embedding
             sqlx::query(
-                "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count)
-                 VALUES (?, ?, ?, ?, ?, ?, 0)"
+                "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy, embedding)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
             )
             .bind(category)
             .bind(key)
@@ -1602,6 +1739,9 @@ impl StateStore for SqliteStateStore {
             .bind(source)
             .bind(&now)
             .bind(&now)
+            .bind(channel_id)
+            .bind(&privacy_str)
+            .bind(&embedding_blob)
             .execute(&self.pool)
             .await?;
         }
@@ -1611,48 +1751,34 @@ impl StateStore for SqliteStateStore {
     async fn get_facts(&self, category: Option<&str>) -> anyhow::Result<Vec<Fact>> {
         // Only return current (non-superseded) facts
         let rows = if let Some(cat) = category {
-            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at FROM facts WHERE category = ? AND superseded_at IS NULL ORDER BY updated_at DESC")
+            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy FROM facts WHERE category = ? AND superseded_at IS NULL ORDER BY updated_at DESC")
                 .bind(cat)
                 .fetch_all(&self.pool)
                 .await?
         } else {
-            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC")
+            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC")
                 .fetch_all(&self.pool)
                 .await?
         };
 
         let mut facts = Vec::with_capacity(rows.len());
         for row in rows {
-            let created_str: String = row.get("created_at");
-            let updated_str: String = row.get("updated_at");
-            let superseded_str: Option<String> = row.get("superseded_at");
-            let last_recalled_str: Option<String> = row.get("last_recalled_at");
-
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-
-            facts.push(Fact {
-                id: row.get("id"),
-                category: row.get("category"),
-                key: row.get("key"),
-                value: row.get("value"),
-                source: row.get("source"),
-                created_at,
-                updated_at,
-                superseded_at: superseded_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-                recall_count: row.try_get("recall_count").unwrap_or(0),
-                last_recalled_at: last_recalled_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-            });
+            facts.push(Self::row_to_fact(&row));
         }
         Ok(facts)
     }
 
     async fn get_relevant_facts(&self, query: &str, max: usize) -> anyhow::Result<Vec<Fact>> {
-        let all_facts = self.get_facts(None).await?;
+        // Load facts with stored embeddings
+        let rows = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding
+             FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let all_facts: Vec<Fact> = rows.iter().map(Self::row_to_fact).collect();
+
         if all_facts.is_empty() || query.trim().is_empty() {
             let mut facts = all_facts;
             facts.truncate(max);
@@ -1670,52 +1796,51 @@ impl StateStore for SqliteStateStore {
             }
         };
 
-        // Embed each fact's combined text and score by similarity
-        let fact_texts: Vec<String> = all_facts
-            .iter()
-            .map(|f| format!("[{}] {}: {}", f.category, f.key, f.value))
-            .collect();
-
-        let fact_embeddings = match self.embedding_service.embed_batch(fact_texts).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Failed to embed facts for filtering, returning all facts: {}", e);
-                let mut facts = all_facts;
-                facts.truncate(max);
-                return Ok(facts);
+        // Score facts using stored embeddings
+        let mut scored: Vec<(usize, f32)> = Vec::new();
+        let mut unscored: Vec<usize> = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            let embedding: Option<Vec<u8>> = row.get("embedding");
+            if let Some(blob) = embedding {
+                if let Ok(vec) = decode_embedding(&blob) {
+                    let score = crate::memory::math::cosine_similarity(&query_vec, &vec);
+                    scored.push((i, score));
+                    continue;
+                }
             }
-        };
-
-        // Score and sort by relevance
-        let mut scored: Vec<(usize, f32)> = fact_embeddings
-            .iter()
-            .enumerate()
-            .map(|(i, emb)| (i, crate::memory::math::cosine_similarity(&query_vec, emb)))
-            .collect();
+            // Facts without embeddings (during backfill) are included without scoring
+            unscored.push(i);
+        }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Take top `max` facts that are above a minimum relevance threshold (0.3)
-        // Low threshold because we still want loosely related facts, just not completely irrelevant ones
-        let relevant: Vec<Fact> = scored
+        // Take top `max` facts that are above a minimum relevance threshold
+        let mut relevant: Vec<Fact> = scored
             .into_iter()
-            .filter(|(_, score)| *score > 0.3)
+            .filter(|(_, score)| *score > 0.5)
             .take(max)
             .map(|(i, _)| all_facts[i].clone())
             .collect();
 
+        // Include unscored facts (missing embeddings) to avoid dropping them
+        for i in unscored {
+            if relevant.len() >= max {
+                break;
+            }
+            relevant.push(all_facts[i].clone());
+        }
+
         // If filtering left us with very few facts, pad with most recent ones
-        if relevant.len() < max / 2 && all_facts.len() > relevant.len() {
-            let mut result = relevant;
-            let existing_ids: std::collections::HashSet<i64> = result.iter().map(|f| f.id).collect();
+        if relevant.len() < max / 3 && all_facts.len() > relevant.len() {
+            let existing_ids: std::collections::HashSet<i64> =
+                relevant.iter().map(|f| f.id).collect();
             for fact in &all_facts {
-                if result.len() >= max {
+                if relevant.len() >= max {
                     break;
                 }
                 if !existing_ids.contains(&fact.id) {
-                    result.push(fact.clone());
+                    relevant.push(fact.clone());
                 }
             }
-            return Ok(result);
         }
 
         Ok(relevant)
@@ -1819,7 +1944,7 @@ impl StateStore for SqliteStateStore {
                     let embedding: Option<Vec<u8>> = row.get("embedding");
                     
                     if let Some(blob) = embedding {
-                        if let Ok(vec) = serde_json::from_slice::<Vec<f32>>(&blob) {
+                        if let Ok(vec) = decode_embedding(&blob) {
                             let score = crate::memory::math::cosine_similarity(&query_vec, &vec);
                             if score > 0.65 { // Relevance threshold
                                 scored.push((id, score));
@@ -1939,6 +2064,10 @@ impl StateStore for SqliteStateStore {
         SqliteStateStore::get_active_goals(self).await
     }
 
+    async fn update_goal(&self, goal_id: i64, status: Option<&str>, progress_note: Option<&str>) -> anyhow::Result<()> {
+        SqliteStateStore::update_goal(self, goal_id, status, progress_note).await
+    }
+
     async fn get_behavior_patterns(&self, min_confidence: f32) -> anyhow::Result<Vec<BehaviorPattern>> {
         SqliteStateStore::get_behavior_patterns(self, min_confidence).await
     }
@@ -1961,6 +2090,266 @@ impl StateStore for SqliteStateStore {
 
     async fn get_trusted_command_patterns(&self) -> anyhow::Result<Vec<(String, i32)>> {
         SqliteStateStore::get_trusted_command_patterns(self).await
+    }
+
+    // ==================== Channel-Scoped Memory Methods ====================
+
+    async fn get_relevant_facts_for_channel(
+        &self,
+        query: &str,
+        max: usize,
+        channel_id: Option<&str>,
+        visibility: ChannelVisibility,
+    ) -> anyhow::Result<Vec<Fact>> {
+        // In DM/Internal contexts, return all facts (existing behavior)
+        if matches!(
+            visibility,
+            ChannelVisibility::Private | ChannelVisibility::Internal
+        ) {
+            return self.get_relevant_facts(query, max).await;
+        }
+
+        // PublicExternal: only same-channel facts + sanitized global facts
+        // Public/PrivateGroup: global + same-channel facts (no private, no other-channel)
+        let rows = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding
+             FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Build facts and track which indices pass the privacy filter
+        let all_facts: Vec<Fact> = rows.iter().map(Self::row_to_fact).collect();
+        let filtered_indices: Vec<usize> = all_facts
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| match f.privacy {
+                FactPrivacy::Private => false,
+                FactPrivacy::Global => {
+                    if matches!(visibility, ChannelVisibility::PublicExternal) {
+                        !matches!(f.category.as_str(), "personal" | "health" | "finance")
+                    } else {
+                        true
+                    }
+                }
+                FactPrivacy::Channel => match (channel_id, &f.channel_id) {
+                    (Some(current), Some(fact_ch)) => current == fact_ch,
+                    (None, None) => true,
+                    _ => false,
+                },
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let filtered: Vec<Fact> = filtered_indices
+            .iter()
+            .map(|&i| all_facts[i].clone())
+            .collect();
+
+        if filtered.is_empty() || query.trim().is_empty() {
+            let mut facts = filtered;
+            facts.truncate(max);
+            return Ok(facts);
+        }
+
+        // Apply semantic filtering using stored embeddings
+        let query_vec = match self.embedding_service.embed(query.to_string()).await {
+            Ok(v) => v,
+            Err(_) => {
+                let mut facts = filtered;
+                facts.truncate(max);
+                return Ok(facts);
+            }
+        };
+
+        let mut scored: Vec<(usize, f32)> = Vec::new();
+        let mut unscored: Vec<usize> = Vec::new();
+        for (fi, &ri) in filtered_indices.iter().enumerate() {
+            let embedding: Option<Vec<u8>> = rows[ri].get("embedding");
+            if let Some(blob) = embedding {
+                if let Ok(vec) = decode_embedding(&blob) {
+                    let score = crate::memory::math::cosine_similarity(&query_vec, &vec);
+                    scored.push((fi, score));
+                    continue;
+                }
+            }
+            unscored.push(fi);
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut relevant: Vec<Fact> = scored
+            .into_iter()
+            .filter(|(_, score)| *score > 0.5)
+            .take(max)
+            .map(|(i, _)| filtered[i].clone())
+            .collect();
+
+        for i in unscored {
+            if relevant.len() >= max {
+                break;
+            }
+            relevant.push(filtered[i].clone());
+        }
+
+        if relevant.len() < max / 3 && filtered.len() > relevant.len() {
+            let existing_ids: std::collections::HashSet<i64> =
+                relevant.iter().map(|f| f.id).collect();
+            for fact in &filtered {
+                if relevant.len() >= max {
+                    break;
+                }
+                if !existing_ids.contains(&fact.id) {
+                    relevant.push(fact.clone());
+                }
+            }
+        }
+
+        Ok(relevant)
+    }
+
+    async fn get_cross_channel_hints(
+        &self,
+        query: &str,
+        current_channel_id: &str,
+        max: usize,
+    ) -> anyhow::Result<Vec<Fact>> {
+        // Get channel-scoped facts from OTHER channels that are relevant to the query
+        let rows = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding
+             FROM facts
+             WHERE superseded_at IS NULL
+               AND privacy = 'channel'
+               AND channel_id IS NOT NULL
+               AND channel_id != ?
+             ORDER BY updated_at DESC",
+        )
+        .bind(current_channel_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() || query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        let facts: Vec<Fact> = rows.iter().map(Self::row_to_fact).collect();
+
+        // Apply semantic filtering using stored embeddings
+        let query_vec = match self.embedding_service.embed(query.to_string()).await {
+            Ok(v) => v,
+            Err(_) => return Ok(vec![]),
+        };
+
+        let mut scored: Vec<(usize, f32)> = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            let embedding: Option<Vec<u8>> = row.get("embedding");
+            if let Some(blob) = embedding {
+                if let Ok(vec) = decode_embedding(&blob) {
+                    let score = crate::memory::math::cosine_similarity(&query_vec, &vec);
+                    scored.push((i, score));
+                }
+            }
+            // Facts without embeddings are skipped for cross-channel hints (conservative)
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let hints: Vec<Fact> = scored
+            .into_iter()
+            .filter(|(_, score)| *score > 0.6) // Higher threshold for cross-channel hints
+            .take(max)
+            .map(|(i, _)| facts[i].clone())
+            .collect();
+
+        Ok(hints)
+    }
+
+    async fn update_fact_privacy(&self, fact_id: i64, privacy: FactPrivacy) -> anyhow::Result<()> {
+        sqlx::query("UPDATE facts SET privacy = ? WHERE id = ?")
+            .bind(privacy.to_string())
+            .bind(fact_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_fact(&self, fact_id: i64) -> anyhow::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(fact_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_all_facts_with_provenance(&self) -> anyhow::Result<Vec<Fact>> {
+        let rows = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy
+             FROM facts WHERE superseded_at IS NULL ORDER BY category, key"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_fact).collect())
+    }
+
+    async fn get_relevant_episodes_for_channel(
+        &self,
+        query: &str,
+        limit: usize,
+        channel_id: Option<&str>,
+    ) -> anyhow::Result<Vec<Episode>> {
+        // For channel-scoped episode retrieval, filter episodes by channel_id
+        // Episodes without channel_id (legacy) are accessible everywhere
+        let rows = sqlx::query(
+            "SELECT id, session_id, summary, topics, emotional_tone, outcome, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at, channel_id, embedding
+             FROM episodes WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 500"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() || query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        let query_vec = match self.embedding_service.embed(query.to_string()).await {
+            Ok(v) => v,
+            Err(_) => return Ok(vec![]),
+        };
+
+        let mut scored: Vec<(Episode, f32)> = Vec::new();
+        for row in rows {
+            // Filter by channel: include episodes from same channel or legacy (no channel_id)
+            let ep_channel_id: Option<String> = row.try_get("channel_id").unwrap_or(None);
+            let include = match (&ep_channel_id, channel_id) {
+                (None, _) => true,                                 // Legacy episodes: include
+                (Some(ep_ch), Some(current_ch)) => ep_ch == current_ch, // Same channel
+                (Some(_), None) => false,                          // Has channel but no current: skip
+            };
+            if !include {
+                continue;
+            }
+
+            let embedding: Option<Vec<u8>> = row.get("embedding");
+            if let Some(blob) = embedding {
+                if let Ok(vec) = decode_embedding(&blob) {
+                    let similarity = crate::memory::math::cosine_similarity(&query_vec, &vec);
+                    let episode = self.row_to_episode(&row)?;
+                    let score = crate::memory::scoring::memory_score(
+                        similarity,
+                        episode.created_at,
+                        episode.recall_count,
+                        episode.last_recalled_at,
+                    );
+                    if score > 0.5 {
+                        scored.push((episode, score));
+                    }
+                }
+            }
+        }
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let episodes: Vec<Episode> = scored.into_iter().take(limit).map(|(e, _)| e).collect();
+        Ok(episodes)
     }
 
     // ==================== Write Methods for Learning System ====================
@@ -2041,8 +2430,8 @@ impl StateStore for SqliteStateStore {
 
     async fn add_dynamic_skill(&self, skill: &crate::traits::DynamicSkill) -> anyhow::Result<i64> {
         let result = sqlx::query(
-            "INSERT INTO dynamic_skills (name, description, triggers_json, body, source, source_url, enabled, version, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"
+            "INSERT INTO dynamic_skills (name, description, triggers_json, body, source, source_url, enabled, version, resources_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"
         )
         .bind(&skill.name)
         .bind(&skill.description)
@@ -2052,6 +2441,7 @@ impl StateStore for SqliteStateStore {
         .bind(&skill.source_url)
         .bind(skill.enabled)
         .bind(&skill.version)
+        .bind(&skill.resources_json)
         .execute(&self.pool)
         .await?;
         Ok(result.last_insert_rowid())
@@ -2059,7 +2449,7 @@ impl StateStore for SqliteStateStore {
 
     async fn get_dynamic_skills(&self) -> anyhow::Result<Vec<crate::traits::DynamicSkill>> {
         let rows = sqlx::query(
-            "SELECT id, name, description, triggers_json, body, source, source_url, enabled, version, created_at
+            "SELECT id, name, description, triggers_json, body, source, source_url, enabled, version, resources_json, created_at
              FROM dynamic_skills ORDER BY created_at ASC"
         )
         .fetch_all(&self.pool)
@@ -2078,6 +2468,7 @@ impl StateStore for SqliteStateStore {
                 enabled: row.get::<bool, _>("enabled"),
                 version: row.get::<Option<String>, _>("version"),
                 created_at: row.get::<String, _>("created_at"),
+                resources_json: row.try_get::<String, _>("resources_json").unwrap_or_else(|_| "[]".to_string()),
             });
         }
         Ok(skills)
@@ -2149,5 +2540,1058 @@ impl StateStore for SqliteStateStore {
             });
         }
         Ok(procedures)
+    }
+
+    // ==================== Dynamic MCP Servers ====================
+
+    async fn save_dynamic_mcp_server(&self, server: &crate::traits::DynamicMcpServer) -> anyhow::Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO dynamic_mcp_servers (name, command, args_json, env_keys_json, triggers_json, enabled, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET command=excluded.command, args_json=excluded.args_json,
+             env_keys_json=excluded.env_keys_json, triggers_json=excluded.triggers_json, enabled=excluded.enabled"
+        )
+        .bind(&server.name)
+        .bind(&server.command)
+        .bind(&server.args_json)
+        .bind(&server.env_keys_json)
+        .bind(&server.triggers_json)
+        .bind(server.enabled)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    async fn list_dynamic_mcp_servers(&self) -> anyhow::Result<Vec<crate::traits::DynamicMcpServer>> {
+        let rows = sqlx::query(
+            "SELECT id, name, command, args_json, env_keys_json, triggers_json, enabled, created_at
+             FROM dynamic_mcp_servers ORDER BY created_at ASC"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut servers = Vec::new();
+        for row in rows {
+            servers.push(crate::traits::DynamicMcpServer {
+                id: row.get::<i64, _>("id"),
+                name: row.get::<String, _>("name"),
+                command: row.get::<String, _>("command"),
+                args_json: row.get::<String, _>("args_json"),
+                env_keys_json: row.get::<String, _>("env_keys_json"),
+                triggers_json: row.get::<String, _>("triggers_json"),
+                enabled: row.get::<bool, _>("enabled"),
+                created_at: row.get::<String, _>("created_at"),
+            });
+        }
+        Ok(servers)
+    }
+
+    async fn delete_dynamic_mcp_server(&self, id: i64) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM dynamic_mcp_servers WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_dynamic_mcp_server(&self, server: &crate::traits::DynamicMcpServer) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE dynamic_mcp_servers SET command = ?, args_json = ?, env_keys_json = ?, triggers_json = ?, enabled = ? WHERE id = ?"
+        )
+        .bind(&server.command)
+        .bind(&server.args_json)
+        .bind(&server.env_keys_json)
+        .bind(&server.triggers_json)
+        .bind(server.enabled)
+        .bind(server.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::traits::{
+        BehaviorPattern, DynamicBot, DynamicMcpServer, DynamicSkill, Episode, ErrorSolution, Goal,
+        Message, Procedure, StateStore, TokenUsage,
+    };
+    use crate::types::FactPrivacy;
+    use std::sync::Arc;
+
+    async fn setup_test_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let store = SqliteStateStore::new(
+            db_file.path().to_str().unwrap(),
+            100,
+            None,
+            embedding_service,
+        )
+        .await
+        .unwrap();
+        (store, db_file)
+    }
+
+    async fn setup_test_store_with_cap(cap: usize) -> (SqliteStateStore, tempfile::NamedTempFile) {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let store = SqliteStateStore::new(
+            db_file.path().to_str().unwrap(),
+            cap,
+            None,
+            embedding_service,
+        )
+        .await
+        .unwrap();
+        (store, db_file)
+    }
+
+    fn make_message(session_id: &str, role: &str, content: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.5,
+            embedding: None,
+        }
+    }
+
+    // ==================== Message Tests ====================
+
+    #[tokio::test]
+    async fn test_append_and_get_history() {
+        let (store, _db) = setup_test_store().await;
+        let session = "sess-1";
+
+        let m1 = make_message(session, "user", "Hello");
+        let m2 = make_message(session, "assistant", "Hi there");
+        let m3 = make_message(session, "user", "How are you?");
+
+        store.append_message(&m1).await.unwrap();
+        store.append_message(&m2).await.unwrap();
+        store.append_message(&m3).await.unwrap();
+
+        let history = store.get_history(session, 100).await.unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].content.as_deref(), Some("Hello"));
+        assert_eq!(history[1].content.as_deref(), Some("Hi there"));
+        assert_eq!(history[2].content.as_deref(), Some("How are you?"));
+    }
+
+    #[tokio::test]
+    async fn test_get_history_limit() {
+        let (store, _db) = setup_test_store().await;
+        let session = "sess-limit";
+
+        for i in 0..10 {
+            let msg = make_message(session, "user", &format!("Message {}", i));
+            store.append_message(&msg).await.unwrap();
+        }
+
+        let history = store.get_history(session, 5).await.unwrap();
+        assert_eq!(history.len(), 5);
+        // The truncate_with_anchor logic preserves the first user message,
+        // so the last message should be the most recent one
+        assert_eq!(history.last().unwrap().content.as_deref(), Some("Message 9"));
+    }
+
+    #[tokio::test]
+    async fn test_session_isolation() {
+        let (store, _db) = setup_test_store().await;
+
+        let m_a = make_message("session_a", "user", "From A");
+        let m_b = make_message("session_b", "user", "From B");
+
+        store.append_message(&m_a).await.unwrap();
+        store.append_message(&m_b).await.unwrap();
+
+        let history_a = store.get_history("session_a", 100).await.unwrap();
+        let history_b = store.get_history("session_b", 100).await.unwrap();
+
+        assert_eq!(history_a.len(), 1);
+        assert_eq!(history_b.len(), 1);
+        assert_eq!(history_a[0].content.as_deref(), Some("From A"));
+        assert_eq!(history_b[0].content.as_deref(), Some("From B"));
+    }
+
+    #[tokio::test]
+    async fn test_clear_session() {
+        let (store, _db) = setup_test_store().await;
+        let session = "sess-clear";
+
+        store
+            .append_message(&make_message(session, "user", "Hi"))
+            .await
+            .unwrap();
+        store
+            .append_message(&make_message(session, "assistant", "Hello"))
+            .await
+            .unwrap();
+
+        let before = store.get_history(session, 100).await.unwrap();
+        assert_eq!(before.len(), 2);
+
+        store.clear_session(session).await.unwrap();
+
+        let after = store.get_history(session, 100).await.unwrap();
+        assert_eq!(after.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_working_memory_cap() {
+        let (store, _db) = setup_test_store_with_cap(5).await;
+        let session = "sess-cap";
+
+        for i in 0..10 {
+            let msg = make_message(session, "user", &format!("Msg {}", i));
+            store.append_message(&msg).await.unwrap();
+        }
+
+        let history = store.get_history(session, 100).await.unwrap();
+        assert!(
+            history.len() <= 5,
+            "Expected <= 5 messages in working memory, got {}",
+            history.len()
+        );
+    }
+
+    // ==================== Fact Tests ====================
+
+    #[tokio::test]
+    async fn test_upsert_fact_insert() {
+        let (store, _db) = setup_test_store().await;
+
+        store
+            .upsert_fact(
+                "preference",
+                "language",
+                "Rust",
+                "user",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        let facts = store.get_facts(Some("preference")).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].category, "preference");
+        assert_eq!(facts[0].key, "language");
+        assert_eq!(facts[0].value, "Rust");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_fact_supersede() {
+        let (store, _db) = setup_test_store().await;
+
+        store
+            .upsert_fact(
+                "preference",
+                "editor",
+                "vim",
+                "user",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        // Upserting the same category/key with the same value should succeed
+        // (it updates timestamp/source rather than inserting a new row).
+        store
+            .upsert_fact(
+                "preference",
+                "editor",
+                "vim",
+                "observation",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        let facts = store.get_facts(Some("preference")).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].value, "vim");
+        // Source should be updated
+        assert_eq!(facts[0].source, "observation");
+    }
+
+    #[tokio::test]
+    async fn test_get_facts_by_category() {
+        let (store, _db) = setup_test_store().await;
+
+        store
+            .upsert_fact("pref", "color", "blue", "user", None, FactPrivacy::Global)
+            .await
+            .unwrap();
+        store
+            .upsert_fact("info", "name", "Alice", "user", None, FactPrivacy::Global)
+            .await
+            .unwrap();
+        store
+            .upsert_fact("pref", "food", "pizza", "user", None, FactPrivacy::Global)
+            .await
+            .unwrap();
+
+        let pref_facts = store.get_facts(Some("pref")).await.unwrap();
+        assert_eq!(pref_facts.len(), 2);
+        for f in &pref_facts {
+            assert_eq!(f.category, "pref");
+        }
+
+        let info_facts = store.get_facts(Some("info")).await.unwrap();
+        assert_eq!(info_facts.len(), 1);
+        assert_eq!(info_facts[0].key, "name");
+
+        let all_facts = store.get_facts(None).await.unwrap();
+        assert_eq!(all_facts.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_delete_fact_soft_delete() {
+        let (store, _db) = setup_test_store().await;
+
+        store
+            .upsert_fact(
+                "temp",
+                "item",
+                "delete-me",
+                "user",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        let facts = store.get_facts(Some("temp")).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        let fact_id = facts[0].id;
+
+        store.delete_fact(fact_id).await.unwrap();
+
+        let after = store.get_facts(Some("temp")).await.unwrap();
+        assert_eq!(after.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_increment_fact_recall() {
+        let (store, _db) = setup_test_store().await;
+
+        store
+            .upsert_fact(
+                "test",
+                "recall_key",
+                "recall_val",
+                "user",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        let facts = store.get_facts(Some("test")).await.unwrap();
+        let fact_id = facts[0].id;
+        assert_eq!(facts[0].recall_count, 0);
+        assert!(facts[0].last_recalled_at.is_none());
+
+        store.increment_fact_recall(fact_id).await.unwrap();
+        store.increment_fact_recall(fact_id).await.unwrap();
+
+        let updated = store.get_facts(Some("test")).await.unwrap();
+        assert_eq!(updated[0].recall_count, 2);
+        assert!(updated[0].last_recalled_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_fact_privacy_channel_scoped() {
+        let (store, _db) = setup_test_store().await;
+
+        store
+            .upsert_fact(
+                "context",
+                "project",
+                "aidaemon",
+                "user",
+                Some("slack:C12345"),
+                FactPrivacy::Channel,
+            )
+            .await
+            .unwrap();
+
+        let facts = store.get_facts(Some("context")).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].channel_id.as_deref(), Some("slack:C12345"));
+        assert_eq!(facts[0].privacy, FactPrivacy::Channel);
+    }
+
+    #[tokio::test]
+    async fn test_update_fact_privacy() {
+        let (store, _db) = setup_test_store().await;
+
+        store
+            .upsert_fact(
+                "secret",
+                "api_key_hint",
+                "starts with sk-",
+                "user",
+                Some("slack:C999"),
+                FactPrivacy::Channel,
+            )
+            .await
+            .unwrap();
+
+        let facts = store.get_facts(Some("secret")).await.unwrap();
+        assert_eq!(facts[0].privacy, FactPrivacy::Channel);
+        let fact_id = facts[0].id;
+
+        store
+            .update_fact_privacy(fact_id, FactPrivacy::Global)
+            .await
+            .unwrap();
+
+        let updated = store.get_facts(Some("secret")).await.unwrap();
+        assert_eq!(updated[0].privacy, FactPrivacy::Global);
+    }
+
+    // ==================== Episode Tests ====================
+
+    #[tokio::test]
+    async fn test_insert_and_get_episodes() {
+        let (store, _db) = setup_test_store().await;
+
+        let episode = Episode {
+            id: 0,
+            session_id: "ep-sess".to_string(),
+            summary: "We discussed Rust async patterns".to_string(),
+            topics: Some(vec!["rust".to_string(), "async".to_string()]),
+            emotional_tone: Some("curious".to_string()),
+            outcome: Some("learned tokio basics".to_string()),
+            importance: 0.8,
+            recall_count: 0,
+            last_recalled_at: None,
+            message_count: 12,
+            start_time: Utc::now() - chrono::Duration::hours(1),
+            end_time: Utc::now(),
+            created_at: Utc::now(),
+            channel_id: None,
+        };
+
+        let ep_id = store.insert_episode(&episode).await.unwrap();
+        assert!(ep_id > 0);
+
+        let episodes = store.get_recent_episodes(10).await.unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].summary, "We discussed Rust async patterns");
+        assert_eq!(episodes[0].message_count, 12);
+        assert_eq!(
+            episodes[0].topics,
+            Some(vec!["rust".to_string(), "async".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_increment_episode_recall() {
+        let (store, _db) = setup_test_store().await;
+
+        let episode = Episode {
+            id: 0,
+            session_id: "ep-recall".to_string(),
+            summary: "Recall test episode".to_string(),
+            topics: None,
+            emotional_tone: None,
+            outcome: None,
+            importance: 0.5,
+            recall_count: 0,
+            last_recalled_at: None,
+            message_count: 5,
+            start_time: Utc::now(),
+            end_time: Utc::now(),
+            created_at: Utc::now(),
+            channel_id: None,
+        };
+
+        let ep_id = store.insert_episode(&episode).await.unwrap();
+
+        store.increment_episode_recall(ep_id).await.unwrap();
+        store.increment_episode_recall(ep_id).await.unwrap();
+
+        let episodes = store.get_recent_episodes(10).await.unwrap();
+        assert_eq!(episodes[0].recall_count, 2);
+        assert!(episodes[0].last_recalled_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_backfill_episode_embeddings() {
+        let (store, _db) = setup_test_store().await;
+
+        let episode = Episode {
+            id: 0,
+            session_id: "ep-embed".to_string(),
+            summary: "An episode about machine learning".to_string(),
+            topics: None,
+            emotional_tone: None,
+            outcome: None,
+            importance: 0.5,
+            recall_count: 0,
+            last_recalled_at: None,
+            message_count: 3,
+            start_time: Utc::now(),
+            end_time: Utc::now(),
+            created_at: Utc::now(),
+            channel_id: None,
+        };
+
+        store.insert_episode(&episode).await.unwrap();
+
+        // Episodes are inserted without embeddings
+        let backfilled = store.backfill_episode_embeddings().await.unwrap();
+        assert_eq!(backfilled, 1);
+
+        // Running again should backfill 0 since all have embeddings now
+        let backfilled_again = store.backfill_episode_embeddings().await.unwrap();
+        assert_eq!(backfilled_again, 0);
+    }
+
+    // ==================== Goal Tests ====================
+
+    #[tokio::test]
+    async fn test_insert_and_get_active_goals() {
+        let (store, _db) = setup_test_store().await;
+
+        let goal = Goal {
+            id: 0,
+            description: "Learn Rust generics".to_string(),
+            status: "active".to_string(),
+            priority: "high".to_string(),
+            progress_notes: None,
+            source_episode_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let goal_id = store.insert_goal(&goal).await.unwrap();
+        assert!(goal_id > 0);
+
+        let active = store.get_active_goals().await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].description, "Learn Rust generics");
+        assert_eq!(active[0].status, "active");
+        assert_eq!(active[0].priority, "high");
+    }
+
+    #[tokio::test]
+    async fn test_update_goal_status() {
+        let (store, _db) = setup_test_store().await;
+
+        let goal = Goal {
+            id: 0,
+            description: "Finish project".to_string(),
+            status: "active".to_string(),
+            priority: "medium".to_string(),
+            progress_notes: None,
+            source_episode_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let goal_id = store.insert_goal(&goal).await.unwrap();
+
+        store
+            .update_goal(goal_id, Some("completed"), None)
+            .await
+            .unwrap();
+
+        let active = store.get_active_goals().await.unwrap();
+        assert_eq!(active.len(), 0, "Completed goal should not appear in active goals");
+    }
+
+    #[tokio::test]
+    async fn test_update_goal_progress_note() {
+        let (store, _db) = setup_test_store().await;
+
+        let goal = Goal {
+            id: 0,
+            description: "Write tests".to_string(),
+            status: "active".to_string(),
+            priority: "low".to_string(),
+            progress_notes: None,
+            source_episode_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let goal_id = store.insert_goal(&goal).await.unwrap();
+
+        store
+            .update_goal(goal_id, None, Some("Added 5 unit tests"))
+            .await
+            .unwrap();
+        store
+            .update_goal(goal_id, None, Some("Added 10 more tests"))
+            .await
+            .unwrap();
+
+        let goals = store.get_active_goals().await.unwrap();
+        assert_eq!(goals.len(), 1);
+        let notes = goals[0].progress_notes.as_ref().unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0], "Added 5 unit tests");
+        assert_eq!(notes[1], "Added 10 more tests");
+    }
+
+    // ==================== User Profile Tests ====================
+
+    #[tokio::test]
+    async fn test_default_user_profile() {
+        let (store, _db) = setup_test_store().await;
+
+        let profile = store.get_user_profile().await.unwrap();
+        assert_eq!(profile.verbosity_preference, "medium");
+        assert_eq!(profile.explanation_depth, "moderate");
+        assert_eq!(profile.tone_preference, "neutral");
+        assert_eq!(profile.emoji_preference, "none");
+        assert!(profile.asks_before_acting);
+        assert!(profile.prefers_explanations);
+        // likes_suggestions defaults to false in the code
+        assert!(!profile.likes_suggestions);
+    }
+
+    #[tokio::test]
+    async fn test_update_user_profile() {
+        let (store, _db) = setup_test_store().await;
+
+        // First call creates the default profile
+        let mut profile = store.get_user_profile().await.unwrap();
+
+        profile.verbosity_preference = "brief".to_string();
+        profile.tone_preference = "casual".to_string();
+        profile.emoji_preference = "frequent".to_string();
+        profile.asks_before_acting = false;
+
+        store.update_user_profile(&profile).await.unwrap();
+
+        let updated = store.get_user_profile().await.unwrap();
+        assert_eq!(updated.verbosity_preference, "brief");
+        assert_eq!(updated.tone_preference, "casual");
+        assert_eq!(updated.emoji_preference, "frequent");
+        assert!(!updated.asks_before_acting);
+        // Unchanged fields should remain
+        assert_eq!(updated.explanation_depth, "moderate");
+        assert!(updated.prefers_explanations);
+    }
+
+    // ==================== Behavior Pattern Tests ====================
+
+    #[tokio::test]
+    async fn test_insert_and_get_behavior_patterns() {
+        let (store, _db) = setup_test_store().await;
+
+        let pattern = BehaviorPattern {
+            id: 0,
+            pattern_type: "habit".to_string(),
+            description: "Always runs tests after code changes".to_string(),
+            trigger_context: Some("code modification".to_string()),
+            action: Some("cargo test".to_string()),
+            confidence: 0.7,
+            occurrence_count: 3,
+            last_seen_at: Some(Utc::now()),
+            created_at: Utc::now(),
+        };
+
+        let pat_id = store.insert_behavior_pattern(&pattern).await.unwrap();
+        assert!(pat_id > 0);
+
+        let patterns = store.get_behavior_patterns(0.5).await.unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(
+            patterns[0].description,
+            "Always runs tests after code changes"
+        );
+        assert_eq!(patterns[0].confidence, 0.7);
+        assert_eq!(patterns[0].occurrence_count, 3);
+
+        // With a higher min_confidence threshold, it should not be returned
+        let filtered = store.get_behavior_patterns(0.9).await.unwrap();
+        assert_eq!(filtered.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_behavior_pattern_confidence() {
+        let (store, _db) = setup_test_store().await;
+
+        let pattern = BehaviorPattern {
+            id: 0,
+            pattern_type: "trigger".to_string(),
+            description: "Checks git status before committing".to_string(),
+            trigger_context: None,
+            action: None,
+            confidence: 0.5,
+            occurrence_count: 1,
+            last_seen_at: None,
+            created_at: Utc::now(),
+        };
+
+        let pat_id = store.insert_behavior_pattern(&pattern).await.unwrap();
+
+        store.update_behavior_pattern(pat_id, 0.1).await.unwrap();
+
+        let patterns = store.get_behavior_patterns(0.0).await.unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].occurrence_count, 2);
+        assert!((patterns[0].confidence - 0.6).abs() < 0.01);
+        assert!(patterns[0].last_seen_at.is_some());
+    }
+
+    // ==================== Procedure Tests ====================
+
+    #[tokio::test]
+    async fn test_insert_and_get_procedures() {
+        let (store, _db) = setup_test_store().await;
+
+        let procedure = Procedure {
+            id: 0,
+            name: "deploy-app".to_string(),
+            trigger_pattern: "deploy the application".to_string(),
+            steps: vec![
+                "cargo build --release".to_string(),
+                "scp target/release/app server:".to_string(),
+                "ssh server systemctl restart app".to_string(),
+            ],
+            success_count: 1,
+            failure_count: 0,
+            avg_duration_secs: Some(30.0),
+            last_used_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let proc_id = store.upsert_procedure(&procedure).await.unwrap();
+        assert!(proc_id > 0);
+
+        let procs = store
+            .get_relevant_procedures("deploy", 10)
+            .await
+            .unwrap();
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].name, "deploy-app");
+        assert_eq!(procs[0].steps.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_procedure_success_count_increments() {
+        let (store, _db) = setup_test_store().await;
+
+        let procedure = Procedure {
+            id: 0,
+            name: "run-tests".to_string(),
+            trigger_pattern: "run the test suite".to_string(),
+            steps: vec!["cargo test".to_string()],
+            success_count: 1,
+            failure_count: 0,
+            avg_duration_secs: None,
+            last_used_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        store.upsert_procedure(&procedure).await.unwrap();
+
+        // Upsert again with the same name triggers ON CONFLICT DO UPDATE
+        // which increments success_count
+        store.upsert_procedure(&procedure).await.unwrap();
+
+        let procs = store
+            .get_relevant_procedures("test", 10)
+            .await
+            .unwrap();
+        assert_eq!(procs.len(), 1);
+        assert!(
+            procs[0].success_count >= 2,
+            "Expected success_count >= 2 after upsert conflict, got {}",
+            procs[0].success_count
+        );
+    }
+
+    // ==================== Error Solution Tests ====================
+
+    #[tokio::test]
+    async fn test_insert_and_get_error_solutions() {
+        let (store, _db) = setup_test_store().await;
+
+        let solution = ErrorSolution {
+            id: 0,
+            error_pattern: "connection refused on port 5432".to_string(),
+            domain: Some("database".to_string()),
+            solution_summary: "Start the PostgreSQL service".to_string(),
+            solution_steps: Some(vec![
+                "sudo systemctl start postgresql".to_string(),
+                "verify with pg_isready".to_string(),
+            ]),
+            success_count: 1,
+            failure_count: 0,
+            last_used_at: None,
+            created_at: Utc::now(),
+        };
+
+        let sol_id = store.insert_error_solution(&solution).await.unwrap();
+        assert!(sol_id > 0);
+
+        let solutions = store
+            .get_relevant_error_solutions("connection refused", 10)
+            .await
+            .unwrap();
+        assert_eq!(solutions.len(), 1);
+        assert_eq!(solutions[0].solution_summary, "Start the PostgreSQL service");
+        assert_eq!(solutions[0].domain.as_deref(), Some("database"));
+    }
+
+    #[tokio::test]
+    async fn test_update_error_solution_outcome() {
+        let (store, _db) = setup_test_store().await;
+
+        let solution = ErrorSolution {
+            id: 0,
+            error_pattern: "file not found".to_string(),
+            domain: None,
+            solution_summary: "Check the file path".to_string(),
+            solution_steps: None,
+            success_count: 0,
+            failure_count: 0,
+            last_used_at: None,
+            created_at: Utc::now(),
+        };
+
+        let sol_id = store.insert_error_solution(&solution).await.unwrap();
+
+        // Record a success
+        store.update_error_solution(sol_id, true).await.unwrap();
+        // Record a failure
+        store.update_error_solution(sol_id, false).await.unwrap();
+        // Record another success
+        store.update_error_solution(sol_id, true).await.unwrap();
+
+        let solutions = store
+            .get_relevant_error_solutions("file not found", 10)
+            .await
+            .unwrap();
+        assert_eq!(solutions.len(), 1);
+        assert_eq!(solutions[0].success_count, 2);
+        assert_eq!(solutions[0].failure_count, 1);
+    }
+
+    // ==================== Token Usage Tests ====================
+
+    #[tokio::test]
+    async fn test_record_and_get_token_usage() {
+        let (store, _db) = setup_test_store().await;
+
+        let usage = TokenUsage {
+            model: "gpt-4".to_string(),
+            input_tokens: 100,
+            output_tokens: 50,
+        };
+
+        store
+            .record_token_usage("token-sess", &usage)
+            .await
+            .unwrap();
+
+        // Use a date in the past to capture all records
+        let records = store
+            .get_token_usage_since("2000-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].model, "gpt-4");
+        assert_eq!(records[0].input_tokens, 100);
+        assert_eq!(records[0].output_tokens, 50);
+    }
+
+    #[tokio::test]
+    async fn test_token_usage_since_filter() {
+        let (store, _db) = setup_test_store().await;
+
+        let usage1 = TokenUsage {
+            model: "gpt-4".to_string(),
+            input_tokens: 100,
+            output_tokens: 50,
+        };
+        let usage2 = TokenUsage {
+            model: "gpt-3.5".to_string(),
+            input_tokens: 200,
+            output_tokens: 80,
+        };
+
+        store
+            .record_token_usage("sess-1", &usage1)
+            .await
+            .unwrap();
+        store
+            .record_token_usage("sess-2", &usage2)
+            .await
+            .unwrap();
+
+        // A far-past date should return all records
+        let all = store
+            .get_token_usage_since("2000-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        // A far-future date should return no records
+        let none = store
+            .get_token_usage_since("2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(none.len(), 0);
+    }
+
+    // ==================== Dynamic Bot Tests ====================
+
+    #[tokio::test]
+    async fn test_dynamic_bots_crud() {
+        let (store, _db) = setup_test_store().await;
+
+        let bot = DynamicBot {
+            id: 0,
+            channel_type: "telegram".to_string(),
+            bot_token: "123456:ABC".to_string(),
+            app_token: None,
+            allowed_user_ids: vec!["user1".to_string(), "user2".to_string()],
+            extra_config: "{}".to_string(),
+            created_at: String::new(),
+        };
+
+        // Add
+        let bot_id = store.add_dynamic_bot(&bot).await.unwrap();
+        assert!(bot_id > 0);
+
+        // List
+        let bots = store.get_dynamic_bots().await.unwrap();
+        assert_eq!(bots.len(), 1);
+        assert_eq!(bots[0].channel_type, "telegram");
+        assert_eq!(bots[0].bot_token, "123456:ABC");
+        assert_eq!(bots[0].allowed_user_ids.len(), 2);
+
+        // Delete
+        store.delete_dynamic_bot(bot_id).await.unwrap();
+
+        let after = store.get_dynamic_bots().await.unwrap();
+        assert_eq!(after.len(), 0);
+    }
+
+    // ==================== Dynamic Skill Tests ====================
+
+    #[tokio::test]
+    async fn test_dynamic_skills_crud() {
+        let (store, _db) = setup_test_store().await;
+
+        let skill = DynamicSkill {
+            id: 0,
+            name: "code-review".to_string(),
+            description: "Review code for best practices".to_string(),
+            triggers_json: r#"["review","code review"]"#.to_string(),
+            body: "# Code Review\nCheck for...\n".to_string(),
+            source: "inline".to_string(),
+            source_url: None,
+            enabled: true,
+            version: Some("1.0".to_string()),
+            created_at: String::new(),
+            resources_json: "[]".to_string(),
+        };
+
+        // Add
+        let skill_id = store.add_dynamic_skill(&skill).await.unwrap();
+        assert!(skill_id > 0);
+
+        // List
+        let skills = store.get_dynamic_skills().await.unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "code-review");
+        assert!(skills[0].enabled);
+
+        // Disable
+        store
+            .update_dynamic_skill_enabled(skill_id, false)
+            .await
+            .unwrap();
+        let skills = store.get_dynamic_skills().await.unwrap();
+        assert!(!skills[0].enabled);
+
+        // Re-enable
+        store
+            .update_dynamic_skill_enabled(skill_id, true)
+            .await
+            .unwrap();
+        let skills = store.get_dynamic_skills().await.unwrap();
+        assert!(skills[0].enabled);
+
+        // Delete
+        store.delete_dynamic_skill(skill_id).await.unwrap();
+        let skills = store.get_dynamic_skills().await.unwrap();
+        assert_eq!(skills.len(), 0);
+    }
+
+    // ==================== Dynamic MCP Server Tests ====================
+
+    #[tokio::test]
+    async fn test_dynamic_mcp_servers_crud() {
+        let (store, _db) = setup_test_store().await;
+
+        let server = DynamicMcpServer {
+            id: 0,
+            name: "test_server".to_string(),
+            command: "npx".to_string(),
+            args_json: r#"["@test/mcp-server"]"#.to_string(),
+            env_keys_json: r#"["API_KEY"]"#.to_string(),
+            triggers_json: r#"["test","testing"]"#.to_string(),
+            enabled: true,
+            created_at: String::new(),
+        };
+
+        // Save
+        let server_id = store.save_dynamic_mcp_server(&server).await.unwrap();
+        assert!(server_id > 0);
+
+        // List
+        let servers = store.list_dynamic_mcp_servers().await.unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "test_server");
+        assert_eq!(servers[0].command, "npx");
+        assert!(servers[0].enabled);
+
+        // Update
+        let mut updated_server = servers[0].clone();
+        updated_server.command = "uvx".to_string();
+        updated_server.enabled = false;
+        store
+            .update_dynamic_mcp_server(&updated_server)
+            .await
+            .unwrap();
+
+        let servers = store.list_dynamic_mcp_servers().await.unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].command, "uvx");
+        assert!(!servers[0].enabled);
+
+        // Delete
+        store
+            .delete_dynamic_mcp_server(updated_server.id)
+            .await
+            .unwrap();
+        let servers = store.list_dynamic_mcp_servers().await.unwrap();
+        assert_eq!(servers.len(), 0);
     }
 }

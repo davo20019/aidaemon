@@ -1,10 +1,15 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+pub mod resources;
+pub use resources::{FileSystemResolver, ResourceEntry, ResourceResolver};
+
+use crate::tools::sanitize::sanitize_external_content;
 use crate::traits::{
     BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, ModelProvider, Procedure,
     UserProfile,
@@ -28,6 +33,12 @@ pub struct Skill {
     /// Whether the skill is enabled (defaults to true)
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Filesystem path for directory-based skills (None for single-file/dynamic skills)
+    #[serde(default)]
+    pub dir_path: Option<PathBuf>,
+    /// Available resources (metadata only — file names, not content)
+    #[serde(default)]
+    pub resources: Vec<ResourceEntry>,
 }
 
 fn default_enabled() -> bool {
@@ -128,6 +139,17 @@ impl Skill {
             }
         }
 
+        // If no explicit triggers, extract keywords from name (Anthropic format compatibility)
+        if triggers.is_empty() {
+            if let Some(ref n) = name {
+                triggers = n
+                    .split('-')
+                    .map(|s| s.to_lowercase())
+                    .filter(|s| s.len() > 2)
+                    .collect();
+            }
+        }
+
         Some(Skill {
             name: name?,
             description: description.unwrap_or_default(),
@@ -137,11 +159,71 @@ impl Skill {
             source_url: None,
             id: None,
             enabled: true,
+            dir_path: None,
+            resources: vec![],
         })
     }
 }
 
-/// Load all `.md` skill files from the given directory.
+/// Scan a skill directory for resource files in any subdirectory.
+fn scan_skill_resources(dir: &Path) -> Vec<ResourceEntry> {
+    let mut entries = Vec::new();
+    let Ok(subdirs) = std::fs::read_dir(dir) else {
+        return entries;
+    };
+
+    for subdir_entry in subdirs.flatten() {
+        let subdir_path = subdir_entry.path();
+        if !subdir_path.is_dir() {
+            continue;
+        }
+
+        let subdir_name = match subdir_path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Infer category from directory name
+        let category = match subdir_name.as_str() {
+            "scripts" => "script",
+            "references" => "reference",
+            "assets" => "asset",
+            other => other, // custom directories work too
+        }
+        .to_string();
+
+        if let Ok(files) = std::fs::read_dir(&subdir_path) {
+            for file in files.flatten() {
+                let path = file.path();
+                if path.is_file() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        entries.push(ResourceEntry {
+                            path: format!("{}/{}", subdir_name, name),
+                            category: category.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
+}
+
+/// Load a directory-based skill from a directory containing SKILL.md.
+fn load_directory_skill(dir: &Path) -> Option<Skill> {
+    let skill_md = dir.join("SKILL.md");
+    let content = std::fs::read_to_string(&skill_md).ok()?;
+    let mut skill = Skill::parse(&content)?;
+    skill.dir_path = Some(dir.to_path_buf());
+    skill.resources = scan_skill_resources(dir);
+    Some(skill)
+}
+
+/// Load skills from a directory. Supports both:
+/// - Legacy single `.md` files (e.g. `skills/deploy.md`)
+/// - Directory-based skills with `SKILL.md` (e.g. `skills/deploy/SKILL.md`)
 pub fn load_skills(dir: &Path) -> Vec<Skill> {
     let mut skills = Vec::new();
 
@@ -155,20 +237,32 @@ pub fn load_skills(dir: &Path) -> Vec<Skill> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                if let Some(skill) = Skill::parse(&content) {
-                    info!(name = %skill.name, triggers = ?skill.triggers, "Loaded skill");
-                    skills.push(skill);
-                } else {
-                    warn!(path = %path.display(), "Failed to parse skill file");
-                }
+
+        if path.is_dir() {
+            // Directory-based skill: look for SKILL.md
+            if let Some(skill) = load_directory_skill(&path) {
+                info!(
+                    name = %skill.name,
+                    triggers = ?skill.triggers,
+                    resources = skill.resources.len(),
+                    "Loaded directory skill"
+                );
+                skills.push(skill);
             }
-            Err(e) => {
-                warn!(path = %path.display(), error = %e, "Failed to read skill file");
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            // Legacy single-file skill
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    if let Some(skill) = Skill::parse(&content) {
+                        info!(name = %skill.name, triggers = ?skill.triggers, "Loaded skill");
+                        skills.push(skill);
+                    } else {
+                        warn!(path = %path.display(), "Failed to parse skill file");
+                    }
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "Failed to read skill file");
+                }
             }
         }
     }
@@ -195,13 +289,13 @@ fn contains_whole_word(text: &str, word: &str) -> bool {
             || text[..abs_pos]
                 .chars()
                 .next_back()
-                .map_or(true, is_word_boundary);
+                .is_none_or(is_word_boundary);
         let after_pos = abs_pos + word.len();
         let after_ok = after_pos >= text.len()
             || text[after_pos..]
                 .chars()
                 .next()
-                .map_or(true, is_word_boundary);
+                .is_none_or(is_word_boundary);
         if before_ok && after_ok {
             return true;
         }
@@ -346,12 +440,35 @@ pub struct MemoryContext<'a> {
     pub profile: Option<&'a UserProfile>,
     /// Trusted command patterns (pattern string, approval count)
     pub trusted_command_patterns: &'a [(String, i32)],
+    /// Cross-channel hints: relevant facts from other channels (category+key only, values under confidentiality)
+    pub cross_channel_hints: &'a [Fact],
 }
 
 /// Build the complete system prompt with all memory components.
 ///
 /// This extended version injects episodic memory, goals, procedures, expertise,
 /// and behavior patterns in addition to facts and skills.
+/// Replace known user IDs (e.g., `U04S8KSS932`) with display names in text.
+/// Matches both bare IDs and `<@USERID>` Slack mention format.
+fn resolve_user_ids(text: &str, user_id_map: &HashMap<String, String>) -> String {
+    if user_id_map.is_empty() {
+        return text.to_string();
+    }
+    let mut result = text.to_string();
+    for (uid, name) in user_id_map {
+        // Replace <@USERID> format (Slack mentions)
+        let mention = format!("<@{}>", uid);
+        if result.contains(&mention) {
+            result = result.replace(&mention, &format!("@{}", name));
+        }
+        // Replace bare user IDs (e.g., in stored facts)
+        if result.contains(uid.as_str()) {
+            result = result.replace(uid.as_str(), name);
+        }
+    }
+    result
+}
+
 pub fn build_system_prompt_with_memory(
     base: &str,
     skills: &[Skill],
@@ -359,6 +476,7 @@ pub fn build_system_prompt_with_memory(
     memory: &MemoryContext,
     max_facts: usize,
     suggestions: Option<&[crate::memory::proactive::Suggestion]>,
+    user_id_map: &HashMap<String, String>,
 ) -> String {
     let mut prompt = base.to_string();
 
@@ -469,9 +587,31 @@ pub fn build_system_prompt_with_memory(
         prompt.push_str("\n\n## Known Facts\n");
         for f in capped_facts {
             let history_marker = if f.recall_count > 3 { " (frequently used)" } else { "" };
+            let resolved_key = resolve_user_ids(&f.key, user_id_map);
+            let resolved_value = resolve_user_ids(&f.value, user_id_map);
+            // Sanitize fact values to prevent prompt injection via stored data
+            let sanitized_value = sanitize_external_content(&resolved_value);
             prompt.push_str(&format!(
                 "- [{}] {}: {}{}\n",
-                f.category, f.key, f.value, history_marker
+                f.category, resolved_key, sanitized_value, history_marker
+            ));
+        }
+    }
+
+    // 6b. Cross-Channel Hints (facts from other channels — confidential until approved)
+    if !memory.cross_channel_hints.is_empty() {
+        prompt.push_str("\n\n## Cross-Channel Context — CONFIDENTIAL until owner approves\n");
+        prompt.push_str("You have relevant info from other conversations. You may mention that you have info,\n\
+                         but DO NOT reveal the values below unless the owner explicitly says to share.\n\
+                         If the owner approves, use `share_memory` tool to make the info permanently shareable here.\n");
+        for f in memory.cross_channel_hints.iter().take(5) {
+            let resolved_key = resolve_user_ids(&f.key, user_id_map);
+            let resolved_value = resolve_user_ids(&f.value, user_id_map);
+            // Sanitize cross-channel hints to prevent injection
+            let sanitized_value = sanitize_external_content(&resolved_value);
+            prompt.push_str(&format!(
+                "- [{}] {}: \"{}\" (from another channel)\n",
+                f.category, resolved_key, sanitized_value
             ));
         }
     }
@@ -538,6 +678,14 @@ pub fn build_system_prompt_with_memory(
     // Active skill bodies
     for skill in active {
         prompt.push_str(&format!("\n\n## Active Skill: {}\n{}", skill.name, skill.body));
+        if !skill.resources.is_empty() {
+            prompt.push_str(
+                "\n\n**Bundled resources** (use `skill_resources` tool to load on demand):",
+            );
+            for entry in &skill.resources {
+                prompt.push_str(&format!("\n- [{}] `{}`", entry.category, entry.path));
+            }
+        }
     }
 
     prompt
@@ -630,6 +778,8 @@ mod tests {
             source_url: None,
             id: None,
             enabled: true,
+            dir_path: None,
+            resources: vec![],
         }
     }
 
@@ -674,6 +824,8 @@ mod tests {
             superseded_at: None,
             recall_count: 0,
             last_recalled_at: None,
+            channel_id: None,
+            privacy: crate::types::FactPrivacy::Global,
         }
     }
 
@@ -701,5 +853,100 @@ mod tests {
         let facts = vec![make_fact("user", "name", "Alice")];
         let prompt = build_system_prompt("base", &[], &[], &facts, 0);
         assert!(!prompt.contains("Known Facts"));
+    }
+
+    // --- directory skill tests ---
+
+    #[test]
+    fn test_load_directory_skill() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skill_dir = dir.path().join("test-skill");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::create_dir(skill_dir.join("scripts")).unwrap();
+        std::fs::create_dir(skill_dir.join("references")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: test-skill\ndescription: A test\ntriggers: test\n---\nDo the thing.",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("scripts/hello.sh"), "#!/bin/bash\necho hi").unwrap();
+        std::fs::write(
+            skill_dir.join("references/guide.md"),
+            "# Guide\nUse snake_case.",
+        )
+        .unwrap();
+
+        let skill = load_directory_skill(&skill_dir).unwrap();
+        assert_eq!(skill.name, "test-skill");
+        assert_eq!(skill.resources.len(), 2);
+        assert!(skill.dir_path.is_some());
+        assert!(skill.resources.iter().any(|r| r.path == "references/guide.md"));
+        assert!(skill.resources.iter().any(|r| r.path == "scripts/hello.sh"));
+    }
+
+    #[test]
+    fn test_load_skills_mixed() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Legacy single-file skill
+        std::fs::write(
+            dir.path().join("legacy.md"),
+            "---\nname: legacy\ndescription: Legacy skill\ntriggers: old\n---\nLegacy body.",
+        )
+        .unwrap();
+
+        // Directory-based skill
+        let skill_dir = dir.path().join("new-skill");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: new-skill\ndescription: New skill\ntriggers: new\n---\nNew body.",
+        )
+        .unwrap();
+
+        let skills = load_skills(dir.path());
+        assert_eq!(skills.len(), 2);
+        assert!(skills.iter().any(|s| s.name == "legacy"));
+        assert!(skills.iter().any(|s| s.name == "new-skill"));
+    }
+
+    #[test]
+    fn test_scan_resources_custom_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("examples")).unwrap();
+        std::fs::create_dir(dir.path().join("data")).unwrap();
+        std::fs::write(dir.path().join("examples/demo.py"), "print('hi')").unwrap();
+        std::fs::write(dir.path().join("data/config.json"), "{}").unwrap();
+
+        let resources = scan_skill_resources(dir.path());
+        assert_eq!(resources.len(), 2);
+        // Custom directories use their dirname as category
+        let examples_entry = resources.iter().find(|r| r.path == "data/config.json").unwrap();
+        assert_eq!(examples_entry.category, "data");
+        let data_entry = resources.iter().find(|r| r.path == "examples/demo.py").unwrap();
+        assert_eq!(data_entry.category, "examples");
+    }
+
+    #[test]
+    fn test_directory_without_skill_md_skipped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let random_dir = dir.path().join("random-stuff");
+        std::fs::create_dir(&random_dir).unwrap();
+        std::fs::write(random_dir.join("readme.txt"), "not a skill").unwrap();
+
+        let skills = load_skills(dir.path());
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn test_parse_anthropic_format() {
+        // Anthropic format: name + description, no explicit triggers
+        let content =
+            "---\nname: code-review\ndescription: Review code for quality\n---\nCheck for bugs.";
+        let skill = Skill::parse(content).unwrap();
+        assert_eq!(skill.name, "code-review");
+        // Auto-triggers derived from hyphenated name (words > 2 chars)
+        assert!(skill.triggers.contains(&"code".to_string()));
+        assert!(skill.triggers.contains(&"review".to_string()));
     }
 }

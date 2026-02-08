@@ -27,7 +27,9 @@ use crate::skills;
 use crate::state::SqliteStateStore;
 #[cfg(feature = "browser")]
 use crate::tools::BrowserTool;
-use crate::tools::{CliAgentTool, ConfigManagerTool, HealthProbeTool, ManageSkillsTool, PlanManagerTool, RememberFactTool, SchedulerTool, SendFileTool, SpawnAgentTool, SystemInfoTool, TerminalTool, UseSkillTool, WebFetchTool, WebSearchTool};
+#[cfg(feature = "slack")]
+use crate::tools::ReadChannelHistoryTool;
+use crate::tools::{CliAgentTool, ConfigManagerTool, HealthProbeTool, ManageMcpTool, ManageMemoriesTool, ManageSkillsTool, PlanManagerTool, RememberFactTool, SchedulerTool, SendFileTool, ShareMemoryTool, SkillResourcesTool, SpawnAgentTool, SystemInfoTool, TerminalTool, UseSkillTool, WebFetchTool, WebSearchTool};
 use crate::traits::{Channel, StateStore, Tool};
 use crate::tasks::TaskRegistry;
 use crate::scheduler::SchedulerManager;
@@ -55,6 +57,13 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     if let Ok(count) = state.backfill_episode_embeddings().await {
         if count > 0 {
             info!(count, "Backfilled missing episode embeddings");
+        }
+    }
+
+    // Backfill any missing fact embeddings
+    if let Ok(count) = state.backfill_fact_embeddings().await {
+        if count > 0 {
+            info!(count, "Backfilled missing fact embeddings");
         }
     }
 
@@ -94,56 +103,134 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         None
     };
 
-    // 1e. Event Consolidator and Pruner (background tasks for event processing)
+    // 1e. Pruner setup is deferred until after provider/router init (see below)
+    // because Consolidator now needs provider + embedding_service for LLM-enhanced procedures.
+
+    // Note: Daily event consolidation is now handled by MemoryManager (unified pipeline).
+    // The Consolidator's extraction methods are called from MemoryManager.consolidate_memories().
+    // The Pruner still calls consolidator.consolidate_session() as a safety net before pruning.
+
+    // Pruning task spawn is deferred (see after provider init)
+
+    // Spawn plan cleanup task (runs at 3:35 AM, after event pruning)
+    let plan_store_cleanup = plan_store.clone();
+    tokio::spawn(async move {
+        loop {
+            let now = chrono::Utc::now();
+            let next_335am = {
+                let today_335am = now.date_naive().and_hms_opt(3, 35, 0).unwrap();
+                let today_335am_utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(today_335am, chrono::Utc);
+                if now < today_335am_utc {
+                    today_335am_utc
+                } else {
+                    today_335am_utc + chrono::Duration::days(1)
+                }
+            };
+            let sleep_duration = (next_335am - now).to_std().unwrap_or(Duration::from_secs(3600));
+            tokio::time::sleep(sleep_duration).await;
+
+            // Delete completed/failed/abandoned plans older than 30 days
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+            match plan_store_cleanup.delete_old_completed(cutoff).await {
+                Ok(deleted) if deleted > 0 => {
+                    info!(deleted, "Cleaned up old completed plans");
+                }
+                Err(e) => {
+                    tracing::error!("Plan cleanup failed: {}", e);
+                }
+                _ => {}
+            }
+        }
+    });
+    // Spawn retention cleanup task (runs at 3:45 AM UTC, after plan cleanup)
+    let retention_pool = state.pool();
+    let retention_config = config.state.retention.clone();
+    tokio::spawn(async move {
+        let retention_manager = crate::memory::retention::RetentionManager::new(retention_pool, retention_config);
+        loop {
+            let now = chrono::Utc::now();
+            let next_345am = {
+                let today_345am = now.date_naive().and_hms_opt(3, 45, 0).unwrap();
+                let today_345am_utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(today_345am, chrono::Utc);
+                if now < today_345am_utc {
+                    today_345am_utc
+                } else {
+                    today_345am_utc + chrono::Duration::days(1)
+                }
+            };
+            let sleep_duration = (next_345am - now).to_std().unwrap_or(Duration::from_secs(3600));
+            tokio::time::sleep(sleep_duration).await;
+
+            info!("Running retention cleanup");
+            match retention_manager.run_all().await {
+                Ok(stats) => {
+                    if stats.total_deleted() > 0 {
+                        info!(
+                            messages = stats.messages_deleted,
+                            facts = stats.facts_deleted,
+                            token_usage = stats.token_usage_deleted,
+                            episodes = stats.episodes_deleted,
+                            patterns = stats.behavior_patterns_deleted,
+                            goals = stats.goals_deleted,
+                            procedures = stats.procedures_deleted,
+                            error_solutions = stats.error_solutions_deleted,
+                            "Retention cleanup complete"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Retention cleanup failed: {}", e);
+                }
+            }
+        }
+    });
+
+    info!("Event consolidation, pruning, plan cleanup, and retention scheduled");
+
+    // 2. Provider (moved before MemoryManager so provider is available)
+    let provider: Arc<dyn crate::traits::ModelProvider> = match config.provider.kind {
+        crate::config::ProviderKind::OpenaiCompatible => Arc::new(
+            crate::providers::OpenAiCompatibleProvider::new(
+                &config.provider.base_url,
+                &config.provider.api_key,
+            ).map_err(|e| anyhow::anyhow!("{}", e))?
+        ),
+        crate::config::ProviderKind::GoogleGenai => Arc::new(crate::providers::GoogleGenAiProvider::new(
+            &config.provider.api_key,
+        )),
+        crate::config::ProviderKind::Anthropic => Arc::new(crate::providers::AnthropicNativeProvider::new(
+            &config.provider.api_key,
+        )),
+    };
+
+    // 3. Router
+    let router = Router::new(config.provider.models.clone());
+    let model = router.select(Tier::Primary).to_string();
+    info!(
+        primary = router.select(Tier::Primary),
+        fast = router.select(Tier::Fast),
+        smart = router.select(Tier::Smart),
+        "Model router configured"
+    );
+
+    // 3b. Consolidator (now needs provider + embedding_service for LLM-enhanced procedures)
     let consolidator = Arc::new(crate::events::Consolidator::new(
         event_store.clone(),
         plan_store.clone(),
         state.pool(),
+        Some(provider.clone()),
+        router.select(Tier::Fast).to_string(),
+        Some(embedding_service.clone()),
     ));
+
+    // 3c. Pruner (uses consolidator for safety-net consolidation before deleting events)
     let pruner = Arc::new(Pruner::new(
         event_store.clone(),
         consolidator.clone(),
         7, // 7-day retention
     ));
 
-    // Spawn daily consolidation task
-    let consolidator_task = consolidator.clone();
-    tokio::spawn(async move {
-        // Run daily at 3 AM UTC
-        loop {
-            let now = chrono::Utc::now();
-            let next_3am = {
-                let today_3am = now.date_naive().and_hms_opt(3, 0, 0).unwrap();
-                let today_3am_utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(today_3am, chrono::Utc);
-                if now < today_3am_utc {
-                    today_3am_utc
-                } else {
-                    today_3am_utc + chrono::Duration::days(1)
-                }
-            };
-            let sleep_duration = (next_3am - now).to_std().unwrap_or(Duration::from_secs(3600));
-            tokio::time::sleep(sleep_duration).await;
-
-            info!("Running daily event consolidation");
-            match consolidator_task.daily_consolidation().await {
-                Ok(stats) => {
-                    info!(
-                        sessions = stats.sessions_processed,
-                        procedures = stats.total_result.procedures_created,
-                        error_solutions = stats.total_result.error_solutions_created,
-                        expertise_updates = stats.total_result.expertise_updated,
-                        failures = stats.failures,
-                        "Daily consolidation complete"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!("Daily consolidation failed: {}", e);
-                }
-            }
-        }
-    });
-
-    // Spawn pruning task (runs 30 minutes after consolidation)
+    // Spawn pruning task (runs at 3:30 AM)
     let pruner_task = pruner.clone();
     tokio::spawn(async move {
         loop {
@@ -176,65 +263,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         }
     });
 
-    // Spawn plan cleanup task (runs at 3:35 AM, after event pruning)
-    let plan_store_cleanup = plan_store.clone();
-    tokio::spawn(async move {
-        loop {
-            let now = chrono::Utc::now();
-            let next_335am = {
-                let today_335am = now.date_naive().and_hms_opt(3, 35, 0).unwrap();
-                let today_335am_utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(today_335am, chrono::Utc);
-                if now < today_335am_utc {
-                    today_335am_utc
-                } else {
-                    today_335am_utc + chrono::Duration::days(1)
-                }
-            };
-            let sleep_duration = (next_335am - now).to_std().unwrap_or(Duration::from_secs(3600));
-            tokio::time::sleep(sleep_duration).await;
-
-            // Delete completed/failed/abandoned plans older than 30 days
-            let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
-            match plan_store_cleanup.delete_old_completed(cutoff).await {
-                Ok(deleted) if deleted > 0 => {
-                    info!(deleted, "Cleaned up old completed plans");
-                }
-                Err(e) => {
-                    tracing::error!("Plan cleanup failed: {}", e);
-                }
-                _ => {}
-            }
-        }
-    });
-    info!("Event consolidation, pruning, and plan cleanup scheduled");
-
-    // 2. Provider (moved before MemoryManager so provider is available)
-    let provider: Arc<dyn crate::traits::ModelProvider> = match config.provider.kind {
-        crate::config::ProviderKind::OpenaiCompatible => Arc::new(
-            crate::providers::OpenAiCompatibleProvider::new(
-                &config.provider.base_url,
-                &config.provider.api_key,
-            ).map_err(|e| anyhow::anyhow!("{}", e))?
-        ),
-        crate::config::ProviderKind::GoogleGenai => Arc::new(crate::providers::GoogleGenAiProvider::new(
-            &config.provider.api_key,
-        )),
-        crate::config::ProviderKind::Anthropic => Arc::new(crate::providers::AnthropicNativeProvider::new(
-            &config.provider.api_key,
-        )),
-    };
-
-    // 3. Router
-    let router = Router::new(config.provider.models.clone());
-    let model = router.select(Tier::Primary).to_string();
-    info!(
-        primary = router.select(Tier::Primary),
-        fast = router.select(Tier::Fast),
-        smart = router.select(Tier::Smart),
-        "Model router configured"
-    );
-
-    // 3b. Memory Manager (Background Tasks — needs provider + fast model)
+    // 3d. Memory Manager (Background Tasks — needs provider + fast model)
     let consolidation_interval = Duration::from_secs(config.state.consolidation_interval_hours * 3600);
     let memory_manager = Arc::new(MemoryManager::new(
         state.pool(),
@@ -242,6 +271,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         provider.clone(),
         router.select(Tier::Fast).to_string(),
         consolidation_interval,
+        Some(consolidator.clone()),
     ));
     memory_manager.start_background_tasks();
 
@@ -258,6 +288,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             state.pool(),
         ).await),
         Arc::new(RememberFactTool::new(state.clone())),
+        Arc::new(ShareMemoryTool::new(state.clone(), approval_tx.clone())),
+        Arc::new(ManageMemoriesTool::new(state.clone())),
         Arc::new(ConfigManagerTool::new(config_path.clone(), approval_tx.clone())),
         Arc::new(WebFetchTool::new()),
         Arc::new(WebSearchTool::new(&config.search)),
@@ -315,10 +347,49 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         info!("Health probe tool enabled");
     }
 
-    // 5. MCP tools
-    if !config.mcp.is_empty() {
-        let mcp_tools = mcp::discover_mcp_tools(&config.mcp).await?;
-        tools.extend(mcp_tools);
+    // Channel history tool (conditional — requires "slack" cargo feature)
+    #[cfg(feature = "slack")]
+    {
+        let mut slack_tokens: Vec<String> = config
+            .all_slack_bots()
+            .iter()
+            .map(|bot| bot.bot_token.clone())
+            .collect();
+        // Also include tokens from dynamic Slack bots (added via /connect, stored in DB)
+        if let Ok(dynamic_bots) = state.get_dynamic_bots().await {
+            for bot in dynamic_bots {
+                if bot.channel_type == "slack" && !bot.bot_token.is_empty() {
+                    slack_tokens.push(bot.bot_token.clone());
+                }
+            }
+        }
+        if !slack_tokens.is_empty() {
+            info!(count = slack_tokens.len(), "Channel history tool enabled");
+            tools.push(Arc::new(ReadChannelHistoryTool::new(slack_tokens)));
+        }
+    }
+
+    // 5. MCP registry (static from config + dynamic from DB)
+    let mcp_registry = mcp::McpRegistry::new(state.clone());
+
+    // Load static MCP servers from config into registry
+    for (name, mcp_config) in &config.mcp {
+        match mcp_registry
+            .add_server(name, mcp_config.clone(), false)
+            .await
+        {
+            Ok(tool_names) => {
+                info!(server = %name, tools = ?tool_names, "Static MCP server registered");
+            }
+            Err(e) => {
+                tracing::error!(server = %name, error = %e, "Failed to spawn static MCP server");
+            }
+        }
+    }
+
+    // Load dynamic MCP servers from database
+    if let Err(e) = mcp_registry.load_from_db().await {
+        tracing::error!(error = %e, "Failed to load dynamic MCP servers from database");
     }
 
     for tool in &tools {
@@ -357,6 +428,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                     source_url: ds.source_url,
                     id: Some(ds.id),
                     enabled: ds.enabled,
+                    dir_path: None,
+                    resources: serde_json::from_str(&ds.resources_json).unwrap_or_default(),
                 });
             }
             if all_skills.iter().any(|s| s.id.is_some()) {
@@ -371,6 +444,14 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         }
     }
 
+    // Create filesystem resolver for directory-based skills
+    let fs_resolver = Arc::new(crate::skills::FileSystemResolver::new());
+    for skill in &all_skills {
+        if let Some(ref dir_path) = skill.dir_path {
+            fs_resolver.register(&skill.name, dir_path.clone()).await;
+        }
+    }
+
     // Create shared skill registry
     let skill_registry = crate::skills::SharedSkillRegistry::new(all_skills);
 
@@ -378,6 +459,12 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     if config.skills.enabled {
         tools.push(Arc::new(UseSkillTool::new(skill_registry.clone())));
         info!("use_skill tool enabled");
+
+        tools.push(Arc::new(SkillResourcesTool::new(
+            skill_registry.clone(),
+            fs_resolver.clone() as Arc<dyn crate::skills::ResourceResolver>,
+        )));
+        info!("skill_resources tool enabled");
     }
 
     // manage_skills tool (always available when skills enabled)
@@ -390,6 +477,14 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         tools.push(Arc::new(manage_skills));
         info!("manage_skills tool enabled");
     }
+
+    // manage_mcp tool (always available for dynamic MCP management)
+    let manage_mcp = ManageMcpTool::new(
+        mcp_registry.clone(),
+        approval_tx.clone(),
+    );
+    tools.push(Arc::new(manage_mcp));
+    info!("manage_mcp tool enabled");
 
     // 7. Agent (with deferred spawn tool wiring to break the circular dep)
     let base_system_prompt = build_base_system_prompt(&config);
@@ -410,6 +505,17 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // Clone provider before passing to Agent (needed by skill promotion task below)
     let provider_for_promotion = provider.clone();
+
+    let llm_call_timeout_secs = if config.daemon.watchdog.enabled {
+        Some(config.daemon.watchdog.llm_call_timeout_secs)
+    } else {
+        None
+    };
+    let watchdog_stale_threshold_secs = if config.daemon.watchdog.enabled {
+        config.daemon.watchdog.stale_threshold_secs
+    } else {
+        0
+    };
 
     let agent = Arc::new(Agent::new(
         provider,
@@ -433,6 +539,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         config.subagents.effective_iteration_limit(),
         config.subagents.task_timeout_secs,
         config.subagents.task_token_budget,
+        llm_call_timeout_secs,
+        Some(mcp_registry.clone()),
     ));
 
     // Close the loop: give the spawn tool a weak reference to the agent.
@@ -524,6 +632,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                 PathBuf::from(&inbox_dir),
                 config.files.max_file_size_mb,
                 state.clone(),
+                watchdog_stale_threshold_secs,
             ))
         })
         .collect();
@@ -546,6 +655,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                 PathBuf::from(&inbox_dir),
                 config.files.max_file_size_mb,
                 state.clone(),
+                watchdog_stale_threshold_secs,
             ))
         })
         .collect();
@@ -569,6 +679,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                 PathBuf::from(&inbox_dir),
                 config.files.max_file_size_mb,
                 state.clone(),
+                watchdog_stale_threshold_secs,
             ))
         })
         .collect();
@@ -603,6 +714,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                             PathBuf::from(&inbox_dir),
                             config.files.max_file_size_mb,
                             state.clone(),
+                            watchdog_stale_threshold_secs,
                         )));
                     }
                     #[cfg(feature = "discord")]
@@ -627,6 +739,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                             PathBuf::from(&inbox_dir),
                             config.files.max_file_size_mb,
                             state.clone(),
+                            watchdog_stale_threshold_secs,
                         )));
                     }
                     #[cfg(feature = "slack")]
@@ -648,6 +761,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                                 PathBuf::from(&inbox_dir),
                                 config.files.max_file_size_mb,
                                 state.clone(),
+                                watchdog_stale_threshold_secs,
                             )));
                         }
                     }
@@ -795,15 +909,19 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     let health_bind = config.daemon.health_bind.clone();
     if config.daemon.dashboard_enabled {
         match crate::dashboard::get_or_create_dashboard_token() {
-            Ok(dashboard_token) => {
+            Ok(dashboard_token_info) => {
                 let ds = crate::dashboard::DashboardState {
                     pool: state.pool(),
                     provider_kind: format!("{:?}", config.provider.kind),
                     models: config.provider.models.clone(),
                     started_at: std::time::Instant::now(),
-                    dashboard_token,
+                    dashboard_token: dashboard_token_info.token,
+                    token_created_at: dashboard_token_info.created_at,
                     daily_token_budget: config.state.daily_token_budget,
                     health_store: health_store.clone(),
+                    auth_failures: std::sync::Arc::new(tokio::sync::Mutex::new(
+                        std::collections::HashMap::new(),
+                    )),
                 };
                 let bind = health_bind.clone();
                 tokio::spawn(async move {
@@ -878,7 +996,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                         event.source, event.content
                     );
                     match agent_for_events
-                        .handle_message(&event.session_id, &wrapped_content, None, crate::types::UserRole::Owner, crate::types::ChannelContext::internal())
+                        .handle_message(&event.session_id, &wrapped_content, None, crate::types::UserRole::Owner, crate::types::ChannelContext::internal(), None)
                         .await
                     {
                         Ok(reply) => {
@@ -982,6 +1100,10 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         Err(e) => tracing::error!(error = %e, "Failed to pause plans during shutdown"),
     }
 
+    // Shut down all MCP server processes
+    info!("Shutting down MCP servers...");
+    mcp_registry.shutdown_all().await;
+
     Ok(())
 }
 
@@ -1045,6 +1167,12 @@ fn build_base_system_prompt(config: &AppConfig) -> String {
 
     let use_skill_table_row = if config.skills.enabled {
         "\n| Activate a saved skill/procedure | use_skill | — |"
+    } else {
+        ""
+    };
+
+    let skill_resources_table_row = if config.skills.enabled {
+        "\n| Load resources (scripts, references) from a skill | skill_resources | — |"
     } else {
         ""
     };
@@ -1152,6 +1280,14 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         ""
     };
 
+    let skill_resources_tool_doc = if config.skills.enabled {
+        "\n- `skill_resources`: Access resources bundled with a skill (scripts, references, assets). \
+        Actions: list (show available resources for a skill), read (load a specific resource file on demand). \
+        Use this to load supporting files from directory-based skills without cluttering the context."
+    } else {
+        ""
+    };
+
     format!(
         "\
 ## Identity
@@ -1239,7 +1375,7 @@ Adjust your verbosity and approach based on your expertise level:
 | Run commands, scripts | terminal | — |
 | Get system specs | system_info | terminal (uname, etc.) |
 | Store user info | remember_fact | — |
-| Read or change aidaemon config | manage_config | terminal (editing config.toml) |{send_file_table_row}{spawn_table_row}{cli_agent_table_row}{scheduler_table_row}{health_probe_table_row}{plan_manager_table_row}{manage_skills_table_row}{use_skill_table_row}
+| Read or change aidaemon config | manage_config | terminal (editing config.toml) |{send_file_table_row}{spawn_table_row}{cli_agent_table_row}{scheduler_table_row}{health_probe_table_row}{plan_manager_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}
 
 ## Tools
 - `terminal`: Run ANY command available on this system. This includes shell commands, \
@@ -1260,7 +1396,7 @@ update API keys, toggle features. For simple config changes, just use this tool 
 do NOT research source code or create plans first.
 - `web_search`: Search the web. Returns titles, URLs, and snippets for your query. Use to find current information, research topics, check facts.
 - `web_fetch`: Fetch a URL and extract its readable content. Strips ads/navigation. For login-required sites, use `browser` instead.
-{browser_tool_doc}{send_file_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}{scheduler_tool_doc}{health_probe_tool_doc}{plan_manager_tool_doc}{manage_skills_tool_doc}{use_skill_tool_doc}
+{browser_tool_doc}{send_file_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}{scheduler_tool_doc}{health_probe_tool_doc}{plan_manager_tool_doc}{manage_skills_tool_doc}{use_skill_tool_doc}{skill_resources_tool_doc}
 
 ## Built-in Channels
 You are a compiled Rust daemon with Telegram, Discord, and Slack support already built in. \

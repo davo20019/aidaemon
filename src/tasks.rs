@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug)]
 pub struct QueuedMessage {
     pub text: String,
+    #[allow(dead_code)]
     pub queued_at: DateTime<Utc>,
 }
 

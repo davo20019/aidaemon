@@ -12,6 +12,9 @@ use std::sync::OnceLock;
 use chrono::Utc;
 use tracing::{debug, info};
 
+/// Row type for command pattern queries.
+type PatternRow = (i64, String, String, i32, i32, Option<String>, Option<String>);
+
 /// A learned command pattern with approval history.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -201,7 +204,7 @@ pub async fn record_denial(pool: &SqlitePool, command: &str) -> anyhow::Result<(
 pub async fn find_matching_pattern(pool: &SqlitePool, command: &str) -> anyhow::Result<Option<(CommandPattern, f32)>> {
     let generalized = generalize_command(command);
 
-    let exact: Option<(i64, String, String, i32, i32, Option<String>, Option<String>)> = sqlx::query_as(
+    let exact: Option<PatternRow> = sqlx::query_as(
         "SELECT id, pattern, original_example, approval_count, denial_count, last_approved_at, last_denied_at FROM command_patterns WHERE pattern = ?"
     )
     .bind(&generalized)
@@ -219,7 +222,7 @@ pub async fn find_matching_pattern(pool: &SqlitePool, command: &str) -> anyhow::
         return Ok(None);
     }
 
-    let candidates: Vec<(i64, String, String, i32, i32, Option<String>, Option<String>)> = sqlx::query_as(
+    let candidates: Vec<PatternRow> = sqlx::query_as(
         "SELECT id, pattern, original_example, approval_count, denial_count, last_approved_at, last_denied_at FROM command_patterns WHERE pattern LIKE ? ORDER BY approval_count DESC LIMIT 20"
     )
     .bind(format!("{}%", base_cmd))
@@ -230,13 +233,12 @@ pub async fn find_matching_pattern(pool: &SqlitePool, command: &str) -> anyhow::
 
     for (id, pattern, original_example, approval_count, denial_count, last_approved_at, last_denied_at) in candidates {
         let similarity = pattern_similarity(command, &pattern);
-        if similarity >= 0.7 {
-            if best_match.is_none() || similarity > best_match.as_ref().unwrap().1 {
+        if similarity >= 0.7
+            && (best_match.is_none() || similarity > best_match.as_ref().unwrap().1) {
                 best_match = Some((CommandPattern {
                     id, pattern, original_example, approval_count, denial_count, last_approved_at, last_denied_at,
                 }, similarity));
             }
-        }
     }
 
     Ok(best_match)

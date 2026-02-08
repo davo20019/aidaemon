@@ -36,6 +36,7 @@ impl AlertType {
 
 /// State tracking for a single probe's alert status.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 struct ProbeAlertState {
     /// Current consecutive failures
     consecutive_failures: u32,
@@ -49,17 +50,6 @@ struct ProbeAlertState {
     last_status: Option<ProbeStatus>,
 }
 
-impl Default for ProbeAlertState {
-    fn default() -> Self {
-        Self {
-            consecutive_failures: 0,
-            first_failure_at: None,
-            down_alert_sent: false,
-            last_alert_at: None,
-            last_status: None,
-        }
-    }
-}
 
 /// Manager for health probe alerts.
 ///
@@ -195,7 +185,7 @@ impl AlertManager {
     ) {
         let downtime = first_failure_at
             .map(|start| Utc::now() - start)
-            .unwrap_or_else(|| Duration::zero());
+            .unwrap_or_else(Duration::zero);
         let downtime_str = format_duration(downtime);
 
         let latency_str = result.latency_ms

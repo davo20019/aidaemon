@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
+use zeroize::Zeroize;
 
 use crate::providers::ProviderError;
 use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
@@ -12,6 +13,12 @@ pub struct OpenAiCompatibleProvider {
     client: Client,
     base_url: String,
     api_key: String,
+}
+
+impl Drop for OpenAiCompatibleProvider {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
+    }
 }
 
 /// Validate the base URL for security.
@@ -220,5 +227,82 @@ impl ModelProvider for OpenAiCompatibleProvider {
             .unwrap_or_default();
 
         Ok(models)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_https_accepted() {
+        let result = validate_base_url("https://api.openai.com");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_http_localhost_accepted() {
+        let result = validate_base_url("http://localhost:8080");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_http_127_accepted() {
+        let result = validate_base_url("http://127.0.0.1:1234");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_http_ipv6_localhost_accepted() {
+        let result = validate_base_url("http://[::1]:8080");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_http_remote_rejected() {
+        let result = validate_base_url("http://api.example.com");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("HTTP is not allowed"),
+            "Expected HTTP rejection error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ftp_rejected() {
+        let result = validate_base_url("ftp://example.com");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Unsupported URL scheme"),
+            "Expected unsupported scheme error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_invalid_url_rejected() {
+        let result = validate_base_url("not a url");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Invalid base_url"),
+            "Expected invalid URL error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_trailing_slash_trimmed() {
+        let provider = OpenAiCompatibleProvider::new("https://api.openai.com/v1/", "test-key");
+        assert!(provider.is_ok(), "Provider::new should succeed with trailing slash");
+        let provider = provider.unwrap();
+        assert!(
+            !provider.base_url.ends_with('/'),
+            "base_url should not end with slash, got: {}",
+            provider.base_url
+        );
     }
 }
