@@ -1066,7 +1066,7 @@ fn default_retention_hours() -> u64 {
     24
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct OAuthConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1074,16 +1074,6 @@ pub struct OAuthConfig {
     pub callback_url: Option<String>,
     #[serde(default)]
     pub providers: HashMap<String, OAuthProviderConfig>,
-}
-
-impl Default for OAuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            callback_url: None,
-            providers: HashMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

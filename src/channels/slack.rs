@@ -643,13 +643,11 @@ impl SlackChannel {
                 return;
             }
             UserRole::Owner
+        } else if bot_mentioned || is_dm {
+            UserRole::Public
         } else {
-            if bot_mentioned || is_dm {
-                UserRole::Public
-            } else {
-                // Non-whitelisted user, no @mention, not a DM — silently ignore
-                return;
-            }
+            // Non-whitelisted user, no @mention, not a DM — silently ignore
+            return;
         };
 
         // Strip bot @mention from text before processing
