@@ -732,9 +732,10 @@ impl Tool for HttpRequestTool {
         let sanitized_body = sanitize_external_content(&body_str);
 
         // Build result with response details
+        let status_code = status.as_u16();
         let mut result = format!(
             "HTTP {} {}\n",
-            status.as_u16(),
+            status_code,
             status.canonical_reason().unwrap_or("")
         );
 
@@ -751,6 +752,50 @@ impl Tool for HttpRequestTool {
         }
         if redirect_count > 0 {
             result.push_str(&format!("(followed {} redirect(s))\n", redirect_count));
+        }
+
+        // For error responses (4xx/5xx), add structured diagnostic section
+        if status_code >= 400 {
+            result.push_str("\n--- API ERROR ---\n");
+            result.push_str(&format!("Status: {}\n", status_code));
+
+            // Try to parse common API error formats (JSON with detail/message/error fields)
+            if let Ok(error_json) = serde_json::from_str::<Value>(&body_str) {
+                // Extract error details from common API patterns
+                let detail = error_json["detail"].as_str()
+                    .or_else(|| error_json["message"].as_str())
+                    .or_else(|| error_json["error"]["message"].as_str())
+                    .or_else(|| error_json["error"].as_str())
+                    .or_else(|| error_json["error_description"].as_str());
+                let title = error_json["title"].as_str()
+                    .or_else(|| error_json["error"]["type"].as_str())
+                    .or_else(|| error_json["error_code"].as_str());
+                let error_type = error_json["type"].as_str();
+
+                if let Some(t) = title {
+                    result.push_str(&format!("Error: {}\n", t));
+                }
+                if let Some(d) = detail {
+                    result.push_str(&format!("Detail: {}\n", d));
+                }
+                if let Some(et) = error_type {
+                    result.push_str(&format!("Type: {}\n", et));
+                }
+
+                // Include any nested errors array
+                if let Some(errors) = error_json["errors"].as_array() {
+                    for (i, err) in errors.iter().enumerate().take(3) {
+                        let msg = err["message"].as_str()
+                            .or_else(|| err["detail"].as_str())
+                            .unwrap_or("unknown");
+                        result.push_str(&format!("  Error {}: {}\n", i + 1, msg));
+                    }
+                }
+            }
+
+            result.push_str("--- END ERROR ---\n");
+            result.push_str("\nIMPORTANT: Report the FULL error details above to the user. ");
+            result.push_str("Do NOT retry the same request — diagnose the root cause first.\n");
         }
 
         result.push('\n');
