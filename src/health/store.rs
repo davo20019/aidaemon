@@ -40,7 +40,7 @@ impl HealthProbeStore {
                 next_run_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            )"
+            )",
         )
         .execute(&self.pool)
         .await?;
@@ -56,7 +56,7 @@ impl HealthProbeStore {
                 response_body TEXT,
                 checked_at TEXT NOT NULL,
                 FOREIGN KEY (probe_id) REFERENCES health_probes(id) ON DELETE CASCADE
-            )"
+            )",
         )
         .execute(&self.pool)
         .await?;
@@ -70,7 +70,7 @@ impl HealthProbeStore {
                 message TEXT NOT NULL,
                 sent_at TEXT NOT NULL,
                 first_failure_at TEXT NOT NULL
-            )"
+            )",
         )
         .execute(&self.pool)
         .await?;
@@ -78,14 +78,14 @@ impl HealthProbeStore {
         // Indexes for efficient queries
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_probe_results_probe_time
-             ON probe_results(probe_id, checked_at DESC)"
+             ON probe_results(probe_id, checked_at DESC)",
         )
         .execute(&self.pool)
         .await?;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_health_probes_next_run
-             ON health_probes(next_run_at) WHERE is_paused = 0"
+             ON health_probes(next_run_at) WHERE is_paused = 0",
         )
         .execute(&self.pool)
         .await?;
@@ -117,7 +117,7 @@ impl HealthProbeStore {
                 consecutive_failures_alert = excluded.consecutive_failures_alert,
                 latency_threshold_ms = excluded.latency_threshold_ms,
                 alert_session_ids = excluded.alert_session_ids,
-                updated_at = excluded.updated_at"
+                updated_at = excluded.updated_at",
         )
         .bind(&probe.id)
         .bind(&probe.name)
@@ -142,12 +142,10 @@ impl HealthProbeStore {
 
     /// Get a probe by ID.
     pub async fn get_probe(&self, id: &str) -> anyhow::Result<Option<HealthProbe>> {
-        let row = sqlx::query(
-            "SELECT * FROM health_probes WHERE id = ?"
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT * FROM health_probes WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_probe(&row)?)),
@@ -157,12 +155,10 @@ impl HealthProbeStore {
 
     /// Get a probe by name.
     pub async fn get_probe_by_name(&self, name: &str) -> anyhow::Result<Option<HealthProbe>> {
-        let row = sqlx::query(
-            "SELECT * FROM health_probes WHERE name = ?"
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT * FROM health_probes WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_probe(&row)?)),
@@ -185,12 +181,11 @@ impl HealthProbeStore {
 
     /// Get probes that are due to run.
     pub async fn get_due_probes(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<HealthProbe>> {
-        let rows = sqlx::query(
-            "SELECT * FROM health_probes WHERE next_run_at <= ? AND is_paused = 0"
-        )
-        .bind(now.to_rfc3339())
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query("SELECT * FROM health_probes WHERE next_run_at <= ? AND is_paused = 0")
+                .bind(now.to_rfc3339())
+                .fetch_all(&self.pool)
+                .await?;
 
         let mut probes = Vec::with_capacity(rows.len());
         for row in rows {
@@ -200,7 +195,12 @@ impl HealthProbeStore {
     }
 
     /// Update probe run times after execution.
-    pub async fn update_probe_run(&self, id: &str, last_run: DateTime<Utc>, next_run: DateTime<Utc>) -> anyhow::Result<()> {
+    pub async fn update_probe_run(
+        &self,
+        id: &str,
+        last_run: DateTime<Utc>,
+        next_run: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE health_probes SET last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?"
         )
@@ -215,20 +215,19 @@ impl HealthProbeStore {
 
     /// Pause a probe.
     pub async fn pause_probe(&self, id: &str) -> anyhow::Result<bool> {
-        let result = sqlx::query(
-            "UPDATE health_probes SET is_paused = 1, updated_at = ? WHERE id = ?"
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("UPDATE health_probes SET is_paused = 1, updated_at = ? WHERE id = ?")
+                .bind(Utc::now().to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected() > 0)
     }
 
     /// Resume a paused probe.
     pub async fn resume_probe(&self, id: &str, next_run: DateTime<Utc>) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE health_probes SET is_paused = 0, next_run_at = ?, updated_at = ? WHERE id = ?"
+            "UPDATE health_probes SET is_paused = 0, next_run_at = ?, updated_at = ? WHERE id = ?",
         )
         .bind(next_run.to_rfc3339())
         .bind(Utc::now().to_rfc3339())
@@ -288,12 +287,18 @@ impl HealthProbeStore {
             source: row.get("source"),
             config: serde_json::from_str(&config_json).unwrap_or_default(),
             consecutive_failures_alert: row.get::<i32, _>("consecutive_failures_alert") as u32,
-            latency_threshold_ms: row.get::<Option<i64>, _>("latency_threshold_ms").map(|v| v as u32),
+            latency_threshold_ms: row
+                .get::<Option<i64>, _>("latency_threshold_ms")
+                .map(|v| v as u32),
             alert_session_ids: alert_sessions_json
                 .and_then(|j| serde_json::from_str(&j).ok())
                 .unwrap_or_default(),
             is_paused: row.get::<i32, _>("is_paused") != 0,
-            last_run_at: last_run_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
+            last_run_at: last_run_str.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
             next_run_at: DateTime::parse_from_rfc3339(&next_run_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()),
@@ -328,9 +333,13 @@ impl HealthProbeStore {
     }
 
     /// Get recent results for a probe.
-    pub async fn get_results(&self, probe_id: &str, limit: usize) -> anyhow::Result<Vec<ProbeResult>> {
+    pub async fn get_results(
+        &self,
+        probe_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ProbeResult>> {
         let rows = sqlx::query(
-            "SELECT * FROM probe_results WHERE probe_id = ? ORDER BY checked_at DESC LIMIT ?"
+            "SELECT * FROM probe_results WHERE probe_id = ? ORDER BY checked_at DESC LIMIT ?",
         )
         .bind(probe_id)
         .bind(limit as i64)
@@ -354,7 +363,7 @@ impl HealthProbeStore {
         let rows = sqlx::query(
             "SELECT * FROM probe_results
              WHERE probe_id = ? AND checked_at >= ? AND checked_at <= ?
-             ORDER BY checked_at DESC"
+             ORDER BY checked_at DESC",
         )
         .bind(probe_id)
         .bind(start.to_rfc3339())
@@ -372,7 +381,7 @@ impl HealthProbeStore {
     /// Get the most recent result for a probe.
     pub async fn get_latest_result(&self, probe_id: &str) -> anyhow::Result<Option<ProbeResult>> {
         let row = sqlx::query(
-            "SELECT * FROM probe_results WHERE probe_id = ? ORDER BY checked_at DESC LIMIT 1"
+            "SELECT * FROM probe_results WHERE probe_id = ? ORDER BY checked_at DESC LIMIT 1",
         )
         .bind(probe_id)
         .fetch_optional(&self.pool)
@@ -442,7 +451,7 @@ impl HealthProbeStore {
     ) -> anyhow::Result<i64> {
         let row = sqlx::query(
             "INSERT INTO probe_alerts (probe_id, alert_type, message, sent_at, first_failure_at)
-             VALUES (?, ?, ?, ?, ?)"
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(probe_id)
         .bind(alert_type)
@@ -456,11 +465,15 @@ impl HealthProbeStore {
     }
 
     /// Get the last alert of a specific type for a probe.
-    pub async fn get_last_alert(&self, probe_id: &str, alert_type: &str) -> anyhow::Result<Option<DateTime<Utc>>> {
+    pub async fn get_last_alert(
+        &self,
+        probe_id: &str,
+        alert_type: &str,
+    ) -> anyhow::Result<Option<DateTime<Utc>>> {
         let row = sqlx::query(
             "SELECT sent_at FROM probe_alerts
              WHERE probe_id = ? AND alert_type = ?
-             ORDER BY sent_at DESC LIMIT 1"
+             ORDER BY sent_at DESC LIMIT 1",
         )
         .bind(probe_id)
         .bind(alert_type)
@@ -494,14 +507,14 @@ impl HealthProbeStore {
         }
 
         let total = results.len() as f64;
-        let healthy_count = results.iter().filter(|r| r.status == ProbeStatus::Healthy).count() as f64;
+        let healthy_count = results
+            .iter()
+            .filter(|r| r.status == ProbeStatus::Healthy)
+            .count() as f64;
         let uptime_percent = (healthy_count / total) * 100.0;
 
         // Collect latencies
-        let mut latencies: Vec<u32> = results
-            .iter()
-            .filter_map(|r| r.latency_ms)
-            .collect();
+        let mut latencies: Vec<u32> = results.iter().filter_map(|r| r.latency_ms).collect();
 
         let (avg_latency_ms, p95_latency_ms) = if latencies.is_empty() {
             (None, None)
@@ -536,7 +549,10 @@ impl HealthProbeStore {
     }
 
     /// Get summary stats for all probes.
-    pub async fn get_all_probe_stats(&self, hours: u32) -> anyhow::Result<HashMap<String, ProbeStats>> {
+    pub async fn get_all_probe_stats(
+        &self,
+        hours: u32,
+    ) -> anyhow::Result<HashMap<String, ProbeStats>> {
         let end = Utc::now();
         let start = end - chrono::Duration::hours(hours as i64);
 

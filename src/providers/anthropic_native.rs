@@ -62,7 +62,7 @@ impl AnthropicNativeProvider {
                 "assistant" => {
                     // Split into text content and tool_use blocks
                     let mut content_blocks = Vec::new();
-                    
+
                     if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
                         if !text.is_empty() {
                             content_blocks.push(json!({
@@ -71,15 +71,16 @@ impl AnthropicNativeProvider {
                             }));
                         }
                     }
-                    
+
                     if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
                         for tc in tool_calls {
                             let name = tc["function"]["name"].as_str().unwrap_or("");
                             let id = tc["id"].as_str().unwrap_or("");
                             let input: Value = serde_json::from_str(
-                                tc["function"]["arguments"].as_str().unwrap_or("{}")
-                            ).unwrap_or(json!({}));
-                            
+                                tc["function"]["arguments"].as_str().unwrap_or("{}"),
+                            )
+                            .unwrap_or(json!({}));
+
                             content_blocks.push(json!({
                                 "type": "tool_use",
                                 "id": id,
@@ -100,7 +101,7 @@ impl AnthropicNativeProvider {
                     // Tool result
                     let tool_use_id = msg["tool_call_id"].as_str().unwrap_or("");
                     let content_str = msg["content"].as_str().unwrap_or("");
-                    
+
                     anthropic_msgs.push(json!({
                         "role": "user",
                         "content": [{
@@ -113,27 +114,27 @@ impl AnthropicNativeProvider {
                 _ => {}
             }
         }
-        
-        // Anthropic requires messages to alternate User/Assistant. 
-        // Our simple conversion might produce Use -> Tool (User) -> Tool (User). 
+
+        // Anthropic requires messages to alternate User/Assistant.
+        // Our simple conversion might produce Use -> Tool (User) -> Tool (User).
         // We might need to merge consecutive user messages if they include tool results?
-        // Actually, valid tool use flow: 
+        // Actually, valid tool use flow:
         // User -> Assistant (ToolUse) -> User (ToolResult) -> Assistant...
         // AgentZero loop creates distinct messages.
         // But if multiple tool results come back, they are separate messages in AgentZero state.
-        // Anthropic expects: User (ToolResult 1), User (ToolResult 2)... 
+        // Anthropic expects: User (ToolResult 1), User (ToolResult 2)...
         // Wait, Anthropic usually allows multiple tool results in one message block or sequential user messages?
         // Actually, "The messages API... requires user and assistant roles to alternate."
         // So User (ToolResult 1) followed by User (ToolResult 2) is INVALID.
         // We MUST merge adjacent messages of the same role.
-        
+
         let merged_msgs = self.merge_adjacent_roles(anthropic_msgs);
         (system_prompt, merged_msgs)
     }
 
     fn merge_adjacent_roles(&self, msgs: Vec<Value>) -> Vec<Value> {
         let mut result: Vec<Value> = Vec::new();
-        
+
         for msg in msgs {
             if let Some(last) = result.last_mut() {
                 if last["role"] == msg["role"] {
@@ -141,15 +142,18 @@ impl AnthropicNativeProvider {
                     // Ensure both are arrays of blocks (normalize string content to block first)
                     Self::normalize_content_to_blocks(last);
                     let mut new_blocks = Self::msg_content_to_blocks(&msg);
-                    
-                    last["content"].as_array_mut().unwrap().append(&mut new_blocks);
+
+                    last["content"]
+                        .as_array_mut()
+                        .unwrap()
+                        .append(&mut new_blocks);
                     continue;
                 }
             }
             // Push new, but normalize to blocks if it's a tool result usage (consistent structure)
             // primarily for cleaner merging later if needed.
             let mut new_msg = msg.clone();
-            // If it's a tool result, it's already blocks. If it's simple text, leave as string? 
+            // If it's a tool result, it's already blocks. If it's simple text, leave as string?
             // Better to normalize everything to blocks if we are doing merging.
             Self::normalize_content_to_blocks(&mut new_msg);
             result.push(new_msg);
@@ -178,7 +182,7 @@ impl AnthropicNativeProvider {
     /// Convert OpenAI tool definitions to Anthropic tools
     fn convert_tools(&self, tools: &[Value]) -> Option<Vec<Value>> {
         if tools.is_empty() {
-             return None;
+            return None;
         }
         let mut anthropic_tools = Vec::new();
         for tool in tools {
@@ -220,13 +224,15 @@ impl ModelProvider for AnthropicNativeProvider {
 
         info!(model, url = %self.base_url, "Calling Anthropic Native");
 
-        let resp = match self.client.post(format!("{}/messages", self.base_url))
+        let resp = match self
+            .client
+            .post(format!("{}/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)
             .send()
-            .await 
+            .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -244,7 +250,7 @@ impl ModelProvider for AnthropicNativeProvider {
         }
 
         let data: Value = serde_json::from_str(&text)?;
-        
+
         let mut final_text = String::new();
         let mut tool_calls = Vec::new();
 
@@ -260,7 +266,7 @@ impl ModelProvider for AnthropicNativeProvider {
                     let id = block["id"].as_str().unwrap_or("").to_string();
                     let input = &block["input"];
                     let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
-                    
+
                     tool_calls.push(ToolCall {
                         id,
                         name,
@@ -280,7 +286,11 @@ impl ModelProvider for AnthropicNativeProvider {
         });
 
         Ok(ProviderResponse {
-            content: if final_text.is_empty() { None } else { Some(final_text) },
+            content: if final_text.is_empty() {
+                None
+            } else {
+                Some(final_text)
+            },
             tool_calls,
             usage,
         })
@@ -457,12 +467,20 @@ mod tests {
 
         // The two tool results (both user role) should be merged into one user message
         // Expected: user, assistant, user (merged tool results)
-        assert_eq!(msgs.len(), 3, "Two tool results should be merged into one user message");
+        assert_eq!(
+            msgs.len(),
+            3,
+            "Two tool results should be merged into one user message"
+        );
 
         let merged_user = &msgs[2];
         assert_eq!(merged_user["role"], "user");
         let content = merged_user["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2, "Merged message should have 2 content blocks");
+        assert_eq!(
+            content.len(),
+            2,
+            "Merged message should have 2 content blocks"
+        );
         assert_eq!(content[0]["type"], "tool_result");
         assert_eq!(content[0]["tool_use_id"], "call_1");
         assert_eq!(content[1]["type"], "tool_result");

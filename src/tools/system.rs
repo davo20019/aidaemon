@@ -31,10 +31,7 @@ impl Tool for SystemInfoTool {
         let mut info = String::new();
 
         // Hostname
-        if let Ok(output) = tokio::process::Command::new("hostname")
-            .output()
-            .await
-        {
+        if let Ok(output) = tokio::process::Command::new("hostname").output().await {
             let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
             info.push_str(&format!("Hostname: {}\n", hostname));
         }
@@ -50,10 +47,7 @@ impl Tool for SystemInfoTool {
         }
 
         // Uptime
-        if let Ok(output) = tokio::process::Command::new("uptime")
-            .output()
-            .await
-        {
+        if let Ok(output) = tokio::process::Command::new("uptime").output().await {
             let uptime = String::from_utf8_lossy(&output.stdout).trim().to_string();
             info.push_str(&format!("Uptime: {}\n", uptime));
         }
@@ -73,10 +67,7 @@ impl Tool for SystemInfoTool {
 
         #[cfg(target_os = "macos")]
         {
-            if let Ok(output) = tokio::process::Command::new("vm_stat")
-                .output()
-                .await
-            {
+            if let Ok(output) = tokio::process::Command::new("vm_stat").output().await {
                 let mem = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 info.push_str(&format!("Memory:\n{}\n", mem));
             }

@@ -7,10 +7,10 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::skills::{SharedSkillRegistry, Skill};
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::skill_registry;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::{build_browser_client, validate_url_for_ssrf};
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{DynamicSkill, StateStore, Tool};
 use crate::types::ApprovalResponse;
 
@@ -45,7 +45,11 @@ impl ManageSkillsTool {
     }
 
     #[allow(dead_code)] // Available for future approval flow on add/install
-    async fn request_approval(&self, session_id: &str, description: &str) -> anyhow::Result<ApprovalResponse> {
+    async fn request_approval(
+        &self,
+        session_id: &str,
+        description: &str,
+    ) -> anyhow::Result<ApprovalResponse> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.approval_tx
             .send(ApprovalRequest {
@@ -53,7 +57,7 @@ impl ManageSkillsTool {
                 session_id: session_id.to_string(),
                 risk_level: RiskLevel::Medium,
                 warnings: vec![
-                    "This will add a new skill that can influence AI behavior".to_string(),
+                    "This will add a new skill that can influence AI behavior".to_string()
                 ],
                 permission_mode: PermissionMode::Default,
                 response_tx,
@@ -67,7 +71,10 @@ impl ManageSkillsTool {
                 Ok(ApprovalResponse::Deny)
             }
             Err(_) => {
-                tracing::warn!(description, "Approval request timed out (300s), auto-denying");
+                tracing::warn!(
+                    description,
+                    "Approval request timed out (300s), auto-denying"
+                );
                 Ok(ApprovalResponse::Deny)
             }
         }
@@ -108,10 +115,17 @@ impl ManageSkillsTool {
         self.persist_and_register(skill, None).await
     }
 
-    async fn persist_and_register(&self, skill: Skill, version: Option<String>) -> anyhow::Result<String> {
+    async fn persist_and_register(
+        &self,
+        skill: Skill,
+        version: Option<String>,
+    ) -> anyhow::Result<String> {
         // Check for duplicate name
         if self.registry.find(&skill.name).await.is_some() {
-            return Ok(format!("A skill named '{}' already exists. Remove it first or choose a different name.", skill.name));
+            return Ok(format!(
+                "A skill named '{}' already exists. Remove it first or choose a different name.",
+                skill.name
+            ));
         }
 
         // Persist to database
@@ -127,7 +141,8 @@ impl ManageSkillsTool {
             enabled: true,
             version,
             created_at: String::new(),
-            resources_json: serde_json::to_string(&skill.resources).unwrap_or_else(|_| "[]".to_string()),
+            resources_json: serde_json::to_string(&skill.resources)
+                .unwrap_or_else(|_| "[]".to_string()),
         };
         let db_id = self.state.add_dynamic_skill(&dynamic).await?;
 
@@ -139,7 +154,10 @@ impl ManageSkillsTool {
         self.registry.add(registered).await;
 
         info!(name = %name, id = db_id, "Dynamic skill added");
-        Ok(format!("Skill '{}' added and activated (id: {}). Description: {}", name, db_id, desc))
+        Ok(format!(
+            "Skill '{}' added and activated (id: {}). Description: {}",
+            name, db_id, desc
+        ))
     }
 
     async fn handle_list(&self) -> anyhow::Result<String> {
@@ -152,7 +170,10 @@ impl ManageSkillsTool {
         for skill in &skills {
             let source = skill.source.as_deref().unwrap_or("filesystem");
             let status = if skill.enabled { "enabled" } else { "disabled" };
-            let id_str = skill.id.map(|id| format!(" (id: {})", id)).unwrap_or_default();
+            let id_str = skill
+                .id
+                .map(|id| format!(" (id: {})", id))
+                .unwrap_or_default();
             output.push_str(&format!(
                 "- **{}**{}: {} [source: {}, {}]\n",
                 skill.name, id_str, skill.description, source, status
@@ -271,7 +292,12 @@ impl ManageSkillsTool {
 
         let entry = match target_entry {
             Some(e) => e,
-            None => return Ok(format!("Skill '{}' not found in any configured registry.", name)),
+            None => {
+                return Ok(format!(
+                    "Skill '{}' not found in any configured registry.",
+                    name
+                ))
+            }
         };
 
         // Fetch the skill content
@@ -282,7 +308,12 @@ impl ManageSkillsTool {
                 s.source_url = Some(entry.url.clone());
                 s
             }
-            None => return Ok(format!("Failed to parse skill '{}' from registry URL.", name)),
+            None => {
+                return Ok(format!(
+                    "Failed to parse skill '{}' from registry URL.",
+                    name
+                ))
+            }
         };
 
         self.persist_and_register(skill, entry.version).await
@@ -300,14 +331,22 @@ impl ManageSkillsTool {
 
         let source_url = match &existing.source_url {
             Some(url) => url.clone(),
-            None => return Ok(format!("Skill '{}' has no source URL and cannot be updated.", name)),
+            None => {
+                return Ok(format!(
+                    "Skill '{}' has no source URL and cannot be updated.",
+                    name
+                ))
+            }
         };
 
         // Re-fetch from source URL
         validate_url_for_ssrf(&source_url).map_err(|e| anyhow::anyhow!("URL blocked: {}", e))?;
         let response = self.client.get(&source_url).send().await?;
         if !response.status().is_success() {
-            return Ok(format!("Failed to fetch skill update: HTTP {}", response.status()));
+            return Ok(format!(
+                "Failed to fetch skill update: HTTP {}",
+                response.status()
+            ));
         }
 
         let content = response.text().await?;
@@ -461,7 +500,10 @@ mod tests {
 
     #[test]
     fn ssrf_valid_urls() {
-        assert!(validate_url_for_ssrf("https://raw.githubusercontent.com/user/repo/main/skill.md").is_ok());
+        assert!(
+            validate_url_for_ssrf("https://raw.githubusercontent.com/user/repo/main/skill.md")
+                .is_ok()
+        );
         assert!(validate_url_for_ssrf("https://example.com/skills/deploy.md").is_ok());
     }
 }

@@ -68,10 +68,7 @@ impl Tool for SkillResourcesTool {
         match action {
             "list" => {
                 if skill.resources.is_empty() {
-                    return Ok(format!(
-                        "Skill '{}' has no bundled resources.",
-                        skill_name
-                    ));
+                    return Ok(format!("Skill '{}' has no bundled resources.", skill_name));
                 }
                 let mut out = format!("Resources for '{}':\n", skill_name);
                 for entry in &skill.resources {

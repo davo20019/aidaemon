@@ -100,8 +100,16 @@ async fn imap_idle_loop(
                         .and_then(|e: &Envelope| e.from.as_deref())
                         .and_then(|addrs: &[async_imap::imap_proto::Address]| addrs.first())
                         .map(|a| {
-                            let mailbox = a.mailbox.as_ref().map(|m| String::from_utf8_lossy(m).to_string()).unwrap_or_default();
-                            let host_part = a.host.as_ref().map(|h| String::from_utf8_lossy(h).to_string()).unwrap_or_default();
+                            let mailbox = a
+                                .mailbox
+                                .as_ref()
+                                .map(|m| String::from_utf8_lossy(m).to_string())
+                                .unwrap_or_default();
+                            let host_part = a
+                                .host
+                                .as_ref()
+                                .map(|h| String::from_utf8_lossy(h).to_string())
+                                .unwrap_or_default();
                             format!("{}@{}", mailbox, host_part)
                         })
                         .unwrap_or_else(|| "unknown".to_string());
@@ -110,6 +118,7 @@ async fn imap_idle_loop(
                         source: "email".to_string(),
                         session_id: "email_trigger".to_string(),
                         content: format!("New email from {}: {}", from, subject),
+                        trusted: false,
                     };
 
                     if sender.send(event).is_err() {

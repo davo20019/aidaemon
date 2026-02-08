@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Visibility level of the channel the message originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,10 +87,16 @@ pub struct ChannelContext {
     pub channel_id: Option<String>,
     /// Display name of the message sender, if resolved (e.g., "Alice", "Bob Smith")
     pub sender_name: Option<String>,
+    /// Platform-qualified sender ID (e.g., "slack:U04S8KSS932", "telegram:123456")
+    pub sender_id: Option<String>,
     /// Display names of members in the channel (for group channels; empty for DMs)
     pub channel_member_names: Vec<String>,
     /// User ID → display name lookup (e.g., "U04S8KSS932" → "Alice") for resolving IDs in facts
     pub user_id_map: HashMap<String, String>,
+    /// Whether this session is explicitly trusted (e.g., a trusted scheduled task).
+    /// Trusted sessions can bypass terminal command approval for allowed commands.
+    /// This must be set explicitly by the scheduler — never derived from session ID strings.
+    pub trusted: bool,
 }
 
 impl ChannelContext {
@@ -104,8 +110,10 @@ impl ChannelContext {
             channel_name: None,
             channel_id: None,
             sender_name: None,
+            sender_id: None,
             channel_member_names: vec![],
             user_id_map: HashMap::new(),
+            trusted: false,
         }
     }
 
@@ -117,8 +125,25 @@ impl ChannelContext {
             channel_name: None,
             channel_id: None,
             sender_name: None,
+            sender_id: None,
             channel_member_names: vec![],
             user_id_map: HashMap::new(),
+            trusted: false,
+        }
+    }
+
+    /// Context for trusted internal sessions (e.g., explicitly trusted scheduled tasks).
+    pub fn internal_trusted() -> Self {
+        Self {
+            visibility: ChannelVisibility::Internal,
+            platform: "internal".to_string(),
+            channel_name: None,
+            channel_id: None,
+            sender_name: None,
+            sender_id: None,
+            channel_member_names: vec![],
+            user_id_map: HashMap::new(),
+            trusted: true,
         }
     }
 
@@ -239,10 +264,7 @@ pub enum MediaKind {
     /// An in-memory photo (e.g. screenshot).
     Photo { data: Vec<u8> },
     /// A file on disk to send as a document.
-    Document {
-        file_path: String,
-        filename: String,
-    },
+    Document { file_path: String, filename: String },
 }
 
 /// A media message to be sent through a channel.

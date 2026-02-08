@@ -70,19 +70,14 @@ impl BrowserTool {
             )
         })?;
 
-        let (browser, mut handler) =
-            Browser::launch(browser_config)
-                .await
-                .map_err(|e| {
-                    format!(
-                    "Failed to launch browser: {}. Make sure Chrome or Chromium is installed.",
-                    e
-                )
-                })?;
+        let (browser, mut handler) = Browser::launch(browser_config).await.map_err(|e| {
+            format!(
+                "Failed to launch browser: {}. Make sure Chrome or Chromium is installed.",
+                e
+            )
+        })?;
 
-        let handle = tokio::spawn(async move {
-            while handler.next().await.is_some() {}
-        });
+        let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
         info!("Browser launched successfully");
         *guard = Some(browser);
@@ -322,8 +317,7 @@ impl BrowserTool {
         self.ensure_browser().await?;
         let page = self.get_page().await?;
 
-        let deadline = tokio::time::Instant::now()
-            + tokio::time::Duration::from_secs(timeout_secs);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
 
         loop {
             match page.find_element(selector).await {
@@ -409,10 +403,7 @@ impl Tool for BrowserTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
 
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
         let session_id = args
             .get("_session_id")

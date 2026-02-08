@@ -219,11 +219,7 @@ mod tests {
             Ok(())
         }
 
-        async fn send_media(
-            &self,
-            _session_id: &str,
-            _media: &MediaMessage,
-        ) -> anyhow::Result<()> {
+        async fn send_media(&self, _session_id: &str, _media: &MediaMessage) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -334,10 +330,8 @@ mod tests {
         let ch_telegram_dyn: Arc<dyn Channel> = ch_telegram.clone();
         let ch_slack_dyn: Arc<dyn Channel> = ch_slack.clone();
 
-        let session_map = session_map_with(vec![
-            ("sess_telegram", "telegram"),
-            ("sess_slack", "slack"),
-        ]);
+        let session_map =
+            session_map_with(vec![("sess_telegram", "telegram"), ("sess_slack", "slack")]);
         let hub = ChannelHub::new(vec![ch_telegram_dyn, ch_slack_dyn], session_map);
 
         let ids = vec!["sess_telegram".to_string(), "sess_slack".to_string()];

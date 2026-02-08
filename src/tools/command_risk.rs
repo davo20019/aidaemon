@@ -1,6 +1,6 @@
-use std::path::Path;
 use serde::Deserialize;
 use shell_words;
+use std::path::Path;
 
 /// Permission persistence mode for terminal commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -53,54 +53,101 @@ pub struct RiskAssessment {
 /// These are matched as path segments (between / or at start/end) to avoid false positives.
 const SENSITIVE_PATH_SEGMENTS: &[&str] = &[
     ".env",
-    "id_rsa", "id_ed25519", "id_dsa", "id_ecdsa",  // SSH keys
-    "known_hosts", "authorized_keys",
-    ".aws", ".kube", ".docker",  // Cloud/container configs
-    "shadow", "passwd", "sudoers",  // System auth files
-    "master.key", "credentials", "secrets",
-    ".netrc", ".pgpass",  // Service credentials
+    "id_rsa",
+    "id_ed25519",
+    "id_dsa",
+    "id_ecdsa", // SSH keys
+    "known_hosts",
+    "authorized_keys",
+    ".aws",
+    ".kube",
+    ".docker", // Cloud/container configs
+    "shadow",
+    "passwd",
+    "sudoers", // System auth files
+    "master.key",
+    "credentials",
+    "secrets",
+    ".netrc",
+    ".pgpass", // Service credentials
 ];
 
 /// Commands that can cause significant system damage or security issues.
 const CRITICAL_COMMANDS: &[&str] = &[
     // Destructive file operations
-    "dd", "mkfs", "fdisk", "rm", "shred",
+    "dd",
+    "mkfs",
+    "fdisk",
+    "rm",
+    "shred",
     // System control
-    "shutdown", "reboot", "halt", "poweroff", "init",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    "init",
     // File/permission changes
-    "mv", "chmod", "chown", "chattr",
+    "mv",
+    "chmod",
+    "chown",
+    "chattr",
     // Privilege escalation
-    "sudo", "su", "doas",
+    "sudo",
+    "su",
+    "doas",
     // Process control
-    "kill", "pkill", "killall",
+    "kill",
+    "pkill",
+    "killall",
     // Service/system management
-    "systemctl", "service", "launchctl",
+    "systemctl",
+    "service",
+    "launchctl",
     // Scheduled tasks
-    "crontab", "at",
+    "crontab",
+    "at",
     // Filesystem
-    "mount", "umount",
+    "mount",
+    "umount",
     // User management
-    "useradd", "userdel", "usermod", "passwd",
+    "useradd",
+    "userdel",
+    "usermod",
+    "passwd",
     // Network/firewall
-    "iptables", "ufw", "firewall-cmd",
+    "iptables",
+    "ufw",
+    "firewall-cmd",
     // Indirect execution (can bypass safety checks via indirection)
-    "eval", "exec", "source",
+    "eval",
+    "exec",
+    "source",
 ];
 
 const NETWORK_COMMANDS: &[&str] = &[
-    "curl", "wget", "nc", "netcat", "ncat",
-    "ssh", "scp", "sftp", "rsync",
-    "telnet", "ftp",
-    "nmap", "ping", "traceroute",
+    "curl",
+    "wget",
+    "nc",
+    "netcat",
+    "ncat",
+    "ssh",
+    "scp",
+    "sftp",
+    "rsync",
+    "telnet",
+    "ftp",
+    "nmap",
+    "ping",
+    "traceroute",
 ];
 
 /// Commands that "amplify" risk when they receive piped input.
 /// Piping to these commands is always Critical because they can execute arbitrary code.
 const PIPE_AMPLIFIERS: &[&str] = &[
-    "bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh",  // Shells
-    "eval", "exec", "xargs",                                     // Execution
-    "sudo", "su", "doas",                                        // Privilege escalation
-    "python", "python3", "ruby", "perl", "node",                 // Script interpreters
+    "bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh", // Shells
+    "eval", "exec", "xargs", // Execution
+    "sudo", "su", "doas", // Privilege escalation
+    "python", "python3", "ruby", "perl", "node", // Script interpreters
 ];
 
 /// Split a command string by shell operators while respecting quotes.
@@ -303,7 +350,10 @@ fn classify_single_segment(segment: &str) -> RiskAssessment {
     };
 
     if parts.is_empty() {
-        return RiskAssessment { level: RiskLevel::Safe, warnings: vec![] };
+        return RiskAssessment {
+            level: RiskLevel::Safe,
+            warnings: vec![],
+        };
     }
 
     let base_cmd = Path::new(&parts[0])
@@ -318,8 +368,8 @@ fn classify_single_segment(segment: &str) -> RiskAssessment {
 
         // Escalation for rm with recursive + force flags
         if base_cmd == "rm" && is_recursive_force_delete(&parts) {
-             level = RiskLevel::Critical;
-             warnings.push("Deletes files recursively without confirmation".to_string());
+            level = RiskLevel::Critical;
+            warnings.push("Deletes files recursively without confirmation".to_string());
         }
     } else if NETWORK_COMMANDS.contains(&base_cmd) {
         level = std::cmp::max(level, RiskLevel::Medium);
@@ -351,7 +401,10 @@ fn classify_single_segment(segment: &str) -> RiskAssessment {
             }
         }
         "aws" => {
-            if parts.iter().any(|a| a.contains("delete") || a.contains("remove") || a.contains("terminate")) {
+            if parts
+                .iter()
+                .any(|a| a.contains("delete") || a.contains("remove") || a.contains("terminate"))
+            {
                 level = std::cmp::max(level, RiskLevel::High);
                 warnings.push("AWS destructive operation".to_string());
             }
@@ -380,8 +433,12 @@ fn classify_single_segment(segment: &str) -> RiskAssessment {
         }
 
         // Check for system directories (only warn once)
-        if !found_system_dir && (arg.starts_with("/etc") || arg.starts_with("/boot") ||
-            arg.starts_with("/sys") || arg.starts_with("/proc")) {
+        if !found_system_dir
+            && (arg.starts_with("/etc")
+                || arg.starts_with("/boot")
+                || arg.starts_with("/sys")
+                || arg.starts_with("/proc"))
+        {
             found_system_dir = true;
             level = std::cmp::max(level, RiskLevel::High);
             warnings.push("Accesses protected system directory".to_string());
@@ -413,7 +470,10 @@ pub fn classify_command(command: &str) -> RiskAssessment {
         if prev_was_pipe && is_pipe_amplifier(segment) {
             max_level = RiskLevel::Critical;
             let base = segment.split_whitespace().next().unwrap_or(segment);
-            all_warnings.push(format!("Pipes to '{}' which can execute arbitrary code", base));
+            all_warnings.push(format!(
+                "Pipes to '{}' which can execute arbitrary code",
+                base
+            ));
         }
 
         // Classify this segment
@@ -448,7 +508,10 @@ pub fn classify_command(command: &str) -> RiskAssessment {
         }
     }
 
-    RiskAssessment { level: max_level, warnings: all_warnings }
+    RiskAssessment {
+        level: max_level,
+        warnings: all_warnings,
+    }
 }
 
 #[cfg(test)]
@@ -559,7 +622,10 @@ mod tests {
         // Piping to shell/interpreter is Critical
         let assessment = classify_command("curl http://example.com | bash");
         assert_eq!(assessment.level, RiskLevel::Critical);
-        assert!(assessment.warnings.iter().any(|w| w.contains("execute arbitrary")));
+        assert!(assessment
+            .warnings
+            .iter()
+            .any(|w| w.contains("execute arbitrary")));
 
         let assessment = classify_command("cat script.sh | sh");
         assert_eq!(assessment.level, RiskLevel::Critical);
@@ -693,10 +759,16 @@ mod tests {
         // Multiple /etc paths should only produce one warning
         let assessment = classify_command("cat /etc/hosts /etc/resolv.conf /etc/fstab");
         assert_eq!(assessment.level, RiskLevel::High);
-        let system_dir_warnings: Vec<_> = assessment.warnings.iter()
+        let system_dir_warnings: Vec<_> = assessment
+            .warnings
+            .iter()
             .filter(|w| w.contains("system directory"))
             .collect();
-        assert_eq!(system_dir_warnings.len(), 1, "Should only have one system directory warning");
+        assert_eq!(
+            system_dir_warnings.len(),
+            1,
+            "Should only have one system directory warning"
+        );
     }
 
     #[test]
@@ -741,7 +813,10 @@ mod tests {
         // Terraform destroy is Critical
         let assessment = classify_command("terraform destroy");
         assert_eq!(assessment.level, RiskLevel::Critical);
-        assert!(assessment.warnings.iter().any(|w| w.contains("terraform destroy")));
+        assert!(assessment
+            .warnings
+            .iter()
+            .any(|w| w.contains("terraform destroy")));
 
         // Terraform apply is High
         let assessment = classify_command("terraform apply");
@@ -750,7 +825,10 @@ mod tests {
         // kubectl delete
         let assessment = classify_command("kubectl delete pod my-pod");
         assert_eq!(assessment.level, RiskLevel::High);
-        assert!(assessment.warnings.iter().any(|w| w.contains("kubectl delete")));
+        assert!(assessment
+            .warnings
+            .iter()
+            .any(|w| w.contains("kubectl delete")));
 
         // AWS destructive
         let assessment = classify_command("aws ec2 terminate-instances --instance-ids i-1234");
@@ -772,10 +850,16 @@ mod tests {
     fn test_user_friendly_warnings() {
         // Check that warnings are user-friendly, not technical jargon
         let assessment = classify_command("rm file.txt");
-        assert!(assessment.warnings.iter().any(|w| w.contains("modify system state")));
+        assert!(assessment
+            .warnings
+            .iter()
+            .any(|w| w.contains("modify system state")));
 
         let assessment = classify_command("curl https://example.com");
-        assert!(assessment.warnings.iter().any(|w| w.contains("accesses the network")));
+        assert!(assessment
+            .warnings
+            .iter()
+            .any(|w| w.contains("accesses the network")));
 
         let assessment = classify_command("cat file | grep pattern");
         assert!(assessment.warnings.iter().any(|w| w.contains("pipes")));

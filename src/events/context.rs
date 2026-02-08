@@ -9,9 +9,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use super::{
-    Event, EventStore, EventType, TaskStatus,
-    ErrorData, TaskEndData, TaskStartData, ThinkingStartData, ToolCallData, ToolResultData,
-    SubAgentSpawnData,
+    ErrorData, Event, EventStore, EventType, SubAgentSpawnData, TaskEndData, TaskStartData,
+    TaskStatus, ThinkingStartData, ToolCallData, ToolResultData,
 };
 use crate::utils::truncate_str;
 
@@ -185,7 +184,10 @@ impl SessionContext {
                 .iter()
                 .map(|sa| format!("depth {}: \"{}\"", sa.depth, truncate_str(&sa.mission, 30)))
                 .collect();
-            lines.push(format!("- **Sub-agents:** {}", sub_agent_summary.join("; ")));
+            lines.push(format!(
+                "- **Sub-agents:** {}",
+                sub_agent_summary.join("; ")
+            ));
         }
 
         lines.push(String::new());
@@ -332,9 +334,8 @@ impl SessionContextCompiler {
         }
 
         // Find last completed task
-        if let Some((_task_id, (end_event, end_data))) = task_ends
-            .iter()
-            .max_by_key(|(_, (e, _))| e.created_at)
+        if let Some((_task_id, (end_event, end_data))) =
+            task_ends.iter().max_by_key(|(_, (e, _))| e.created_at)
         {
             let description = task_starts
                 .get(&end_data.task_id)
@@ -414,14 +415,12 @@ mod tests {
                 tool_name: Some("terminal".to_string()),
                 recovered: false,
             }),
-            recent_tools: vec![
-                RecentTool {
-                    name: "terminal".to_string(),
-                    summary: "git status".to_string(),
-                    success: true,
-                    timestamp: Utc::now(),
-                },
-            ],
+            recent_tools: vec![RecentTool {
+                name: "terminal".to_string(),
+                summary: "git status".to_string(),
+                success: true,
+                timestamp: Utc::now(),
+            }],
             ..Default::default()
         };
 

@@ -106,7 +106,7 @@ impl Tool for SendFileTool {
     }
 
     fn description(&self) -> &str {
-        "Send a file to the user via Telegram. Validates the path is within allowed directories and not a sensitive file."
+        "Send a file to the user in the current chat. ALWAYS use this tool when the user asks you to send, share, or deliver a file. Validates the path is within allowed directories and not a sensitive file."
     }
 
     fn schema(&self) -> Value {
@@ -138,10 +138,7 @@ impl Tool for SendFileTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: file_path"))?;
 
-        let caption = args
-            .get("caption")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let caption = args.get("caption").and_then(|v| v.as_str()).unwrap_or("");
 
         let session_id = args
             .get("_session_id")

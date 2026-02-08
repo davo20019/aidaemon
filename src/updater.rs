@@ -91,7 +91,18 @@ impl Updater {
     }
 
     /// Download the latest release and replace the current binary.
+    ///
+    /// SECURITY NOTE: The download relies on HTTPS transport security only.
+    /// No cryptographic signature or checksum verification of the binary is
+    /// performed. If the GitHub repository or release assets are compromised,
+    /// a malicious binary could be distributed. For maximum security, use
+    /// `UpdateMode::CheckOnly` to require manual approval before applying
+    /// updates, or `UpdateMode::Disable` to manage updates out-of-band.
     fn perform_update() -> anyhow::Result<String> {
+        warn!(
+            "Applying update with HTTPS transport security only — \
+             no binary signature verification is available"
+        );
         let identifier = Self::platform_asset_identifier()?;
         let target_asset = format!("{}-{}.tar.gz", BIN_NAME, identifier);
 
@@ -152,10 +163,7 @@ impl Updater {
 
     /// Notify users that an update was applied and restart is imminent.
     async fn notify_update_applied(&self, new_version: &str) {
-        let message = format!(
-            "aidaemon updated to v{}. Restarting now...",
-            new_version
-        );
+        let message = format!("aidaemon updated to v{}. Restarting now...", new_version);
         self.hub
             .broadcast_text(&self.notify_session_ids, &message)
             .await;
@@ -260,24 +268,22 @@ impl Updater {
             .await;
 
         match self.config.mode {
-            UpdateMode::Enable => {
-                match Self::perform_update_async().await {
-                    Ok(version) => {
-                        self.notify_update_applied(&version).await;
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        Self::restart_service();
-                    }
-                    Err(e) => {
-                        error!("Failed to apply update: {}", e);
-                        self.hub
-                            .broadcast_text(
-                                &self.notify_session_ids,
-                                &format!("Failed to apply update to v{}: {}", new_version, e),
-                            )
-                            .await;
-                    }
+            UpdateMode::Enable => match Self::perform_update_async().await {
+                Ok(version) => {
+                    self.notify_update_applied(&version).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Self::restart_service();
                 }
-            }
+                Err(e) => {
+                    error!("Failed to apply update: {}", e);
+                    self.hub
+                        .broadcast_text(
+                            &self.notify_session_ids,
+                            &format!("Failed to apply update to v{}: {}", new_version, e),
+                        )
+                        .await;
+                }
+            },
             UpdateMode::CheckOnly => {
                 if self.request_update_approval(&new_version).await {
                     match Self::perform_update_async().await {
@@ -291,10 +297,7 @@ impl Updater {
                             self.hub
                                 .broadcast_text(
                                     &self.notify_session_ids,
-                                    &format!(
-                                        "Failed to apply update to v{}: {}",
-                                        new_version, e
-                                    ),
+                                    &format!("Failed to apply update to v{}: {}", new_version, e),
                                 )
                                 .await;
                         }
@@ -336,10 +339,7 @@ impl Updater {
     /// Calculate how long to sleep until the next occurrence of a given UTC hour.
     fn duration_until_utc_hour(hour: u8) -> Duration {
         let now = Utc::now();
-        let today_target = now
-            .date_naive()
-            .and_hms_opt(hour as u32, 0, 0)
-            .unwrap();
+        let today_target = now.date_naive().and_hms_opt(hour as u32, 0, 0).unwrap();
         let today_target_utc =
             chrono::DateTime::<Utc>::from_naive_utc_and_offset(today_target, Utc);
         let target = if now < today_target_utc {
@@ -347,8 +347,6 @@ impl Updater {
         } else {
             today_target_utc + chrono::Duration::days(1)
         };
-        (target - now)
-            .to_std()
-            .unwrap_or(Duration::from_secs(3600))
+        (target - now).to_std().unwrap_or(Duration::from_secs(3600))
     }
 }

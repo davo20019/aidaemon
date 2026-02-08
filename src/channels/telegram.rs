@@ -7,22 +7,30 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use chrono::Utc;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode};
+use teloxide::types::{
+    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode,
+};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use super::formatting::{
+    build_help_text, format_number, html_escape, markdown_to_telegram_html, sanitize_filename,
+    split_message,
+};
 use crate::agent::Agent;
-use crate::channels::{ChannelHub, SessionMap};
 #[cfg(feature = "discord")]
-use crate::channels::{DiscordChannel, spawn_discord_channel};
+use crate::channels::{spawn_discord_channel, DiscordChannel};
 #[cfg(feature = "slack")]
-use crate::channels::{SlackChannel, spawn_slack_channel};
-use super::formatting::{build_help_text, markdown_to_telegram_html, html_escape, split_message, format_number, sanitize_filename};
+use crate::channels::{spawn_slack_channel, SlackChannel};
+use crate::channels::{ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
-use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, MediaKind, MediaMessage, StatusUpdate, UserRole};
+use crate::types::{
+    ApprovalResponse, ChannelContext, ChannelVisibility, MediaKind, MediaMessage, StatusUpdate,
+    UserRole,
+};
 
 pub struct TelegramChannel {
     /// Bot username fetched from Telegram API (e.g., "coding_bot", "debug_bot").
@@ -111,7 +119,9 @@ impl TelegramChannel {
         let mut doc: toml::Table = content.parse()?;
 
         let ids_toml = toml::Value::Array(
-            ids.iter().map(|&id| toml::Value::Integer(id as i64)).collect(),
+            ids.iter()
+                .map(|&id| toml::Value::Integer(id as i64))
+                .collect(),
         );
 
         // Update whichever config format exists: [telegram] or [[telegram_bots]]
@@ -150,7 +160,10 @@ impl TelegramChannel {
         // Fetch from Telegram API
         match self.bot.get_me().await {
             Ok(me) => {
-                let username = me.username.clone().unwrap_or_else(|| "telegram".to_string());
+                let username = me
+                    .username
+                    .clone()
+                    .unwrap_or_else(|| "telegram".to_string());
                 // Update both bot_username and cached_channel_name
                 if let Ok(mut guard) = self.bot_username.write() {
                     *guard = username.clone();
@@ -235,30 +248,26 @@ impl TelegramChannel {
         info!(name = %bot_username, "Starting Telegram channel");
 
         let handler = dptree::entry()
-            .branch(
-                Update::filter_message().endpoint({
-                    let channel = Arc::clone(&self);
-                    move |msg: teloxide::types::Message, bot: Bot| {
-                        let channel = Arc::clone(&channel);
-                        async move {
-                            channel.handle_message(msg, bot).await;
-                            respond(())
-                        }
+            .branch(Update::filter_message().endpoint({
+                let channel = Arc::clone(&self);
+                move |msg: teloxide::types::Message, bot: Bot| {
+                    let channel = Arc::clone(&channel);
+                    async move {
+                        channel.handle_message(msg, bot).await;
+                        respond(())
                     }
-                }),
-            )
-            .branch(
-                Update::filter_callback_query().endpoint({
-                    let channel = Arc::clone(&self);
-                    move |q: CallbackQuery, bot: Bot| {
-                        let channel = Arc::clone(&channel);
-                        async move {
-                            channel.handle_callback(q, bot).await;
-                            respond(())
-                        }
+                }
+            }))
+            .branch(Update::filter_callback_query().endpoint({
+                let channel = Arc::clone(&self);
+                move |q: CallbackQuery, bot: Bot| {
+                    let channel = Arc::clone(&channel);
+                    async move {
+                        channel.handle_callback(q, bot).await;
+                        respond(())
                     }
-                }),
-            );
+                }
+            }));
 
         Dispatcher::builder(self.bot.clone(), handler)
             .enable_ctrlc_handler()
@@ -278,7 +287,10 @@ impl TelegramChannel {
         };
         if !is_authorized {
             warn!(user_id, "Unauthorized callback from user");
-            let _ = bot.answer_callback_query(q.id).text(format!("Unauthorized. Your ID: {}", user_id)).await;
+            let _ = bot
+                .answer_callback_query(q.id)
+                .text(format!("Unauthorized. Your ID: {}", user_id))
+                .await;
             return;
         }
 
@@ -342,32 +354,33 @@ impl TelegramChannel {
                     format!("Current model: {}\n\nUsage: /model <model-name>\nExample: /model gemini-3-pro-preview", current)
                 } else {
                     self.agent.set_model(arg.to_string()).await;
-                    format!("Model switched to: {}\nAuto-routing disabled. Use /auto to re-enable.", arg)
+                    format!(
+                        "Model switched to: {}\nAuto-routing disabled. Use /auto to re-enable.",
+                        arg
+                    )
                 }
             }
-            "/models" => {
-                match self.agent.list_models().await {
-                    Ok(models) => {
-                        if models.is_empty() {
-                            "No models found from provider.".to_string()
-                        } else {
-                            let current = self.agent.current_model().await;
-                            let list: Vec<String> = models
-                                .iter()
-                                .map(|m| {
-                                    if *m == current {
-                                        format!("• {} (active)", m)
-                                    } else {
-                                        format!("• {}", m)
-                                    }
-                                })
-                                .collect();
-                            format!("Available models:\n{}", list.join("\n"))
-                        }
+            "/models" => match self.agent.list_models().await {
+                Ok(models) => {
+                    if models.is_empty() {
+                        "No models found from provider.".to_string()
+                    } else {
+                        let current = self.agent.current_model().await;
+                        let list: Vec<String> = models
+                            .iter()
+                            .map(|m| {
+                                if *m == current {
+                                    format!("• {} (active)", m)
+                                } else {
+                                    format!("• {}", m)
+                                }
+                            })
+                            .collect();
+                        format!("Available models:\n{}", list.join("\n"))
                     }
-                    Err(e) => format!("Failed to list models: {}", e),
                 }
-            }
+                Err(e) => format!("Failed to list models: {}", e),
+            },
             "/auto" => {
                 self.agent.clear_model_override().await;
                 "Auto-routing re-enabled. Model will be selected automatically based on query complexity.".to_string()
@@ -457,19 +470,17 @@ impl TelegramChannel {
                     Err(e) => format!("Failed to clear context: {}", e),
                 }
             }
-            "/cost" => {
-                self.handle_cost_command().await
-            }
+            "/cost" => self.handle_cost_command().await,
             "/connect" => {
-                self.handle_connect_command(arg, msg.from.as_ref().map(|u| u.id.0).unwrap_or(0)).await
+                self.handle_connect_command(arg, msg.from.as_ref().map(|u| u.id.0).unwrap_or(0))
+                    .await
             }
-            "/bots" => {
-                self.handle_bots_command().await
-            }
-            "/help" | "/start" => {
-                build_help_text(true, true)
-            }
-            _ => format!("Unknown command: {}\nType /help for available commands.", cmd),
+            "/bots" => self.handle_bots_command().await,
+            "/help" | "/start" => build_help_text(true, true, "/"),
+            _ => format!(
+                "Unknown command: {}\nType /help for available commands.",
+                cmd
+            ),
         };
 
         let _ = bot.send_message(msg.chat.id, reply).await;
@@ -487,7 +498,9 @@ impl TelegramChannel {
             (
                 doc.file.id.clone(),
                 doc.file.size as u64,
-                doc.file_name.clone().unwrap_or_else(|| "document".to_string()),
+                doc.file_name
+                    .clone()
+                    .unwrap_or_else(|| "document".to_string()),
                 doc.mime_type
                     .as_ref()
                     .map(|m| m.to_string())
@@ -495,7 +508,9 @@ impl TelegramChannel {
             )
         } else if let Some(photos) = msg.photo() {
             // Last photo in the array is the largest
-            let photo = photos.last().ok_or_else(|| anyhow::anyhow!("Empty photo array"))?;
+            let photo = photos
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("Empty photo array"))?;
             (
                 photo.file.id.clone(),
                 photo.file.size as u64,
@@ -557,8 +572,7 @@ impl TelegramChannel {
 
         // Get file info from Telegram
         let file = bot.get_file(file_id).await?;
-        let file_path_on_server = file
-            .path;
+        let file_path_on_server = file.path;
 
         // Download via HTTP (simpler than teloxide's Download trait)
         let download_url = format!(
@@ -567,7 +581,10 @@ impl TelegramChannel {
         );
         let response = reqwest::get(&download_url).await?;
         if !response.status().is_success() {
-            anyhow::bail!("Failed to download file from Telegram: HTTP {}", response.status());
+            anyhow::bail!(
+                "Failed to download file from Telegram: HTTP {}",
+                response.status()
+            );
         }
         let bytes = response.bytes().await?;
 
@@ -617,8 +634,12 @@ impl TelegramChannel {
         use std::collections::HashMap as StdHashMap;
 
         let now = Utc::now();
-        let since_24h = (now - chrono::Duration::hours(24)).format("%Y-%m-%d %H:%M:%S").to_string();
-        let since_7d = (now - chrono::Duration::days(7)).format("%Y-%m-%d %H:%M:%S").to_string();
+        let since_24h = (now - chrono::Duration::hours(24))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let since_7d = (now - chrono::Duration::days(7))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
 
         let records_24h = match self.state.get_token_usage_since(&since_24h).await {
             Ok(r) => r,
@@ -729,7 +750,10 @@ impl TelegramChannel {
         let me = match test_bot.get_me().await {
             Ok(me) => me,
             Err(e) => {
-                return format!("Invalid token: {}\n\nMake sure you copied the full token from @BotFather.", e);
+                return format!(
+                    "Invalid token: {}\n\nMake sure you copied the full token from @BotFather.",
+                    e
+                );
             }
         };
 
@@ -753,7 +777,13 @@ impl TelegramChannel {
         }
 
         // Save the new bot with same allowed users as current bot
-        let allowed_user_ids_str: Vec<String> = self.allowed_user_ids.read().unwrap().iter().map(|id| id.to_string()).collect();
+        let allowed_user_ids_str: Vec<String> = self
+            .allowed_user_ids
+            .read()
+            .unwrap()
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
 
         let new_bot = crate::traits::DynamicBot {
             id: 0, // Will be set by database
@@ -804,7 +834,9 @@ impl TelegramChannel {
                 new_channel.set_channel_hub(weak_hub);
 
                 // Register with the hub
-                let channel_name = hub.register_channel(new_channel.clone() as Arc<dyn Channel>).await;
+                let channel_name = hub
+                    .register_channel(new_channel.clone() as Arc<dyn Channel>)
+                    .await;
                 info!(channel = %channel_name, "Registered new Telegram bot with hub");
 
                 // Spawn the bot in the background using helper to avoid type cycles
@@ -909,6 +941,7 @@ impl TelegramChannel {
                 let new_channel = Arc::new(DiscordChannel::new(
                     token,
                     vec![user_id], // Discord uses u64 user IDs
+                    vec![user_id], // Dynamic bot creator is the owner
                     None,          // No guild_id for dynamic bots
                     Arc::clone(&self.agent),
                     self.config_path.clone(),
@@ -925,7 +958,9 @@ impl TelegramChannel {
                 new_channel.set_channel_hub(weak_hub);
 
                 // Register with the hub
-                let channel_name = hub.register_channel(new_channel.clone() as Arc<dyn Channel>).await;
+                let channel_name = hub
+                    .register_channel(new_channel.clone() as Arc<dyn Channel>)
+                    .await;
                 info!(channel = %channel_name, "Registered new Discord bot with hub");
 
                 // Spawn the bot in the background
@@ -970,25 +1005,23 @@ impl TelegramChannel {
             .await;
 
         let (bot_name, team_name) = match response {
-            Ok(resp) => {
-                match resp.json::<serde_json::Value>().await {
-                    Ok(json) => {
-                        if json["ok"].as_bool() != Some(true) {
-                            return format!(
-                                "Invalid Slack token: {}\n\nMake sure you have the correct bot token.",
-                                json["error"].as_str().unwrap_or("unknown error")
-                            );
-                        }
-                        (
-                            json["user"].as_str().unwrap_or("unknown").to_string(),
-                            json["team"].as_str().unwrap_or("unknown").to_string(),
-                        )
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    if json["ok"].as_bool() != Some(true) {
+                        return format!(
+                            "Invalid Slack token: {}\n\nMake sure you have the correct bot token.",
+                            json["error"].as_str().unwrap_or("unknown error")
+                        );
                     }
-                    Err(e) => {
-                        return format!("Failed to parse Slack response: {}", e);
-                    }
+                    (
+                        json["user"].as_str().unwrap_or("unknown").to_string(),
+                        json["team"].as_str().unwrap_or("unknown").to_string(),
+                    )
                 }
-            }
+                Err(e) => {
+                    return format!("Failed to parse Slack response: {}", e);
+                }
+            },
             Err(e) => {
                 return format!("Failed to validate Slack token: {}", e);
             }
@@ -1063,7 +1096,9 @@ impl TelegramChannel {
                 new_channel.set_channel_hub(weak_hub);
 
                 // Register with the hub
-                let channel_name = hub.register_channel(new_channel.clone() as Arc<dyn Channel>).await;
+                let channel_name = hub
+                    .register_channel(new_channel.clone() as Arc<dyn Channel>)
+                    .await;
                 info!(channel = %channel_name, "Registered new Slack bot with hub");
 
                 // Spawn the bot in the background
@@ -1101,7 +1136,10 @@ impl TelegramChannel {
 
         // Add current bot (from config)
         let current_username = self.get_bot_username().await;
-        bots_list.push(format!("• telegram:@{} (this bot, from config)", current_username));
+        bots_list.push(format!(
+            "• telegram:@{} (this bot, from config)",
+            current_username
+        ));
 
         // Add dynamic bots from database
         match self.state.get_dynamic_bots().await {
@@ -1113,7 +1151,10 @@ impl TelegramChannel {
                             let test_bot = Bot::new(&bot.bot_token);
                             match test_bot.get_me().await {
                                 Ok(me) => {
-                                    let username = me.username.clone().unwrap_or_else(|| "unknown".to_string());
+                                    let username = me
+                                        .username
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown".to_string());
                                     format!("• telegram:@{} (id: {})", username, bot.id)
                                 }
                                 Err(_) => format!("• telegram:<invalid token> (id: {})", bot.id),
@@ -1150,9 +1191,17 @@ impl TelegramChannel {
         let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
 
         // Authorization check with first-user auto-claim.
+        // WARNING: When allowed_user_ids is empty, the FIRST user to message
+        // the bot becomes the owner. This is a convenience for initial setup
+        // but means the bot is open to anyone until that first message.
         let auth_result = {
             let allowed = self.allowed_user_ids.read().unwrap();
             if allowed.is_empty() {
+                warn!(
+                    user_id,
+                    "No allowed_user_ids configured — auto-claiming first user as owner. \
+                     Set allowed_user_ids in config.toml to prevent this."
+                );
                 drop(allowed);
                 let mut allowed = self.allowed_user_ids.write().unwrap();
                 check_auth(&mut allowed, user_id)
@@ -1168,7 +1217,10 @@ impl TelegramChannel {
                 // Persist to config.toml so it survives restarts
                 let ids = self.allowed_user_ids.read().unwrap().clone();
                 if let Err(e) = self.persist_allowed_user_ids(&ids).await {
-                    warn!(user_id, "Failed to persist auto-claimed user ID to config: {}", e);
+                    warn!(
+                        user_id,
+                        "Failed to persist auto-claimed user ID to config: {}", e
+                    );
                 }
                 let _ = bot
                     .send_message(
@@ -1210,7 +1262,9 @@ impl TelegramChannel {
             match self.handle_file_message(&msg, &bot).await {
                 Ok(file_text) => file_text,
                 Err(e) => {
-                    let _ = bot.send_message(msg.chat.id, format!("File error: {}", e)).await;
+                    let _ = bot
+                        .send_message(msg.chat.id, format!("File error: {}", e))
+                        .await;
                     return;
                 }
             }
@@ -1259,21 +1313,34 @@ impl TelegramChannel {
                 platform: "telegram".to_string(),
                 channel_name: msg.chat.title().map(|s| s.to_string()),
                 channel_id: Some(format!("telegram:{}", msg.chat.id.0)),
-                sender_name: None,
+                sender_name: msg.from.as_ref().map(|u| match &u.last_name {
+                    Some(last) => format!("{} {}", u.first_name, last),
+                    None => u.first_name.clone(),
+                }),
+                sender_id: msg.from.as_ref().map(|u| format!("telegram:{}", u.id.0)),
                 channel_member_names: vec![],
                 user_id_map: std::collections::HashMap::new(),
+                trusted: false,
             }
         };
 
         // Handle cancel/stop commands - these bypass the queue
         let text_lower = text.to_lowercase();
         if text_lower == "cancel" || text_lower == "stop" {
-            let cancelled = self.task_registry.cancel_running_for_session(&session_id).await;
+            let cancelled = self
+                .task_registry
+                .cancel_running_for_session(&session_id)
+                .await;
             self.task_registry.clear_queue(&session_id).await;
             if cancelled.is_empty() {
-                let _ = bot.send_message(msg.chat.id, "No running task to cancel.").await;
+                let _ = bot
+                    .send_message(msg.chat.id, "No running task to cancel.")
+                    .await;
             } else {
-                let desc = cancelled.first().map(|(_, d)| d.as_str()).unwrap_or("unknown");
+                let desc = cancelled
+                    .first()
+                    .map(|(_, d)| d.as_str())
+                    .unwrap_or("unknown");
                 let queue_cleared = self.task_registry.queue_len(&session_id).await;
                 let mut response = format!("⏹️ Cancelled: {}", desc);
                 if queue_cleared > 0 {
@@ -1287,14 +1354,22 @@ impl TelegramChannel {
         // Check if a task is already running - if so, queue this message
         if self.task_registry.has_running_task(&session_id).await {
             let queue_pos = self.task_registry.queue_message(&session_id, &text).await;
-            let current_task = self.task_registry.get_running_task_description(&session_id).await
+            let current_task = self
+                .task_registry
+                .get_running_task_description(&session_id)
+                .await
                 .unwrap_or_else(|| "processing".to_string());
             let preview: String = text.chars().take(50).collect();
             let suffix = if text.len() > 50 { "..." } else { "" };
-            let _ = bot.send_message(
-                msg.chat.id,
-                format!("📥 Queued ({}): \"{}{}\" | Currently: {}", queue_pos, preview, suffix, current_task)
-            ).await;
+            let _ = bot
+                .send_message(
+                    msg.chat.id,
+                    format!(
+                        "📥 Queued ({}): \"{}{}\" | Currently: {}",
+                        queue_pos, preview, suffix, current_task
+                    ),
+                )
+                .await;
             return;
         }
 
@@ -1302,7 +1377,10 @@ impl TelegramChannel {
 
         // Create heartbeat for watchdog — agent bumps this on every activity point.
         let heartbeat = Arc::new(AtomicU64::new(
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         ));
 
         // Send typing indicator immediately, then repeat every 4s while agent works.
@@ -1316,7 +1394,9 @@ impl TelegramChannel {
         let stale_threshold_secs = self.watchdog_stale_threshold_secs;
         tokio::spawn(async move {
             loop {
-                let _ = typing_bot.send_chat_action(typing_chat_id, ChatAction::Typing).await;
+                let _ = typing_bot
+                    .send_chat_action(typing_chat_id, ChatAction::Typing)
+                    .await;
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(4)) => {
                         if stale_threshold_secs > 0 {
@@ -1352,7 +1432,10 @@ impl TelegramChannel {
                 // In non-DM channels: only send one "Thinking..." then suppress
                 if !is_dm {
                     if !sent_thinking
-                        && matches!(update, StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. })
+                        && matches!(
+                            update,
+                            StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. }
+                        )
                     {
                         let _ = status_bot.send_message(status_chat_id, "Thinking...").await;
                         sent_thinking = true;
@@ -1361,7 +1444,10 @@ impl TelegramChannel {
                     continue;
                 }
                 let now = tokio::time::Instant::now();
-                if now.duration_since(last_sent) < min_interval {
+                // Skip rate limiting for ToolProgress with URLs (e.g., OAuth authorize links)
+                let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
+                    if chunk.contains("https://") || chunk.contains("http://"));
+                if !has_url && now.duration_since(last_sent) < min_interval {
                     continue;
                 }
                 let text = match &update {
@@ -1374,11 +1460,16 @@ impl TelegramChannel {
                         }
                     }
                     StatusUpdate::ToolProgress { name, chunk } => {
-                        let preview: String = chunk.chars().take(100).collect();
-                        if chunk.len() > 100 {
-                            format!("📤 {}: {}...", name, preview)
+                        // Don't truncate if the chunk contains a URL (e.g., OAuth authorize links)
+                        if chunk.contains("https://") || chunk.contains("http://") {
+                            format!("📤 {}\n{}", name, chunk)
                         } else {
-                            format!("📤 {}: {}", name, preview)
+                            let preview: String = chunk.chars().take(100).collect();
+                            if chunk.len() > 100 {
+                                format!("📤 {}: {}...", name, preview)
+                            } else {
+                                format!("📤 {}: {}", name, preview)
+                            }
                         }
                     }
                     StatusUpdate::ToolComplete { name, summary } => {
@@ -1387,39 +1478,96 @@ impl TelegramChannel {
                     StatusUpdate::ToolCancellable { name, task_id } => {
                         format!("⏳ {} started (task_id: {})", name, task_id)
                     }
-                    StatusUpdate::ProgressSummary { elapsed_mins, summary } => {
+                    StatusUpdate::ProgressSummary {
+                        elapsed_mins,
+                        summary,
+                    } => {
                         format!("📊 Progress ({} min): {}", elapsed_mins, summary)
                     }
                     StatusUpdate::IterationWarning { current, threshold } => {
-                        format!("⚠️ Approaching soft limit: {} of {} iterations", current, threshold)
+                        format!(
+                            "⚠️ Approaching soft limit: {} of {} iterations",
+                            current, threshold
+                        )
                     }
-                    StatusUpdate::PlanCreated { description, total_steps, .. } => {
+                    StatusUpdate::PlanCreated {
+                        description,
+                        total_steps,
+                        ..
+                    } => {
                         format!("📋 Plan created: {} ({} steps)", description, total_steps)
                     }
-                    StatusUpdate::PlanStepStart { step_index, total_steps, description, .. } => {
-                        format!("▶️ Step {}/{}: {}", step_index + 1, total_steps, description)
+                    StatusUpdate::PlanStepStart {
+                        step_index,
+                        total_steps,
+                        description,
+                        ..
+                    } => {
+                        format!(
+                            "▶️ Step {}/{}: {}",
+                            step_index + 1,
+                            total_steps,
+                            description
+                        )
                     }
-                    StatusUpdate::PlanStepComplete { step_index, total_steps, description, summary, .. } => {
-                        let base = format!("✅ Step {}/{} done: {}", step_index + 1, total_steps, description);
+                    StatusUpdate::PlanStepComplete {
+                        step_index,
+                        total_steps,
+                        description,
+                        summary,
+                        ..
+                    } => {
+                        let base = format!(
+                            "✅ Step {}/{} done: {}",
+                            step_index + 1,
+                            total_steps,
+                            description
+                        );
                         if let Some(s) = summary {
                             format!("{} - {}", base, s)
                         } else {
                             base
                         }
                     }
-                    StatusUpdate::PlanStepFailed { step_index, description, error, .. } => {
-                        format!("❌ Step {} failed: {} - {}", step_index + 1, description, error)
+                    StatusUpdate::PlanStepFailed {
+                        step_index,
+                        description,
+                        error,
+                        ..
+                    } => {
+                        format!(
+                            "❌ Step {} failed: {} - {}",
+                            step_index + 1,
+                            description,
+                            error
+                        )
                     }
-                    StatusUpdate::PlanComplete { description, total_steps, duration_secs, .. } => {
+                    StatusUpdate::PlanComplete {
+                        description,
+                        total_steps,
+                        duration_secs,
+                        ..
+                    } => {
                         let mins = duration_secs / 60;
                         let secs = duration_secs % 60;
-                        format!("🎉 Plan complete: {} ({} steps in {}m {}s)", description, total_steps, mins, secs)
+                        format!(
+                            "🎉 Plan complete: {} ({} steps in {}m {}s)",
+                            description, total_steps, mins, secs
+                        )
                     }
                     StatusUpdate::PlanAbandoned { description, .. } => {
                         format!("🚫 Plan abandoned: {}", description)
                     }
-                    StatusUpdate::PlanRevised { description, reason, new_total_steps, .. } => {
-                        format!("🔄 Plan revised: {} ({} steps) - {}", description, new_total_steps, reason)
+                    StatusUpdate::PlanRevised {
+                        description,
+                        reason,
+                        new_total_steps,
+                        ..
+                    } => {
+                        format!(
+                            "🔄 Plan revised: {} ({} steps) - {}",
+                            description, new_total_steps, reason
+                        )
                     }
                 };
                 let _ = status_bot.send_message(status_chat_id, text).await;
@@ -1463,8 +1611,14 @@ impl TelegramChannel {
                             let html_chunks = split_message(&html, 4096);
                             let plain_chunks = split_message(&reply, 4096);
                             for (i, html_chunk) in html_chunks.iter().enumerate() {
-                                let plain_chunk = plain_chunks.get(i).map(|s| s.as_str()).unwrap_or(html_chunk.as_str());
-                                if let Err(e) = send_html_or_fallback(&bot, chat_id, html_chunk, plain_chunk).await {
+                                let plain_chunk = plain_chunks
+                                    .get(i)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(html_chunk.as_str());
+                                if let Err(e) =
+                                    send_html_or_fallback(&bot, chat_id, html_chunk, plain_chunk)
+                                        .await
+                                {
                                     warn!("Failed to send Telegram message: {}", e);
                                 }
                             }
@@ -1479,9 +1633,7 @@ impl TelegramChannel {
                             return; // Exit loop on cancellation
                         }
                         warn!("Agent error: {}", e);
-                        let _ = bot
-                            .send_message(chat_id, format!("Error: {}", e))
-                            .await;
+                        let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
                     }
                 }
 
@@ -1490,19 +1642,32 @@ impl TelegramChannel {
                     // Small delay to ensure previous message is fully committed to DB
                     tokio::time::sleep(Duration::from_millis(100)).await;
 
-                    info!(session_id, "Processing queued message: {}", queued.text.chars().take(50).collect::<String>());
-                    let _ = bot.send_message(chat_id, format!("▶️ Processing queued: \"{}\"",
-                        queued.text.chars().take(50).collect::<String>())).await;
+                    info!(
+                        session_id,
+                        "Processing queued message: {}",
+                        queued.text.chars().take(50).collect::<String>()
+                    );
+                    let _ = bot
+                        .send_message(
+                            chat_id,
+                            format!(
+                                "▶️ Processing queued: \"{}\"",
+                                queued.text.chars().take(50).collect::<String>()
+                            ),
+                        )
+                        .await;
 
                     // Set up for next iteration
                     current_text = queued.text;
                     let desc: String = current_text.chars().take(80).collect();
-                    let (new_task_id, new_cancel_token) = registry.register(&session_id, &desc).await;
+                    let (new_task_id, new_cancel_token) =
+                        registry.register(&session_id, &desc).await;
                     current_task_id = new_task_id;
                     current_cancel_token = new_cancel_token;
 
                     // Create new status channel and typing indicator
-                    let (new_status_tx, mut new_status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
+                    let (new_status_tx, mut new_status_rx) =
+                        tokio::sync::mpsc::channel::<StatusUpdate>(16);
                     current_status_tx = new_status_tx;
 
                     let status_bot = bot.clone();
@@ -1514,7 +1679,10 @@ impl TelegramChannel {
                             // In non-DM channels: only send one "Thinking..." then suppress
                             if !is_dm {
                                 if !sent_thinking
-                                    && matches!(update, StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. })
+                                    && matches!(
+                                        update,
+                                        StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. }
+                                    )
                                 {
                                     let _ = status_bot.send_message(chat_id, "Thinking...").await;
                                     sent_thinking = true;
@@ -1527,7 +1695,9 @@ impl TelegramChannel {
                                 continue;
                             }
                             let text = match &update {
-                                StatusUpdate::Thinking(iter) => format!("Thinking... (step {})", iter + 1),
+                                StatusUpdate::Thinking(iter) => {
+                                    format!("Thinking... (step {})", iter + 1)
+                                }
                                 StatusUpdate::ToolStart { name, summary } => {
                                     if summary.is_empty() {
                                         format!("Using {}...", name)
@@ -1544,7 +1714,10 @@ impl TelegramChannel {
 
                     // Fresh heartbeat for queued message
                     let new_heartbeat = Arc::new(AtomicU64::new(
-                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
                     ));
                     current_heartbeat = new_heartbeat.clone();
 
@@ -1555,7 +1728,9 @@ impl TelegramChannel {
                     let heartbeat_for_queued = new_heartbeat;
                     tokio::spawn(async move {
                         loop {
-                            let _ = typing_bot.send_chat_action(chat_id, ChatAction::Typing).await;
+                            let _ = typing_bot
+                                .send_chat_action(chat_id, ChatAction::Typing)
+                                .await;
                             tokio::select! {
                                 _ = tokio::time::sleep(Duration::from_secs(4)) => {
                                     if stale_threshold_secs > 0 {
@@ -1603,7 +1778,12 @@ impl Channel for TelegramChannel {
 
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
         let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
-            self.allowed_user_ids.read().unwrap().first().copied().unwrap_or(0) as i64
+            self.allowed_user_ids
+                .read()
+                .unwrap()
+                .first()
+                .copied()
+                .unwrap_or(0) as i64
         });
         let html = markdown_to_telegram_html(text);
         for chunk in split_message(&html, 4096) {
@@ -1616,7 +1796,12 @@ impl Channel for TelegramChannel {
 
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
         let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
-            self.allowed_user_ids.read().unwrap().first().copied().unwrap_or(0) as i64
+            self.allowed_user_ids
+                .read()
+                .unwrap()
+                .first()
+                .copied()
+                .unwrap_or(0) as i64
         });
         match &media.kind {
             MediaKind::Photo { data } => {
@@ -1627,7 +1812,10 @@ impl Channel for TelegramChannel {
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to send photo: {}", e))?;
             }
-            MediaKind::Document { file_path, filename } => {
+            MediaKind::Document {
+                file_path,
+                filename,
+            } => {
                 let doc = InputFile::file(file_path).file_name(filename.clone());
                 let mut req = self.bot.send_document(ChatId(chat_id), doc);
                 if !media.caption.is_empty() {
@@ -1649,7 +1837,12 @@ impl Channel for TelegramChannel {
         permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse> {
         let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
-            self.allowed_user_ids.read().unwrap().first().copied().unwrap_or(0) as i64
+            self.allowed_user_ids
+                .read()
+                .unwrap()
+                .first()
+                .copied()
+                .unwrap_or(0) as i64
         });
 
         info!(session_id, command, chat_id, risk = %risk_level, mode = %permission_mode, "Approval requested");
@@ -1686,10 +1879,7 @@ impl Channel for TelegramChannel {
                     "Allow Session",
                     format!("approve:session:{}", approval_id),
                 ),
-                InlineKeyboardButton::callback(
-                    "Deny",
-                    format!("approve:deny:{}", approval_id),
-                ),
+                InlineKeyboardButton::callback("Deny", format!("approve:deny:{}", approval_id)),
             ]])
         } else {
             InlineKeyboardMarkup::new(vec![vec![
@@ -1701,10 +1891,7 @@ impl Channel for TelegramChannel {
                     "Allow Always",
                     format!("approve:always:{}", approval_id),
                 ),
-                InlineKeyboardButton::callback(
-                    "Deny",
-                    format!("approve:deny:{}", approval_id),
-                ),
+                InlineKeyboardButton::callback("Deny", format!("approve:deny:{}", approval_id)),
             ]])
         };
 
@@ -1797,8 +1984,17 @@ fn restart_process() {
 }
 
 /// Send a message with HTML parse mode, falling back to plain text on failure.
-async fn send_html_or_fallback(bot: &Bot, chat_id: ChatId, html: &str, plain: &str) -> Result<(), teloxide::RequestError> {
-    match bot.send_message(chat_id, html).parse_mode(ParseMode::Html).await {
+async fn send_html_or_fallback(
+    bot: &Bot,
+    chat_id: ChatId,
+    html: &str,
+    plain: &str,
+) -> Result<(), teloxide::RequestError> {
+    match bot
+        .send_message(chat_id, html)
+        .parse_mode(ParseMode::Html)
+        .await
+    {
         Ok(_) => Ok(()),
         Err(e) => {
             warn!("HTML send failed, falling back to plain text: {}", e);
@@ -1926,7 +2122,9 @@ allowed_user_ids = []
         let mut doc: toml::Table = content.parse().unwrap();
         let ids = vec![12345u64];
         let ids_toml = toml::Value::Array(
-            ids.iter().map(|&id| toml::Value::Integer(id as i64)).collect(),
+            ids.iter()
+                .map(|&id| toml::Value::Integer(id as i64))
+                .collect(),
         );
         if let Some(tg) = doc.get_mut("telegram").and_then(|v| v.as_table_mut()) {
             tg.insert("allowed_user_ids".to_string(), ids_toml);
@@ -1957,7 +2155,9 @@ allowed_user_ids = []
         let mut doc: toml::Table = content.parse().unwrap();
         let ids = vec![67890u64];
         let ids_toml = toml::Value::Array(
-            ids.iter().map(|&id| toml::Value::Integer(id as i64)).collect(),
+            ids.iter()
+                .map(|&id| toml::Value::Integer(id as i64))
+                .collect(),
         );
         if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut()) {
             if let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {

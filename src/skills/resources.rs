@@ -48,17 +48,17 @@ impl FileSystemResolver {
 impl ResourceResolver for FileSystemResolver {
     async fn read_resource(&self, skill_name: &str, resource_path: &str) -> anyhow::Result<String> {
         let dirs = self.skill_dirs.read().await;
-        let base = dirs.get(skill_name).ok_or_else(|| {
-            anyhow::anyhow!("No directory registered for skill '{}'", skill_name)
-        })?;
+        let base = dirs
+            .get(skill_name)
+            .ok_or_else(|| anyhow::anyhow!("No directory registered for skill '{}'", skill_name))?;
 
         let full_path = base.join(resource_path);
 
         // Security: canonicalize and verify path stays within skill directory
         let canonical_base = base.canonicalize()?;
-        let canonical_path = full_path.canonicalize().map_err(|e| {
-            anyhow::anyhow!("Cannot resolve resource '{}': {}", resource_path, e)
-        })?;
+        let canonical_path = full_path
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("Cannot resolve resource '{}': {}", resource_path, e))?;
         if !canonical_path.starts_with(&canonical_base) {
             anyhow::bail!("Resource path traversal blocked");
         }
@@ -77,7 +77,6 @@ impl ResourceResolver for FileSystemResolver {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -151,11 +150,9 @@ mod tests {
             .read_resource("nonexistent", "references/guide.md")
             .await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("No directory registered")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No directory registered"));
     }
 }

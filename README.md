@@ -11,7 +11,7 @@ I built this because I wanted to control my computer from my phone, from anywher
 aidaemon runs 24/7 as a background daemon. It needs to be small, fast, and run on anything:
 
 - **Runs on cheap/old hardware** - a lightweight Rust binary. On a Raspberry Pi or a $5 VPS with 512 MB RAM, it runs comfortably where heavier runtimes won't.
-- **Single binary, zero runtime** - `cargo install aidaemon` gives you one binary. No Node.js, no Python, no Docker. Copy it to any machine and run it.
+- **Single binary, zero runtime** - one binary, copy it to any machine and run it. Install with `curl -sSfL https://get.aidaemon.ai | bash` or `cargo install aidaemon`.
 - **Startup in milliseconds** - restarts after a crash are near-instant, which matters for the auto-recovery retry loop.
 - **No garbage collector** - predictable latency. No GC pauses between receiving the LLM response and sending the reply.
 
@@ -23,6 +23,8 @@ If you don't care about resource usage and want more channels (WhatsApp, Signal,
 - **Telegram interface** - chat with your AI assistant from any device
 - **Slack integration** - Socket Mode support with threads, file sharing, and inline approvals (feature flag: `--features slack`)
 - **Discord integration** - bot with slash commands and thread support (feature flag: `--features discord`)
+- **Dynamic bot management** - add or list bots at runtime via `/connect` and `/bots` commands, no restart needed
+- **Multi-bot support** - run multiple Telegram, Slack, and Discord bots from a single daemon
 
 ### LLM Providers
 - **Multiple providers** - native Anthropic, Google Gemini, DeepSeek, and OpenAI-compatible (OpenAI, OpenRouter, Ollama, etc.)
@@ -31,16 +33,25 @@ If you don't care about resource usage and want more channels (WhatsApp, Signal,
 
 ### Tools & Agents
 - **Agentic tool use** - the LLM can call tools (system info, terminal commands, MCP servers) in a loop
-- **MCP client** - connect to any MCP server (filesystem, databases, etc.) and the agent gains those tools automatically
+- **Dynamic MCP management** - add, remove, and configure MCP servers at runtime via the `manage_mcp` tool
 - **Browser tool** - headless Chrome with screenshot, click, fill, and JS execution
 - **Web research** - search (DuckDuckGo/Brave) and fetch tools for internet access
+- **HTTP requests** - authenticated API calls with OAuth 1.0a, Bearer, Header, and Basic auth profiles
 - **Sub-agent spawning** - recursive agents with configurable depth, iteration limit, and dynamic budget extension
 - **CLI agent delegation** - delegate tasks to claude, gemini, codex, aider, copilot (auto-discovered via `which`)
-- **Skills system** - trigger-based markdown instructions loaded from a directory
+- **Channel history** - read recent Slack channel messages with time filtering and user resolution
+- **Skills system** - trigger-based markdown instructions with dynamic management, remote registries, and auto-promotion from successful procedures
+
+### OAuth & API Integration
+- **OAuth 2.0 PKCE** - built-in flows for Twitter/X and GitHub, plus custom providers
+- **OAuth 1.0a** - legacy API support (e.g., Twitter v1.1)
+- **HTTP auth profiles** - pre-configured auth for external APIs (Bearer, Header, Basic, OAuth)
+- **Token management** - tokens stored in OS keychain, automatic refresh, connection tracking
 
 ### Memory & State
 - **Persistent memory** - SQLite-backed conversation history + facts table, with fast in-memory working memory
 - **Memory consolidation** - background fact extraction with vector embeddings (AllMiniLML6V2) for semantic recall
+- **People intelligence** - organic contact management with auto-extracted facts, relationship tracking, and privacy controls
 - **Database encryption** - optional SQLCipher AES-256 encryption at rest (feature flag: `--features encryption`)
 
 ### Automation
@@ -55,12 +66,13 @@ If you don't care about resource usage and want more channels (WhatsApp, Signal,
 ### Security & Config
 - **Config manager** - LLM can read/update `config.toml` with automatic backup, restore, and secrets redaction
 - **Command approval flow** - inline keyboard (Allow Once / Allow Always / Deny) for unapproved terminal commands
+- **HTTP write approval** - POST/PUT/PATCH/DELETE requests require user approval with risk classification
 - **Secrets management** - OS keychain integration + environment variable support for API keys
 
 ### Operations
 - **Web dashboard** - built-in status page with usage stats, active sessions, and task monitoring
-- **Channel commands** - `/model`, `/models`, `/auto`, `/reload`, `/restart`, `/clear`, `/cost`, `/tasks`, `/cancel`, `/help`
-- **Auto-retry with backoff** - exponential backoff (5s → 10s → 20s → 40s → 60s cap) for dispatcher crashes
+- **Channel commands** - `/model`, `/models`, `/auto`, `/reload`, `/restart`, `/clear`, `/cost`, `/tasks`, `/cancel`, `/connect`, `/bots`, `/help`
+- **Auto-retry with backoff** - exponential backoff (5s -> 10s -> 20s -> 40s -> 60s cap) for dispatcher crashes
 - **Health endpoint** - HTTP `/health` for monitoring
 - **Service installer** - one command to install as a systemd or launchd service
 - **Setup wizard** - interactive first-run setup, no manual config editing needed
@@ -167,11 +179,20 @@ allowed_prefixes = ["ls", "cat", "head", "tail", "echo", "date", "whoami", "pwd"
 
 ### MCP Servers
 
+MCP servers can be configured statically or added at runtime via the `manage_mcp` tool.
+
 ```toml
 [mcp.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 ```
+
+The `manage_mcp` tool supports runtime management:
+- **add** — add and start a new MCP server (allowed commands: `npx`, `uvx`, `node`, `python`, `python3`)
+- **list** — list all registered servers and their tools
+- **remove** — remove a server
+- **set_env** — store API keys for a server in the OS keychain
+- **restart** — restart a server with fresh environment from keychain
 
 ### Browser
 
@@ -220,11 +241,132 @@ args = ["-p", "--output-format", "json", "--sandbox=false"]
 
 ### Skills
 
+Skills are trigger-based markdown instructions that guide the agent's behavior. They can be loaded from a directory, added from URLs, created inline, or installed from remote registries.
+
 ```toml
 [skills]
 enabled = true
 dir = "skills"    # relative to config.toml location
+
+# Optional: remote registries for browsing and installing community skills
+registries = [
+    "https://example.com/skills/registry.json"
+]
 ```
+
+The `manage_skills` tool supports runtime management:
+- **add** — add a skill from a URL
+- **add_inline** — create a skill from raw markdown with YAML frontmatter
+- **list** — list all loaded skills with their status and triggers
+- **remove/enable/disable** — manage individual skills
+- **browse** — search remote skill registries
+- **install** — install a skill from a registry
+- **update** — re-fetch a skill from its source URL
+
+Successful procedures (>= 5 uses, >= 80% success rate) are automatically promoted to skills every 12 hours.
+
+### OAuth
+
+OAuth enables the agent to authenticate with external services like Twitter/X and GitHub. Built-in providers require no URL configuration — just enable OAuth and set credentials.
+
+```toml
+[oauth]
+enabled = true
+callback_url = "http://localhost:8080"  # must match your OAuth app's redirect URI
+
+# Optional: add custom OAuth providers beyond the built-in Twitter/GitHub
+[oauth.providers.stripe]
+auth_type = "oauth2_pkce"
+authorize_url = "https://connect.stripe.com/oauth/authorize"
+token_url = "https://connect.stripe.com/oauth/token"
+scopes = ["read_write"]
+allowed_domains = ["api.stripe.com"]
+```
+
+Built-in providers (no URL config needed):
+- **twitter** (alias: **x**) — Tweet read/write, user info, offline access
+- **github** — User info, repository access
+
+The `manage_oauth` tool handles the full lifecycle:
+- **providers** — list available providers and credential status
+- **set_credentials** — store client_id/client_secret in OS keychain
+- **connect** — start OAuth flow (displays authorize URL, waits for callback)
+- **list** — show connected services with token expiry
+- **refresh** — refresh an expired access token
+- **remove** — disconnect a service
+
+### HTTP Auth Profiles
+
+Pre-configured auth profiles for external APIs, used by the `http_request` tool. Supports four auth types:
+
+```toml
+# Bearer token (OAuth 2.0 or API key)
+[http_auth.stripe]
+auth_type = "bearer"
+allowed_domains = ["api.stripe.com"]
+token = "keychain"
+
+# OAuth 1.0a (e.g., Twitter v1.1 API)
+[http_auth.twitter_v1]
+auth_type = "oauth1a"
+allowed_domains = ["api.twitter.com"]
+api_key = "keychain"
+api_secret = "keychain"
+access_token = "keychain"
+access_token_secret = "keychain"
+
+# Custom header auth
+[http_auth.custom_api]
+auth_type = "header"
+allowed_domains = ["api.example.com"]
+header_name = "X-API-Key"
+header_value = "keychain"
+
+# Basic auth
+[http_auth.internal]
+auth_type = "basic"
+allowed_domains = ["internal.company.com"]
+username = "service_account"
+password = "keychain"
+```
+
+All credential fields support `"keychain"` for OS keychain storage. The `allowed_domains` field is required and enforces domain restrictions on each profile.
+
+OAuth connections established via `manage_oauth` automatically create auth profiles — no manual config needed for built-in providers.
+
+### People Intelligence
+
+Organic contact management that learns about people from conversations. Disabled by default.
+
+```toml
+[people]
+enabled = true
+auto_extract = true                    # learn facts from conversations
+auto_extract_categories = [            # categories to auto-extract
+    "birthday", "preference", "interest",
+    "work", "family", "important_date"
+]
+restricted_categories = [              # never auto-extracted
+    "health", "finance", "political", "religious"
+]
+fact_retention_days = 180              # auto-delete stale facts
+reconnect_reminder_days = 30           # suggest reconnecting after inactivity
+```
+
+The `manage_people` tool provides manual control:
+- **add/list/view/update/remove** — manage person records
+- **add_fact/remove_fact** — manage facts about a person
+- **link** — link a platform identity (e.g., `slack:U123`, `telegram:456`)
+- **export/purge** — export or delete all data for a person
+- **audit/confirm** — review and verify auto-extracted facts
+
+Privacy model:
+- Owner sees the full contact graph in DMs
+- Non-owners get communication style adaptation only
+- Public channels receive no personal fact injection
+- Restricted categories are never auto-extracted
+
+Background tasks run daily: stale fact pruning, upcoming date reminders (14-day window), and reconnect suggestions.
 
 ### Email Triggers
 
@@ -310,6 +452,8 @@ These commands work in Telegram, Slack, and Discord:
 | `/cost` | Show token usage statistics for current session |
 | `/tasks` | List running and recent background tasks |
 | `/cancel <id>` | Cancel a running background task |
+| `/connect <channel> <token>` | Add a new bot at runtime (Telegram, Slack, Discord) |
+| `/bots` | List all connected bots (config-based and dynamic) |
 | `/help` | Show available commands |
 
 ## Running as a Service
@@ -326,14 +470,33 @@ sudo systemctl enable --now aidaemon
 
 ## Security Model
 
+### Where to Run It
+
+aidaemon works great on any dedicated machine — an old laptop, a Mac Mini, a Raspberry Pi, or a $5/mo VPS. Docker works too if that's your thing, but it's not required. The main recommendation is to give it its own machine rather than running it on your daily driver where you keep personal files and passwords. Any spare computer you have lying around works perfectly.
+
+### Application-Level Protections
+
 - **User authentication** — `allowed_user_ids` is enforced on every message and callback query. Unauthorized users are silently ignored.
+- **Role-based access control** — Owner, Guest, and Public roles with different tool access levels. Scheduled task management is restricted to owners.
 - **Terminal allowlist** — commands must match an `allowed_prefixes` entry using word-boundary matching (`"ls"` allows `ls -la` but not `lsblk`). Set to `["*"]` to allow all.
 - **Shell operator detection** — commands containing `;`, `|`, `` ` ``, `&&`, `||`, `$(`, `>(`, `<(`, or newlines always require approval, regardless of prefix match.
 - **Command approval flow** — unapproved commands trigger an inline keyboard (Allow Once / Allow Always / Deny). The agent blocks until you respond.
-- **Persistent approvals** — "Allow Always" choices are persisted across restarts.
+- **Persistent approvals** — "Allow Always" choices are persisted across restarts. Use `permission_mode = "cautious"` to make all approvals session-only.
+- **Path verification** — file-modifying commands are blocked unless the target paths were first observed via read-only commands (e.g., `ls`, `cat`).
+- **Stall detection** — consecutive same-tool loops, alternating tool patterns, and hard iteration caps prevent runaway agent execution.
+- **HTTP request approval** — write operations (POST, PUT, PATCH, DELETE) and authenticated requests require user approval with risk classification.
+- **SSRF protection** — HTTP requests, redirects, and MCP server additions validate URLs against private IP ranges, localhost, and metadata endpoints.
+- **HTTPS enforcement** — the `http_request` tool only allows HTTPS URLs.
+- **Domain allowlists** — each HTTP auth profile restricts which domains it can authenticate against.
+- **Input sanitization** — external content (tool outputs, web fetches, trigger payloads, skill bodies) is stripped of prompt injection patterns and invisible Unicode before reaching the LLM.
 - **Untrusted trigger sessions** — sessions originating from automated sources (e.g. email triggers, scheduled tasks with `trusted = false`) require terminal approval for every command.
+- **Sub-agent isolation** — sub-agents inherit the parent's user role (no privilege escalation) and share the parent's path verification tracker.
+- **MCP environment scrubbing** — MCP server sub-processes start with a minimal environment; credentials are not forwarded unless explicitly configured.
 - **Config secrets redaction** — when the LLM reads config via the config manager tool, sensitive keys (`api_key`, `password`, `bot_token`, etc.) are replaced with `[REDACTED]`.
 - **Config change approval** — sensitive config modifications (API keys, allowed users, terminal wildcards) require explicit user approval.
+- **OAuth token security** — OAuth tokens and dynamic bot tokens are stored in the OS keychain, never in config files or chat history.
+- **Public channel protection** — public-facing channels use a minimal system prompt with no internal architecture details, and output is sanitized to redact secrets.
+- **Dashboard security** — bearer token authentication with rate limiting, token expiration (24h), and constant-time comparison.
 - **File permissions** — config backups are written with `0600` (owner-only read/write) on Unix.
 
 ## Inspired by OpenClaw
@@ -366,10 +529,14 @@ Channels ──→ Agent ──→ Smart Router ──→ LLM Provider
                │     ├── Terminal (with approval flow)
                │     ├── Browser (headless Chrome)
                │     ├── Web research (search + fetch)
+               │     ├── HTTP requests (with auth profiles + OAuth)
                │     ├── Config manager
-               │     ├── MCP servers (JSON-RPC over stdio)
+               │     ├── MCP servers (JSON-RPC over stdio, dynamic management)
                │     ├── Sub-agents (recursive, depth-limited)
                │     ├── CLI agents (claude, gemini, codex, aider, copilot)
+               │     ├── Channel history (Slack message reading)
+               │     ├── People intelligence (contact management)
+               │     ├── OAuth manager (connect/refresh/remove services)
                │     └── Scheduler (create/list/cancel tasks)
                │
                ├──→ State
@@ -378,24 +545,26 @@ Channels ──→ Agent ──→ Smart Router ──→ LLM Provider
                │
                ├──→ Memory Manager
                │     ├── Fact extraction (background consolidation)
-               │     └── Vector embeddings (AllMiniLML6V2)
+               │     ├── Vector embeddings (AllMiniLML6V2)
+               │     └── People intelligence (organic fact learning)
                │
                ├──→ Task Registry (background task tracking)
                │
-               └──→ Skills (trigger-based markdown instructions)
+               └──→ Skills (trigger-based, with registries + auto-promotion)
 
 Triggers ──→ EventBus ──→ Agent ──→ Channel notification
 ├── IMAP IDLE (email)
 └── Scheduler (cron tasks)
 
-Health server (axum) ──→ GET /health + Web Dashboard
+Health server (axum) ──→ GET /health + Web Dashboard + OAuth callbacks
 ```
 
-- **Agent loop**: user message → build history → smart router selects model tier → call LLM → if tool calls, execute and loop (max iterations) → return final response
+- **Agent loop**: user message -> build history -> smart router selects model tier -> call LLM -> if tool calls, execute and loop (max iterations) -> return final response
 - **Working memory**: `VecDeque<Message>` in RAM, capped at N messages, hydrated from SQLite on cold start
 - **Session ID** = channel-specific chat/thread ID
-- **MCP**: spawns server subprocesses, communicates via JSON-RPC over stdio
+- **MCP**: spawns server subprocesses, communicates via JSON-RPC over stdio. Servers can be added/removed at runtime.
 - **Memory consolidation**: periodically extracts durable facts from conversations, stores with vector embeddings for semantic retrieval
+- **People intelligence**: auto-extracts contact facts during consolidation, runs daily background tasks for date reminders and reconnect suggestions
 - **Token tracking**: per-request usage logged to SQLite, queryable via `/cost` command or dashboard
 
 ## License

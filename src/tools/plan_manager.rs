@@ -6,9 +6,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::info;
 
-use crate::plans::{
-    generate_plan_steps, PlanStatus, PlanStore, StepStatus, StepTracker, TaskPlan,
-};
+use crate::plans::{generate_plan_steps, PlanStatus, PlanStore, StepStatus, StepTracker, TaskPlan};
 use crate::traits::{ModelProvider, Tool};
 
 /// Tool for LLM to manage task plans.
@@ -426,10 +424,7 @@ impl PlanManagerTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing checkpoint_key"))?;
 
-        let value = args
-            .get("checkpoint_value")
-            .cloned()
-            .unwrap_or(Value::Null);
+        let value = args.get("checkpoint_value").cloned().unwrap_or(Value::Null);
 
         let plan = self
             .plan_store
@@ -459,11 +454,7 @@ impl PlanManagerTool {
         }
     }
 
-    async fn get_plan(
-        &self,
-        session_id: &str,
-        plan_id: Option<&str>,
-    ) -> anyhow::Result<String> {
+    async fn get_plan(&self, session_id: &str, plan_id: Option<&str>) -> anyhow::Result<String> {
         // Look up by plan_id if provided, otherwise find the active plan for this session
         let plan = if let Some(id) = plan_id {
             self.plan_store.get(id).await?

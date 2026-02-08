@@ -42,7 +42,13 @@ pub fn detect_domains(task_context: &str) -> Vec<String> {
     if lower.contains("python") || lower.contains(".py") || lower.contains("pip") {
         domains.push("python".to_string());
     }
-    if lower.contains("javascript") || lower.contains("typescript") || lower.contains(".js") || lower.contains(".ts") || lower.contains("npm") || lower.contains("node") {
+    if lower.contains("javascript")
+        || lower.contains("typescript")
+        || lower.contains(".js")
+        || lower.contains(".ts")
+        || lower.contains("npm")
+        || lower.contains("node")
+    {
         domains.push("javascript".to_string());
     }
     if lower.contains("go ") || lower.contains("golang") || lower.contains(".go") {
@@ -56,30 +62,54 @@ pub fn detect_domains(task_context: &str) -> Vec<String> {
     if lower.contains("kubernetes") || lower.contains("k8s") || lower.contains("kubectl") {
         domains.push("kubernetes".to_string());
     }
-    if lower.contains("terraform") || lower.contains("ansible") || lower.contains("infrastructure") {
+    if lower.contains("terraform") || lower.contains("ansible") || lower.contains("infrastructure")
+    {
         domains.push("infrastructure".to_string());
     }
 
     // Web development
-    if lower.contains("html") || lower.contains("css") || lower.contains("frontend") || lower.contains("react") || lower.contains("vue") {
+    if lower.contains("html")
+        || lower.contains("css")
+        || lower.contains("frontend")
+        || lower.contains("react")
+        || lower.contains("vue")
+    {
         domains.push("web-frontend".to_string());
     }
-    if lower.contains("api") || lower.contains("backend") || lower.contains("server") || lower.contains("endpoint") {
+    if lower.contains("api")
+        || lower.contains("backend")
+        || lower.contains("server")
+        || lower.contains("endpoint")
+    {
         domains.push("web-backend".to_string());
     }
 
     // Databases
-    if lower.contains("sql") || lower.contains("database") || lower.contains("postgres") || lower.contains("mysql") || lower.contains("sqlite") {
+    if lower.contains("sql")
+        || lower.contains("database")
+        || lower.contains("postgres")
+        || lower.contains("mysql")
+        || lower.contains("sqlite")
+    {
         domains.push("databases".to_string());
     }
 
     // Git/Version control
-    if lower.contains("git") || lower.contains("commit") || lower.contains("branch") || lower.contains("merge") {
+    if lower.contains("git")
+        || lower.contains("commit")
+        || lower.contains("branch")
+        || lower.contains("merge")
+    {
         domains.push("git".to_string());
     }
 
     // System administration
-    if lower.contains("linux") || lower.contains("unix") || lower.contains("bash") || lower.contains("shell") || lower.contains("terminal") {
+    if lower.contains("linux")
+        || lower.contains("unix")
+        || lower.contains("bash")
+        || lower.contains("shell")
+        || lower.contains("terminal")
+    {
         domains.push("system-admin".to_string());
     }
 

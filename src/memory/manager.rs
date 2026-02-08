@@ -1,17 +1,18 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-use sqlx::{SqlitePool, Row};
-use tracing::{error, info, warn};
-use serde::Deserialize;
-use serde_json::json;
-use chrono::{DateTime, Utc};
+use crate::config::PeopleConfig;
 use crate::events::Consolidator;
 use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::scoring::calculate_episode_importance;
-use crate::traits::{BehaviorPattern, Message, ModelProvider, UserProfile};
+use crate::traits::{BehaviorPattern, Message, ModelProvider, Person, StateStore, UserProfile};
 use crate::types::FactPrivacy;
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
+use serde_json::json;
+use sqlx::{Row, SqlitePool};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
 
 pub struct MemoryManager {
     pool: SqlitePool,
@@ -20,6 +21,8 @@ pub struct MemoryManager {
     fast_model: String,
     consolidation_interval: Duration,
     consolidator: Option<Arc<Consolidator>>,
+    state: Option<Arc<dyn StateStore>>,
+    people_config: PeopleConfig,
 }
 
 impl MemoryManager {
@@ -38,7 +41,21 @@ impl MemoryManager {
             fast_model,
             consolidation_interval,
             consolidator,
+            state: None,
+            people_config: PeopleConfig::default(),
         }
+    }
+
+    /// Set the state store for people fact routing.
+    pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    /// Set the people config for controlling auto-extraction.
+    pub fn with_people_config(mut self, config: PeopleConfig) -> Self {
+        self.people_config = config;
+        self
     }
 
     pub fn start_background_tasks(self: Arc<Self>) {
@@ -144,24 +161,23 @@ impl MemoryManager {
                 match self.embedding_service.embed(text).await {
                     Ok(embedding) => {
                         let blob = encode_embedding(&embedding);
-                        sqlx::query(
-                            "UPDATE messages SET embedding = ? WHERE id = ?"
-                        )
-                        .bind(blob)
-                        .bind(id)
-                        .execute(&self.pool)
-                        .await?;
+                        sqlx::query("UPDATE messages SET embedding = ? WHERE id = ?")
+                            .bind(blob)
+                            .bind(id)
+                            .execute(&self.pool)
+                            .await?;
                     }
                     Err(e) => {
                         let err_msg = e.to_string();
-                        error!("Failed to generate embedding for message {}: {}", id, err_msg);
-                        sqlx::query(
-                            "UPDATE messages SET embedding_error = ? WHERE id = ?"
-                        )
-                        .bind(err_msg)
-                        .bind(id)
-                        .execute(&self.pool)
-                        .await?;
+                        error!(
+                            "Failed to generate embedding for message {}: {}",
+                            id, err_msg
+                        );
+                        sqlx::query("UPDATE messages SET embedding_error = ? WHERE id = ?")
+                            .bind(err_msg)
+                            .bind(id)
+                            .execute(&self.pool)
+                            .await?;
                     }
                 }
             }
@@ -182,7 +198,7 @@ impl MemoryManager {
                AND consolidated_at IS NULL
                AND created_at < ?
                AND content IS NOT NULL
-             ORDER BY session_id, created_at ASC"
+             ORDER BY session_id, created_at ASC",
         )
         .bind(&cutoff)
         .fetch_all(&self.pool)
@@ -219,21 +235,30 @@ impl MemoryManager {
             extract durable facts worth remembering long-term. Output ONLY a JSON array: \
             [{\"category\": \"...\", \"key\": \"...\", \"value\": \"...\", \"privacy\": \"...\"}]. \
             Categories:\n\
-            - user: Personal info (name, location, job)\n\
+            - user: Personal info about the OWNER (name, location, job)\n\
             - preference: Tool, workflow, and communication preferences\n\
             - project: Projects, tech stacks, goals\n\
             - technical: Environment details, installed tools\n\
             - relationship: Communication patterns with the AI\n\
-            - behavior: Observed tool-usage patterns and recurring workflows\n\n\
+            - behavior: Observed tool-usage patterns and recurring workflows\n\
+            - people: Information about OTHER individuals mentioned or participating in conversation\n\n\
             For \"behavior\", look for:\n\
             - Which tools the user prefers for specific tasks\n\
             - Recurring workflows or action sequences\n\
             - Types of tasks frequently delegated\n\n\
+            For \"people\", extract:\n\
+            - Names and relationships mentioned (e.g., \"my wife Aracely\", \"coworker Juan\")\n\
+            - Personal details about others (birthdays, preferences, interests, jobs)\n\
+            - Important dates related to people\n\
+            - Format the key as \"person_name:detail_type\" (e.g., \"aracely:birthday\", \"juan:job\")\n\
+            - Include a \"person_name\" field with just the person's name\n\
+            - NEVER extract health info, financial details, political opinions, or religious beliefs about people\n\
+            Example: {\"category\": \"people\", \"key\": \"aracely:birthday\", \"value\": \"March 15\", \"privacy\": \"private\", \"person_name\": \"Aracely\"}\n\n\
             Also classify each fact's privacy:\n\
             - \"global\": General facts useful anywhere (name, job, timezone, tech preferences)\n\
             - \"channel\": Context-specific facts from this conversation\n\
             - \"private\": Sensitive personal info the user would want kept private\n\
-            Default to \"channel\" if unsure.\n\n\
+            Default to \"channel\" if unsure. People facts should default to \"private\".\n\n\
             Only extract facts useful in future conversations. If nothing worth remembering, return [].";
 
         for (session_id, messages) in &sessions {
@@ -250,23 +275,38 @@ impl MemoryManager {
             ];
 
             // Call LLM with fast model, no tools
-            match self.provider.chat(&self.fast_model, &llm_messages, &[]).await {
+            match self
+                .provider
+                .chat(&self.fast_model, &llm_messages, &[])
+                .await
+            {
                 Ok(response) => {
                     if let Some(text) = &response.content {
                         match parse_consolidation_response(text) {
                             Ok(facts) => {
                                 let ch_id = derive_channel_id_from_session(session_id);
                                 for fact in &facts {
-                                    let privacy = fact.privacy.as_deref()
+                                    // Route "people" facts to the person_facts table
+                                    if fact.category == "people" {
+                                        self.route_people_fact(fact).await;
+                                        continue;
+                                    }
+
+                                    let privacy = fact
+                                        .privacy
+                                        .as_deref()
                                         .map(FactPrivacy::from_str_lossy)
                                         .unwrap_or(FactPrivacy::Channel);
-                                    if let Err(e) = self.upsert_fact(
-                                        &fact.category,
-                                        &fact.key,
-                                        &fact.value,
-                                        ch_id.as_deref(),
-                                        privacy,
-                                    ).await {
+                                    if let Err(e) = self
+                                        .upsert_fact(
+                                            &fact.category,
+                                            &fact.key,
+                                            &fact.value,
+                                            ch_id.as_deref(),
+                                            privacy,
+                                        )
+                                        .await
+                                    {
                                         warn!(
                                             "Failed to upsert consolidated fact [{}/{}]: {}",
                                             fact.category, fact.key, e
@@ -290,16 +330,19 @@ impl MemoryManager {
 
                     // Only mark messages as consolidated when facts were successfully parsed
                     // On parse failure, messages remain unconsolidated for retry next cycle
-                    if response.content.as_ref().is_some_and(|text| parse_consolidation_response(text).is_ok()) {
+                    if response
+                        .content
+                        .as_ref()
+                        .is_some_and(|text| parse_consolidation_response(text).is_ok())
+                    {
                         let now = chrono::Utc::now().to_rfc3339();
                         for (id, _role, _content) in messages {
-                            let _ = sqlx::query(
-                                "UPDATE messages SET consolidated_at = ? WHERE id = ?"
-                            )
-                            .bind(&now)
-                            .bind(id)
-                            .execute(&self.pool)
-                            .await;
+                            let _ =
+                                sqlx::query("UPDATE messages SET consolidated_at = ? WHERE id = ?")
+                                    .bind(&now)
+                                    .bind(id)
+                                    .execute(&self.pool)
+                                    .await;
                         }
                     }
                 }
@@ -319,12 +362,133 @@ impl MemoryManager {
             let session_ids: Vec<String> = sessions.keys().cloned().collect();
             for session_id in &session_ids {
                 if let Err(e) = consolidator.consolidate_session(session_id).await {
-                    warn!("Event consolidation failed for session {}: {}", session_id, e);
+                    warn!(
+                        "Event consolidation failed for session {}: {}",
+                        session_id, e
+                    );
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Route a "people" category fact to the person_facts table.
+    async fn route_people_fact(&self, fact: &ExtractedFact) {
+        let state = match &self.state {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Check runtime setting first, fall back to config
+        let people_enabled = match state.get_setting("people_enabled").await {
+            Ok(Some(val)) => val == "true",
+            _ => self.people_config.enabled,
+        };
+        if !people_enabled || !self.people_config.auto_extract {
+            return;
+        }
+
+        let person_name = match &fact.person_name {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => {
+                // Try to extract person name from the key (format: "person_name:detail_type")
+                match fact.key.split(':').next() {
+                    Some(name) if !name.is_empty() => name.to_string(),
+                    _ => return,
+                }
+            }
+        };
+
+        // Extract the detail type from the key
+        let detail_key = fact.key.split(':').nth(1).unwrap_or(&fact.key);
+
+        // Check restricted categories
+        if self
+            .people_config
+            .restricted_categories
+            .iter()
+            .any(|rc| rc == detail_key)
+        {
+            info!("Skipping restricted people fact category: {}", detail_key);
+            return;
+        }
+
+        // Check if this detail type is in allowed auto-extract categories
+        if !self
+            .people_config
+            .auto_extract_categories
+            .iter()
+            .any(|ac| ac == detail_key)
+        {
+            // Still allow common detail types not in the explicit list
+            let always_allowed = ["name", "relationship", "nickname", "job", "role"];
+            if !always_allowed.contains(&detail_key) {
+                return;
+            }
+        }
+
+        // Find or create the person
+        let person_id = match state.find_person_by_name(&person_name).await {
+            Ok(Some(p)) => p.id,
+            Ok(None) => {
+                // Auto-create with minimal info
+                let person = Person {
+                    id: 0,
+                    name: person_name.clone(),
+                    aliases: vec![],
+                    relationship: None,
+                    platform_ids: std::collections::HashMap::new(),
+                    notes: None,
+                    communication_style: None,
+                    language_preference: None,
+                    last_interaction_at: None,
+                    interaction_count: 0,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                };
+                match state.upsert_person(&person).await {
+                    Ok(id) => {
+                        info!(
+                            "Auto-created person '{}' (ID: {}) from consolidation",
+                            person_name, id
+                        );
+                        id
+                    }
+                    Err(e) => {
+                        warn!("Failed to auto-create person '{}': {}", person_name, e);
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to look up person '{}': {}", person_name, e);
+                return;
+            }
+        };
+
+        // Store the fact with low confidence (auto-extracted)
+        if let Err(e) = state
+            .upsert_person_fact(
+                person_id,
+                detail_key,
+                &fact.key,
+                &fact.value,
+                "consolidation",
+                0.7,
+            )
+            .await
+        {
+            warn!(
+                "Failed to store people fact [{}/{}] for '{}': {}",
+                detail_key, fact.key, person_name, e
+            );
+        } else {
+            debug!(
+                "Stored people fact [{}/{}] for '{}' (confidence: 0.7)",
+                detail_key, fact.key, person_name
+            );
+        }
     }
 
     async fn upsert_fact(
@@ -340,7 +504,7 @@ impl MemoryManager {
 
         // Use supersession logic: find existing current fact
         let existing = sqlx::query(
-            "SELECT id, value FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL"
+            "SELECT id, value FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL",
         )
         .bind(category)
         .bind(key)
@@ -424,7 +588,9 @@ impl MemoryManager {
                 "assistant" => {
                     // Check for tool calls
                     if let Some(tc_json) = &msg.tool_calls_json {
-                        if let Ok(tool_calls) = serde_json::from_str::<Vec<serde_json::Value>>(tc_json) {
+                        if let Ok(tool_calls) =
+                            serde_json::from_str::<Vec<serde_json::Value>>(tc_json)
+                        {
                             for tc in &tool_calls {
                                 if let Some(name) = tc.get("name").and_then(|n| n.as_str()) {
                                     transcript.push_str(&format!("[Action: {}]\n", name));
@@ -451,7 +617,11 @@ impl MemoryManager {
                             let summary = if content.len() > 200 {
                                 format!("[{} output: {} chars]", name, content.len())
                             } else {
-                                format!("[{}: {}]", name, content.chars().take(100).collect::<String>())
+                                format!(
+                                    "[{}: {}]",
+                                    name,
+                                    content.chars().take(100).collect::<String>()
+                                )
                             };
                             transcript.push_str(&format!("{}\n", summary));
                         }
@@ -465,7 +635,11 @@ impl MemoryManager {
     }
 
     /// Create an episode from a session's messages.
-    pub async fn create_episode(&self, session_id: &str, messages: &[Message]) -> anyhow::Result<i64> {
+    pub async fn create_episode(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+    ) -> anyhow::Result<i64> {
         if messages.is_empty() {
             return Err(anyhow::anyhow!("No messages to create episode from"));
         }
@@ -484,7 +658,9 @@ impl MemoryManager {
         let has_decisions = messages.iter().any(|m| {
             m.content.as_ref().is_some_and(|c| {
                 let lower = c.to_lowercase();
-                lower.contains("decided") || lower.contains("let's go with") || lower.contains("i'll use")
+                lower.contains("decided")
+                    || lower.contains("let's go with")
+                    || lower.contains("i'll use")
             })
         });
         let has_goals = !analysis.goals_mentioned.is_empty();
@@ -498,8 +674,14 @@ impl MemoryManager {
         );
 
         // Get time bounds
-        let start_time = messages.first().map(|m| m.created_at).unwrap_or_else(Utc::now);
-        let end_time = messages.last().map(|m| m.created_at).unwrap_or_else(Utc::now);
+        let start_time = messages
+            .first()
+            .map(|m| m.created_at)
+            .unwrap_or_else(Utc::now);
+        let end_time = messages
+            .last()
+            .map(|m| m.created_at)
+            .unwrap_or_else(Utc::now);
         let now = Utc::now();
 
         // Insert episode
@@ -579,9 +761,14 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             json!({"role": "user", "content": format!("Analyze this conversation:\n\n{}", transcript)}),
         ];
 
-        let response = self.provider.chat(&self.fast_model, &llm_messages, &[]).await?;
+        let response = self
+            .provider
+            .chat(&self.fast_model, &llm_messages, &[])
+            .await?;
 
-        let text = response.content.ok_or_else(|| anyhow::anyhow!("Empty response from LLM"))?;
+        let text = response
+            .content
+            .ok_or_else(|| anyhow::anyhow!("Empty response from LLM"))?;
 
         // Parse JSON response
         let trimmed = text.trim();
@@ -595,8 +782,8 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             trimmed
         };
 
-        let analysis: SessionAnalysis = serde_json::from_str(json_str)
-            .unwrap_or_else(|_| SessionAnalysis {
+        let analysis: SessionAnalysis =
+            serde_json::from_str(json_str).unwrap_or_else(|_| SessionAnalysis {
                 summary: "Session with various tasks".to_string(),
                 topics: vec!["general".to_string()],
                 emotional_tone: "neutral".to_string(),
@@ -626,8 +813,10 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             let desc_lower = description.to_lowercase();
 
             // Check for word overlap
-            let goal_words: std::collections::HashSet<&str> = goal_lower.split_whitespace().collect();
-            let desc_words: std::collections::HashSet<&str> = desc_lower.split_whitespace().collect();
+            let goal_words: std::collections::HashSet<&str> =
+                goal_lower.split_whitespace().collect();
+            let desc_words: std::collections::HashSet<&str> =
+                desc_lower.split_whitespace().collect();
             let intersection = goal_words.intersection(&desc_words).count();
             let union = goal_words.union(&desc_words).count();
 
@@ -676,14 +865,21 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         .execute(&self.pool)
         .await?;
 
-        info!(goal = goal_text, episode_id = source_episode_id, "Created new goal");
+        info!(
+            goal = goal_text,
+            episode_id = source_episode_id,
+            "Created new goal"
+        );
         Ok(())
     }
 
     // ==================== Communication Style Analysis ====================
 
     /// Analyze user's communication style from recent sessions.
-    pub async fn analyze_communication_style(&self, recent_messages: &[Message]) -> anyhow::Result<UserProfile> {
+    pub async fn analyze_communication_style(
+        &self,
+        recent_messages: &[Message],
+    ) -> anyhow::Result<UserProfile> {
         let user_messages: Vec<&Message> = recent_messages
             .iter()
             .filter(|m| m.role == "user")
@@ -698,7 +894,8 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             .iter()
             .filter_map(|m| m.content.as_ref())
             .map(|c| c.len() as f32)
-            .sum::<f32>() / user_messages.len() as f32;
+            .sum::<f32>()
+            / user_messages.len() as f32;
 
         let verbosity = if avg_length > 200.0 {
             "detailed"
@@ -803,8 +1000,14 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
     }
 
     async fn update_profile(&self, profile: &UserProfile) -> anyhow::Result<()> {
-        let active_hours_json = profile.active_hours.as_ref().map(|h| serde_json::to_string(h).unwrap_or_default());
-        let workflows_json = profile.common_workflows.as_ref().map(|w| serde_json::to_string(w).unwrap_or_default());
+        let active_hours_json = profile
+            .active_hours
+            .as_ref()
+            .map(|h| serde_json::to_string(h).unwrap_or_default());
+        let workflows_json = profile
+            .common_workflows
+            .as_ref()
+            .map(|w| serde_json::to_string(w).unwrap_or_default());
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
@@ -831,7 +1034,10 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
     // ==================== Behavior Pattern Detection ====================
 
     /// Detect behavior patterns from recent tool usage.
-    pub async fn detect_patterns(&self, recent_messages: &[Message]) -> anyhow::Result<Vec<BehaviorPattern>> {
+    pub async fn detect_patterns(
+        &self,
+        recent_messages: &[Message],
+    ) -> anyhow::Result<Vec<BehaviorPattern>> {
         // Extract tool call sequences
         let mut tool_sequences: Vec<(String, DateTime<Utc>)> = Vec::new();
 
@@ -927,7 +1133,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
 
         sqlx::query(
             "UPDATE facts SET recall_count = MAX(0, recall_count - 1)
-             WHERE recall_count > 0 AND (last_recalled_at IS NULL OR last_recalled_at < ?)"
+             WHERE recall_count > 0 AND (last_recalled_at IS NULL OR last_recalled_at < ?)",
         )
         .bind(&thirty_days_ago)
         .execute(&self.pool)
@@ -936,7 +1142,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         // Decay episodes
         sqlx::query(
             "UPDATE episodes SET recall_count = MAX(0, recall_count - 1)
-             WHERE recall_count > 0 AND (last_recalled_at IS NULL OR last_recalled_at < ?)"
+             WHERE recall_count > 0 AND (last_recalled_at IS NULL OR last_recalled_at < ?)",
         )
         .bind(&thirty_days_ago)
         .execute(&self.pool)
@@ -945,7 +1151,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         // Decay behavior pattern confidence
         sqlx::query(
             "UPDATE behavior_patterns SET confidence = MAX(0.1, confidence - 0.05)
-             WHERE confidence > 0.1 AND (last_seen_at IS NULL OR last_seen_at < ?)"
+             WHERE confidence > 0.1 AND (last_seen_at IS NULL OR last_seen_at < ?)",
         )
         .bind(&thirty_days_ago)
         .execute(&self.pool)
@@ -963,7 +1169,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         let two_weeks_ago = (Utc::now() - chrono::Duration::days(14)).to_rfc3339();
 
         let stale_goals = sqlx::query(
-            "SELECT id, description FROM goals WHERE status = 'active' AND updated_at < ?"
+            "SELECT id, description FROM goals WHERE status = 'active' AND updated_at < ?",
         )
         .bind(&two_weeks_ago)
         .fetch_all(&self.pool)
@@ -972,7 +1178,10 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         for row in stale_goals {
             let id: i64 = row.get("id");
             let description: String = row.get("description");
-            info!(goal_id = id, description, "Stale goal detected - may need user input");
+            info!(
+                goal_id = id,
+                description, "Stale goal detected - may need user input"
+            );
         }
 
         Ok(())
@@ -994,7 +1203,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                AND e.id IS NULL
              GROUP BY m.session_id
              HAVING COUNT(m.id) >= 5
-               AND MAX(m.created_at) < ?"
+               AND MAX(m.created_at) < ?",
         )
         .bind(&thirty_mins_ago)
         .bind(&thirty_mins_ago)
@@ -1005,7 +1214,10 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             return Ok(());
         }
 
-        info!(count = idle_sessions.len(), "Creating episodes for idle sessions");
+        info!(
+            count = idle_sessions.len(),
+            "Creating episodes for idle sessions"
+        );
 
         for session_id in idle_sessions {
             let messages = self.fetch_session_messages(&session_id, 100).await?;
@@ -1049,7 +1261,11 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
     }
 
     /// Fetch messages for a specific session.
-    async fn fetch_session_messages(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
+    async fn fetch_session_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
         let rows = sqlx::query(
             "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
              FROM messages
@@ -1062,29 +1278,36 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         .fetch_all(&self.pool)
         .await?;
 
-        let messages = rows.into_iter().map(|row| {
-            let created_str: String = row.get("created_at");
-            Message {
-                id: row.get("id"),
-                session_id: row.get("session_id"),
-                role: row.get("role"),
-                content: row.get("content"),
-                tool_call_id: row.get("tool_call_id"),
-                tool_name: row.get("tool_name"),
-                tool_calls_json: row.get("tool_calls_json"),
-                created_at: DateTime::parse_from_rfc3339(&created_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-                importance: row.get("importance"),
-                embedding: None,
-            }
-        }).collect();
+        let messages = rows
+            .into_iter()
+            .map(|row| {
+                let created_str: String = row.get("created_at");
+                Message {
+                    id: row.get("id"),
+                    session_id: row.get("session_id"),
+                    role: row.get("role"),
+                    content: row.get("content"),
+                    tool_call_id: row.get("tool_call_id"),
+                    tool_name: row.get("tool_name"),
+                    tool_calls_json: row.get("tool_calls_json"),
+                    created_at: DateTime::parse_from_rfc3339(&created_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    importance: row.get("importance"),
+                    embedding: None,
+                }
+            })
+            .collect();
 
         Ok(messages)
     }
 
     /// Fetch messages from all sessions since a given time.
-    async fn fetch_messages_since(&self, since: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
+    async fn fetch_messages_since(
+        &self,
+        since: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
         let rows = sqlx::query(
             "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
              FROM messages
@@ -1097,23 +1320,26 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         .fetch_all(&self.pool)
         .await?;
 
-        let messages = rows.into_iter().map(|row| {
-            let created_str: String = row.get("created_at");
-            Message {
-                id: row.get("id"),
-                session_id: row.get("session_id"),
-                role: row.get("role"),
-                content: row.get("content"),
-                tool_call_id: row.get("tool_call_id"),
-                tool_name: row.get("tool_name"),
-                tool_calls_json: row.get("tool_calls_json"),
-                created_at: DateTime::parse_from_rfc3339(&created_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-                importance: row.get("importance"),
-                embedding: None,
-            }
-        }).collect();
+        let messages = rows
+            .into_iter()
+            .map(|row| {
+                let created_str: String = row.get("created_at");
+                Message {
+                    id: row.get("id"),
+                    session_id: row.get("session_id"),
+                    role: row.get("role"),
+                    content: row.get("content"),
+                    tool_call_id: row.get("tool_call_id"),
+                    tool_name: row.get("tool_name"),
+                    tool_calls_json: row.get("tool_calls_json"),
+                    created_at: DateTime::parse_from_rfc3339(&created_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    importance: row.get("importance"),
+                    embedding: None,
+                }
+            })
+            .collect();
 
         Ok(messages)
     }
@@ -1125,6 +1351,8 @@ struct ExtractedFact {
     key: String,
     value: String,
     privacy: Option<String>,
+    /// For "people" category: the person's name
+    person_name: Option<String>,
 }
 
 /// Derive a channel_id from a session_id string.

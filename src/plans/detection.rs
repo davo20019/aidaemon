@@ -49,17 +49,25 @@ pub fn should_create_plan(user_message: &str) -> PlanTrigger {
     }
 
     // Database migrations
-    if lower.contains("migrat") && (lower.contains("database") || lower.contains("db") || lower.contains("schema")) {
+    if lower.contains("migrat")
+        && (lower.contains("database") || lower.contains("db") || lower.contains("schema"))
+    {
         return PlanTrigger::AutoCreate("database migration".to_string());
     }
 
     // Bulk deletions
-    if lower.contains("delete") && (lower.contains("all") || lower.contains("every") || lower.contains("bulk")) {
+    if lower.contains("delete")
+        && (lower.contains("all") || lower.contains("every") || lower.contains("bulk"))
+    {
         return PlanTrigger::AutoCreate("bulk deletion".to_string());
     }
 
     // System upgrades
-    if lower.contains("upgrade") && (lower.contains("system") || lower.contains("server") || lower.contains("infrastructure")) {
+    if lower.contains("upgrade")
+        && (lower.contains("system")
+            || lower.contains("server")
+            || lower.contains("infrastructure"))
+    {
         return PlanTrigger::AutoCreate("system upgrade".to_string());
     }
 
@@ -115,7 +123,9 @@ pub fn should_create_plan(user_message: &str) -> PlanTrigger {
 
     // Build/setup tasks
     if (lower.contains("set up") || lower.contains("setup") || lower.contains("build"))
-        && (lower.contains("project") || lower.contains("environment") || lower.contains("pipeline"))
+        && (lower.contains("project")
+            || lower.contains("environment")
+            || lower.contains("pipeline"))
     {
         return PlanTrigger::Suggest("setup task".to_string());
     }
@@ -174,16 +184,25 @@ mod tests {
     #[test]
     fn test_suggest_user_request() {
         let trigger = should_create_plan("Help me step by step with this");
-        assert_eq!(trigger, PlanTrigger::Suggest("user requested planning".to_string()));
+        assert_eq!(
+            trigger,
+            PlanTrigger::Suggest("user requested planning".to_string())
+        );
 
         let trigger = should_create_plan("Create a plan for the feature");
-        assert_eq!(trigger, PlanTrigger::Suggest("user requested planning".to_string()));
+        assert_eq!(
+            trigger,
+            PlanTrigger::Suggest("user requested planning".to_string())
+        );
     }
 
     #[test]
     fn test_suggest_refactoring() {
         let trigger = should_create_plan("Refactor the authentication module");
-        assert_eq!(trigger, PlanTrigger::Suggest("refactoring task".to_string()));
+        assert_eq!(
+            trigger,
+            PlanTrigger::Suggest("refactoring task".to_string())
+        );
     }
 
     #[test]
@@ -191,7 +210,10 @@ mod tests {
         let trigger = should_create_plan(
             "First update the config, then restart the service, and finally verify it works",
         );
-        assert_eq!(trigger, PlanTrigger::Suggest("multi-phase task".to_string()));
+        assert_eq!(
+            trigger,
+            PlanTrigger::Suggest("multi-phase task".to_string())
+        );
     }
 
     #[test]

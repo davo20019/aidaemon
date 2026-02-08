@@ -44,9 +44,7 @@ pub(crate) fn markdown_to_telegram_html(md: &str) -> String {
                     .filter(|cell| !cell.is_empty())
                     .collect()
             };
-            let is_separator = |row: &str| -> bool {
-                row.contains("---") || row.contains(":--")
-            };
+            let is_separator = |row: &str| -> bool { row.contains("---") || row.contains(":--") };
 
             let headers: Vec<String> = if !table_lines.is_empty() {
                 parse_row(table_lines[0])
@@ -54,7 +52,8 @@ pub(crate) fn markdown_to_telegram_html(md: &str) -> String {
                 Vec::new()
             };
 
-            let data_rows: Vec<Vec<String>> = table_lines.iter()
+            let data_rows: Vec<Vec<String>> = table_lines
+                .iter()
                 .skip(1)
                 .filter(|line| !is_separator(line))
                 .map(|line| parse_row(line))
@@ -70,7 +69,8 @@ pub(crate) fn markdown_to_telegram_html(md: &str) -> String {
                     let formatted_cell = convert_inline_formatting(&escaped_cell);
                     if ci < headers.len() {
                         let escaped_header = html_escape(&headers[ci]);
-                        result.push_str(&format!("<b>{}</b>: {}\n", escaped_header, formatted_cell));
+                        result
+                            .push_str(&format!("<b>{}</b>: {}\n", escaped_header, formatted_cell));
                     } else {
                         result.push_str(&formatted_cell);
                         result.push('\n');
@@ -94,7 +94,10 @@ pub(crate) fn markdown_to_telegram_html(md: &str) -> String {
         }
 
         // Unordered list markers: "- " or "* " at start → "• "
-        let processed = if let Some(rest) = escaped.strip_prefix("- ").or_else(|| escaped.strip_prefix("* ")) {
+        let processed = if let Some(rest) = escaped
+            .strip_prefix("- ")
+            .or_else(|| escaped.strip_prefix("* "))
+        {
             format!("• {}", rest)
         } else {
             escaped
@@ -182,7 +185,11 @@ fn convert_inline_formatting(s: &str) -> String {
         // Italic: _text_ (but not inside words like some_var_name)
         if chars[i] == '_' && (i == 0 || chars[i - 1] == ' ') {
             if let Some(end) = find_char(&chars, '_', i + 1) {
-                if end + 1 >= len || chars[end + 1] == ' ' || chars[end + 1] == '.' || chars[end + 1] == ',' {
+                if end + 1 >= len
+                    || chars[end + 1] == ' '
+                    || chars[end + 1] == '.'
+                    || chars[end + 1] == ','
+                {
                     result.push_str("<i>");
                     let inner: String = chars[i + 1..end].iter().collect();
                     result.push_str(&inner);
@@ -269,8 +276,9 @@ pub(crate) fn split_message(text: &str, max_len: usize) -> Vec<String> {
         let search_region = &remaining[..boundary];
 
         // Try paragraph boundary first
-        let split_at = search_region.rfind("\n\n")
-            .map(|p| p + 1)  // include first \n, second starts next chunk
+        let split_at = search_region
+            .rfind("\n\n")
+            .map(|p| p + 1) // include first \n, second starts next chunk
             // Then try line boundary
             .or_else(|| search_region.rfind('\n'))
             // Last resort: split at char boundary
@@ -282,7 +290,10 @@ pub(crate) fn split_message(text: &str, max_len: usize) -> Vec<String> {
         // Safety: if split_at is 0 (e.g. max_len=0), force progress by
         // advancing one character to avoid an infinite loop.
         let split_at = if split_at == 0 {
-            remaining.char_indices().nth(1).map_or(remaining.len(), |(i, _)| i)
+            remaining
+                .char_indices()
+                .nth(1)
+                .map_or(remaining.len(), |(i, _)| i)
         } else {
             split_at
         };
@@ -381,11 +392,12 @@ pub(crate) fn markdown_to_slack_mrkdwn(md: &str) -> String {
         }
 
         // Unordered list markers: "- " or "* " at start → "• "
-        let processed = if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            format!("• {}", rest)
-        } else {
-            line.to_string()
-        };
+        let processed =
+            if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+                format!("• {}", rest)
+            } else {
+                line.to_string()
+            };
 
         // Apply inline formatting conversions
         let processed = convert_slack_inline(&processed);
@@ -459,7 +471,9 @@ fn convert_slack_inline(s: &str) -> String {
 ///
 /// `include_restart`: whether to show the /restart command (Telegram, Slack)
 /// `include_connect`: whether to show /connect and /bots (Telegram only)
-pub(crate) fn build_help_text(include_restart: bool, include_connect: bool) -> String {
+/// `prefix`: command prefix character ("/" for Telegram, "!" for Slack)
+pub(crate) fn build_help_text(include_restart: bool, include_connect: bool, prefix: &str) -> String {
+    let p = prefix;
     let mut text = String::from(
         "**What I can do**\n\
          \n\
@@ -496,35 +510,35 @@ pub(crate) fn build_help_text(include_restart: bool, include_connect: bool) -> S
          **Commands**",
     );
 
-    text.push_str(
+    text.push_str(&format!(
         "\n\
-         `/model` — Show or switch AI model\n\
-         `/models` — List available models\n\
-         `/auto` — Re-enable automatic model routing\n\
-         `/reload` — Reload configuration",
-    );
+         `{p}model` — Show or switch AI model\n\
+         `{p}models` — List available models\n\
+         `{p}auto` — Re-enable automatic model routing\n\
+         `{p}reload` — Reload configuration",
+    ));
 
     if include_restart {
-        text.push_str("\n`/restart` — Restart the daemon");
+        text.push_str(&format!("\n`{p}restart` — Restart the daemon"));
     }
 
-    text.push_str(
+    text.push_str(&format!(
         "\n\
-         `/tasks` — List running tasks\n\
-         `/cancel <id>` — Cancel a running task\n\
-         `/clear` — Start fresh conversation\n\
-         `/cost` — Show token usage stats",
-    );
+         `{p}tasks` — List running tasks\n\
+         `{p}cancel <id>` — Cancel a running task\n\
+         `{p}clear` — Start fresh conversation\n\
+         `{p}cost` — Show token usage stats",
+    ));
 
     if include_connect {
-        text.push_str(
+        text.push_str(&format!(
             "\n\
-             `/connect` — Add a new bot\n\
-             `/bots` — List connected bots",
-        );
+             `{p}connect` — Add a new bot\n\
+             `{p}bots` — List connected bots",
+        ));
     }
 
-    text.push_str("\n`/help` — Show this message");
+    text.push_str(&format!("\n`{p}help` — Show this message"));
 
     text
 }

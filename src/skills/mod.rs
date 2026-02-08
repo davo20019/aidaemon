@@ -1,8 +1,8 @@
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -11,8 +11,8 @@ pub use resources::{FileSystemResolver, ResourceEntry, ResourceResolver};
 
 use crate::tools::sanitize::sanitize_external_content;
 use crate::traits::{
-    BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, ModelProvider, Procedure,
-    UserProfile,
+    BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, ModelProvider, Person,
+    PersonFact, Procedure, UserProfile,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +73,13 @@ impl SharedSkillRegistry {
 
     /// Get a snapshot of all enabled skills.
     pub async fn snapshot(&self) -> Vec<Skill> {
-        self.inner.read().await.iter().filter(|s| s.enabled).cloned().collect()
+        self.inner
+            .read()
+            .await
+            .iter()
+            .filter(|s| s.enabled)
+            .cloned()
+            .collect()
     }
 
     /// Get a snapshot of all skills (including disabled).
@@ -83,7 +89,12 @@ impl SharedSkillRegistry {
 
     /// Find a skill by name (among enabled skills).
     pub async fn find(&self, name: &str) -> Option<Skill> {
-        self.inner.read().await.iter().find(|s| s.name == name && s.enabled).cloned()
+        self.inner
+            .read()
+            .await
+            .iter()
+            .find(|s| s.name == name && s.enabled)
+            .cloned()
     }
 
     /// Set the enabled flag for a skill by name. Returns true if found.
@@ -406,9 +417,13 @@ pub fn build_system_prompt(
         }
     }
 
-    // Active skill bodies
+    // Active skill bodies (sanitized to prevent prompt injection from external skill sources)
     for skill in active {
-        prompt.push_str(&format!("\n\n## Active Skill: {}\n{}", skill.name, skill.body));
+        let sanitized_body = sanitize_external_content(&skill.body);
+        prompt.push_str(&format!(
+            "\n\n## Active Skill: {}\n{}",
+            skill.name, sanitized_body
+        ));
     }
 
     // Known facts (capped to max_facts, already ordered by updated_at DESC)
@@ -442,6 +457,12 @@ pub struct MemoryContext<'a> {
     pub trusted_command_patterns: &'a [(String, i32)],
     /// Cross-channel hints: relevant facts from other channels (category+key only, values under confidentiality)
     pub cross_channel_hints: &'a [Fact],
+    /// All tracked people (injected only in owner DMs)
+    pub people: &'a [Person],
+    /// The current speaker (resolved from sender_id), if any
+    pub current_person: Option<&'a Person>,
+    /// Facts about the current speaker
+    pub current_person_facts: &'a [PersonFact],
 }
 
 /// Build the complete system prompt with all memory components.
@@ -494,8 +515,10 @@ pub fn build_system_prompt_with_memory(
             prompt.push_str("- Keep explanations brief — user prefers direct answers\n");
         }
         if profile.asks_before_acting {
-            prompt.push_str("- User prefers to be asked before significant actions are taken. \
-                For multi-step tasks, briefly state your plan and confirm before executing.\n");
+            prompt.push_str(
+                "- User prefers to be asked before significant actions are taken. \
+                For multi-step tasks, briefly state your plan and confirm before executing.\n",
+            );
         }
     }
 
@@ -586,7 +609,11 @@ pub fn build_system_prompt_with_memory(
     if !capped_facts.is_empty() {
         prompt.push_str("\n\n## Known Facts\n");
         for f in capped_facts {
-            let history_marker = if f.recall_count > 3 { " (frequently used)" } else { "" };
+            let history_marker = if f.recall_count > 3 {
+                " (frequently used)"
+            } else {
+                ""
+            };
             let resolved_key = resolve_user_ids(&f.key, user_id_map);
             let resolved_value = resolve_user_ids(&f.value, user_id_map);
             // Sanitize fact values to prevent prompt injection via stored data
@@ -652,7 +679,9 @@ pub fn build_system_prompt_with_memory(
         for (pattern, count) in memory.trusted_command_patterns.iter().take(10) {
             prompt.push_str(&format!("- `{}` (approved {}x)\n", pattern, count));
         }
-        prompt.push_str("\nWhen suggesting terminal commands, prefer simpler commands over complex pipelines. ");
+        prompt.push_str(
+            "\nWhen suggesting terminal commands, prefer simpler commands over complex pipelines. ",
+        );
         prompt.push_str("If a pipeline is necessary, explain why each part is needed.\n");
     }
 
@@ -667,7 +696,76 @@ pub fn build_system_prompt_with_memory(
         }
     }
 
-    // 10. Available Skills
+    // 11. People Context (only when people data exists)
+    if !memory.people.is_empty() {
+        prompt.push_str("\n\n## People You Know\n");
+        for p in memory.people.iter().take(20) {
+            let rel = p.relationship.as_deref().unwrap_or("contact");
+            let style = p
+                .communication_style
+                .as_deref()
+                .map(|s| format!(", style: {}", s))
+                .unwrap_or_default();
+            let lang = p
+                .language_preference
+                .as_deref()
+                .map(|l| format!(", language: {}", l))
+                .unwrap_or_default();
+            prompt.push_str(&format!("- **{}** ({}){}{}\n", p.name, rel, style, lang));
+        }
+    }
+
+    // 12. Current Speaker Context (when talking to a known person who is not the owner)
+    if let Some(person) = memory.current_person {
+        prompt.push_str(&format!(
+            "\n\n## Current Speaker Context\nYou are talking to {} ",
+            person.name
+        ));
+        if let Some(ref rel) = person.relationship {
+            prompt.push_str(&format!("(the owner's {}). ", rel));
+        } else {
+            prompt.push_str("(a known contact). ");
+        }
+        if let Some(ref style) = person.communication_style {
+            prompt.push_str(&format!("Communication style: {}. ", style));
+        }
+        if let Some(ref lang) = person.language_preference {
+            prompt.push_str(&format!("Language preference: {}. ", lang));
+        }
+        prompt.push('\n');
+
+        // Add relevant facts about this person
+        if !memory.current_person_facts.is_empty() {
+            prompt.push_str("Known facts about them:\n");
+            for f in memory.current_person_facts.iter().take(10) {
+                prompt.push_str(&format!("- [{}] {}: {}\n", f.category, f.key, f.value));
+            }
+        }
+
+        // First interaction notice
+        if person.interaction_count == 0 {
+            prompt.push_str(&format!(
+                "\nThis is your first interaction with {}. Naturally mention early in the conversation: \
+                 \"I learn from our conversations and adapt my communication style over time. \
+                 If you have any preferences, just let me know!\"\n",
+                person.name
+            ));
+        }
+    }
+
+    // 13. People Privacy Rules (when people data exists)
+    if !memory.people.is_empty() || memory.current_person.is_some() {
+        prompt.push_str("\n\n## People Privacy Rules\n\
+            - You ARE transparent about: adapting communication style, learning from conversations\n\
+            - You are NOT transparent about: the owner's people graph, relationship insights, stored facts about people, or proactive coaching\n\
+            - Only share detailed information about people with the OWNER in private DMs\n\
+            - If someone asks \"what do you know about me?\", you may share what THEY have told you directly, but NOT facts the owner stored or things learned from other contexts\n\
+            - Never say \"the owner told me about you\" or share facts from the owner's private notes\n\
+            - In group chats, do not volunteer personal facts about any individual\n\
+            - When proactively reminding the owner about dates/events, do so naturally (\"By the way, someone's birthday is coming up next week!\")\n");
+    }
+
+    // 14. Available Skills
     if !skills.is_empty() {
         prompt.push_str("\n\n## Available Skills\n");
         for skill in skills {
@@ -675,9 +773,13 @@ pub fn build_system_prompt_with_memory(
         }
     }
 
-    // Active skill bodies
+    // Active skill bodies (sanitized to prevent prompt injection from external skill sources)
     for skill in active {
-        prompt.push_str(&format!("\n\n## Active Skill: {}\n{}", skill.name, skill.body));
+        let sanitized_body = sanitize_external_content(&skill.body);
+        prompt.push_str(&format!(
+            "\n\n## Active Skill: {}\n{}",
+            skill.name, sanitized_body
+        ));
         if !skill.resources.is_empty() {
             prompt.push_str(
                 "\n\n**Bundled resources** (use `skill_resources` tool to load on demand):",
@@ -880,7 +982,10 @@ mod tests {
         assert_eq!(skill.name, "test-skill");
         assert_eq!(skill.resources.len(), 2);
         assert!(skill.dir_path.is_some());
-        assert!(skill.resources.iter().any(|r| r.path == "references/guide.md"));
+        assert!(skill
+            .resources
+            .iter()
+            .any(|r| r.path == "references/guide.md"));
         assert!(skill.resources.iter().any(|r| r.path == "scripts/hello.sh"));
     }
 
@@ -921,9 +1026,15 @@ mod tests {
         let resources = scan_skill_resources(dir.path());
         assert_eq!(resources.len(), 2);
         // Custom directories use their dirname as category
-        let examples_entry = resources.iter().find(|r| r.path == "data/config.json").unwrap();
+        let examples_entry = resources
+            .iter()
+            .find(|r| r.path == "data/config.json")
+            .unwrap();
         assert_eq!(examples_entry.category, "data");
-        let data_entry = resources.iter().find(|r| r.path == "examples/demo.py").unwrap();
+        let data_entry = resources
+            .iter()
+            .find(|r| r.path == "examples/demo.py")
+            .unwrap();
         assert_eq!(data_entry.category, "examples");
     }
 

@@ -10,7 +10,7 @@ use tracing::{error, info};
 use crate::agent::{Agent, StatusUpdate};
 use crate::channels::ChannelHub;
 use crate::traits::Tool;
-use crate::types::{ChannelContext, ChannelVisibility};
+use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
 ///
@@ -111,6 +111,10 @@ struct SpawnArgs {
     /// Channel visibility injected by execute_tool — propagated to child agents.
     #[serde(default)]
     _channel_visibility: Option<String>,
+    /// User role injected by execute_tool — propagated to child agents to prevent
+    /// privilege escalation (e.g., Guest user spawning Owner-level sub-agent).
+    #[serde(default)]
+    _user_role: Option<String>,
 }
 
 #[async_trait]
@@ -189,14 +193,24 @@ impl Tool for SpawnAgentTool {
                 channel_name: None,
                 channel_id: None,
                 sender_name: None,
+                sender_id: None,
                 channel_member_names: vec![],
                 user_id_map: std::collections::HashMap::new(),
+                trusted: false,
             }
+        };
+
+        // Propagate parent's user role to prevent privilege escalation.
+        // Default to Guest (least privilege) if not provided.
+        let user_role = match args._user_role.as_deref() {
+            Some("Owner") => UserRole::Owner,
+            Some("Guest") => UserRole::Guest,
+            _ => UserRole::Guest,
         };
 
         if !args.background {
             return self
-                .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx)
+                .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx, user_role)
                 .await;
         }
 
@@ -206,7 +220,7 @@ impl Tool for SpawnAgentTool {
             None => {
                 info!("Background mode requested but hub not available, falling back to sync");
                 return self
-                    .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx)
+                    .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx, user_role)
                     .await;
             }
         };
@@ -215,7 +229,7 @@ impl Tool for SpawnAgentTool {
             _ => {
                 info!("Background mode requested but no session_id, falling back to sync");
                 return self
-                    .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx)
+                    .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx, user_role)
                     .await;
             }
         };
@@ -228,7 +242,7 @@ impl Tool for SpawnAgentTool {
             let timeout_duration = Duration::from_secs(timeout_secs);
             let result = tokio::time::timeout(
                 timeout_duration,
-                agent.spawn_child(&mission, &args.task, status_tx, channel_ctx),
+                agent.spawn_child(&mission, &args.task, status_tx, channel_ctx, user_role),
             )
             .await;
 
@@ -284,11 +298,12 @@ impl SpawnAgentTool {
         task: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         channel_ctx: ChannelContext,
+        user_role: UserRole,
     ) -> anyhow::Result<String> {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
         let result = tokio::time::timeout(
             timeout_duration,
-            agent.spawn_child(mission, task, status_tx, channel_ctx),
+            agent.spawn_child(mission, task, status_tx, channel_ctx, user_role),
         )
         .await;
 
@@ -392,8 +407,7 @@ mod tests {
 
     #[test]
     fn spawn_args_background_true() {
-        let json =
-            r#"{"mission": "test", "task": "do stuff", "background": true, "_session_id": "tg:123"}"#;
+        let json = r#"{"mission": "test", "task": "do stuff", "background": true, "_session_id": "tg:123"}"#;
         let args: SpawnArgs = serde_json::from_str(json).unwrap();
         assert!(args.background);
         assert_eq!(args._session_id.as_deref(), Some("tg:123"));

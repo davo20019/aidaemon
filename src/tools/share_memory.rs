@@ -51,7 +51,10 @@ impl ShareMemoryTool {
                 Ok(ApprovalResponse::Deny)
             }
             Err(_) => {
-                warn!("Approval request timed out for share_memory ({}s)", APPROVAL_TIMEOUT_SECS);
+                warn!(
+                    "Approval request timed out for share_memory ({}s)",
+                    APPROVAL_TIMEOUT_SECS
+                );
                 Ok(ApprovalResponse::Deny)
             }
         }
@@ -102,7 +105,9 @@ impl Tool for ShareMemoryTool {
 
         // Find the fact by category + key
         let facts = self.state.get_facts(Some(&args.category)).await?;
-        let fact = facts.iter().find(|f| f.key == args.key && f.superseded_at.is_none());
+        let fact = facts
+            .iter()
+            .find(|f| f.key == args.key && f.superseded_at.is_none());
 
         match fact {
             Some(f) => {
@@ -117,14 +122,17 @@ impl Tool for ShareMemoryTool {
                         f.value.clone()
                     }
                 );
-                match self.request_approval(&args._session_id, &description).await? {
-                    ApprovalResponse::Deny => {
-                        Ok("Memory sharing denied by user.".to_string())
-                    }
+                match self
+                    .request_approval(&args._session_id, &description)
+                    .await?
+                {
+                    ApprovalResponse::Deny => Ok("Memory sharing denied by user.".to_string()),
                     ApprovalResponse::AllowOnce
                     | ApprovalResponse::AllowSession
                     | ApprovalResponse::AllowAlways => {
-                        self.state.update_fact_privacy(f.id, FactPrivacy::Global).await?;
+                        self.state
+                            .update_fact_privacy(f.id, FactPrivacy::Global)
+                            .await?;
                         Ok(format!(
                             "Memory shared: [{}] {} is now globally accessible.",
                             args.category, args.key

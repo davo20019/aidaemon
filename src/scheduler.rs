@@ -140,7 +140,7 @@ impl SchedulerManager {
         let rows = sqlx::query(
             "SELECT id, name, cron_expr, prompt, is_oneshot, is_trusted
              FROM scheduled_tasks
-             WHERE next_run_at <= ? AND is_paused = 0"
+             WHERE next_run_at <= ? AND is_paused = 0",
         )
         .bind(&now_str)
         .fetch_all(&self.pool)
@@ -165,6 +165,7 @@ impl SchedulerManager {
                 source: "scheduler".to_string(),
                 session_id,
                 content: prompt.clone(),
+                trusted: is_trusted,
             };
 
             if self.sender.send(event).is_err() {
@@ -195,11 +196,13 @@ impl SchedulerManager {
                     }
                     Err(e) => {
                         error!(name = %name, "Failed to compute next run, pausing task: {}", e);
-                        sqlx::query("UPDATE scheduled_tasks SET is_paused = 1, updated_at = ? WHERE id = ?")
-                            .bind(&now_str)
-                            .bind(&id)
-                            .execute(&self.pool)
-                            .await?;
+                        sqlx::query(
+                            "UPDATE scheduled_tasks SET is_paused = 1, updated_at = ? WHERE id = ?",
+                        )
+                        .bind(&now_str)
+                        .bind(&id)
+                        .execute(&self.pool)
+                        .await?;
                     }
                 }
             }
@@ -216,7 +219,7 @@ impl SchedulerManager {
         let rows = sqlx::query(
             "SELECT id, name, cron_expr, prompt, is_oneshot, is_trusted
              FROM scheduled_tasks
-             WHERE next_run_at < ? AND is_paused = 0"
+             WHERE next_run_at < ? AND is_paused = 0",
         )
         .bind(&now_str)
         .fetch_all(&self.pool)
@@ -246,6 +249,7 @@ impl SchedulerManager {
                 source: "scheduler".to_string(),
                 session_id,
                 content: prompt.clone(),
+                trusted: is_trusted,
             };
 
             if self.sender.send(event).is_err() {
@@ -275,11 +279,13 @@ impl SchedulerManager {
                     }
                     Err(e) => {
                         error!(name = %name, "Failed to recompute next run after recovery: {}", e);
-                        sqlx::query("UPDATE scheduled_tasks SET is_paused = 1, updated_at = ? WHERE id = ?")
-                            .bind(&now_str)
-                            .bind(&id)
-                            .execute(&self.pool)
-                            .await?;
+                        sqlx::query(
+                            "UPDATE scheduled_tasks SET is_paused = 1, updated_at = ? WHERE id = ?",
+                        )
+                        .bind(&now_str)
+                        .bind(&id)
+                        .execute(&self.pool)
+                        .await?;
                     }
                 }
             }
@@ -368,7 +374,8 @@ pub fn parse_schedule(input: &str) -> anyhow::Result<String> {
     let parts: Vec<&str> = input.split_whitespace().collect();
     if parts.len() == 5 {
         // Try to parse as cron
-        input.parse::<Cron>()
+        input
+            .parse::<Cron>()
             .map_err(|e| anyhow::anyhow!("Invalid cron expression '{}': {}", input, e))?;
         return Ok(input.to_string());
     }

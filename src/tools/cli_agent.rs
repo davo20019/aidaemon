@@ -72,7 +72,9 @@ impl LoopDetector {
         }
 
         // Check if any line appears too frequently
-        self.line_counts.values().any(|&count| count >= LOOP_DETECTION_THRESHOLD)
+        self.line_counts
+            .values()
+            .any(|&count| count >= LOOP_DETECTION_THRESHOLD)
     }
 
     /// Get the most repeated line pattern for error reporting
@@ -155,13 +157,45 @@ pub struct CliAgentTool {
 }
 
 /// Default tool definitions when the user enables cli_agents but doesn't specify tools.
-fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static str>, &'static str)> {
+fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static str>, &'static str)>
+{
     vec![
-        ("claude", "claude", vec!["-p", "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"], "Claude Code — Anthropic's AI coding agent (auto-approve mode)"),
-        ("gemini", "gemini", vec!["-p", "--sandbox=false", "--auto-approve"], "Gemini CLI — Google's AI coding agent (auto-approve mode)"),
-        ("codex", "codex", vec!["exec", "--json", "--full-auto"], "Codex CLI — OpenAI's AI coding agent"),
-        ("copilot", "copilot", vec!["-p", "--allow-all-tools", "--allow-all-paths"], "GitHub Copilot CLI (auto-approve mode)"),
-        ("aider", "aider", vec!["--yes", "--message"], "Aider — AI pair programming"),
+        (
+            "claude",
+            "claude",
+            vec![
+                "-p",
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ],
+            "Claude Code — Anthropic's AI coding agent (auto-approve mode)",
+        ),
+        (
+            "gemini",
+            "gemini",
+            vec!["-p", "--sandbox=false", "--auto-approve"],
+            "Gemini CLI — Google's AI coding agent (auto-approve mode)",
+        ),
+        (
+            "codex",
+            "codex",
+            vec!["exec", "--json", "--full-auto"],
+            "Codex CLI — OpenAI's AI coding agent",
+        ),
+        (
+            "copilot",
+            "copilot",
+            vec!["-p", "--allow-all-tools", "--allow-all-paths"],
+            "GitHub Copilot CLI (auto-approve mode)",
+        ),
+        (
+            "aider",
+            "aider",
+            vec!["--yes", "--message"],
+            "Aider — AI pair programming",
+        ),
     ]
 }
 
@@ -170,7 +204,14 @@ impl CliAgentTool {
         let default_timeout = Duration::from_secs(config.timeout_secs);
         let default_max_output = config.max_output_chars;
 
-        type ToolCandidate = (String, String, Vec<String>, String, Option<u64>, Option<usize>);
+        type ToolCandidate = (
+            String,
+            String,
+            Vec<String>,
+            String,
+            Option<u64>,
+            Option<usize>,
+        );
         let mut candidates: Vec<ToolCandidate> = Vec::new();
 
         if config.tools.is_empty() {
@@ -199,7 +240,8 @@ impl CliAgentTool {
 
         let mut tools = HashMap::new();
 
-        for (name, command, args, description, timeout_override, max_output_override) in candidates {
+        for (name, command, args, description, timeout_override, max_output_override) in candidates
+        {
             let which = tokio::process::Command::new("which")
                 .arg(&command)
                 .output()
@@ -208,16 +250,18 @@ impl CliAgentTool {
             match which {
                 Ok(output) if output.status.success() => {
                     info!(name = %name, command = %command, "CLI agent tool discovered");
-                    tools.insert(name.clone(), CliToolEntry {
-                        command,
-                        args,
-                        description,
-                        timeout: timeout_override
-                            .map(Duration::from_secs)
-                            .unwrap_or(default_timeout),
-                        max_output_chars: max_output_override
-                            .unwrap_or(default_max_output),
-                    });
+                    tools.insert(
+                        name.clone(),
+                        CliToolEntry {
+                            command,
+                            args,
+                            description,
+                            timeout: timeout_override
+                                .map(Duration::from_secs)
+                                .unwrap_or(default_timeout),
+                            max_output_chars: max_output_override.unwrap_or(default_max_output),
+                        },
+                    );
                 }
                 _ => {
                     info!(name = %name, command = %command, "CLI agent tool not found, skipping");
@@ -263,8 +307,18 @@ impl CliAgentTool {
         session_id: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
-        let entry = self.tools.get(tool_name)
+        let entry = self
+            .tools
+            .get(tool_name)
             .ok_or_else(|| anyhow::anyhow!("Unknown CLI agent tool: {}", tool_name))?;
+
+        info!(
+            tool = tool_name,
+            session = session_id,
+            prompt_len = prompt.len(),
+            working_dir = working_dir.unwrap_or("(default)"),
+            "CLI agent invocation — runs with auto-approve flags"
+        );
 
         // Build command
         let mut cmd = tokio::process::Command::new(&entry.command);
@@ -303,8 +357,14 @@ impl CliAgentTool {
         let mut child = cmd.spawn()?;
         let pid = child.id().unwrap_or(0);
 
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
 
         // Two buffers: stdout_buf for JSON extraction, display_buf for user display
         let stdout_buf = Arc::new(Mutex::new(String::new()));
@@ -316,7 +376,8 @@ impl CliAgentTool {
 
         // Create completion channel - includes loop detection info
         // Result: (exit_code, was_killed_for_loop, loop_repetition_count)
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<(Option<i32>, bool, Option<usize>)>();
+        let (completion_tx, completion_rx) =
+            tokio::sync::oneshot::channel::<(Option<i32>, bool, Option<usize>)>();
 
         // Spawn a task to read stdout/stderr, emit progress updates, and signal completion
         let pid_for_kill = pid;
@@ -565,7 +626,10 @@ impl CliAgentTool {
             }
             Ok(Err(_)) => {
                 // Channel closed unexpectedly
-                Ok(format!("ERROR: CLI agent '{}' task failed unexpectedly", tool_name))
+                Ok(format!(
+                    "ERROR: CLI agent '{}' task failed unexpectedly",
+                    tool_name
+                ))
             }
             Err(_) => {
                 // Timeout - move to background
@@ -618,9 +682,7 @@ impl CliAgentTool {
             let result = extract_meaningful_output(&stdout_output, 10000);
             Ok(format!(
                 "CLI agent '{}' finished after {}s.\n\nResult:\n{}",
-                agent.tool_name,
-                elapsed,
-                result
+                agent.tool_name, elapsed, result
             ))
         } else {
             Ok(format!(
@@ -664,7 +726,8 @@ impl CliAgentTool {
         let mut running = self.running.lock().await;
 
         // Find all tasks matching this session
-        let to_cancel: Vec<String> = running.iter()
+        let to_cancel: Vec<String> = running
+            .iter()
             .filter(|(_, agent)| agent.session_id == session_id)
             .map(|(task_id, _)| task_id.clone())
             .collect();
@@ -745,12 +808,30 @@ fn extract_progress_from_json(line: &str) -> Option<String> {
             // Extract key info based on tool type
             if tool_name == "Read" || tool_name == "read" {
                 if let Some(path) = input.get("file_path").and_then(|p| p.as_str()) {
-                    let short_path: String = path.chars().rev().take(50).collect::<String>().chars().rev().collect();
+                    let short_path: String = path
+                        .chars()
+                        .rev()
+                        .take(50)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
                     return Some(format!("📖 Reading: ...{}", short_path));
                 }
-            } else if tool_name == "Write" || tool_name == "write" || tool_name == "Edit" || tool_name == "edit" {
+            } else if tool_name == "Write"
+                || tool_name == "write"
+                || tool_name == "Edit"
+                || tool_name == "edit"
+            {
                 if let Some(path) = input.get("file_path").and_then(|p| p.as_str()) {
-                    let short_path: String = path.chars().rev().take(50).collect::<String>().chars().rev().collect();
+                    let short_path: String = path
+                        .chars()
+                        .rev()
+                        .take(50)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
                     return Some(format!("✏️ Writing: ...{}", short_path));
                 }
             } else if tool_name == "Bash" || tool_name == "bash" || tool_name == "terminal" {
@@ -783,53 +864,64 @@ fn extract_progress_from_json(line: &str) -> Option<String> {
                     if let Some(arr) = content.as_array() {
                         for item in arr {
                             if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                                let name = item
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("unknown");
                                 let input = item.get("input");
 
                                 // Extract details based on tool type
                                 let detail = match name {
-                                    "Bash" | "bash" | "terminal" => {
-                                        input.and_then(|i| i.get("command"))
-                                            .and_then(|c| c.as_str())
-                                            .map(|cmd| {
-                                                let short: String = cmd.chars().take(50).collect();
-                                                format!("⚡ {}", short)
-                                            })
-                                    }
-                                    "Read" | "read" => {
-                                        input.and_then(|i| i.get("file_path"))
-                                            .and_then(|p| p.as_str())
-                                            .map(|path| {
-                                                let short: String = path.chars().rev().take(40).collect::<String>().chars().rev().collect();
-                                                format!("📖 ...{}", short)
-                                            })
-                                    }
-                                    "Write" | "write" | "Edit" | "edit" => {
-                                        input.and_then(|i| i.get("file_path"))
-                                            .and_then(|p| p.as_str())
-                                            .map(|path| {
-                                                let short: String = path.chars().rev().take(40).collect::<String>().chars().rev().collect();
-                                                format!("✏️ ...{}", short)
-                                            })
-                                    }
-                                    "Glob" | "glob" => {
-                                        input.and_then(|i| i.get("pattern"))
-                                            .and_then(|p| p.as_str())
-                                            .map(|pat| format!("🔍 {}", pat))
-                                    }
-                                    "Grep" | "grep" => {
-                                        input.and_then(|i| i.get("pattern"))
-                                            .and_then(|p| p.as_str())
-                                            .map(|pat| {
-                                                let short: String = pat.chars().take(30).collect();
-                                                format!("🔍 grep: {}", short)
-                                            })
-                                    }
-                                    "Task" => {
-                                        input.and_then(|i| i.get("description"))
-                                            .and_then(|d| d.as_str())
-                                            .map(|desc| format!("🚀 {}", desc))
-                                    }
+                                    "Bash" | "bash" | "terminal" => input
+                                        .and_then(|i| i.get("command"))
+                                        .and_then(|c| c.as_str())
+                                        .map(|cmd| {
+                                            let short: String = cmd.chars().take(50).collect();
+                                            format!("⚡ {}", short)
+                                        }),
+                                    "Read" | "read" => input
+                                        .and_then(|i| i.get("file_path"))
+                                        .and_then(|p| p.as_str())
+                                        .map(|path| {
+                                            let short: String = path
+                                                .chars()
+                                                .rev()
+                                                .take(40)
+                                                .collect::<String>()
+                                                .chars()
+                                                .rev()
+                                                .collect();
+                                            format!("📖 ...{}", short)
+                                        }),
+                                    "Write" | "write" | "Edit" | "edit" => input
+                                        .and_then(|i| i.get("file_path"))
+                                        .and_then(|p| p.as_str())
+                                        .map(|path| {
+                                            let short: String = path
+                                                .chars()
+                                                .rev()
+                                                .take(40)
+                                                .collect::<String>()
+                                                .chars()
+                                                .rev()
+                                                .collect();
+                                            format!("✏️ ...{}", short)
+                                        }),
+                                    "Glob" | "glob" => input
+                                        .and_then(|i| i.get("pattern"))
+                                        .and_then(|p| p.as_str())
+                                        .map(|pat| format!("🔍 {}", pat)),
+                                    "Grep" | "grep" => input
+                                        .and_then(|i| i.get("pattern"))
+                                        .and_then(|p| p.as_str())
+                                        .map(|pat| {
+                                            let short: String = pat.chars().take(30).collect();
+                                            format!("🔍 grep: {}", short)
+                                        }),
+                                    "Task" => input
+                                        .and_then(|i| i.get("description"))
+                                        .and_then(|d| d.as_str())
+                                        .map(|desc| format!("🚀 {}", desc)),
                                     _ => None,
                                 };
 
@@ -897,7 +989,8 @@ fn extract_jsonl_content(raw: &str) -> Option<String> {
     let mut last_content: Option<String> = None;
     for line in raw.lines().rev() {
         if let Ok(v) = serde_json::from_str::<Value>(line) {
-            if let Some(content) = v.pointer("/item/content")
+            if let Some(content) = v
+                .pointer("/item/content")
                 .or_else(|| v.pointer("/content"))
                 .or_else(|| v.pointer("/result"))
             {
@@ -906,7 +999,8 @@ fn extract_jsonl_content(raw: &str) -> Option<String> {
                     break;
                 }
                 if let Some(arr) = content.as_array() {
-                    let texts: Vec<&str> = arr.iter()
+                    let texts: Vec<&str> = arr
+                        .iter()
                         .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
                         .collect();
                     if !texts.is_empty() {
@@ -931,7 +1025,9 @@ impl Tool for CliAgentTool {
     }
 
     fn schema(&self) -> Value {
-        let tool_descriptions: Vec<String> = self.tool_names.iter()
+        let tool_descriptions: Vec<String> = self
+            .tool_names
+            .iter()
             .filter_map(|name| {
                 self.tools.get(name).map(|entry| {
                     if entry.description.is_empty() {
@@ -1006,31 +1102,41 @@ impl Tool for CliAgentTool {
 
         match action {
             "run" => {
-                let tool = args.tool.as_ref()
+                let tool = args
+                    .tool
+                    .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Missing 'tool' parameter for action=run"))?;
-                let prompt = args.prompt.as_ref()
+                let prompt = args
+                    .prompt
+                    .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter for action=run"))?;
-                self.handle_run(tool, prompt, args.working_dir.as_deref(), &session_id, status_tx).await
+                self.handle_run(
+                    tool,
+                    prompt,
+                    args.working_dir.as_deref(),
+                    &session_id,
+                    status_tx,
+                )
+                .await
             }
             "check" => {
-                let task_id = args.task_id.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'task_id' parameter for action=check"))?;
+                let task_id = args.task_id.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("Missing 'task_id' parameter for action=check")
+                })?;
                 self.handle_check(task_id).await
             }
             "cancel" => {
-                let task_id = args.task_id.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'task_id' parameter for action=cancel"))?;
+                let task_id = args.task_id.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("Missing 'task_id' parameter for action=cancel")
+                })?;
                 self.handle_cancel(task_id).await
             }
-            "cancel_all" => {
-                self.handle_cancel_all(&session_id).await
-            }
-            "list" => {
-                self.handle_list().await
-            }
-            _ => {
-                Ok(format!("Unknown action '{}'. Use run, check, cancel, cancel_all, or list.", action))
-            }
+            "cancel_all" => self.handle_cancel_all(&session_id).await,
+            "list" => self.handle_list().await,
+            _ => Ok(format!(
+                "Unknown action '{}'. Use run, check, cancel, cancel_all, or list.",
+                action
+            )),
         }
     }
 }

@@ -164,9 +164,7 @@ impl ReadChannelHistoryTool {
 
         let body = resp.json::<Value>().await.ok()?;
         if body["ok"].as_bool() == Some(true) {
-            body["channel"]["name"]
-                .as_str()
-                .map(|s| s.to_string())
+            body["channel"]["name"].as_str().map(|s| s.to_string())
         } else {
             None
         }
@@ -206,7 +204,11 @@ impl ReadChannelHistoryTool {
         let body = resp.json::<Value>().await?;
         if body["ok"].as_bool() != Some(true) {
             let err = body["error"].as_str().unwrap_or("unknown error");
-            warn!(channel_id, error = err, "Slack conversations.history API error");
+            warn!(
+                channel_id,
+                error = err,
+                "Slack conversations.history API error"
+            );
             let hint = match err {
                 "channel_not_found" => "The channel was not found. The bot may not be a member of this channel.",
                 "not_in_channel" => "The bot is not a member of this channel. Invite the bot first with /invite @aidaemon.",
@@ -218,10 +220,7 @@ impl ReadChannelHistoryTool {
             anyhow::bail!("Slack API error: {}. {}", err, hint);
         }
 
-        Ok(body["messages"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default())
+        Ok(body["messages"].as_array().cloned().unwrap_or_default())
     }
 
     /// Format a single message for output.
@@ -245,9 +244,7 @@ impl ReadChannelHistoryTool {
             .split('.')
             .next()
             .and_then(|s| s.parse::<i64>().ok())
-            .and_then(|secs| {
-                DateTime::from_timestamp(secs, 0).map(|dt| dt.naive_utc())
-            })
+            .and_then(|secs| DateTime::from_timestamp(secs, 0).map(|dt| dt.naive_utc()))
             .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| ts.to_string());
 
@@ -343,15 +340,24 @@ impl Tool for ReadChannelHistoryTool {
 
         // Determine channel ID: explicit arg > _channel_id injection
         let channel_id = if let Some(cid) = args["channel_id"].as_str() {
-            info!(channel_id = cid, "read_channel_history: using explicit channel_id");
+            info!(
+                channel_id = cid,
+                "read_channel_history: using explicit channel_id"
+            );
             cid.to_string()
         } else if let Some(injected) = args["_channel_id"].as_str() {
             // _channel_id is formatted as "slack:C12345" — extract the raw ID
             if let Some(raw) = injected.strip_prefix("slack:") {
-                info!(channel_id = raw, injected, "read_channel_history: using injected _channel_id");
+                info!(
+                    channel_id = raw,
+                    injected, "read_channel_history: using injected _channel_id"
+                );
                 raw.to_string()
             } else {
-                warn!(injected, "read_channel_history: _channel_id not a slack channel");
+                warn!(
+                    injected,
+                    "read_channel_history: _channel_id not a slack channel"
+                );
                 return Ok(
                     "This tool only works in Slack channels. The current channel is not a Slack channel."
                         .to_string(),
@@ -368,22 +374,14 @@ impl Tool for ReadChannelHistoryTool {
         let has_token = self.token().is_some();
         info!(channel_id = %channel_id, has_token, "read_channel_history: fetching history");
 
-        let limit = args["limit"]
-            .as_u64()
-            .unwrap_or(50)
-            .min(200);
+        let limit = args["limit"].as_u64().unwrap_or(50).min(200);
 
         let oldest = args["oldest"].as_str().and_then(parse_time_param);
         let latest = args["latest"].as_str().and_then(parse_time_param);
 
         // Fetch messages
         let messages = match self
-            .fetch_history(
-                &channel_id,
-                limit,
-                oldest.as_deref(),
-                latest.as_deref(),
-            )
+            .fetch_history(&channel_id, limit, oldest.as_deref(), latest.as_deref())
             .await
         {
             Ok(msgs) => {
@@ -444,13 +442,15 @@ impl Tool for ReadChannelHistoryTool {
         // Build header with date range
         let date_range = if formatted.len() >= 2 {
             // Extract dates from first and last formatted messages
-            let first_ts = messages.last() // oldest (reversed)
+            let first_ts = messages
+                .last() // oldest (reversed)
                 .and_then(|m| m["ts"].as_str())
                 .and_then(|ts| ts.split('.').next()?.parse::<i64>().ok())
                 .and_then(|s| DateTime::from_timestamp(s, 0).map(|dt| dt.naive_utc()))
                 .map(|dt| dt.format("%Y-%m-%d").to_string())
                 .unwrap_or_default();
-            let last_ts = messages.first() // newest (reversed)
+            let last_ts = messages
+                .first() // newest (reversed)
                 .and_then(|m| m["ts"].as_str())
                 .and_then(|ts| ts.split('.').next()?.parse::<i64>().ok())
                 .and_then(|s| DateTime::from_timestamp(s, 0).map(|dt| dt.naive_utc()))
@@ -645,11 +645,8 @@ mod tests {
 
     #[test]
     fn test_permalink_no_dot_in_ts() {
-        let url = ReadChannelHistoryTool::build_permalink(
-            "https://team.slack.com",
-            "C999",
-            "1705312200",
-        );
+        let url =
+            ReadChannelHistoryTool::build_permalink("https://team.slack.com", "C999", "1705312200");
         assert_eq!(url, "https://team.slack.com/archives/C999/p1705312200");
     }
 

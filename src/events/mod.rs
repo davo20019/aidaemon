@@ -7,15 +7,15 @@
 //! - **Learning input**: Feed the consolidation system for long-term memory
 //! - **Audit trail**: Full debugging and reconstruction capability
 
+mod consolidation;
+mod context;
 mod payloads;
 mod store;
-mod context;
-mod consolidation;
 
-pub use payloads::*;
-pub use store::{EventStore, EventEmitter};
-pub use context::SessionContextCompiler;
 pub use consolidation::{Consolidator, Pruner};
+pub use context::SessionContextCompiler;
+pub use payloads::*;
+pub use store::{EventEmitter, EventStore};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -41,20 +41,15 @@ pub struct Event {
 
 impl Event {
     /// Create a new event (id will be assigned by the database)
-    pub fn new(
-        session_id: impl Into<String>,
-        event_type: EventType,
-        data: JsonValue,
-    ) -> Self {
+    pub fn new(session_id: impl Into<String>, event_type: EventType, data: JsonValue) -> Self {
         let session_id = session_id.into();
 
         // Extract task_id and tool_name from data for indexing
-        let task_id = data.get("task_id")
+        let task_id = data
+            .get("task_id")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let tool_name = data.get("name")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let tool_name = data.get("name").and_then(|v| v.as_str()).map(String::from);
 
         Self {
             id: 0, // Will be set by database

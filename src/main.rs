@@ -10,6 +10,7 @@ mod events;
 mod health;
 mod mcp;
 mod memory;
+mod oauth;
 #[allow(dead_code)]
 mod plans;
 mod providers;
@@ -17,19 +18,19 @@ mod router;
 mod scheduler;
 mod skills;
 mod state;
+mod tasks;
 mod tools;
 mod traits;
-mod tasks;
-mod types;
 mod triggers;
+mod types;
 mod updater;
 pub mod utils;
 mod wizard;
 
 #[cfg(test)]
-mod testing;
-#[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod testing;
 
 use std::path::PathBuf;
 
@@ -41,15 +42,13 @@ fn main() -> anyhow::Result<()> {
 
     // Tracing
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                if cfg!(feature = "browser") {
-                    EnvFilter::new("info,chromiumoxide=off")
-                } else {
-                    EnvFilter::new("info")
-                }
-            }),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            if cfg!(feature = "browser") {
+                EnvFilter::new("info,chromiumoxide=off")
+            } else {
+                EnvFilter::new("info")
+            }
+        }))
         .init();
 
     let config_path = PathBuf::from("config.toml");
@@ -67,8 +66,11 @@ fn main() -> anyhow::Result<()> {
                 println!("{}\n", env!("CARGO_PKG_DESCRIPTION"));
                 println!("Usage: aidaemon [COMMAND]\n");
                 println!("Commands:");
-                println!("  install-service  Install as a system service (launchd/systemd)");
-                println!("  check-update     Check for available updates");
+                println!("  install-service       Install as a system service (launchd/systemd)");
+                println!("  check-update          Check for available updates");
+                println!("  keychain set <key>    Store a secret in the OS keychain");
+                println!("  keychain get <key>    Retrieve a secret from the OS keychain");
+                println!("  keychain delete <key> Remove a secret from the OS keychain");
                 println!("\nOptions:");
                 println!("  -h, --help       Print help");
                 println!("  -V, --version    Print version");
@@ -88,10 +90,7 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                     Ok(None) => {
-                        println!(
-                            "aidaemon is up to date (v{}).",
-                            env!("CARGO_PKG_VERSION")
-                        );
+                        println!("aidaemon is up to date (v{}).", env!("CARGO_PKG_VERSION"));
                     }
                     Err(e) => {
                         eprintln!("Update check failed: {}", e);
@@ -99,6 +98,9 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 return Ok(());
+            }
+            "keychain" => {
+                return handle_keychain_command(&args[2..]);
             }
             _ => {}
         }
@@ -155,4 +157,74 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?
         .block_on(crate::core::run(config, config_path))
+}
+
+fn handle_keychain_command(args: &[String]) -> anyhow::Result<()> {
+    if args.is_empty() {
+        eprintln!("Usage: aidaemon keychain <set|get|delete> <key>");
+        eprintln!("\nExamples:");
+        eprintln!("  aidaemon keychain set api_key");
+        eprintln!("  aidaemon keychain set http_auth_twitter_api_key");
+        eprintln!("  aidaemon keychain get api_key");
+        eprintln!("  aidaemon keychain delete api_key");
+        std::process::exit(1);
+    }
+
+    let action = args[0].as_str();
+    let key = args.get(1).map(|s| s.as_str());
+
+    match action {
+        "set" => {
+            let key = key.unwrap_or_else(|| {
+                eprintln!("Usage: aidaemon keychain set <key>");
+                std::process::exit(1);
+            });
+            let value = dialoguer::Password::new()
+                .with_prompt(format!("Enter value for '{}'", key))
+                .with_confirmation("Confirm value", "Values don't match, try again")
+                .interact()?;
+            config::store_in_keychain(key, &value)?;
+            println!("Stored '{}' in OS keychain (service: aidaemon)", key);
+        }
+        "get" => {
+            let key = key.unwrap_or_else(|| {
+                eprintln!("Usage: aidaemon keychain get <key>");
+                std::process::exit(1);
+            });
+            match config::resolve_from_keychain(key) {
+                Ok(value) => {
+                    // Show first 4 and last 4 chars, mask the rest
+                    if value.len() > 12 {
+                        let masked = format!(
+                            "{}{}{}",
+                            &value[..4],
+                            "*".repeat(value.len() - 8),
+                            &value[value.len() - 4..]
+                        );
+                        println!("{}", masked);
+                    } else {
+                        println!("{}", "*".repeat(value.len()));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Not found: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "delete" => {
+            let key = key.unwrap_or_else(|| {
+                eprintln!("Usage: aidaemon keychain delete <key>");
+                std::process::exit(1);
+            });
+            config::delete_from_keychain(key)?;
+            println!("Deleted '{}' from OS keychain", key);
+        }
+        _ => {
+            eprintln!("Unknown keychain action: '{}'. Use set, get, or delete.", action);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
 }

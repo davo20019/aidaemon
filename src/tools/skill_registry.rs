@@ -14,9 +14,9 @@
 //! ]
 //! ```
 
+use crate::tools::web_fetch::validate_url_for_ssrf;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use crate::tools::web_fetch::validate_url_for_ssrf;
 
 /// A single entry in a skill registry manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,7 +33,10 @@ pub struct RegistryEntry {
 }
 
 /// Fetch and parse a skill registry manifest from a URL.
-pub async fn fetch_registry(client: &Client, registry_url: &str) -> anyhow::Result<Vec<RegistryEntry>> {
+pub async fn fetch_registry(
+    client: &Client,
+    registry_url: &str,
+) -> anyhow::Result<Vec<RegistryEntry>> {
     validate_url_for_ssrf(registry_url)
         .map_err(|e| anyhow::anyhow!("Registry URL blocked: {}", e))?;
 
@@ -54,15 +57,16 @@ pub fn search_registry<'a>(entries: &'a [RegistryEntry], query: &str) -> Vec<&'a
         .filter(|e| {
             e.name.to_lowercase().contains(&query_lower)
                 || e.description.to_lowercase().contains(&query_lower)
-                || e.triggers.iter().any(|t| t.to_lowercase().contains(&query_lower))
+                || e.triggers
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(&query_lower))
         })
         .collect()
 }
 
 /// Fetch the skill markdown content from a registry entry's URL.
 pub async fn fetch_skill_content(client: &Client, entry: &RegistryEntry) -> anyhow::Result<String> {
-    validate_url_for_ssrf(&entry.url)
-        .map_err(|e| anyhow::anyhow!("Skill URL blocked: {}", e))?;
+    validate_url_for_ssrf(&entry.url).map_err(|e| anyhow::anyhow!("Skill URL blocked: {}", e))?;
 
     let response = client.get(&entry.url).send().await?;
     if !response.status().is_success() {

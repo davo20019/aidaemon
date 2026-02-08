@@ -115,7 +115,7 @@ impl RetentionManager {
                 SELECT id FROM messages
                 WHERE consolidated_at IS NOT NULL AND created_at < ?
                 LIMIT 500
-            )"
+            )",
         )
         .bind(&cutoff)
         .execute(&self.pool)
@@ -129,13 +129,14 @@ impl RetentionManager {
         if self.config.superseded_facts_days == 0 {
             return Ok(0);
         }
-        let cutoff = (Utc::now() - Duration::days(self.config.superseded_facts_days as i64)).to_rfc3339();
+        let cutoff =
+            (Utc::now() - Duration::days(self.config.superseded_facts_days as i64)).to_rfc3339();
         let result = sqlx::query(
             "DELETE FROM facts WHERE id IN (
                 SELECT id FROM facts
                 WHERE superseded_at IS NOT NULL AND superseded_at < ?
                 LIMIT 500
-            )"
+            )",
         )
         .bind(&cutoff)
         .execute(&self.pool)
@@ -149,7 +150,8 @@ impl RetentionManager {
         if self.config.token_usage_aggregate_days == 0 {
             return Ok((0, 0));
         }
-        let cutoff = (Utc::now() - Duration::days(self.config.token_usage_aggregate_days as i64)).to_rfc3339();
+        let cutoff = (Utc::now() - Duration::days(self.config.token_usage_aggregate_days as i64))
+            .to_rfc3339();
 
         // Step 1: Aggregate into token_usage_daily
         let agg_result = sqlx::query(
@@ -170,7 +172,7 @@ impl RetentionManager {
                 SELECT id FROM token_usage
                 WHERE created_at < ?
                 LIMIT 500
-            )"
+            )",
         )
         .bind(&cutoff)
         .execute(&self.pool)
@@ -192,7 +194,7 @@ impl RetentionManager {
                 SELECT id FROM episodes
                 WHERE recall_count = 0 AND created_at < ?
                 LIMIT 500
-            )"
+            )",
         )
         .bind(&cutoff)
         .execute(&self.pool)
@@ -206,13 +208,14 @@ impl RetentionManager {
         if self.config.behavior_patterns_days == 0 {
             return Ok(0);
         }
-        let cutoff = (Utc::now() - Duration::days(self.config.behavior_patterns_days as i64)).to_rfc3339();
+        let cutoff =
+            (Utc::now() - Duration::days(self.config.behavior_patterns_days as i64)).to_rfc3339();
         let result = sqlx::query(
             "DELETE FROM behavior_patterns WHERE id IN (
                 SELECT id FROM behavior_patterns
                 WHERE confidence <= 0.1 AND (last_seen_at IS NULL OR last_seen_at < ?)
                 LIMIT 500
-            )"
+            )",
         )
         .bind(&cutoff)
         .execute(&self.pool)
@@ -232,7 +235,7 @@ impl RetentionManager {
                 SELECT id FROM goals
                 WHERE status IN ('completed', 'abandoned') AND updated_at < ?
                 LIMIT 500
-            )"
+            )",
         )
         .bind(&cutoff)
         .execute(&self.pool)
@@ -252,7 +255,7 @@ impl RetentionManager {
                 SELECT id FROM procedures
                 WHERE success_count = 0 AND (last_used_at IS NULL OR last_used_at < ?)
                 LIMIT 500
-            )"
+            )",
         )
         .bind(&cutoff)
         .execute(&self.pool)
@@ -266,13 +269,14 @@ impl RetentionManager {
         if self.config.error_solutions_days == 0 {
             return Ok(0);
         }
-        let cutoff = (Utc::now() - Duration::days(self.config.error_solutions_days as i64)).to_rfc3339();
+        let cutoff =
+            (Utc::now() - Duration::days(self.config.error_solutions_days as i64)).to_rfc3339();
         let result = sqlx::query(
             "DELETE FROM error_solutions WHERE id IN (
                 SELECT id FROM error_solutions
                 WHERE failure_count > success_count AND (last_used_at IS NULL OR last_used_at < ?)
                 LIMIT 500
-            )"
+            )",
         )
         .bind(&cutoff)
         .execute(&self.pool)
@@ -302,8 +306,11 @@ mod tests {
                 content TEXT,
                 created_at TEXT NOT NULL,
                 consolidated_at TEXT
-            )"
-        ).execute(&pool).await.unwrap();
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query(
             "CREATE TABLE facts (
@@ -316,8 +323,11 @@ mod tests {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 recall_count INTEGER DEFAULT 0
-            )"
-        ).execute(&pool).await.unwrap();
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query(
             "CREATE TABLE token_usage (
@@ -327,8 +337,11 @@ mod tests {
                 input_tokens INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
                 created_at TEXT NOT NULL
-            )"
-        ).execute(&pool).await.unwrap();
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query(
             "CREATE TABLE token_usage_daily (
@@ -339,8 +352,11 @@ mod tests {
                 total_output_tokens INTEGER NOT NULL,
                 request_count INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(date, model)
-            )"
-        ).execute(&pool).await.unwrap();
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query(
             "CREATE TABLE episodes (
@@ -349,8 +365,11 @@ mod tests {
                 summary TEXT NOT NULL,
                 recall_count INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL
-            )"
-        ).execute(&pool).await.unwrap();
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query(
             "CREATE TABLE behavior_patterns (
@@ -360,8 +379,11 @@ mod tests {
                 confidence REAL DEFAULT 0.5,
                 last_seen_at TEXT,
                 created_at TEXT NOT NULL
-            )"
-        ).execute(&pool).await.unwrap();
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query(
             "CREATE TABLE goals (
@@ -369,8 +391,11 @@ mod tests {
                 description TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
                 updated_at TEXT NOT NULL
-            )"
-        ).execute(&pool).await.unwrap();
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query(
             "CREATE TABLE procedures (
@@ -381,8 +406,11 @@ mod tests {
                 success_count INTEGER DEFAULT 0,
                 last_used_at TEXT,
                 created_at TEXT NOT NULL
-            )"
-        ).execute(&pool).await.unwrap();
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query(
             "CREATE TABLE error_solutions (
@@ -394,8 +422,11 @@ mod tests {
                 failure_count INTEGER DEFAULT 0,
                 last_used_at TEXT,
                 created_at TEXT NOT NULL
-            )"
-        ).execute(&pool).await.unwrap();
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         pool
     }
@@ -419,7 +450,9 @@ mod tests {
 
         // Verify unconsolidated message survived
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages WHERE id = 'm1'")
-            .fetch_one(&pool).await.unwrap();
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(count.0, 1);
     }
 
@@ -442,7 +475,9 @@ mod tests {
         assert_eq!(deleted, 1);
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM facts")
-            .fetch_one(&pool).await.unwrap();
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(count.0, 1);
     }
 
@@ -489,8 +524,11 @@ mod tests {
         let deleted = mgr.cleanup_episodes().await.unwrap();
         assert_eq!(deleted, 1);
 
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM episodes WHERE summary = 'important'")
-            .fetch_one(&pool).await.unwrap();
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM episodes WHERE summary = 'important'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count.0, 1);
     }
 
@@ -530,7 +568,9 @@ mod tests {
         assert_eq!(deleted, 1);
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM goals WHERE status = 'active'")
-            .fetch_one(&pool).await.unwrap();
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(count.0, 1);
     }
 
@@ -551,8 +591,11 @@ mod tests {
         let deleted = mgr.cleanup_procedures().await.unwrap();
         assert_eq!(deleted, 1);
 
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM procedures WHERE name = 'good_proc'")
-            .fetch_one(&pool).await.unwrap();
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM procedures WHERE name = 'good_proc'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count.0, 1);
     }
 }

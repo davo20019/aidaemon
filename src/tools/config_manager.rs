@@ -13,15 +13,27 @@ use crate::traits::Tool;
 use crate::types::ApprovalResponse;
 
 /// Key names that contain secrets and must be redacted before showing to the LLM.
-const SENSITIVE_KEYS: &[&str] = &["api_key", "bot_token", "app_token", "password", "encryption_key"];
+const SENSITIVE_KEYS: &[&str] = &[
+    "api_key",
+    "bot_token",
+    "app_token",
+    "password",
+    "encryption_key",
+];
 
 /// Key names that are security-sensitive and require user approval to modify.
 /// This includes secrets plus keys that control security behavior.
 const APPROVAL_REQUIRED_KEYS: &[&str] = &[
     // Secrets
-    "api_key", "bot_token", "app_token", "password", "encryption_key",
+    "api_key",
+    "bot_token",
+    "app_token",
+    "password",
+    "encryption_key",
     // Security-sensitive settings
-    "allowed_prefixes", "allowed_user_ids", "allowed_command_prefixes",
+    "allowed_prefixes",
+    "allowed_user_ids",
+    "allowed_command_prefixes",
     "base_url", // Could redirect API traffic
     "trusted",  // Scheduler trusted flag
 ];
@@ -51,7 +63,10 @@ fn set_owner_only_permissions(_path: &Path) {
 
 impl ConfigManagerTool {
     pub fn new(config_path: PathBuf, approval_tx: mpsc::Sender<ApprovalRequest>) -> Self {
-        Self { config_path, approval_tx }
+        Self {
+            config_path,
+            approval_tx,
+        }
     }
 
     /// Check if a key path requires user approval to modify.
@@ -61,7 +76,11 @@ impl ConfigManagerTool {
     }
 
     /// Request user approval for a config change.
-    async fn request_approval(&self, session_id: &str, description: &str) -> anyhow::Result<ApprovalResponse> {
+    async fn request_approval(
+        &self,
+        session_id: &str,
+        description: &str,
+    ) -> anyhow::Result<ApprovalResponse> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.approval_tx
             .send(ApprovalRequest {
@@ -81,7 +100,10 @@ impl ConfigManagerTool {
                 Ok(ApprovalResponse::Deny)
             }
             Err(_) => {
-                tracing::warn!(description, "Approval request timed out (300s), auto-denying");
+                tracing::warn!(
+                    description,
+                    "Approval request timed out (300s), auto-denying"
+                );
                 Ok(ApprovalResponse::Deny)
             }
         }
@@ -144,8 +166,7 @@ impl ConfigManagerTool {
             .map_err(|e| format!("Invalid TOML syntax: {}", e))?;
 
         // Expand env vars so "${VAR}" values don't break type validation
-        let expanded =
-            crate::config::expand_env_vars(content).map_err(|e| format!("{}", e))?;
+        let expanded = crate::config::expand_env_vars(content).map_err(|e| format!("{}", e))?;
 
         // Then check it deserializes into our AppConfig
         toml::from_str::<AppConfig>(&expanded)
@@ -212,7 +233,10 @@ impl Tool for ConfigManagerTool {
                 let mut doc: toml::Value = content.parse()?;
                 redact_secrets(&mut doc);
                 let redacted = toml::to_string_pretty(&doc)?;
-                Ok(format!("Current config.toml (secrets redacted):\n\n{}", redacted))
+                Ok(format!(
+                    "Current config.toml (secrets redacted):\n\n{}",
+                    redacted
+                ))
             }
             "get" => {
                 if args.key.is_empty() {
@@ -220,7 +244,10 @@ impl Tool for ConfigManagerTool {
                 }
                 // Block direct reads of sensitive keys
                 if is_sensitive_key(&args.key) {
-                    return Ok(format!("{} = \"{}\" (redacted for security)", args.key, REDACTED));
+                    return Ok(format!(
+                        "{} = \"{}\" (redacted for security)",
+                        args.key, REDACTED
+                    ));
                 }
                 let content = tokio::fs::read_to_string(&self.config_path).await?;
                 let doc: toml::Value = content.parse()?;
@@ -232,7 +259,9 @@ impl Tool for ConfigManagerTool {
             }
             "set" => {
                 if args.key.is_empty() || args.value.is_empty() {
-                    return Ok("Error: 'key' and 'value' are required for 'set' action.".to_string());
+                    return Ok(
+                        "Error: 'key' and 'value' are required for 'set' action.".to_string()
+                    );
                 }
 
                 // Require user approval for security-sensitive keys
@@ -296,13 +325,14 @@ impl Tool for ConfigManagerTool {
                     args.key, args.value
                 ))
             }
-            "restore" => {
-                match self.restore_backup().await {
-                    Ok(msg) => Ok(msg),
-                    Err(e) => Ok(format!("Restore failed: {}", e)),
-                }
-            }
-            _ => Ok(format!("Unknown action: {}. Use 'read', 'get', 'set', or 'restore'.", args.action)),
+            "restore" => match self.restore_backup().await {
+                Ok(msg) => Ok(msg),
+                Err(e) => Ok(format!("Restore failed: {}", e)),
+            },
+            _ => Ok(format!(
+                "Unknown action: {}. Use 'read', 'get', 'set', or 'restore'.",
+                args.action
+            )),
         }
     }
 }

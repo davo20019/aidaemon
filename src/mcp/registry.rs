@@ -52,7 +52,10 @@ impl McpRegistry {
         if name.is_empty() || name.len() > 32 {
             anyhow::bail!("Server name must be 1-32 characters (got {})", name.len());
         }
-        if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
             anyhow::bail!(
                 "Server name '{}' contains invalid characters. Only lowercase letters, digits, and underscores are allowed.",
                 name
@@ -85,8 +88,7 @@ impl McpRegistry {
         Self::validate_server_name(name)?;
 
         // Spawn the MCP client
-        let client =
-            Arc::new(McpClient::spawn(&config.command, &config.args, &config.env).await?);
+        let client = Arc::new(McpClient::spawn(&config.command, &config.args, &config.env).await?);
 
         // List tools from the server
         let tool_defs = client.list_tools().await?;
@@ -192,9 +194,10 @@ impl McpRegistry {
         }
 
         // Clean up keychain entries for env keys
-        let env_keys: Vec<String> =
-            serde_json::from_str(&serde_json::to_string(&entry.config.env.keys().collect::<Vec<_>>())?)
-                .unwrap_or_default();
+        let env_keys: Vec<String> = serde_json::from_str(&serde_json::to_string(
+            &entry.config.env.keys().collect::<Vec<_>>(),
+        )?)
+        .unwrap_or_default();
         for key in &env_keys {
             let keychain_key = format!("mcp_{}_{}", name, key);
             if let Err(e) = delete_from_keychain(&keychain_key) {
@@ -207,12 +210,7 @@ impl McpRegistry {
     }
 
     /// Store an env var value in the OS keychain for an MCP server.
-    pub async fn set_server_env(
-        &self,
-        name: &str,
-        key: &str,
-        value: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn set_server_env(&self, name: &str, key: &str, value: &str) -> anyhow::Result<()> {
         Self::validate_server_name(name)?;
         Self::validate_env_key(key)?;
         let keychain_key = format!("mcp_{}_{}", name, key);
@@ -318,8 +316,7 @@ impl McpRegistry {
                 continue;
             }
 
-            let args: Vec<String> =
-                serde_json::from_str(&server.args_json).unwrap_or_default();
+            let args: Vec<String> = serde_json::from_str(&server.args_json).unwrap_or_default();
             let env_keys: Vec<String> =
                 serde_json::from_str(&server.env_keys_json).unwrap_or_default();
 
@@ -490,4 +487,3 @@ fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
         .delete_credential()
         .map_err(|e| anyhow::anyhow!("Failed to delete '{}' from OS keychain: {}", field_name, e))
 }
-

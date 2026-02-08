@@ -28,7 +28,11 @@ impl StepTracker {
         tool_name: &str,
         tool_call_id: &str,
     ) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self.plan_store.get_incomplete_for_session(session_id).await? else {
+        let Some(mut plan) = self
+            .plan_store
+            .get_incomplete_for_session(session_id)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -63,7 +67,11 @@ impl StepTracker {
         success: bool,
         result_summary: &str,
     ) -> anyhow::Result<Option<(TaskPlan, bool)>> {
-        let Some(mut plan) = self.plan_store.get_incomplete_for_session(session_id).await? else {
+        let Some(mut plan) = self
+            .plan_store
+            .get_incomplete_for_session(session_id)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -140,7 +148,11 @@ impl StepTracker {
         step_index: usize,
         result_summary: Option<String>,
     ) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self.plan_store.get_incomplete_for_session(session_id).await? else {
+        let Some(mut plan) = self
+            .plan_store
+            .get_incomplete_for_session(session_id)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -177,7 +189,11 @@ impl StepTracker {
         step_index: usize,
         error: String,
     ) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self.plan_store.get_incomplete_for_session(session_id).await? else {
+        let Some(mut plan) = self
+            .plan_store
+            .get_incomplete_for_session(session_id)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -205,7 +221,11 @@ impl StepTracker {
 
     /// Retry the current step.
     pub async fn retry_step(&self, session_id: &str) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self.plan_store.get_incomplete_for_session(session_id).await? else {
+        let Some(mut plan) = self
+            .plan_store
+            .get_incomplete_for_session(session_id)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -231,7 +251,11 @@ impl StepTracker {
         session_id: &str,
         reason: Option<String>,
     ) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self.plan_store.get_incomplete_for_session(session_id).await? else {
+        let Some(mut plan) = self
+            .plan_store
+            .get_incomplete_for_session(session_id)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -273,7 +297,11 @@ impl StepTracker {
 
     /// Pause the plan (e.g., when session ends).
     pub async fn pause_plan(&self, session_id: &str) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self.plan_store.get_incomplete_for_session(session_id).await? else {
+        let Some(mut plan) = self
+            .plan_store
+            .get_incomplete_for_session(session_id)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -288,7 +316,11 @@ impl StepTracker {
 
     /// Resume a paused plan.
     pub async fn resume_plan(&self, session_id: &str) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self.plan_store.get_incomplete_for_session(session_id).await? else {
+        let Some(mut plan) = self
+            .plan_store
+            .get_incomplete_for_session(session_id)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -312,7 +344,11 @@ impl StepTracker {
 
     /// Abandon a plan (user cancelled).
     pub async fn abandon_plan(&self, session_id: &str) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self.plan_store.get_incomplete_for_session(session_id).await? else {
+        let Some(mut plan) = self
+            .plan_store
+            .get_incomplete_for_session(session_id)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -328,7 +364,11 @@ impl StepTracker {
         session_id: &str,
         error: String,
     ) -> anyhow::Result<Option<TaskPlan>> {
-        let Some(mut plan) = self.plan_store.get_incomplete_for_session(session_id).await? else {
+        let Some(mut plan) = self
+            .plan_store
+            .get_incomplete_for_session(session_id)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -430,7 +470,10 @@ mod tests {
         assert_eq!(abandoned.status, PlanStatus::Abandoned);
 
         // Should no longer find incomplete plan
-        let incomplete = store.get_incomplete_for_session("session_123").await.unwrap();
+        let incomplete = store
+            .get_incomplete_for_session("session_123")
+            .await
+            .unwrap();
         assert!(incomplete.is_none());
     }
 }

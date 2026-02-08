@@ -20,10 +20,10 @@ pub struct Suggestion {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // IDs reserved for feedback/analytics
 pub enum SuggestionSource {
-    Pattern(i64),      // Behavior pattern ID
-    Goal(i64),         // Goal ID
-    Procedure(i64),    // Procedure ID
-    Episode(i64),      // Episode ID
+    Pattern(i64),   // Behavior pattern ID
+    Goal(i64),      // Goal ID
+    Procedure(i64), // Procedure ID
+    Episode(i64),   // Episode ID
 }
 
 /// Context for generating suggestions.
@@ -87,7 +87,11 @@ impl ProactiveEngine {
         suggestions.extend(self.episode_suggestions(context));
 
         // Sort by confidence and deduplicate
-        suggestions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        suggestions.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Keep top 3
         suggestions.truncate(3);
@@ -97,7 +101,11 @@ impl ProactiveEngine {
 
     /// Get the top suggestion if above confidence threshold.
     #[allow(dead_code)] // Reserved for single-suggestion mode
-    pub fn get_top_suggestion(&self, context: &SuggestionContext, min_confidence: f32) -> Option<Suggestion> {
+    pub fn get_top_suggestion(
+        &self,
+        context: &SuggestionContext,
+        min_confidence: f32,
+    ) -> Option<Suggestion> {
         self.get_suggestions(context)
             .into_iter()
             .find(|s| s.confidence >= min_confidence)
@@ -125,7 +133,10 @@ impl ProactiveEngine {
                 "trigger" => {
                     // Trigger patterns: check user message
                     pattern.trigger_context.as_ref().is_some_and(|trigger| {
-                        context.user_message.to_lowercase().contains(&trigger.to_lowercase())
+                        context
+                            .user_message
+                            .to_lowercase()
+                            .contains(&trigger.to_lowercase())
                     })
                 }
                 "habit" => {
@@ -160,10 +171,17 @@ impl ProactiveEngine {
             }
 
             // Check if current context relates to the goal
-            let relevant = context.user_message.to_lowercase().contains(goal.description.to_lowercase().split_whitespace().next().unwrap_or(""))
-                || context.current_topic.as_ref().is_some_and(|topic| {
-                    goal.description.to_lowercase().contains(&topic.to_lowercase())
-                });
+            let relevant = context.user_message.to_lowercase().contains(
+                goal.description
+                    .to_lowercase()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(""),
+            ) || context.current_topic.as_ref().is_some_and(|topic| {
+                goal.description
+                    .to_lowercase()
+                    .contains(&topic.to_lowercase())
+            });
 
             if relevant {
                 let confidence = match goal.priority.as_str() {
@@ -194,11 +212,14 @@ impl ProactiveEngine {
             }
 
             // Check if trigger pattern matches
-            let matches = context.user_message.to_lowercase()
+            let matches = context
+                .user_message
+                .to_lowercase()
                 .contains(&procedure.trigger_pattern.to_lowercase());
 
             if matches {
-                let success_rate = procedure.success_count as f32 / (procedure.success_count + procedure.failure_count) as f32;
+                let success_rate = procedure.success_count as f32
+                    / (procedure.success_count + procedure.failure_count) as f32;
 
                 suggestions.push(Suggestion {
                     text: format!("I know how to handle this (procedure: {})", procedure.name),
@@ -218,14 +239,22 @@ impl ProactiveEngine {
         for episode in &self.recent_episodes {
             // Check if topics overlap
             let topic_match = episode.topics.as_ref().is_some_and(|topics| {
-                topics.iter().any(|t| context.user_message.to_lowercase().contains(&t.to_lowercase()))
+                topics.iter().any(|t| {
+                    context
+                        .user_message
+                        .to_lowercase()
+                        .contains(&t.to_lowercase())
+                })
             });
 
             if topic_match {
                 let confidence = episode.importance * 0.6; // Scale by importance
 
                 suggestions.push(Suggestion {
-                    text: format!("We've worked on something similar before: {}", truncate_str(&episode.summary, 50)),
+                    text: format!(
+                        "We've worked on something similar before: {}",
+                        truncate_str(&episode.summary, 50)
+                    ),
                     source: SuggestionSource::Episode(episode.id),
                     confidence,
                 });
@@ -260,13 +289,7 @@ mod tests {
 
     #[test]
     fn test_no_suggestions_when_disabled() {
-        let engine = ProactiveEngine::new(
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            make_profile(false),
-        );
+        let engine = ProactiveEngine::new(vec![], vec![], vec![], vec![], make_profile(false));
 
         let context = SuggestionContext {
             last_action: None,
@@ -295,13 +318,7 @@ mod tests {
             completed_at: None,
         };
 
-        let engine = ProactiveEngine::new(
-            vec![],
-            vec![goal],
-            vec![],
-            vec![],
-            make_profile(true),
-        );
+        let engine = ProactiveEngine::new(vec![], vec![goal], vec![], vec![], make_profile(true));
 
         let context = SuggestionContext {
             last_action: None,

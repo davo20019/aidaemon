@@ -1,8 +1,8 @@
 [package]
 name = "aidaemon"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-description = "A personal AI agent that runs as a background daemon, accessible via Telegram, with tool use, MCP integration, email triggers, and persistent memory"
+description = "A personal AI agent that runs as a background daemon, accessible via Telegram, Slack, or Discord, with tool use, MCP integration, and persistent memory"
 license = "MIT"
 repository = "https://github.com/davo20019/aidaemon"
 homepage = "https://aidaemon.ai/"
@@ -52,6 +52,11 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"], optional = tr
 self_update = { version = "0.42", features = ["archive-tar", "compression-flate2"], default-features = false }
 semver = "1"
 zeroize = { version = "1", features = ["derive"] }
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

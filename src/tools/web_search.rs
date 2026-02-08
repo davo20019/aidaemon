@@ -41,11 +41,9 @@ impl DuckDuckGoBackend {
 #[async_trait]
 impl SearchBackend for DuckDuckGoBackend {
     async fn search(&self, query: &str, max_results: usize) -> anyhow::Result<Vec<SearchResult>> {
-        let url = reqwest::Url::parse_with_params(
-            "https://lite.duckduckgo.com/lite/",
-            &[("q", query)],
-        )?
-        .to_string();
+        let url =
+            reqwest::Url::parse_with_params("https://lite.duckduckgo.com/lite/", &[("q", query)])?
+                .to_string();
         let resp = self.client.get(&url).send().await?;
         let html = resp.text().await?;
 
@@ -71,11 +69,17 @@ impl SearchBackend for DuckDuckGoBackend {
             // Extract title (text between > and </a>)
             let title_start = match html[link_start..].find('>') {
                 Some(p) => link_start + p + 1,
-                None => { pos = link_start + 20; continue; }
+                None => {
+                    pos = link_start + 20;
+                    continue;
+                }
             };
             let title_end = match html[title_start..].find("</a>") {
                 Some(p) => title_start + p,
-                None => { pos = title_start; continue; }
+                None => {
+                    pos = title_start;
+                    continue;
+                }
             };
             let title = strip_tags(&html[title_start..title_end]);
 
@@ -90,7 +94,9 @@ impl SearchBackend for DuckDuckGoBackend {
                     Some(p) => sn_content_start + p,
                     None => sn_content_start,
                 };
-                strip_tags(&html[sn_content_start..sn_end]).trim().to_string()
+                strip_tags(&html[sn_content_start..sn_end])
+                    .trim()
+                    .to_string()
             } else {
                 String::new()
             };
@@ -210,7 +216,8 @@ impl SearchBackend for BraveBackend {
             }
 
             // Retry on 429 (rate limited) with exponential backoff
-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < max_retries - 1 {
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < max_retries - 1
+            {
                 let delay_secs = 2u64.pow(attempt as u32); // 1s, 2s, 4s
                 tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                 continue;

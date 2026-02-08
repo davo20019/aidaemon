@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use std::collections::HashMap;
+
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::types::{ApprovalResponse, ChannelVisibility, FactPrivacy, MediaMessage, StatusUpdate};
 
@@ -12,7 +14,7 @@ use crate::types::{ApprovalResponse, ChannelVisibility, FactPrivacy, MediaMessag
 pub struct Message {
     pub id: String,
     pub session_id: String,
-    pub role: String,           // "system", "user", "assistant", "tool"
+    pub role: String, // "system", "user", "assistant", "tool"
     pub content: Option<String>,
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
@@ -98,7 +100,7 @@ pub struct Episode {
 pub struct Goal {
     pub id: i64,
     pub description: String,
-    pub status: String, // "active", "completed", "abandoned"
+    pub status: String,   // "active", "completed", "abandoned"
     pub priority: String, // "low", "medium", "high"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_notes: Option<Vec<String>>,
@@ -205,6 +207,40 @@ pub struct Event {
     pub source: String,
     pub session_id: String,
     pub content: String,
+    /// Whether this event originates from an explicitly trusted source
+    /// (e.g., a scheduled task marked `trusted = true` in config).
+    pub trusted: bool,
+}
+
+/// A person in the owner's social circle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Person {
+    pub id: i64,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub relationship: Option<String>,
+    pub platform_ids: HashMap<String, String>,
+    pub notes: Option<String>,
+    pub communication_style: Option<String>,
+    pub language_preference: Option<String>,
+    pub last_interaction_at: Option<DateTime<Utc>>,
+    pub interaction_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A fact about a person (birthday, preference, interest, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonFact {
+    pub id: i64,
+    pub person_id: i64,
+    pub category: String,
+    pub key: String,
+    pub value: String,
+    pub source: String,
+    pub confidence: f32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Tool trait — system tools, terminal, MCP-proxied tools.
@@ -316,7 +352,11 @@ pub trait StateStore: Send + Sync {
         Ok(vec![])
     }
     /// Update a fact's privacy level (e.g., channel → global after approval).
-    async fn update_fact_privacy(&self, _fact_id: i64, _privacy: FactPrivacy) -> anyhow::Result<()> {
+    async fn update_fact_privacy(
+        &self,
+        _fact_id: i64,
+        _privacy: FactPrivacy,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
     /// Soft-delete a fact by superseding it.
@@ -338,14 +378,23 @@ pub trait StateStore: Send + Sync {
     }
     /// Get context using Tri-Hybrid retrieval (Recency + Vector + Salience).
     /// Default implementation just calls get_history.
-    async fn get_context(&self, session_id: &str, _query: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
+    async fn get_context(
+        &self,
+        session_id: &str,
+        _query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
         self.get_history(session_id, limit).await
     }
     /// Clear conversation history for a session (working memory + DB messages).
     /// Facts are preserved.
     async fn clear_session(&self, session_id: &str) -> anyhow::Result<()>;
     /// Record token usage from an LLM call.
-    async fn record_token_usage(&self, _session_id: &str, _usage: &TokenUsage) -> anyhow::Result<()> {
+    async fn record_token_usage(
+        &self,
+        _session_id: &str,
+        _usage: &TokenUsage,
+    ) -> anyhow::Result<()> {
         Ok(()) // default no-op
     }
     /// Get token usage records since a given datetime string (ISO 8601).
@@ -358,7 +407,11 @@ pub trait StateStore: Send + Sync {
     // SqliteStateStore overrides them with actual implementations.
 
     /// Get episodes relevant to a query.
-    async fn get_relevant_episodes(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<Episode>> {
+    async fn get_relevant_episodes(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<Episode>> {
         Ok(vec![])
     }
 
@@ -368,22 +421,38 @@ pub trait StateStore: Send + Sync {
     }
 
     /// Update a goal's status and/or add a progress note.
-    async fn update_goal(&self, _goal_id: i64, _status: Option<&str>, _progress_note: Option<&str>) -> anyhow::Result<()> {
+    async fn update_goal(
+        &self,
+        _goal_id: i64,
+        _status: Option<&str>,
+        _progress_note: Option<&str>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Get behavior patterns above a confidence threshold.
-    async fn get_behavior_patterns(&self, _min_confidence: f32) -> anyhow::Result<Vec<BehaviorPattern>> {
+    async fn get_behavior_patterns(
+        &self,
+        _min_confidence: f32,
+    ) -> anyhow::Result<Vec<BehaviorPattern>> {
         Ok(vec![])
     }
 
     /// Get procedures relevant to a query.
-    async fn get_relevant_procedures(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<Procedure>> {
+    async fn get_relevant_procedures(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<Procedure>> {
         Ok(vec![])
     }
 
     /// Get error solutions relevant to an error message.
-    async fn get_relevant_error_solutions(&self, _error: &str, _limit: usize) -> anyhow::Result<Vec<ErrorSolution>> {
+    async fn get_relevant_error_solutions(
+        &self,
+        _error: &str,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<ErrorSolution>> {
         Ok(vec![])
     }
 
@@ -407,7 +476,12 @@ pub trait StateStore: Send + Sync {
     // These have default no-op implementations for backwards compatibility.
 
     /// Increment expertise counters and update level for a domain.
-    async fn increment_expertise(&self, _domain: &str, _success: bool, _error: Option<&str>) -> anyhow::Result<()> {
+    async fn increment_expertise(
+        &self,
+        _domain: &str,
+        _success: bool,
+        _error: Option<&str>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -418,7 +492,12 @@ pub trait StateStore: Send + Sync {
 
     /// Update procedure outcome after execution.
     #[allow(dead_code)] // Reserved for procedure feedback loop
-    async fn update_procedure_outcome(&self, _procedure_id: i64, _success: bool, _duration: Option<f32>) -> anyhow::Result<()> {
+    async fn update_procedure_outcome(
+        &self,
+        _procedure_id: i64,
+        _success: bool,
+        _duration: Option<f32>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -429,7 +508,11 @@ pub trait StateStore: Send + Sync {
 
     /// Update error solution outcome.
     #[allow(dead_code)] // Reserved for error solution feedback loop
-    async fn update_error_solution_outcome(&self, _solution_id: i64, _success: bool) -> anyhow::Result<()> {
+    async fn update_error_solution_outcome(
+        &self,
+        _solution_id: i64,
+        _success: bool,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -476,7 +559,11 @@ pub trait StateStore: Send + Sync {
     }
 
     /// Get procedures eligible for skill promotion (success_count >= min_success, success rate >= min_rate).
-    async fn get_promotable_procedures(&self, _min_success: i32, _min_rate: f32) -> anyhow::Result<Vec<Procedure>> {
+    async fn get_promotable_procedures(
+        &self,
+        _min_success: i32,
+        _min_rate: f32,
+    ) -> anyhow::Result<Vec<Procedure>> {
         Ok(vec![])
     }
 
@@ -502,6 +589,171 @@ pub trait StateStore: Send + Sync {
     async fn update_dynamic_mcp_server(&self, _server: &DynamicMcpServer) -> anyhow::Result<()> {
         Ok(())
     }
+
+    // ==================== Settings Methods ====================
+    // Generic key-value settings for runtime toggles.
+
+    /// Get a setting value by key. Returns None if unset.
+    async fn get_setting(&self, _key: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Set a setting value. Creates or updates the key.
+    async fn set_setting(&self, _key: &str, _value: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    // ==================== People Methods ====================
+    // For tracking the owner's social circle.
+
+    /// Create or update a person record. Returns the person ID.
+    async fn upsert_person(&self, _person: &Person) -> anyhow::Result<i64> {
+        Ok(0)
+    }
+
+    /// Get a person by their database ID.
+    async fn get_person(&self, _id: i64) -> anyhow::Result<Option<Person>> {
+        Ok(None)
+    }
+
+    /// Look up a person by a platform-qualified sender ID (e.g., "slack:U123").
+    async fn get_person_by_platform_id(
+        &self,
+        _platform_id: &str,
+    ) -> anyhow::Result<Option<Person>> {
+        Ok(None)
+    }
+
+    /// Find a person by name or alias (case-insensitive).
+    async fn find_person_by_name(&self, _name: &str) -> anyhow::Result<Option<Person>> {
+        Ok(None)
+    }
+
+    /// Get all people.
+    async fn get_all_people(&self) -> anyhow::Result<Vec<Person>> {
+        Ok(vec![])
+    }
+
+    /// Delete a person and all their facts (cascade).
+    async fn delete_person(&self, _id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Link a platform identity to a person.
+    async fn link_platform_id(
+        &self,
+        _person_id: i64,
+        _platform_id: &str,
+        _display_name: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Update interaction tracking for a person.
+    async fn touch_person_interaction(&self, _person_id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Create or update a fact about a person.
+    async fn upsert_person_fact(
+        &self,
+        _person_id: i64,
+        _category: &str,
+        _key: &str,
+        _value: &str,
+        _source: &str,
+        _confidence: f32,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Get facts about a person, optionally filtered by category.
+    async fn get_person_facts(
+        &self,
+        _person_id: i64,
+        _category: Option<&str>,
+    ) -> anyhow::Result<Vec<PersonFact>> {
+        Ok(vec![])
+    }
+
+    /// Delete a person fact by ID.
+    async fn delete_person_fact(&self, _fact_id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Confirm an auto-extracted person fact (set confidence to 1.0).
+    async fn confirm_person_fact(&self, _fact_id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Get people with upcoming dates (birthdays, important dates) within N days.
+    async fn get_people_with_upcoming_dates(
+        &self,
+        _within_days: i32,
+    ) -> anyhow::Result<Vec<(Person, PersonFact)>> {
+        Ok(vec![])
+    }
+
+    /// Delete stale auto-extracted person facts older than N days with confidence < 1.0.
+    async fn prune_stale_person_facts(&self, _retention_days: u32) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    /// Get people who haven't interacted in more than N days.
+    async fn get_people_needing_reconnect(
+        &self,
+        _inactive_days: u32,
+    ) -> anyhow::Result<Vec<Person>> {
+        Ok(vec![])
+    }
+
+    // ==================== OAuth Connection Methods ====================
+    // For tracking OAuth-connected external services.
+
+    /// Save an OAuth connection. Returns the connection ID.
+    async fn save_oauth_connection(&self, _conn: &OAuthConnection) -> anyhow::Result<i64> {
+        Ok(0)
+    }
+
+    /// Get an OAuth connection by service name.
+    async fn get_oauth_connection(
+        &self,
+        _service: &str,
+    ) -> anyhow::Result<Option<OAuthConnection>> {
+        Ok(None)
+    }
+
+    /// List all OAuth connections.
+    async fn list_oauth_connections(&self) -> anyhow::Result<Vec<OAuthConnection>> {
+        Ok(vec![])
+    }
+
+    /// Delete an OAuth connection by service name.
+    async fn delete_oauth_connection(&self, _service: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Update token expiry for an OAuth connection.
+    async fn update_oauth_token_expiry(
+        &self,
+        _service: &str,
+        _expires_at: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// An OAuth connection to an external service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthConnection {
+    pub id: i64,
+    pub service: String,
+    pub auth_type: String,
+    pub username: Option<String>,
+    pub scopes: String,
+    pub token_expires_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// A dynamically added skill (stored in database).
@@ -512,7 +764,7 @@ pub struct DynamicSkill {
     pub description: String,
     pub triggers_json: String, // JSON array of trigger strings
     pub body: String,
-    pub source: String,        // "url", "inline", "auto", "registry"
+    pub source: String, // "url", "inline", "auto", "registry"
     pub source_url: Option<String>,
     pub enabled: bool,
     pub version: Option<String>,
@@ -530,11 +782,11 @@ fn default_empty_json() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamicBot {
     pub id: i64,
-    pub channel_type: String,    // "telegram", "discord", "slack"
+    pub channel_type: String, // "telegram", "discord", "slack"
     pub bot_token: String,
-    pub app_token: Option<String>, // Only for Slack
+    pub app_token: Option<String>,     // Only for Slack
     pub allowed_user_ids: Vec<String>, // Stored as JSON
-    pub extra_config: String,    // JSON for channel-specific settings
+    pub extra_config: String,          // JSON for channel-specific settings
     pub created_at: String,
 }
 
@@ -544,9 +796,9 @@ pub struct DynamicMcpServer {
     pub id: i64,
     pub name: String,
     pub command: String,
-    pub args_json: String,          // JSON array of argument strings
-    pub env_keys_json: String,      // JSON array of env var key names (values in keychain)
-    pub triggers_json: String,      // JSON array of trigger keywords
+    pub args_json: String,     // JSON array of argument strings
+    pub env_keys_json: String, // JSON array of env var key names (values in keychain)
+    pub triggers_json: String, // JSON array of trigger keywords
     pub enabled: bool,
     pub created_at: String,
 }

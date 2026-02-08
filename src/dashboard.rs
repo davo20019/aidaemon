@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 use crate::config::ModelsConfig;
 use crate::health::HealthProbeStore;
+use crate::oauth::OAuthGateway;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 const KEYCHAIN_FIELD: &str = "dashboard_token";
@@ -42,6 +43,7 @@ pub struct DashboardState {
     pub token_created_at: Instant,
     pub daily_token_budget: Option<u64>,
     pub health_store: Option<Arc<HealthProbeStore>>,
+    pub oauth_gateway: Option<OAuthGateway>,
     /// Rate limiter: maps IP address to (failure_count, first_failure_time).
     pub auth_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
 }
@@ -70,7 +72,10 @@ pub fn get_or_create_dashboard_token() -> anyhow::Result<DashboardToken> {
         }
     }
     let prefix = tok.get(..8).unwrap_or("????????");
-    info!("Dashboard token created (prefix: {}..., expires in 24h)", prefix);
+    info!(
+        "Dashboard token created (prefix: {}..., expires in 24h)",
+        prefix
+    );
     Ok(DashboardToken {
         token: tok,
         created_at: Instant::now(),
@@ -97,6 +102,7 @@ pub fn build_router(state: DashboardState) -> Router {
 
     Router::new()
         .route("/health", get(health_handler))
+        .route("/oauth/callback", get(oauth_callback_handler))
         .route("/", get(index_handler))
         .merge(api)
         .with_state(state)
@@ -144,7 +150,7 @@ async fn auth_middleware(
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
 
-    if token != state.dashboard_token {
+    if !constant_time_eq(token.as_bytes(), state.dashboard_token.as_bytes()) {
         // Track failed attempt
         let mut failures = state.auth_failures.lock().await;
         let entry = failures
@@ -164,6 +170,65 @@ async fn auth_middleware(
 
 async fn health_handler() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
+}
+
+#[derive(Deserialize)]
+struct OAuthCallbackParams {
+    state: Option<String>,
+    code: Option<String>,
+    error: Option<String>,
+}
+
+async fn oauth_callback_handler(
+    State(state): State<DashboardState>,
+    Query(params): Query<OAuthCallbackParams>,
+) -> Html<String> {
+    let gateway = match &state.oauth_gateway {
+        Some(g) => g,
+        None => {
+            return Html("<html><body><h2>OAuth not enabled</h2><p>OAuth is not configured on this daemon.</p></body></html>".to_string());
+        }
+    };
+
+    let state_param = match &params.state {
+        Some(s) => s.as_str(),
+        None => {
+            return Html("<html><body><h2>Error</h2><p>Missing state parameter.</p></body></html>".to_string());
+        }
+    };
+
+    match gateway
+        .handle_callback(state_param, params.code.as_deref(), params.error.as_deref())
+        .await
+    {
+        Ok(msg) => {
+            let safe_msg = html_escape(&msg);
+            let is_error = msg.contains("denied") || msg.contains("failed") || msg.contains("expired");
+            let (icon, title) = if is_error {
+                ("&#10060;", "OAuth Error")
+            } else {
+                ("&#9989;", "Connected!")
+            };
+            Html(format!(
+                "<html><head><title>{title}</title></head>\
+                 <body style=\"font-family:sans-serif;text-align:center;padding:60px\">\
+                 <h1>{icon}</h1><h2>{title}</h2><p>{safe_msg}</p>\
+                 <p style=\"color:#888\">You can close this tab and return to your chat.</p>\
+                 </body></html>"
+            ))
+        }
+        Err(e) => {
+            warn!("OAuth callback error: {}", e);
+            let safe_err = html_escape(&e.to_string());
+            Html(format!(
+                "<html><head><title>OAuth Error</title></head>\
+                 <body style=\"font-family:sans-serif;text-align:center;padding:60px\">\
+                 <h1>&#10060;</h1><h2>OAuth Error</h2><p>{safe_err}</p>\
+                 <p style=\"color:#888\">Please try again.</p>\
+                 </body></html>"
+            ))
+        }
+    }
 }
 
 async fn index_handler() -> Html<&'static str> {
@@ -193,6 +258,28 @@ struct UsageQuery {
 
 fn default_usage_days() -> u32 {
     7
+}
+
+/// Escape HTML special characters to prevent XSS in rendered pages.
+/// Constant-time byte comparison to prevent timing side-channel attacks
+/// on dashboard bearer token authentication.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 async fn api_usage(
@@ -300,12 +387,19 @@ async fn api_tasks(State(state): State<DashboardState>) -> Json<serde_json::Valu
     let vals: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| {
+            // Truncate prompt to prevent leaking sensitive task instructions
+            // through the dashboard API. Full prompt visible via direct DB only.
+            let truncated_prompt = if r.prompt.len() > 100 {
+                format!("{}...", &r.prompt[..100])
+            } else {
+                r.prompt.clone()
+            };
             json!({
                 "id": r.id,
                 "name": r.name,
                 "original_schedule": r.original_schedule,
                 "cron_expr": r.cron_expr,
-                "prompt": r.prompt,
+                "prompt": truncated_prompt,
                 "source": r.source,
                 "is_oneshot": r.is_oneshot != 0,
                 "is_paused": r.is_paused != 0,
@@ -402,11 +496,10 @@ async fn api_health_history(
     };
 
     // Find probe by ID or name
-    let probe = store.get_probe(&q.probe).await.ok().flatten()
-        .or({
-            // Try by name synchronously is tricky; we'll use a future
-            None
-        });
+    let probe = store.get_probe(&q.probe).await.ok().flatten().or({
+        // Try by name synchronously is tricky; we'll use a future
+        None
+    });
 
     let probe_id = if let Some(p) = probe {
         p.id
@@ -490,7 +583,10 @@ async fn api_health_summary(State(state): State<DashboardState>) -> Json<serde_j
         }
 
         let latest = store.get_latest_result(&probe.id).await.unwrap_or(None);
-        let is_healthy = latest.as_ref().map(|r| r.status.is_healthy()).unwrap_or(true);
+        let is_healthy = latest
+            .as_ref()
+            .map(|r| r.status.is_healthy())
+            .unwrap_or(true);
 
         if is_healthy {
             healthy += 1;

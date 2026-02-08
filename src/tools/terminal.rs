@@ -151,11 +151,9 @@ impl TerminalTool {
         if permission_mode == PermissionMode::Yolo && !merged.contains(&"*".to_string()) {
             merged.push("*".to_string());
         }
-        match sqlx::query_scalar::<_, String>(
-            "SELECT prefix FROM terminal_allowed_prefixes"
-        )
-        .fetch_all(&pool)
-        .await
+        match sqlx::query_scalar::<_, String>("SELECT prefix FROM terminal_allowed_prefixes")
+            .fetch_all(&pool)
+            .await
         {
             Ok(persisted) => {
                 for p in persisted {
@@ -214,13 +212,13 @@ impl TerminalTool {
 
     /// Add a prefix to session-only approved list (cleared on restart).
     async fn add_session_prefix(&self, command: &str) {
-        let prefix = command
-            .split_whitespace()
-            .next()
-            .unwrap_or(command.trim());
+        let prefix = command.split_whitespace().next().unwrap_or(command.trim());
         let mut session = self.session_approved.write().await;
         if session.insert(prefix.to_string()) {
-            info!(prefix, "Added to session-approved prefixes (will reset on restart)");
+            info!(
+                prefix,
+                "Added to session-approved prefixes (will reset on restart)"
+            );
         }
     }
 
@@ -257,10 +255,7 @@ impl TerminalTool {
     }
 
     async fn add_prefix(&self, command: &str) {
-        let prefix = command
-            .split_whitespace()
-            .next()
-            .unwrap_or(command.trim());
+        let prefix = command.split_whitespace().next().unwrap_or(command.trim());
         if prefix == "*" {
             warn!("Refusing to add wildcard '*' as permanent prefix");
             return;
@@ -273,7 +268,7 @@ impl TerminalTool {
             // Persist to SQLite
             if let Some(ref pool) = self.pool {
                 if let Err(e) = sqlx::query(
-                    "INSERT OR IGNORE INTO terminal_allowed_prefixes (prefix) VALUES (?)"
+                    "INSERT OR IGNORE INTO terminal_allowed_prefixes (prefix) VALUES (?)",
                 )
                 .bind(prefix)
                 .execute(pool)
@@ -292,21 +287,27 @@ impl TerminalTool {
         {
             let prefixes = self.allowed_prefixes.read().await;
             if prefixes.iter().any(|p| p == "*") {
-                return Ok("Trust-all mode is already enabled. All commands are auto-approved.".to_string());
+                return Ok(
+                    "Trust-all mode is already enabled. All commands are auto-approved."
+                        .to_string(),
+                );
             }
         }
 
         // Request user approval
-        match self.request_approval(
-            session_id,
-            "ENABLE TRUST-ALL MODE",
-            RiskLevel::Critical,
-            vec![
-                "All future commands will run without approval".to_string(),
-                "This includes dangerous commands (rm, sudo, etc.)".to_string(),
-                "Persists across restarts".to_string(),
-            ],
-        ).await {
+        match self
+            .request_approval(
+                session_id,
+                "ENABLE TRUST-ALL MODE",
+                RiskLevel::Critical,
+                vec![
+                    "All future commands will run without approval".to_string(),
+                    "This includes dangerous commands (rm, sudo, etc.)".to_string(),
+                    "Persists across restarts".to_string(),
+                ],
+            )
+            .await
+        {
             Ok(ApprovalResponse::AllowOnce)
             | Ok(ApprovalResponse::AllowSession)
             | Ok(ApprovalResponse::AllowAlways) => {
@@ -319,7 +320,7 @@ impl TerminalTool {
                     // Persist to database
                     if let Some(ref pool) = self.pool {
                         if let Err(e) = sqlx::query(
-                            "INSERT OR IGNORE INTO terminal_allowed_prefixes (prefix) VALUES ('*')"
+                            "INSERT OR IGNORE INTO terminal_allowed_prefixes (prefix) VALUES ('*')",
                         )
                         .execute(pool)
                         .await
@@ -328,14 +329,16 @@ impl TerminalTool {
                         }
                     }
                 }
-                Ok("Trust-all mode enabled. All commands will now run without approval prompts.".to_string())
+                Ok(
+                    "Trust-all mode enabled. All commands will now run without approval prompts."
+                        .to_string(),
+                )
             }
-            Ok(ApprovalResponse::Deny) => {
-                Ok("Trust-all mode was denied. Commands will continue to require approval.".to_string())
-            }
-            Err(e) => {
-                Ok(format!("Could not get approval for trust-all mode: {}", e))
-            }
+            Ok(ApprovalResponse::Deny) => Ok(
+                "Trust-all mode was denied. Commands will continue to require approval."
+                    .to_string(),
+            ),
+            Err(e) => Ok(format!("Could not get approval for trust-all mode: {}", e)),
         }
     }
 
@@ -413,7 +416,11 @@ impl TerminalTool {
                 let elapsed = self.initial_timeout.as_secs();
                 let partial_stdout = {
                     let b = stdout_buf.lock().await;
-                    let tail = if b.len() > 500 { &b[b.len()-500..] } else { &b };
+                    let tail = if b.len() > 500 {
+                        &b[b.len() - 500..]
+                    } else {
+                        &b
+                    };
                     String::from_utf8_lossy(tail).to_string()
                 };
 
@@ -446,7 +453,10 @@ impl TerminalTool {
         let mut running = self.running.lock().await;
 
         let Some(proc) = running.get(&pid) else {
-            return Ok(format!("No tracked process with pid={}. It may have already finished and been reaped.", pid));
+            return Ok(format!(
+                "No tracked process with pid={}. It may have already finished and been reaped.",
+                pid
+            ));
         };
 
         if proc.reader_handle.is_finished() {
@@ -455,7 +465,11 @@ impl TerminalTool {
             let status = proc.reader_handle.await.ok().flatten();
             let stdout = String::from_utf8_lossy(&proc.stdout_buf.lock().await).to_string();
             let stderr = String::from_utf8_lossy(&proc.stderr_buf.lock().await).to_string();
-            let mut output = format!("[Process pid={} finished after {:.0}s]\n", pid, proc.started_at.elapsed().as_secs_f64());
+            let mut output = format!(
+                "[Process pid={} finished after {:.0}s]\n",
+                pid,
+                proc.started_at.elapsed().as_secs_f64()
+            );
             output.push_str(&format_output(&stdout, &stderr, self.max_output_chars));
             if let Some(s) = status {
                 if !s.success() {
@@ -499,7 +513,10 @@ impl TerminalTool {
         let mut running = self.running.lock().await;
 
         let Some(proc) = running.remove(&pid) else {
-            return Ok(format!("No tracked process with pid={}. It may have already finished.", pid));
+            return Ok(format!(
+                "No tracked process with pid={}. It may have already finished.",
+                pid
+            ));
         };
 
         // Send SIGTERM
@@ -507,17 +524,15 @@ impl TerminalTool {
 
         if term_sent {
             // Wait up to 2 seconds for graceful shutdown
-            let finished = tokio::time::timeout(
-                Duration::from_secs(2),
-                async {
-                    loop {
-                        if proc.reader_handle.is_finished() {
-                            return;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+            let finished = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if proc.reader_handle.is_finished() {
+                        return;
                     }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-            ).await;
+            })
+            .await;
 
             if finished.is_err() && !proc.reader_handle.is_finished() {
                 // Still alive — SIGKILL
@@ -532,7 +547,9 @@ impl TerminalTool {
         let stderr = String::from_utf8_lossy(&proc.stderr_buf.lock().await).to_string();
         let mut output = format!(
             "[Process pid={} killed after {:.0}s (command: `{}`)]\n",
-            pid, proc.started_at.elapsed().as_secs_f64(), proc.command
+            pid,
+            proc.started_at.elapsed().as_secs_f64(),
+            proc.command
         );
         output.push_str(&format_output(&stdout, &stderr, self.max_output_chars));
         Ok(output)
@@ -561,6 +578,10 @@ struct TerminalArgs {
     _untrusted_source: bool,
     #[serde(default)]
     _session_id: String,
+    /// Explicitly set by the agent from ChannelContext.trusted — never derived
+    /// from session ID strings. Only trusted scheduled tasks set this to true.
+    #[serde(default)]
+    _trusted_session: bool,
 }
 
 fn default_action() -> String {
@@ -611,19 +632,22 @@ impl Tool for TerminalTool {
 
         match args.action.as_str() {
             "check" => {
-                let pid = args.pid.ok_or_else(|| anyhow::anyhow!("pid is required for action=\"check\""))?;
+                let pid = args
+                    .pid
+                    .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"check\""))?;
                 self.handle_check(pid).await
             }
             "kill" => {
-                let pid = args.pid.ok_or_else(|| anyhow::anyhow!("pid is required for action=\"kill\""))?;
+                let pid = args
+                    .pid
+                    .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"kill\""))?;
                 self.handle_kill(pid).await
             }
-            "trust_all" => {
-                self.handle_trust_all(&args._session_id).await
-            }
+            "trust_all" => self.handle_trust_all(&args._session_id).await,
             _ => {
                 // "run" or default
-                let command = args.command
+                let command = args
+                    .command
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("command is required for action=\"run\""))?;
 
@@ -632,7 +656,9 @@ impl Tool for TerminalTool {
 
                 // Check for learned patterns and potentially lower risk
                 if let Some(ref pool) = self.pool {
-                    if let Ok(Some((pattern, similarity))) = find_matching_pattern(pool, command).await {
+                    if let Ok(Some((pattern, similarity))) =
+                        find_matching_pattern(pool, command).await
+                    {
                         if pattern.is_trusted() && similarity >= 0.9 {
                             // Trusted pattern with high similarity - lower risk by one level
                             let original_level = assessment.level;
@@ -665,8 +691,9 @@ impl Tool for TerminalTool {
                     }
                 }
 
-                // Check if this is a trusted scheduled session (auto-approve)
-                let is_trusted_session = args._session_id.starts_with("scheduled_");
+                // Check if this is a trusted session (explicitly set by ChannelContext,
+                // not derived from session ID strings — prevents session ID spoofing).
+                let is_trusted_session = args._trusted_session;
 
                 // Determine if approval is needed
                 // Note: is_allowed() checks both permanent AND session-approved prefixes
@@ -681,7 +708,9 @@ impl Tool for TerminalTool {
                     false
                 } else if !is_allowed {
                     true
-                } else if assessment.level == RiskLevel::Critical && self.permission_mode != PermissionMode::Yolo {
+                } else if assessment.level == RiskLevel::Critical
+                    && self.permission_mode != PermissionMode::Yolo
+                {
                     // Even with wildcard/prefix approval, Critical commands require explicit approval
                     info!(command = %command, risk = %assessment.level, "Forcing approval: critical command despite prefix match");
                     true
@@ -690,12 +719,15 @@ impl Tool for TerminalTool {
                 };
 
                 if needs_approval {
-                    match self.request_approval(
-                        &args._session_id,
-                        command,
-                        assessment.level,
-                        assessment.warnings.clone(),
-                    ).await {
+                    match self
+                        .request_approval(
+                            &args._session_id,
+                            command,
+                            assessment.level,
+                            assessment.warnings.clone(),
+                        )
+                        .await
+                    {
                         Ok(ApprovalResponse::AllowOnce) => {
                             // Just run this once, but still learn from it
                             if let Some(ref pool) = self.pool {
@@ -800,7 +832,10 @@ mod tests {
     fn test_format_truncation() {
         let long_output = "a".repeat(200);
         let result = format_output(&long_output, "", 100);
-        assert!(result.len() > 100, "truncated output should include the suffix");
+        assert!(
+            result.len() > 100,
+            "truncated output should include the suffix"
+        );
         assert!(result.ends_with("\n... (truncated)"));
         // The content portion before the suffix should be exactly max_chars long
         let prefix = &result[..100];

@@ -22,12 +22,21 @@ impl SchedulerTool {
     }
 
     /// Request user approval for creating a trusted scheduled task.
-    async fn request_approval(&self, session_id: &str, task_name: &str, prompt: &str) -> anyhow::Result<ApprovalResponse> {
+    async fn request_approval(
+        &self,
+        session_id: &str,
+        task_name: &str,
+        prompt: &str,
+    ) -> anyhow::Result<ApprovalResponse> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let description = format!(
             "Create TRUSTED scheduled task '{}'\nPrompt: {}",
             task_name,
-            if prompt.len() > 100 { format!("{}...", &prompt[..100]) } else { prompt.to_string() }
+            if prompt.len() > 100 {
+                format!("{}...", &prompt[..100])
+            } else {
+                prompt.to_string()
+            }
         );
         self.approval_tx
             .send(ApprovalRequest {
@@ -62,6 +71,9 @@ struct SchedulerArgs {
     id: Option<String>,
     #[serde(default)]
     _session_id: String,
+    /// User role injected by execute_tool — used for access control.
+    #[serde(default)]
+    _user_role: Option<String>,
 }
 
 #[async_trait]
@@ -126,16 +138,43 @@ impl Tool for SchedulerTool {
         match args.action.as_str() {
             "create" => self.create(args).await,
             "list" => self.list().await,
-            "delete" => self.delete(args).await,
-            "pause" => self.pause(args).await,
-            "resume" => self.resume(args).await,
-            other => Ok(format!("Unknown action '{}'. Use: create, list, delete, pause, resume", other)),
+            "delete" => {
+                if args._user_role.as_deref() != Some("Owner") {
+                    return Ok("Error: Only the owner can delete scheduled tasks.".to_string());
+                }
+                self.delete(args).await
+            }
+            "pause" => {
+                if args._user_role.as_deref() != Some("Owner") {
+                    return Ok("Error: Only the owner can pause scheduled tasks.".to_string());
+                }
+                self.pause(args).await
+            }
+            "resume" => {
+                if args._user_role.as_deref() != Some("Owner") {
+                    return Ok("Error: Only the owner can resume scheduled tasks.".to_string());
+                }
+                self.resume(args).await
+            }
+            other => Ok(format!(
+                "Unknown action '{}'. Use: create, list, delete, pause, resume",
+                other
+            )),
         }
     }
 }
 
 impl SchedulerTool {
     async fn create(&self, args: SchedulerArgs) -> anyhow::Result<String> {
+        // Only Owner-role users can create scheduled tasks
+        if args._user_role.as_deref() != Some("Owner") {
+            return Ok(
+                "Error: Only the owner can create scheduled tasks. \
+                 This action requires Owner-level permissions."
+                    .to_string(),
+            );
+        }
+
         let name = args.name.as_deref().unwrap_or("").trim();
         if name.is_empty() {
             return Ok("Error: 'name' is required for create".to_string());
@@ -275,11 +314,12 @@ impl SchedulerTool {
         };
 
         let now_str = chrono::Utc::now().to_rfc3339();
-        let result = sqlx::query("UPDATE scheduled_tasks SET is_paused = 1, updated_at = ? WHERE id = ?")
-            .bind(&now_str)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result =
+            sqlx::query("UPDATE scheduled_tasks SET is_paused = 1, updated_at = ? WHERE id = ?")
+                .bind(&now_str)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
 
         if result.rows_affected() == 0 {
             Ok(format!("No scheduled task found with ID '{}'", id))
@@ -318,6 +358,10 @@ impl SchedulerTool {
             .await?;
 
         info!(id = %id, "Resumed scheduled task");
-        Ok(format!("Resumed scheduled task {}. Next run: {}", id, next_run.format("%Y-%m-%d %H:%M UTC")))
+        Ok(format!(
+            "Resumed scheduled task {}. Next run: {}",
+            id,
+            next_run.format("%Y-%m-%d %H:%M UTC")
+        ))
     }
 }

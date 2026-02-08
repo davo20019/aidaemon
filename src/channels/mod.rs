@@ -1,14 +1,14 @@
-mod formatting;
-mod hub;
-pub(crate) mod telegram;
 #[cfg(feature = "discord")]
 mod discord;
+mod formatting;
+mod hub;
 #[cfg(feature = "slack")]
 mod slack;
+pub(crate) mod telegram;
 
-pub use hub::{ChannelHub, SessionMap};
-pub use telegram::TelegramChannel;
 #[cfg(feature = "discord")]
-pub use discord::{DiscordChannel, spawn_discord_channel};
+pub use discord::{spawn_discord_channel, DiscordChannel};
+pub use hub::{ChannelHub, SessionMap};
 #[cfg(feature = "slack")]
-pub use slack::{SlackChannel, spawn_slack_channel};
+pub use slack::{spawn_slack_channel, SlackChannel};
+pub use telegram::TelegramChannel;

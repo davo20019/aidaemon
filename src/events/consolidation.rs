@@ -4,17 +4,15 @@
 //! in long-term memory (procedures, error-solutions, expertise, episodes).
 //! After consolidation, events can be pruned to manage storage.
 
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use sqlx::Row;
 use tracing::{info, warn};
 
+use super::{ErrorData, TaskEndData, TaskStartData, ToolCallData, ToolResultData};
 use super::{Event, EventStore, EventType, TaskStatus};
-use super::{
-    ErrorData, TaskEndData, TaskStartData, ToolCallData, ToolResultData,
-};
 use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::{PlanStore, StepStatus};
@@ -73,11 +71,21 @@ impl Consolidator {
         fast_model: String,
         embedding_service: Option<Arc<EmbeddingService>>,
     ) -> Self {
-        Self { event_store, plan_store, pool, provider, fast_model, embedding_service }
+        Self {
+            event_store,
+            plan_store,
+            pool,
+            provider,
+            fast_model,
+            embedding_service,
+        }
     }
 
     /// Consolidate events for a session into long-term memory
-    pub async fn consolidate_session(&self, session_id: &str) -> anyhow::Result<ConsolidationResult> {
+    pub async fn consolidate_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<ConsolidationResult> {
         // Get unconsolidated events
         let events = self.event_store.query_unconsolidated(session_id).await?;
 
@@ -105,7 +113,9 @@ impl Consolidator {
         let since = Utc::now() - Duration::hours(24);
         if let Ok(completed_plans) = self.plan_store.get_completed_since(session_id, since).await {
             for plan in completed_plans {
-                let steps: Vec<String> = plan.steps.iter()
+                let steps: Vec<String> = plan
+                    .steps
+                    .iter()
                     .filter(|s| s.status == StepStatus::Completed)
                     .map(|s| s.description.clone())
                     .collect();
@@ -120,22 +130,27 @@ impl Consolidator {
                         name: format!("plan_{}", &plan.id[..8.min(plan.id.len())]),
                         trigger_pattern: plan.description.clone(),
                         steps: steps.clone(),
-                        success_count: 1, failure_count: 0,
+                        success_count: 1,
+                        failure_count: 0,
                         avg_duration_secs: None,
                         last_used_at: Some(Utc::now()),
-                        created_at: Utc::now(), updated_at: Utc::now(),
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
                     };
 
                     // Try LLM enhancement for plan-based procedures too
-                    let tool_sequence_str = proc.steps.iter()
+                    let tool_sequence_str = proc
+                        .steps
+                        .iter()
                         .enumerate()
                         .map(|(i, s)| format!("{}. {}", i + 1, s))
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    let final_proc = match self.enhance_procedure_with_llm(
-                        &proc, &plan.description, &tool_sequence_str
-                    ).await {
+                    let final_proc = match self
+                        .enhance_procedure_with_llm(&proc, &plan.description, &tool_sequence_str)
+                        .await
+                    {
                         Some(enhanced) => enhanced,
                         None => proc,
                     };
@@ -196,7 +211,10 @@ impl Consolidator {
 
     /// Trigger: Daily cron job - consolidate all sessions with pending events
     pub async fn daily_consolidation(&self) -> anyhow::Result<DailyConsolidationStats> {
-        let sessions = self.event_store.get_sessions_needing_consolidation().await?;
+        let sessions = self
+            .event_store
+            .get_sessions_needing_consolidation()
+            .await?;
 
         let mut stats = DailyConsolidationStats {
             sessions_processed: sessions.len(),
@@ -243,8 +261,12 @@ impl Consolidator {
         // Find successful tasks with multiple tool calls
         for (task_id, task_evts) in task_events {
             // Check if task completed successfully
-            let task_end = task_evts.iter().find(|e| e.event_type == EventType::TaskEnd);
-            let task_start = task_evts.iter().find(|e| e.event_type == EventType::TaskStart);
+            let task_end = task_evts
+                .iter()
+                .find(|e| e.event_type == EventType::TaskEnd);
+            let task_start = task_evts
+                .iter()
+                .find(|e| e.event_type == EventType::TaskStart);
 
             let (task_end, task_start) = match (task_end, task_start) {
                 (Some(end), Some(start)) => (end, start),
@@ -311,15 +333,18 @@ impl Consolidator {
                 };
 
                 // Try LLM enhancement
-                let tool_sequence_str = proc.steps.iter()
+                let tool_sequence_str = proc
+                    .steps
+                    .iter()
                     .enumerate()
                     .map(|(i, s)| format!("{}. {}", i + 1, s))
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                let final_proc = match self.enhance_procedure_with_llm(
-                    &proc, &start_data.description, &tool_sequence_str
-                ).await {
+                let final_proc = match self
+                    .enhance_procedure_with_llm(&proc, &start_data.description, &tool_sequence_str)
+                    .await
+                {
                     Some(enhanced) => enhanced,
                     None => proc,
                 };
@@ -421,7 +446,10 @@ impl Consolidator {
             }
             return Some("shell".to_string());
         }
-        if tool_names.iter().any(|t| t == "web_search" || t == "web_fetch") {
+        if tool_names
+            .iter()
+            .any(|t| t == "web_search" || t == "web_fetch")
+        {
             return Some("research".to_string());
         }
         if tool_names.iter().any(|t| t == "browser") {
@@ -442,12 +470,22 @@ impl Consolidator {
         let end_time = events.last()?.created_at;
 
         // Count key events
-        let user_messages = events.iter().filter(|e| e.event_type == EventType::UserMessage).count();
-        let task_count = events.iter().filter(|e| e.event_type == EventType::TaskStart).count();
-        let error_count = events.iter().filter(|e| e.event_type == EventType::Error).count();
+        let user_messages = events
+            .iter()
+            .filter(|e| e.event_type == EventType::UserMessage)
+            .count();
+        let task_count = events
+            .iter()
+            .filter(|e| e.event_type == EventType::TaskStart)
+            .count();
+        let error_count = events
+            .iter()
+            .filter(|e| e.event_type == EventType::Error)
+            .count();
 
         // Determine outcome
-        let last_task_end = events.iter()
+        let last_task_end = events
+            .iter()
             .rev()
             .find(|e| e.event_type == EventType::TaskEnd);
 
@@ -466,7 +504,8 @@ impl Consolidator {
         };
 
         // Collect topics from task descriptions
-        let topics: Vec<String> = events.iter()
+        let topics: Vec<String> = events
+            .iter()
             .filter(|e| e.event_type == EventType::TaskStart)
             .filter_map(|e| e.parse_data::<TaskStartData>().ok())
             .map(|d| truncate(&d.description, 50))
@@ -482,7 +521,11 @@ impl Consolidator {
             id: 0,
             session_id: session_id.to_string(),
             summary,
-            topics: if topics.is_empty() { None } else { Some(topics) },
+            topics: if topics.is_empty() {
+                None
+            } else {
+                Some(topics)
+            },
             emotional_tone: None,
             outcome: Some(outcome.to_string()),
             importance: calculate_importance(user_messages, task_count, error_count),
@@ -510,9 +553,11 @@ impl Consolidator {
             Err(_) => return false,
         };
 
-        let rows = match sqlx::query("SELECT name, trigger_embedding FROM procedures WHERE trigger_embedding IS NOT NULL")
-            .fetch_all(&self.pool)
-            .await
+        let rows = match sqlx::query(
+            "SELECT name, trigger_embedding FROM procedures WHERE trigger_embedding IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
         {
             Ok(rows) => rows,
             Err(_) => return false,
@@ -542,7 +587,8 @@ impl Consolidator {
         let provider = self.provider.as_ref()?;
 
         let step_count = proc.steps.len();
-        let duration_str = proc.avg_duration_secs
+        let duration_str = proc
+            .avg_duration_secs
             .map(|d| format!("{:.0}", d))
             .unwrap_or_else(|| "unknown".to_string());
 
@@ -602,21 +648,38 @@ impl Consolidator {
         };
 
         // Check if LLM says skip
-        if parsed.get("skip").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if parsed
+            .get("skip")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return None;
         }
 
-        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let trigger_pattern = parsed.get("trigger_pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = parsed
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let trigger_pattern = parsed
+            .get("trigger_pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         if name.is_empty() || trigger_pattern.is_empty() {
             return None;
         }
 
         // Extract steps from LLM
-        let llm_steps: Vec<String> = parsed.get("steps")
+        let llm_steps: Vec<String> = parsed
+            .get("steps")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         // Step count validation: if LLM steps differ by more than 1, keep original steps
@@ -676,7 +739,7 @@ impl Consolidator {
                 success_count = success_count + 1,
                 last_used_at = excluded.last_used_at,
                 updated_at = excluded.updated_at
-            "#
+            "#,
         )
         .bind(&proc.name)
         .bind(&proc.trigger_pattern)
@@ -694,7 +757,9 @@ impl Consolidator {
     }
 
     pub async fn save_error_solution(&self, es: &ErrorSolution) -> anyhow::Result<()> {
-        let steps_json = es.solution_steps.as_ref()
+        let steps_json = es
+            .solution_steps
+            .as_ref()
             .map(|s| serde_json::to_string(s).unwrap_or_default());
         let now = Utc::now().to_rfc3339();
 
@@ -703,7 +768,7 @@ impl Consolidator {
             INSERT INTO error_solutions (error_pattern, domain, solution_summary, solution_steps,
                                          success_count, failure_count, last_used_at, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            "#
+            "#,
         )
         .bind(&es.error_pattern)
         .bind(&es.domain)
@@ -732,7 +797,7 @@ impl Consolidator {
                     last_task_at = ?,
                     updated_at = ?
                 WHERE domain = ?
-                "#
+                "#,
             )
             .bind(&now)
             .bind(&now)
@@ -748,7 +813,7 @@ impl Consolidator {
                     last_task_at = ?,
                     updated_at = ?
                 WHERE domain = ?
-                "#
+                "#,
             )
             .bind(&now)
             .bind(&now)
@@ -780,7 +845,9 @@ impl Consolidator {
     }
 
     async fn save_episode(&self, episode: &Episode) -> anyhow::Result<()> {
-        let topics_json = episode.topics.as_ref()
+        let topics_json = episode
+            .topics
+            .as_ref()
             .map(|t| serde_json::to_string(t).unwrap_or_default());
 
         sqlx::query(
@@ -833,14 +900,18 @@ impl Pruner {
         let cutoff = Utc::now() - Duration::days(self.retention_days as i64);
 
         // First, consolidate any old unconsolidated events
-        let old_sessions = self.event_store
+        let old_sessions = self
+            .event_store
             .get_sessions_with_old_unconsolidated_events(cutoff)
             .await?;
 
         let mut consolidation_errors = 0;
         for session_id in old_sessions {
             if let Err(e) = self.consolidator.consolidate_session(&session_id).await {
-                warn!("Failed to consolidate before prune for {}: {}", session_id, e);
+                warn!(
+                    "Failed to consolidate before prune for {}: {}",
+                    session_id, e
+                );
                 consolidation_errors += 1;
             }
         }

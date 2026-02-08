@@ -22,7 +22,7 @@ fn redact_option(secret: &Option<String>) -> &'static str {
     }
 }
 
-const KEYCHAIN_SERVICE: &str = "aidaemon";
+pub(crate) const KEYCHAIN_SERVICE: &str = "aidaemon";
 
 /// Expand `${ENV_VAR}` references in a string.
 /// Returns an error listing all undefined variables (does not fail on first miss).
@@ -48,7 +48,7 @@ pub fn expand_env_vars(content: &str) -> anyhow::Result<String> {
     Ok(result.into_owned())
 }
 
-fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
+pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
     entry
         .get_password()
@@ -60,6 +60,14 @@ pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
     entry.set_password(value)?;
     Ok(())
+}
+
+/// Delete a secret from the OS keychain.
+pub fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
+    entry
+        .delete_credential()
+        .map_err(|e| anyhow::anyhow!("Failed to delete '{}' from OS keychain: {}", field_name, e))
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -115,6 +123,12 @@ pub struct AppConfig {
     pub updates: UpdateConfig,
     #[serde(default)]
     pub users: UsersConfig,
+    #[serde(default)]
+    pub people: PeopleConfig,
+    #[serde(default)]
+    pub oauth: OAuthConfig,
+    #[serde(default)]
+    pub http_auth: HashMap<String, HttpAuthProfile>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -147,7 +161,6 @@ pub enum ProviderKind {
     GoogleGenai,
     Anthropic,
 }
-
 
 fn default_base_url() -> String {
     "https://api.openai.com/v1".to_string()
@@ -393,17 +406,28 @@ impl Default for RetentionConfig {
     }
 }
 
-fn default_retention_30() -> u32 { 30 }
-fn default_retention_90() -> u32 { 90 }
-fn default_retention_180() -> u32 { 180 }
-fn default_retention_365() -> u32 { 365 }
+fn default_retention_30() -> u32 {
+    30
+}
+fn default_retention_90() -> u32 {
+    90
+}
+fn default_retention_180() -> u32 {
+    180
+}
+fn default_retention_365() -> u32 {
+    365
+}
 
 impl fmt::Debug for StateConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StateConfig")
             .field("db_path", &self.db_path)
             .field("working_memory_cap", &self.working_memory_cap)
-            .field("consolidation_interval_hours", &self.consolidation_interval_hours)
+            .field(
+                "consolidation_interval_hours",
+                &self.consolidation_interval_hours,
+            )
             .field("encryption_key", &redact_option(&self.encryption_key))
             .field("max_facts", &self.max_facts)
             .field("daily_token_budget", &self.daily_token_budget)
@@ -695,16 +719,10 @@ pub enum IterationLimitConfig {
     Unlimited,
     /// Soft limit with warnings but no forced termination.
     /// Agent will be warned at `warn_at` iterations and continue until natural completion.
-    Soft {
-        threshold: usize,
-        warn_at: usize,
-    },
+    Soft { threshold: usize, warn_at: usize },
     /// Legacy hard limit behavior (backward compatibility).
     /// Agent will be forced to stop at `cap` iterations.
-    Hard {
-        initial: usize,
-        cap: usize,
-    },
+    Hard { initial: usize, cap: usize },
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1048,6 +1066,190 @@ fn default_retention_hours() -> u64 {
     24
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct OAuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub callback_url: Option<String>,
+    #[serde(default)]
+    pub providers: HashMap<String, OAuthProviderConfig>,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            callback_url: None,
+            providers: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OAuthProviderConfig {
+    pub auth_type: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PeopleConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_people_auto_extract")]
+    pub auto_extract: bool,
+    #[serde(default = "default_people_auto_extract_categories")]
+    pub auto_extract_categories: Vec<String>,
+    #[serde(default = "default_people_restricted_categories")]
+    pub restricted_categories: Vec<String>,
+    #[serde(default = "default_people_fact_retention_days")]
+    pub fact_retention_days: u32,
+    #[serde(default = "default_people_reconnect_reminder_days")]
+    pub reconnect_reminder_days: u32,
+}
+
+impl Default for PeopleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_extract: default_people_auto_extract(),
+            auto_extract_categories: default_people_auto_extract_categories(),
+            restricted_categories: default_people_restricted_categories(),
+            fact_retention_days: default_people_fact_retention_days(),
+            reconnect_reminder_days: default_people_reconnect_reminder_days(),
+        }
+    }
+}
+
+fn default_people_auto_extract() -> bool {
+    true
+}
+fn default_people_auto_extract_categories() -> Vec<String> {
+    vec![
+        "birthday".into(),
+        "preference".into(),
+        "interest".into(),
+        "work".into(),
+        "family".into(),
+        "important_date".into(),
+    ]
+}
+fn default_people_restricted_categories() -> Vec<String> {
+    vec![
+        "health".into(),
+        "finance".into(),
+        "political".into(),
+        "religious".into(),
+    ]
+}
+fn default_people_fact_retention_days() -> u32 {
+    180
+}
+fn default_people_reconnect_reminder_days() -> u32 {
+    30
+}
+
+#[derive(Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpAuthType {
+    Oauth1a,
+    Bearer,
+    Header,
+    Basic,
+}
+
+impl fmt::Debug for HttpAuthType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HttpAuthType::Oauth1a => write!(f, "oauth1a"),
+            HttpAuthType::Bearer => write!(f, "bearer"),
+            HttpAuthType::Header => write!(f, "header"),
+            HttpAuthType::Basic => write!(f, "basic"),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct HttpAuthProfile {
+    pub auth_type: HttpAuthType,
+    pub allowed_domains: Vec<String>,
+    // OAuth 1.0a fields
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_secret: Option<String>,
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub access_token_secret: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    // Bearer token
+    #[serde(default)]
+    pub token: Option<String>,
+    // Header auth
+    #[serde(default)]
+    pub header_name: Option<String>,
+    #[serde(default)]
+    pub header_value: Option<String>,
+    // Basic auth
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl fmt::Debug for HttpAuthProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpAuthProfile")
+            .field("auth_type", &self.auth_type)
+            .field("allowed_domains", &self.allowed_domains)
+            .field("api_key", &redact_option(&self.api_key))
+            .field("api_secret", &redact_option(&self.api_secret))
+            .field("access_token", &redact_option(&self.access_token))
+            .field(
+                "access_token_secret",
+                &redact_option(&self.access_token_secret),
+            )
+            .field("user_id", &self.user_id)
+            .field("token", &redact_option(&self.token))
+            .field("header_name", &self.header_name)
+            .field("header_value", &redact_option(&self.header_value))
+            .field("username", &self.username)
+            .field("password", &redact_option(&self.password))
+            .finish()
+    }
+}
+
+impl HttpAuthProfile {
+    /// Collect all credential values for this profile (for stripping from error messages).
+    pub fn credential_values(&self) -> Vec<&str> {
+        let mut vals = Vec::new();
+        for v in [
+            &self.api_key,
+            &self.api_secret,
+            &self.access_token,
+            &self.access_token_secret,
+            &self.token,
+            &self.header_value,
+            &self.password,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !v.is_empty() {
+                vals.push(v.as_str());
+            }
+        }
+        vals
+    }
+}
+
 impl AppConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
@@ -1129,7 +1331,11 @@ impl AppConfig {
         // Telegram bots array
         for (i, bot) in self.telegram_bots.iter_mut().enumerate() {
             if bot.bot_token == "keychain" {
-                let key = if i == 0 { "bot_token".to_string() } else { format!("telegram_bot_token_{}", i) };
+                let key = if i == 0 {
+                    "bot_token".to_string()
+                } else {
+                    format!("telegram_bot_token_{}", i)
+                };
                 bot.bot_token = resolve_from_keychain(&key)?;
             }
         }
@@ -1160,7 +1366,11 @@ impl AppConfig {
             }
             for (i, bot) in self.discord_bots.iter_mut().enumerate() {
                 if bot.bot_token == "keychain" {
-                    let key = if i == 0 { "discord_bot_token".to_string() } else { format!("discord_bot_token_{}", i) };
+                    let key = if i == 0 {
+                        "discord_bot_token".to_string()
+                    } else {
+                        format!("discord_bot_token_{}", i)
+                    };
                     bot.bot_token = resolve_from_keychain(&key)?;
                 }
             }
@@ -1178,12 +1388,41 @@ impl AppConfig {
             }
             for (i, bot) in self.slack_bots.iter_mut().enumerate() {
                 if bot.app_token == "keychain" {
-                    let key = if i == 0 { "slack_app_token".to_string() } else { format!("slack_app_token_{}", i) };
+                    let key = if i == 0 {
+                        "slack_app_token".to_string()
+                    } else {
+                        format!("slack_app_token_{}", i)
+                    };
                     bot.app_token = resolve_from_keychain(&key)?;
                 }
                 if bot.bot_token == "keychain" {
-                    let key = if i == 0 { "slack_bot_token".to_string() } else { format!("slack_bot_token_{}", i) };
+                    let key = if i == 0 {
+                        "slack_bot_token".to_string()
+                    } else {
+                        format!("slack_bot_token_{}", i)
+                    };
                     bot.bot_token = resolve_from_keychain(&key)?;
+                }
+            }
+        }
+
+        // HTTP auth profiles
+        for (name, profile) in self.http_auth.iter_mut() {
+            let fields: &mut [(&str, &mut Option<String>)] = &mut [
+                ("api_key", &mut profile.api_key),
+                ("api_secret", &mut profile.api_secret),
+                ("access_token", &mut profile.access_token),
+                ("access_token_secret", &mut profile.access_token_secret),
+                ("token", &mut profile.token),
+                ("header_value", &mut profile.header_value),
+                ("password", &mut profile.password),
+            ];
+            for (field, value) in fields.iter_mut() {
+                if let Some(ref v) = value {
+                    if v == "keychain" {
+                        let keychain_key = format!("http_auth_{}_{}", name, field);
+                        **value = Some(resolve_from_keychain(&keychain_key)?);
+                    }
                 }
             }
         }
@@ -1224,7 +1463,8 @@ mod tests {
     fn expand_env_vars_handles_multiple() {
         std::env::set_var("AIDAEMON_TEST_A", "aaa");
         std::env::set_var("AIDAEMON_TEST_B", "bbb");
-        let result = expand_env_vars("a = \"${AIDAEMON_TEST_A}\"\nb = \"${AIDAEMON_TEST_B}\"").unwrap();
+        let result =
+            expand_env_vars("a = \"${AIDAEMON_TEST_A}\"\nb = \"${AIDAEMON_TEST_B}\"").unwrap();
         assert_eq!(result, "a = \"aaa\"\nb = \"bbb\"");
         std::env::remove_var("AIDAEMON_TEST_A");
         std::env::remove_var("AIDAEMON_TEST_B");
@@ -1251,13 +1491,19 @@ mod tests {
     #[test]
     fn iteration_limit_default_is_unlimited() {
         let config = SubagentsConfig::default();
-        assert!(matches!(config.iteration_limit, IterationLimitConfig::Unlimited));
+        assert!(matches!(
+            config.iteration_limit,
+            IterationLimitConfig::Unlimited
+        ));
     }
 
     #[test]
     fn iteration_limit_effective_returns_unlimited_when_defaults_unchanged() {
         let config = SubagentsConfig::default();
-        assert!(matches!(config.effective_iteration_limit(), IterationLimitConfig::Unlimited));
+        assert!(matches!(
+            config.effective_iteration_limit(),
+            IterationLimitConfig::Unlimited
+        ));
     }
 
     #[test]

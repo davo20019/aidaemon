@@ -25,11 +25,7 @@ pub struct McpTool {
 
 impl McpTool {
     #[allow(dead_code)] // Used by discover_mcp_tools for static configs
-    pub fn new(
-        tool_name: String,
-        tool_schema: Value,
-        client: Arc<McpClient>,
-    ) -> Self {
+    pub fn new(tool_name: String, tool_schema: Value, client: Arc<McpClient>) -> Self {
         let server_tool_name = tool_name.clone();
         Self {
             tool_name,
@@ -70,12 +66,17 @@ impl Tool for McpTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Object(Default::default()));
+        let args: Value =
+            serde_json::from_str(arguments).unwrap_or(Value::Object(Default::default()));
 
         // Audit log: truncate args for logging to avoid flooding logs with large payloads
         let args_preview: String = {
             let s = args.to_string();
-            if s.len() > 200 { format!("{}...", &s[..200]) } else { s }
+            if s.len() > 200 {
+                format!("{}...", &s[..200])
+            } else {
+                s
+            }
         };
 
         // Threat detection: flag suspicious patterns in tool arguments
@@ -217,7 +218,11 @@ fn detect_suspicious_args(tool_name: &str, args: &str) {
 /// Check MCP tool output for suspicious patterns and log warnings.
 fn detect_suspicious_output(tool_name: &str, output: &str) {
     // Only check first 4096 bytes to avoid scanning huge outputs
-    let check = if output.len() > 4096 { &output[..4096] } else { output };
+    let check = if output.len() > 4096 {
+        &output[..4096]
+    } else {
+        output
+    };
     let lower = check.to_lowercase();
     for (pattern, description) in SUSPICIOUS_OUTPUT_PATTERNS {
         if lower.contains(&pattern.to_lowercase()) {

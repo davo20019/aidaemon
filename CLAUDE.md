@@ -96,7 +96,13 @@ Failing to check dynamic bots will cause features to silently not register even 
 - **`plans/`** — persistent multi-step task plans with detection, generation, tracking, and crash recovery.
 - **`tools/terminal.rs`** — shell execution with risk assessment (`command_risk.rs`) and inline approval flow (Allow Once / Allow Always / Deny).
 - **`providers/`** — `openai_compatible.rs`, `google_genai.rs`, `anthropic_native.rs` — pluggable LLM backends.
-- **`skills.rs`** — trigger-based markdown files loaded from a directory; keywords in user messages activate matching skills which inject into the system prompt.
+- **`skills/mod.rs`** — advanced skill system with trigger-based matching, bundled resources, and dynamic management. Skills can come from filesystem (`.md` files), URLs, inline content, remote registries, or auto-promotion from successful procedures. `SharedSkillRegistry` (`Arc<RwLock<Vec<Skill>>>`) allows runtime add/remove. Each skill has metadata (name, description, triggers, source, source_url, enabled flag) and can bundle resource files (scripts, references, configs) in a directory structure. Matching is whole-word + case-insensitive with optional LLM confirmation via fast model.
+- **`skills/resources.rs`** — `ResourceEntry` and `ResourceResolver` trait (`FileSystemResolver` impl) for loading bundled skill files on demand with path traversal protection and 32KB size cap.
+- **`tools/use_skill.rs`** — `UseSkillTool` lets the agent activate skills on demand by name.
+- **`tools/manage_skills.rs`** — `ManageSkillsTool` with 10 actions: add (from URL), add_inline, list, remove, enable, disable, browse (search registries), install (from registry), update (re-fetch from source). Includes SSRF protection.
+- **`tools/skill_resources.rs`** — `SkillResourcesTool` with list/read actions for loading bundled resource files from skills.
+- **`tools/skill_registry.rs`** — registry client for browsing/searching/installing skills from remote JSON manifests configured in `[skills.registries]`.
+- **`memory/skill_promotion.rs`** — `SkillPromoter` background task (12h cycle) that auto-converts successful procedures (≥5 uses, ≥80% success rate) into skills via LLM generation.
 - **`config.rs`** — loads `config.toml` with secret resolution: `"keychain"` → OS credential store, `"${ENV_VAR}"` → env var, or plain value.
 
 ### Concurrency Model

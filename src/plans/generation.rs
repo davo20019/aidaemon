@@ -88,7 +88,11 @@ fn parse_json_array(text: &str) -> anyhow::Result<Vec<String>> {
             anyhow::bail!("Step {} is empty", i + 1);
         }
         if step.len() > 500 {
-            anyhow::bail!("Step {} is too long ({} chars). Keep steps concise.", i + 1, step.len());
+            anyhow::bail!(
+                "Step {} is too long ({} chars). Keep steps concise.",
+                i + 1,
+                step.len()
+            );
         }
     }
 
@@ -217,10 +221,7 @@ These steps should cover everything."#;
             "Deploy the app to production."
         );
 
-        assert_eq!(
-            extract_plan_description("Deploy to prod"),
-            "Deploy to prod"
-        );
+        assert_eq!(extract_plan_description("Deploy to prod"), "Deploy to prod");
 
         // Long message truncation
         let long = "a".repeat(150);

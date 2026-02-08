@@ -16,11 +16,11 @@ use crate::memory::embeddings::EmbeddingService;
 use crate::plans::{PlanStore, StepTracker};
 use crate::skills::SharedSkillRegistry;
 use crate::state::SqliteStateStore;
-use crate::tools::SystemInfoTool;
-use crate::tools::memory::RememberFactTool;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
+use crate::tools::memory::RememberFactTool;
+use crate::tools::SystemInfoTool;
 use crate::traits::{
-    Channel, ChannelCapabilities, ModelProvider, ProviderResponse, Tool, ToolCall, TokenUsage,
+    Channel, ChannelCapabilities, ModelProvider, ProviderResponse, TokenUsage, Tool, ToolCall,
 };
 use crate::types::{ApprovalResponse, MediaMessage};
 
@@ -239,9 +239,7 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
     let embedding_service = Arc::new(EmbeddingService::new()?);
 
     // State store
-    let state = Arc::new(
-        SqliteStateStore::new(&db_path, 100, None, embedding_service).await?,
-    );
+    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
 
     // Event store & plan store share the same SQLite pool
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
@@ -255,7 +253,9 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
     // Tools — SystemInfoTool + RememberFactTool (no side effects, no approval)
     let tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(SystemInfoTool),
-        Arc::new(RememberFactTool::new(state.clone() as Arc<dyn crate::traits::StateStore>)),
+        Arc::new(RememberFactTool::new(
+            state.clone() as Arc<dyn crate::traits::StateStore>
+        )),
     ];
 
     // Empty skill registry
@@ -275,23 +275,23 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         plan_store,
         step_tracker,
         tools,
-        "mock-model".to_string(),                    // model
+        "mock-model".to_string(),                        // model
         "You are a helpful test assistant.".to_string(), // system_prompt
-        PathBuf::from("config.toml"),                 // config_path
+        PathBuf::from("config.toml"),                    // config_path
         skills,
-        3,     // max_depth
-        50,    // max_iterations
-        100,   // max_iterations_cap
-        8000,  // max_response_chars
-        30,    // timeout_secs
+        3,    // max_depth
+        50,   // max_iterations
+        100,  // max_iterations_cap
+        8000, // max_response_chars
+        30,   // timeout_secs
         models_config,
-        20,    // max_facts
-        None,  // daily_token_budget
+        20,   // max_facts
+        None, // daily_token_budget
         IterationLimitConfig::Unlimited,
-        None,  // task_timeout_secs
-        None,  // task_token_budget
-        None,  // llm_call_timeout_secs
-        None,  // mcp_registry
+        None, // task_timeout_secs
+        None, // task_token_budget
+        None, // llm_call_timeout_secs
+        None, // mcp_registry
     );
 
     // Channel (not wired to hub — tests call agent.handle_message directly)

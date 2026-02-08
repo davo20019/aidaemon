@@ -2,14 +2,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock;
 
 use crate::traits::{
-    BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, Message, Procedure,
-    StateStore, TokenUsage, TokenUsageRecord, UserProfile,
+    BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, Message, Procedure, StateStore,
+    TokenUsage, TokenUsageRecord, UserProfile,
 };
 use crate::types::{ChannelVisibility, FactPrivacy};
 
@@ -44,7 +44,12 @@ pub struct SqliteStateStore {
 }
 
 impl SqliteStateStore {
-    pub async fn new(db_path: &str, cap: usize, encryption_key: Option<&str>, embedding_service: Arc<EmbeddingService>) -> anyhow::Result<Self> {
+    pub async fn new(
+        db_path: &str,
+        cap: usize,
+        encryption_key: Option<&str>,
+        embedding_service: Arc<EmbeddingService>,
+    ) -> anyhow::Result<Self> {
         let opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
@@ -63,18 +68,27 @@ impl SqliteStateStore {
         if let Some(key) = encryption_key {
             if !key.is_empty() {
                 // Validate key contains only safe characters (prevent SQL injection via PRAGMA)
-                if !key.chars().all(|c| c.is_ascii_alphanumeric() || "!@#$%^&*_+-=.".contains(c)) {
+                if !key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "!@#$%^&*_+-=.".contains(c))
+                {
                     anyhow::bail!(
                         "Encryption key contains invalid characters. Only alphanumeric and !@#$%^&*_+-=. are allowed."
                     );
                 }
                 // PRAGMA key must be the first statement on a new connection.
                 // Use hex-encoded format for robustness against injection.
-                let hex_key: String = key.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+                let hex_key: String = key
+                    .as_bytes()
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
                 sqlx::query(&format!("PRAGMA key = \"x'{}'\"", hex_key))
                     .execute(&pool)
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to set SQLCipher encryption key: {}", e))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to set SQLCipher encryption key: {}", e)
+                    })?;
                 tracing::info!("SQLCipher encryption enabled for database");
             }
         }
@@ -100,7 +114,7 @@ impl SqliteStateStore {
                 tool_name TEXT,
                 tool_calls_json TEXT,
                 created_at TEXT NOT NULL
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -115,14 +129,16 @@ impl SqliteStateStore {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(category, key)
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
 
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)")
-            .execute(&pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)",
+        )
+        .execute(&pool)
+        .await?;
 
         // --- Migrations for Advanced Memory ---
         // 1. Add importance column
@@ -136,16 +152,26 @@ impl SqliteStateStore {
             .await; // Ignore error if exists
 
         // Add embedding_error column if it doesn't exist
-        let _ = sqlx::query("ALTER TABLE messages ADD COLUMN embedding_error TEXT").execute(&pool).await;
+        let _ = sqlx::query("ALTER TABLE messages ADD COLUMN embedding_error TEXT")
+            .execute(&pool)
+            .await;
 
         // 4. Add consolidated_at column for memory consolidation (Layer 6)
-        let _ = sqlx::query("ALTER TABLE messages ADD COLUMN consolidated_at TEXT").execute(&pool).await;
+        let _ = sqlx::query("ALTER TABLE messages ADD COLUMN consolidated_at TEXT")
+            .execute(&pool)
+            .await;
 
         // --- Human-Like Memory System Migrations ---
         // 5. Add new columns to facts table for supersession and recall tracking
-        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN superseded_at TEXT").execute(&pool).await;
-        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN recall_count INTEGER DEFAULT 0").execute(&pool).await;
-        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN last_recalled_at TEXT").execute(&pool).await;
+        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN superseded_at TEXT")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN recall_count INTEGER DEFAULT 0")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN last_recalled_at TEXT")
+            .execute(&pool)
+            .await;
 
         // 6. Create episodes table (episodic memory)
         sqlx::query(
@@ -164,7 +190,7 @@ impl SqliteStateStore {
                 start_time TEXT NOT NULL,
                 end_time TEXT NOT NULL,
                 created_at TEXT NOT NULL
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -186,7 +212,7 @@ impl SqliteStateStore {
                 updated_at TEXT NOT NULL,
                 completed_at TEXT,
                 FOREIGN KEY (source_episode_id) REFERENCES episodes(id)
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -210,7 +236,7 @@ impl SqliteStateStore {
                 prefers_explanations INTEGER DEFAULT 1,
                 likes_suggestions INTEGER DEFAULT 0,
                 updated_at TEXT NOT NULL
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -227,7 +253,7 @@ impl SqliteStateStore {
                 occurrence_count INTEGER DEFAULT 1,
                 last_seen_at TEXT,
                 created_at TEXT NOT NULL
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -246,7 +272,7 @@ impl SqliteStateStore {
                 last_used_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -265,7 +291,7 @@ impl SqliteStateStore {
                 last_task_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -283,7 +309,7 @@ impl SqliteStateStore {
                 failure_count INTEGER DEFAULT 0,
                 last_used_at TEXT,
                 created_at TEXT NOT NULL
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -293,7 +319,7 @@ impl SqliteStateStore {
             "CREATE TABLE IF NOT EXISTS terminal_allowed_prefixes (
                 prefix TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -309,7 +335,7 @@ impl SqliteStateStore {
                 last_approved_at TEXT,
                 last_denied_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -330,21 +356,21 @@ impl SqliteStateStore {
                 next_run_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_next_run
-                ON scheduled_tasks(next_run_at) WHERE is_paused = 0"
+                ON scheduled_tasks(next_run_at) WHERE is_paused = 0",
         )
         .execute(&pool)
         .await?;
 
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_tasks_name_source
-                ON scheduled_tasks(name) WHERE source = 'config'"
+                ON scheduled_tasks(name) WHERE source = 'config'",
         )
         .execute(&pool)
         .await?;
@@ -361,7 +387,7 @@ impl SqliteStateStore {
                 used_count INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -375,7 +401,7 @@ impl SqliteStateStore {
                 input_tokens INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -390,7 +416,7 @@ impl SqliteStateStore {
                 total_output_tokens INTEGER NOT NULL,
                 request_count INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(date, model)
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -405,7 +431,7 @@ impl SqliteStateStore {
                 allowed_user_ids TEXT NOT NULL DEFAULT '[]',
                 extra_config TEXT DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
@@ -423,16 +449,18 @@ impl SqliteStateStore {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 version TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )"
+            )",
         )
         .execute(&pool)
         .await?;
 
         // Migration: add resources_json column if missing
-        sqlx::query("ALTER TABLE dynamic_skills ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]'")
-            .execute(&pool)
-            .await
-            .ok();
+        sqlx::query(
+            "ALTER TABLE dynamic_skills ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]'",
+        )
+        .execute(&pool)
+        .await
+        .ok();
 
         // Dynamic MCP servers table - stores MCP servers added via manage_mcp tool
         sqlx::query(
@@ -445,23 +473,113 @@ impl SqliteStateStore {
                 triggers_json TEXT NOT NULL DEFAULT '[]',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )"
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        // People tables - for tracking the owner's social circle
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS people (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                relationship TEXT,
+                platform_ids_json TEXT NOT NULL DEFAULT '{}',
+                notes TEXT,
+                communication_style TEXT,
+                language_preference TEXT,
+                last_interaction_at TEXT,
+                interaction_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS person_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+                category TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'agent',
+                confidence REAL NOT NULL DEFAULT 1.0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(person_id, category, key)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_people_name ON people(name)")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_person_facts_person ON person_facts(person_id)",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_person_facts_category ON person_facts(category)",
+        )
+        .execute(&pool)
+        .await?;
+
+        // --- OAuth connections table ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS oauth_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service TEXT NOT NULL UNIQUE,
+                auth_type TEXT NOT NULL,
+                username TEXT,
+                scopes TEXT NOT NULL DEFAULT '[]',
+                token_expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        // --- Settings table (generic key-value runtime toggles) ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
         )
         .execute(&pool)
         .await?;
 
         // --- Channel-Scoped Memory Migrations ---
         // Add channel_id and privacy columns to facts table
-        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN channel_id TEXT").execute(&pool).await;
-        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN privacy TEXT DEFAULT 'global'").execute(&pool).await;
-        let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_facts_channel ON facts(channel_id)").execute(&pool).await;
-        let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_facts_privacy ON facts(privacy)").execute(&pool).await;
+        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN channel_id TEXT")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN privacy TEXT DEFAULT 'global'")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_facts_channel ON facts(channel_id)")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_facts_privacy ON facts(privacy)")
+            .execute(&pool)
+            .await;
         // Add channel_id column to episodes table
-        let _ = sqlx::query("ALTER TABLE episodes ADD COLUMN channel_id TEXT").execute(&pool).await;
+        let _ = sqlx::query("ALTER TABLE episodes ADD COLUMN channel_id TEXT")
+            .execute(&pool)
+            .await;
 
         // --- Binary Embedding Storage Migration ---
         // Add embedding column to facts table for pre-computed embeddings
-        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN embedding BLOB").execute(&pool).await;
+        let _ = sqlx::query("ALTER TABLE facts ADD COLUMN embedding BLOB")
+            .execute(&pool)
+            .await;
 
         Ok(Self {
             pool,
@@ -516,7 +634,10 @@ impl SqliteStateStore {
     /// Insert a new episode and return its ID.
     #[allow(dead_code)]
     pub async fn insert_episode(&self, episode: &Episode) -> anyhow::Result<i64> {
-        let topics_json = episode.topics.as_ref().map(|t| serde_json::to_string(t).unwrap_or_default());
+        let topics_json = episode
+            .topics
+            .as_ref()
+            .map(|t| serde_json::to_string(t).unwrap_or_default());
         let result = sqlx::query(
             "INSERT INTO episodes (session_id, summary, topics, emotional_tone, outcome, embedding, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -540,7 +661,11 @@ impl SqliteStateStore {
     }
 
     /// Get episodes relevant to a query using embedding similarity.
-    pub async fn get_relevant_episodes(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Episode>> {
+    pub async fn get_relevant_episodes(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Episode>> {
         // First get all episodes with embeddings
         let rows = sqlx::query(
             "SELECT id, session_id, summary, topics, emotional_tone, outcome, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at, embedding
@@ -591,7 +716,10 @@ impl SqliteStateStore {
             tracing::debug!(
                 count = scored.len(),
                 top_score = scored.first().map(|(_, s)| *s).unwrap_or(0.0),
-                top_summary = scored.first().map(|(e, _)| truncate_str(&e.summary, 50)).unwrap_or_default(),
+                top_summary = scored
+                    .first()
+                    .map(|(e, _)| truncate_str(&e.summary, 50))
+                    .unwrap_or_default(),
                 "Retrieved relevant episodes"
             );
         }
@@ -631,7 +759,11 @@ impl SqliteStateStore {
 
     /// Update episode embedding.
     #[allow(dead_code)]
-    pub async fn update_episode_embedding(&self, episode_id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+    pub async fn update_episode_embedding(
+        &self,
+        episode_id: i64,
+        embedding: &[f32],
+    ) -> anyhow::Result<()> {
         let blob = encode_embedding(embedding);
         sqlx::query("UPDATE episodes SET embedding = ? WHERE id = ?")
             .bind(blob)
@@ -644,11 +776,10 @@ impl SqliteStateStore {
     /// Backfill missing episode embeddings.
     /// Called on startup to ensure all episodes have embeddings for semantic search.
     pub async fn backfill_episode_embeddings(&self) -> anyhow::Result<usize> {
-        let rows: Vec<sqlx::sqlite::SqliteRow> = sqlx::query(
-            "SELECT id, summary FROM episodes WHERE embedding IS NULL"
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<sqlx::sqlite::SqliteRow> =
+            sqlx::query("SELECT id, summary FROM episodes WHERE embedding IS NULL")
+                .fetch_all(&self.pool)
+                .await?;
 
         if rows.is_empty() {
             return Ok(0);
@@ -747,11 +878,21 @@ impl SqliteStateStore {
             source: row.get("source"),
             created_at,
             updated_at,
-            superseded_at: superseded_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
+            superseded_at: superseded_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
             recall_count: row.try_get("recall_count").unwrap_or(0),
-            last_recalled_at: last_recalled_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
+            last_recalled_at: last_recalled_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
             channel_id,
-            privacy: privacy_str.map(|s| FactPrivacy::from_str_lossy(&s)).unwrap_or(FactPrivacy::Global),
+            privacy: privacy_str
+                .map(|s| FactPrivacy::from_str_lossy(&s))
+                .unwrap_or(FactPrivacy::Global),
         }
     }
 
@@ -774,11 +915,21 @@ impl SqliteStateStore {
             outcome: row.get("outcome"),
             importance: row.get("importance"),
             recall_count: row.get("recall_count"),
-            last_recalled_at: last_recalled_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
+            last_recalled_at: last_recalled_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
             message_count: row.get("message_count"),
-            start_time: chrono::DateTime::parse_from_rfc3339(&start_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-            end_time: chrono::DateTime::parse_from_rfc3339(&end_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+            start_time: chrono::DateTime::parse_from_rfc3339(&start_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            end_time: chrono::DateTime::parse_from_rfc3339(&end_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
             channel_id,
         })
     }
@@ -788,7 +939,10 @@ impl SqliteStateStore {
     /// Insert a new goal.
     #[allow(dead_code)]
     pub async fn insert_goal(&self, goal: &Goal) -> anyhow::Result<i64> {
-        let progress_notes_json = goal.progress_notes.as_ref().map(|p| serde_json::to_string(p).unwrap_or_default());
+        let progress_notes_json = goal
+            .progress_notes
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap_or_default());
         let result = sqlx::query(
             "INSERT INTO goals (description, status, priority, progress_notes, source_episode_id, created_at, updated_at, completed_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -825,7 +979,12 @@ impl SqliteStateStore {
     }
 
     /// Update goal status and optionally add a progress note.
-    pub async fn update_goal(&self, goal_id: i64, status: Option<&str>, progress_note: Option<&str>) -> anyhow::Result<()> {
+    pub async fn update_goal(
+        &self,
+        goal_id: i64,
+        status: Option<&str>,
+        progress_note: Option<&str>,
+    ) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
 
         if let Some(note) = progress_note {
@@ -851,7 +1010,11 @@ impl SqliteStateStore {
         }
 
         if let Some(s) = status {
-            let completed_at = if s == "completed" { Some(now.clone()) } else { None };
+            let completed_at = if s == "completed" {
+                Some(now.clone())
+            } else {
+                None
+            };
             sqlx::query("UPDATE goals SET status = ?, updated_at = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?")
                 .bind(s)
                 .bind(&now)
@@ -872,17 +1035,19 @@ impl SqliteStateStore {
             return Ok(None);
         }
 
-        let query_vec = self.embedding_service.embed(description.to_string()).await?;
+        let query_vec = self
+            .embedding_service
+            .embed(description.to_string())
+            .await?;
         let goal_texts: Vec<String> = goals.iter().map(|g| g.description.clone()).collect();
         let goal_embeddings = self.embedding_service.embed_batch(goal_texts).await?;
 
         let mut best_match: Option<(usize, f32)> = None;
         for (i, emb) in goal_embeddings.iter().enumerate() {
             let score = crate::memory::math::cosine_similarity(&query_vec, emb);
-            if score > 0.75
-                && (best_match.is_none() || score > best_match.unwrap().1) {
-                    best_match = Some((i, score));
-                }
+            if score > 0.75 && (best_match.is_none() || score > best_match.unwrap().1) {
+                best_match = Some((i, score));
+            }
         }
 
         Ok(best_match.map(|(i, _)| goals[i].clone()))
@@ -903,9 +1068,17 @@ impl SqliteStateStore {
             priority: row.get("priority"),
             progress_notes,
             source_episode_id: row.get("source_episode_id"),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-            completed_at: completed_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            completed_at: completed_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
         })
     }
 
@@ -937,7 +1110,9 @@ impl SqliteStateStore {
                 asks_before_acting: row.get::<i32, _>("asks_before_acting") == 1,
                 prefers_explanations: row.get::<i32, _>("prefers_explanations") == 1,
                 likes_suggestions: row.get::<i32, _>("likes_suggestions") == 1,
-                updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+                updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
             })
         } else {
             // Create default profile
@@ -967,8 +1142,14 @@ impl SqliteStateStore {
     /// Update user profile fields.
     #[allow(dead_code)]
     pub async fn update_user_profile(&self, profile: &UserProfile) -> anyhow::Result<()> {
-        let active_hours_json = profile.active_hours.as_ref().map(|h| serde_json::to_string(h).unwrap_or_default());
-        let workflows_json = profile.common_workflows.as_ref().map(|w| serde_json::to_string(w).unwrap_or_default());
+        let active_hours_json = profile
+            .active_hours
+            .as_ref()
+            .map(|h| serde_json::to_string(h).unwrap_or_default());
+        let workflows_json = profile
+            .common_workflows
+            .as_ref()
+            .map(|w| serde_json::to_string(w).unwrap_or_default());
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
@@ -1014,7 +1195,10 @@ impl SqliteStateStore {
     }
 
     /// Get behavior patterns above a confidence threshold.
-    pub async fn get_behavior_patterns(&self, min_confidence: f32) -> anyhow::Result<Vec<BehaviorPattern>> {
+    pub async fn get_behavior_patterns(
+        &self,
+        min_confidence: f32,
+    ) -> anyhow::Result<Vec<BehaviorPattern>> {
         let rows = sqlx::query(
             "SELECT id, pattern_type, description, trigger_context, action, confidence, occurrence_count, last_seen_at, created_at
              FROM behavior_patterns WHERE confidence >= ? ORDER BY confidence DESC, occurrence_count DESC"
@@ -1036,8 +1220,14 @@ impl SqliteStateStore {
                 action: row.get("action"),
                 confidence: row.get("confidence"),
                 occurrence_count: row.get("occurrence_count"),
-                last_seen_at: last_seen_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-                created_at: chrono::DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+                last_seen_at: last_seen_str.and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc))
+                }),
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
             });
         }
         Ok(patterns)
@@ -1045,7 +1235,11 @@ impl SqliteStateStore {
 
     /// Update pattern occurrence and confidence.
     #[allow(dead_code)]
-    pub async fn update_behavior_pattern(&self, pattern_id: i64, confidence_delta: f32) -> anyhow::Result<()> {
+    pub async fn update_behavior_pattern(
+        &self,
+        pattern_id: i64,
+        confidence_delta: f32,
+    ) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "UPDATE behavior_patterns SET occurrence_count = occurrence_count + 1, confidence = MIN(1.0, confidence + ?), last_seen_at = ? WHERE id = ?"
@@ -1084,7 +1278,11 @@ impl SqliteStateStore {
     }
 
     /// Get procedures relevant to a query.
-    pub async fn get_relevant_procedures(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Procedure>> {
+    pub async fn get_relevant_procedures(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Procedure>> {
         let rows = sqlx::query(
             "SELECT id, name, trigger_pattern, steps, success_count, failure_count, avg_duration_secs, last_used_at, created_at, updated_at, trigger_embedding
              FROM procedures WHERE success_count > failure_count ORDER BY success_count DESC LIMIT 100"
@@ -1124,7 +1322,11 @@ impl SqliteStateStore {
                 }
             } else {
                 // Fall back to text matching
-                if procedure.trigger_pattern.to_lowercase().contains(&query.to_lowercase()) {
+                if procedure
+                    .trigger_pattern
+                    .to_lowercase()
+                    .contains(&query.to_lowercase())
+                {
                     0.5
                 } else {
                     0.0
@@ -1142,7 +1344,13 @@ impl SqliteStateStore {
 
     /// Update procedure success/failure and optionally update steps.
     #[allow(dead_code)] // Wired to trait but reserved for feedback loop
-    pub async fn update_procedure(&self, procedure_id: i64, success: bool, new_steps: Option<&[String]>, duration_secs: Option<f32>) -> anyhow::Result<()> {
+    pub async fn update_procedure(
+        &self,
+        procedure_id: i64,
+        success: bool,
+        new_steps: Option<&[String]>,
+        duration_secs: Option<f32>,
+    ) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
 
         if success {
@@ -1200,9 +1408,17 @@ impl SqliteStateStore {
             success_count: row.get("success_count"),
             failure_count: row.get("failure_count"),
             avg_duration_secs: row.get("avg_duration_secs"),
-            last_used_at: last_used_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+            last_used_at: last_used_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
         })
     }
 
@@ -1270,7 +1486,7 @@ impl SqliteStateStore {
             "SELECT pattern, approval_count FROM command_patterns
              WHERE approval_count >= 3
              ORDER BY approval_count DESC
-             LIMIT 10"
+             LIMIT 10",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1279,7 +1495,12 @@ impl SqliteStateStore {
     }
 
     /// Increment expertise counters and update level.
-    pub async fn increment_expertise(&self, domain: &str, success: bool, error: Option<&str>) -> anyhow::Result<()> {
+    pub async fn increment_expertise(
+        &self,
+        domain: &str,
+        success: bool,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
         let _ = self.get_or_create_expertise(domain).await?; // Ensure exists
         let now = Utc::now().to_rfc3339();
 
@@ -1306,7 +1527,9 @@ impl SqliteStateStore {
                 .fetch_one(&self.pool)
                 .await?;
             let errors_json: Option<String> = row.get("common_errors");
-            let mut errors: Vec<String> = errors_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
+            let mut errors: Vec<String> = errors_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
             if !errors.contains(&err.to_string()) {
                 errors.push(err.to_string());
                 if errors.len() > 10 {
@@ -1355,9 +1578,17 @@ impl SqliteStateStore {
             current_level: row.get("current_level"),
             confidence_score: row.get("confidence_score"),
             common_errors,
-            last_task_at: last_task_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+            last_task_at: last_task_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
         })
     }
 
@@ -1365,7 +1596,10 @@ impl SqliteStateStore {
 
     /// Insert a new error solution.
     pub async fn insert_error_solution(&self, solution: &ErrorSolution) -> anyhow::Result<i64> {
-        let steps_json = solution.solution_steps.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default());
+        let steps_json = solution
+            .solution_steps
+            .as_ref()
+            .map(|s| serde_json::to_string(s).unwrap_or_default());
         let result = sqlx::query(
             "INSERT INTO error_solutions (error_pattern, error_embedding, domain, solution_summary, solution_steps, success_count, failure_count, last_used_at, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -1385,7 +1619,11 @@ impl SqliteStateStore {
     }
 
     /// Get error solutions relevant to an error message.
-    pub async fn get_relevant_error_solutions(&self, error: &str, limit: usize) -> anyhow::Result<Vec<ErrorSolution>> {
+    pub async fn get_relevant_error_solutions(
+        &self,
+        error: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ErrorSolution>> {
         let rows = sqlx::query(
             "SELECT id, error_pattern, domain, solution_summary, solution_steps, success_count, failure_count, last_used_at, created_at, error_embedding
              FROM error_solutions WHERE success_count > failure_count ORDER BY success_count DESC LIMIT 100"
@@ -1425,7 +1663,11 @@ impl SqliteStateStore {
                 }
             } else {
                 // Fall back to text matching
-                if solution.error_pattern.to_lowercase().contains(&error.to_lowercase()) {
+                if solution
+                    .error_pattern
+                    .to_lowercase()
+                    .contains(&error.to_lowercase())
+                {
                     0.5
                 } else {
                     0.0
@@ -1443,7 +1685,11 @@ impl SqliteStateStore {
 
     /// Update error solution success/failure.
     #[allow(dead_code)] // Wired to trait but reserved for feedback loop
-    pub async fn update_error_solution(&self, solution_id: i64, success: bool) -> anyhow::Result<()> {
+    pub async fn update_error_solution(
+        &self,
+        solution_id: i64,
+        success: bool,
+    ) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
         if success {
             sqlx::query("UPDATE error_solutions SET success_count = success_count + 1, last_used_at = ? WHERE id = ?")
@@ -1461,7 +1707,10 @@ impl SqliteStateStore {
         Ok(())
     }
 
-    fn row_to_error_solution(&self, row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<ErrorSolution> {
+    fn row_to_error_solution(
+        &self,
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> anyhow::Result<ErrorSolution> {
         let steps_json: Option<String> = row.get("solution_steps");
         let solution_steps = steps_json.and_then(|j| serde_json::from_str(&j).ok());
         let created_str: String = row.get("created_at");
@@ -1475,8 +1724,14 @@ impl SqliteStateStore {
             solution_steps,
             success_count: row.get("success_count"),
             failure_count: row.get("failure_count"),
-            last_used_at: last_used_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+            last_used_at: last_used_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
         })
     }
 
@@ -1505,11 +1760,13 @@ impl SqliteStateStore {
     #[allow(dead_code)]
     pub async fn increment_fact_recall(&self, fact_id: i64) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query("UPDATE facts SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?")
-            .bind(&now)
-            .bind(fact_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE facts SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?",
+        )
+        .bind(&now)
+        .bind(fact_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1517,6 +1774,141 @@ impl SqliteStateStore {
     fn row_to_fact_with_history(&self, row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Fact> {
         Ok(Self::row_to_fact(row))
     }
+
+    fn row_to_person(row: &sqlx::sqlite::SqliteRow) -> crate::traits::Person {
+        let aliases_str: String = row
+            .try_get("aliases_json")
+            .unwrap_or_else(|_| "[]".to_string());
+        let platform_ids_str: String = row
+            .try_get("platform_ids_json")
+            .unwrap_or_else(|_| "{}".to_string());
+        let created_str: String = row.get("created_at");
+        let updated_str: String = row.get("updated_at");
+        let last_interaction_str: Option<String> =
+            row.try_get("last_interaction_at").unwrap_or(None);
+
+        crate::traits::Person {
+            id: row.get("id"),
+            name: row.get("name"),
+            aliases: serde_json::from_str(&aliases_str).unwrap_or_default(),
+            relationship: row.try_get("relationship").unwrap_or(None),
+            platform_ids: serde_json::from_str(&platform_ids_str).unwrap_or_default(),
+            notes: row.try_get("notes").unwrap_or(None),
+            communication_style: row.try_get("communication_style").unwrap_or(None),
+            language_preference: row.try_get("language_preference").unwrap_or(None),
+            last_interaction_at: last_interaction_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            interaction_count: row.try_get("interaction_count").unwrap_or(0),
+            created_at: parse_dt(created_str),
+            updated_at: parse_dt(updated_str),
+        }
+    }
+
+    fn row_to_person_fact(row: &sqlx::sqlite::SqliteRow) -> crate::traits::PersonFact {
+        let created_str: String = row.get("created_at");
+        let updated_str: String = row.get("updated_at");
+
+        crate::traits::PersonFact {
+            id: row.get("id"),
+            person_id: row.get("person_id"),
+            category: row.get("category"),
+            key: row.get("key"),
+            value: row.get("value"),
+            source: row.get("source"),
+            confidence: row.get("confidence"),
+            created_at: parse_dt(created_str),
+            updated_at: parse_dt(updated_str),
+        }
+    }
+}
+
+/// Resolve a "keychain:key_name" reference to the actual value from OS keychain.
+/// Falls back to the raw string if keychain lookup fails or it's not a reference.
+fn resolve_keychain_ref(value: &str) -> String {
+    if let Some(key_name) = value.strip_prefix("keychain:") {
+        match keyring::Entry::new(crate::config::KEYCHAIN_SERVICE, key_name) {
+            Ok(entry) => match entry.get_password() {
+                Ok(password) => return password,
+                Err(_) => {
+                    tracing::warn!(
+                        key = key_name,
+                        "Failed to resolve keychain reference for dynamic bot"
+                    );
+                }
+            },
+            Err(_) => {
+                tracing::warn!(
+                    key = key_name,
+                    "Failed to create keychain entry for dynamic bot"
+                );
+            }
+        }
+    }
+    // Fall back to raw value (backward compat with pre-existing plaintext entries)
+    value.to_string()
+}
+
+fn parse_dt(s: String) -> chrono::DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339(&s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+/// Parse a date string and calculate days until it from today (wrapping year).
+fn days_until_date(value: &str, today: chrono::NaiveDate) -> Option<i64> {
+    use chrono::NaiveDate;
+
+    let trimmed = value.trim();
+
+    // Try "YYYY-MM-DD"
+    if let Ok(d) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let this_year = today.with_month(d.month())?.with_day(d.day())?;
+        let diff = (this_year - today).num_days();
+        return Some(if diff < 0 { diff + 365 } else { diff });
+    }
+
+    // Try "MM-DD" or "MM/DD"
+    for fmt in &["%m-%d", "%m/%d"] {
+        if let Ok(d) =
+            NaiveDate::parse_from_str(&format!("2000-{}", trimmed), &format!("2000-{}", fmt))
+        {
+            let this_year = today.with_month(d.month())?.with_day(d.day())?;
+            let diff = (this_year - today).num_days();
+            return Some(if diff < 0 { diff + 365 } else { diff });
+        }
+    }
+
+    // Try "Month DD" (e.g., "March 15")
+    let months = [
+        ("january", 1),
+        ("february", 2),
+        ("march", 3),
+        ("april", 4),
+        ("may", 5),
+        ("june", 6),
+        ("july", 7),
+        ("august", 8),
+        ("september", 9),
+        ("october", 10),
+        ("november", 11),
+        ("december", 12),
+    ];
+    let lower = trimmed.to_lowercase();
+    for (name, num) in &months {
+        if let Some(rest) = lower.strip_prefix(name) {
+            let rest = rest.trim().trim_start_matches([',', ' ']);
+            if let Ok(day) = rest.parse::<u32>() {
+                let this_year = today.with_month(*num)?.with_day(day)?;
+                let diff = (this_year - today).num_days();
+                return Some(if diff < 0 { diff + 365 } else { diff });
+            }
+        }
+    }
+
+    None
 }
 
 #[async_trait]
@@ -1542,7 +1934,9 @@ impl StateStore for SqliteStateStore {
 
         // Update working memory
         let mut wm = self.working_memory.write().await;
-        let deque = wm.entry(msg.session_id.clone()).or_insert_with(VecDeque::new);
+        let deque = wm
+            .entry(msg.session_id.clone())
+            .or_insert_with(VecDeque::new);
         deque.push_back(msg.clone());
 
         // Evict old messages but ALWAYS preserve the first user message (anchor)
@@ -1789,7 +2183,10 @@ impl StateStore for SqliteStateStore {
         let query_vec = match self.embedding_service.embed(query.to_string()).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("Failed to embed query for fact filtering, returning all facts: {}", e);
+                tracing::warn!(
+                    "Failed to embed query for fact filtering, returning all facts: {}",
+                    e
+                );
                 let mut facts = all_facts;
                 facts.truncate(max);
                 return Ok(facts);
@@ -1846,7 +2243,12 @@ impl StateStore for SqliteStateStore {
         Ok(relevant)
     }
 
-    async fn get_context(&self, session_id: &str, query: &str, _limit: usize) -> anyhow::Result<Vec<Message>> {
+    async fn get_context(
+        &self,
+        session_id: &str,
+        query: &str,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
         // 1. Recency (Last 10 conversation messages) - Critical for conversational flow
         // Only get user messages and final assistant responses (not tool calls/results)
         // This prevents intermediate tool messages from pushing out important context
@@ -1864,26 +2266,30 @@ impl StateStore for SqliteStateStore {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut messages: Vec<Message> = recency_rows.into_iter().map(|row| {
-            let created_str: String = row.get("created_at");
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            Message {
-                id: row.get("id"),
-                session_id: row.get("session_id"),
-                role: row.get("role"),
-                content: row.get("content"),
-                tool_call_id: row.get("tool_call_id"),
-                tool_name: row.get("tool_name"),
-                tool_calls_json: row.get("tool_calls_json"),
-                created_at,
-                importance: row.try_get("importance").unwrap_or(0.5),
-                embedding: None,
-            }
-        }).collect();
+        let mut messages: Vec<Message> = recency_rows
+            .into_iter()
+            .map(|row| {
+                let created_str: String = row.get("created_at");
+                let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                Message {
+                    id: row.get("id"),
+                    session_id: row.get("session_id"),
+                    role: row.get("role"),
+                    content: row.get("content"),
+                    tool_call_id: row.get("tool_call_id"),
+                    tool_name: row.get("tool_name"),
+                    tool_calls_json: row.get("tool_calls_json"),
+                    created_at,
+                    importance: row.try_get("importance").unwrap_or(0.5),
+                    embedding: None,
+                }
+            })
+            .collect();
 
-        let mut seen_ids: std::collections::HashSet<String> = messages.iter().map(|m| m.id.clone()).collect();
+        let mut seen_ids: std::collections::HashSet<String> =
+            messages.iter().map(|m| m.id.clone()).collect();
 
         // 2. Salience (Importance >= 0.8) - Critical memory
         // Added session_id filter to prevent bleeding context from other sessions
@@ -1899,17 +2305,19 @@ impl StateStore for SqliteStateStore {
         .bind(limit_salience)
         .fetch_all(&self.pool)
         .await?;
-        
+
         for row in salience {
-             let id: String = row.get("id");
-             if seen_ids.contains(&id) { continue; }
-             
-             let created_str: String = row.get("created_at");
-             let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+            let id: String = row.get("id");
+            if seen_ids.contains(&id) {
+                continue;
+            }
+
+            let created_str: String = row.get("created_at");
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
-             
-             messages.push(Message {
+
+            messages.push(Message {
                 id: id.clone(),
                 session_id: row.get("session_id"),
                 role: row.get("role"),
@@ -1920,45 +2328,48 @@ impl StateStore for SqliteStateStore {
                 created_at,
                 importance: row.try_get("importance").unwrap_or(0.5),
                 embedding: None,
-             });
-             seen_ids.insert(id);
+            });
+            seen_ids.insert(id);
         }
 
         // 3. Relevance (Vector Search)
         // Only run if we have a query
         if !query.trim().is_empty() {
-             if let Ok(query_vec) = self.embedding_service.embed(query.to_string()).await {
-                 // Fetch candidate embeddings (limit to recent 2000 to save compute)
-                 // Added session_id filter
-                 let candidates = sqlx::query(
+            if let Ok(query_vec) = self.embedding_service.embed(query.to_string()).await {
+                // Fetch candidate embeddings (limit to recent 2000 to save compute)
+                // Added session_id filter
+                let candidates = sqlx::query(
                     "SELECT id, embedding FROM messages WHERE session_id = ? AND embedding IS NOT NULL ORDER BY created_at DESC LIMIT 2000"
                  )
                  .bind(session_id)
                  .fetch_all(&self.pool)
                  .await?;
 
-                 let mut scored = Vec::new();
-                 for row in candidates {
+                let mut scored = Vec::new();
+                for row in candidates {
                     let id: String = row.get("id");
-                    if seen_ids.contains(&id) { continue; }
+                    if seen_ids.contains(&id) {
+                        continue;
+                    }
                     let embedding: Option<Vec<u8>> = row.get("embedding");
-                    
+
                     if let Some(blob) = embedding {
                         if let Ok(vec) = decode_embedding(&blob) {
                             let score = crate::memory::math::cosine_similarity(&query_vec, &vec);
-                            if score > 0.65 { // Relevance threshold
+                            if score > 0.65 {
+                                // Relevance threshold
                                 scored.push((id, score));
                             }
                         }
                     }
-                 }
-                 // Sort by score DESC
-                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                 
-                 // Take top 5
-                 for (id, _score) in scored.into_iter().take(5) {
-                     // Fetch full message
-                     let row = sqlx::query(
+                }
+                // Sort by score DESC
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Take top 5
+                for (id, _score) in scored.into_iter().take(5) {
+                    // Fetch full message
+                    let row = sqlx::query(
                         "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
                          FROM messages WHERE id = ?"
                      )
@@ -1966,13 +2377,13 @@ impl StateStore for SqliteStateStore {
                      .fetch_optional(&self.pool)
                      .await?;
 
-                     if let Some(row) = row {
-                         let created_str: String = row.get("created_at");
-                         let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                    if let Some(row) = row {
+                        let created_str: String = row.get("created_at");
+                        let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now());
 
-                         let msg = Message {
+                        let msg = Message {
                             id: row.get("id"),
                             session_id: row.get("session_id"),
                             role: row.get("role"),
@@ -1983,16 +2394,16 @@ impl StateStore for SqliteStateStore {
                             created_at,
                             importance: row.try_get("importance").unwrap_or(0.5),
                             embedding: None,
-                         };
-                         // (Optional) Append score to content for debugging?
-                         // if let Some(c) = &mut msg.content {
-                         //    *c = format!("(Similarity: {:.2}) {}", score, c);
-                         // }
-                         messages.push(msg);
-                         seen_ids.insert(id);
-                     }
-                 }
-             }
+                        };
+                        // (Optional) Append score to content for debugging?
+                        // if let Some(c) = &mut msg.content {
+                        //    *c = format!("(Similarity: {:.2}) {}", score, c);
+                        // }
+                        messages.push(msg);
+                        seen_ids.insert(id);
+                    }
+                }
+            }
         }
 
         // Sort final list by created_at (Chronological)
@@ -2021,7 +2432,7 @@ impl StateStore for SqliteStateStore {
     async fn record_token_usage(&self, session_id: &str, usage: &TokenUsage) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO token_usage (session_id, model, input_tokens, output_tokens, created_at)
-             VALUES (?, ?, ?, ?, datetime('now'))"
+             VALUES (?, ?, ?, ?, datetime('now'))",
         )
         .bind(session_id)
         .bind(&usage.model)
@@ -2035,7 +2446,7 @@ impl StateStore for SqliteStateStore {
     async fn get_token_usage_since(&self, since: &str) -> anyhow::Result<Vec<TokenUsageRecord>> {
         let rows = sqlx::query(
             "SELECT model, input_tokens, output_tokens, created_at
-             FROM token_usage WHERE created_at >= ? ORDER BY created_at DESC"
+             FROM token_usage WHERE created_at >= ? ORDER BY created_at DESC",
         )
         .bind(since)
         .fetch_all(&self.pool)
@@ -2055,7 +2466,11 @@ impl StateStore for SqliteStateStore {
 
     // ==================== Extended Memory Trait Methods ====================
 
-    async fn get_relevant_episodes(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Episode>> {
+    async fn get_relevant_episodes(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Episode>> {
         // Delegate to inherent method
         SqliteStateStore::get_relevant_episodes(self, query, limit).await
     }
@@ -2064,19 +2479,35 @@ impl StateStore for SqliteStateStore {
         SqliteStateStore::get_active_goals(self).await
     }
 
-    async fn update_goal(&self, goal_id: i64, status: Option<&str>, progress_note: Option<&str>) -> anyhow::Result<()> {
+    async fn update_goal(
+        &self,
+        goal_id: i64,
+        status: Option<&str>,
+        progress_note: Option<&str>,
+    ) -> anyhow::Result<()> {
         SqliteStateStore::update_goal(self, goal_id, status, progress_note).await
     }
 
-    async fn get_behavior_patterns(&self, min_confidence: f32) -> anyhow::Result<Vec<BehaviorPattern>> {
+    async fn get_behavior_patterns(
+        &self,
+        min_confidence: f32,
+    ) -> anyhow::Result<Vec<BehaviorPattern>> {
         SqliteStateStore::get_behavior_patterns(self, min_confidence).await
     }
 
-    async fn get_relevant_procedures(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Procedure>> {
+    async fn get_relevant_procedures(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Procedure>> {
         SqliteStateStore::get_relevant_procedures(self, query, limit).await
     }
 
-    async fn get_relevant_error_solutions(&self, error: &str, limit: usize) -> anyhow::Result<Vec<ErrorSolution>> {
+    async fn get_relevant_error_solutions(
+        &self,
+        error: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ErrorSolution>> {
         SqliteStateStore::get_relevant_error_solutions(self, error, limit).await
     }
 
@@ -2321,9 +2752,9 @@ impl StateStore for SqliteStateStore {
             // Filter by channel: include episodes from same channel or legacy (no channel_id)
             let ep_channel_id: Option<String> = row.try_get("channel_id").unwrap_or(None);
             let include = match (&ep_channel_id, channel_id) {
-                (None, _) => true,                                 // Legacy episodes: include
+                (None, _) => true,                                      // Legacy episodes: include
                 (Some(ep_ch), Some(current_ch)) => ep_ch == current_ch, // Same channel
-                (Some(_), None) => false,                          // Has channel but no current: skip
+                (Some(_), None) => false, // Has channel but no current: skip
             };
             if !include {
                 continue;
@@ -2354,7 +2785,12 @@ impl StateStore for SqliteStateStore {
 
     // ==================== Write Methods for Learning System ====================
 
-    async fn increment_expertise(&self, domain: &str, success: bool, error: Option<&str>) -> anyhow::Result<()> {
+    async fn increment_expertise(
+        &self,
+        domain: &str,
+        success: bool,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
         SqliteStateStore::increment_expertise(self, domain, success, error).await
     }
 
@@ -2362,7 +2798,12 @@ impl StateStore for SqliteStateStore {
         SqliteStateStore::insert_procedure(self, procedure).await
     }
 
-    async fn update_procedure_outcome(&self, procedure_id: i64, success: bool, duration: Option<f32>) -> anyhow::Result<()> {
+    async fn update_procedure_outcome(
+        &self,
+        procedure_id: i64,
+        success: bool,
+        duration: Option<f32>,
+    ) -> anyhow::Result<()> {
         SqliteStateStore::update_procedure(self, procedure_id, success, None, duration).await
     }
 
@@ -2370,7 +2811,11 @@ impl StateStore for SqliteStateStore {
         SqliteStateStore::insert_error_solution(self, solution).await
     }
 
-    async fn update_error_solution_outcome(&self, solution_id: i64, success: bool) -> anyhow::Result<()> {
+    async fn update_error_solution_outcome(
+        &self,
+        solution_id: i64,
+        success: bool,
+    ) -> anyhow::Result<()> {
         SqliteStateStore::update_error_solution(self, solution_id, success).await
     }
 
@@ -2378,18 +2823,47 @@ impl StateStore for SqliteStateStore {
 
     async fn add_dynamic_bot(&self, bot: &crate::traits::DynamicBot) -> anyhow::Result<i64> {
         let allowed_user_ids_json = serde_json::to_string(&bot.allowed_user_ids)?;
+
+        // Store tokens in OS keychain to avoid plaintext storage in SQLite.
+        // We insert first to get the row ID, then store in keychain and update
+        // the row to hold a "keychain:key" reference instead of the raw token.
         let result = sqlx::query(
             "INSERT INTO dynamic_bots (channel_type, bot_token, app_token, allowed_user_ids, extra_config, created_at)
              VALUES (?, ?, ?, ?, ?, datetime('now'))"
         )
         .bind(&bot.channel_type)
-        .bind(&bot.bot_token)
+        .bind(&bot.bot_token) // Temporarily store plaintext; will be replaced below
         .bind(&bot.app_token)
         .bind(&allowed_user_ids_json)
         .bind(&bot.extra_config)
         .execute(&self.pool)
         .await?;
-        Ok(result.last_insert_rowid())
+        let row_id = result.last_insert_rowid();
+
+        // Try to move the bot_token to keychain
+        let bot_token_key = format!("dynamic_bot_{}_bot_token", row_id);
+        if crate::config::store_in_keychain(&bot_token_key, &bot.bot_token).is_ok() {
+            // Replace plaintext with keychain reference
+            let _ = sqlx::query("UPDATE dynamic_bots SET bot_token = ? WHERE id = ?")
+                .bind(format!("keychain:{}", bot_token_key))
+                .bind(row_id)
+                .execute(&self.pool)
+                .await;
+        }
+
+        // Try to move the app_token to keychain (Slack bots)
+        if let Some(ref app_tok) = bot.app_token {
+            let app_token_key = format!("dynamic_bot_{}_app_token", row_id);
+            if crate::config::store_in_keychain(&app_token_key, app_tok).is_ok() {
+                let _ = sqlx::query("UPDATE dynamic_bots SET app_token = ? WHERE id = ?")
+                    .bind(format!("keychain:{}", app_token_key))
+                    .bind(row_id)
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+
+        Ok(row_id)
     }
 
     async fn get_dynamic_bots(&self) -> anyhow::Result<Vec<crate::traits::DynamicBot>> {
@@ -2403,13 +2877,21 @@ impl StateStore for SqliteStateStore {
         let mut bots = Vec::with_capacity(rows.len());
         for row in rows {
             let allowed_user_ids_json: String = row.get("allowed_user_ids");
-            let allowed_user_ids: Vec<String> = serde_json::from_str(&allowed_user_ids_json).unwrap_or_default();
+            let allowed_user_ids: Vec<String> =
+                serde_json::from_str(&allowed_user_ids_json).unwrap_or_default();
+
+            // Resolve keychain references: "keychain:key_name" -> actual value
+            let raw_bot_token: String = row.get("bot_token");
+            let bot_token = resolve_keychain_ref(&raw_bot_token);
+
+            let raw_app_token: Option<String> = row.get("app_token");
+            let app_token = raw_app_token.map(|t| resolve_keychain_ref(&t));
 
             bots.push(crate::traits::DynamicBot {
                 id: row.get("id"),
                 channel_type: row.get("channel_type"),
-                bot_token: row.get("bot_token"),
-                app_token: row.get("app_token"),
+                bot_token,
+                app_token,
                 allowed_user_ids,
                 extra_config: row.get("extra_config"),
                 created_at: row.get("created_at"),
@@ -2419,6 +2901,10 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn delete_dynamic_bot(&self, id: i64) -> anyhow::Result<()> {
+        // Clean up keychain entries for this bot
+        let _ = crate::config::delete_from_keychain(&format!("dynamic_bot_{}_bot_token", id));
+        let _ = crate::config::delete_from_keychain(&format!("dynamic_bot_{}_app_token", id));
+
         sqlx::query("DELETE FROM dynamic_bots WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
@@ -2468,7 +2954,9 @@ impl StateStore for SqliteStateStore {
                 enabled: row.get::<bool, _>("enabled"),
                 version: row.get::<Option<String>, _>("version"),
                 created_at: row.get::<String, _>("created_at"),
-                resources_json: row.try_get::<String, _>("resources_json").unwrap_or_else(|_| "[]".to_string()),
+                resources_json: row
+                    .try_get::<String, _>("resources_json")
+                    .unwrap_or_else(|_| "[]".to_string()),
             });
         }
         Ok(skills)
@@ -2491,14 +2979,18 @@ impl StateStore for SqliteStateStore {
         Ok(())
     }
 
-    async fn get_promotable_procedures(&self, min_success: i32, min_rate: f32) -> anyhow::Result<Vec<crate::traits::Procedure>> {
+    async fn get_promotable_procedures(
+        &self,
+        min_success: i32,
+        min_rate: f32,
+    ) -> anyhow::Result<Vec<crate::traits::Procedure>> {
         let rows = sqlx::query(
             "SELECT id, name, trigger_pattern, steps, success_count, failure_count,
                     avg_duration_secs, last_used_at, created_at, updated_at
              FROM procedures
              WHERE success_count >= ?
                AND CAST(success_count AS REAL) / CAST(success_count + failure_count AS REAL) >= ?
-             ORDER BY success_count DESC"
+             ORDER BY success_count DESC",
         )
         .bind(min_success)
         .bind(min_rate)
@@ -2517,24 +3009,36 @@ impl StateStore for SqliteStateStore {
                 success_count: row.get::<i32, _>("success_count"),
                 failure_count: row.get::<i32, _>("failure_count"),
                 avg_duration_secs: row.get::<Option<f32>, _>("avg_duration_secs"),
-                last_used_at: row.get::<Option<String>, _>("last_used_at")
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().or_else(|| {
-                        chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok()
-                            .map(|n| n.and_utc().into())
-                    }))
+                last_used_at: row
+                    .get::<Option<String>, _>("last_used_at")
+                    .and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(&s).ok().or_else(|| {
+                            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                                .ok()
+                                .map(|n| n.and_utc().into())
+                        })
+                    })
                     .map(|d| d.with_timezone(&chrono::Utc)),
-                created_at: row.get::<Option<String>, _>("created_at")
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().or_else(|| {
-                        chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok()
-                            .map(|n| n.and_utc().into())
-                    }))
+                created_at: row
+                    .get::<Option<String>, _>("created_at")
+                    .and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(&s).ok().or_else(|| {
+                            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                                .ok()
+                                .map(|n| n.and_utc().into())
+                        })
+                    })
                     .map(|d| d.with_timezone(&chrono::Utc))
                     .unwrap_or_else(chrono::Utc::now),
-                updated_at: row.get::<Option<String>, _>("updated_at")
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().or_else(|| {
-                        chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok()
-                            .map(|n| n.and_utc().into())
-                    }))
+                updated_at: row
+                    .get::<Option<String>, _>("updated_at")
+                    .and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(&s).ok().or_else(|| {
+                            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                                .ok()
+                                .map(|n| n.and_utc().into())
+                        })
+                    })
                     .map(|d| d.with_timezone(&chrono::Utc))
                     .unwrap_or_else(chrono::Utc::now),
             });
@@ -2544,7 +3048,10 @@ impl StateStore for SqliteStateStore {
 
     // ==================== Dynamic MCP Servers ====================
 
-    async fn save_dynamic_mcp_server(&self, server: &crate::traits::DynamicMcpServer) -> anyhow::Result<i64> {
+    async fn save_dynamic_mcp_server(
+        &self,
+        server: &crate::traits::DynamicMcpServer,
+    ) -> anyhow::Result<i64> {
         let result = sqlx::query(
             "INSERT INTO dynamic_mcp_servers (name, command, args_json, env_keys_json, triggers_json, enabled, created_at)
              VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
@@ -2562,10 +3069,12 @@ impl StateStore for SqliteStateStore {
         Ok(result.last_insert_rowid())
     }
 
-    async fn list_dynamic_mcp_servers(&self) -> anyhow::Result<Vec<crate::traits::DynamicMcpServer>> {
+    async fn list_dynamic_mcp_servers(
+        &self,
+    ) -> anyhow::Result<Vec<crate::traits::DynamicMcpServer>> {
         let rows = sqlx::query(
             "SELECT id, name, command, args_json, env_keys_json, triggers_json, enabled, created_at
-             FROM dynamic_mcp_servers ORDER BY created_at ASC"
+             FROM dynamic_mcp_servers ORDER BY created_at ASC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -2594,7 +3103,10 @@ impl StateStore for SqliteStateStore {
         Ok(())
     }
 
-    async fn update_dynamic_mcp_server(&self, server: &crate::traits::DynamicMcpServer) -> anyhow::Result<()> {
+    async fn update_dynamic_mcp_server(
+        &self,
+        server: &crate::traits::DynamicMcpServer,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE dynamic_mcp_servers SET command = ?, args_json = ?, env_keys_json = ?, triggers_json = ?, enabled = ? WHERE id = ?"
         )
@@ -2604,6 +3116,467 @@ impl StateStore for SqliteStateStore {
         .bind(&server.triggers_json)
         .bind(server.enabled)
         .bind(server.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ==================== Settings ====================
+
+    async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("value")))
+    }
+
+    async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ==================== People ====================
+
+    async fn upsert_person(&self, person: &crate::traits::Person) -> anyhow::Result<i64> {
+        let aliases_json = serde_json::to_string(&person.aliases)?;
+        let platform_ids_json = serde_json::to_string(&person.platform_ids)?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        if person.id > 0 {
+            sqlx::query(
+                "UPDATE people SET name = ?, aliases_json = ?, relationship = ?, platform_ids_json = ?, \
+                 notes = ?, communication_style = ?, language_preference = ?, updated_at = ? WHERE id = ?"
+            )
+            .bind(&person.name)
+            .bind(&aliases_json)
+            .bind(&person.relationship)
+            .bind(&platform_ids_json)
+            .bind(&person.notes)
+            .bind(&person.communication_style)
+            .bind(&person.language_preference)
+            .bind(&now)
+            .bind(person.id)
+            .execute(&self.pool)
+            .await?;
+            Ok(person.id)
+        } else {
+            let result = sqlx::query(
+                "INSERT INTO people (name, aliases_json, relationship, platform_ids_json, notes, \
+                 communication_style, language_preference, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&person.name)
+            .bind(&aliases_json)
+            .bind(&person.relationship)
+            .bind(&platform_ids_json)
+            .bind(&person.notes)
+            .bind(&person.communication_style)
+            .bind(&person.language_preference)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+            Ok(result.last_insert_rowid())
+        }
+    }
+
+    async fn get_person(&self, id: i64) -> anyhow::Result<Option<crate::traits::Person>> {
+        let row = sqlx::query(
+            "SELECT id, name, aliases_json, relationship, platform_ids_json, notes, \
+             communication_style, language_preference, last_interaction_at, interaction_count, \
+             created_at, updated_at FROM people WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| Self::row_to_person(&r)))
+    }
+
+    async fn get_person_by_platform_id(
+        &self,
+        platform_id: &str,
+    ) -> anyhow::Result<Option<crate::traits::Person>> {
+        // Search platform_ids_json for a key matching the platform_id
+        // SQLite json_each lets us iterate JSON object keys
+        let row = sqlx::query(
+            "SELECT p.id, p.name, p.aliases_json, p.relationship, p.platform_ids_json, p.notes, \
+             p.communication_style, p.language_preference, p.last_interaction_at, p.interaction_count, \
+             p.created_at, p.updated_at \
+             FROM people p, json_each(p.platform_ids_json) j \
+             WHERE j.key = ?"
+        )
+        .bind(platform_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| Self::row_to_person(&r)))
+    }
+
+    async fn find_person_by_name(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::traits::Person>> {
+        let name_lower = name.to_lowercase();
+        // Check name first (case-insensitive)
+        let row = sqlx::query(
+            "SELECT id, name, aliases_json, relationship, platform_ids_json, notes, \
+             communication_style, language_preference, last_interaction_at, interaction_count, \
+             created_at, updated_at FROM people WHERE LOWER(name) = ?",
+        )
+        .bind(&name_lower)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(r) = row {
+            return Ok(Some(Self::row_to_person(&r)));
+        }
+
+        // Check aliases (JSON array search)
+        let rows = sqlx::query(
+            "SELECT id, name, aliases_json, relationship, platform_ids_json, notes, \
+             communication_style, language_preference, last_interaction_at, interaction_count, \
+             created_at, updated_at FROM people",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        for r in &rows {
+            let aliases_str: String = r.get("aliases_json");
+            if let Ok(aliases) = serde_json::from_str::<Vec<String>>(&aliases_str) {
+                if aliases.iter().any(|a| a.to_lowercase() == name_lower) {
+                    return Ok(Some(Self::row_to_person(r)));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn get_all_people(&self) -> anyhow::Result<Vec<crate::traits::Person>> {
+        let rows = sqlx::query(
+            "SELECT id, name, aliases_json, relationship, platform_ids_json, notes, \
+             communication_style, language_preference, last_interaction_at, interaction_count, \
+             created_at, updated_at FROM people ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_person).collect())
+    }
+
+    async fn delete_person(&self, id: i64) -> anyhow::Result<()> {
+        // person_facts has ON DELETE CASCADE, but be explicit
+        sqlx::query("DELETE FROM person_facts WHERE person_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM people WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn link_platform_id(
+        &self,
+        person_id: i64,
+        platform_id: &str,
+        display_name: &str,
+    ) -> anyhow::Result<()> {
+        // Read current platform_ids, add new one, write back
+        let row = sqlx::query("SELECT platform_ids_json FROM people WHERE id = ?")
+            .bind(person_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        let mut ids: std::collections::HashMap<String, String> = match row {
+            Some(r) => {
+                let json_str: String = r.get("platform_ids_json");
+                serde_json::from_str(&json_str).unwrap_or_default()
+            }
+            None => return Err(anyhow::anyhow!("Person {} not found", person_id)),
+        };
+
+        ids.insert(platform_id.to_string(), display_name.to_string());
+        let updated_json = serde_json::to_string(&ids)?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query("UPDATE people SET platform_ids_json = ?, updated_at = ? WHERE id = ?")
+            .bind(&updated_json)
+            .bind(&now)
+            .bind(person_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn touch_person_interaction(&self, person_id: i64) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE people SET last_interaction_at = ?, interaction_count = interaction_count + 1, updated_at = ? WHERE id = ?"
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(person_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_person_fact(
+        &self,
+        person_id: i64,
+        category: &str,
+        key: &str,
+        value: &str,
+        source: &str,
+        confidence: f32,
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO person_facts (person_id, category, key, value, source, confidence, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(person_id, category, key) DO UPDATE SET \
+             value = excluded.value, source = excluded.source, confidence = excluded.confidence, updated_at = excluded.updated_at"
+        )
+        .bind(person_id)
+        .bind(category)
+        .bind(key)
+        .bind(value)
+        .bind(source)
+        .bind(confidence)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_person_facts(
+        &self,
+        person_id: i64,
+        category: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::traits::PersonFact>> {
+        let rows = if let Some(cat) = category {
+            sqlx::query(
+                "SELECT id, person_id, category, key, value, source, confidence, created_at, updated_at \
+                 FROM person_facts WHERE person_id = ? AND category = ? ORDER BY category, key"
+            )
+            .bind(person_id)
+            .bind(cat)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, person_id, category, key, value, source, confidence, created_at, updated_at \
+                 FROM person_facts WHERE person_id = ? ORDER BY category, key"
+            )
+            .bind(person_id)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows.iter().map(Self::row_to_person_fact).collect())
+    }
+
+    async fn delete_person_fact(&self, fact_id: i64) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM person_facts WHERE id = ?")
+            .bind(fact_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn confirm_person_fact(&self, fact_id: i64) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query("UPDATE person_facts SET confidence = 1.0, source = 'owner', updated_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(fact_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_people_with_upcoming_dates(
+        &self,
+        within_days: i32,
+    ) -> anyhow::Result<Vec<(crate::traits::Person, crate::traits::PersonFact)>> {
+        // Get all birthday/important_date facts, then filter by upcoming date in Rust
+        let rows = sqlx::query(
+            "SELECT pf.id as fact_id, pf.person_id, pf.category, pf.key, pf.value, pf.source, pf.confidence, \
+             pf.created_at as fact_created, pf.updated_at as fact_updated, \
+             p.id, p.name, p.aliases_json, p.relationship, p.platform_ids_json, p.notes, \
+             p.communication_style, p.language_preference, p.last_interaction_at, p.interaction_count, \
+             p.created_at, p.updated_at \
+             FROM person_facts pf JOIN people p ON pf.person_id = p.id \
+             WHERE pf.category IN ('birthday', 'important_date')"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let today = chrono::Utc::now().date_naive();
+        let mut results = Vec::new();
+
+        for r in &rows {
+            let value: String = r.get("value");
+            // Try to parse month-day from various formats (e.g., "March 15", "03-15", "2000-03-15")
+            if let Some(upcoming_in) = days_until_date(&value, today) {
+                if upcoming_in <= within_days as i64 && upcoming_in >= 0 {
+                    let person = Self::row_to_person(r);
+                    let fact = crate::traits::PersonFact {
+                        id: r.get("fact_id"),
+                        person_id: r.get("person_id"),
+                        category: r.get("category"),
+                        key: r.get("key"),
+                        value: r.get("value"),
+                        source: r.get("source"),
+                        confidence: r.get("confidence"),
+                        created_at: parse_dt(r.get::<String, _>("fact_created")),
+                        updated_at: parse_dt(r.get::<String, _>("fact_updated")),
+                    };
+                    results.push((person, fact));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn prune_stale_person_facts(&self, retention_days: u32) -> anyhow::Result<u64> {
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+        let result = sqlx::query(
+            "DELETE FROM person_facts WHERE source = 'consolidation' AND confidence < 1.0 AND updated_at < ?"
+        )
+        .bind(&cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn get_people_needing_reconnect(
+        &self,
+        inactive_days: u32,
+    ) -> anyhow::Result<Vec<crate::traits::Person>> {
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::days(inactive_days as i64)).to_rfc3339();
+        let rows = sqlx::query(
+            "SELECT id, name, aliases_json, relationship, platform_ids_json, notes, \
+             communication_style, language_preference, last_interaction_at, interaction_count, \
+             created_at, updated_at FROM people \
+             WHERE last_interaction_at IS NOT NULL AND last_interaction_at < ? \
+             AND relationship IN ('friend', 'family', 'coworker') \
+             ORDER BY last_interaction_at ASC",
+        )
+        .bind(&cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_person).collect())
+    }
+
+    // ==================== OAuth Connection Methods ====================
+
+    async fn save_oauth_connection(
+        &self,
+        conn: &crate::traits::OAuthConnection,
+    ) -> anyhow::Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "INSERT INTO oauth_connections (service, auth_type, username, scopes, token_expires_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(service) DO UPDATE SET \
+             auth_type = excluded.auth_type, username = excluded.username, scopes = excluded.scopes, \
+             token_expires_at = excluded.token_expires_at, updated_at = excluded.updated_at",
+        )
+        .bind(&conn.service)
+        .bind(&conn.auth_type)
+        .bind(&conn.username)
+        .bind(&conn.scopes)
+        .bind(&conn.token_expires_at)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    async fn get_oauth_connection(
+        &self,
+        service: &str,
+    ) -> anyhow::Result<Option<crate::traits::OAuthConnection>> {
+        let row = sqlx::query(
+            "SELECT id, service, auth_type, username, scopes, token_expires_at, created_at, updated_at \
+             FROM oauth_connections WHERE service = ?",
+        )
+        .bind(service)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| crate::traits::OAuthConnection {
+            id: r.get("id"),
+            service: r.get("service"),
+            auth_type: r.get("auth_type"),
+            username: r.try_get("username").unwrap_or(None),
+            scopes: r.get("scopes"),
+            token_expires_at: r.try_get("token_expires_at").unwrap_or(None),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    async fn list_oauth_connections(&self) -> anyhow::Result<Vec<crate::traits::OAuthConnection>> {
+        let rows = sqlx::query(
+            "SELECT id, service, auth_type, username, scopes, token_expires_at, created_at, updated_at \
+             FROM oauth_connections ORDER BY service ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| crate::traits::OAuthConnection {
+                id: r.get("id"),
+                service: r.get("service"),
+                auth_type: r.get("auth_type"),
+                username: r.try_get("username").unwrap_or(None),
+                scopes: r.get("scopes"),
+                token_expires_at: r.try_get("token_expires_at").unwrap_or(None),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    async fn delete_oauth_connection(&self, service: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM oauth_connections WHERE service = ?")
+            .bind(service)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_oauth_token_expiry(
+        &self,
+        service: &str,
+        expires_at: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE oauth_connections SET token_expires_at = ?, updated_at = ? WHERE service = ?",
+        )
+        .bind(expires_at)
+        .bind(&now)
+        .bind(service)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2700,7 +3673,10 @@ mod tests {
         assert_eq!(history.len(), 5);
         // The truncate_with_anchor logic preserves the first user message,
         // so the last message should be the most recent one
-        assert_eq!(history.last().unwrap().content.as_deref(), Some("Message 9"));
+        assert_eq!(
+            history.last().unwrap().content.as_deref(),
+            Some("Message 9")
+        );
     }
 
     #[tokio::test]
@@ -3113,7 +4089,11 @@ mod tests {
             .unwrap();
 
         let active = store.get_active_goals().await.unwrap();
-        assert_eq!(active.len(), 0, "Completed goal should not appear in active goals");
+        assert_eq!(
+            active.len(),
+            0,
+            "Completed goal should not appear in active goals"
+        );
     }
 
     #[tokio::test]
@@ -3280,10 +4260,7 @@ mod tests {
         let proc_id = store.upsert_procedure(&procedure).await.unwrap();
         assert!(proc_id > 0);
 
-        let procs = store
-            .get_relevant_procedures("deploy", 10)
-            .await
-            .unwrap();
+        let procs = store.get_relevant_procedures("deploy", 10).await.unwrap();
         assert_eq!(procs.len(), 1);
         assert_eq!(procs[0].name, "deploy-app");
         assert_eq!(procs[0].steps.len(), 3);
@@ -3312,10 +4289,7 @@ mod tests {
         // which increments success_count
         store.upsert_procedure(&procedure).await.unwrap();
 
-        let procs = store
-            .get_relevant_procedures("test", 10)
-            .await
-            .unwrap();
+        let procs = store.get_relevant_procedures("test", 10).await.unwrap();
         assert_eq!(procs.len(), 1);
         assert!(
             procs[0].success_count >= 2,
@@ -3353,7 +4327,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(solutions.len(), 1);
-        assert_eq!(solutions[0].solution_summary, "Start the PostgreSQL service");
+        assert_eq!(
+            solutions[0].solution_summary,
+            "Start the PostgreSQL service"
+        );
         assert_eq!(solutions[0].domain.as_deref(), Some("database"));
     }
 
@@ -3434,14 +4411,8 @@ mod tests {
             output_tokens: 80,
         };
 
-        store
-            .record_token_usage("sess-1", &usage1)
-            .await
-            .unwrap();
-        store
-            .record_token_usage("sess-2", &usage2)
-            .await
-            .unwrap();
+        store.record_token_usage("sess-1", &usage1).await.unwrap();
+        store.record_token_usage("sess-2", &usage2).await.unwrap();
 
         // A far-past date should return all records
         let all = store
@@ -3593,5 +4564,78 @@ mod tests {
             .unwrap();
         let servers = store.list_dynamic_mcp_servers().await.unwrap();
         assert_eq!(servers.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_oauth_connection_crud() {
+        let (store, _tmp) = setup_test_store().await;
+
+        // Insert
+        let conn = crate::traits::OAuthConnection {
+            id: 0,
+            service: "twitter".to_string(),
+            auth_type: "oauth2_pkce".to_string(),
+            username: Some("@testuser".to_string()),
+            scopes: r#"["tweet.read","tweet.write"]"#.to_string(),
+            token_expires_at: Some("2025-12-31T00:00:00Z".to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let id = store.save_oauth_connection(&conn).await.unwrap();
+        assert!(id > 0);
+
+        // Get by service
+        let fetched = store.get_oauth_connection("twitter").await.unwrap().unwrap();
+        assert_eq!(fetched.service, "twitter");
+        assert_eq!(fetched.auth_type, "oauth2_pkce");
+        assert_eq!(fetched.username, Some("@testuser".to_string()));
+
+        // List all
+        let all = store.list_oauth_connections().await.unwrap();
+        assert_eq!(all.len(), 1);
+
+        // Update expiry
+        store
+            .update_oauth_token_expiry("twitter", Some("2026-06-30T00:00:00Z"))
+            .await
+            .unwrap();
+        let updated = store.get_oauth_connection("twitter").await.unwrap().unwrap();
+        assert_eq!(
+            updated.token_expires_at,
+            Some("2026-06-30T00:00:00Z".to_string())
+        );
+
+        // Upsert (same service, different data)
+        let conn2 = crate::traits::OAuthConnection {
+            id: 0,
+            service: "twitter".to_string(),
+            auth_type: "oauth2_pkce".to_string(),
+            username: Some("@newuser".to_string()),
+            scopes: r#"["tweet.read"]"#.to_string(),
+            token_expires_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.save_oauth_connection(&conn2).await.unwrap();
+        let upserted = store.get_oauth_connection("twitter").await.unwrap().unwrap();
+        assert_eq!(upserted.username, Some("@newuser".to_string()));
+        // Still just 1 connection (upserted, not duplicated)
+        assert_eq!(store.list_oauth_connections().await.unwrap().len(), 1);
+
+        // Delete
+        store.delete_oauth_connection("twitter").await.unwrap();
+        assert!(store
+            .get_oauth_connection("twitter")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.list_oauth_connections().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_oauth_connection_not_found() {
+        let (store, _tmp) = setup_test_store().await;
+        let result = store.get_oauth_connection("nonexistent").await.unwrap();
+        assert!(result.is_none());
     }
 }

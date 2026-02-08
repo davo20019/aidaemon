@@ -396,8 +396,7 @@ impl PlanStore {
 
         let steps = serde_json::from_str(&steps_json)?;
         let checkpoint = serde_json::from_str(&checkpoint_json)?;
-        let status =
-            PlanStatus::from_str(&status_str).unwrap_or(PlanStatus::InProgress);
+        let status = PlanStatus::from_str(&status_str).unwrap_or(PlanStatus::InProgress);
         let created_at = DateTime::parse_from_rfc3339(&created_at_str)?.with_timezone(&Utc);
         let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)?.with_timezone(&Utc);
 
@@ -440,7 +439,11 @@ mod tests {
             "session_123",
             "Deploy the app",
             "Production deployment",
-            vec!["Test".to_string(), "Build".to_string(), "Deploy".to_string()],
+            vec![
+                "Test".to_string(),
+                "Build".to_string(),
+                "Deploy".to_string(),
+            ],
             "high_stakes",
         );
 

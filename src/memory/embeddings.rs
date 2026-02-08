@@ -1,4 +1,4 @@
-use fastembed::{InitOptions, TextEmbedding, EmbeddingModel};
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use std::sync::Arc;
 use tokio::task;
 
@@ -34,8 +34,6 @@ impl EmbeddingService {
     #[allow(dead_code)]
     pub async fn embed_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         let model = self.model.clone();
-        task::spawn_blocking(move || {
-            model.embed(texts, None)})
-        .await?
+        task::spawn_blocking(move || model.embed(texts, None)).await?
     }
 }

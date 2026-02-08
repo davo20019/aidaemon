@@ -116,10 +116,40 @@ pub fn classify_query(text: &str) -> ClassificationResult {
 
     // Exact match greetings/acks (case-insensitive, trimmed)
     let fast_exact = [
-        "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "yes", "no", "sure",
-        "bye", "goodbye", "good morning", "good night", "gm", "gn", "yo", "sup", "ty",
-        "thx", "np", "k", "yep", "nope", "nah", "yeah", "yea", "cool", "nice", "great",
-        "awesome", "lol", "haha", "wow",
+        "hi",
+        "hello",
+        "hey",
+        "thanks",
+        "thank you",
+        "ok",
+        "okay",
+        "yes",
+        "no",
+        "sure",
+        "bye",
+        "goodbye",
+        "good morning",
+        "good night",
+        "gm",
+        "gn",
+        "yo",
+        "sup",
+        "ty",
+        "thx",
+        "np",
+        "k",
+        "yep",
+        "nope",
+        "nah",
+        "yeah",
+        "yea",
+        "cool",
+        "nice",
+        "great",
+        "awesome",
+        "lol",
+        "haha",
+        "wow",
     ];
     if fast_exact.contains(&lower.as_str()) {
         return ClassificationResult {
@@ -142,7 +172,13 @@ pub fn classify_query(text: &str) -> ClassificationResult {
 
     // Simple lookup prefixes
     let fast_prefixes = [
-        "what is ", "who is ", "define ", "what's ", "who's ", "when is ", "where is ",
+        "what is ",
+        "who is ",
+        "define ",
+        "what's ",
+        "who's ",
+        "when is ",
+        "where is ",
     ];
     for prefix in &fast_prefixes {
         if lower.starts_with(prefix) && word_count <= 6 {
@@ -170,7 +206,10 @@ mod tests {
 
     #[test]
     fn test_smart_code_fence() {
-        assert_eq!(classify("Here is some code:\n```rust\nfn main() {}\n```"), Tier::Smart);
+        assert_eq!(
+            classify("Here is some code:\n```rust\nfn main() {}\n```"),
+            Tier::Smart
+        );
     }
 
     #[test]
@@ -181,7 +220,10 @@ mod tests {
 
     #[test]
     fn test_smart_multiple_questions() {
-        assert_eq!(classify("What is this? How does it work? Why is it broken?"), Tier::Smart);
+        assert_eq!(
+            classify("What is this? How does it work? Why is it broken?"),
+            Tier::Smart
+        );
     }
 
     #[test]
@@ -230,8 +272,14 @@ mod tests {
 
     #[test]
     fn test_primary_default() {
-        assert_eq!(classify("Tell me about the history of computing and its impact on modern society"), Tier::Primary);
-        assert_eq!(classify("Can you help me with my project setup"), Tier::Primary);
+        assert_eq!(
+            classify("Tell me about the history of computing and its impact on modern society"),
+            Tier::Primary
+        );
+        assert_eq!(
+            classify("Can you help me with my project setup"),
+            Tier::Primary
+        );
     }
 
     #[test]

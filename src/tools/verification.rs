@@ -18,8 +18,8 @@ const CONDITIONAL_MODIFYING: &[(&str, &str)] = &[
 
 /// Read-only commands whose path arguments should be recorded as "seen."
 const READ_ONLY_COMMANDS: &[&str] = &[
-    "ls", "cat", "head", "tail", "less", "more", "file", "stat", "wc", "du", "find", "tree",
-    "fd", "grep", "rg", "diff", "bat", "exa", "eza", "readlink", "test",
+    "ls", "cat", "head", "tail", "less", "more", "file", "stat", "wc", "du", "find", "tree", "fd",
+    "grep", "rg", "diff", "bat", "exa", "eza", "readlink", "test",
 ];
 
 /// A warning returned when a modifying command targets unverified paths.
@@ -109,9 +109,7 @@ impl VerificationTracker {
 
                 let is_modifying = FILE_MODIFYING_COMMANDS.contains(&cmd_name.as_str())
                     || CONDITIONAL_MODIFYING.iter().any(|(cmd, flag)| {
-                        cmd_name == *cmd
-                            && (flag.is_empty()
-                                || args.iter().any(|a| a == flag))
+                        cmd_name == *cmd && (flag.is_empty() || args.iter().any(|a| a == flag))
                     });
 
                 if !is_modifying {
@@ -252,8 +250,15 @@ fn extract_path_args(args: &[String]) -> Vec<String> {
                 if (arg.len() == 2 || arg.starts_with("--")) && !next.starts_with('-') {
                     // Only skip for known value-taking flags
                     let value_flags = [
-                        "-o", "-f", "-t", "-m", "-T", "--target-directory", "--output",
-                        "--suffix", "--backup",
+                        "-o",
+                        "-f",
+                        "-t",
+                        "-m",
+                        "-T",
+                        "--target-directory",
+                        "--output",
+                        "--suffix",
+                        "--backup",
                     ];
                     if value_flags.contains(&arg.as_str()) {
                         skip_next = true;
@@ -289,7 +294,10 @@ mod tests {
             .check_modifying_command(sid, "rm /tmp/foo.txt")
             .await;
         assert!(warning.is_some());
-        assert!(warning.unwrap().unverified_paths.contains(&"/tmp/foo.txt".to_string()));
+        assert!(warning
+            .unwrap()
+            .unverified_paths
+            .contains(&"/tmp/foo.txt".to_string()));
 
         // Record the path
         tracker.record_seen_path(sid, "/tmp/foo.txt").await;
@@ -310,9 +318,7 @@ mod tests {
         tracker.record_from_command(sid, "ls /foo").await;
 
         // rm /foo/bar should pass because /foo was seen
-        let warning = tracker
-            .check_modifying_command(sid, "rm /foo/bar")
-            .await;
+        let warning = tracker.check_modifying_command(sid, "rm /foo/bar").await;
         assert!(warning.is_none());
     }
 
@@ -356,9 +362,7 @@ mod tests {
         let sid = "test-session";
 
         // rm -rf /dir should extract /dir, not -rf
-        let warning = tracker
-            .check_modifying_command(sid, "rm -rf /dir")
-            .await;
+        let warning = tracker.check_modifying_command(sid, "rm -rf /dir").await;
         assert!(warning.is_some());
         let w = warning.unwrap();
         assert_eq!(w.unverified_paths, vec!["/dir".to_string()]);
@@ -408,9 +412,7 @@ mod tests {
         tracker.record_seen_path(sid, &expanded_path).await;
 
         // rm ~/file.txt should be verified (tilde expands to same path)
-        let warning = tracker
-            .check_modifying_command(sid, "rm ~/file.txt")
-            .await;
+        let warning = tracker.check_modifying_command(sid, "rm ~/file.txt").await;
         assert!(warning.is_none());
     }
 
@@ -425,9 +427,7 @@ mod tests {
             .await;
         assert!(warning.is_none());
 
-        let warning = tracker
-            .check_modifying_command(sid, "ls /var/log")
-            .await;
+        let warning = tracker.check_modifying_command(sid, "ls /var/log").await;
         assert!(warning.is_none());
     }
 

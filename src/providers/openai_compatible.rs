@@ -35,10 +35,8 @@ fn validate_base_url(base_url: &str) -> Result<(), String> {
         "https" => Ok(()), // HTTPS is always allowed
         "http" => {
             // HTTP only allowed for localhost
-            let is_localhost = host == "localhost"
-                || host == "127.0.0.1"
-                || host == "[::1]"
-                || host == "::1";
+            let is_localhost =
+                host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1";
 
             if is_localhost {
                 warn!(
@@ -135,7 +133,10 @@ impl ModelProvider for OpenAiCompatibleProvider {
 
         if !status.is_success() {
             error!(status = %status, "Provider API error: {}", text);
-            debug!("Failed request body: {}", serde_json::to_string(&body).unwrap_or_default());
+            debug!(
+                "Failed request body: {}",
+                serde_json::to_string(&body).unwrap_or_default()
+            );
             return Err(ProviderError::from_status(status.as_u16(), &text).into());
         }
 
@@ -161,18 +162,16 @@ impl ModelProvider for OpenAiCompatibleProvider {
 
         let mut tool_calls = Vec::new();
         if let Some(tcs) = message["tool_calls"].as_array() {
-            debug!("Raw tool_calls from provider: {}", serde_json::to_string(tcs).unwrap_or_default());
+            debug!(
+                "Raw tool_calls from provider: {}",
+                serde_json::to_string(tcs).unwrap_or_default()
+            );
             for tc in tcs {
-                let extra_content = tc.get("extra_content")
-                    .filter(|v| !v.is_null())
-                    .cloned();
+                let extra_content = tc.get("extra_content").filter(|v| !v.is_null()).cloned();
 
                 tool_calls.push(ToolCall {
                     id: tc["id"].as_str().unwrap_or("").to_string(),
-                    name: tc["function"]["name"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string(),
+                    name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
                     arguments: tc["function"]["arguments"]
                         .as_str()
                         .unwrap_or("{}")
@@ -297,7 +296,10 @@ mod tests {
     #[test]
     fn test_trailing_slash_trimmed() {
         let provider = OpenAiCompatibleProvider::new("https://api.openai.com/v1/", "test-key");
-        assert!(provider.is_ok(), "Provider::new should succeed with trailing slash");
+        assert!(
+            provider.is_ok(),
+            "Provider::new should succeed with trailing slash"
+        );
         let provider = provider.unwrap();
         assert!(
             !provider.base_url.ends_with('/'),

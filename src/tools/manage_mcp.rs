@@ -19,10 +19,7 @@ pub struct ManageMcpTool {
 }
 
 impl ManageMcpTool {
-    pub fn new(
-        registry: McpRegistry,
-        approval_tx: mpsc::Sender<ApprovalRequest>,
-    ) -> Self {
+    pub fn new(registry: McpRegistry, approval_tx: mpsc::Sender<ApprovalRequest>) -> Self {
         Self {
             registry,
             approval_tx,
@@ -40,9 +37,7 @@ impl ManageMcpTool {
                 command: description.to_string(),
                 session_id: session_id.to_string(),
                 risk_level: RiskLevel::Medium,
-                warnings: vec![
-                    "This will spawn an external MCP server process".to_string(),
-                ],
+                warnings: vec!["This will spawn an external MCP server process".to_string()],
                 permission_mode: PermissionMode::Default,
                 response_tx,
             })
@@ -55,7 +50,10 @@ impl ManageMcpTool {
                 Ok(ApprovalResponse::Deny)
             }
             Err(_) => {
-                tracing::warn!(description, "Approval request timed out (300s), auto-denying");
+                tracing::warn!(
+                    description,
+                    "Approval request timed out (300s), auto-denying"
+                );
                 Ok(ApprovalResponse::Deny)
             }
         }
@@ -129,7 +127,12 @@ impl ManageMcpTool {
 
         let mut output = String::from("Registered MCP servers:\n\n");
         for server in &servers {
-            output.push_str(&format!("**{}** (`{} {}`)\n", server.name, server.command, server.args.join(" ")));
+            output.push_str(&format!(
+                "**{}** (`{} {}`)\n",
+                server.name,
+                server.command,
+                server.args.join(" ")
+            ));
             output.push_str(&format!("  Tools: {}\n", server.tool_names.join(", ")));
             if !server.env_keys.is_empty() {
                 output.push_str(&format!("  Env keys: {}\n", server.env_keys.join(", ")));
@@ -147,12 +150,7 @@ impl ManageMcpTool {
         }
     }
 
-    async fn handle_set_env(
-        &self,
-        name: &str,
-        key: &str,
-        value: &str,
-    ) -> anyhow::Result<String> {
+    async fn handle_set_env(&self, name: &str, key: &str, value: &str) -> anyhow::Result<String> {
         match self.registry.set_server_env(name, key, value).await {
             Ok(()) => Ok(format!(
                 "Environment variable '{}' stored securely in OS keychain for server '{}'.\n\
@@ -173,10 +171,7 @@ impl ManageMcpTool {
                 name,
                 tool_names.join(", ")
             )),
-            Err(e) => Ok(format!(
-                "Failed to restart MCP server '{}': {}",
-                name, e
-            )),
+            Err(e) => Ok(format!("Failed to restart MCP server '{}': {}", name, e)),
         }
     }
 }

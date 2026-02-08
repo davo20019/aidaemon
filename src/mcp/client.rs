@@ -101,7 +101,13 @@ impl McpClient {
                         Ok(_) => {
                             let trimmed = line.trim_end();
                             if !trimmed.is_empty() {
-                                warn!(mcp_server = %cmd_name, "{}", trimmed);
+                                // Truncate long stderr lines to prevent log flooding
+                                let safe_line = if trimmed.len() > 500 {
+                                    format!("{}... [truncated]", &trimmed[..500])
+                                } else {
+                                    trimmed.to_string()
+                                };
+                                warn!(mcp_server = %cmd_name, "{}", safe_line);
                             }
                         }
                         Err(_) => break,
@@ -118,22 +124,32 @@ impl McpClient {
         };
 
         // Send initialize request (with init timeout)
-        let _resp = tokio::time::timeout(INIT_TIMEOUT, client.send_request_inner(
-            "initialize",
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "aidaemon",
-                    "version": "0.1.0"
-                }
-            }),
-        ))
+        let _resp = tokio::time::timeout(
+            INIT_TIMEOUT,
+            client.send_request_inner(
+                "initialize",
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "aidaemon",
+                        "version": "0.1.0"
+                    }
+                }),
+            ),
+        )
         .await
-        .map_err(|_| anyhow::anyhow!("MCP server initialization timed out after {:?}", INIT_TIMEOUT))??;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "MCP server initialization timed out after {:?}",
+                INIT_TIMEOUT
+            )
+        })??;
 
         // Send initialized notification
-        client.send_notification("notifications/initialized", json!({})).await?;
+        client
+            .send_notification("notifications/initialized", json!({}))
+            .await?;
 
         Ok(client)
     }
@@ -142,7 +158,13 @@ impl McpClient {
     pub async fn send_request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         tokio::time::timeout(RPC_TIMEOUT, self.send_request_inner(method, params))
             .await
-            .map_err(|_| anyhow::anyhow!("MCP RPC call '{}' timed out after {:?}", method, RPC_TIMEOUT))?
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "MCP RPC call '{}' timed out after {:?}",
+                    method,
+                    RPC_TIMEOUT
+                )
+            })?
     }
 
     /// Inner send without timeout (used by both public send_request and init).
@@ -212,10 +234,7 @@ impl McpClient {
     /// List tools from the MCP server.
     pub async fn list_tools(&self) -> anyhow::Result<Vec<Value>> {
         let result = self.send_request("tools/list", json!({})).await?;
-        let tools = result["tools"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let tools = result["tools"].as_array().cloned().unwrap_or_default();
         Ok(tools)
     }
 
@@ -239,10 +258,7 @@ impl McpClient {
 
         // MCP returns content as an array of content blocks
         if let Some(content) = result["content"].as_array() {
-            let texts: Vec<&str> = content
-                .iter()
-                .filter_map(|c| c["text"].as_str())
-                .collect();
+            let texts: Vec<&str> = content.iter().filter_map(|c| c["text"].as_str()).collect();
             Ok(texts.join("\n"))
         } else {
             Ok(result.to_string())

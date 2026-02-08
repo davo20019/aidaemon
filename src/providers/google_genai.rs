@@ -61,7 +61,7 @@ impl GoogleGenAiProvider {
 
         for msg in messages {
             let role = msg["role"].as_str().unwrap_or("user");
-            
+
             match role {
                 "system" => {
                     // Gemini supports top-level system_instruction (for 1.5+ models)
@@ -102,13 +102,13 @@ impl GoogleGenAiProvider {
                             });
                             // Merge extra fields (thought_signature etc.) as siblings of functionCall in the part
                             let mut part_obj = json!({ "functionCall": function_call });
-                            if let Some(extra) = tc.get("extra_content").and_then(|e| e.as_object()) {
+                            if let Some(extra) = tc.get("extra_content").and_then(|e| e.as_object())
+                            {
                                 if let Some(part_map) = part_obj.as_object_mut() {
                                     for (k, v) in extra {
                                         part_map.insert(k.clone(), v.clone());
                                     }
                                 }
-
                             }
                             parts.push(part_obj);
                         }
@@ -122,12 +122,12 @@ impl GoogleGenAiProvider {
                     // Tool response
                     let _tool_call_id = msg["tool_call_id"].as_str().unwrap_or("");
                     let _tool_name = msg["name"].as_str().unwrap_or(""); // OpenAI puts name here? Or in tool_call?
-                    // In our trait Message, we have tool_name. usage in openai_compatible.rs seems to verify this.
-                    // But actually OpenAI format for tool response is: { role: tool, tool_call_id: ..., content: ... }
-                    // Gemini needs:
-                    // { role: "function", parts: [{ "functionResponse": { "name": ..., "response": ... } }] }
-                    // Note: Gemini API requires previous message to be "model" with "functionCall".
-                    
+                                                                         // In our trait Message, we have tool_name. usage in openai_compatible.rs seems to verify this.
+                                                                         // But actually OpenAI format for tool response is: { role: tool, tool_call_id: ..., content: ... }
+                                                                         // Gemini needs:
+                                                                         // { role: "function", parts: [{ "functionResponse": { "name": ..., "response": ... } }] }
+                                                                         // Note: Gemini API requires previous message to be "model" with "functionCall".
+
                     let content_str = msg["content"].as_str().unwrap_or("");
                     // Gemini's functionResponse.response maps to protobuf Struct,
                     // which must be a JSON object — never an array or primitive.
@@ -143,12 +143,15 @@ impl GoogleGenAiProvider {
                     // if let Some(ref tname) = msg.tool_name { m["name"] = json!(tname); }
                     // So yes, "name" should be present.
 
-                    let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("unknown_tool");
+                    let name = msg
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown_tool");
 
                     contents.push(json!({
                         "role": "function", // API expects "function" role or just parts with functionResponse?
                         // Actually documentation says role should be 'function' (v1beta).
-                        // wait, checking recent docs... v1beta 'role' can be 'user' or 'model'. Function responses are usually 'function'? 
+                        // wait, checking recent docs... v1beta 'role' can be 'user' or 'model'. Function responses are usually 'function'?
                         // Actually, for generateContent, it's:
                         // role: "function" is NOT standard. It's usually "user" or "model" or implicitly handled?
                         // "role": "function" was used in PaLM. Gemini uses "function_response" part in a "user" (or separate) role?
@@ -174,7 +177,11 @@ impl GoogleGenAiProvider {
     /// When `include_grounding` is true, appends Google Search grounding.
     /// Expose convert_tools for integration tests.
     #[cfg(test)]
-    pub fn convert_tools_for_test(&self, tools: &[Value], include_grounding: bool) -> Option<Vec<Value>> {
+    pub fn convert_tools_for_test(
+        &self,
+        tools: &[Value],
+        include_grounding: bool,
+    ) -> Option<Vec<Value>> {
         self.convert_tools(tools, include_grounding)
     }
 
@@ -240,7 +247,11 @@ impl GoogleGenAiProvider {
                     }
                 }
 
-                let extra_content = if extra.is_empty() { None } else { Some(Value::Object(extra)) };
+                let extra_content = if extra.is_empty() {
+                    None
+                } else {
+                    Some(Value::Object(extra))
+                };
 
                 tool_calls.push(ToolCall {
                     id: format!("call_{}", uuid::Uuid::new_v4()),
@@ -279,7 +290,11 @@ impl GoogleGenAiProvider {
         });
 
         Ok(ProviderResponse {
-            content: if final_text.is_empty() { None } else { Some(final_text) },
+            content: if final_text.is_empty() {
+                None
+            } else {
+                Some(final_text)
+            },
             tool_calls,
             usage,
         })
@@ -321,7 +336,8 @@ impl ModelProvider for GoogleGenAiProvider {
 
         info!(model, url_prefix = %self.base_url, "Calling Google GenAI");
 
-        let resp = match self.client
+        let resp = match self
+            .client
             .post(&url)
             .header("x-goog-api-key", &self.api_key)
             .json(&body)
@@ -350,16 +366,17 @@ impl ModelProvider for GoogleGenAiProvider {
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // Use header-based authentication instead of URL query parameter
         let url = format!("{}/models?page_size=50", self.base_url);
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
             .header("x-goog-api-key", &self.api_key)
             .send()
             .await?;
-        
+
         if !resp.status().is_success() {
             anyhow::bail!("Failed to list models: {}", resp.status());
         }
-        
+
         let data: Value = resp.json().await?;
         let models = data["models"]
             .as_array()
@@ -373,7 +390,7 @@ impl ModelProvider for GoogleGenAiProvider {
                     .collect()
             })
             .unwrap_or_default();
-            
+
         Ok(models)
     }
 }
@@ -424,13 +441,16 @@ mod tests {
     #[test]
     fn test_strips_top_level_schema() {
         let p = provider();
-        let tools = vec![openai_tool("mytool", json!({
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "type": "object",
-            "properties": {
-                "query": { "type": "string" }
-            }
-        }))];
+        let tools = vec![openai_tool(
+            "mytool",
+            json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" }
+                }
+            }),
+        )];
 
         let result = p.convert_tools_for_test(&tools, false).unwrap();
         assert_no_schema_field(&json!(result), "tools");
@@ -439,25 +459,28 @@ mod tests {
     #[test]
     fn test_strips_nested_schema() {
         let p = provider();
-        let tools = vec![openai_tool("mytool", json!({
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "type": "object",
-            "properties": {
-                "config": {
-                    "type": "object",
-                    "$schema": "http://json-schema.org/draft-07/schema#",
-                    "properties": {
-                        "items": {
-                            "type": "array",
+        let tools = vec![openai_tool(
+            "mytool",
+            json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "properties": {
                             "items": {
-                                "$schema": "http://json-schema.org/draft-07/schema#",
-                                "type": "string"
+                                "type": "array",
+                                "items": {
+                                    "$schema": "http://json-schema.org/draft-07/schema#",
+                                    "type": "string"
+                                }
                             }
                         }
                     }
                 }
-            }
-        }))];
+            }),
+        )];
 
         let result = p.convert_tools_for_test(&tools, false).unwrap();
         assert_no_schema_field(&json!(result), "tools");
@@ -466,15 +489,18 @@ mod tests {
     #[test]
     fn test_preserves_valid_fields() {
         let p = provider();
-        let tools = vec![openai_tool("mytool", json!({
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "The name" },
-                "count": { "type": "integer" }
-            },
-            "required": ["name"]
-        }))];
+        let tools = vec![openai_tool(
+            "mytool",
+            json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "The name" },
+                    "count": { "type": "integer" }
+                },
+                "required": ["name"]
+            }),
+        )];
 
         let result = p.convert_tools_for_test(&tools, false).unwrap();
         let params = &result[0]["function_declarations"][0]["parameters"];
@@ -488,15 +514,21 @@ mod tests {
     fn test_multiple_tools_all_stripped() {
         let p = provider();
         let tools = vec![
-            openai_tool("clean_tool", json!({
-                "type": "object",
-                "properties": { "a": { "type": "string" } }
-            })),
-            openai_tool("dirty_tool", json!({
-                "$schema": "http://json-schema.org/draft-07/schema#",
-                "type": "object",
-                "properties": { "b": { "type": "string" } }
-            })),
+            openai_tool(
+                "clean_tool",
+                json!({
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } }
+                }),
+            ),
+            openai_tool(
+                "dirty_tool",
+                json!({
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "properties": { "b": { "type": "string" } }
+                }),
+            ),
         ];
 
         let result = p.convert_tools_for_test(&tools, false).unwrap();
@@ -513,18 +545,21 @@ mod tests {
     #[test]
     fn test_mcp_style_schema_stripped() {
         let p = provider();
-        let tools = vec![openai_tool("mcp__server__read_file", json!({
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The file path to read"
-                }
-            },
-            "required": ["path"]
-        }))];
+        let tools = vec![openai_tool(
+            "mcp__server__read_file",
+            json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The file path to read"
+                    }
+                },
+                "required": ["path"]
+            }),
+        )];
 
         let result = p.convert_tools_for_test(&tools, false).unwrap();
         assert_no_schema_field(&json!(result), "tools");

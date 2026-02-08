@@ -6,9 +6,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::channels::ChannelHub;
 use super::probes::{HealthProbe, ProbeResult, ProbeStatus};
 use super::store::HealthProbeStore;
+use crate::channels::ChannelHub;
 
 /// Alert types for health probes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +35,7 @@ impl AlertType {
 }
 
 /// State tracking for a single probe's alert status.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct ProbeAlertState {
     /// Current consecutive failures
     consecutive_failures: u32,
@@ -49,7 +48,6 @@ struct ProbeAlertState {
     /// Last probe status
     last_status: Option<ProbeStatus>,
 }
-
 
 /// Manager for health probe alerts.
 ///
@@ -86,7 +84,8 @@ impl AlertManager {
         if is_healthy {
             // Check if we need to send a recovery alert
             if state.down_alert_sent {
-                self.send_recovery_alert(probe, result, state.first_failure_at).await;
+                self.send_recovery_alert(probe, result, state.first_failure_at)
+                    .await;
             }
 
             // Reset failure tracking
@@ -101,8 +100,11 @@ impl AlertManager {
             }
 
             // Check if we should send a down alert
-            if state.consecutive_failures >= probe.consecutive_failures_alert && !state.down_alert_sent {
-                self.send_down_alert(probe, result, state.first_failure_at.unwrap_or(now)).await;
+            if state.consecutive_failures >= probe.consecutive_failures_alert
+                && !state.down_alert_sent
+            {
+                self.send_down_alert(probe, result, state.first_failure_at.unwrap_or(now))
+                    .await;
                 state.down_alert_sent = true;
                 state.last_alert_at = Some(now);
             }
@@ -110,10 +112,13 @@ impl AlertManager {
 
         // Check latency threshold
         if is_healthy {
-            if let (Some(threshold), Some(latency)) = (probe.latency_threshold_ms, result.latency_ms) {
+            if let (Some(threshold), Some(latency)) =
+                (probe.latency_threshold_ms, result.latency_ms)
+            {
                 if latency > threshold {
                     // Check cooldown
-                    let should_alert = state.last_alert_at
+                    let should_alert = state
+                        .last_alert_at
                         .map(|last| now - last >= self.alert_cooldown)
                         .unwrap_or(true);
 
@@ -166,12 +171,16 @@ impl AlertManager {
         }
 
         // Record alert in database
-        if let Err(e) = self.store.insert_alert(
-            &probe.id,
-            AlertType::Down.as_str(),
-            &message,
-            first_failure_at,
-        ).await {
+        if let Err(e) = self
+            .store
+            .insert_alert(
+                &probe.id,
+                AlertType::Down.as_str(),
+                &message,
+                first_failure_at,
+            )
+            .await
+        {
             warn!(probe = %probe.name, "Failed to record alert: {}", e);
         }
     }
@@ -188,7 +197,8 @@ impl AlertManager {
             .unwrap_or_else(Duration::zero);
         let downtime_str = format_duration(downtime);
 
-        let latency_str = result.latency_ms
+        let latency_str = result
+            .latency_ms
             .map(|ms| format!(" (latency: {}ms)", ms))
             .unwrap_or_default();
 
@@ -197,10 +207,7 @@ impl AlertManager {
              Target: `{}`\n\
              Downtime: {}\n\
              Status: Healthy{}",
-            probe.name,
-            probe.target,
-            downtime_str,
-            latency_str
+            probe.name, probe.target, downtime_str, latency_str
         );
 
         info!(
@@ -216,23 +223,22 @@ impl AlertManager {
         }
 
         // Record alert in database
-        if let Err(e) = self.store.insert_alert(
-            &probe.id,
-            AlertType::Recovered.as_str(),
-            &message,
-            first_failure_at.unwrap_or_else(Utc::now),
-        ).await {
+        if let Err(e) = self
+            .store
+            .insert_alert(
+                &probe.id,
+                AlertType::Recovered.as_str(),
+                &message,
+                first_failure_at.unwrap_or_else(Utc::now),
+            )
+            .await
+        {
             warn!(probe = %probe.name, "Failed to record recovery alert: {}", e);
         }
     }
 
     /// Send a latency warning alert.
-    async fn send_latency_alert(
-        &self,
-        probe: &HealthProbe,
-        result: &ProbeResult,
-        threshold: u32,
-    ) {
+    async fn send_latency_alert(&self, probe: &HealthProbe, result: &ProbeResult, threshold: u32) {
         let latency = result.latency_ms.unwrap_or(0);
 
         let message = format!(
@@ -260,12 +266,16 @@ impl AlertManager {
         }
 
         // Record alert in database
-        if let Err(e) = self.store.insert_alert(
-            &probe.id,
-            AlertType::LatencyWarning.as_str(),
-            &message,
-            Utc::now(),
-        ).await {
+        if let Err(e) = self
+            .store
+            .insert_alert(
+                &probe.id,
+                AlertType::LatencyWarning.as_str(),
+                &message,
+                Utc::now(),
+            )
+            .await
+        {
             warn!(probe = %probe.name, "Failed to record latency alert: {}", e);
         }
     }
@@ -277,9 +287,7 @@ impl AlertManager {
             "⚠️ **Health Warning: {} is DEGRADED**\n\
              Target: `{}`\n\
              Details: {}",
-            probe.name,
-            probe.target,
-            details
+            probe.name, probe.target, details
         );
 
         info!(
@@ -294,12 +302,16 @@ impl AlertManager {
         }
 
         // Record alert in database
-        if let Err(e) = self.store.insert_alert(
-            &probe.id,
-            AlertType::Degraded.as_str(),
-            &message,
-            Utc::now(),
-        ).await {
+        if let Err(e) = self
+            .store
+            .insert_alert(
+                &probe.id,
+                AlertType::Degraded.as_str(),
+                &message,
+                Utc::now(),
+            )
+            .await
+        {
             warn!(probe = %probe.name, "Failed to record degradation alert: {}", e);
         }
     }
@@ -307,7 +319,9 @@ impl AlertManager {
     /// Get the current alert state for a probe (for debugging/status).
     pub async fn get_probe_state(&self, probe_id: &str) -> Option<(u32, bool)> {
         let states = self.states.read().await;
-        states.get(probe_id).map(|s| (s.consecutive_failures, s.down_alert_sent))
+        states
+            .get(probe_id)
+            .map(|s| (s.consecutive_failures, s.down_alert_sent))
     }
 
     /// Clear all tracked states (useful for testing or reset).

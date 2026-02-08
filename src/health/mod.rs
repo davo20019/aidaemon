@@ -50,7 +50,11 @@ impl HealthProbeManager {
     /// Seed probes from configuration.
     ///
     /// Uses upsert by name for config-sourced probes and removes stale entries.
-    pub async fn seed_from_config(&self, probes: &[HealthProbeConfig], default_alert_sessions: &[String]) {
+    pub async fn seed_from_config(
+        &self,
+        probes: &[HealthProbeConfig],
+        default_alert_sessions: &[String],
+    ) {
         let now = Utc::now();
 
         for probe_config in probes {
@@ -86,7 +90,11 @@ impl HealthProbeManager {
                 timeout_secs: probe_config.config.timeout_secs.unwrap_or(10),
                 expected_status: probe_config.config.expected_status,
                 expected_body: probe_config.config.expected_body.clone(),
-                method: probe_config.config.method.clone().unwrap_or_else(|| "GET".to_string()),
+                method: probe_config
+                    .config
+                    .method
+                    .clone()
+                    .unwrap_or_else(|| "GET".to_string()),
                 headers: probe_config.config.headers.clone().unwrap_or_default(),
                 max_age_secs: probe_config.config.max_age_secs,
                 expected_exit_code: probe_config.config.expected_exit_code,
@@ -217,7 +225,10 @@ impl HealthProbeManager {
 
     /// Run a single probe immediately (on-demand execution).
     pub async fn run_probe_now(&self, probe_id: &str) -> anyhow::Result<ProbeResult> {
-        let probe = self.store.get_probe(probe_id).await?
+        let probe = self
+            .store
+            .get_probe(probe_id)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("Probe not found: {}", probe_id))?;
 
         let result = ProbeExecutor::execute(&probe).await;
@@ -230,7 +241,11 @@ impl HealthProbeManager {
 
         // Update last run time (but don't change next_run_at for on-demand runs)
         let now = Utc::now();
-        if let Err(e) = self.store.update_probe_run(&probe.id, now, probe.next_run_at).await {
+        if let Err(e) = self
+            .store
+            .update_probe_run(&probe.id, now, probe.next_run_at)
+            .await
+        {
             warn!(probe = %probe.name, "Failed to update last run time: {}", e);
         }
 

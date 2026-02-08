@@ -492,10 +492,7 @@ fn validate_api_key(key: &str, kind: &str, base_url: &str) -> anyhow::Result<()>
             // Google AI: list models endpoint
             // Use header-based auth to avoid API key in URL logs
             let url = "https://generativelanguage.googleapis.com/v1beta/models";
-            let resp = client
-                .get(url)
-                .header("x-goog-api-key", key)
-                .send()?;
+            let resp = client.get(url).header("x-goog-api-key", key).send()?;
             let status = resp.status().as_u16();
             if status == 400 || status == 401 || status == 403 {
                 anyhow::bail!("invalid API key");

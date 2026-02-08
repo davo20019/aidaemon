@@ -33,17 +33,32 @@ mod tests {
         // Short message "hello" gets penalty (-0.2)
         // User base (0.6) - 0.2 = 0.4
         let score = score_message(&msg);
-        assert!(score < 0.5, "Short 'hello' should be low importance: {}", score);
+        assert!(
+            score < 0.5,
+            "Short 'hello' should be low importance: {}",
+            score
+        );
 
         // Medium message
-        msg.content = Some("I am writing a longer message to test the length heuristic functionality properly.".into());
+        msg.content = Some(
+            "I am writing a longer message to test the length heuristic functionality properly."
+                .into(),
+        );
         let score_medium = score_message(&msg);
-        assert!(score_medium > 0.5, "Medium message should be normal importance: {}", score_medium);
+        assert!(
+            score_medium > 0.5,
+            "Medium message should be normal importance: {}",
+            score_medium
+        );
 
         // Keyword boost
         msg.content = Some("this is a very important secret password".into());
         let score_high = score_message(&msg);
-        assert!(score_high >= 0.8, "Score should be high for keywords: {}", score_high);
+        assert!(
+            score_high >= 0.8,
+            "Score should be high for keywords: {}",
+            score_high
+        );
 
         // System role
         msg.role = "system".into();

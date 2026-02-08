@@ -5,10 +5,10 @@
 //! - Generalizing procedures to be reusable
 //! - Error-solution pair learning
 
-use regex::Regex;
 #[allow(unused_imports)]
 use crate::traits::{ErrorSolution, Message, Procedure};
 use chrono::Utc;
+use regex::Regex;
 use std::sync::OnceLock;
 
 // Pre-compiled regexes for better performance
@@ -65,28 +65,25 @@ fn summarize_tool_args(tool_name: &str, args_json: &str) -> String {
                 })
                 .unwrap_or_else(|| "cmd".to_string())
         }
-        "remember_fact" => {
-            args.get("category")
-                .and_then(|c| c.as_str())
-                .unwrap_or("fact")
-                .to_string()
-        }
-        "web_search" => {
-            args.get("query")
-                .and_then(|q| q.as_str())
-                .map(|q| {
-                    let words: Vec<&str> = q.split_whitespace().take(2).collect();
-                    words.join(" ")
-                })
-                .unwrap_or_else(|| "query".to_string())
-        }
+        "remember_fact" => args
+            .get("category")
+            .and_then(|c| c.as_str())
+            .unwrap_or("fact")
+            .to_string(),
+        "web_search" => args
+            .get("query")
+            .and_then(|q| q.as_str())
+            .map(|q| {
+                let words: Vec<&str> = q.split_whitespace().take(2).collect();
+                words.join(" ")
+            })
+            .unwrap_or_else(|| "query".to_string()),
         "web_fetch" => "url".to_string(),
-        "browser" => {
-            args.get("action")
-                .and_then(|a| a.as_str())
-                .unwrap_or("action")
-                .to_string()
-        }
+        "browser" => args
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("action")
+            .to_string(),
         _ => "...".to_string(),
     }
 }
@@ -162,11 +159,7 @@ pub fn extract_trigger_pattern(task_context: &str) -> String {
 }
 
 /// Create a new Procedure from task context.
-pub fn create_procedure(
-    name: String,
-    trigger_pattern: String,
-    steps: Vec<String>,
-) -> Procedure {
+pub fn create_procedure(name: String, trigger_pattern: String, steps: Vec<String>) -> Procedure {
     let now = Utc::now();
     Procedure {
         id: 0, // Will be set by database
@@ -252,7 +245,10 @@ mod tests {
 
     #[test]
     fn test_generate_procedure_name() {
-        assert_eq!(generate_procedure_name("Build the Rust project"), "rust-build");
+        assert_eq!(
+            generate_procedure_name("Build the Rust project"),
+            "rust-build"
+        );
         assert_eq!(generate_procedure_name("Run the tests"), "run-tests");
         assert_eq!(generate_procedure_name("Deploy to production"), "deploy");
     }

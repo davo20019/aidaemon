@@ -6,17 +6,17 @@
 //! - Provides explicit step-by-step progress tracking
 //! - Supports resume capability for long-running tasks
 
-mod store;
 mod detection;
 mod generation;
-mod tracking;
 mod recovery;
+mod store;
+mod tracking;
 
-pub use store::PlanStore;
-pub use detection::{should_create_plan, get_plan_suggestion_prompt};
+pub use detection::{get_plan_suggestion_prompt, should_create_plan};
 pub use generation::generate_plan_steps;
-pub use tracking::StepTracker;
 pub use recovery::PlanRecovery;
+pub use store::PlanStore;
+pub use tracking::StepTracker;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

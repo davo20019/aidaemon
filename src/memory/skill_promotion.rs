@@ -53,7 +53,10 @@ impl SkillPromoter {
         for procedure in &promotable {
             // Skip if a skill with this name already exists
             let candidate_name = procedure.name.to_lowercase().replace(' ', "-");
-            if existing_names.iter().any(|n| n.to_lowercase() == candidate_name) {
+            if existing_names
+                .iter()
+                .any(|n| n.to_lowercase() == candidate_name)
+            {
                 continue;
             }
 

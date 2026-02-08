@@ -237,7 +237,10 @@ impl ProbeExecutor {
                 let latency = start.elapsed().as_millis() as u32;
                 ProbeResult::new(probe.id.clone(), ProbeStatus::Timeout)
                     .with_latency(latency)
-                    .with_error(format!("Probe timed out after {}s", probe.config.timeout_secs))
+                    .with_error(format!(
+                        "Probe timed out after {}s",
+                        probe.config.timeout_secs
+                    ))
             }
         };
 
@@ -258,10 +261,8 @@ impl ProbeExecutor {
             ProbeType::Command => Self::execute_command(probe).await,
             ProbeType::File => Self::execute_file(probe).await,
             ProbeType::Port => Self::execute_port(probe).await,
-            ProbeType::Custom => {
-                ProbeResult::new(probe.id.clone(), ProbeStatus::Error)
-                    .with_error("Custom probes not implemented")
-            }
+            ProbeType::Custom => ProbeResult::new(probe.id.clone(), ProbeStatus::Error)
+                .with_error("Custom probes not implemented"),
         }
     }
 
@@ -339,7 +340,8 @@ impl ProbeExecutor {
             .with_body(&body);
 
         if !status_ok {
-            result = result.with_error(format!("Expected status {}, got {}", expected, status_code));
+            result =
+                result.with_error(format!("Expected status {}, got {}", expected, status_code));
         } else if !body_ok {
             result = result.with_error(format!(
                 "Response body does not contain expected text: {:?}",
@@ -396,11 +398,9 @@ impl ProbeExecutor {
 
                 result
             }
-            Err(e) => {
-                ProbeResult::new(probe.id.clone(), ProbeStatus::Error)
-                    .with_latency(latency)
-                    .with_error(format!("Failed to execute command: {}", e))
-            }
+            Err(e) => ProbeResult::new(probe.id.clone(), ProbeStatus::Error)
+                .with_latency(latency)
+                .with_error(format!("Failed to execute command: {}", e)),
         }
     }
 
@@ -420,30 +420,28 @@ impl ProbeExecutor {
         // Check file age if max_age_secs is specified
         if let Some(max_age) = probe.config.max_age_secs {
             match std::fs::metadata(path) {
-                Ok(meta) => {
-                    match meta.modified() {
-                        Ok(modified) => {
-                            let age = modified.elapsed().unwrap_or_default();
-                            let latency = start.elapsed().as_millis() as u32;
+                Ok(meta) => match meta.modified() {
+                    Ok(modified) => {
+                        let age = modified.elapsed().unwrap_or_default();
+                        let latency = start.elapsed().as_millis() as u32;
 
-                            if age.as_secs() > max_age {
-                                return ProbeResult::new(probe.id.clone(), ProbeStatus::Unhealthy)
-                                    .with_latency(latency)
-                                    .with_error(format!(
-                                        "File is too old: {} seconds (max: {})",
-                                        age.as_secs(),
-                                        max_age
-                                    ));
-                            }
-                        }
-                        Err(e) => {
-                            let latency = start.elapsed().as_millis() as u32;
-                            return ProbeResult::new(probe.id.clone(), ProbeStatus::Error)
+                        if age.as_secs() > max_age {
+                            return ProbeResult::new(probe.id.clone(), ProbeStatus::Unhealthy)
                                 .with_latency(latency)
-                                .with_error(format!("Cannot read file modification time: {}", e));
+                                .with_error(format!(
+                                    "File is too old: {} seconds (max: {})",
+                                    age.as_secs(),
+                                    max_age
+                                ));
                         }
                     }
-                }
+                    Err(e) => {
+                        let latency = start.elapsed().as_millis() as u32;
+                        return ProbeResult::new(probe.id.clone(), ProbeStatus::Error)
+                            .with_latency(latency)
+                            .with_error(format!("Cannot read file modification time: {}", e));
+                    }
+                },
                 Err(e) => {
                     let latency = start.elapsed().as_millis() as u32;
                     return ProbeResult::new(probe.id.clone(), ProbeStatus::Error)
@@ -454,8 +452,7 @@ impl ProbeExecutor {
         }
 
         let latency = start.elapsed().as_millis() as u32;
-        ProbeResult::new(probe.id.clone(), ProbeStatus::Healthy)
-            .with_latency(latency)
+        ProbeResult::new(probe.id.clone(), ProbeStatus::Healthy).with_latency(latency)
     }
 
     /// Execute a port probe (TCP connectivity).
@@ -475,8 +472,7 @@ impl ProbeExecutor {
                 let _ = stream.shutdown().await;
 
                 debug!(target = %target, latency_ms = latency, "Port probe healthy");
-                ProbeResult::new(probe.id.clone(), ProbeStatus::Healthy)
-                    .with_latency(latency)
+                ProbeResult::new(probe.id.clone(), ProbeStatus::Healthy).with_latency(latency)
             }
             Err(e) => {
                 let latency = start.elapsed().as_millis() as u32;
@@ -516,8 +512,8 @@ mod tests {
     #[test]
     fn test_probe_result_body_truncation() {
         let long_body = "x".repeat(2000);
-        let result = ProbeResult::new("test".to_string(), ProbeStatus::Healthy)
-            .with_body(long_body);
+        let result =
+            ProbeResult::new("test".to_string(), ProbeStatus::Healthy).with_body(long_body);
 
         assert!(result.response_body.as_ref().unwrap().len() <= 1024);
         assert!(result.response_body.as_ref().unwrap().ends_with("..."));

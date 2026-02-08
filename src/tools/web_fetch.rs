@@ -16,7 +16,12 @@ pub fn validate_url_for_ssrf(url: &str) -> Result<(), String> {
     // 1. Only allow http and https schemes
     match parsed.scheme() {
         "http" | "https" => {}
-        scheme => return Err(format!("Blocked scheme '{}': only http/https allowed", scheme)),
+        scheme => {
+            return Err(format!(
+                "Blocked scheme '{}': only http/https allowed",
+                scheme
+            ))
+        }
     }
 
     // 2. Must have a host
@@ -181,10 +186,28 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
 pub fn build_browser_client() -> Client {
     Client::builder()
         .timeout(Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:142.0) Gecko/20100101 Firefox/142.0")
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            // Re-validate each redirect hop against SSRF rules
+            let url = attempt.url().to_string();
+            if let Err(_reason) = validate_url_for_ssrf(&url) {
+                attempt.stop()
+            } else if attempt.previous().len() >= 10 {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+        .user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:142.0) Gecko/20100101 Firefox/142.0",
+        )
         .default_headers({
             let mut h = reqwest::header::HeaderMap::new();
-            h.insert("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".parse().unwrap());
+            h.insert(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                    .parse()
+                    .unwrap(),
+            );
             h.insert("Accept-Language", "en-US,en;q=0.5".parse().unwrap());
             h.insert("Accept-Encoding", "gzip, deflate, br".parse().unwrap());
             h.insert("DNT", "1".parse().unwrap());

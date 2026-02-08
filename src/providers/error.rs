@@ -118,7 +118,11 @@ impl ProviderError {
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(status) = self.status {
-            write!(f, "Provider error ({}, {:?}): {}", status, self.kind, self.message)
+            write!(
+                f,
+                "Provider error ({}, {:?}): {}",
+                status, self.kind, self.message
+            )
         } else {
             write!(f, "Provider error ({:?}): {}", self.kind, self.message)
         }

@@ -10,17 +10,19 @@ use futures::stream::StreamExt;
 use futures::SinkExt;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
-use super::formatting::{build_help_text, format_number, markdown_to_slack_mrkdwn, sanitize_filename, split_message};
+use super::formatting::{
+    build_help_text, format_number, markdown_to_slack_mrkdwn, sanitize_filename, split_message,
+};
 use crate::agent::Agent;
-use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 use crate::channels::{ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
+use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 
 /// Maximum message length for Slack (actual limit is 40,000 but leave margin).
 const MAX_MESSAGE_LEN: usize = 39_000;
@@ -209,9 +211,11 @@ impl SlackChannel {
                     };
 
                     // Acknowledge the envelope immediately
-                    if let Some(envelope_id) = envelope.get("envelope_id").and_then(|v| v.as_str()) {
+                    if let Some(envelope_id) = envelope.get("envelope_id").and_then(|v| v.as_str())
+                    {
                         let ack = serde_json::json!({ "envelope_id": envelope_id });
-                        let ack_msg = tokio_tungstenite::tungstenite::Message::Text(ack.to_string());
+                        let ack_msg =
+                            tokio_tungstenite::tungstenite::Message::Text(ack.to_string());
                         if let Err(e) = ws_tx.send(ack_msg).await {
                             warn!("Failed to ack envelope: {}", e);
                         }
@@ -219,7 +223,10 @@ impl SlackChannel {
 
                     // Handle disconnect events
                     if envelope.get("type").and_then(|v| v.as_str()) == Some("disconnect") {
-                        let reason = envelope.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let reason = envelope
+                            .get("reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
                         info!(reason, "Slack requested disconnect");
                         break;
                     }
@@ -257,7 +264,10 @@ impl SlackChannel {
 
         let body: Value = resp.json().await?;
         if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error = body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let error = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             anyhow::bail!("apps.connections.open failed: {}", error);
         }
 
@@ -327,6 +337,12 @@ impl SlackChannel {
         }
     }
 
+    /// Convert `@DisplayName` mentions in outgoing text back to Slack's `<@USERID>` format.
+    async fn restore_user_mentions(&self, text: &str) -> String {
+        let cache = self.user_cache.read().await;
+        restore_mentions_from_cache(text, &cache)
+    }
+
     /// Resolve all `<@USERID>` mentions in a text string to display names.
     /// Replaces e.g. `<@U04FL1J2V6>` with `@Alice` (or leaves unchanged if unresolvable).
     async fn resolve_user_mentions(&self, text: &str) -> String {
@@ -385,7 +401,10 @@ impl SlackChannel {
         } else {
             debug!(
                 channel_id,
-                error = json.get("error").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                error = json
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
                 "Failed to resolve channel name"
             );
             None
@@ -489,7 +508,10 @@ impl SlackChannel {
             .await?;
         let body: Value = resp.json().await?;
         if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error = body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let error = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             anyhow::bail!("Slack API {} failed: {}", method, error);
         }
         Ok(body)
@@ -502,13 +524,22 @@ impl SlackChannel {
             .http
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(body)
+            .header("Content-Type", "application/json; charset=utf-8")
+            .body(serde_json::to_vec(body)?)
             .send()
             .await?;
         let result: Value = resp.json().await?;
         if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-            anyhow::bail!("Slack API {} failed: {}", method, error);
+            let error = result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!(
+                "Slack API {} failed: {} (response: {})",
+                method,
+                error,
+                result
+            );
         }
         Ok(result)
     }
@@ -580,25 +611,40 @@ impl SlackChannel {
             None => return,
         };
 
-        let raw_text = event.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let channel_type = event.get("channel_type").and_then(|v| v.as_str()).unwrap_or("");
+        let raw_text = event
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let channel_type = event
+            .get("channel_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         // Determine user role: Owner if whitelisted, Public if @mention/DM, otherwise ignore
-        let is_whitelisted = !self.allowed_user_ids.is_empty() && self.allowed_user_ids.contains(&user);
-        let user_role = if is_whitelisted {
-            UserRole::Owner
-        } else {
-            // Check if user @mentioned the bot or sent a DM
+        let is_whitelisted =
+            !self.allowed_user_ids.is_empty() && self.allowed_user_ids.contains(&user);
+
+        // Check if the message mentions the bot
+        let bot_mentioned = {
             let bot_id_guard = self.bot_user_id.lock().await;
-            let is_mention = if let Some(ref bid) = *bot_id_guard {
+            if let Some(ref bid) = *bot_id_guard {
                 raw_text.contains(&format!("<@{}>", bid))
             } else {
                 false
-            };
-            drop(bot_id_guard);
-            let is_dm = channel_type == "im";
+            }
+        };
+        let is_dm = channel_type == "im";
 
-            if is_mention || is_dm {
+        let user_role = if is_whitelisted {
+            // Owner in a non-DM channel who didn't mention the bot and is mentioning
+            // someone else — they're talking to that person, not the bot. Stay silent.
+            if !is_dm && !bot_mentioned && raw_text.contains("<@") {
+                return;
+            }
+            UserRole::Owner
+        } else {
+            if bot_mentioned || is_dm {
                 UserRole::Public
             } else {
                 // Non-whitelisted user, no @mention, not a DM — silently ignore
@@ -610,7 +656,10 @@ impl SlackChannel {
         let text = {
             let bot_id_guard = self.bot_user_id.lock().await;
             let stripped = if let Some(ref bid) = *bot_id_guard {
-                raw_text.replace(&format!("<@{}>", bid), "").trim().to_string()
+                raw_text
+                    .replace(&format!("<@{}>", bid), "")
+                    .trim()
+                    .to_string()
             } else {
                 raw_text.clone()
             };
@@ -619,7 +668,11 @@ impl SlackChannel {
             self.resolve_user_mentions(&stripped).await
         };
 
-        let ts = event.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let ts = event
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let thread_ts = event
             .get("thread_ts")
             .and_then(|v| v.as_str())
@@ -632,7 +685,13 @@ impl SlackChannel {
                     Ok(ctx) => Some(ctx),
                     Err(e) => {
                         let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
-                        let _ = self.post_message(&channel_id, &format!("File error: {}", e), reply_thread.as_deref()).await;
+                        let _ = self
+                            .post_message(
+                                &channel_id,
+                                &format!("File error: {}", e),
+                                reply_thread.as_deref(),
+                            )
+                            .await;
                         return;
                     }
                 }
@@ -652,18 +711,46 @@ impl SlackChannel {
         };
 
         // Handle slash commands sent as text (block Public users)
-        if agent_text.starts_with('/') {
+        // Accept both /command and !command (Slack reserves / for native slash commands)
+        if agent_text.starts_with('/') || agent_text.starts_with('!') {
             if user_role == UserRole::Public {
                 let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
-                let _ = self.post_message(&channel_id, "Commands are not available for public users.", reply_thread.as_deref()).await;
+                let _ = self
+                    .post_message(
+                        &channel_id,
+                        "Commands are not available for public users.",
+                        reply_thread.as_deref(),
+                    )
+                    .await;
                 return;
             }
             let session_id = self.build_session_id(&channel_id, thread_ts.as_deref());
             let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
-            let reply = self.dispatch_command(&agent_text, &session_id).await;
+            let (reply, buttons) = self.dispatch_command_with_buttons(&agent_text, &session_id).await;
             let mrkdwn = markdown_to_slack_mrkdwn(&reply);
-            for chunk in split_message(&mrkdwn, MAX_MESSAGE_LEN) {
-                let _ = self.post_message(&channel_id, &chunk, reply_thread.as_deref()).await;
+            let chunks = split_message(&mrkdwn, MAX_MESSAGE_LEN);
+            let last_idx = chunks.len().saturating_sub(1);
+            for (i, chunk) in chunks.into_iter().enumerate() {
+                // Attach buttons to the last chunk only
+                if i == last_idx && !buttons.is_empty() {
+                    let blocks = serde_json::json!([
+                        {
+                            "type": "section",
+                            "text": { "type": "mrkdwn", "text": &chunk }
+                        },
+                        {
+                            "type": "actions",
+                            "elements": buttons
+                        }
+                    ]);
+                    let _ = self
+                        .post_message_with_blocks(&channel_id, &chunk, blocks, reply_thread.as_deref())
+                        .await;
+                } else {
+                    let _ = self
+                        .post_message(&channel_id, &chunk, reply_thread.as_deref())
+                        .await;
+                }
             }
             return;
         }
@@ -678,6 +765,35 @@ impl SlackChannel {
         };
 
         let session_id = self.build_session_id(&channel_id, reply_thread.as_deref());
+
+        // Handle cancel/stop commands - these bypass the queue
+        let text_lower = agent_text.to_lowercase();
+        if text_lower == "cancel" || text_lower == "stop" || text_lower == "abort" {
+            let cancelled = self
+                .task_registry
+                .cancel_running_for_session(&session_id)
+                .await;
+            self.task_registry.clear_queue(&session_id).await;
+            if cancelled.is_empty() {
+                let _ = self
+                    .post_message(
+                        &channel_id,
+                        "No running task to cancel.",
+                        reply_thread.as_deref(),
+                    )
+                    .await;
+            } else {
+                let desc = cancelled
+                    .first()
+                    .map(|(_, d)| d.as_str())
+                    .unwrap_or("unknown");
+                let response = format!("⏹️ Cancelled: {}", desc);
+                let _ = self
+                    .post_message(&channel_id, &response, reply_thread.as_deref())
+                    .await;
+            }
+            return;
+        }
 
         // Register this session with the channel hub
         {
@@ -709,16 +825,47 @@ impl SlackChannel {
                 channel_name,
                 channel_id: Some(format!("slack:{}", channel_id)),
                 sender_name,
+                sender_id: Some(format!("slack:{}", user)),
                 channel_member_names,
                 user_id_map,
+                trusted: false,
             }
         };
 
         info!(session_id, user_id = %user, "Received Slack message");
 
+        // Check if a task is already running for this session - if so, queue this message
+        if self.task_registry.has_running_task(&session_id).await {
+            let queue_pos = self
+                .task_registry
+                .queue_message(&session_id, &agent_text)
+                .await;
+            let current_task = self
+                .task_registry
+                .get_running_task_description(&session_id)
+                .await
+                .unwrap_or_else(|| "processing".to_string());
+            let preview: String = agent_text.chars().take(50).collect();
+            let suffix = if agent_text.len() > 50 { "..." } else { "" };
+            let _ = self
+                .post_message(
+                    &channel_id,
+                    &format!(
+                        "📥 Queued ({}): \"{}{}\" | Currently: {}",
+                        queue_pos, preview, suffix, current_task
+                    ),
+                    reply_thread.as_deref(),
+                )
+                .await;
+            return;
+        }
+
         // Create heartbeat for watchdog — agent bumps this on every activity point.
         let heartbeat = Arc::new(AtomicU64::new(
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         ));
 
         // Typing indicator via reaction
@@ -729,10 +876,14 @@ impl SlackChannel {
         let typing_token = typing_cancel.clone();
         tokio::spawn(async move {
             // Add hourglass reaction as typing indicator
-            let _ = typing_self.add_reaction(&typing_channel, &typing_ts, "hourglass_flowing_sand").await;
+            let _ = typing_self
+                .add_reaction(&typing_channel, &typing_ts, "hourglass_flowing_sand")
+                .await;
             typing_token.cancelled().await;
             // Remove when done
-            let _ = typing_self.remove_reaction(&typing_channel, &typing_ts, "hourglass_flowing_sand").await;
+            let _ = typing_self
+                .remove_reaction(&typing_channel, &typing_ts, "hourglass_flowing_sand")
+                .await;
         });
 
         // Watchdog: periodically check heartbeat staleness
@@ -793,7 +944,10 @@ impl SlackChannel {
                     continue;
                 }
                 let now = tokio::time::Instant::now();
-                if now.duration_since(last_sent) < min_interval {
+                // Skip rate limiting for ToolProgress with URLs (e.g., OAuth authorize links)
+                let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
+                    if chunk.contains("https://") || chunk.contains("http://"));
+                if !has_url && now.duration_since(last_sent) < min_interval {
                     continue;
                 }
                 let text = match &update {
@@ -806,11 +960,16 @@ impl SlackChannel {
                         }
                     }
                     StatusUpdate::ToolProgress { name, chunk } => {
-                        let preview: String = chunk.chars().take(100).collect();
-                        if chunk.len() > 100 {
-                            format!("_📤 {}: {}..._", name, preview)
+                        // Don't truncate if the chunk contains a URL (e.g., OAuth authorize links)
+                        if chunk.contains("https://") || chunk.contains("http://") {
+                            format!("_📤 {}_\n{}", name, chunk)
                         } else {
-                            format!("_📤 {}: {}_", name, preview)
+                            let preview: String = chunk.chars().take(100).collect();
+                            if chunk.len() > 100 {
+                                format!("_📤 {}: {}..._", name, preview)
+                            } else {
+                                format!("_📤 {}: {}_", name, preview)
+                            }
                         }
                     }
                     StatusUpdate::ToolComplete { name, summary } => {
@@ -819,42 +978,101 @@ impl SlackChannel {
                     StatusUpdate::ToolCancellable { name, task_id } => {
                         format!("_⏳ {} started (task_id: {})_", name, task_id)
                     }
-                    StatusUpdate::ProgressSummary { elapsed_mins, summary } => {
+                    StatusUpdate::ProgressSummary {
+                        elapsed_mins,
+                        summary,
+                    } => {
                         format!("_📊 Progress ({} min): {}_", elapsed_mins, summary)
                     }
                     StatusUpdate::IterationWarning { current, threshold } => {
-                        format!("_⚠️ Approaching soft limit: {} of {} iterations_", current, threshold)
+                        format!(
+                            "_⚠️ Approaching soft limit: {} of {} iterations_",
+                            current, threshold
+                        )
                     }
-                    StatusUpdate::PlanCreated { description, total_steps, .. } => {
+                    StatusUpdate::PlanCreated {
+                        description,
+                        total_steps,
+                        ..
+                    } => {
                         format!("_📋 Plan created: {} ({} steps)_", description, total_steps)
                     }
-                    StatusUpdate::PlanStepStart { step_index, total_steps, description, .. } => {
-                        format!("_▶️ Step {}/{}: {}_", step_index + 1, total_steps, description)
+                    StatusUpdate::PlanStepStart {
+                        step_index,
+                        total_steps,
+                        description,
+                        ..
+                    } => {
+                        format!(
+                            "_▶️ Step {}/{}: {}_",
+                            step_index + 1,
+                            total_steps,
+                            description
+                        )
                     }
-                    StatusUpdate::PlanStepComplete { step_index, total_steps, description, summary, .. } => {
-                        let base = format!("_✅ Step {}/{} done: {}", step_index + 1, total_steps, description);
+                    StatusUpdate::PlanStepComplete {
+                        step_index,
+                        total_steps,
+                        description,
+                        summary,
+                        ..
+                    } => {
+                        let base = format!(
+                            "_✅ Step {}/{} done: {}",
+                            step_index + 1,
+                            total_steps,
+                            description
+                        );
                         if let Some(s) = summary {
                             format!("{} - {}_", base, s)
                         } else {
                             format!("{}_", base)
                         }
                     }
-                    StatusUpdate::PlanStepFailed { step_index, description, error, .. } => {
-                        format!("_❌ Step {} failed: {} - {}_", step_index + 1, description, error)
+                    StatusUpdate::PlanStepFailed {
+                        step_index,
+                        description,
+                        error,
+                        ..
+                    } => {
+                        format!(
+                            "_❌ Step {} failed: {} - {}_",
+                            step_index + 1,
+                            description,
+                            error
+                        )
                     }
-                    StatusUpdate::PlanComplete { description, total_steps, duration_secs, .. } => {
+                    StatusUpdate::PlanComplete {
+                        description,
+                        total_steps,
+                        duration_secs,
+                        ..
+                    } => {
                         let mins = duration_secs / 60;
                         let secs = duration_secs % 60;
-                        format!("_🎉 Plan complete: {} ({} steps in {}m {}s)_", description, total_steps, mins, secs)
+                        format!(
+                            "_🎉 Plan complete: {} ({} steps in {}m {}s)_",
+                            description, total_steps, mins, secs
+                        )
                     }
                     StatusUpdate::PlanAbandoned { description, .. } => {
                         format!("_🚫 Plan abandoned: {}_", description)
                     }
-                    StatusUpdate::PlanRevised { description, reason, new_total_steps, .. } => {
-                        format!("_🔄 Plan revised: {} ({} steps) - {}_", description, new_total_steps, reason)
+                    StatusUpdate::PlanRevised {
+                        description,
+                        reason,
+                        new_total_steps,
+                        ..
+                    } => {
+                        format!(
+                            "_🔄 Plan revised: {} ({} steps) - {}_",
+                            description, new_total_steps, reason
+                        )
                     }
                 };
-                let _ = status_self.post_message(&status_channel, &text, status_thread.as_deref()).await;
+                let _ = status_self
+                    .post_message(&status_channel, &text, status_thread.as_deref())
+                    .await;
                 last_sent = tokio::time::Instant::now();
             }
         });
@@ -869,46 +1087,159 @@ impl SlackChannel {
         let reply_thread_ts = reply_thread.clone();
         let bot_token = self.bot_token.clone();
         let http = self.http.clone();
+        // Snapshot user_cache for restoring @mentions in the reply
+        let user_cache_snapshot = self.user_cache.read().await.clone();
         tokio::spawn(async move {
-            let result = tokio::select! {
-                r = agent.handle_message(&session_id, &agent_text, Some(status_tx), user_role, channel_ctx, Some(heartbeat)) => r,
-                _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
-            };
-            typing_cancel.cancel();
-            let _ = status_task.await;
+            let mut current_text = agent_text;
+            let mut current_task_id = task_id;
+            let mut current_cancel_token = cancel_token;
+            let mut current_status_tx = status_tx;
+            let mut current_typing_cancel = typing_cancel;
+            let mut current_status_task = status_task;
+            let mut current_heartbeat = heartbeat;
 
-            match result {
-                Ok(reply) => {
-                    registry.complete(task_id).await;
-                    let mrkdwn = markdown_to_slack_mrkdwn(&reply);
-                    let chunks = split_message(&mrkdwn, MAX_MESSAGE_LEN);
-                    for chunk in &chunks {
+            loop {
+                let result = tokio::select! {
+                    r = agent.handle_message(&session_id, &current_text, Some(current_status_tx), user_role, channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
+                    _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
+                };
+                current_typing_cancel.cancel();
+                let _ = current_status_task.await;
+
+                match result {
+                    Ok(reply) => {
+                        registry.complete(current_task_id).await;
+                        let mrkdwn = markdown_to_slack_mrkdwn(&reply);
+                        // Restore @DisplayName → <@USERID> for proper Slack mentions
+                        let mrkdwn = restore_mentions_from_cache(&mrkdwn, &user_cache_snapshot);
+                        let chunks = split_message(&mrkdwn, MAX_MESSAGE_LEN);
+                        for chunk in &chunks {
+                            let _ = slack_post_message(
+                                &http,
+                                &bot_token,
+                                &reply_channel,
+                                chunk,
+                                reply_thread_ts.as_deref(),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        registry.fail(current_task_id, &error_msg).await;
+                        // Don't notify user about task cancellation
+                        if error_msg == "Task cancelled" {
+                            info!("Task #{} cancelled", current_task_id);
+                            return; // Exit loop on cancellation
+                        }
+                        warn!("Agent error: {}", e);
                         let _ = slack_post_message(
                             &http,
                             &bot_token,
                             &reply_channel,
-                            chunk,
+                            &format!("Error: {}", e),
                             reply_thread_ts.as_deref(),
-                        ).await;
+                        )
+                        .await;
                     }
                 }
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    registry.fail(task_id, &error_msg).await;
-                    warn!("Agent error: {}", e);
+
+                // Check if there are queued messages to process
+                if let Some(queued) = registry.pop_queued_message(&session_id).await {
+                    // Small delay to ensure previous message is fully committed to DB
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+
+                    info!(
+                        session_id,
+                        "Processing queued message: {}",
+                        queued.text.chars().take(50).collect::<String>()
+                    );
                     let _ = slack_post_message(
                         &http,
                         &bot_token,
                         &reply_channel,
-                        &format!("Error: {}", e),
+                        &format!(
+                            "_▶️ Processing queued: \"{}\"_",
+                            queued.text.chars().take(50).collect::<String>()
+                        ),
                         reply_thread_ts.as_deref(),
-                    ).await;
+                    )
+                    .await;
+
+                    // Set up for next iteration
+                    current_text = queued.text;
+                    let desc: String = current_text.chars().take(80).collect();
+                    let (new_task_id, new_cancel_token) =
+                        registry.register(&session_id, &desc).await;
+                    current_task_id = new_task_id;
+                    current_cancel_token = new_cancel_token;
+
+                    // Create new status channel for queued message
+                    let (new_status_tx, mut new_status_rx) =
+                        tokio::sync::mpsc::channel::<StatusUpdate>(16);
+                    current_status_tx = new_status_tx;
+
+                    let queued_status_channel = reply_channel.clone();
+                    let queued_status_thread = reply_thread_ts.clone();
+                    let queued_status_http = http.clone();
+                    let queued_status_token = bot_token.clone();
+                    current_status_task = tokio::spawn(async move {
+                        let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
+                        let min_interval = Duration::from_secs(3);
+                        while let Some(update) = new_status_rx.recv().await {
+                            // For queued messages, only show Thinking and ToolStart
+                            if !is_dm {
+                                continue;
+                            }
+                            let now = tokio::time::Instant::now();
+                            if now.duration_since(last_sent) < min_interval {
+                                continue;
+                            }
+                            let text = match &update {
+                                StatusUpdate::Thinking(iter) => {
+                                    format!("_Thinking... (step {})_", iter + 1)
+                                }
+                                StatusUpdate::ToolStart { name, summary } => {
+                                    if summary.is_empty() {
+                                        format!("_Using {}..._", name)
+                                    } else {
+                                        format!("_Using {}: {}..._", name, summary)
+                                    }
+                                }
+                                _ => continue,
+                            };
+                            let _ = slack_post_message(
+                                &queued_status_http,
+                                &queued_status_token,
+                                &queued_status_channel,
+                                &text,
+                                queued_status_thread.as_deref(),
+                            )
+                            .await;
+                            last_sent = tokio::time::Instant::now();
+                        }
+                    });
+
+                    // Fresh heartbeat for queued message
+                    let new_heartbeat = Arc::new(AtomicU64::new(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    ));
+                    current_heartbeat = new_heartbeat;
+
+                    // New typing cancel for queued message (no reaction-based indicator)
+                    current_typing_cancel = tokio_util::sync::CancellationToken::new();
+                } else {
+                    // No more queued messages, exit loop
+                    break;
                 }
             }
         });
     }
 
-    /// Handle interactive payloads (button clicks for approvals).
+    /// Handle interactive payloads (button clicks for approvals and command buttons).
     async fn handle_interactive(&self, payload: &Value) {
         let interaction_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if interaction_type != "block_actions" {
@@ -921,7 +1252,8 @@ impl SlackChannel {
             .unwrap_or("");
 
         // Authorization check: fail-closed - deny if no users configured or user not in list
-        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id.to_string()) {
+        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id.to_string())
+        {
             warn!(user_id, "Unauthorized Slack interactive action");
             return;
         }
@@ -932,7 +1264,37 @@ impl SlackChannel {
         };
 
         for action in actions {
-            let action_id = action.get("action_id").and_then(|v| v.as_str()).unwrap_or("");
+            let action_id = action
+                .get("action_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            // Handle command buttons (e.g., "cmd:restart", "cmd:reload")
+            if let Some(command) = action_id.strip_prefix("cmd:") {
+                let channel_id = payload
+                    .pointer("/channel/id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let thread_ts = payload
+                    .pointer("/message/thread_ts")
+                    .or_else(|| payload.pointer("/message/ts"))
+                    .and_then(|v| v.as_str());
+                let session_id = self.build_session_id(channel_id, thread_ts);
+                let cmd_text = format!("/{}", command);
+                let reply = self.dispatch_command(&cmd_text, &session_id).await;
+
+                // Respond via response_url to update the message
+                if let Some(response_url) = payload.get("response_url").and_then(|v| v.as_str()) {
+                    let mrkdwn = markdown_to_slack_mrkdwn(&reply);
+                    let updated = serde_json::json!({
+                        "replace_original": false,
+                        "text": mrkdwn,
+                    });
+                    let _ = self.http.post(response_url).json(&updated).send().await;
+                }
+                continue;
+            }
+
             let parts: Vec<&str> = action_id.splitn(3, ':').collect();
             if parts.len() != 3 || parts[0] != "approve" {
                 continue;
@@ -983,13 +1345,23 @@ impl SlackChannel {
 
     /// Handle slash commands from Slack.
     async fn handle_slash_command(&self, payload: &Value) {
-        let user_id = payload.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
-        let channel_id = payload.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
-        let command = payload.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let user_id = payload
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let channel_id = payload
+            .get("channel_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let command = payload
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let text_arg = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
         // Authorization check: fail-closed - deny if no users configured or user not in list
-        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id.to_string()) {
+        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id.to_string())
+        {
             warn!(user_id, "Unauthorized Slack slash command");
             return;
         }
@@ -1017,9 +1389,16 @@ impl SlackChannel {
     }
 
     /// Dispatch a command string and return the reply text.
+    /// Accepts both `/command` and `!command` syntax (Slack reserves `/` for native slash commands).
     async fn dispatch_command(&self, text: &str, session_id: &str) -> String {
         let parts: Vec<&str> = text.splitn(2, ' ').collect();
-        let cmd = parts[0];
+        // Normalize !prefix to /prefix so !restart works like /restart in Slack
+        let normalized_cmd = if let Some(stripped) = parts[0].strip_prefix('!') {
+            format!("/{}", stripped)
+        } else {
+            parts[0].to_string()
+        };
+        let cmd = normalized_cmd.as_str();
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
 
         match cmd {
@@ -1029,7 +1408,10 @@ impl SlackChannel {
                     format!("Current model: {}\n\nUsage: /model <model-name>", current)
                 } else {
                     self.agent.set_model(arg.to_string()).await;
-                    format!("Model switched to: {}\nAuto-routing disabled. Use /auto to re-enable.", arg)
+                    format!(
+                        "Model switched to: {}\nAuto-routing disabled. Use /auto to re-enable.",
+                        arg
+                    )
                 }
             }
             "/models" => match self.agent.list_models().await {
@@ -1122,18 +1504,61 @@ impl SlackChannel {
                     }
                 }
             }
-            "/clear" => {
-                match self.agent.clear_session(session_id).await {
-                    Ok(_) => "Context cleared. Starting fresh.".to_string(),
-                    Err(e) => format!("Failed to clear context: {}", e),
-                }
-            }
+            "/clear" => match self.agent.clear_session(session_id).await {
+                Ok(_) => "Context cleared. Starting fresh.".to_string(),
+                Err(e) => format!("Failed to clear context: {}", e),
+            },
             "/cost" => self.handle_cost_command().await,
-            "/help" | "/start" => {
-                build_help_text(true, false)
-            }
-            _ => format!("Unknown command: {}\nType /help for available commands.", cmd),
+            "/help" | "/start" => build_help_text(true, false, "!"),
+            _ => format!(
+                "Unknown command: {}\nType `!help` for available commands.",
+                cmd
+            ),
         }
+    }
+
+    /// Dispatch a command and return the reply text plus optional Block Kit buttons.
+    async fn dispatch_command_with_buttons(
+        &self,
+        text: &str,
+        session_id: &str,
+    ) -> (String, Vec<Value>) {
+        let reply = self.dispatch_command(text, session_id).await;
+
+        // Normalize the command to determine which buttons to show
+        let parts: Vec<&str> = text.splitn(2, ' ').collect();
+        let cmd = if let Some(stripped) = parts[0].strip_prefix('!') {
+            format!("/{}", stripped)
+        } else {
+            parts[0].to_string()
+        };
+
+        let buttons = match cmd.as_str() {
+            "/help" | "/start" => Self::command_action_buttons(&[
+                ("Restart", "cmd:restart"),
+                ("Reload", "cmd:reload"),
+                ("Clear", "cmd:clear"),
+                ("Cost", "cmd:cost"),
+            ]),
+            "/reload" => Self::command_action_buttons(&[("Restart", "cmd:restart")]),
+            _ => vec![],
+        };
+
+        (reply, buttons)
+    }
+
+    /// Build Block Kit button elements for command actions.
+    fn command_action_buttons(commands: &[(&str, &str)]) -> Vec<Value> {
+        commands
+            .iter()
+            .map(|(label, action_id)| {
+                serde_json::json!({
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": label },
+                    "action_id": action_id,
+                })
+            })
+            .collect()
     }
 
     async fn handle_cost_command(&self) -> String {
@@ -1154,12 +1579,12 @@ impl SlackChannel {
             Err(e) => return format!("Failed to query token usage: {}", e),
         };
 
-        let (input_24h, output_24h) = records_24h
-            .iter()
-            .fold((0i64, 0i64), |(i, o), r| (i + r.input_tokens, o + r.output_tokens));
-        let (input_7d, output_7d) = records_7d
-            .iter()
-            .fold((0i64, 0i64), |(i, o), r| (i + r.input_tokens, o + r.output_tokens));
+        let (input_24h, output_24h) = records_24h.iter().fold((0i64, 0i64), |(i, o), r| {
+            (i + r.input_tokens, o + r.output_tokens)
+        });
+        let (input_7d, output_7d) = records_7d.iter().fold((0i64, 0i64), |(i, o), r| {
+            (i + r.input_tokens, o + r.output_tokens)
+        });
 
         let mut model_totals: HashMap<&str, i64> = HashMap::new();
         for r in &records_7d {
@@ -1197,7 +1622,11 @@ impl SlackChannel {
     }
 
     /// Determine the thread_ts to use when replying.
-    fn reply_thread_ts(&self, message_ts: &str, existing_thread_ts: Option<&str>) -> Option<String> {
+    fn reply_thread_ts(
+        &self,
+        message_ts: &str,
+        existing_thread_ts: Option<&str>,
+    ) -> Option<String> {
         if self.use_threads {
             Some(existing_thread_ts.unwrap_or(message_ts).to_string())
         } else {
@@ -1215,6 +1644,25 @@ impl SlackChannel {
         let mut body = serde_json::json!({
             "channel": channel,
             "text": text,
+        });
+        if let Some(ts) = thread_ts {
+            body["thread_ts"] = Value::String(ts.to_string());
+        }
+        self.slack_api_post("chat.postMessage", &body).await
+    }
+
+    /// Post a message with Block Kit blocks (e.g., buttons) to a Slack channel.
+    async fn post_message_with_blocks(
+        &self,
+        channel: &str,
+        text: &str,
+        blocks: Value,
+        thread_ts: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        let mut body = serde_json::json!({
+            "channel": channel,
+            "text": text,
+            "blocks": blocks,
         });
         if let Some(ts) = thread_ts {
             body["thread_ts"] = Value::String(ts.to_string());
@@ -1302,12 +1750,30 @@ impl SlackChannel {
         data: &[u8],
         thread_ts: Option<&str>,
     ) -> anyhow::Result<()> {
-        // Step 1: Get upload URL
-        let mut params = serde_json::json!({
-            "filename": filename,
-            "length": data.len(),
-        });
-        let resp = self.slack_api_post("files.getUploadURLExternal", &params).await?;
+        // Step 1: Get upload URL (uses form-encoded, not JSON)
+        let url = "https://slack.com/api/files.getUploadURLExternal";
+        let form_resp = self
+            .http
+            .post(url)
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .form(&[
+                ("filename", filename.to_string()),
+                ("length", data.len().to_string()),
+            ])
+            .send()
+            .await?;
+        let resp: Value = form_resp.json().await?;
+        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let error = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!(
+                "Slack API files.getUploadURLExternal failed: {} (response: {})",
+                error,
+                resp
+            );
+        }
         let upload_url = resp
             .get("upload_url")
             .and_then(|v| v.as_str())
@@ -1319,40 +1785,49 @@ impl SlackChannel {
             .ok_or_else(|| anyhow::anyhow!("No file_id in response"))?
             .to_string();
 
-        // Step 2: Upload the file
-        self.http
-            .put(&upload_url)
+        // Step 2: Upload the file (Slack docs specify POST, not PUT)
+        let upload_resp = self
+            .http
+            .post(&upload_url)
+            .header("Content-Type", "application/octet-stream")
             .body(data.to_vec())
             .send()
             .await?;
-
-        // Step 3: Complete the upload
-        let file_obj = serde_json::json!({
-            "id": file_id,
-        });
-        params = serde_json::json!({
-            "files": [file_obj],
+        if !upload_resp.status().is_success() {
+            let status = upload_resp.status();
+            let body = upload_resp.text().await.unwrap_or_default();
+            anyhow::bail!("Slack file upload failed with status {}: {}", status, body);
+        }
+        // Step 3: Complete the upload and share to channel
+        let mut complete_params = serde_json::json!({
+            "files": [{"id": file_id, "title": filename}],
             "channel_id": channels,
         });
         if let Some(ts) = thread_ts {
-            params["thread_ts"] = Value::String(ts.to_string());
+            complete_params["thread_ts"] = Value::String(ts.to_string());
         }
-        self.slack_api_post("files.completeUploadExternal", &params).await?;
-
+        self.slack_api_post("files.completeUploadExternal", &complete_params)
+            .await?;
         Ok(())
     }
 
     /// Parse a session ID to get (channel_id, thread_ts).
     fn parse_session_id(&self, session_id: &str) -> (String, Option<String>) {
         // Strip bot name prefix if present: "{bot_name}:slack:..." -> "slack:..."
-        let without_prefix = if self.name() != "default" {
-            session_id.strip_prefix(&format!("{}:", self.name())).unwrap_or(session_id)
+        // session_id() prefixes with get_bot_name(), not name()/channel_name()
+        let bot_name = self.get_bot_name();
+        let without_prefix = if bot_name != "slack" {
+            session_id
+                .strip_prefix(&format!("{}:", bot_name))
+                .unwrap_or(session_id)
         } else {
             session_id
         };
 
         // Format: "slack:{channel_id}:{thread_ts}" or "slack:{channel_id}"
-        let stripped = without_prefix.strip_prefix("slack:").unwrap_or(without_prefix);
+        let stripped = without_prefix
+            .strip_prefix("slack:")
+            .unwrap_or(without_prefix);
         let parts: Vec<&str> = stripped.splitn(2, ':').collect();
         let channel_id = parts[0].to_string();
         let thread_ts = parts.get(1).map(|s| s.to_string());
@@ -1428,6 +1903,26 @@ impl SlackApiHandle {
     }
 }
 
+/// Convert `@DisplayName` mentions back to `<@USERID>` using a user cache snapshot.
+/// Standalone function usable outside of `&self` contexts (e.g., spawned tasks).
+fn restore_mentions_from_cache(text: &str, cache: &HashMap<String, String>) -> String {
+    if cache.is_empty() {
+        return text.to_string();
+    }
+    let mut result = text.to_string();
+    // Sort by name length descending so "David Loor" matches before "David"
+    let mut entries: Vec<_> = cache.iter().collect();
+    entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    for (user_id, name) in entries {
+        let mention = format!("@{}", name);
+        if result.contains(&mention) {
+            let slack_mention = format!("<@{}>", user_id);
+            result = result.replace(&mention, &slack_mention);
+        }
+    }
+    result
+}
+
 /// Free function to post a message via Slack Web API.
 async fn slack_post_message(
     http: &reqwest::Client,
@@ -1451,7 +1946,10 @@ async fn slack_post_message(
         .await?;
     let result: Value = resp.json().await?;
     if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let error = result
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         anyhow::bail!("chat.postMessage failed: {}", error);
     }
     Ok(result)
@@ -1475,8 +1973,11 @@ impl Channel for SlackChannel {
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
         let (channel_id, thread_ts) = self.parse_session_id(session_id);
         let mrkdwn = markdown_to_slack_mrkdwn(text);
+        // Convert @DisplayName back to <@USERID> so Slack renders proper mentions
+        let mrkdwn = self.restore_user_mentions(&mrkdwn).await;
         for chunk in split_message(&mrkdwn, MAX_MESSAGE_LEN) {
-            self.post_message(&channel_id, &chunk, thread_ts.as_deref()).await?;
+            self.post_message(&channel_id, &chunk, thread_ts.as_deref())
+                .await?;
         }
         Ok(())
     }
@@ -1485,27 +1986,21 @@ impl Channel for SlackChannel {
         let (channel_id, thread_ts) = self.parse_session_id(session_id);
         match &media.kind {
             MediaKind::Photo { data } => {
-                self.upload_file(
-                    &channel_id,
-                    "screenshot.png",
-                    data,
-                    thread_ts.as_deref(),
-                )
-                .await?;
+                self.upload_file(&channel_id, "screenshot.png", data, thread_ts.as_deref())
+                    .await?;
             }
-            MediaKind::Document { file_path, filename } => {
+            MediaKind::Document {
+                file_path,
+                filename,
+            } => {
                 let data = tokio::fs::read(file_path).await?;
-                self.upload_file(
-                    &channel_id,
-                    filename,
-                    &data,
-                    thread_ts.as_deref(),
-                )
-                .await?;
+                self.upload_file(&channel_id, filename, &data, thread_ts.as_deref())
+                    .await?;
             }
         }
         if !media.caption.is_empty() {
-            self.post_message(&channel_id, &media.caption, thread_ts.as_deref()).await?;
+            self.post_message(&channel_id, &media.caption, thread_ts.as_deref())
+                .await?;
         }
         Ok(())
     }
@@ -1552,10 +2047,7 @@ impl Channel for SlackChannel {
             RiskLevel::Critical => ("🚨", "Critical risk"),
         };
 
-        let mut message_text = format!(
-            "{} *{}*\n```{}```",
-            risk_icon, risk_label, command
-        );
+        let mut message_text = format!("{} *{}*\n```{}```", risk_icon, risk_label, command);
 
         if !warnings.is_empty() {
             message_text.push('\n');
@@ -1566,7 +2058,8 @@ impl Channel for SlackChannel {
 
         // Add explanation based on which button is shown
         if use_session_button {
-            message_text.push_str("\n\n_\"Allow Session\" approves this command type until restart._");
+            message_text
+                .push_str("\n\n_\"Allow Session\" approves this command type until restart._");
         } else {
             message_text.push_str("\n\n_\"Allow Always\" permanently approves this command type._");
         }

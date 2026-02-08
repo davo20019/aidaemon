@@ -144,12 +144,11 @@ impl EventStore {
     pub async fn delete_old_consolidated(&self, before: DateTime<Utc>) -> anyhow::Result<u64> {
         let before_str = before.to_rfc3339();
 
-        let result = sqlx::query(
-            "DELETE FROM events WHERE consolidated_at IS NOT NULL AND created_at < ?",
-        )
-        .bind(&before_str)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("DELETE FROM events WHERE consolidated_at IS NOT NULL AND created_at < ?")
+                .bind(&before_str)
+                .execute(&self.pool)
+                .await?;
 
         Ok(result.rows_affected())
     }
@@ -520,8 +519,12 @@ impl EventStore {
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Event>> {
-        self.query_events_by_types(session_id, &[EventType::ToolCall, EventType::ToolResult], limit)
-            .await
+        self.query_events_by_types(
+            session_id,
+            &[EventType::ToolCall, EventType::ToolResult],
+            limit,
+        )
+        .await
     }
 
     /// Get the last completed task for a session

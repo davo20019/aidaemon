@@ -173,7 +173,9 @@ impl HealthProbeTool {
 
         let probe_type = args.probe_type.as_deref().unwrap_or("").trim();
         if probe_type.is_empty() {
-            return Ok("Error: 'type' is required for create (http, port, command, file)".to_string());
+            return Ok(
+                "Error: 'type' is required for create (http, port, command, file)".to_string(),
+            );
         }
 
         let target = args.target.as_deref().unwrap_or("").trim();
@@ -188,7 +190,10 @@ impl HealthProbeTool {
 
         // Check if probe with this name already exists
         if self.store.get_probe_by_name(name).await?.is_some() {
-            return Ok(format!("Error: A probe with name '{}' already exists", name));
+            return Ok(format!(
+                "Error: A probe with name '{}' already exists",
+                name
+            ));
         }
 
         // Parse and validate schedule
@@ -402,7 +407,10 @@ impl HealthProbeTool {
 
         // Update last_run_at
         let now = Utc::now();
-        let _ = self.store.update_probe_run(&probe.id, now, probe.next_run_at).await;
+        let _ = self
+            .store
+            .update_probe_run(&probe.id, now, probe.next_run_at)
+            .await;
 
         info!(
             name = %probe.name,
@@ -510,8 +518,14 @@ impl HealthProbeTool {
             stats.check_count,
             stats.healthy_count,
             stats.uptime_percent,
-            stats.avg_latency_ms.map(|ms| format!("{}ms", ms)).unwrap_or_else(|| "N/A".to_string()),
-            stats.p95_latency_ms.map(|ms| format!("{}ms", ms)).unwrap_or_else(|| "N/A".to_string()),
+            stats
+                .avg_latency_ms
+                .map(|ms| format!("{}ms", ms))
+                .unwrap_or_else(|| "N/A".to_string()),
+            stats
+                .p95_latency_ms
+                .map(|ms| format!("{}ms", ms))
+                .unwrap_or_else(|| "N/A".to_string()),
         ))
     }
 }
