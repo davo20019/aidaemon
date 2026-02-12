@@ -35,102 +35,65 @@ impl PlanTrigger {
 
 /// Analyze a user message to determine if a plan should be created.
 pub fn should_create_plan(user_message: &str) -> PlanTrigger {
-    let lower = user_message.to_lowercase();
-    let words: Vec<&str> = lower.split_whitespace().collect();
-
-    // === AUTO-CREATE: High-stakes operations ===
-    // These are too risky to leave to LLM discretion
-
-    // Production deployments
-    if (lower.contains("deploy") || lower.contains("release") || lower.contains("ship"))
-        && (lower.contains("prod") || lower.contains("production") || lower.contains("live"))
-    {
-        return PlanTrigger::AutoCreate("production deployment".to_string());
+    let trimmed = user_message.trim();
+    if trimmed.is_empty() {
+        return PlanTrigger::None;
     }
 
-    // Database migrations
-    if lower.contains("migrat")
-        && (lower.contains("database") || lower.contains("db") || lower.contains("schema"))
-    {
-        return PlanTrigger::AutoCreate("database migration".to_string());
+    // Explicit command mode (no lexical guessing).
+    // Examples:
+    // - /plan auto production deployment
+    // - /plan suggest break into phases
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("/plan auto") {
+        let reason = rest.trim();
+        return PlanTrigger::AutoCreate(if reason.is_empty() {
+            "explicit /plan auto".to_string()
+        } else {
+            reason.to_string()
+        });
+    }
+    if let Some(rest) = lower.strip_prefix("/plan suggest") {
+        let reason = rest.trim();
+        return PlanTrigger::Suggest(if reason.is_empty() {
+            "explicit /plan suggest".to_string()
+        } else {
+            reason.to_string()
+        });
     }
 
-    // Bulk deletions
-    if lower.contains("delete")
-        && (lower.contains("all") || lower.contains("every") || lower.contains("bulk"))
-    {
-        return PlanTrigger::AutoCreate("bulk deletion".to_string());
+    // Explicit inline markers.
+    if let Some(reason) = parse_plan_marker(trimmed, "PLAN_AUTO") {
+        return PlanTrigger::AutoCreate(reason);
     }
-
-    // System upgrades
-    if lower.contains("upgrade")
-        && (lower.contains("system")
-            || lower.contains("server")
-            || lower.contains("infrastructure"))
-    {
-        return PlanTrigger::AutoCreate("system upgrade".to_string());
-    }
-
-    // === SUGGEST: Complex but not critical ===
-    // LLM decides based on context
-
-    // User explicitly wants planning
-    if lower.contains("step by step")
-        || lower.contains("step-by-step")
-        || lower.contains("create a plan")
-        || lower.contains("make a plan")
-        || lower.contains("plan out")
-        || lower.contains("plan for")
-    {
-        return PlanTrigger::Suggest("user requested planning".to_string());
-    }
-
-    // Refactoring tasks (often multi-step)
-    if lower.contains("refactor") {
-        return PlanTrigger::Suggest("refactoring task".to_string());
-    }
-
-    // Implementation tasks
-    if lower.contains("implement") && words.len() > 10 {
-        return PlanTrigger::Suggest("implementation task".to_string());
-    }
-
-    // Multi-phase indicators
-    let multi_phase_keywords = [
-        "then",
-        "after that",
-        "next",
-        "finally",
-        "first",
-        "second",
-        "third",
-        "and also",
-        "as well as",
-        "followed by",
-    ];
-    let multi_count = multi_phase_keywords
-        .iter()
-        .filter(|&&kw| lower.contains(kw))
-        .count();
-    if multi_count >= 2 {
-        return PlanTrigger::Suggest("multi-phase task".to_string());
-    }
-
-    // Long requests (>50 words often indicate complex tasks)
-    if words.len() > 50 {
-        return PlanTrigger::Suggest("complex request".to_string());
-    }
-
-    // Build/setup tasks
-    if (lower.contains("set up") || lower.contains("setup") || lower.contains("build"))
-        && (lower.contains("project")
-            || lower.contains("environment")
-            || lower.contains("pipeline"))
-    {
-        return PlanTrigger::Suggest("setup task".to_string());
+    if let Some(reason) = parse_plan_marker(trimmed, "PLAN_SUGGEST") {
+        return PlanTrigger::Suggest(reason);
     }
 
     PlanTrigger::None
+}
+
+/// Parse explicit marker forms:
+/// - [PLAN_AUTO]
+/// - [PLAN_AUTO: reason text]
+fn parse_plan_marker(text: &str, marker: &str) -> Option<String> {
+    let upper = text.to_ascii_uppercase();
+    let open = format!("[{}", marker);
+    let start = upper.find(&open)?;
+    let rest = &text[start + open.len()..];
+    let end = rest.find(']')?;
+    let inside = rest[..end].trim();
+    if inside.is_empty() {
+        return Some(format!("explicit {}", marker.to_ascii_lowercase()));
+    }
+    if let Some(reason) = inside.strip_prefix(':') {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Some(format!("explicit {}", marker.to_ascii_lowercase()));
+        }
+        return Some(reason.to_string());
+    }
+    None
 }
 
 /// Get a prompt hint for suggesting plan creation to the LLM.
@@ -152,79 +115,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_auto_create_production_deploy() {
-        let trigger = should_create_plan("Deploy the app to production");
-        assert!(trigger.is_auto_create());
-
-        let trigger = should_create_plan("release to prod");
-        assert!(trigger.is_auto_create());
-
-        let trigger = should_create_plan("ship it to production servers");
-        assert!(trigger.is_auto_create());
-    }
-
-    #[test]
-    fn test_auto_create_database_migration() {
-        let trigger = should_create_plan("Run the database migration");
-        assert!(trigger.is_auto_create());
-
-        let trigger = should_create_plan("migrate the schema");
-        assert!(trigger.is_auto_create());
-    }
-
-    #[test]
-    fn test_auto_create_bulk_delete() {
-        let trigger = should_create_plan("Delete all the old logs");
-        assert!(trigger.is_auto_create());
-
-        let trigger = should_create_plan("bulk delete inactive users");
-        assert!(trigger.is_auto_create());
-    }
-
-    #[test]
-    fn test_suggest_user_request() {
-        let trigger = should_create_plan("Help me step by step with this");
+    fn test_explicit_auto_command() {
+        let trigger = should_create_plan("/plan auto production deployment");
         assert_eq!(
             trigger,
-            PlanTrigger::Suggest("user requested planning".to_string())
+            PlanTrigger::AutoCreate("production deployment".to_string())
         );
+    }
+
+    #[test]
+    fn test_explicit_suggest_command() {
+        let trigger = should_create_plan("/plan suggest split into phases");
+        assert_eq!(
+            trigger,
+            PlanTrigger::Suggest("split into phases".to_string())
+        );
+    }
+
+    #[test]
+    fn test_explicit_auto_marker_with_reason() {
+        let trigger = should_create_plan("Please do this. [PLAN_AUTO: high-risk change]");
+        assert_eq!(
+            trigger,
+            PlanTrigger::AutoCreate("high-risk change".to_string())
+        );
+    }
+
+    #[test]
+    fn test_explicit_suggest_marker_without_reason() {
+        let trigger = should_create_plan("Please walk through this [PLAN_SUGGEST]");
+        assert_eq!(
+            trigger,
+            PlanTrigger::Suggest("explicit plan_suggest".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_heuristic_plan_detection() {
+        let trigger = should_create_plan("Deploy the app to production");
+        assert_eq!(trigger, PlanTrigger::None);
 
         let trigger = should_create_plan("Create a plan for the feature");
-        assert_eq!(
-            trigger,
-            PlanTrigger::Suggest("user requested planning".to_string())
-        );
-    }
-
-    #[test]
-    fn test_suggest_refactoring() {
-        let trigger = should_create_plan("Refactor the authentication module");
-        assert_eq!(
-            trigger,
-            PlanTrigger::Suggest("refactoring task".to_string())
-        );
-    }
-
-    #[test]
-    fn test_suggest_multi_phase() {
-        let trigger = should_create_plan(
-            "First update the config, then restart the service, and finally verify it works",
-        );
-        assert_eq!(
-            trigger,
-            PlanTrigger::Suggest("multi-phase task".to_string())
-        );
-    }
-
-    #[test]
-    fn test_no_plan_simple_request() {
-        let trigger = should_create_plan("What's the weather?");
         assert_eq!(trigger, PlanTrigger::None);
 
-        let trigger = should_create_plan("Fix the typo in README");
-        assert_eq!(trigger, PlanTrigger::None);
-
-        let trigger = should_create_plan("Show me the logs");
+        let trigger = should_create_plan("First do A, then do B");
         assert_eq!(trigger, PlanTrigger::None);
     }
 

@@ -1,27 +1,34 @@
 //! Automatic skill promotion from learned procedures.
 //!
 //! When a procedure has been successfully used many times (configurable threshold),
-//! it can be automatically promoted to a dynamic skill. This lets the agent
-//! turn repeated successful patterns into reusable, named skills.
+//! it can be automatically promoted to a skill draft pending user review.
+//! Drafts are stored in the `skill_drafts` table and can be approved or dismissed
+//! via the `manage_skills review` action.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::skills::{SharedSkillRegistry, Skill};
-use crate::traits::{DynamicSkill, ModelProvider, Procedure, StateStore};
+use crate::skills::{self, Skill};
+use crate::traits::{ModelProvider, Procedure, SkillDraft, StateStore};
 
 /// Minimum number of successes before a procedure is eligible for promotion.
 const DEFAULT_MIN_SUCCESS: i32 = 5;
 /// Minimum success rate (0.0 - 1.0) for promotion eligibility.
 const DEFAULT_MIN_RATE: f32 = 0.8;
+/// Stricter thresholds when evidence gate enforcement is enabled.
+const EVIDENCE_MIN_SUCCESS: i32 = 7;
+const EVIDENCE_MIN_RATE: f32 = 0.9;
+const EVIDENCE_MIN_MARGIN: i32 = 3;
 
 pub struct SkillPromoter {
     state: Arc<dyn StateStore>,
     provider: Arc<dyn ModelProvider>,
     fast_model: String,
-    registry: SharedSkillRegistry,
+    skills_dir: PathBuf,
+    evidence_gate_enforce: bool,
 }
 
 impl SkillPromoter {
@@ -29,29 +36,44 @@ impl SkillPromoter {
         state: Arc<dyn StateStore>,
         provider: Arc<dyn ModelProvider>,
         fast_model: String,
-        registry: SharedSkillRegistry,
+        skills_dir: PathBuf,
+        evidence_gate_enforce: bool,
     ) -> Self {
         Self {
             state,
             provider,
             fast_model,
-            registry,
+            skills_dir,
+            evidence_gate_enforce,
         }
     }
 
-    /// Run a full promotion cycle: find eligible procedures, generate skills, persist and register.
+    /// Run a full promotion cycle: find eligible procedures, generate skill drafts,
+    /// and insert them into the skill_drafts table for user review.
     pub async fn run_promotion_cycle(&self) -> anyhow::Result<usize> {
         let promotable = self.check_promotable_procedures().await?;
         if promotable.is_empty() {
             return Ok(0);
         }
 
-        let existing_skills = self.registry.snapshot_all().await;
+        let existing_skills = skills::load_skills(&self.skills_dir);
         let existing_names: Vec<&str> = existing_skills.iter().map(|s| s.name.as_str()).collect();
 
-        let mut promoted = 0;
+        let mut drafted = 0;
         for procedure in &promotable {
-            // Skip if a skill with this name already exists
+            if self.evidence_gate_enforce
+                && procedure.success_count - procedure.failure_count < EVIDENCE_MIN_MARGIN
+            {
+                info!(
+                    procedure = %procedure.name,
+                    success_count = procedure.success_count,
+                    failure_count = procedure.failure_count,
+                    "Skipping promotion: insufficient evidence margin"
+                );
+                continue;
+            }
+
+            // Skip if a skill with this name already exists on disk
             let candidate_name = procedure.name.to_lowercase().replace(' ', "-");
             if existing_names
                 .iter()
@@ -60,37 +82,38 @@ impl SkillPromoter {
                 continue;
             }
 
+            // Skip if a draft already exists for this procedure
+            if self
+                .state
+                .skill_draft_exists_for_procedure(&procedure.name)
+                .await?
+            {
+                continue;
+            }
+
             match self.promote_procedure(procedure).await {
                 Ok(Some(skill)) => {
-                    // Persist to database
+                    // Insert as draft, not directly to filesystem
                     let triggers_json = serde_json::to_string(&skill.triggers)?;
-                    let dynamic = DynamicSkill {
+                    let draft = SkillDraft {
                         id: 0,
                         name: skill.name.clone(),
                         description: skill.description.clone(),
                         triggers_json,
                         body: skill.body.clone(),
-                        source: "auto".to_string(),
-                        source_url: None,
-                        enabled: true,
-                        version: None,
+                        source_procedure: procedure.name.clone(),
+                        status: "pending".to_string(),
                         created_at: String::new(),
-                        resources_json: "[]".to_string(),
                     };
-                    let db_id = self.state.add_dynamic_skill(&dynamic).await?;
+                    self.state.add_skill_draft(&draft).await?;
 
-                    // Register
-                    let mut registered = skill;
-                    registered.id = Some(db_id);
-                    registered.source = Some("auto".to_string());
                     info!(
-                        name = %registered.name,
+                        name = %skill.name,
                         procedure = %procedure.name,
                         success_count = procedure.success_count,
-                        "Auto-promoted procedure to skill"
+                        "Auto-promoted procedure to skill draft (pending review)"
                     );
-                    self.registry.add(registered).await;
-                    promoted += 1;
+                    drafted += 1;
                 }
                 Ok(None) => {
                     // LLM decided not to promote
@@ -99,19 +122,24 @@ impl SkillPromoter {
                     warn!(
                         procedure = %procedure.name,
                         error = %e,
-                        "Failed to promote procedure to skill"
+                        "Failed to promote procedure to skill draft"
                     );
                 }
             }
         }
 
-        Ok(promoted)
+        Ok(drafted)
     }
 
     /// Query for procedures that meet the promotion threshold.
     async fn check_promotable_procedures(&self) -> anyhow::Result<Vec<Procedure>> {
+        let (min_success, min_rate) = if self.evidence_gate_enforce {
+            (EVIDENCE_MIN_SUCCESS, EVIDENCE_MIN_RATE)
+        } else {
+            (DEFAULT_MIN_SUCCESS, DEFAULT_MIN_RATE)
+        };
         self.state
-            .get_promotable_procedures(DEFAULT_MIN_SUCCESS, DEFAULT_MIN_RATE)
+            .get_promotable_procedures(min_success, min_rate)
             .await
     }
 
@@ -165,6 +193,15 @@ impl SkillPromoter {
         ];
 
         let response = self.provider.chat(&self.fast_model, &messages, &[]).await?;
+
+        // Track token usage for background LLM calls
+        if let Some(usage) = &response.usage {
+            let _ = self
+                .state
+                .record_token_usage("background:skill_promotion", usage)
+                .await;
+        }
+
         let text = response
             .content
             .ok_or_else(|| anyhow::anyhow!("Empty response from skill generation LLM"))?;
@@ -178,7 +215,6 @@ impl SkillPromoter {
         match Skill::parse(trimmed) {
             Some(mut skill) => {
                 skill.source = Some("auto".to_string());
-                skill.enabled = true;
                 Ok(Some(skill))
             }
             None => {

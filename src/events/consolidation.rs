@@ -60,6 +60,8 @@ pub struct Consolidator {
     provider: Option<Arc<dyn ModelProvider>>,
     fast_model: String,
     embedding_service: Option<Arc<EmbeddingService>>,
+    state: Option<Arc<dyn crate::traits::StateStore>>,
+    learning_evidence_gate_enforce: bool,
 }
 
 impl Consolidator {
@@ -78,7 +80,20 @@ impl Consolidator {
             provider,
             fast_model,
             embedding_service,
+            state: None,
+            learning_evidence_gate_enforce: false,
         }
+    }
+
+    /// Set the state store for token usage tracking.
+    pub fn with_state(mut self, state: Arc<dyn crate::traits::StateStore>) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    pub fn with_learning_evidence_gate(mut self, enforce: bool) -> Self {
+        self.learning_evidence_gate_enforce = enforce;
+        self
     }
 
     /// Consolidate events for a session into long-term memory
@@ -101,6 +116,14 @@ impl Consolidator {
         // 1. Extract and save procedures from successful task sequences
         let procedures = self.extract_procedures(&events).await;
         for proc in procedures {
+            if self.learning_evidence_gate_enforce && !self.procedure_meets_evidence_gate(&proc) {
+                info!(
+                    trigger = %proc.trigger_pattern,
+                    steps = proc.steps.len(),
+                    "Skipping procedure without sufficient evidence"
+                );
+                continue;
+            }
             if let Err(e) = self.save_procedure(&proc).await {
                 warn!("Failed to save procedure: {}", e);
             } else {
@@ -155,6 +178,16 @@ impl Consolidator {
                         None => proc,
                     };
 
+                    if self.learning_evidence_gate_enforce
+                        && !self.procedure_meets_evidence_gate(&final_proc)
+                    {
+                        info!(
+                            trigger = %final_proc.trigger_pattern,
+                            "Skipping plan-based procedure without evidence"
+                        );
+                        continue;
+                    }
+
                     if let Err(e) = self.save_procedure(&final_proc).await {
                         warn!("Failed to save plan-based procedure: {}", e);
                     } else {
@@ -200,6 +233,16 @@ impl Consolidator {
         );
 
         Ok(result)
+    }
+
+    fn procedure_meets_evidence_gate(&self, procedure: &Procedure) -> bool {
+        if procedure.steps.len() < 2 {
+            return false;
+        }
+        if procedure.failure_count > 0 {
+            return false;
+        }
+        procedure.success_count >= 1
     }
 
     /// Trigger: End of session/task
@@ -626,6 +669,13 @@ impl Consolidator {
                 return None;
             }
         };
+
+        // Track token usage for background LLM calls
+        if let (Some(state), Some(usage)) = (&self.state, &response.usage) {
+            let _ = state
+                .record_token_usage("background:consolidation", usage)
+                .await;
+        }
 
         let text = response.content?;
         let trimmed = text.trim();

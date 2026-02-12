@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{debug, error, info};
 
 use crate::config::PeopleConfig;
@@ -19,26 +18,7 @@ impl PeopleIntelligence {
         Self { state, config }
     }
 
-    /// Start background tasks for people intelligence.
-    /// Runs daily checks for upcoming dates, stale facts, and reconnect suggestions.
-    pub fn start_background_tasks(self: Arc<Self>) {
-        let pi = self.clone();
-        tokio::spawn(async move {
-            info!("People intelligence background tasks started");
-            // Wait 5 minutes after startup to avoid competing with other init tasks
-            tokio::time::sleep(Duration::from_secs(300)).await;
-
-            loop {
-                // Run daily checks
-                pi.run_daily_checks().await;
-
-                // Sleep until next check (24 hours)
-                tokio::time::sleep(Duration::from_secs(86400)).await;
-            }
-        });
-    }
-
-    async fn run_daily_checks(&self) {
+    pub async fn run_daily_checks(&self) {
         // Check runtime setting — skip if people intelligence is disabled
         let enabled = match self.state.get_setting("people_enabled").await {
             Ok(Some(val)) => val == "true",

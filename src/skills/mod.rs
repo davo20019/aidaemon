@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 pub mod resources;
@@ -27,86 +25,12 @@ pub struct Skill {
     /// URL this skill was fetched from (if source is "url")
     #[serde(default)]
     pub source_url: Option<String>,
-    /// Database ID for dynamic skills (None for filesystem skills)
-    #[serde(default)]
-    pub id: Option<i64>,
-    /// Whether the skill is enabled (defaults to true)
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
     /// Filesystem path for directory-based skills (None for single-file/dynamic skills)
     #[serde(default)]
     pub dir_path: Option<PathBuf>,
     /// Available resources (metadata only — file names, not content)
     #[serde(default)]
     pub resources: Vec<ResourceEntry>,
-}
-
-fn default_enabled() -> bool {
-    true
-}
-
-/// Thread-safe, shared skill registry. Used by Agent, UseSkillTool, and ManageSkillsTool.
-#[derive(Clone)]
-pub struct SharedSkillRegistry {
-    inner: Arc<RwLock<Vec<Skill>>>,
-}
-
-impl SharedSkillRegistry {
-    pub fn new(skills: Vec<Skill>) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(skills)),
-        }
-    }
-
-    /// Add a skill to the registry.
-    pub async fn add(&self, skill: Skill) {
-        self.inner.write().await.push(skill);
-    }
-
-    /// Remove a skill by name. Returns true if found and removed.
-    pub async fn remove(&self, name: &str) -> bool {
-        let mut skills = self.inner.write().await;
-        let len_before = skills.len();
-        skills.retain(|s| s.name != name);
-        skills.len() < len_before
-    }
-
-    /// Get a snapshot of all enabled skills.
-    pub async fn snapshot(&self) -> Vec<Skill> {
-        self.inner
-            .read()
-            .await
-            .iter()
-            .filter(|s| s.enabled)
-            .cloned()
-            .collect()
-    }
-
-    /// Get a snapshot of all skills (including disabled).
-    pub async fn snapshot_all(&self) -> Vec<Skill> {
-        self.inner.read().await.clone()
-    }
-
-    /// Find a skill by name (among enabled skills).
-    pub async fn find(&self, name: &str) -> Option<Skill> {
-        self.inner
-            .read()
-            .await
-            .iter()
-            .find(|s| s.name == name && s.enabled)
-            .cloned()
-    }
-
-    /// Set the enabled flag for a skill by name. Returns true if found.
-    pub async fn set_enabled(&self, name: &str, enabled: bool) -> bool {
-        let mut skills = self.inner.write().await;
-        if let Some(skill) = skills.iter_mut().find(|s| s.name == name) {
-            skill.enabled = enabled;
-            true
-        } else {
-            false
-        }
-    }
 }
 
 impl Skill {
@@ -126,6 +50,8 @@ impl Skill {
         let mut name = None;
         let mut description = None;
         let mut triggers = Vec::new();
+        let mut source = None;
+        let mut source_url = None;
 
         for line in frontmatter.lines() {
             let line = line.trim();
@@ -145,19 +71,18 @@ impl Skill {
                             .filter(|s| !s.is_empty())
                             .collect();
                     }
+                    "source" => {
+                        if !value.is_empty() {
+                            source = Some(value.to_string());
+                        }
+                    }
+                    "source_url" => {
+                        if !value.is_empty() {
+                            source_url = Some(value.to_string());
+                        }
+                    }
                     _ => {}
                 }
-            }
-        }
-
-        // If no explicit triggers, extract keywords from name (Anthropic format compatibility)
-        if triggers.is_empty() {
-            if let Some(ref n) = name {
-                triggers = n
-                    .split('-')
-                    .map(|s| s.to_lowercase())
-                    .filter(|s| s.len() > 2)
-                    .collect();
             }
         }
 
@@ -166,14 +91,142 @@ impl Skill {
             description: description.unwrap_or_default(),
             triggers,
             body,
-            source: None,
-            source_url: None,
-            id: None,
-            enabled: true,
+            source,
+            source_url,
             dir_path: None,
             resources: vec![],
         })
     }
+
+    /// Serialize a Skill back to frontmatter + body markdown format.
+    pub fn to_markdown(&self) -> String {
+        let mut md = String::from("---\n");
+        md.push_str(&format!("name: {}\n", self.name));
+        if !self.description.is_empty() {
+            md.push_str(&format!("description: {}\n", self.description));
+        }
+        if !self.triggers.is_empty() {
+            md.push_str(&format!("triggers: {}\n", self.triggers.join(", ")));
+        }
+        if let Some(ref source) = self.source {
+            md.push_str(&format!("source: {}\n", source));
+        }
+        if let Some(ref url) = self.source_url {
+            md.push_str(&format!("source_url: {}\n", url));
+        }
+        md.push_str("---\n");
+        md.push_str(&self.body);
+        if !self.body.ends_with('\n') {
+            md.push('\n');
+        }
+        md
+    }
+}
+
+/// Sanitize a skill name into a safe filename.
+/// Lowercase, replace spaces/underscores with hyphens, strip non-alphanumeric except hyphens,
+/// collapse consecutive hyphens, strip leading dots.
+pub fn sanitize_skill_filename(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let sanitized: String = lower
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+
+    // Collapse consecutive hyphens
+    let mut result = String::new();
+    let mut prev_hyphen = false;
+    for c in sanitized.chars() {
+        if c == '-' {
+            if !prev_hyphen && !result.is_empty() {
+                result.push(c);
+            }
+            prev_hyphen = true;
+        } else {
+            result.push(c);
+            prev_hyphen = false;
+        }
+    }
+
+    // Strip trailing hyphens
+    let result = result.trim_end_matches('-').to_string();
+
+    if result.is_empty() {
+        "skill".to_string()
+    } else {
+        result
+    }
+}
+
+/// Write a skill to a `.md` file in the given directory. Uses atomic write
+/// (temp file + rename) to prevent partial writes. Returns the path written.
+pub fn write_skill_to_file(dir: &Path, skill: &Skill) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+
+    let filename = format!("{}.md", sanitize_skill_filename(&skill.name));
+    let target = dir.join(&filename);
+    let tmp = dir.join(format!(".{}.tmp", filename));
+
+    let content = skill.to_markdown();
+    std::fs::write(&tmp, &content)?;
+    std::fs::rename(&tmp, &target)?;
+
+    Ok(target)
+}
+
+/// Remove a skill file from the directory. Handles both single `.md` files and
+/// directory-based skills. Returns true if something was removed.
+pub fn remove_skill_file(dir: &Path, skill_name: &str) -> anyhow::Result<bool> {
+    // Try exact filename match first
+    let sanitized = sanitize_skill_filename(skill_name);
+    let md_path = dir.join(format!("{}.md", sanitized));
+    if md_path.exists() {
+        std::fs::remove_file(&md_path)?;
+        return Ok(true);
+    }
+
+    // Try directory-based skill
+    let dir_path = dir.join(&sanitized);
+    if dir_path.is_dir() {
+        std::fs::remove_dir_all(&dir_path)?;
+        return Ok(true);
+    }
+
+    // Fallback: scan all files and parse to find matching name
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let skill_md = path.join("SKILL.md");
+                if skill_md.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                        if let Some(parsed) = Skill::parse(&content) {
+                            if parsed.name == skill_name {
+                                std::fs::remove_dir_all(&path)?;
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Some(parsed) = Skill::parse(&content) {
+                        if parsed.name == skill_name {
+                            std::fs::remove_file(&path)?;
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// Find a skill by name (case-sensitive) in a slice.
+pub fn find_skill_by_name<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
+    skills.iter().find(|s| s.name == name)
 }
 
 /// Scan a skill directory for resource files in any subdirectory.
@@ -281,54 +334,63 @@ pub fn load_skills(dir: &Path) -> Vec<Skill> {
     skills
 }
 
-/// Check if a character is a word boundary (not alphanumeric and not underscore).
-fn is_word_boundary(c: char) -> bool {
-    !c.is_alphanumeric() && c != '_'
+/// Normalize a potential skill reference token into canonical filename form.
+fn normalize_skill_ref(token: &str) -> String {
+    let trimmed = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+    sanitize_skill_filename(trimmed)
 }
 
-/// Check if `word` appears as a whole word in `text` (case-sensitive; caller should
-/// lowercase both if needed). Word boundaries are start/end of string or any character
-/// that is not alphanumeric/underscore.
-fn contains_whole_word(text: &str, word: &str) -> bool {
-    if word.is_empty() {
-        return false;
-    }
-    let mut start = 0;
-    while let Some(pos) = text[start..].find(word) {
-        let abs_pos = start + pos;
-        let before_ok = abs_pos == 0
-            || text[..abs_pos]
-                .chars()
-                .next_back()
-                .is_none_or(is_word_boundary);
-        let after_pos = abs_pos + word.len();
-        let after_ok = after_pos >= text.len()
-            || text[after_pos..]
-                .chars()
-                .next()
-                .is_none_or(is_word_boundary);
-        if before_ok && after_ok {
-            return true;
-        }
-        // Advance past this occurrence
-        start = abs_pos + 1;
-        if start >= text.len() {
-            break;
-        }
-    }
-    false
-}
-
-/// Match skills whose trigger keywords appear as whole words in the user message (case-insensitive).
-pub fn match_skills<'a>(skills: &'a [Skill], user_message: &str) -> Vec<&'a Skill> {
+/// Extract explicit skill references from the user message.
+///
+/// Supported explicit forms:
+/// - `$skill-name`
+/// - `skill:skill-name`
+/// - `use skill <skill-name>`
+fn extract_explicit_skill_refs(user_message: &str) -> Vec<String> {
     let lower = user_message.to_lowercase();
+    let mut refs: Vec<String> = Vec::new();
+
+    for token in lower.split_whitespace() {
+        if let Some(raw) = token.strip_prefix('$') {
+            let norm = normalize_skill_ref(raw);
+            if !norm.is_empty() && !refs.contains(&norm) {
+                refs.push(norm);
+            }
+        }
+        if let Some(raw) = token.strip_prefix("skill:") {
+            let norm = normalize_skill_ref(raw);
+            if !norm.is_empty() && !refs.contains(&norm) {
+                refs.push(norm);
+            }
+        }
+    }
+
+    // Parse "use skill <name>"
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for window in words.windows(3) {
+        if window[0] == "use" && window[1] == "skill" {
+            let norm = normalize_skill_ref(window[2]);
+            if !norm.is_empty() && !refs.contains(&norm) {
+                refs.push(norm);
+            }
+        }
+    }
+
+    refs
+}
+
+/// Match skills only through explicit invocation references.
+pub fn match_skills<'a>(skills: &'a [Skill], user_message: &str) -> Vec<&'a Skill> {
+    let refs = extract_explicit_skill_refs(user_message);
+    if refs.is_empty() {
+        return Vec::new();
+    }
+
     skills
         .iter()
         .filter(|skill| {
-            skill
-                .triggers
-                .iter()
-                .any(|trigger| contains_whole_word(&lower, trigger))
+            refs.iter()
+                .any(|r| r == &sanitize_skill_filename(&skill.name))
         })
         .collect()
 }
@@ -625,20 +687,17 @@ pub fn build_system_prompt_with_memory(
         }
     }
 
-    // 6b. Cross-Channel Hints (facts from other channels — confidential until approved)
+    // 6b. Cross-Channel Hints (facts from other channels — redacted values)
     if !memory.cross_channel_hints.is_empty() {
-        prompt.push_str("\n\n## Cross-Channel Context — CONFIDENTIAL until owner approves\n");
+        prompt.push_str("\n\n## Cross-Channel Context — CONFIDENTIAL\n");
         prompt.push_str("You have relevant info from other conversations. You may mention that you have info,\n\
-                         but DO NOT reveal the values below unless the owner explicitly says to share.\n\
-                         If the owner approves, use `share_memory` tool to make the info permanently shareable here.\n");
+                         but NEVER reveal the actual values — they are redacted below.\n\
+                         If the owner approves sharing, use `share_memory` tool to make the info permanently shareable here.\n");
         for f in memory.cross_channel_hints.iter().take(5) {
             let resolved_key = resolve_user_ids(&f.key, user_id_map);
-            let resolved_value = resolve_user_ids(&f.value, user_id_map);
-            // Sanitize cross-channel hints to prevent injection
-            let sanitized_value = sanitize_external_content(&resolved_value);
             prompt.push_str(&format!(
-                "- [{}] {}: \"{}\" (from another channel)\n",
-                f.category, resolved_key, sanitized_value
+                "- [{}] {}: <confidential> (from another channel)\n",
+                f.category, resolved_key
             ));
         }
     }
@@ -696,7 +755,19 @@ pub fn build_system_prompt_with_memory(
         }
     }
 
-    // 11. People Context (only when people data exists)
+    // 11. People Privacy Rules (BEFORE data — agent sees constraints first)
+    if !memory.people.is_empty() || memory.current_person.is_some() {
+        prompt.push_str("\n\n## People Privacy Rules\n\
+            - You ARE transparent about: adapting communication style, learning from conversations\n\
+            - You are NOT transparent about: the owner's people graph, relationship insights, stored facts about people, or proactive coaching\n\
+            - Only share detailed information about people with the OWNER in private DMs\n\
+            - If someone asks \"what do you know about me?\", you may share what THEY have told you directly, but NOT facts the owner stored or things learned from other contexts\n\
+            - Never say \"the owner told me about you\" or share facts from the owner's private notes\n\
+            - In group chats, do not volunteer personal facts about any individual\n\
+            - When proactively reminding the owner about dates/events, do so naturally (\"By the way, someone's birthday is coming up next week!\")\n");
+    }
+
+    // 12. People Context (only when people data exists)
     if !memory.people.is_empty() {
         prompt.push_str("\n\n## People You Know\n");
         for p in memory.people.iter().take(20) {
@@ -715,7 +786,7 @@ pub fn build_system_prompt_with_memory(
         }
     }
 
-    // 12. Current Speaker Context (when talking to a known person who is not the owner)
+    // 13. Current Speaker Context (when talking to a known person who is not the owner)
     if let Some(person) = memory.current_person {
         prompt.push_str(&format!(
             "\n\n## Current Speaker Context\nYou are talking to {} ",
@@ -751,18 +822,6 @@ pub fn build_system_prompt_with_memory(
                 person.name
             ));
         }
-    }
-
-    // 13. People Privacy Rules (when people data exists)
-    if !memory.people.is_empty() || memory.current_person.is_some() {
-        prompt.push_str("\n\n## People Privacy Rules\n\
-            - You ARE transparent about: adapting communication style, learning from conversations\n\
-            - You are NOT transparent about: the owner's people graph, relationship insights, stored facts about people, or proactive coaching\n\
-            - Only share detailed information about people with the OWNER in private DMs\n\
-            - If someone asks \"what do you know about me?\", you may share what THEY have told you directly, but NOT facts the owner stored or things learned from other contexts\n\
-            - Never say \"the owner told me about you\" or share facts from the owner's private notes\n\
-            - In group chats, do not volunteer personal facts about any individual\n\
-            - When proactively reminding the owner about dates/events, do so naturally (\"By the way, someone's birthday is coming up next week!\")\n");
     }
 
     // 14. Available Skills
@@ -805,69 +864,6 @@ fn truncate(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
 
-    // --- contains_whole_word tests ---
-
-    #[test]
-    fn whole_word_at_start() {
-        assert!(contains_whole_word("browse the web", "browse"));
-    }
-
-    #[test]
-    fn whole_word_at_end() {
-        assert!(contains_whole_word("open the browser", "browser"));
-    }
-
-    #[test]
-    fn whole_word_in_middle() {
-        assert!(contains_whole_word("please browse now", "browse"));
-    }
-
-    #[test]
-    fn whole_word_with_punctuation() {
-        assert!(contains_whole_word("browse, please", "browse"));
-        assert!(contains_whole_word("use browse.", "browse"));
-        assert!(contains_whole_word("(browse)", "browse"));
-    }
-
-    #[test]
-    fn whole_word_hyphenated() {
-        assert!(contains_whole_word("web-browse tool", "browse"));
-    }
-
-    #[test]
-    fn partial_match_rejected() {
-        assert!(!contains_whole_word("browseable interface", "browse"));
-        assert!(!contains_whole_word("prebrowse step", "browse"));
-    }
-
-    #[test]
-    fn substring_in_longer_word_rejected() {
-        assert!(!contains_whole_word("remembering things", "member"));
-    }
-
-    #[test]
-    fn exact_match_only_word() {
-        assert!(contains_whole_word("browse", "browse"));
-    }
-
-    #[test]
-    fn empty_word_returns_false() {
-        assert!(!contains_whole_word("anything", ""));
-    }
-
-    #[test]
-    fn empty_text_returns_false() {
-        assert!(!contains_whole_word("", "word"));
-    }
-
-    #[test]
-    fn word_with_underscore_boundary() {
-        // underscore is NOT a word boundary, so "disk" inside "disk_check" is NOT a whole word
-        assert!(!contains_whole_word("run disk_check", "disk"));
-        // but "disk_check" as a whole word IS matched
-        assert!(contains_whole_word("run disk_check now", "disk_check"));
-    }
-
     // --- match_skills tests ---
 
     fn make_skill(name: &str, triggers: &[&str]) -> Skill {
@@ -878,38 +874,42 @@ mod tests {
             body: String::new(),
             source: None,
             source_url: None,
-            id: None,
-            enabled: true,
             dir_path: None,
             resources: vec![],
         }
     }
 
     #[test]
-    fn match_skills_whole_word() {
+    fn match_skills_explicit_dollar_reference() {
         let skills = vec![
             make_skill("web-browsing", &["browse", "website"]),
             make_skill("system-admin", &["disk", "memory", "cpu"]),
         ];
-        // "browse" as whole word matches
-        let matched = match_skills(&skills, "browse google.com");
+        let matched = match_skills(&skills, "please run $web-browsing now");
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].name, "web-browsing");
     }
 
     #[test]
-    fn match_skills_rejects_partial() {
+    fn match_skills_explicit_skill_prefix() {
         let skills = vec![make_skill("web-browsing", &["browse", "website"])];
-        // "browseable" should NOT match "browse"
-        let matched = match_skills(&skills, "this is a browseable page");
-        assert!(matched.is_empty());
+        let matched = match_skills(&skills, "skill:web-browsing");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "web-browsing");
     }
 
     #[test]
-    fn match_skills_case_insensitive() {
+    fn match_skills_use_skill_form() {
         let skills = vec![make_skill("web-browsing", &["browse"])];
-        let matched = match_skills(&skills, "Please BROWSE the site");
+        let matched = match_skills(&skills, "Use skill WEB-BROWSING");
         assert_eq!(matched.len(), 1);
+    }
+
+    #[test]
+    fn match_skills_does_not_guess_from_keywords() {
+        let skills = vec![make_skill("web-browsing", &["browse", "website"])];
+        let matched = match_skills(&skills, "please browse the site");
+        assert!(matched.is_empty());
     }
 
     // --- build_system_prompt max_facts tests ---
@@ -1051,13 +1051,181 @@ mod tests {
 
     #[test]
     fn test_parse_anthropic_format() {
-        // Anthropic format: name + description, no explicit triggers
+        // Anthropic format: name + description, no explicit triggers.
+        // Trigger inference is intentionally disabled to avoid keyword guessing.
         let content =
             "---\nname: code-review\ndescription: Review code for quality\n---\nCheck for bugs.";
         let skill = Skill::parse(content).unwrap();
         assert_eq!(skill.name, "code-review");
-        // Auto-triggers derived from hyphenated name (words > 2 chars)
-        assert!(skill.triggers.contains(&"code".to_string()));
-        assert!(skill.triggers.contains(&"review".to_string()));
+        assert!(skill.triggers.is_empty());
+    }
+
+    // --- to_markdown roundtrip tests ---
+
+    #[test]
+    fn to_markdown_roundtrip() {
+        let skill = Skill {
+            name: "deploy-app".to_string(),
+            description: "Deploy the application".to_string(),
+            triggers: vec!["deploy".to_string(), "ship".to_string()],
+            body: "Run cargo build --release\nCopy binary to server".to_string(),
+            source: Some("url".to_string()),
+            source_url: Some("https://example.com/deploy.md".to_string()),
+            dir_path: None,
+            resources: vec![],
+        };
+        let md = skill.to_markdown();
+        let parsed = Skill::parse(&md).unwrap();
+        assert_eq!(parsed.name, skill.name);
+        assert_eq!(parsed.description, skill.description);
+        assert_eq!(parsed.triggers, skill.triggers);
+        assert_eq!(parsed.body, skill.body);
+        assert_eq!(parsed.source, skill.source);
+        assert_eq!(parsed.source_url, skill.source_url);
+    }
+
+    #[test]
+    fn to_markdown_minimal() {
+        let skill = Skill {
+            name: "simple".to_string(),
+            description: String::new(),
+            triggers: vec![],
+            body: "Do the thing.".to_string(),
+            source: None,
+            source_url: None,
+            dir_path: None,
+            resources: vec![],
+        };
+        let md = skill.to_markdown();
+        assert!(md.starts_with("---\n"));
+        assert!(md.contains("name: simple"));
+        let parsed = Skill::parse(&md).unwrap();
+        assert_eq!(parsed.name, "simple");
+    }
+
+    // --- sanitize_skill_filename tests ---
+
+    #[test]
+    fn sanitize_basic() {
+        assert_eq!(sanitize_skill_filename("Deploy App"), "deploy-app");
+    }
+
+    #[test]
+    fn sanitize_special_chars() {
+        assert_eq!(sanitize_skill_filename("my-skill (v2)"), "my-skill-v2");
+    }
+
+    #[test]
+    fn sanitize_leading_dots() {
+        // Leading non-alphanumeric chars are stripped
+        assert_eq!(sanitize_skill_filename("...hidden"), "hidden");
+    }
+
+    #[test]
+    fn sanitize_empty() {
+        assert_eq!(sanitize_skill_filename(""), "skill");
+        assert_eq!(sanitize_skill_filename("..."), "skill");
+    }
+
+    #[test]
+    fn sanitize_already_clean() {
+        assert_eq!(sanitize_skill_filename("deploy"), "deploy");
+        assert_eq!(sanitize_skill_filename("code-review"), "code-review");
+    }
+
+    // --- write_skill_to_file tests ---
+
+    #[test]
+    fn write_and_read_skill_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skill = Skill {
+            name: "test-write".to_string(),
+            description: "A writable skill".to_string(),
+            triggers: vec!["test".to_string()],
+            body: "Do tests.".to_string(),
+            source: None,
+            source_url: None,
+            dir_path: None,
+            resources: vec![],
+        };
+        let path = write_skill_to_file(dir.path(), &skill).unwrap();
+        assert!(path.exists());
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "test-write.md");
+
+        // No leftover temp file
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1);
+
+        // Roundtrip
+        let loaded = load_skills(dir.path());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "test-write");
+    }
+
+    // --- remove_skill_file tests ---
+
+    #[test]
+    fn remove_single_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skill = Skill {
+            name: "removable".to_string(),
+            description: "Remove me".to_string(),
+            triggers: vec![],
+            body: "Body.".to_string(),
+            source: None,
+            source_url: None,
+            dir_path: None,
+            resources: vec![],
+        };
+        write_skill_to_file(dir.path(), &skill).unwrap();
+        assert!(remove_skill_file(dir.path(), "removable").unwrap());
+        assert!(load_skills(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn remove_directory_skill() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skill_dir = dir.path().join("removable");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: removable\ndescription: test\ntriggers: rem\n---\nbody",
+        )
+        .unwrap();
+        assert!(remove_skill_file(dir.path(), "removable").unwrap());
+        assert!(!skill_dir.exists());
+    }
+
+    #[test]
+    fn remove_not_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(!remove_skill_file(dir.path(), "nonexistent").unwrap());
+    }
+
+    // --- find_skill_by_name tests ---
+
+    #[test]
+    fn find_existing() {
+        let skills = vec![make_skill("alpha", &[]), make_skill("beta", &[])];
+        assert_eq!(find_skill_by_name(&skills, "beta").unwrap().name, "beta");
+    }
+
+    #[test]
+    fn find_missing() {
+        let skills = vec![make_skill("alpha", &[])];
+        assert!(find_skill_by_name(&skills, "nope").is_none());
+    }
+
+    // --- parse source/source_url frontmatter ---
+
+    #[test]
+    fn parse_with_source_fields() {
+        let content = "---\nname: fetched\ndescription: From URL\ntriggers: fetch\nsource: url\nsource_url: https://example.com/skill.md\n---\nFetched body.";
+        let skill = Skill::parse(content).unwrap();
+        assert_eq!(skill.source.as_deref(), Some("url"));
+        assert_eq!(
+            skill.source_url.as_deref(),
+            Some("https://example.com/skill.md")
+        );
     }
 }

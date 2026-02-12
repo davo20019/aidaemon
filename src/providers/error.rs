@@ -19,6 +19,8 @@ pub enum ProviderErrorKind {
     Billing,
     /// 429 — rate limited; check retry_after_secs.
     RateLimit,
+    /// 400 — malformed request (e.g. missing thought_signature, invalid schema).
+    BadRequest,
     /// 404 or "model not found" — bad model name.
     NotFound,
     /// 408, request timeout, or provider took too long.
@@ -34,6 +36,7 @@ pub enum ProviderErrorKind {
 impl ProviderError {
     pub fn from_status(status: u16, body: &str) -> Self {
         let kind = match status {
+            400 => ProviderErrorKind::BadRequest,
             401 | 403 => ProviderErrorKind::Auth,
             402 => ProviderErrorKind::Billing,
             404 => ProviderErrorKind::NotFound,
@@ -97,6 +100,9 @@ impl ProviderError {
             }
             ProviderErrorKind::ServerError => {
                 "LLM provider is experiencing issues (server error). Will retry.".to_string()
+            }
+            ProviderErrorKind::BadRequest => {
+                format!("LLM request was malformed (400). This may be a bug — please report it. Details: {}", self.message)
             }
             ProviderErrorKind::Unknown => format!("LLM error: {}", self.message),
         }

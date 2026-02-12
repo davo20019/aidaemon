@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::config::ModelsConfig;
+use crate::execution_policy::ModelProfile;
 
 /// Tier-based model selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,16 @@ impl Router {
         }
     }
 
+    /// Thin profile-to-model mapping used by policy-driven routing.
+    /// Cheap -> fast, Balanced -> primary, Strong -> smart.
+    pub fn select_for_profile(&self, profile: ModelProfile) -> &str {
+        match profile {
+            ModelProfile::Cheap => &self.models.fast,
+            ModelProfile::Balanced => &self.models.primary,
+            ModelProfile::Strong => &self.models.smart,
+        }
+    }
+
     /// Returns true when all three tier models resolve to the same string,
     /// meaning auto-routing would be pointless.
     pub fn is_uniform(&self) -> bool {
@@ -49,10 +60,9 @@ impl Router {
     }
 }
 
-/// Classify a user query into a model tier using keyword/pattern heuristics.
+/// Classify a user query into a model tier using structural signals only.
 pub fn classify_query(text: &str) -> ClassificationResult {
     let trimmed = text.trim();
-    let lower = trimmed.to_lowercase();
 
     // --- Smart tier checks ---
 
@@ -80,83 +90,7 @@ pub fn classify_query(text: &str) -> ClassificationResult {
         };
     }
 
-    // Smart keywords
-    let smart_keywords = [
-        "implement",
-        "refactor",
-        "debug",
-        "analyze",
-        "step by step",
-        "write code",
-        "architecture",
-        "optimize",
-        "algorithm",
-        "explain how",
-        "write a",
-        "build a",
-        "create a function",
-        "design",
-        "compare and contrast",
-        "walk me through",
-        "troubleshoot",
-        "review this",
-        "fix this",
-        "rewrite",
-    ];
-    for kw in &smart_keywords {
-        if lower.contains(kw) {
-            return ClassificationResult {
-                tier: Tier::Smart,
-                reason: format!("keyword: {}", kw),
-            };
-        }
-    }
-
     // --- Fast tier checks ---
-
-    // Exact match greetings/acks (case-insensitive, trimmed)
-    let fast_exact = [
-        "hi",
-        "hello",
-        "hey",
-        "thanks",
-        "thank you",
-        "ok",
-        "okay",
-        "yes",
-        "no",
-        "sure",
-        "bye",
-        "goodbye",
-        "good morning",
-        "good night",
-        "gm",
-        "gn",
-        "yo",
-        "sup",
-        "ty",
-        "thx",
-        "np",
-        "k",
-        "yep",
-        "nope",
-        "nah",
-        "yeah",
-        "yea",
-        "cool",
-        "nice",
-        "great",
-        "awesome",
-        "lol",
-        "haha",
-        "wow",
-    ];
-    if fast_exact.contains(&lower.as_str()) {
-        return ClassificationResult {
-            tier: Tier::Fast,
-            reason: format!("greeting/ack: {}", lower),
-        };
-    }
 
     // Single-word messages
     let word_count = trimmed.split_whitespace().count();
@@ -165,28 +99,6 @@ pub fn classify_query(text: &str) -> ClassificationResult {
             tier: Tier::Fast,
             reason: "single word".to_string(),
         };
-    }
-
-    // Note: short messages (2-3 words) fall through to Primary by default.
-    // Short ≠ simple — "capital Ecuador" or "explain gravity" need a capable model.
-
-    // Simple lookup prefixes
-    let fast_prefixes = [
-        "what is ",
-        "who is ",
-        "define ",
-        "what's ",
-        "who's ",
-        "when is ",
-        "where is ",
-    ];
-    for prefix in &fast_prefixes {
-        if lower.starts_with(prefix) && word_count <= 6 {
-            return ClassificationResult {
-                tier: Tier::Fast,
-                reason: format!("simple lookup: {}", prefix.trim()),
-            };
-        }
     }
 
     // --- Default: Primary ---
@@ -227,15 +139,10 @@ mod tests {
     }
 
     #[test]
-    fn test_smart_keywords() {
-        assert_eq!(classify("implement a web server in Rust"), Tier::Smart);
-        assert_eq!(classify("please refactor this module"), Tier::Smart);
-        assert_eq!(classify("debug this error for me"), Tier::Smart);
-        assert_eq!(classify("analyze the performance"), Tier::Smart);
-        assert_eq!(classify("explain this step by step"), Tier::Smart);
-        assert_eq!(classify("write code for sorting"), Tier::Smart);
-        assert_eq!(classify("optimize the database queries"), Tier::Smart);
-        assert_eq!(classify("design a REST API"), Tier::Smart);
+    fn test_keywords_no_longer_force_smart() {
+        assert_eq!(classify("implement a web server in Rust"), Tier::Primary);
+        assert_eq!(classify("please refactor this module"), Tier::Primary);
+        assert_eq!(classify("debug this error for me"), Tier::Primary);
     }
 
     #[test]
@@ -264,10 +171,10 @@ mod tests {
     }
 
     #[test]
-    fn test_fast_simple_lookup() {
-        assert_eq!(classify("what is rust"), Tier::Fast);
-        assert_eq!(classify("who is linus torvalds"), Tier::Fast);
-        assert_eq!(classify("define recursion"), Tier::Fast);
+    fn test_lookup_phrases_use_primary_without_keyword_rules() {
+        assert_eq!(classify("what is rust"), Tier::Primary);
+        assert_eq!(classify("who is linus torvalds"), Tier::Primary);
+        assert_eq!(classify("define recursion"), Tier::Primary);
     }
 
     #[test]
@@ -309,5 +216,24 @@ mod tests {
         assert_eq!(Tier::Fast.to_string(), "fast");
         assert_eq!(Tier::Primary.to_string(), "primary");
         assert_eq!(Tier::Smart.to_string(), "smart");
+    }
+
+    #[test]
+    fn test_select_for_profile() {
+        let models = ModelsConfig {
+            primary: "primary-model".to_string(),
+            fast: "fast-model".to_string(),
+            smart: "smart-model".to_string(),
+        };
+        let router = Router::new(models);
+        assert_eq!(router.select_for_profile(ModelProfile::Cheap), "fast-model");
+        assert_eq!(
+            router.select_for_profile(ModelProfile::Balanced),
+            "primary-model"
+        );
+        assert_eq!(
+            router.select_for_profile(ModelProfile::Strong),
+            "smart-model"
+        );
     }
 }

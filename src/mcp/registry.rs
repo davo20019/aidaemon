@@ -121,20 +121,9 @@ impl McpRegistry {
             )));
         }
 
-        // Auto-generate triggers from server name + tool names only.
-        // Description keywords are too noisy (common words like "this", "that", "from").
-        let mut triggers: Vec<String> = vec![name.to_lowercase()];
-        for td in &tool_defs {
-            if let Some(raw) = td["name"].as_str() {
-                // Split tool name by underscores/hyphens to get keywords
-                for part in raw.split(['_', '-']) {
-                    let lower = part.to_lowercase();
-                    if lower.len() >= 3 && !triggers.contains(&lower) {
-                        triggers.push(lower);
-                    }
-                }
-            }
-        }
+        // Keep explicit server aliases only. We no longer infer trigger keywords
+        // from tool names to avoid accidental activation by natural-language text.
+        let triggers: Vec<String> = vec![name.to_lowercase()];
 
         info!(
             server = name,
@@ -385,18 +374,30 @@ impl McpRegistry {
         }
     }
 
-    /// Return tools from MCP servers whose triggers match the user message.
-    /// Uses whole-word, case-insensitive matching (same algorithm as skills).
+    /// Return tools from MCP servers only through explicit invocation references.
+    ///
+    /// Supported forms:
+    /// - `mcp:server_name`
+    /// - `$mcp:server_name`
+    /// - `use mcp server_name`
+    /// - `/mcp server_name`
     pub async fn match_tools(&self, user_message: &str) -> Vec<Arc<dyn Tool>> {
-        let lower = user_message.to_lowercase();
+        let refs = extract_explicit_mcp_server_refs(user_message);
+        if refs.is_empty() {
+            return Vec::new();
+        }
+
         let servers = self.servers.read().await;
 
         let mut matched_tools = Vec::new();
         for entry in servers.values() {
-            let matches = entry
-                .triggers
-                .iter()
-                .any(|trigger| contains_whole_word(&lower, trigger));
+            let server_name = entry.name.to_lowercase();
+            let matches = refs.iter().any(|r| r == &server_name)
+                || entry
+                    .triggers
+                    .iter()
+                    .map(|t| t.to_lowercase())
+                    .any(|alias| refs.iter().any(|r| r == &alias));
             if matches {
                 matched_tools.extend(entry.tools.iter().cloned());
             }
@@ -437,53 +438,83 @@ impl McpRegistry {
 
 // ==================== Helper functions ====================
 
-/// Check if `word` appears as a whole word in `text`.
-/// Word boundaries are start/end of string or any non-alphanumeric, non-underscore character.
-/// (Same algorithm as skills::contains_whole_word)
-fn contains_whole_word(text: &str, word: &str) -> bool {
-    if word.is_empty() {
-        return false;
-    }
-    let word_lower = word.to_lowercase();
-    let mut start = 0;
-    while let Some(pos) = text[start..].find(&word_lower) {
-        let abs_pos = start + pos;
-        let before_ok = abs_pos == 0
-            || text[..abs_pos]
-                .chars()
-                .next_back()
-                .is_none_or(is_word_boundary);
-        let after_pos = abs_pos + word_lower.len();
-        let after_ok = after_pos >= text.len()
-            || text[after_pos..]
-                .chars()
-                .next()
-                .is_none_or(is_word_boundary);
-        if before_ok && after_ok {
-            return true;
-        }
-        start = abs_pos + 1;
-        if start >= text.len() {
-            break;
-        }
-    }
-    false
+fn normalize_server_ref(token: &str) -> String {
+    token
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .to_ascii_lowercase()
 }
 
-fn is_word_boundary(c: char) -> bool {
-    !c.is_alphanumeric() && c != '_'
+fn extract_explicit_mcp_server_refs(user_message: &str) -> Vec<String> {
+    let lower = user_message.to_ascii_lowercase();
+    let mut refs: Vec<String> = Vec::new();
+
+    for token in lower.split_whitespace() {
+        let candidate = token
+            .strip_prefix("$mcp:")
+            .or_else(|| token.strip_prefix("mcp:"));
+        if let Some(raw) = candidate {
+            let norm = normalize_server_ref(raw);
+            if !norm.is_empty() && !refs.contains(&norm) {
+                refs.push(norm);
+            }
+        }
+    }
+
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for window in words.windows(3) {
+        if window[0] == "use" && window[1] == "mcp" {
+            let norm = normalize_server_ref(window[2]);
+            if !norm.is_empty() && !refs.contains(&norm) {
+                refs.push(norm);
+            }
+        }
+    }
+    for window in words.windows(2) {
+        if window[0] == "/mcp" {
+            let norm = normalize_server_ref(window[1]);
+            if !norm.is_empty() && !refs.contains(&norm) {
+                refs.push(norm);
+            }
+        }
+    }
+
+    refs
 }
 
 fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
-    let entry = keyring::Entry::new("aidaemon", field_name)?;
-    entry
-        .get_password()
-        .map_err(|e| anyhow::anyhow!("Failed to read '{}' from OS keychain: {}", field_name, e))
+    crate::config::resolve_from_keychain(field_name)
 }
 
 fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
-    let entry = keyring::Entry::new("aidaemon", field_name)?;
-    entry
-        .delete_credential()
-        .map_err(|e| anyhow::anyhow!("Failed to delete '{}' from OS keychain: {}", field_name, e))
+    crate::config::delete_from_keychain(field_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_explicit_mcp_server_refs;
+
+    #[test]
+    fn extracts_prefixed_mcp_refs() {
+        let refs = extract_explicit_mcp_server_refs("please use mcp:github and $mcp:slack");
+        assert!(refs.contains(&"github".to_string()));
+        assert!(refs.contains(&"slack".to_string()));
+    }
+
+    #[test]
+    fn extracts_use_mcp_form() {
+        let refs = extract_explicit_mcp_server_refs("Use MCP browser_tools for this");
+        assert_eq!(refs, vec!["browser_tools".to_string()]);
+    }
+
+    #[test]
+    fn extracts_slash_mcp_form() {
+        let refs = extract_explicit_mcp_server_refs("/mcp github");
+        assert_eq!(refs, vec!["github".to_string()]);
+    }
+
+    #[test]
+    fn does_not_guess_from_natural_language() {
+        let refs = extract_explicit_mcp_server_refs("can you search github issues?");
+        assert!(refs.is_empty());
+    }
 }

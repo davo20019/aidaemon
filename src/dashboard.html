@@ -68,6 +68,14 @@ tr:last-child td { border-bottom: none; }
       <h2>Scheduled Tasks</h2>
       <div id="tasks-body"></div>
     </div>
+    <div class="card wide" id="maintenance-card">
+      <h2>Maintenance Jobs</h2>
+      <div id="maintenance-body"></div>
+    </div>
+    <div class="card wide" id="policy-card">
+      <h2>Policy Metrics</h2>
+      <div id="policy-body"></div>
+    </div>
     <div class="card wide" id="usage-card">
       <h2>Token Usage (7 days)</h2>
       <div id="usage-body"></div>
@@ -129,6 +137,7 @@ function fmtDuration(secs) {
 }
 
 function fmtNum(n) { return n != null ? n.toLocaleString() : '-'; }
+function fmtTs(ts) { return ts ? ts.slice(0, 16).replace('T', ' ') : '-'; }
 
 async function fetchStatus() {
   try {
@@ -184,7 +193,60 @@ async function fetchTasks() {
   } catch {}
 }
 
-function fetchAll() { fetchStatus(); fetchUsage(); fetchSessions(); fetchTasks(); }
+async function fetchMaintenanceJobs() {
+  try {
+    const payload = await api('/api/heartbeat/jobs');
+    const rows = payload.maintenance_jobs || [];
+    if (!rows.length) {
+      document.getElementById('maintenance-body').innerHTML = '<p class="empty">No maintenance telemetry available</p>';
+      return;
+    }
+    let html = '<table><tr><th>Job</th><th>Last Run</th><th>Last Success</th><th>Failures</th><th>Last Error</th></tr>';
+    for (const r of rows) {
+      html += '<tr>'
+        + '<td class="mono">' + esc(r.name) + '</td>'
+        + '<td class="mono">' + esc(fmtTs(r.last_run_at)) + '</td>'
+        + '<td class="mono">' + esc(fmtTs(r.last_success_at)) + '</td>'
+        + '<td>' + fmtNum(r.consecutive_failures) + '</td>'
+        + '<td class="truncate">' + esc(r.last_error || '-') + '</td>'
+        + '</tr>';
+    }
+    html += '</table>';
+    document.getElementById('maintenance-body').innerHTML = html;
+  } catch {}
+}
+
+async function fetchPolicyMetrics() {
+  try {
+    const d = await api('/api/policy/metrics');
+    const g = d.graduation || {};
+    const rows = [
+      ['Router shadow total', fmtNum(d.router_shadow_total)],
+      ['Router divergence', fmtNum(d.router_shadow_diverged)],
+      ['Router divergence rate', ((d.router_divergence_rate || 0) * 100).toFixed(2) + '%'],
+      ['Tool exposure samples', fmtNum(d.tool_exposure_samples)],
+      ['Avg tools before filter', (d.avg_tools_before_filter || 0).toFixed(2)],
+      ['Avg tools after filter', (d.avg_tools_after_filter || 0).toFixed(2)],
+      ['Ambiguity detected', fmtNum(d.ambiguity_detected_total)],
+      ['Uncertainty clarifications', fmtNum(d.uncertainty_clarify_total)],
+      ['Current uncertainty threshold', (d.uncertainty_threshold || 0).toFixed(2)],
+      ['Context refreshes', fmtNum(d.context_refresh_total)],
+      ['Escalations', fmtNum(d.escalation_total)],
+      ['Fallback expansions', fmtNum(d.fallback_expansion_total)],
+      ['Graduation observed days', (g.observed_days || 0).toFixed(2)],
+      ['Graduation divergence rate', (((g.divergence_rate || 0) * 100).toFixed(2) + '%')],
+      ['Graduation gate', g.gate_passed ? 'PASS' : 'WAIT'],
+    ];
+    let html = '<table><tr><th>Metric</th><th>Value</th></tr>';
+    for (const [k, v] of rows) html += '<tr><td>' + esc(k) + '</td><td class="mono">' + esc(String(v)) + '</td></tr>';
+    html += '</table>';
+    document.getElementById('policy-body').innerHTML = html;
+  } catch {
+    document.getElementById('policy-body').innerHTML = '<p class="empty">Policy metrics unavailable</p>';
+  }
+}
+
+function fetchAll() { fetchStatus(); fetchUsage(); fetchSessions(); fetchTasks(); fetchMaintenanceJobs(); fetchPolicyMetrics(); }
 
 // Startup
 if (TOKEN) { tryConnect(); } else { showAuth(); }

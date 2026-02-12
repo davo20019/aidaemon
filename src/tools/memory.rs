@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use crate::traits::{StateStore, Tool};
+use crate::traits::{StateStore, Tool, ToolRole};
 use crate::types::FactPrivacy;
 
 pub struct RememberFactTool {
@@ -63,6 +63,10 @@ impl Tool for RememberFactTool {
                 "required": ["category", "key", "value"]
             }
         })
+    }
+
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

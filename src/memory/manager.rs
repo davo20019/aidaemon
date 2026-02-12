@@ -58,84 +58,67 @@ impl MemoryManager {
         self
     }
 
-    pub fn start_background_tasks(self: Arc<Self>) {
-        // Embedding generation loop (every 5s)
-        let manager = self.clone();
-        tokio::spawn(async move {
-            info!("Starting memory background tasks...");
-            loop {
-                if let Err(e) = manager.process_embeddings().await {
-                    error!("Error processing embeddings: {}", e);
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+    /// Register all memory background jobs with the heartbeat coordinator.
+    /// Methods are public so the heartbeat can call them individually.
+    pub fn register_heartbeat_jobs(
+        self: &Arc<Self>,
+        heartbeat: &mut crate::heartbeat::HeartbeatCoordinator,
+    ) {
+        // Embedding generation (every 5s)
+        let mgr = self.clone();
+        heartbeat.register_job("embeddings", Duration::from_secs(5), move || {
+            let m = mgr.clone();
+            async move {
+                let _ = m.process_embeddings().await?;
+                Ok(())
             }
         });
 
-        // Memory consolidation loop (configurable interval, default 6h)
-        let manager = self.clone();
+        // Memory consolidation (configurable interval, default 6h)
+        let mgr = self.clone();
         let interval = self.consolidation_interval;
-        tokio::spawn(async move {
-            info!(
-                interval_hours = interval.as_secs() / 3600,
-                "Starting memory consolidation loop..."
-            );
-            loop {
-                tokio::time::sleep(interval).await;
-                if let Err(e) = manager.consolidate_memories().await {
-                    error!("Error during memory consolidation: {}", e);
-                }
-            }
+        heartbeat.register_job("consolidation", interval, move || {
+            let m = mgr.clone();
+            async move { m.consolidate_memories().await }
         });
 
-        // Memory decay loop (daily at 3 AM or every 24h)
-        let manager = self.clone();
-        tokio::spawn(async move {
-            info!("Starting memory decay loop (daily)...");
-            loop {
-                // Wait 24 hours
-                tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
-                if let Err(e) = manager.decay_memories().await {
-                    error!("Error during memory decay: {}", e);
-                }
-            }
+        // Memory decay (daily)
+        let mgr = self.clone();
+        heartbeat.register_job("memory_decay", Duration::from_secs(24 * 3600), move || {
+            let m = mgr.clone();
+            async move { m.decay_memories().await }
         });
 
-        // Goal review loop (weekly)
-        let manager = self.clone();
-        tokio::spawn(async move {
-            info!("Starting goal review loop (weekly)...");
-            loop {
-                // Wait 7 days
-                tokio::time::sleep(Duration::from_secs(7 * 24 * 3600)).await;
-                if let Err(e) = manager.review_goals().await {
-                    error!("Error during goal review: {}", e);
-                }
-            }
+        // Goal review (weekly)
+        let mgr = self.clone();
+        heartbeat.register_job(
+            "goal_review",
+            Duration::from_secs(7 * 24 * 3600),
+            move || {
+                let m = mgr.clone();
+                async move { m.review_goals().await }
+            },
+        );
+
+        // Episode creation (every 30 minutes)
+        let mgr = self.clone();
+        heartbeat.register_job("episodes", Duration::from_secs(30 * 60), move || {
+            let m = mgr.clone();
+            async move { m.create_episodes_for_idle_sessions().await }
         });
 
-        // Episode creation loop (every 30 minutes - check for idle sessions)
-        let manager = self.clone();
-        tokio::spawn(async move {
-            info!("Starting episode creation loop (every 30m)...");
-            loop {
-                tokio::time::sleep(Duration::from_secs(30 * 60)).await;
-                if let Err(e) = manager.create_episodes_for_idle_sessions().await {
-                    error!("Error creating episodes for idle sessions: {}", e);
-                }
-            }
-        });
+        // Pattern detection and style analysis (every 6 hours)
+        let mgr = self.clone();
+        heartbeat.register_job(
+            "pattern_detection",
+            Duration::from_secs(6 * 3600),
+            move || {
+                let m = mgr.clone();
+                async move { m.analyze_recent_activity().await }
+            },
+        );
 
-        // Pattern detection and style analysis loop (every 6 hours)
-        let manager = self.clone();
-        tokio::spawn(async move {
-            info!("Starting pattern detection loop (every 6h)...");
-            loop {
-                tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
-                if let Err(e) = manager.analyze_recent_activity().await {
-                    error!("Error during pattern/style analysis: {}", e);
-                }
-            }
-        });
+        info!("Memory background tasks registered with heartbeat");
     }
 
     async fn process_embeddings(&self) -> anyhow::Result<bool> {
@@ -281,6 +264,12 @@ impl MemoryManager {
                 .await
             {
                 Ok(response) => {
+                    // Track token usage for background LLM calls
+                    if let (Some(state), Some(usage)) = (&self.state, &response.usage) {
+                        let _ = state
+                            .record_token_usage("background:memory_consolidation", usage)
+                            .await;
+                    }
                     if let Some(text) = &response.content {
                         match parse_consolidation_response(text) {
                             Ok(facts) => {
@@ -373,6 +362,76 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// Check if two person names likely refer to the same person.
+    /// Handles first-name-only match, case-insensitive, prefix match.
+    fn names_likely_match(candidate: &str, existing: &str) -> bool {
+        let c = candidate.trim().to_lowercase();
+        let e = existing.trim().to_lowercase();
+
+        if c == e {
+            return true;
+        }
+
+        // First-name match: "John" matches "John Smith"
+        let c_parts: Vec<&str> = c.split_whitespace().collect();
+        let e_parts: Vec<&str> = e.split_whitespace().collect();
+
+        // Single-name candidate matches multi-name existing (first name)
+        if c_parts.len() == 1 && e_parts.len() > 1 && c_parts[0] == e_parts[0] {
+            return true;
+        }
+        // Multi-name candidate matches single-name existing (first name)
+        if e_parts.len() == 1 && c_parts.len() > 1 && c_parts[0] == e_parts[0] {
+            return true;
+        }
+
+        false
+    }
+
+    /// Find a person by exact name first, then fuzzy match against all people + aliases.
+    /// Returns the matched person and upgrades name to more complete form when found.
+    async fn find_or_match_person(
+        state: &Arc<dyn StateStore>,
+        name: &str,
+    ) -> anyhow::Result<Option<Person>> {
+        // Exact match first
+        if let Some(person) = state.find_person_by_name(name).await? {
+            return Ok(Some(person));
+        }
+
+        // Fuzzy match against all people
+        let all_people = state.get_all_people().await?;
+        for person in &all_people {
+            if Self::names_likely_match(name, &person.name) {
+                return Ok(Some(person.clone()));
+            }
+            // Check aliases too
+            for alias in &person.aliases {
+                if Self::names_likely_match(name, alias) {
+                    return Ok(Some(person.clone()));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Normalize a person name: trim, title-case.
+    fn normalize_person_name(name: &str) -> String {
+        name.split_whitespace()
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(first) => {
+                        first.to_uppercase().to_string() + &chars.as_str().to_lowercase()
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Route a "people" category fact to the person_facts table.
     async fn route_people_fact(&self, fact: &ExtractedFact) {
         let state = match &self.state {
@@ -389,7 +448,7 @@ impl MemoryManager {
             return;
         }
 
-        let person_name = match &fact.person_name {
+        let raw_name = match &fact.person_name {
             Some(name) if !name.is_empty() => name.clone(),
             _ => {
                 // Try to extract person name from the key (format: "person_name:detail_type")
@@ -399,6 +458,12 @@ impl MemoryManager {
                 }
             }
         };
+
+        // Name normalization: trim, title-case, reject single-char names
+        let person_name = Self::normalize_person_name(&raw_name);
+        if person_name.len() < 2 {
+            return;
+        }
 
         // Extract the detail type from the key
         let detail_key = fact.key.split(':').nth(1).unwrap_or(&fact.key);
@@ -428,9 +493,27 @@ impl MemoryManager {
             }
         }
 
-        // Find or create the person
-        let person_id = match state.find_person_by_name(&person_name).await {
-            Ok(Some(p)) => p.id,
+        // Find or create the person (with fuzzy name matching)
+        let person_id = match Self::find_or_match_person(state, &person_name).await {
+            Ok(Some(p)) => {
+                // If we matched via fuzzy and the new name is more complete, upgrade
+                if p.name.len() < person_name.len()
+                    && Self::names_likely_match(&person_name, &p.name)
+                {
+                    let mut updated = p.clone();
+                    updated.name = person_name.clone();
+                    updated.updated_at = chrono::Utc::now();
+                    if let Err(e) = state.upsert_person(&updated).await {
+                        warn!("Failed to upgrade person name to '{}': {}", person_name, e);
+                    } else {
+                        info!(
+                            "Upgraded person name '{}' → '{}' (ID: {})",
+                            p.name, person_name, p.id
+                        );
+                    }
+                }
+                p.id
+            }
             Ok(None) => {
                 // Auto-create with minimal info
                 let person = Person {
@@ -502,13 +585,17 @@ impl MemoryManager {
         let now = chrono::Utc::now().to_rfc3339();
         let privacy_str = privacy.to_string();
 
+        // Use an IMMEDIATE transaction to make the SELECT → UPDATE → INSERT atomic.
+        // This prevents concurrent consolidation cycles from losing facts.
+        let mut tx = self.pool.begin().await?;
+
         // Use supersession logic: find existing current fact
         let existing = sqlx::query(
             "SELECT id, value FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL",
         )
         .bind(category)
         .bind(key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         if let Some(row) = existing {
@@ -520,11 +607,11 @@ impl MemoryManager {
                 sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
                     .bind(&now)
                     .bind(old_id)
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await?;
 
-                // Insert new fact
-                sqlx::query(
+                // Insert new fact — ignore duplicate entry errors (code 2067)
+                let insert_result = sqlx::query(
                     "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy)
                      VALUES (?, ?, ?, 'consolidation', ?, ?, 0, ?, ?)"
                 )
@@ -535,8 +622,21 @@ impl MemoryManager {
                 .bind(&now)
                 .bind(channel_id)
                 .bind(&privacy_str)
-                .execute(&self.pool)
-                .await?;
+                .execute(&mut *tx)
+                .await;
+
+                match insert_result {
+                    Ok(_) => {}
+                    Err(sqlx::Error::Database(ref db_err))
+                        if db_err.code().as_deref() == Some("2067") =>
+                    {
+                        // Duplicate entry — fact already exists, ignore
+                    }
+                    Err(e) => {
+                        tx.rollback().await.ok();
+                        return Err(e.into());
+                    }
+                }
             }
         } else {
             // Check for previously-deleted (superseded) fact — don't re-create via consolidation.
@@ -547,15 +647,16 @@ impl MemoryManager {
             )
             .bind(category)
             .bind(key)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
             if was_deleted.is_some() {
+                tx.commit().await?;
                 return Ok(());
             }
 
-            // No existing fact - insert new
-            sqlx::query(
+            // No existing fact - insert new (ignore duplicate entry errors from concurrent inserts)
+            let insert_result = sqlx::query(
                 "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy)
                  VALUES (?, ?, ?, 'consolidation', ?, ?, 0, ?, ?)"
             )
@@ -566,9 +667,23 @@ impl MemoryManager {
             .bind(&now)
             .bind(channel_id)
             .bind(&privacy_str)
-            .execute(&self.pool)
-            .await?;
+            .execute(&mut *tx)
+            .await;
+
+            match insert_result {
+                Ok(_) => {}
+                Err(sqlx::Error::Database(ref db_err))
+                    if db_err.code().as_deref() == Some("2067") =>
+                {
+                    // Duplicate entry — fact already exists, ignore
+                }
+                Err(e) => {
+                    tx.rollback().await.ok();
+                    return Err(e.into());
+                }
+            }
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -684,10 +799,10 @@ impl MemoryManager {
             .unwrap_or_else(Utc::now);
         let now = Utc::now();
 
-        // Insert episode
+        // Insert episode (OR IGNORE to handle concurrent creation for same session)
         let topics_json = serde_json::to_string(&analysis.topics).ok();
         let result = sqlx::query(
-            "INSERT INTO episodes (session_id, summary, topics, emotional_tone, outcome, importance, recall_count, message_count, start_time, end_time, created_at)
+            "INSERT OR IGNORE INTO episodes (session_id, summary, topics, emotional_tone, outcome, importance, recall_count, message_count, start_time, end_time, created_at)
              VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)"
         )
         .bind(session_id)
@@ -702,6 +817,22 @@ impl MemoryManager {
         .bind(now.to_rfc3339())
         .execute(&self.pool)
         .await?;
+
+        if result.rows_affected() == 0 {
+            // Race condition: another consolidation cycle already created an episode for this session.
+            // Fetch the existing episode ID and return it.
+            info!(
+                session_id,
+                "Episode already exists for session, using existing"
+            );
+            let existing: Option<(i64,)> =
+                sqlx::query_as("SELECT id FROM episodes WHERE session_id = ? LIMIT 1")
+                    .bind(session_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            let episode_id = existing.map(|(id,)| id).unwrap_or(0);
+            return Ok(episode_id);
+        }
 
         let episode_id = result.last_insert_rowid();
 
@@ -765,6 +896,13 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             .provider
             .chat(&self.fast_model, &llm_messages, &[])
             .await?;
+
+        // Track token usage for background LLM calls
+        if let (Some(state), Some(usage)) = (&self.state, &response.usage) {
+            let _ = state
+                .record_token_usage("background:episode_creation", usage)
+                .await;
+        }
 
         let text = response
             .content

@@ -9,6 +9,8 @@ use zeroize::Zeroize;
 use crate::providers::ProviderError;
 use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
 
+const CONSULTANT_TEXT_ONLY_MARKER: &str = "[CONSULTANT_TEXT_ONLY_MODE]";
+
 /// Recursively strip fields unsupported by Gemini API from a JSON value.
 /// Google Gemini rejects `$schema` and `additionalProperties` in function parameter schemas.
 fn strip_unsupported_fields(value: &mut Value) {
@@ -43,10 +45,8 @@ impl Drop for GoogleGenAiProvider {
 
 impl GoogleGenAiProvider {
     pub fn new(api_key: &str) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .expect("failed to build HTTP client");
+        let client = crate::providers::build_http_client(Duration::from_secs(120))
+            .unwrap_or_else(|e| panic!("failed to build HTTP client: {e}"));
         Self {
             client,
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
@@ -215,6 +215,57 @@ impl GoogleGenAiProvider {
         }
     }
 
+    /// Detect whether the system instruction explicitly requests text-only consultant mode.
+    fn is_consultant_text_only_mode(system_instruction: &Option<Value>) -> bool {
+        system_instruction
+            .as_ref()
+            .and_then(|sys| sys.get("parts"))
+            .and_then(|parts| parts.as_array())
+            .is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part.get("text")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|text| text.contains(CONSULTANT_TEXT_ONLY_MARKER))
+                })
+            })
+    }
+
+    fn build_request_body(
+        &self,
+        system_instruction: Option<Value>,
+        contents: Vec<Value>,
+        tools: &[Value],
+    ) -> (Value, bool, bool, bool) {
+        let consultant_text_only_mode = Self::is_consultant_text_only_mode(&system_instruction);
+        let has_function_tools = !tools.is_empty();
+        let include_grounding = !has_function_tools && !consultant_text_only_mode;
+        let disable_function_calling = !has_function_tools || consultant_text_only_mode;
+        let gemini_tools = self.convert_tools(tools, include_grounding);
+
+        let mut body = json!({
+            "contents": contents,
+        });
+
+        if let Some(ref sys) = system_instruction {
+            body["system_instruction"] = sys.clone();
+        }
+        if let Some(ref gt) = gemini_tools {
+            body["tools"] = json!(gt);
+        }
+        if disable_function_calling {
+            body["tool_config"] = json!({
+                "function_calling_config": { "mode": "NONE" }
+            });
+        }
+
+        (
+            body,
+            consultant_text_only_mode,
+            include_grounding,
+            disable_function_calling,
+        )
+    }
+
     /// Parse a Gemini generateContent response into a ProviderResponse.
     fn parse_response(&self, data: &Value, model: &str) -> anyhow::Result<ProviderResponse> {
         let candidate = data["candidates"]
@@ -227,10 +278,28 @@ impl GoogleGenAiProvider {
             .unwrap_or(&empty_parts);
 
         let mut final_text = String::new();
+        let mut thinking_text = String::new();
         let mut tool_calls = Vec::new();
 
         for part in content_parts {
             if let Some(text) = part.get("text").and_then(|s| s.as_str()) {
+                // Gemini thinking models return thought parts (thought: true).
+                // Capture them separately — they can be used as fallback when
+                // the model produces no regular text content.
+                let is_thought = part
+                    .get("thought")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_thought {
+                    info!(
+                        model,
+                        thought_len = text.len(),
+                        thought_preview = %text.chars().take(300).collect::<String>(),
+                        "Gemini thinking output"
+                    );
+                    thinking_text.push_str(text);
+                    continue;
+                }
                 final_text.push_str(text);
             }
             if let Some(fc) = part.get("functionCall") {
@@ -297,6 +366,11 @@ impl GoogleGenAiProvider {
             },
             tool_calls,
             usage,
+            thinking: if thinking_text.is_empty() {
+                None
+            } else {
+                Some(thinking_text)
+            },
         })
     }
 }
@@ -310,31 +384,23 @@ impl ModelProvider for GoogleGenAiProvider {
         tools: &[Value],
     ) -> anyhow::Result<ProviderResponse> {
         let (system_instruction, contents) = self.convert_messages(messages);
-
-        // Include google_search grounding ONLY when no function-calling tools are
-        // present. When both are sent together the model may route through grounding
-        // instead of calling the user's function tools, producing hallucinated text
-        // responses instead of tool calls.
         let has_function_tools = !tools.is_empty();
-        let include_grounding = !has_function_tools;
-        let gemini_tools = self.convert_tools(tools, include_grounding);
-
-        let mut body = json!({
-            "contents": contents,
-        });
-
-        if let Some(ref sys) = system_instruction {
-            body["system_instruction"] = sys.clone();
-        }
-        if let Some(ref gt) = gemini_tools {
-            body["tools"] = json!(gt);
-        }
+        let (body, consultant_text_only_mode, include_grounding, disable_function_calling) =
+            self.build_request_body(system_instruction, contents, tools);
 
         // Use header-based authentication instead of URL query parameter
         // to avoid API key exposure in logs, proxies, and error messages
         let url = format!("{}/models/{}:generateContent", self.base_url, model);
 
-        info!(model, url_prefix = %self.base_url, "Calling Google GenAI");
+        info!(
+            model,
+            url_prefix = %self.base_url,
+            consultant_text_only_mode,
+            has_function_tools,
+            include_grounding,
+            disable_function_calling,
+            "Calling Google GenAI"
+        );
 
         let resp = match self
             .client
@@ -401,7 +467,16 @@ mod tests {
     use serde_json::json;
 
     fn provider() -> GoogleGenAiProvider {
-        GoogleGenAiProvider::new("fake-key")
+        let client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .no_proxy()
+            .build()
+            .expect("failed to build HTTP client");
+        GoogleGenAiProvider {
+            client,
+            base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+            api_key: "fake-key".to_string(),
+        }
     }
 
     /// Helper: build an OpenAI-format tool definition from a parameters object.
@@ -564,6 +639,151 @@ mod tests {
         let result = p.convert_tools_for_test(&tools, false).unwrap();
         assert_no_schema_field(&json!(result), "tools");
         assert_no_additional_properties(&json!(result), "tools");
+    }
+
+    #[test]
+    fn test_detects_consultant_text_only_marker() {
+        let sys = Some(json!({
+            "parts": [
+                { "text": "prefix" },
+                { "text": "[CONSULTANT_TEXT_ONLY_MODE]\ntext only" }
+            ]
+        }));
+        assert!(GoogleGenAiProvider::is_consultant_text_only_mode(&sys));
+    }
+
+    #[test]
+    fn test_request_body_consultant_mode_disables_grounding_and_function_calls() {
+        let p = provider();
+        let system_instruction = Some(json!({
+            "parts": [{ "text": "[CONSULTANT_TEXT_ONLY_MODE]\ntext only" }]
+        }));
+        let contents = vec![json!({
+            "role": "user",
+            "parts": [{ "text": "what is rust?" }]
+        })];
+
+        let (body, consultant_mode, include_grounding, disable_fn_calling) =
+            p.build_request_body(system_instruction, contents, &[]);
+
+        assert!(consultant_mode);
+        assert!(!include_grounding);
+        assert!(disable_fn_calling);
+        assert!(body.get("tools").is_none());
+        assert_eq!(
+            body["tool_config"]["function_calling_config"]["mode"],
+            "NONE"
+        );
+    }
+
+    #[test]
+    fn test_request_body_with_no_tools_disables_function_calls_and_keeps_grounding() {
+        let p = provider();
+        let system_instruction = Some(json!({
+            "parts": [{ "text": "normal system prompt" }]
+        }));
+        let contents = vec![json!({
+            "role": "user",
+            "parts": [{ "text": "latest news" }]
+        })];
+
+        let (body, consultant_mode, include_grounding, disable_fn_calling) =
+            p.build_request_body(system_instruction, contents, &[]);
+
+        assert!(!consultant_mode);
+        assert!(include_grounding);
+        assert!(disable_fn_calling);
+        assert_eq!(
+            body["tool_config"]["function_calling_config"]["mode"],
+            "NONE"
+        );
+        let tools = body["tools"].as_array().expect("tools should be present");
+        assert!(
+            tools.iter().any(|t| t.get("google_search").is_some()),
+            "expected google_search grounding when not in consultant mode"
+        );
+    }
+
+    /// Verify that thought_signature from Gemini thinking models survives the
+    /// parse → convert round-trip (response parsing → message conversion).
+    #[test]
+    fn test_thought_signature_round_trip() {
+        let p = provider();
+
+        // 1. Simulate a Gemini response with thought_signature on a functionCall part
+        let gemini_response = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "name": "terminal",
+                            "args": { "command": "ls projects" }
+                        },
+                        "thought_signature": "abc123-sig"
+                    }]
+                }
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5
+            }
+        });
+
+        // 2. Parse the response — extra_content should capture thought_signature
+        let parsed = p
+            .parse_response(&gemini_response, "gemini-2.5-flash")
+            .unwrap();
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let tc = &parsed.tool_calls[0];
+        assert_eq!(tc.name, "terminal");
+        let extra = tc
+            .extra_content
+            .as_ref()
+            .expect("extra_content should be present");
+        assert_eq!(extra["thought_signature"], "abc123-sig");
+
+        // 3. Build an assistant message in OpenAI wire format (as agent.rs does)
+        let mut val = json!({
+            "id": tc.id,
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": tc.arguments,
+            }
+        });
+        if let Some(ref extra) = tc.extra_content {
+            val["extra_content"] = extra.clone();
+        }
+
+        // 4. Build a Gemini-format message array with the assistant + tool result
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [val]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "name": "terminal",
+                "content": "{\"result\": \"site-cars\"}"
+            }),
+        ];
+
+        // 5. Convert back to Gemini format — thought_signature must be preserved
+        let (_sys, contents) = p.convert_messages(&messages);
+        assert_eq!(contents.len(), 2);
+
+        // The model message should have the functionCall part with thought_signature
+        let model_msg = &contents[0];
+        assert_eq!(model_msg["role"], "model");
+        let parts = model_msg["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].get("functionCall").is_some());
+        assert_eq!(
+            parts[0]["thought_signature"], "abc123-sig",
+            "thought_signature must survive the round-trip"
+        );
     }
 
     /// Recursively check that no object in `value` contains an `additionalProperties` key.

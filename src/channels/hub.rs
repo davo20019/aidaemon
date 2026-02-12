@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::traits::Channel;
 use crate::types::{ApprovalResponse, MediaMessage};
@@ -17,8 +18,8 @@ pub type SessionMap = Arc<RwLock<HashMap<String, String>>>;
 ///
 /// The hub routes approval requests, media, and notifications to the
 /// correct channel based on which channel originated the session.
-/// If the session's channel is unknown, it falls back to the first
-/// registered channel.
+/// Unknown sessions are refused (returns None) to prevent cross-channel
+/// privacy leaks.
 pub struct ChannelHub {
     /// Registered channels. Uses RwLock to support dynamic registration.
     channels: RwLock<Vec<Arc<dyn Channel>>>,
@@ -50,7 +51,8 @@ impl ChannelHub {
         &self.session_map
     }
 
-    /// Find the channel that owns a session, falling back to the first channel.
+    /// Find the channel that owns a session.
+    /// Returns None for unknown sessions to prevent cross-channel privacy leaks.
     async fn channel_for_session(&self, session_id: &str) -> Option<Arc<dyn Channel>> {
         let map = self.session_map.read().await;
         let channels = self.channels.read().await;
@@ -59,8 +61,34 @@ impl ChannelHub {
                 return Some(ch.clone());
             }
         }
-        // Fallback: first registered channel
-        channels.first().cloned()
+        None
+    }
+
+    /// Request approval through a channel that supports inline buttons.
+    ///
+    /// Used for UX flows that require button consistency (for example scheduled
+    /// goal confirmation) while preserving text fallback in non-inline channels.
+    pub async fn request_inline_approval(
+        &self,
+        session_id: &str,
+        command: &str,
+        risk_level: RiskLevel,
+        warnings: &[String],
+        permission_mode: PermissionMode,
+    ) -> anyhow::Result<ApprovalResponse> {
+        let channel = self
+            .channel_for_session(session_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No channel found for session {}", session_id))?;
+        if !channel.capabilities().inline_buttons {
+            anyhow::bail!(
+                "Channel {} does not support inline approval buttons",
+                channel.name()
+            );
+        }
+        channel
+            .request_approval(session_id, command, risk_level, warnings, permission_mode)
+            .await
     }
 
     /// Route approval requests from tools to the appropriate channel.
@@ -142,6 +170,22 @@ impl ChannelHub {
     pub async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
         if let Some(channel) = self.channel_for_session(session_id).await {
             channel.send_text(session_id, text).await
+        } else {
+            anyhow::bail!("No channel found for session {}", session_id)
+        }
+    }
+
+    /// Send media to the channel that owns a specific session.
+    /// Falls back to text caption for channels without media support.
+    pub async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
+        if let Some(channel) = self.channel_for_session(session_id).await {
+            if channel.capabilities().media {
+                channel.send_media(session_id, media).await
+            } else {
+                channel
+                    .send_text(session_id, &format!("[File] {}", media.caption))
+                    .await
+            }
         } else {
             anyhow::bail!("No channel found for session {}", session_id)
         }
@@ -261,17 +305,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_channel_for_session_fallback() {
+    async fn test_channel_for_session_unknown_returns_none() {
         let ch_telegram: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("telegram"));
         let ch_slack: Arc<dyn Channel> = Arc::new(NamedTestChannel::new("slack"));
 
         let session_map = empty_session_map();
         let hub = ChannelHub::new(vec![ch_telegram, ch_slack], session_map);
 
-        // Unknown session should fall back to the first channel
+        // Unknown session should return None to prevent cross-channel leaks
         let found = hub.channel_for_session("unknown_session").await;
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().name(), "telegram");
+        assert!(found.is_none());
     }
 
     #[tokio::test]

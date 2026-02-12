@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::info;
 
+use crate::cron_utils::{compute_next_run, parse_schedule};
 use crate::health::{HealthProbe, HealthProbeStore, ProbeConfig, ProbeExecutor, ProbeType};
-use crate::scheduler::{compute_next_run, parse_schedule};
 use crate::traits::Tool;
 
 pub struct HealthProbeTool {

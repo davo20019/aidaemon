@@ -150,16 +150,19 @@ impl OAuthGateway {
     fn get_credentials(service: &str) -> anyhow::Result<(String, String)> {
         let client_id_key = format!("oauth_{}_client_id", service);
         let client_secret_key = format!("oauth_{}_client_secret", service);
-        let client_id = crate::config::resolve_from_keychain(&client_id_key)
-            .map_err(|_| anyhow::anyhow!(
+        let client_id = crate::config::resolve_from_keychain(&client_id_key).map_err(|_| {
+            anyhow::anyhow!(
                 "Client ID not found in keychain. Set it with: aidaemon keychain set {}",
                 client_id_key
-            ))?;
-        let client_secret = crate::config::resolve_from_keychain(&client_secret_key)
-            .map_err(|_| anyhow::anyhow!(
-                "Client secret not found in keychain. Set it with: aidaemon keychain set {}",
-                client_secret_key
-            ))?;
+            )
+        })?;
+        let client_secret =
+            crate::config::resolve_from_keychain(&client_secret_key).map_err(|_| {
+                anyhow::anyhow!(
+                    "Client secret not found in keychain. Set it with: aidaemon keychain set {}",
+                    client_secret_key
+                )
+            })?;
         Ok((client_id, client_secret))
     }
 
@@ -308,9 +311,8 @@ impl OAuthGateway {
         }
 
         // Calculate token expiry
-        let expires_at = expires_in.map(|secs| {
-            (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
-        });
+        let expires_at = expires_in
+            .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339());
 
         // Save connection metadata to SQLite
         let conn = crate::traits::OAuthConnection {
@@ -485,9 +487,8 @@ impl OAuthGateway {
 
         // Update expiry
         let expires_in = token_data["expires_in"].as_u64();
-        let expires_at = expires_in.map(|secs| {
-            (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
-        });
+        let expires_at = expires_in
+            .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339());
         self.state_store
             .update_oauth_token_expiry(service, expires_at.as_deref())
             .await?;

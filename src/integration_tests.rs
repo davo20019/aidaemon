@@ -4,12 +4,20 @@
 //! multi-turn history, and session isolation — the same code path all
 //! channels use via `Agent::handle_message()`.
 
-use crate::testing::{setup_test_agent, MockProvider};
-use crate::traits::{
-    BehaviorPattern, Episode, ErrorSolution, Goal, Procedure, StateStore, UserProfile,
+use crate::testing::{
+    setup_full_stack_test_agent, setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
+    setup_test_agent_v3, setup_test_agent_v3_task_leads, setup_test_agent_with_models,
+    MockProvider, MockTool,
 };
-use crate::types::{ChannelContext, ChannelVisibility, UserRole};
+use crate::traits::{
+    BehaviorPattern, Episode, ErrorSolution, Goal, GoalV3, Procedure, ProviderResponse, StateStore,
+    UserProfile,
+};
+use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 use chrono::Utc;
+use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[tokio::test]
 async fn test_basic_message_response() {
@@ -1345,6 +1353,365 @@ async fn test_stall_detection_unknown_tool() {
     );
 }
 
+/// Regression test: "create a new website about cars" scenario.
+///
+/// Real-world bug: user sent a complex prompt, aidaemon delegated to cli_agent,
+/// cli_agent completed successfully (built the site, took screenshots). Then
+/// aidaemon did follow-up work — exploring the project with 10+ consecutive
+/// terminal-like calls (ls, git status, git remote -v, cat package.json, etc.).
+/// The alternating pattern detection falsely triggered because all calls used
+/// the same tool name (unique_tools.len() == 1 <= 2).
+///
+/// This test simulates the full flow: system_info (project discovery, 3 calls)
+/// → remember_fact (storing project findings, 9 calls) → final summary.
+/// The first 3 system_info calls hit the per-tool call-count limit (3 for
+/// non-exempt tools), then the agent switches to remember_fact (exempt).
+/// Total: 12 single-tool-name calls in the window, must NOT trigger stall.
+#[tokio::test]
+async fn test_complex_prompt_website_project_exploration() {
+    let mut responses: Vec<ProviderResponse> = Vec::new();
+
+    // Iteration 1: agent narrates intent + checks system info
+    {
+        let mut resp = MockProvider::tool_call_response("system_info", "{}");
+        resp.content = Some(
+            "I'll help you create a new website about cars. Let me first check the system \
+             environment to understand what tools and runtimes are available."
+                .to_string(),
+        );
+        responses.push(resp);
+    }
+
+    // Iteration 2: agent checks system again (e.g. checking Node.js version)
+    {
+        let mut resp = MockProvider::tool_call_response("system_info", r#"{"check":"node"}"#);
+        resp.content = Some("Let me check if Node.js and npm are installed.".to_string());
+        responses.push(resp);
+    }
+
+    // Iteration 3: system_info one more time (e.g. checking git)
+    {
+        let mut resp = MockProvider::tool_call_response("system_info", r#"{"check":"git"}"#);
+        resp.content = Some("Checking git configuration for the project.".to_string());
+        responses.push(resp);
+    }
+
+    // Iterations 4-12: agent records what it found (simulating terminal exploration
+    // like ls, cat package.json, git remote -v, etc. — uses remember_fact since
+    // terminal requires approval flow unavailable in test harness)
+    let facts = [
+        (
+            "project_structure",
+            "Next.js app with src/app layout, tailwind configured",
+        ),
+        (
+            "dependencies",
+            "next@14, react@18, tailwindcss@3, typescript@5",
+        ),
+        (
+            "git_remote",
+            "origin https://github.com/user/my-website.git",
+        ),
+        (
+            "deployment",
+            "Vercel project linked, domain myproject.example.com",
+        ),
+        (
+            "pages_found",
+            "Home, About, Gallery, Contact — all with placeholder content",
+        ),
+        (
+            "build_status",
+            "npm run build succeeds, no TypeScript errors",
+        ),
+        (
+            "styling",
+            "Tailwind with custom theme, dark mode support configured",
+        ),
+        (
+            "images",
+            "public/images/ has 12 sample photos from Unsplash",
+        ),
+        (
+            "performance",
+            "Lighthouse score 98/100, all Core Web Vitals green",
+        ),
+    ];
+    for (key, value) in &facts {
+        let args = format!(
+            r#"{{"category":"project","key":"{}","value":"{}"}}"#,
+            key, value
+        );
+        let mut resp = MockProvider::tool_call_response("remember_fact", &args);
+        resp.content = Some(format!("Recording project detail: {}", key));
+        responses.push(resp);
+    }
+
+    // Final: agent summarizes everything
+    responses.push(MockProvider::text_response(
+        "Done! I've explored the website project and recorded all the key details. \
+         The site is built with Next.js 14, deployed to myproject.example.com via Vercel, \
+         with 4 pages, Tailwind styling, and a Lighthouse score of 98.",
+    ));
+
+    let harness = setup_test_agent(MockProvider::with_responses(responses))
+        .await
+        .unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "telegram_12345",
+            "I need to create a new website for my portfolio. We should push it to \
+             myproject.example.com. make it modern.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Agent must complete normally — no stall detection
+    assert!(
+        response.contains("Done!"),
+        "Agent should complete the full exploration without stall. Got: {}",
+        response.chars().take(300).collect::<String>()
+    );
+    // 3 system_info + 9 remember_fact + 1 final text = 13 LLM calls
+    // (system_info calls 4+ get blocked but the iteration still counts)
+    let calls = harness.provider.call_count().await;
+    assert!(
+        calls >= 12,
+        "Expected at least 12 LLM calls for full exploration, got {}",
+        calls
+    );
+}
+
+/// Regression test: "Previous convo" — user resumes a conversation and the agent
+/// explores an existing project to understand where they left off.
+///
+/// Real-world bug: user said "Previous convo" and the agent started exploring the
+/// my-website project with many terminal commands: ls, git status, ls src -R,
+/// cat package.json (x2), git remote -v (x2), ls .git (x2). The duplicate calls
+/// (same command twice) didn't reach the soft-redirect threshold of 3, but
+/// 11 consecutive terminal calls triggered the alternating pattern detection
+/// at the 10th call (window full of a single tool name).
+///
+/// This test scripts 11 consecutive remember_fact calls with some duplicate
+/// arguments (simulating the real-world pattern) and verifies no stall fires.
+#[tokio::test]
+async fn test_complex_prompt_resume_previous_conversation() {
+    let mut responses: Vec<ProviderResponse> = Vec::new();
+
+    // Iteration 1: agent narrates + first exploration
+    {
+        let mut resp = MockProvider::tool_call_response(
+            "remember_fact",
+            r#"{"category":"context","key":"project_dir","value":"/home/testuser/my-website"}"#,
+        );
+        resp.content = Some(
+            "I see you want to continue from our previous conversation about the website project. \
+             Let me check the current state of the project."
+                .to_string(),
+        );
+        responses.push(resp);
+    }
+
+    // Iterations 2-11: agent explores the project, with some duplicate calls
+    // (simulating real behavior: git remote -v called twice, ls .git twice, etc.)
+    let exploration_steps = [
+        ("project_status", "git shows 3 modified files, 1 untracked"),
+        (
+            "branch",
+            "On branch feature/gallery, 2 commits ahead of main",
+        ),
+        ("package_json", "next@14.1.0, react@18.2.0, 12 dependencies"),
+        // Duplicate: agent re-reads package.json (real behavior observed)
+        ("package_json", "next@14.1.0, react@18.2.0, 12 dependencies"),
+        ("git_remote", "origin git@github.com:user/my-website.git"),
+        // Duplicate: agent re-checks remote (real behavior observed)
+        ("git_remote", "origin git@github.com:user/my-website.git"),
+        (
+            "recent_commits",
+            "feat: add gallery page, fix: responsive nav, style: footer",
+        ),
+        (
+            "directory_layout",
+            "src/app/(pages)/gallery/page.tsx, components/CarCard.tsx",
+        ),
+        // Duplicate: agent re-lists directory (real behavior observed)
+        (
+            "directory_layout",
+            "src/app/(pages)/gallery/page.tsx, components/CarCard.tsx",
+        ),
+        (
+            "deployment_status",
+            "Last deploy 2 hours ago, all checks passed",
+        ),
+    ];
+    for (key, value) in &exploration_steps {
+        let args = format!(
+            r#"{{"category":"project","key":"{}","value":"{}"}}"#,
+            key, value
+        );
+        let mut resp = MockProvider::tool_call_response("remember_fact", &args);
+        resp.content = Some(format!("Checking: {}", key));
+        responses.push(resp);
+    }
+
+    // Final: agent summarizes what it found
+    responses.push(MockProvider::text_response(
+        "I've reviewed the project state. You were working on the gallery page for the \
+         website. The feature/gallery branch has 3 modified files and is 2 commits ahead of \
+         main. The last deploy was 2 hours ago. What would you like to continue with?",
+    ));
+
+    let harness = setup_test_agent(MockProvider::with_responses(responses))
+        .await
+        .unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "telegram_12345",
+            "Previous convo",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Agent must complete normally despite 11 consecutive same-tool calls
+    // (some with duplicate arguments)
+    assert!(
+        response.contains("gallery page"),
+        "Agent should complete exploration without stall. Got: {}",
+        response.chars().take(300).collect::<String>()
+    );
+    let calls = harness.provider.call_count().await;
+    assert!(
+        calls >= 11,
+        "Expected at least 11 LLM calls for project exploration, got {}",
+        calls
+    );
+}
+
+/// Regression test: agent uses TWO tools in a productive alternating pattern
+/// (system_info + remember_fact) without triggering the alternating detection.
+///
+/// Tests that the diversity check works correctly: when the agent bounces
+/// between 2 tools but each call has unique arguments (productive exploration),
+/// the alternating pattern detection should NOT fire.
+#[tokio::test]
+async fn test_two_tool_alternating_with_diverse_args_allowed() {
+    let mut responses: Vec<ProviderResponse> = Vec::new();
+
+    // 12 iterations alternating system_info and remember_fact
+    // system_info will get blocked after 3 calls, but the pattern still exercises
+    // the alternating detection logic. Using multi-tool responses to keep both
+    // in the recent_tool_names window.
+    for i in 0..12 {
+        if i < 3 {
+            // First 3: use system_info (before the 3-call block kicks in)
+            let mut resp = MockProvider::tool_call_response("system_info", "{}");
+            resp.content = Some(format!("Checking system, iteration {}.", i));
+            responses.push(resp);
+        }
+        // All 12: also use remember_fact with unique args
+        let args = format!(
+            r#"{{"category":"observation","key":"check_{}","value":"result_{}"}}"#,
+            i, i
+        );
+        let mut resp = MockProvider::tool_call_response("remember_fact", &args);
+        resp.content = Some(format!("Recording observation {}.", i));
+        responses.push(resp);
+    }
+
+    // Final text
+    responses.push(MockProvider::text_response(
+        "Finished all system checks and observations. Everything looks good.",
+    ));
+
+    let harness = setup_test_agent(MockProvider::with_responses(responses))
+        .await
+        .unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "mixed_session",
+            "Run a comprehensive system audit and record all findings",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("Finished all system checks"),
+        "Agent should complete two-tool exploration without stall. Got: {}",
+        response.chars().take(300).collect::<String>()
+    );
+}
+
+/// Verify that a TRUE alternating loop (same 2 calls cycling with identical
+/// arguments) IS still detected and stopped.
+#[tokio::test]
+async fn test_true_alternating_loop_still_detected() {
+    let mut responses: Vec<ProviderResponse> = Vec::new();
+
+    // 12 iterations of the exact same 2 calls alternating (A-B-A-B loop)
+    // system_info gets blocked after 3 calls, then remember_fact with identical
+    // args will trigger the repetitive hash detection instead. Either way, the
+    // agent should be stopped — it's genuinely looping.
+    for i in 0..12 {
+        // Same system_info call every time
+        let mut resp = MockProvider::tool_call_response("system_info", "{}");
+        resp.content = Some(format!("Checking system status, attempt {}.", i));
+        responses.push(resp);
+        // Same remember_fact call every time (identical args = true loop)
+        let mut resp = MockProvider::tool_call_response(
+            "remember_fact",
+            r#"{"category":"status","key":"check","value":"pending"}"#,
+        );
+        resp.content = Some("Still checking...".to_string());
+        responses.push(resp);
+    }
+    // This should never be reached
+    responses.push(MockProvider::text_response("This should not be reached"));
+
+    let harness = setup_test_agent(MockProvider::with_responses(responses))
+        .await
+        .unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "loop_session",
+            "check the system status",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Should be stopped by stall/repetitive detection, NOT complete normally
+    assert!(
+        !response.contains("This should not be reached"),
+        "True alternating loop should be detected and stopped"
+    );
+    // Should be stopped before all 12 iterations complete
+    let calls = harness.provider.call_count().await;
+    assert!(
+        calls < 20,
+        "Expected loop to be stopped early, but got {} LLM calls",
+        calls
+    );
+}
+
 /// Memory persistence through tool use: agent remembers a fact via tool,
 /// then on the next turn, the fact should appear in the system prompt.
 #[tokio::test]
@@ -2137,7 +2504,7 @@ async fn test_public_channel_hides_personal_memory() {
         .upsert_fact(
             "personal",
             "name",
-            "David",
+            "Alice",
             "user",
             None,
             crate::types::FactPrivacy::Global,
@@ -2149,9 +2516,9 @@ async fn test_public_channel_hides_personal_memory() {
     harness
         .state
         .upsert_fact(
-            "health",
-            "condition",
-            "Takes medication",
+            "preference",
+            "hobby",
+            "Enjoys photography",
             "user",
             None,
             crate::types::FactPrivacy::Private,
@@ -2225,7 +2592,7 @@ async fn test_public_channel_hides_personal_memory() {
 
     // Private facts should NOT appear in public channels
     assert!(
-        !content.contains("Takes medication"),
+        !content.contains("Enjoys photography"),
         "Private facts should NOT appear in public channel prompt"
     );
     // Goals are DM-only — should NOT appear in public channels
@@ -2511,9 +2878,9 @@ async fn test_private_facts_never_in_channels() {
     harness
         .state
         .upsert_fact(
-            "health",
-            "condition",
-            "Takes medication for anxiety",
+            "preference",
+            "travel",
+            "Prefers window seats on flights",
             "user",
             None,
             crate::types::FactPrivacy::Private,
@@ -2554,7 +2921,7 @@ async fn test_private_facts_never_in_channels() {
     let content = sys["content"].as_str().unwrap();
 
     assert!(
-        !content.contains("anxiety") && !content.contains("medication"),
+        !content.contains("window seats") && !content.contains("Prefers window"),
         "Private facts must NEVER appear in public channel prompts"
     );
 }
@@ -2766,7 +3133,7 @@ async fn test_memory_management_list() {
         .upsert_fact(
             "personal",
             "name",
-            "David",
+            "Alice",
             "user",
             None,
             crate::types::FactPrivacy::Global,
@@ -2805,7 +3172,7 @@ async fn test_public_external_no_memory() {
         .upsert_fact(
             "personal",
             "name",
-            "David",
+            "Alice",
             "user",
             None,
             crate::types::FactPrivacy::Global,
@@ -2871,7 +3238,7 @@ async fn test_public_external_no_memory() {
 
     // PublicExternal should not have personal memory
     assert!(
-        !content.contains("David"),
+        !content.contains("Alice"),
         "PublicExternal should NOT have personal facts"
     );
     assert!(
@@ -2962,7 +3329,7 @@ async fn test_output_sanitization_in_response() {
     assert!(!result.contains("sk-abc"), "Original key should be gone");
 
     // Test file path redaction
-    let input2 = "Config at /Users/david/projects/secret/config.toml";
+    let input2 = "Config at /home/testuser/projects/secret/config.toml";
     let (result2, redacted2) = sanitize_output(input2);
     assert!(redacted2, "Should detect file path");
     assert!(result2.contains("[REDACTED]"), "Should redact the path");
@@ -3258,4 +3625,2524 @@ async fn test_private_group_fact_access() {
         !content.contains("Very private"),
         "Private facts should NOT appear in PrivateGroup channels"
     );
+}
+
+// ==========================================================================
+// Full-Stack Tests
+//
+// These use `FullStackTestHarness` with a real TerminalTool + ChannelHub
+// approval wiring. Tests exercise real shell commands through the agent loop,
+// verifying stall detection doesn't false-positive on legitimate exploration.
+// ==========================================================================
+
+/// Full-stack regression test: 12+ consecutive terminal calls with unique
+/// commands (website exploration scenario). Must complete without stall.
+///
+/// Replicates the "create a website about cars" production failure where the
+/// agent explored a project with `ls`, `git status`, `pwd`, etc. and the
+/// stall detection falsely triggered.
+#[tokio::test]
+async fn test_full_stack_website_exploration_no_stall() {
+    let mut responses: Vec<ProviderResponse> = Vec::new();
+
+    let commands = [
+        ("Let me explore the project.", r#"{"command": "ls -la"}"#),
+        ("Checking system.", r#"{"command": "pwd"}"#),
+        ("Git status.", r#"{"command": "git status"}"#),
+        ("OS info.", r#"{"command": "uname -a"}"#),
+        ("Who am I.", r#"{"command": "whoami"}"#),
+        ("Current date.", r#"{"command": "date"}"#),
+        ("Disk space.", r#"{"command": "df -h ."}"#),
+        ("Environment.", r#"{"command": "env | head -5"}"#),
+        ("Shell.", r#"{"command": "echo $SHELL"}"#),
+        ("Hostname.", r#"{"command": "hostname"}"#),
+        ("Uptime.", r#"{"command": "uptime"}"#),
+        ("Process list.", r#"{"command": "ps aux | head -3"}"#),
+    ];
+
+    for (narration, args) in &commands {
+        let mut resp = MockProvider::tool_call_response("terminal", args);
+        resp.content = Some(narration.to_string());
+        responses.push(resp);
+    }
+
+    // Final text response
+    responses.push(MockProvider::text_response(
+        "Done! Here's the complete summary of the system exploration.",
+    ));
+
+    let harness = setup_full_stack_test_agent(MockProvider::with_responses(responses))
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "telegram_test",
+            "Explore the current system thoroughly — check files, git, OS, user, disk, and processes.",
+            None,
+            UserRole::Owner,
+            ChannelContext {
+                visibility: ChannelVisibility::Private,
+                platform: "telegram".to_string(),
+                channel_name: None,
+                channel_id: None,
+                sender_name: Some("Alice".to_string()),
+                sender_id: Some("telegram:12345".to_string()),
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
+                trusted: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Agent must complete normally — no false-positive stall detection
+    assert!(
+        response.contains("Done!"),
+        "Agent should complete the full exploration without stall. Got: {}",
+        response.chars().take(300).collect::<String>()
+    );
+    assert!(
+        !response.contains("stuck in a loop"),
+        "Should not trigger stall detection for diverse terminal commands"
+    );
+    let calls = harness.provider.call_count().await;
+    assert!(
+        calls >= 13,
+        "Expected at least 13 LLM calls (12 terminal + 1 final), got {}",
+        calls
+    );
+}
+
+/// Full-stack test: terminal calls with duplicate commands (real pattern from
+/// production). The agent sometimes re-checks things like `ls -la` or
+/// `git remote -v` — this should NOT trigger stall detection.
+#[tokio::test]
+async fn test_full_stack_duplicate_commands_no_stall() {
+    let mut responses: Vec<ProviderResponse> = Vec::new();
+
+    let commands = [
+        ("Checking project.", r#"{"command": "ls -la"}"#),
+        ("Git info.", r#"{"command": "git status"}"#),
+        // Duplicate: re-checking project structure
+        ("Let me re-check.", r#"{"command": "ls -la"}"#),
+        ("Remote.", r#"{"command": "git remote -v"}"#),
+        // Duplicate: verifying remote
+        ("Verify remote.", r#"{"command": "git remote -v"}"#),
+        ("Date check.", r#"{"command": "date"}"#),
+        ("Hostname.", r#"{"command": "hostname"}"#),
+        // Duplicate: re-checking hostname
+        ("Check again.", r#"{"command": "hostname"}"#),
+        ("User.", r#"{"command": "whoami"}"#),
+        ("Shell.", r#"{"command": "echo $SHELL"}"#),
+    ];
+
+    for (narration, args) in &commands {
+        let mut resp = MockProvider::tool_call_response("terminal", args);
+        resp.content = Some(narration.to_string());
+        responses.push(resp);
+    }
+
+    responses.push(MockProvider::text_response(
+        "Done! Here's what I found about the system.",
+    ));
+
+    let harness = setup_full_stack_test_agent(MockProvider::with_responses(responses))
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "telegram_test",
+            "Check the project — files, git status, remote, hostname, user.",
+            None,
+            UserRole::Owner,
+            ChannelContext {
+                visibility: ChannelVisibility::Private,
+                platform: "telegram".to_string(),
+                channel_name: None,
+                channel_id: None,
+                sender_name: Some("Alice".to_string()),
+                sender_id: Some("telegram:12345".to_string()),
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
+                trusted: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("Done!"),
+        "Agent should complete with duplicate commands without stall. Got: {}",
+        response.chars().take(300).collect::<String>()
+    );
+    assert!(
+        !response.contains("stuck in a loop"),
+        "Duplicate commands with diverse patterns should not trigger stall"
+    );
+    let calls = harness.provider.call_count().await;
+    assert!(
+        calls >= 11,
+        "Expected at least 11 LLM calls (10 terminal + 1 final), got {}",
+        calls
+    );
+}
+
+/// Full-stack test: cli_agent delegation followed by terminal follow-up work.
+///
+/// Verifies that stall counters reset after cli_agent completion, so the
+/// follow-up terminal exploration doesn't inherit stall state from before.
+#[tokio::test]
+async fn test_full_stack_cli_agent_then_terminal_followup() {
+    let mut responses: Vec<ProviderResponse> = Vec::new();
+
+    // Step 1: delegate to cli_agent
+    {
+        let mut resp = MockProvider::tool_call_response(
+            "cli_agent",
+            r#"{"action":"run","tool":"claude","prompt":"build website"}"#,
+        );
+        resp.content = Some("I'll delegate the website build to the CLI agent.".to_string());
+        responses.push(resp);
+    }
+
+    // Steps 2-9: follow-up terminal work after cli_agent completes
+    let followup_commands = [
+        ("CLI agent done. Let me verify.", r#"{"command": "ls -la"}"#),
+        ("Git status.", r#"{"command": "git status"}"#),
+        ("Check remote.", r#"{"command": "git remote -v"}"#),
+        ("Who.", r#"{"command": "whoami"}"#),
+        ("Date.", r#"{"command": "date"}"#),
+        ("Pwd.", r#"{"command": "pwd"}"#),
+        ("Uptime.", r#"{"command": "uptime"}"#),
+        ("Host.", r#"{"command": "hostname"}"#),
+    ];
+
+    for (narration, args) in &followup_commands {
+        let mut resp = MockProvider::tool_call_response("terminal", args);
+        resp.content = Some(narration.to_string());
+        responses.push(resp);
+    }
+
+    // Final response
+    responses.push(MockProvider::text_response(
+        "Done! Website deployed successfully.",
+    ));
+
+    // Add mock cli_agent tool
+    let cli_agent_mock = Arc::new(MockTool::new(
+        "cli_agent",
+        "Delegates tasks to CLI agents",
+        "Website built successfully. Files in /tmp/my-website",
+    ));
+
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        MockProvider::with_responses(responses),
+        vec![cli_agent_mock as Arc<dyn crate::traits::Tool>],
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "telegram_test",
+            "Build a website about cars then verify everything is set up correctly.",
+            None,
+            UserRole::Owner,
+            ChannelContext {
+                visibility: ChannelVisibility::Private,
+                platform: "telegram".to_string(),
+                channel_name: None,
+                channel_id: None,
+                sender_name: Some("Alice".to_string()),
+                sender_id: Some("telegram:12345".to_string()),
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
+                trusted: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("deployed successfully"),
+        "Agent should complete after cli_agent + terminal follow-up. Got: {}",
+        response.chars().take(300).collect::<String>()
+    );
+    let calls = harness.provider.call_count().await;
+    assert!(
+        calls >= 10,
+        "Expected at least 10 LLM calls (1 cli_agent + 8 terminal + 1 final), got {}",
+        calls
+    );
+}
+
+/// Full-stack test: verify StatusUpdate events flow correctly through the stack.
+///
+/// Sends a terminal command through the full agent loop and verifies that
+/// ToolStart and ToolComplete status updates are emitted.
+#[tokio::test]
+async fn test_full_stack_status_updates_received() {
+    let responses = vec![
+        {
+            let mut resp =
+                MockProvider::tool_call_response("terminal", r#"{"command": "echo hello"}"#);
+            resp.content = Some("Let me check something.".to_string());
+            resp
+        },
+        MockProvider::text_response("Done! All good."),
+    ];
+
+    let harness = setup_full_stack_test_agent(MockProvider::with_responses(responses))
+        .await
+        .unwrap();
+
+    // Create status channel to capture updates
+    let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(64);
+
+    let response = harness
+        .agent
+        .handle_message(
+            "telegram_test",
+            "Run echo hello",
+            Some(status_tx),
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("All good"),
+        "Agent should complete normally. Got: {}",
+        response
+    );
+
+    // Collect all status updates
+    let mut updates = Vec::new();
+    while let Ok(update) = status_rx.try_recv() {
+        updates.push(update);
+    }
+
+    // Verify we got tool lifecycle events
+    let has_tool_start = updates
+        .iter()
+        .any(|u| matches!(u, StatusUpdate::ToolStart { name, .. } if name == "terminal"));
+    let has_thinking = updates
+        .iter()
+        .any(|u| matches!(u, StatusUpdate::Thinking(_)));
+
+    assert!(
+        has_tool_start,
+        "Should have received ToolStart for terminal. Updates: {:?}",
+        updates
+    );
+    assert!(
+        has_thinking,
+        "Should have received at least one Thinking update. Updates: {:?}",
+        updates
+    );
+    // ToolComplete may or may not be captured depending on timing — the key
+    // verification is that ToolStart fires before execution and Thinking fires
+    // for subsequent iterations.
+}
+
+/// Full-stack regression: duplicate identical send_file calls in one task
+/// should only execute the underlying send once.
+#[tokio::test]
+async fn test_full_stack_duplicate_send_file_suppressed() {
+    struct CountingSendFileTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::Tool for CountingSendFileTool {
+        fn name(&self) -> &str {
+            "send_file"
+        }
+
+        fn description(&self) -> &str {
+            "Test send_file tool that counts executions."
+        }
+
+        fn schema(&self) -> serde_json::Value {
+            json!({
+                "name": "send_file",
+                "description": self.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string" },
+                        "caption": { "type": "string" }
+                    },
+                    "required": ["file_path"]
+                }
+            })
+        }
+
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("File sent by counting send_file tool".to_string())
+        }
+    }
+
+    let send_file_args = r#"{"file_path":"/Users/davidloor/projects/lodestarpc/proposal/sow-attorney-wellness.pdf","caption":"Here is the SOW PDF from the Lodestar project."}"#;
+    let responses = vec![
+        MockProvider::tool_call_response("send_file", send_file_args),
+        MockProvider::tool_call_response("send_file", send_file_args),
+        MockProvider::text_response("Done. I sent the file."),
+    ];
+
+    let send_file_calls = Arc::new(AtomicUsize::new(0));
+    let send_file_tool = Arc::new(CountingSendFileTool {
+        calls: send_file_calls.clone(),
+    });
+
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        MockProvider::with_responses(responses),
+        vec![send_file_tool as Arc<dyn crate::traits::Tool>],
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "telegram_test",
+            "Send me the SOW PDF from the Lodestar project",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("Done."),
+        "Agent should complete normally. Got: {}",
+        response
+    );
+
+    assert_eq!(
+        send_file_calls.load(Ordering::SeqCst),
+        1,
+        "send_file should execute only once for duplicate identical calls"
+    );
+
+    let history = harness
+        .state
+        .get_history("telegram_test", 200)
+        .await
+        .unwrap();
+    let dedupe_msgs = history
+        .iter()
+        .filter(|m| {
+            m.role == "tool"
+                && m.tool_name.as_deref() == Some("send_file")
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("Duplicate send_file suppressed"))
+        })
+        .count();
+    assert_eq!(
+        dedupe_msgs, 1,
+        "Expected one dedupe tool message for suppressed duplicate send_file"
+    );
+}
+
+/// Full-stack regression test: "What's the url of the site that you deployed?"
+///
+/// Real-world scenario: user asks about a previously deployed site. The agent
+/// has no memory of the deployment so it searches for clues — checking git
+/// remotes, config files, deployment manifests, environment variables, etc.
+/// This triggers 10+ consecutive terminal calls as the agent hunts for the URL.
+///
+/// This is a particularly tricky case because:
+/// 1. Many commands return similar "not found" results (low diversity)
+/// 2. The agent may retry similar commands in different directories
+/// 3. Some commands overlap semantically (git remote -v, cat CNAME, etc.)
+#[tokio::test]
+async fn test_full_stack_deployed_site_url_lookup_no_stall() {
+    let mut responses: Vec<ProviderResponse> = Vec::new();
+
+    // The agent tries to find deployment info through various commands
+    let commands = [
+        (
+            "Let me check the git remote to find the deployment URL.",
+            r#"{"command": "git remote -v"}"#,
+        ),
+        (
+            "Let me look for deployment configuration files.",
+            r#"{"command": "ls -la"}"#,
+        ),
+        (
+            "Checking for a CNAME or deployment config.",
+            r#"{"command": "ls public/ 2>/dev/null || echo 'no public dir'"}"#,
+        ),
+        (
+            "Let me check package.json for deployment scripts.",
+            r#"{"command": "cat package.json 2>/dev/null || echo 'no package.json'"}"#,
+        ),
+        (
+            "Looking for Vercel or Netlify config.",
+            r#"{"command": "ls vercel.json netlify.toml .vercel 2>/dev/null || echo 'none found'"}"#,
+        ),
+        (
+            "Checking environment variables for URLs.",
+            r#"{"command": "env | grep -i url || echo 'no URL env vars'"}"#,
+        ),
+        (
+            "Let me check git log for deployment commits.",
+            r#"{"command": "git log --oneline -5 2>/dev/null || echo 'not a git repo'"}"#,
+        ),
+        (
+            "Checking for GitHub Pages or similar config.",
+            r#"{"command": "cat CNAME 2>/dev/null || echo 'no CNAME'"}"#,
+        ),
+        (
+            "Looking for docker or CI deployment files.",
+            r#"{"command": "ls Dockerfile docker-compose.yml .github/workflows/ 2>/dev/null || echo 'none'"}"#,
+        ),
+        (
+            "Checking the git config for any deploy URLs.",
+            r#"{"command": "git config --list 2>/dev/null | grep -i url || echo 'no url in git config'"}"#,
+        ),
+        (
+            "One more check — looking at recent branches.",
+            r#"{"command": "git branch -a 2>/dev/null | head -10 || echo 'no branches'"}"#,
+        ),
+    ];
+
+    for (narration, args) in &commands {
+        let mut resp = MockProvider::tool_call_response("terminal", args);
+        resp.content = Some(narration.to_string());
+        responses.push(resp);
+    }
+
+    // Agent gives up and reports what it found
+    responses.push(MockProvider::text_response(
+        "I couldn't find a specific deployment URL in the current project. \
+         The git remote points to github.com but I don't see a CNAME, \
+         Vercel config, or Netlify config. Could you tell me which project \
+         you're referring to? I may have that info stored from a previous session.",
+    ));
+
+    let harness = setup_full_stack_test_agent(MockProvider::with_responses(responses))
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "telegram_test",
+            "What's the url of the site that you deployed?",
+            None,
+            UserRole::Owner,
+            ChannelContext {
+                visibility: ChannelVisibility::Private,
+                platform: "telegram".to_string(),
+                channel_name: None,
+                channel_id: None,
+                sender_name: Some("Alice".to_string()),
+                sender_id: Some("telegram:12345".to_string()),
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
+                trusted: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Agent must complete normally — 11 consecutive terminal calls should NOT stall
+    assert!(
+        !response.contains("stuck in a loop"),
+        "Should not trigger stall for URL lookup exploration. Got: {}",
+        response.chars().take(400).collect::<String>()
+    );
+    assert!(
+        !response.contains("I seem to be stuck"),
+        "Should not trigger graceful stall response. Got: {}",
+        response.chars().take(400).collect::<String>()
+    );
+    assert!(
+        response.contains("deployment URL") || response.contains("git remote"),
+        "Agent should give a meaningful answer about deployment. Got: {}",
+        response.chars().take(400).collect::<String>()
+    );
+    let calls = harness.provider.call_count().await;
+    assert!(
+        calls >= 12,
+        "Expected at least 12 LLM calls (11 terminal + 1 final), got {}",
+        calls
+    );
+}
+
+/// Full-stack regression test: blocked non-exempt tool triggers false-positive stall.
+///
+/// Root cause analysis: when the LLM calls a non-exempt tool (e.g. system_info,
+/// web_search) more than 3 times, the call gets BLOCKED with a coaching message.
+/// But the blocked call doesn't increment `successful_tool_calls`, so if the LLM
+/// keeps trying the same tool, every iteration has `successful_tool_calls == 0`,
+/// and after 3 such iterations, `stall_count >= 3` fires graceful_stall_response.
+///
+/// This reproduces the exact "What's the url of the site that you deployed?"
+/// failure: the LLM called system_info to search for deployment config, got
+/// blocked after 3 calls, then kept trying → stall after 4 tool calls total.
+#[tokio::test]
+async fn test_full_stack_blocked_tool_triggers_stall() {
+    let mut responses: Vec<ProviderResponse> = Vec::new();
+
+    // Iteration 1 (intent gate): narration required
+    {
+        let mut resp = MockProvider::tool_call_response("system_info", "{}");
+        resp.content = Some(
+            "Let me look up the deployment URL by checking the system configuration.".to_string(),
+        );
+        responses.push(resp);
+    }
+
+    // Iterations 2-4: system_info executes successfully (3 calls, hits per-tool limit)
+    for i in 0..3 {
+        let mut resp = MockProvider::tool_call_response(
+            "system_info",
+            &format!(r#"{{"check":"deploy_{}"}}"#, i),
+        );
+        resp.content = Some(format!("Checking deployment config {}.", i));
+        responses.push(resp);
+    }
+
+    // Iterations 5-7: system_info gets BLOCKED (prior_calls >= 3, not exempt)
+    // These iterations have successful_tool_calls == 0 → stall_count increments
+    for i in 3..6 {
+        let mut resp = MockProvider::tool_call_response(
+            "system_info",
+            &format!(r#"{{"check":"deploy_{}"}}"#, i),
+        );
+        resp.content = Some(format!("Let me try checking config {} again.", i));
+        responses.push(resp);
+    }
+
+    // Final: should reach this if stall detection doesn't fire
+    responses.push(MockProvider::text_response(
+        "I couldn't find the deployment URL. Which project are you referring to?",
+    ));
+
+    let harness = setup_full_stack_test_agent(MockProvider::with_responses(responses))
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "telegram_test",
+            "What's the url of the site that you deployed?",
+            None,
+            UserRole::Owner,
+            ChannelContext {
+                visibility: ChannelVisibility::Private,
+                platform: "telegram".to_string(),
+                channel_name: None,
+                channel_id: None,
+                sender_name: Some("Alice".to_string()),
+                sender_id: Some("telegram:12345".to_string()),
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
+                trusted: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Regression test: blocked tool calls now count as progress for stall
+    // detection, so the agent gets a chance to adapt instead of stalling.
+    assert!(
+        !response.contains("stuck") && !response.contains("not making progress"),
+        "Blocked non-exempt tool calls should NOT trigger stall detection. Got: {}",
+        response.chars().take(400).collect::<String>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Consultant pass tests — no-tools first turn with smart router
+// ---------------------------------------------------------------------------
+
+/// For questions, the consultant pass returns the analysis directly
+/// (1 LLM call) without handing off to the execution model.  This prevents
+/// the model from looping with tools when facts already have the answer.
+/// The response must be confident (no "I don't have" / uncertain markers)
+/// for the intent gate to allow direct return.
+#[tokio::test]
+async fn test_consultant_pass_returns_directly_for_questions() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "Your website is deployed to Cloudflare Workers at your-site.workers.dev.\n\n\
+         [INTENT_GATE]\n\
+         {\"complexity\": \"knowledge\", \"can_answer_now\": true, \"needs_tools\": false}",
+    )]);
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    harness
+        .state
+        .upsert_fact(
+            "project",
+            "my website",
+            "deployed to cloudflare workers at your-site.workers.dev",
+            "user",
+            None,
+            crate::types::FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+
+    // Question (contains ?) → consultant returns directly
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Can you tell me the deployment URL for my website?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The [INTENT_GATE] block is stripped, leaving just the analysis text
+    assert_eq!(
+        response,
+        "Your website is deployed to Cloudflare Workers at your-site.workers.dev."
+    );
+
+    // Only 1 LLM call — consultant answered directly, no execution model
+    assert_eq!(harness.provider.call_count().await, 1);
+}
+
+/// For action requests (non-questions), the consultant analysis feeds into
+/// the execution model which can use tools.
+#[tokio::test]
+async fn test_consultant_pass_continues_for_actions() {
+    // Three responses:
+    //   1. Consultant (no tools) → analysis of the action
+    //   2. Full agent loop → tool call (system_info)
+    //   3. Full agent loop → final text with tool result
+    // V3 routes "show me system info" as Simple → falls through to full agent loop.
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("I'll check the system information for you."),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("Your system is running macOS."),
+    ]);
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    // Action request (imperative, no ?) → consultant pass → full agent loop
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Show me the current system information and environment details",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Your system is running macOS.");
+
+    let call_count = harness.provider.call_count().await;
+    assert!(
+        call_count >= 2,
+        "Expected at least 2 LLM calls (consultant + full loop)"
+    );
+
+    let calls = harness.provider.call_log.lock().await;
+    // First call: no tools (consultant pass)
+    assert!(
+        calls[0].tools.is_empty(),
+        "Consultant call should have no tools"
+    );
+}
+
+/// Regression: if the execution model replies with deferred-action narration
+/// ("I'll do X", "starting workflow") but no tool calls, the agent must keep
+/// iterating instead of returning that narration as final output.
+#[tokio::test]
+async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
+    let provider = MockProvider::with_responses(vec![
+        // 1) Consultant pass
+        MockProvider::text_response(
+            "I'll check and send it over.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"simple\"}",
+        ),
+        // 2) Full loop (bad): deferred action text, no tool calls
+        MockProvider::text_response(
+            "I'll find your resume and send it over right away.\nStarting the send-resume workflow...",
+        ),
+        // 3) Full loop (good): actual tool execution
+        MockProvider::tool_call_response("system_info", "{}"),
+        // 4) Final answer
+        MockProvider::text_response("Found it and sent it."),
+    ]);
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "send me my resume",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Found it and sent it.");
+    assert_eq!(harness.provider.call_count().await, 4);
+
+    let calls = harness.provider.call_log.lock().await;
+    assert!(
+        calls[0].tools.is_empty(),
+        "Consultant pass must be tool-free"
+    );
+    assert!(
+        !calls[1].tools.is_empty(),
+        "Execution loop must have tools available after consultant pass"
+    );
+}
+
+/// Regression: even after some successful tool calls, a deferred-action
+/// narration ("I'll send it over") must not be treated as final completion.
+#[tokio::test]
+async fn test_deferred_action_after_tool_progress_does_not_complete_task() {
+    let provider = MockProvider::with_responses(vec![
+        // 1) Consultant pass
+        MockProvider::text_response(
+            "I'll find it for you.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"simple\"}",
+        ),
+        // 2) Full loop: executes a tool successfully
+        MockProvider::tool_call_response("system_info", "{}"),
+        // 3) Full loop (bad): deferred narration instead of results
+        MockProvider::text_response(
+            "I'll send it over once I locate the exact file. Give me a moment.",
+        ),
+        // 4) Full loop (good): concrete outcome
+        MockProvider::text_response("I couldn't find a matching SOW PDF in the project files."),
+    ]);
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Send me the SOW PDF from the Lodestar project",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        "I couldn't find a matching SOW PDF in the project files."
+    );
+    assert_eq!(harness.provider.call_count().await, 4);
+
+    let calls = harness.provider.call_log.lock().await;
+    assert!(
+        calls[0].tools.is_empty(),
+        "Consultant pass must be tool-free"
+    );
+    assert!(
+        !calls[1].tools.is_empty(),
+        "Execution loop must have tools available after consultant pass"
+    );
+}
+
+/// With uniform models (all "mock-model"), no consultant pass — tools should
+/// be available from the very first LLM call.
+#[tokio::test]
+async fn test_no_consultant_pass_with_uniform_models() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("Here is your info."),
+    ]);
+
+    // Uniform models → router disabled → no consultant pass
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "What's my system info?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Here is your info.");
+    assert_eq!(harness.provider.call_count().await, 2);
+
+    // First call should have tools (no consultant pass)
+    let calls = harness.provider.call_log.lock().await;
+    assert!(
+        !calls[0].tools.is_empty(),
+        "Without consultant pass, first call should have tools"
+    );
+}
+
+/// Consultant pass with an empty response on iteration 1 should NOT
+/// intercept — it falls through to the normal empty-response handling.
+#[tokio::test]
+async fn test_consultant_pass_empty_response_not_intercepted() {
+    // Consultant returns empty text → should not be intercepted
+    // Then execution model responds normally
+    let provider = MockProvider::with_responses(vec![
+        // Empty content response (consultant returns nothing)
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+        },
+        MockProvider::text_response("Fallback response."),
+    ]);
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let _response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Hello",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The empty consultant response should NOT be intercepted (the !reply.is_empty()
+    // check lets it fall through to normal empty-response handling).
+    // The exact behavior depends on depth/iteration, but it should not panic.
+}
+
+/// Regression: when the execution loop returns empty content with no tool calls
+/// after consultant pass, the fallback response should be persisted and task
+/// completion should be emitted (no silent early return).
+#[tokio::test]
+async fn test_empty_execution_response_persists_fallback_message() {
+    let provider = MockProvider::with_responses(vec![
+        // Consultant pass (iteration 1): empty response, falls through.
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+        },
+        // Execution loop (iteration 2): also empty -> fallback string path.
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 20,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+        },
+    ]);
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Who is becquer?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let expected = "I wasn't able to process that request. Could you try rephrasing?";
+    assert_eq!(response, expected);
+    assert_eq!(harness.provider.call_count().await, 2);
+
+    let history = harness.state.get_history("test_session", 10).await.unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.as_deref() == Some(expected)),
+        "Fallback response should be persisted in history. History: {:?}",
+        history
+    );
+}
+
+/// When the consultant pass model returns BOTH text AND tool calls on
+/// iteration 1, the tool calls should be DROPPED and only the text
+/// analysis should be kept.  This handles Gemini models that hallucinate
+/// function calls from system prompt tool descriptions.
+/// When hallucinated tool calls are detected, the code forces `needs_tools = true`
+/// (the LLM signaled it needs tools by attempting to call them), so the question
+/// falls through to the tool loop — not returned directly.
+#[tokio::test]
+async fn test_consultant_pass_drops_hallucinated_tool_calls() {
+    use crate::traits::ToolCall;
+
+    // Consultant returns confident text + hallucinated tool call (iteration 1)
+    // → hallucinated tool calls force needs_tools=true → falls through to execution loop.
+    // Execution loop returns the final text response.
+    let provider = MockProvider::with_responses(vec![
+        // Iteration 1: consultant returns confident text AND a hallucinated tool call
+        ProviderResponse {
+            content: Some(
+                "Your website is deployed at your-site.workers.dev on Cloudflare Workers."
+                    .to_string(),
+            ),
+            tool_calls: vec![ToolCall {
+                id: "call_hallucinated".to_string(),
+                name: "terminal".to_string(),
+                arguments: r#"{"command":"find ~ -name wrangler.toml"}"#.to_string(),
+                extra_content: None,
+            }],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+        },
+        // Iteration 2+: execution loop response
+        MockProvider::text_response(
+            "Your website is deployed at your-site.workers.dev on Cloudflare Workers.",
+        ),
+    ]);
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Can you tell me the deployment URL for my website?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The final response comes from the execution loop
+    assert_eq!(
+        response,
+        "Your website is deployed at your-site.workers.dev on Cloudflare Workers."
+    );
+
+    // At least 1 LLM call (consultant) + execution loop calls
+    let call_count = harness.provider.call_count().await;
+    assert!(
+        call_count >= 2,
+        "Expected at least 2 LLM calls — consultant + execution loop (got {})",
+        call_count
+    );
+}
+
+// ==================== V3 Orchestration Integration Tests ====================
+
+#[tokio::test]
+async fn test_v3_uniform_models_no_routing() {
+    // With uniform models (no router), consultant pass doesn't activate,
+    // so V3 routing doesn't happen — simple messages get direct responses.
+    let provider = MockProvider::new(); // Returns "Mock response"
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Hello!",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Mock response");
+
+    // No V3 goals — uniform models bypass consultant pass / V3 routing
+    let goals = harness.state.get_active_goals_v3().await.unwrap();
+    assert!(goals.is_empty(), "No V3 goals with uniform models");
+}
+
+#[tokio::test]
+async fn test_v3_simple_falls_through_to_full_loop() {
+    // V3 enabled, non-uniform models → consultant pass activates → V3 routing
+    // Consultant says "needs tools" (not can_answer_now), simple task → full agent loop
+    let provider = MockProvider::with_responses(vec![
+        // 1st call: consultant pass — analysis that triggers needs_tools
+        MockProvider::text_response(
+            "I'll help you check the system info.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
+        ),
+        // 2nd call: full agent loop — tool call
+        MockProvider::tool_call_response("system_info", "{}"),
+        // 3rd call: full agent loop — final response
+        MockProvider::text_response("Your system is running macOS."),
+    ]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "check system info",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Should get the full agent loop's response
+    assert_eq!(response, "Your system is running macOS.");
+
+    // No V3 goals should be created (simple tasks don't create goals)
+    let goals = harness.state.get_active_goals_v3().await.unwrap();
+    assert!(goals.is_empty(), "Simple tasks should not create V3 goals");
+}
+
+#[tokio::test]
+async fn test_v3_complex_creates_goal() {
+    // V3 always-on, complex request → goal created, task lead spawned.
+    // No plan generation pre-loop call (removed).
+    let provider = MockProvider::with_responses(vec![
+        // 1st call: consultant pass — analysis (complex request detected)
+        MockProvider::text_response(
+            "This is a complex multi-step task requiring setup and deployment.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
+        ),
+        // 2nd+ calls: task lead (after V3 creates goal and spawns task lead)
+        MockProvider::text_response("I'll start working on building your website."),
+    ]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Build me a full-stack website with user authentication, role-based access control, a PostgreSQL database with migrations, comprehensive API documentation, integration and unit tests, and deploy the whole stack to production with CI/CD pipeline configuration",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Should get a response (the exact text depends on how many LLM calls the agent loop makes)
+    assert!(!response.is_empty(), "Should return a non-empty response");
+
+    // The key assertion: a V3 goal should have been created
+    let goals = harness
+        .state
+        .get_goals_for_session_v3("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1, "Complex request should create a V3 goal");
+    // Task leads are always-on, so the goal is completed after the task lead succeeds
+    assert_eq!(goals[0].status, "completed");
+    assert!(goals[0]
+        .description
+        .contains("Build me a full-stack website"));
+}
+
+#[tokio::test]
+async fn test_v3_complex_internal_maintenance_does_not_create_goal() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            "This is a complex maintenance request.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
+        ),
+    ]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Maintain knowledge base: process embeddings, consolidate memories, decay old facts",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("already runs via built-in background jobs"),
+        "Expected maintenance-routing response, got: {response}"
+    );
+
+    let goals = harness
+        .state
+        .get_goals_for_session_v3("test_session")
+        .await
+        .unwrap();
+    assert!(
+        goals.is_empty(),
+        "Internal maintenance intent should not create a V3 goal"
+    );
+}
+
+#[tokio::test]
+async fn test_v3_simple_stall_detection_in_full_loop() {
+    // Simple tasks now go through full agent loop which has its own stall detection.
+    // After the consultant pass, repeated identical tool calls should be detected.
+    let provider = MockProvider::with_responses(vec![
+        // 1st call: consultant pass
+        MockProvider::text_response(
+            "I'll run a command for you.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
+        ),
+        // 2nd call: intent gate narration (full loop requires narration on first tool iteration)
+        MockProvider::tool_call_response("system_info", "{}"),
+        // Repeated identical tool calls — stall detection should kick in
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+        // Enough repetitions to trigger stall detection
+        MockProvider::text_response("Should not reach here"),
+    ]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "run a quick check",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Full loop stall detection produces graceful responses
+    assert!(
+        !response.is_empty(),
+        "Should return a non-empty response even on stall"
+    );
+}
+
+#[tokio::test]
+async fn test_v3_simple_uses_full_loop_with_all_tools() {
+    // Simple tasks now use the full agent loop with all tools available.
+    // Verify the agent can complete a simple task through the full loop.
+    let provider = MockProvider::with_responses(vec![
+        // 1st call: consultant pass
+        MockProvider::text_response(
+            "I'll help with that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
+        ),
+        // 2nd call: full agent loop makes a tool call
+        MockProvider::tool_call_response("system_info", "{}"),
+        // 3rd call: full agent loop returns final response
+        MockProvider::text_response("Diagnostics complete. All systems normal."),
+    ]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "run diagnostics",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Diagnostics complete. All systems normal.");
+}
+
+#[tokio::test]
+async fn test_v3_scheduled_one_shot_creates_pending_confirmation() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
+    )]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "deploy in 2 hours",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("Reply **confirm**"),
+        "Expected confirmation prompt for scheduled goal"
+    );
+
+    let goals = harness
+        .state
+        .get_goals_for_session_v3("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].goal_type, "finite");
+    assert_eq!(goals[0].status, "pending_confirmation");
+    assert!(goals[0].schedule.is_some());
+}
+
+#[tokio::test]
+async fn test_v3_scheduled_recurring_creates_pending_confirmation() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "I'll schedule recurring monitoring.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"every 6h\",\"schedule_type\":\"recurring\"}",
+    )]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "monitor API health every 6h",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("Reply **confirm**"),
+        "Expected confirmation prompt for recurring schedule"
+    );
+
+    let goals = harness
+        .state
+        .get_goals_for_session_v3("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].goal_type, "continuous");
+    assert_eq!(goals[0].status, "pending_confirmation");
+    assert!(goals[0].schedule.is_some());
+}
+
+#[tokio::test]
+async fn test_v3_schedule_confirm_activates_goal() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
+    )]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "deploy in 2 hours",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let confirm_response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "confirm",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(confirm_response.contains("Scheduled:"));
+
+    let goals = harness
+        .state
+        .get_goals_for_session_v3("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].status, "active");
+    assert_eq!(
+        harness.provider.call_count().await,
+        1,
+        "confirm should be handled by confirmation gate without LLM call"
+    );
+}
+
+#[tokio::test]
+async fn test_v3_schedule_cancel_removes_goal() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
+    )]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "deploy in 2 hours",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let cancel_response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "cancel",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(cancel_response.contains("cancelled"));
+
+    let goals = harness
+        .state
+        .get_goals_for_session_v3("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].status, "cancelled");
+}
+
+#[tokio::test]
+async fn test_v3_targeted_cancel_text_does_not_auto_cancel_session_goal() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            "Understood.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"cancel_intent\":true,\"cancel_scope\":\"targeted\",\"complexity\":\"simple\"}",
+        ),
+        MockProvider::text_response("Please share the goal ID to cancel that specific goal."),
+    ]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let morning_goal = GoalV3::new_continuous(
+        "Send me a slack message at 7:00 am EST tomorrow with a positive message",
+        "test_session",
+        "0 7 * * *",
+        Some(2000),
+        Some(20000),
+    );
+    harness.state.create_goal_v3(&morning_goal).await.unwrap();
+
+    let english_goal = GoalV3::new_continuous(
+        "English Research: Researching English pronunciation/phonetics for Spanish speakers",
+        "other_session",
+        "0 5,12,19 * * *",
+        Some(2000),
+        Some(20000),
+    );
+    harness.state.create_goal_v3(&english_goal).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "cancel this goal: English Research: Researching English",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        "Please share the goal ID to cancel that specific goal."
+    );
+    assert_eq!(
+        harness.provider.call_count().await,
+        2,
+        "Targeted cancel text should not trigger session-wide auto-cancel shortcut"
+    );
+
+    let morning_after = harness
+        .state
+        .get_goal_v3(&morning_goal.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let english_after = harness
+        .state
+        .get_goal_v3(&english_goal.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(morning_after.status, "active");
+    assert_eq!(english_after.status, "active");
+}
+
+#[tokio::test]
+async fn test_v3_schedule_new_message_cancels_pending() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
+        ),
+        MockProvider::text_response(
+            "Rust is a systems programming language.\n[INTENT_GATE] {\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"knowledge\"}",
+        ),
+    ]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "deploy in 2 hours",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "what is rust?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let goals = harness
+        .state
+        .get_goals_for_session_v3("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].status, "cancelled");
+}
+
+// ============================================================================
+// V3 Phase 2: Task Lead + Executor tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_v3_task_lead_flag_off_uses_agent_loop() {
+    // V3 is always-on with task leads always-on. Complex request → goal created,
+    // task lead spawned. No plan generation pre-loop call (removed).
+    let provider = MockProvider::with_responses(vec![
+        // 1st call: consultant pass
+        MockProvider::text_response(
+            "This is a complex request.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
+        ),
+        // 2nd call: task lead response
+        MockProvider::text_response("I'll start building the website."),
+    ]);
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Build me a full-stack website with user authentication, role-based access control, a PostgreSQL database with migrations, comprehensive API documentation, integration and unit tests, and deploy the whole stack to production with CI/CD pipeline configuration",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Should get a response from the task lead
+    assert!(!response.is_empty());
+
+    // Goal should be created
+    let goals = harness
+        .state
+        .get_goals_for_session_v3("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1, "Complex request should create a V3 goal");
+    // Goal should be completed (task lead always-on, succeeds)
+    assert_eq!(goals[0].status, "completed");
+}
+
+#[tokio::test]
+async fn test_v3_task_lead_spawns_for_complex() {
+    // V3 always-on, complex request → task lead spawned, goal updated.
+    // No plan generation pre-loop call (removed).
+    let provider = MockProvider::with_responses(vec![
+        // 1st call: consultant pass (orchestrator)
+        MockProvider::text_response(
+            "This is a complex multi-step task.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
+        ),
+        // 2nd call: task lead's first LLM call — it responds with a final answer
+        // (In a real scenario it would use manage_goal_tasks, but here we test the flow)
+        MockProvider::text_response("I've planned and completed all the tasks for your website."),
+    ]);
+    let harness = setup_test_agent_v3_task_leads(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Build me a full-stack website with user authentication, role-based access control, a PostgreSQL database with migrations, comprehensive API documentation, integration and unit tests, and deploy the whole stack to production with CI/CD pipeline configuration",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Task lead's response is returned
+    assert!(
+        response.contains("planned") || response.contains("completed") || !response.is_empty(),
+        "Task lead should return a response, got: {}",
+        response
+    );
+
+    // Goal should be created and completed (task lead succeeded)
+    let goals = harness
+        .state
+        .get_goals_for_session_v3("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1, "Complex request should create a V3 goal");
+    assert_eq!(
+        goals[0].status, "completed",
+        "Goal should be completed after task lead succeeds"
+    );
+}
+
+#[tokio::test]
+async fn test_v3_task_lead_creates_tasks_via_tool() {
+    // V3 always-on, task lead uses manage_goal_tasks to create tasks.
+    // No plan generation pre-loop call (removed).
+    let provider = MockProvider::with_responses(vec![
+        // 1st: consultant pass
+        MockProvider::text_response(
+            "Complex task.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
+        ),
+        // 2nd: task lead calls manage_goal_tasks(create_task)
+        MockProvider::tool_call_response(
+            "manage_goal_tasks",
+            r#"{"action":"create_task","description":"Build the frontend","task_order":1,"priority":"high"}"#,
+        ),
+        // 3rd: task lead calls manage_goal_tasks(complete_goal) after seeing the result
+        MockProvider::tool_call_response(
+            "manage_goal_tasks",
+            r#"{"action":"complete_goal","summary":"Frontend task created successfully"}"#,
+        ),
+        // 4th: task lead's final text response
+        MockProvider::text_response("All tasks have been created and the goal is complete."),
+    ]);
+    let harness = setup_test_agent_v3_task_leads(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Build me a full-stack website with user authentication, role-based access control, a PostgreSQL database with migrations, comprehensive API documentation, integration and unit tests, and deploy the whole stack to production with CI/CD pipeline configuration",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(!response.is_empty());
+
+    // Check that a task was created in the DB
+    let goals = harness
+        .state
+        .get_goals_for_session_v3("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1);
+    let goal_id = &goals[0].id;
+
+    let tasks = harness.state.get_tasks_for_goal_v3(goal_id).await.unwrap();
+    assert_eq!(
+        tasks.len(),
+        1,
+        "Task lead should have created 1 task via manage_goal_tasks"
+    );
+    assert_eq!(tasks[0].description, "Build the frontend");
+    assert_eq!(tasks[0].priority, "high");
+}
+
+#[tokio::test]
+async fn test_v3_task_lead_claims_before_dispatch() {
+    // V3 always-on, task lead creates tasks with idempotent and dependency features.
+    // No plan generation pre-loop call (removed).
+    let provider = MockProvider::with_responses(vec![
+        // 1st: consultant pass
+        MockProvider::text_response(
+            "Complex task.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
+        ),
+        // 2nd: task lead creates task with idempotent=true
+        MockProvider::tool_call_response(
+            "manage_goal_tasks",
+            r#"{"action":"create_task","description":"Research the topic","task_order":1,"idempotent":true}"#,
+        ),
+        // 3rd: task lead lists tasks to check state
+        MockProvider::tool_call_response(
+            "manage_goal_tasks",
+            r#"{"action":"list_tasks"}"#,
+        ),
+        // 4th: task lead completes goal
+        MockProvider::tool_call_response(
+            "manage_goal_tasks",
+            r#"{"action":"complete_goal","summary":"Research task created and listed"}"#,
+        ),
+        // 5th: task lead final text
+        MockProvider::text_response("Goal complete. Research task has been created."),
+    ]);
+    let harness = setup_test_agent_v3_task_leads(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Build a quantum computing research tool with visualization dashboard, deploy it to production with full API documentation, set up monitoring and alerting, create integration tests, and prepare a comprehensive README with architecture diagrams for the team",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(!response.is_empty());
+
+    // Verify task was created with idempotent flag
+    let goals = harness
+        .state
+        .get_goals_for_session_v3("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1);
+
+    let tasks = harness
+        .state
+        .get_tasks_for_goal_v3(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].idempotent, "Task should be marked idempotent");
+    assert_eq!(tasks[0].description, "Research the topic");
+}
+
+#[tokio::test]
+async fn test_v3_executor_activity_logging() {
+    // Test that executor agents with v3_task_id log TaskActivityV3 records.
+    // This tests the activity logging indirectly through manage_goal_tasks.
+    let state = {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap().to_string();
+        let embedding_service =
+            Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            crate::state::SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let state: Arc<dyn crate::traits::StateStore> = state;
+
+        // Create a goal
+        let goal = crate::traits::GoalV3::new_finite("Test activity logging", "test-session");
+        state.create_goal_v3(&goal).await.unwrap();
+
+        // Create a task
+        let task = crate::traits::TaskV3 {
+            id: "test-task-001".to_string(),
+            goal_id: goal.id.clone(),
+            description: "Test task for activity logging".to_string(),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            task_order: 1,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task_v3(&task).await.unwrap();
+
+        std::mem::forget(db_file);
+        state
+    };
+
+    // Log a tool_call activity
+    let activity = crate::traits::TaskActivityV3 {
+        id: 0,
+        task_id: "test-task-001".to_string(),
+        activity_type: "tool_call".to_string(),
+        tool_name: Some("terminal".to_string()),
+        tool_args: Some(r#"{"command":"ls"}"#.to_string()),
+        result: Some("file1.txt\nfile2.txt".to_string()),
+        success: Some(true),
+        tokens_used: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state.log_task_activity_v3(&activity).await.unwrap();
+
+    // Log an llm_call activity
+    let activity2 = crate::traits::TaskActivityV3 {
+        id: 0,
+        task_id: "test-task-001".to_string(),
+        activity_type: "llm_call".to_string(),
+        tool_name: None,
+        tool_args: None,
+        result: Some("I found 2 files".to_string()),
+        success: Some(true),
+        tokens_used: Some(150),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state.log_task_activity_v3(&activity2).await.unwrap();
+
+    // Verify activities were logged
+    let activities = state.get_task_activities_v3("test-task-001").await.unwrap();
+    assert_eq!(activities.len(), 2, "Should have 2 activity records");
+
+    let tool_activity = activities
+        .iter()
+        .find(|a| a.activity_type == "tool_call")
+        .expect("Should have a tool_call activity");
+    assert_eq!(tool_activity.tool_name.as_deref(), Some("terminal"));
+    assert_eq!(tool_activity.success, Some(true));
+
+    let llm_activity = activities
+        .iter()
+        .find(|a| a.activity_type == "llm_call")
+        .expect("Should have an llm_call activity");
+    assert_eq!(llm_activity.tokens_used, Some(150));
+    assert_eq!(llm_activity.success, Some(true));
+}
+
+#[tokio::test]
+async fn test_v3_task_id_passed_to_executor() {
+    // Verify spawn_agent schema accepts task_id parameter
+    let json_args = serde_json::json!({
+        "mission": "Test executor",
+        "task": "Do something",
+        "task_id": "test-task-123"
+    });
+
+    // The SpawnArgs struct should parse task_id
+    let parsed: serde_json::Value = serde_json::from_str(&json_args.to_string()).unwrap();
+    assert_eq!(parsed["task_id"], "test-task-123");
+    assert_eq!(parsed["mission"], "Test executor");
+
+    // Also verify the schema includes task_id
+    use crate::tools::spawn::SpawnAgentTool;
+    use crate::traits::Tool;
+    let tool = SpawnAgentTool::new_deferred(8000, 300);
+    let schema = tool.schema();
+    let props = &schema["parameters"]["properties"];
+    assert!(
+        props.get("task_id").is_some(),
+        "spawn_agent schema should include task_id"
+    );
+    assert_eq!(props["task_id"]["type"], "string");
+}
+
+// ======================== Phase 4: Learning Integration Tests ========================
+
+#[tokio::test]
+async fn test_v3_goal_context_feed_forward() {
+    // Verify that when facts exist in the state, a V3 goal created for a complex
+    // request gets relevant knowledge injected into its context field.
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use crate::types::FactPrivacy;
+
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_path = db_file.path().to_str().unwrap().to_string();
+    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let state: Arc<dyn StateStore> = Arc::new(
+        SqliteStateStore::new(&db_path, 100, None, embedding_service)
+            .await
+            .unwrap(),
+    );
+
+    // Pre-populate facts
+    state
+        .upsert_fact(
+            "technical",
+            "deployment_target",
+            "AWS us-east-1 region",
+            "manual",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+    state
+        .upsert_fact(
+            "project",
+            "framework",
+            "Uses React and Node.js",
+            "manual",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+
+    // Create a goal and simulate what the agent does: query facts and inject into context
+    let mut goal = GoalV3::new_finite(
+        "Build a full-stack website and deploy to AWS",
+        "test-session",
+    );
+
+    let relevant_facts = state
+        .get_relevant_facts("Build a full-stack website and deploy to AWS", 10)
+        .await
+        .unwrap_or_default();
+
+    let relevant_procedures = state
+        .get_relevant_procedures("Build a full-stack website and deploy to AWS", 5)
+        .await
+        .unwrap_or_default();
+
+    if !relevant_facts.is_empty() || !relevant_procedures.is_empty() {
+        let ctx = serde_json::json!({
+            "relevant_facts": relevant_facts.iter().map(|f| {
+                serde_json::json!({"category": f.category, "key": f.key, "value": f.value})
+            }).collect::<Vec<_>>(),
+            "relevant_procedures": relevant_procedures.iter().map(|p| {
+                serde_json::json!({"name": p.name, "trigger": p.trigger_pattern, "steps": p.steps})
+            }).collect::<Vec<_>>(),
+            "task_results": [],
+        });
+        goal.context = Some(serde_json::to_string(&ctx).unwrap_or_default());
+    }
+
+    state.create_goal_v3(&goal).await.unwrap();
+
+    // Verify goal was created with context
+    let stored_goal = state.get_goal_v3(&goal.id).await.unwrap().unwrap();
+    assert!(
+        stored_goal.context.is_some(),
+        "Goal should have context with relevant facts"
+    );
+
+    let ctx: serde_json::Value =
+        serde_json::from_str(stored_goal.context.as_deref().unwrap()).unwrap();
+
+    // Should have the expected structure
+    assert!(ctx.get("task_results").is_some());
+    assert!(ctx.get("relevant_facts").is_some());
+
+    let facts = ctx["relevant_facts"].as_array().unwrap();
+    assert!(
+        facts.len() >= 2,
+        "Should have at least 2 relevant facts, got {}",
+        facts.len()
+    );
+
+    // Verify fact structure
+    assert!(facts[0].get("category").is_some());
+    assert!(facts[0].get("key").is_some());
+    assert!(facts[0].get("value").is_some());
+
+    std::mem::forget(db_file);
+}
+
+#[tokio::test]
+async fn test_v3_context_accumulation_end_to_end() {
+    // Create a goal and tasks, complete tasks, verify context accumulation
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use crate::tools::manage_goal_tasks::ManageGoalTasksTool;
+    use crate::traits::Tool;
+
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_path = db_file.path().to_str().unwrap().to_string();
+    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let state: Arc<dyn StateStore> = Arc::new(
+        SqliteStateStore::new(&db_path, 100, None, embedding_service)
+            .await
+            .unwrap(),
+    );
+
+    // Create a goal
+    let goal = GoalV3::new_finite("Build and deploy website", "test-session");
+    let goal_id = goal.id.clone();
+    state.create_goal_v3(&goal).await.unwrap();
+
+    let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
+
+    // Create tasks
+    tool.call(
+        &serde_json::json!({
+            "action": "create_task",
+            "description": "Set up database schema",
+            "task_order": 1
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    tool.call(
+        &serde_json::json!({
+            "action": "create_task",
+            "description": "Build API endpoints",
+            "task_order": 2
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+    assert_eq!(tasks.len(), 2);
+
+    // Complete first task
+    tool.call(
+        &serde_json::json!({
+            "action": "update_task",
+            "task_id": tasks[0].id,
+            "status": "completed",
+            "result": "Created users, posts, and comments tables in PostgreSQL"
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    // Verify context after first task
+    let goal = state.get_goal_v3(&goal_id).await.unwrap().unwrap();
+    let ctx: serde_json::Value = serde_json::from_str(goal.context.as_deref().unwrap()).unwrap();
+    let results = ctx["task_results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0]["result_summary"]
+        .as_str()
+        .unwrap()
+        .contains("PostgreSQL"));
+
+    // Complete second task
+    tool.call(
+        &serde_json::json!({
+            "action": "update_task",
+            "task_id": tasks[1].id,
+            "status": "completed",
+            "result": "Built REST API with CRUD for users, posts, comments"
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    // Verify both results in context
+    let goal = state.get_goal_v3(&goal_id).await.unwrap().unwrap();
+    let ctx: serde_json::Value = serde_json::from_str(goal.context.as_deref().unwrap()).unwrap();
+    let results = ctx["task_results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "Both task results should be accumulated");
+
+    std::mem::forget(db_file);
+}
+
+// ==================== Orchestrator Tool Isolation Regression Tests ====================
+
+#[tokio::test]
+async fn test_orchestrator_consultant_pass_has_no_tools() {
+    // The consultant pass (iteration 1) must have no tool definitions.
+    // After the consultant pass, Simple tasks fall through to the full agent loop
+    // which DOES have tools.
+    let provider = MockProvider::with_responses(vec![
+        // Consultant pass (iteration 1, no tools)
+        MockProvider::text_response("I'll check that for you."),
+        // Full agent loop (has tools)
+        MockProvider::tool_call_response("system_info", "{}"),
+        // Full agent loop final response
+        MockProvider::text_response("System is running macOS."),
+    ]);
+
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let _response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Show me the system information",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let calls = harness.provider.call_log.lock().await;
+    assert!(calls.len() >= 2, "Expected at least 2 LLM calls");
+
+    // First call (consultant pass): MUST have zero tools
+    assert!(
+        calls[0].tools.is_empty(),
+        "Consultant pass must have empty tools, got {} tools",
+        calls[0].tools.len()
+    );
+}
+
+#[tokio::test]
+async fn test_orchestrator_drops_tool_calls_for_action_requests() {
+    // Even for action requests (non-questions), if the consultant LLM hallucinates
+    // tool calls, they must be dropped. The orchestrator never executes tools.
+    use crate::traits::ToolCall;
+
+    let provider = MockProvider::with_responses(vec![
+        // Consultant returns text + hallucinated tool call for an action request
+        ProviderResponse {
+            content: Some("I'll look into the system details.".to_string()),
+            tool_calls: vec![ToolCall {
+                id: "call_hallucinated".to_string(),
+                name: "system_info".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+        },
+        // Lightweight executor: tool call
+        MockProvider::tool_call_response("system_info", "{}"),
+        // Lightweight executor: final response
+        MockProvider::text_response("System is running macOS."),
+    ]);
+
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Check the system information now",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The response should come from the lightweight executor, not from the
+    // orchestrator directly executing the hallucinated tool call
+    assert_eq!(response, "System is running macOS.");
+
+    let calls = harness.provider.call_log.lock().await;
+    // First call is consultant (no tools), subsequent are lightweight executor
+    assert!(
+        calls[0].tools.is_empty(),
+        "Orchestrator must not pass tools to LLM"
+    );
+}
+
+#[tokio::test]
+async fn test_orchestrator_knowledge_no_tool_execution() {
+    // A knowledge question must be answered by the consultant with zero tool
+    // execution. Only 1 LLM call should occur.
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "The capital of France is Paris.\n\n[INTENT_GATE]\n{\"complexity\": \"knowledge\", \"can_answer_now\": true, \"needs_tools\": false}",
+    )]);
+
+    let harness = setup_test_agent_v3(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "What is the capital of France?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "The capital of France is Paris.");
+
+    let call_count = harness.provider.call_count().await;
+    assert_eq!(
+        call_count, 1,
+        "Knowledge question must be answered in exactly 1 LLM call (consultant only)"
+    );
+
+    let calls = harness.provider.call_log.lock().await;
+    assert!(
+        calls[0].tools.is_empty(),
+        "Knowledge LLM call must have zero tools"
+    );
+}
+
+#[tokio::test]
+async fn test_executor_mode_retains_tools() {
+    // Contrast: an agent in executor mode (depth > 0) MUST have tools available.
+    // This ensures set_test_executor_mode doesn't break tool access.
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("System info retrieved."),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    // setup_test_agent calls set_test_executor_mode() → depth=1, Executor role
+
+    let _response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Show me the system information",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let calls = harness.provider.call_log.lock().await;
+    assert!(
+        !calls[0].tools.is_empty(),
+        "Executor mode must have tools available in LLM calls"
+    );
+}
+
+/// Scenario: Turn 1 makes tool calls, Turn 2 asks a different question.
+/// The tool intermediates from Turn 1 should be collapsed so they don't
+/// pollute Turn 2's context and confuse the LLM (context bleeding bug).
+#[tokio::test]
+async fn test_old_tool_intermediates_collapsed_in_follow_up() {
+    let provider = MockProvider::with_responses(vec![
+        // Turn 1: tool call + final response
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("Your system has 16GB RAM and an M1 chip."),
+        // Turn 2: direct text response (different topic)
+        MockProvider::text_response("Bella is your cat."),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    // Turn 1: triggers a tool call (system_info)
+    let r1 = harness
+        .agent
+        .handle_message(
+            "collapse_test",
+            "What system info do I have?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1, "Your system has 16GB RAM and an M1 chip.");
+
+    // Turn 2: different topic — should NOT include Turn 1's tool intermediates
+    let r2 = harness
+        .agent
+        .handle_message(
+            "collapse_test",
+            "Who is bella?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2, "Bella is your cat.");
+
+    // Verify Turn 2's messages don't contain tool intermediates from Turn 1
+    let call_log = harness.provider.call_log.lock().await;
+    let turn2_call = call_log.last().unwrap();
+    let turn2_msgs = &turn2_call.messages;
+
+    // There should be NO tool-role messages from Turn 1
+    let tool_msgs: Vec<&serde_json::Value> = turn2_msgs
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .collect();
+    assert!(
+        tool_msgs.is_empty(),
+        "Turn 2 should not contain tool results from Turn 1, found {} tool messages",
+        tool_msgs.len()
+    );
+
+    // There should be NO assistant messages with tool_calls from Turn 1
+    let assistant_with_tc: Vec<&serde_json::Value> = turn2_msgs
+        .iter()
+        .filter(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                && m.get("tool_calls").is_some()
+        })
+        .collect();
+    assert!(
+        assistant_with_tc.is_empty(),
+        "Turn 2 should not contain assistant tool_calls from Turn 1, found {}",
+        assistant_with_tc.len()
+    );
+
+    // But Turn 2 SHOULD still have the user messages and final assistant response from Turn 1
+    let user_msgs: Vec<&serde_json::Value> = turn2_msgs
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .collect();
+    assert!(
+        user_msgs.len() >= 2,
+        "Turn 2 should include user messages from both turns, found {}",
+        user_msgs.len()
+    );
+}
+
+// ==================== Context Window Management Tests ====================
+
+/// Verify that a long conversation (20+ messages) doesn't crash and the agent
+/// still produces a response. Budget enforcement should trim history silently.
+#[tokio::test]
+async fn test_long_conversation_no_crash() {
+    // Create responses for 11 turns (22 messages total user+assistant)
+    let mut responses = Vec::new();
+    for i in 0..11 {
+        responses.push(MockProvider::text_response(&format!("Response {}", i)));
+    }
+
+    let provider = MockProvider::with_responses(responses);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    // Send 11 messages in the same session
+    for i in 0..11 {
+        let msg = format!(
+            "Message number {} with some extra text to make it a bit longer",
+            i
+        );
+        let result = harness
+            .agent
+            .handle_message(
+                "long_session",
+                &msg,
+                None,
+                UserRole::Owner,
+                ChannelContext::private("telegram"),
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Message {} should succeed: {:?}",
+            i,
+            result.err()
+        );
+        let text = result.unwrap();
+        assert!(!text.is_empty(), "Response {} should not be empty", i);
+    }
+}
+
+/// Verify tool result compression: a very large tool result should be truncated.
+#[tokio::test]
+async fn test_tool_result_compressed() {
+    use crate::memory::context_window::compress_tool_result;
+
+    // Result under the limit should pass through unchanged
+    let short = "Hello world";
+    let result = compress_tool_result("terminal", short, 2000);
+    assert_eq!(result, short);
+
+    // Result over the limit should be truncated with annotation
+    let large = "x".repeat(5000);
+    let compressed = compress_tool_result("terminal", &large, 2000);
+    assert!(compressed.len() < 5000);
+    assert!(compressed.contains("[truncated"));
+    assert!(compressed.contains("5000"));
+}
+
+/// Verify conversation summary CRUD operations work correctly.
+#[tokio::test]
+async fn test_summary_crud() {
+    use crate::traits::ConversationSummary;
+
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("Hello")]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    // Initially no summary
+    let summary = harness
+        .state
+        .get_conversation_summary("test_session")
+        .await
+        .unwrap();
+    assert!(summary.is_none());
+
+    // Upsert a summary
+    let summary = ConversationSummary {
+        session_id: "test_session".to_string(),
+        summary: "We discussed topic A and decided on approach B.".to_string(),
+        message_count: 10,
+        last_message_id: "msg-123".to_string(),
+        updated_at: Utc::now(),
+    };
+    harness
+        .state
+        .upsert_conversation_summary(&summary)
+        .await
+        .unwrap();
+
+    // Retrieve it
+    let loaded = harness
+        .state
+        .get_conversation_summary("test_session")
+        .await
+        .unwrap();
+    assert!(loaded.is_some());
+    let loaded = loaded.unwrap();
+    assert_eq!(loaded.session_id, "test_session");
+    assert_eq!(
+        loaded.summary,
+        "We discussed topic A and decided on approach B."
+    );
+    assert_eq!(loaded.message_count, 10);
+
+    // Update it
+    let updated = ConversationSummary {
+        summary: "Updated: topic A, approach B, and new topic C.".to_string(),
+        message_count: 15,
+        ..loaded
+    };
+    harness
+        .state
+        .upsert_conversation_summary(&updated)
+        .await
+        .unwrap();
+
+    let reloaded = harness
+        .state
+        .get_conversation_summary("test_session")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.summary,
+        "Updated: topic A, approach B, and new topic C."
+    );
+    assert_eq!(reloaded.message_count, 15);
+
+    // Clear session should also clear summary
+    harness.state.clear_session("test_session").await.unwrap();
+    let after_clear = harness
+        .state
+        .get_conversation_summary("test_session")
+        .await
+        .unwrap();
+    assert!(
+        after_clear.is_none(),
+        "Summary should be deleted after clear_session"
+    );
+}
+
+/// Verify should_extract_facts filters trivial messages correctly.
+#[tokio::test]
+async fn test_should_extract_facts_filtering() {
+    use crate::memory::context_window::should_extract_facts;
+
+    // Trivial messages should be filtered out
+    assert!(!should_extract_facts("ok"));
+    assert!(!should_extract_facts("thanks"));
+    assert!(!should_extract_facts("👍"));
+    assert!(!should_extract_facts("hi")); // too short
+
+    // Meaningful messages should pass through
+    assert!(should_extract_facts(
+        "My dog's name is Bella and she's 3 years old"
+    ));
+    assert!(should_extract_facts(
+        "I work at Acme Corp as a senior engineer"
+    ));
 }

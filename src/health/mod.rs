@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::channels::ChannelHub;
 use crate::config::HealthProbeConfig;
-use crate::scheduler::{compute_next_run, parse_schedule};
+use crate::cron_utils::{compute_next_run, parse_schedule};
 
 pub use alerts::AlertManager;
 pub use probes::{HealthProbe, ProbeConfig, ProbeExecutor, ProbeResult, ProbeType};

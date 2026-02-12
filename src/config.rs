@@ -48,7 +48,18 @@ pub fn expand_env_vars(content: &str) -> anyhow::Result<String> {
     Ok(result.into_owned())
 }
 
+/// Returns true if keychain access is disabled via `AIDAEMON_NO_KEYCHAIN=1`.
+fn keychain_disabled() -> bool {
+    std::env::var("AIDAEMON_NO_KEYCHAIN").is_ok_and(|v| v == "1" || v == "true")
+}
+
 pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
+    if keychain_disabled() {
+        anyhow::bail!(
+            "Keychain disabled (AIDAEMON_NO_KEYCHAIN=1), skipping '{}'",
+            field_name
+        );
+    }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
     entry
         .get_password()
@@ -57,6 +68,9 @@ pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
 
 /// Store a secret in the OS keychain under the `aidaemon` service.
 pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
+    if keychain_disabled() {
+        return Ok(());
+    }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
     entry.set_password(value)?;
     Ok(())
@@ -64,6 +78,9 @@ pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
 
 /// Delete a secret from the OS keychain.
 pub fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
+    if keychain_disabled() {
+        return Ok(());
+    }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
     entry
         .delete_credential()
@@ -114,8 +131,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
-    pub scheduler: SchedulerConfig,
-    #[serde(default)]
     pub files: FilesConfig,
     #[serde(default)]
     pub health: HealthConfig,
@@ -129,6 +144,12 @@ pub struct AppConfig {
     pub oauth: OAuthConfig,
     #[serde(default)]
     pub http_auth: HashMap<String, HttpAuthProfile>,
+    #[serde(default)]
+    pub heartbeat: HeartbeatConfig,
+    #[serde(default)]
+    pub policy: PolicyConfig,
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
 }
 
 #[derive(Deserialize, Clone)]
@@ -160,6 +181,10 @@ pub enum ProviderKind {
     OpenaiCompatible,
     GoogleGenai,
     Anthropic,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_base_url() -> String {
@@ -359,6 +384,9 @@ pub struct StateConfig {
     /// Retention policies for automatic cleanup of old data.
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// Context window management (trimming, summarization, progressive facts).
+    #[serde(default)]
+    pub context_window: ContextWindowConfig,
 }
 
 /// Retention policies for automatic cleanup of old data.
@@ -432,6 +460,7 @@ impl fmt::Debug for StateConfig {
             .field("max_facts", &self.max_facts)
             .field("daily_token_budget", &self.daily_token_budget)
             .field("retention", &self.retention)
+            .field("context_window", &self.context_window)
             .finish()
     }
 }
@@ -446,6 +475,7 @@ impl Default for StateConfig {
             max_facts: default_max_facts(),
             daily_token_budget: None,
             retention: RetentionConfig::default(),
+            context_window: ContextWindowConfig::default(),
         }
     }
 }
@@ -828,7 +858,7 @@ pub struct CliAgentsConfig {
 impl Default for CliAgentsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             timeout_secs: default_cli_agents_timeout_secs(),
             max_output_chars: default_cli_agents_max_output_chars(),
             tools: HashMap::new(),
@@ -879,35 +909,6 @@ pub enum SearchBackendKind {
     #[default]
     DuckDuckGo,
     Brave,
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct SchedulerConfig {
-    #[serde(default = "default_scheduler_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_tick_interval_secs")]
-    pub tick_interval_secs: u64,
-    #[serde(default)]
-    pub tasks: Vec<ScheduledTaskConfig>,
-}
-
-fn default_scheduler_enabled() -> bool {
-    true
-}
-
-fn default_tick_interval_secs() -> u64 {
-    30
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ScheduledTaskConfig {
-    pub name: String,
-    pub schedule: String,
-    pub prompt: String,
-    #[serde(default)]
-    pub oneshot: bool,
-    #[serde(default)]
-    pub trusted: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -1240,6 +1241,200 @@ impl HttpAuthProfile {
     }
 }
 
+/// Context window management configuration.
+/// Controls conversation history trimming, summarization, and progressive fact extraction.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ContextWindowConfig {
+    /// Enable context window management (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Default token budget for conversation history (default: 24000).
+    #[serde(default = "default_context_budget")]
+    pub default_budget: usize,
+    /// Per-model token budgets (model name → budget). Overrides default_budget.
+    #[serde(default)]
+    pub model_budgets: HashMap<String, usize>,
+    /// Maximum characters for tool results before truncation (default: 2000).
+    #[serde(default = "default_tool_result_chars")]
+    pub max_tool_result_chars: usize,
+    /// Number of recent messages to always keep in the window (default: 6).
+    #[serde(default = "default_summary_window")]
+    pub summary_window: usize,
+    /// Enable progressive fact extraction after each interaction (default: true).
+    #[serde(default = "default_true")]
+    pub progressive_facts: bool,
+    /// Message count threshold before summarization kicks in (default: 12).
+    #[serde(default = "default_summarize_threshold")]
+    pub summarize_threshold: usize,
+}
+
+impl Default for ContextWindowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_budget: default_context_budget(),
+            model_budgets: HashMap::new(),
+            max_tool_result_chars: default_tool_result_chars(),
+            summary_window: default_summary_window(),
+            progressive_facts: true,
+            summarize_threshold: default_summarize_threshold(),
+        }
+    }
+}
+
+fn default_context_budget() -> usize {
+    24000
+}
+fn default_tool_result_chars() -> usize {
+    2000
+}
+fn default_summary_window() -> usize {
+    6
+}
+fn default_summarize_threshold() -> usize {
+    12
+}
+
+fn default_heartbeat_tick() -> u64 {
+    30
+}
+
+fn default_max_concurrent() -> usize {
+    3
+}
+
+fn default_policy_shadow_mode() -> bool {
+    true
+}
+fn default_policy_enforce() -> bool {
+    true
+}
+fn default_tool_filter_enforce() -> bool {
+    true
+}
+fn default_uncertainty_clarify_enforce() -> bool {
+    true
+}
+fn default_context_refresh_enforce() -> bool {
+    true
+}
+fn default_learning_evidence_gate_enforce() -> bool {
+    true
+}
+fn default_autotune_shadow() -> bool {
+    true
+}
+fn default_autotune_enforce() -> bool {
+    true
+}
+fn default_uncertainty_threshold() -> f32 {
+    0.55
+}
+fn default_classify_retirement_enabled() -> bool {
+    true
+}
+fn default_classify_retirement_window_days() -> u32 {
+    7
+}
+fn default_classify_retirement_max_divergence() -> f32 {
+    0.05
+}
+fn default_diagnostics_max_events() -> usize {
+    200
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiagnosticsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub record_decision_points: bool,
+    #[serde(default = "default_diagnostics_max_events")]
+    pub max_events: usize,
+    #[serde(default)]
+    pub include_raw_tool_args: bool,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            record_decision_points: true,
+            max_events: default_diagnostics_max_events(),
+            include_raw_tool_args: false,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HeartbeatConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Tick interval in seconds (default: 30)
+    #[serde(default = "default_heartbeat_tick")]
+    pub tick_interval_secs: u64,
+    /// Max concurrent LLM tasks spawned by heartbeat (default: 3)
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent_llm_tasks: usize,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tick_interval_secs: 30,
+            max_concurrent_llm_tasks: 3,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PolicyConfig {
+    #[serde(default = "default_policy_shadow_mode")]
+    pub policy_shadow_mode: bool,
+    #[serde(default = "default_policy_enforce")]
+    pub policy_enforce: bool,
+    #[serde(default = "default_tool_filter_enforce")]
+    pub tool_filter_enforce: bool,
+    #[serde(default = "default_uncertainty_clarify_enforce")]
+    pub uncertainty_clarify_enforce: bool,
+    #[serde(default = "default_context_refresh_enforce")]
+    pub context_refresh_enforce: bool,
+    #[serde(default = "default_learning_evidence_gate_enforce")]
+    pub learning_evidence_gate_enforce: bool,
+    #[serde(default = "default_autotune_shadow")]
+    pub autotune_shadow: bool,
+    #[serde(default = "default_autotune_enforce")]
+    pub autotune_enforce: bool,
+    #[serde(default = "default_uncertainty_threshold")]
+    pub uncertainty_clarify_threshold: f32,
+    #[serde(default = "default_classify_retirement_enabled")]
+    pub classify_retirement_enabled: bool,
+    #[serde(default = "default_classify_retirement_window_days")]
+    pub classify_retirement_window_days: u32,
+    #[serde(default = "default_classify_retirement_max_divergence")]
+    pub classify_retirement_max_divergence: f32,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            policy_shadow_mode: default_policy_shadow_mode(),
+            policy_enforce: default_policy_enforce(),
+            tool_filter_enforce: default_tool_filter_enforce(),
+            uncertainty_clarify_enforce: default_uncertainty_clarify_enforce(),
+            context_refresh_enforce: default_context_refresh_enforce(),
+            learning_evidence_gate_enforce: default_learning_evidence_gate_enforce(),
+            autotune_shadow: default_autotune_shadow(),
+            autotune_enforce: default_autotune_enforce(),
+            uncertainty_clarify_threshold: default_uncertainty_threshold(),
+            classify_retirement_enabled: default_classify_retirement_enabled(),
+            classify_retirement_window_days: default_classify_retirement_window_days(),
+            classify_retirement_max_divergence: default_classify_retirement_max_divergence(),
+        }
+    }
+}
+
 impl AppConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
@@ -1292,7 +1487,9 @@ impl AppConfig {
         let mut bots = self.slack_bots.clone();
 
         if let Some(ref legacy) = self.slack {
-            if legacy.enabled && !legacy.bot_token.is_empty() && !legacy.app_token.is_empty() {
+            // Keep legacy `enabled` for backward compatibility in config parsing,
+            // but activation is token-driven to match Telegram/Discord behavior.
+            if !legacy.bot_token.is_empty() && !legacy.app_token.is_empty() {
                 bots.push(SlackBotConfig {
                     app_token: legacy.app_token.clone(),
                     bot_token: legacy.bot_token.clone(),
@@ -1536,5 +1733,35 @@ mod tests {
     fn task_timeout_default_is_30_minutes() {
         let config = SubagentsConfig::default();
         assert_eq!(config.task_timeout_secs, Some(1800));
+    }
+
+    #[cfg(feature = "slack")]
+    #[test]
+    fn all_slack_bots_merges_legacy_without_enabled_gate() {
+        let toml = r#"
+[provider]
+api_key = "test-key"
+kind = "openai_compatible"
+
+[provider.models]
+primary = "gpt-4o"
+fast = "gpt-4o-mini"
+smart = "gpt-4o"
+
+[terminal]
+allowed_prefixes = ["ls"]
+
+[slack]
+enabled = false
+app_token = "xapp-123"
+bot_token = "xoxb-456"
+allowed_user_ids = ["U123"]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        let bots = cfg.all_slack_bots();
+        assert_eq!(bots.len(), 1);
+        assert_eq!(bots[0].app_token, "xapp-123");
+        assert_eq!(bots[0].bot_token, "xoxb-456");
+        assert_eq!(bots[0].allowed_user_ids, vec!["U123"]);
     }
 }

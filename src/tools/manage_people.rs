@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Datelike;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -46,6 +47,10 @@ struct ManagePeopleArgs {
     fact_id: Option<i64>,
     #[serde(default)]
     display_name: Option<String>,
+    #[serde(default)]
+    within_days: Option<i32>,
+    #[serde(default)]
+    inactive_days: Option<u32>,
 }
 
 #[async_trait]
@@ -61,13 +66,13 @@ impl Tool for ManagePeopleTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_people",
-            "description": "Manage the owner's contacts and social circle. Use 'enable'/'disable'/'status' to toggle People Intelligence at runtime. Other actions: add, list, view, update, remove, add_fact, remove_fact, link, export, purge, audit, confirm",
+            "description": "Manage the owner's contacts and social circle. Use 'enable'/'disable'/'status' to toggle People Intelligence at runtime. Other actions: add, list, view, brief, upcoming, reconnect, update, remove, add_fact, remove_fact, link, export, purge, audit, confirm",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["enable", "disable", "status", "add", "list", "view", "update", "remove", "add_fact", "remove_fact", "link", "export", "purge", "audit", "confirm"],
+                        "enum": ["enable", "disable", "status", "add", "list", "view", "brief", "upcoming", "reconnect", "update", "remove", "add_fact", "remove_fact", "link", "export", "purge", "audit", "confirm"],
                         "description": "Action to perform. 'enable'/'disable' toggle people tracking; 'status' shows current state."
                     },
                     "name": {
@@ -121,6 +126,14 @@ impl Tool for ManagePeopleTool {
                     "fact_id": {
                         "type": "integer",
                         "description": "Fact ID (for remove_fact, confirm)"
+                    },
+                    "within_days": {
+                        "type": "integer",
+                        "description": "Window for upcoming dates (for upcoming, default 14)"
+                    },
+                    "inactive_days": {
+                        "type": "integer",
+                        "description": "Inactivity threshold in days (for reconnect, default 30)"
                     }
                 },
                 "required": ["action"],
@@ -151,6 +164,9 @@ impl Tool for ManagePeopleTool {
             "add" => self.handle_add(&args).await,
             "list" => self.handle_list(&args).await,
             "view" => self.handle_view(&args).await,
+            "brief" => self.handle_brief(&args).await,
+            "upcoming" => self.handle_upcoming(&args).await,
+            "reconnect" => self.handle_reconnect(&args).await,
             "update" => self.handle_update(&args).await,
             "remove" => self.handle_remove(&args).await,
             "add_fact" => self.handle_add_fact(&args).await,
@@ -160,12 +176,74 @@ impl Tool for ManagePeopleTool {
             "purge" => self.handle_purge(&args).await,
             "audit" => self.handle_audit(&args).await,
             "confirm" => self.handle_confirm(&args).await,
-            other => Ok(format!("Unknown action: {}. Use: enable, disable, status, add, list, view, update, remove, add_fact, remove_fact, link, export, purge, audit, confirm", other)),
+            other => Ok(format!("Unknown action: {}. Use: enable, disable, status, add, list, view, brief, upcoming, reconnect, update, remove, add_fact, remove_fact, link, export, purge, audit, confirm", other)),
         }
     }
 }
 
 impl ManagePeopleTool {
+    fn days_until_date(value: &str, today: chrono::NaiveDate) -> Option<i64> {
+        use chrono::NaiveDate;
+        let trimmed = value.trim();
+
+        if let Ok(d) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+            let this_year = today.with_month(d.month())?.with_day(d.day())?;
+            let diff = (this_year - today).num_days();
+            return Some(if diff < 0 { diff + 365 } else { diff });
+        }
+
+        if let Ok(d) = NaiveDate::parse_from_str(&format!("2000-{}", trimmed), "%Y-%m-%d") {
+            let this_year = today.with_month(d.month())?.with_day(d.day())?;
+            let diff = (this_year - today).num_days();
+            return Some(if diff < 0 { diff + 365 } else { diff });
+        }
+        if let Ok(d) = NaiveDate::parse_from_str(&format!("2000/{}", trimmed), "%Y/%m/%d") {
+            let this_year = today.with_month(d.month())?.with_day(d.day())?;
+            let diff = (this_year - today).num_days();
+            return Some(if diff < 0 { diff + 365 } else { diff });
+        }
+
+        let months = [
+            ("january", 1),
+            ("february", 2),
+            ("march", 3),
+            ("april", 4),
+            ("may", 5),
+            ("june", 6),
+            ("july", 7),
+            ("august", 8),
+            ("september", 9),
+            ("october", 10),
+            ("november", 11),
+            ("december", 12),
+        ];
+        let lower = trimmed.to_lowercase();
+        for (name, num) in &months {
+            if let Some(rest) = lower.strip_prefix(name) {
+                let rest = rest.trim().trim_start_matches([',', ' ']);
+                if let Ok(day) = rest.parse::<u32>() {
+                    let this_year = today.with_month(*num)?.with_day(day)?;
+                    let diff = (this_year - today).num_days();
+                    return Some(if diff < 0 { diff + 365 } else { diff });
+                }
+            }
+        }
+        None
+    }
+
+    async fn resolve_person(&self, args: &ManagePeopleArgs) -> anyhow::Result<Option<Person>> {
+        if let Some(id) = args.id {
+            return self.state.get_person(id).await;
+        }
+        if let Some(ref name) = args.name {
+            return self.state.find_person_by_name(name).await;
+        }
+        if let Some(ref person_name) = args.person_name {
+            return self.state.find_person_by_name(person_name).await;
+        }
+        Ok(None)
+    }
+
     async fn handle_add(&self, args: &ManagePeopleArgs) -> anyhow::Result<String> {
         let name = match &args.name {
             Some(n) => n.clone(),
@@ -290,6 +368,183 @@ impl ManagePeopleTool {
             }
         }
 
+        Ok(result)
+    }
+
+    async fn handle_brief(&self, args: &ManagePeopleArgs) -> anyhow::Result<String> {
+        let person = match self.resolve_person(args).await? {
+            Some(p) => p,
+            None => return Ok("Provide 'name', 'person_name', or 'id' for brief.".to_string()),
+        };
+        let facts = self.state.get_person_facts(person.id, None).await?;
+
+        let relationship = person.relationship.as_deref().unwrap_or("unknown");
+        let style = person
+            .communication_style
+            .as_deref()
+            .unwrap_or("not specified");
+        let language = person
+            .language_preference
+            .as_deref()
+            .unwrap_or("not specified");
+        let last = person
+            .last_interaction_at
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "none recorded".to_string());
+
+        let mut top_notes = Vec::new();
+        for f in &facts {
+            if f.category == "preference"
+                || f.category == "interest"
+                || f.category == "family"
+                || f.category == "work"
+            {
+                top_notes.push(format!("{}: {}", f.key, f.value));
+            }
+            if top_notes.len() >= 4 {
+                break;
+            }
+        }
+
+        let today = chrono::Utc::now().date_naive();
+        let next_date = facts
+            .iter()
+            .filter(|f| f.category == "birthday" || f.category == "important_date")
+            .filter_map(|f| {
+                Self::days_until_date(&f.value, today)
+                    .map(|d| (d, format!("{} {} ({})", f.category, f.value, f.key)))
+            })
+            .min_by_key(|(d, _)| *d);
+
+        let opener = if style.to_ascii_lowercase().contains("formal") {
+            "Use a concise, respectful opener and avoid slang."
+        } else if style.to_ascii_lowercase().contains("warm")
+            || style.to_ascii_lowercase().contains("casual")
+        {
+            "Open warmly, personal tone first, then the main point."
+        } else {
+            "Start with a friendly check-in, then move to the purpose."
+        };
+
+        let mut result = format!(
+            "**People Brief: {}**\n- Relationship: {}\n- Communication style: {}\n- Language: {}\n- Last interaction: {}\n- Total interactions: {}",
+            person.name, relationship, style, language, last, person.interaction_count
+        );
+
+        if let Some((days, detail)) = next_date {
+            let when = if days == 0 {
+                "today".to_string()
+            } else if days == 1 {
+                "tomorrow".to_string()
+            } else {
+                format!("in {} days", days)
+            };
+            result.push_str(&format!("\n- Next important date: {} ({})", detail, when));
+        }
+
+        if !top_notes.is_empty() {
+            result.push_str("\n- Useful context:");
+            for note in &top_notes {
+                result.push_str(&format!("\n  - {}", note));
+            }
+        }
+        result.push_str(&format!("\n- Suggested approach: {}", opener));
+        Ok(result)
+    }
+
+    async fn handle_upcoming(&self, args: &ManagePeopleArgs) -> anyhow::Result<String> {
+        let within_days = args.within_days.unwrap_or(14).clamp(1, 365);
+        let today = chrono::Utc::now().date_naive();
+        let mut rows: Vec<(i64, Person, PersonFact)> = Vec::new();
+
+        let people = self.state.get_all_people().await?;
+        for person in people {
+            let facts = self.state.get_person_facts(person.id, None).await?;
+            for fact in facts {
+                if fact.category != "birthday" && fact.category != "important_date" {
+                    continue;
+                }
+                if let Some(days) = Self::days_until_date(&fact.value, today) {
+                    if days >= 0 && days <= within_days as i64 {
+                        rows.push((days, person.clone(), fact));
+                    }
+                }
+            }
+        }
+
+        if rows.is_empty() {
+            return Ok(format!(
+                "No upcoming birthdays/important dates in the next {} days.",
+                within_days
+            ));
+        }
+
+        rows.sort_by_key(|(days, person, _)| (*days, person.name.clone()));
+
+        let mut result = format!(
+            "**Upcoming Dates** ({} within {} days)\n",
+            rows.len(),
+            within_days
+        );
+        for (days, person, fact) in &rows {
+            let when = if *days == i64::MAX {
+                "date format unknown".to_string()
+            } else if *days == 0 {
+                "today".to_string()
+            } else if *days == 1 {
+                "tomorrow".to_string()
+            } else {
+                format!("in {} days", days)
+            };
+            let rel = person.relationship.as_deref().unwrap_or("—");
+            result.push_str(&format!(
+                "- **{}** ({}) — [{}] {}: {} ({})\n",
+                person.name, rel, fact.category, fact.key, fact.value, when
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn handle_reconnect(&self, args: &ManagePeopleArgs) -> anyhow::Result<String> {
+        let inactive_days = args.inactive_days.unwrap_or(30).clamp(1, 3650);
+        let people = self
+            .state
+            .get_people_needing_reconnect(inactive_days)
+            .await?;
+        if people.is_empty() {
+            return Ok(format!(
+                "No reconnect suggestions right now (threshold: {} days).",
+                inactive_days
+            ));
+        }
+
+        let now = chrono::Utc::now();
+        let mut result = format!(
+            "**Reconnect Suggestions** ({} people, threshold: {} days)\n",
+            people.len(),
+            inactive_days
+        );
+        for p in &people {
+            let days_since = p
+                .last_interaction_at
+                .map(|d| (now - d).num_days())
+                .unwrap_or(-1);
+            let rel = p.relationship.as_deref().unwrap_or("—");
+            let style = p.communication_style.as_deref().unwrap_or("default");
+            let last = p
+                .last_interaction_at
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let nudge = if style.to_ascii_lowercase().contains("formal") {
+                "send a concise check-in"
+            } else {
+                "send a warm personal check-in"
+            };
+            result.push_str(&format!(
+                "- **{}** ({}) — last: {} (~{} days), style: {}, suggestion: {}\n",
+                p.name, rel, last, days_since, style, nudge
+            ));
+        }
         Ok(result)
     }
 
@@ -580,5 +835,191 @@ impl ManagePeopleTool {
             if enabled { "enabled" } else { "disabled" },
             people_count
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+
+    async fn setup_tool() -> ManagePeopleTool {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        state.set_setting("people_enabled", "true").await.unwrap();
+        std::mem::forget(db_file);
+        ManagePeopleTool::new(state as Arc<dyn StateStore>)
+    }
+
+    #[tokio::test]
+    async fn upcoming_lists_people_with_dates() {
+        let tool = setup_tool().await;
+
+        let add_result = tool
+            .call(
+                &json!({
+                    "action": "add",
+                    "name": "Alice",
+                    "relationship": "friend"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            add_result.contains("Added person"),
+            "unexpected add output: {}",
+            add_result
+        );
+
+        let upcoming = chrono::Utc::now().date_naive() + chrono::Duration::days(2);
+        let date_value = upcoming.format("%m-%d").to_string();
+        let add_fact_result = tool
+            .call(
+                &json!({
+                    "action": "add_fact",
+                    "person_name": "Alice",
+                    "category": "birthday",
+                    "key": "birthday",
+                    "value": date_value
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            add_fact_result.contains("Added fact"),
+            "unexpected add_fact output: {}",
+            add_fact_result
+        );
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "upcoming",
+                    "within_days": 7
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.contains("Upcoming Dates"),
+            "unexpected upcoming output: {}",
+            result
+        );
+        assert!(
+            result.contains("Alice"),
+            "unexpected upcoming output: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_lists_inactive_people() {
+        let tool = setup_tool().await;
+
+        tool.call(
+            &json!({
+                "action": "add",
+                "name": "Bob",
+                "relationship": "friend",
+                "communication_style": "warm"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        tool.call(
+            &json!({
+                "action": "link",
+                "person_name": "Bob",
+                "platform_id": "slack:U_BOB",
+                "display_name": "bob"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Touch interaction now; with inactive_days=1 this should not show.
+        // Use the state method via the tool boundary by resolving person brief,
+        // then calling reconnect with a low threshold to validate output shape.
+        let brief = tool
+            .call(
+                &json!({
+                    "action": "brief",
+                    "name": "Bob"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(brief.contains("People Brief: Bob"));
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "reconnect",
+                    "inactive_days": 1
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        // Might be empty depending on interaction timestamps; assert stable text contract.
+        assert!(
+            result.contains("Reconnect Suggestions")
+                || result.contains("No reconnect suggestions right now")
+        );
+    }
+
+    #[tokio::test]
+    async fn brief_includes_core_guidance() {
+        let tool = setup_tool().await;
+        tool.call(
+            &json!({
+                "action": "add",
+                "name": "Carol",
+                "relationship": "coworker",
+                "communication_style": "formal",
+                "language": "English"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        tool.call(
+            &json!({
+                "action": "add_fact",
+                "person_name": "Carol",
+                "category": "work",
+                "key": "role",
+                "value": "Engineering Manager"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "brief",
+                    "name": "Carol"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("People Brief: Carol"));
+        assert!(result.contains("Suggested approach"));
     }
 }

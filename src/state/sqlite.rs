@@ -2,14 +2,15 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{Datelike, Utc};
+use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock;
 
 use crate::traits::{
-    BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, Message, Procedure, StateStore,
-    TokenUsage, TokenUsageRecord, UserProfile,
+    BehaviorPattern, ConversationSummary, Episode, ErrorSolution, Expertise, Fact, Goal, GoalV3,
+    Message, Procedure, StateStore, TaskActivityV3, TaskV3, TokenUsage, TokenUsageRecord,
+    UserProfile,
 };
 use crate::types::{ChannelVisibility, FactPrivacy};
 
@@ -41,6 +42,21 @@ pub struct SqliteStateStore {
     working_memory: Arc<RwLock<HashMap<String, VecDeque<Message>>>>,
     cap: usize,
     embedding_service: Arc<EmbeddingService>,
+}
+
+fn parse_legacy_datetime_to_local(raw: &str) -> Option<chrono::DateTime<chrono::Local>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Local))
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .and_then(|naive| match chrono::Local.from_local_datetime(&naive) {
+                    chrono::LocalResult::Single(dt) => Some(dt),
+                    chrono::LocalResult::Ambiguous(early, _) => Some(early),
+                    chrono::LocalResult::None => None,
+                })
+        })
 }
 
 impl SqliteStateStore {
@@ -198,6 +214,13 @@ impl SqliteStateStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id)")
             .execute(&pool)
             .await?;
+
+        // Prevent concurrent episode creation for the same session
+        let _ = sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_session_unique ON episodes(session_id)",
+        )
+        .execute(&pool)
+        .await;
 
         // 7. Create goals table
         sqlx::query(
@@ -436,6 +459,18 @@ impl SqliteStateStore {
         .execute(&pool)
         .await?;
 
+        // Session-channel mapping — persists session_id → channel_name so the
+        // hub can route notifications after a restart (session_map is in-memory).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS session_channels (
+                session_id TEXT PRIMARY KEY,
+                channel_name TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
         // Dynamic skills table - stores skills added via manage_skills tool
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS dynamic_skills (
@@ -462,6 +497,22 @@ impl SqliteStateStore {
         .await
         .ok();
 
+        // Skill drafts table - stores auto-promoted skill drafts pending user review
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS skill_drafts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                triggers_json TEXT NOT NULL DEFAULT '[]',
+                body TEXT NOT NULL,
+                source_procedure TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
         // Dynamic MCP servers table - stores MCP servers added via manage_mcp tool
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS dynamic_mcp_servers (
@@ -473,6 +524,42 @@ impl SqliteStateStore {
                 triggers_json TEXT NOT NULL DEFAULT '[]',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Dynamic CLI agents table - stores CLI agents added via manage_cli_agents tool
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS dynamic_cli_agents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                command TEXT NOT NULL,
+                args_json TEXT NOT NULL DEFAULT '[]',
+                description TEXT NOT NULL DEFAULT '',
+                timeout_secs INTEGER,
+                max_output_chars INTEGER,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        // CLI agent invocations table - logs each CLI agent run for auditing
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS cli_agent_invocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                prompt_summary TEXT NOT NULL,
+                working_dir TEXT,
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT,
+                exit_code INTEGER,
+                output_summary TEXT,
+                success INTEGER,
+                duration_secs REAL
             )",
         )
         .execute(&pool)
@@ -580,6 +667,169 @@ impl SqliteStateStore {
         let _ = sqlx::query("ALTER TABLE facts ADD COLUMN embedding BLOB")
             .execute(&pool)
             .await;
+
+        // --- V3 Orchestration Tables ---
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS goals_v3 (
+                id TEXT PRIMARY KEY,
+                description TEXT NOT NULL,
+                goal_type TEXT NOT NULL DEFAULT 'finite',
+                status TEXT NOT NULL DEFAULT 'active',
+                priority TEXT NOT NULL DEFAULT 'medium',
+                conditions TEXT,
+                schedule TEXT,
+                context TEXT,
+                resources TEXT,
+                budget_per_check INTEGER,
+                budget_daily INTEGER,
+                tokens_used_today INTEGER NOT NULL DEFAULT 0,
+                last_useful_action TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT,
+                parent_goal_id TEXT,
+                session_id TEXT NOT NULL,
+                notified_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_goals_v3_status ON goals_v3(status)")
+            .execute(&pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_goals_v3_session ON goals_v3(session_id)")
+            .execute(&pool)
+            .await?;
+
+        // Migration: add notified_at column to goals_v3 (nullable)
+        let _ = sqlx::query("ALTER TABLE goals_v3 ADD COLUMN notified_at TEXT")
+            .execute(&pool)
+            .await;
+
+        // Migration: add notification_attempts column to goals_v3 for retry tracking
+        let _ = sqlx::query(
+            "ALTER TABLE goals_v3 ADD COLUMN notification_attempts INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&pool)
+        .await;
+
+        // Migration: add dispatch_failures column for progress-based circuit breaker
+        let _ = sqlx::query(
+            "ALTER TABLE goals_v3 ADD COLUMN dispatch_failures INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&pool)
+        .await;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS tasks_v3 (
+                id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL REFERENCES goals_v3(id) ON DELETE CASCADE,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority TEXT NOT NULL DEFAULT 'medium',
+                task_order INTEGER NOT NULL DEFAULT 0,
+                parallel_group TEXT,
+                depends_on TEXT,
+                agent_id TEXT,
+                context TEXT,
+                result TEXT,
+                error TEXT,
+                blocker TEXT,
+                idempotent INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                started_at TEXT,
+                completed_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_v3_goal ON tasks_v3(goal_id)")
+            .execute(&pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_v3_status ON tasks_v3(status)")
+            .execute(&pool)
+            .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS task_activity_v3 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL REFERENCES tasks_v3(id) ON DELETE CASCADE,
+                activity_type TEXT NOT NULL,
+                tool_name TEXT,
+                tool_args TEXT,
+                result TEXT,
+                success INTEGER,
+                tokens_used INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_task_activity_v3_task ON task_activity_v3(task_id)",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Notification queue — queued when channel unavailable, delivered on reconnect.
+        // Retention: status_update expires after 24h, critical persists indefinitely.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS notification_queue (
+                id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                notification_type TEXT NOT NULL,
+                priority TEXT NOT NULL DEFAULT 'status_update',
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                delivered_at TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_notification_queue_pending
+             ON notification_queue(delivered_at, priority, created_at)
+             WHERE delivered_at IS NULL",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Conversation summaries for context window management
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS conversation_summaries (
+                session_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                last_message_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Migration: deduplicate people entries and add unique index on LOWER(name).
+        // Keeps the row with the lowest id for each name, merging interaction counts.
+        let _ = sqlx::query(
+            "DELETE FROM people WHERE id NOT IN (
+                SELECT MIN(id) FROM people GROUP BY LOWER(name)
+            )",
+        )
+        .execute(&pool)
+        .await;
+        let _ = sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_people_name_unique ON people(LOWER(name))",
+        )
+        .execute(&pool)
+        .await;
 
         Ok(Self {
             pool,
@@ -1829,20 +2079,12 @@ impl SqliteStateStore {
 /// Falls back to the raw string if keychain lookup fails or it's not a reference.
 fn resolve_keychain_ref(value: &str) -> String {
     if let Some(key_name) = value.strip_prefix("keychain:") {
-        match keyring::Entry::new(crate::config::KEYCHAIN_SERVICE, key_name) {
-            Ok(entry) => match entry.get_password() {
-                Ok(password) => return password,
-                Err(_) => {
-                    tracing::warn!(
-                        key = key_name,
-                        "Failed to resolve keychain reference for dynamic bot"
-                    );
-                }
-            },
+        match crate::config::resolve_from_keychain(key_name) {
+            Ok(password) => return password,
             Err(_) => {
                 tracing::warn!(
                     key = key_name,
-                    "Failed to create keychain entry for dynamic bot"
+                    "Failed to resolve keychain reference for dynamic bot"
                 );
             }
         }
@@ -2093,8 +2335,9 @@ impl StateStore for SqliteStateStore {
                     .execute(&self.pool)
                     .await?;
 
-                // Insert new fact with embedding
-                sqlx::query(
+                // Insert new fact with embedding — ignore duplicate entry errors (code 2067)
+                // that can occur due to UNIQUE(category, key) constraint race conditions
+                let insert_result = sqlx::query(
                     "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy, embedding)
                      VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                 )
@@ -2108,7 +2351,17 @@ impl StateStore for SqliteStateStore {
                 .bind(&privacy_str)
                 .bind(&embedding_blob)
                 .execute(&self.pool)
-                .await?;
+                .await;
+
+                match insert_result {
+                    Ok(_) => {}
+                    Err(sqlx::Error::Database(ref db_err))
+                        if db_err.code().as_deref() == Some("2067") =>
+                    {
+                        // Duplicate entry — fact already exists, ignore
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             } else {
                 // Same value - update timestamp/source and backfill embedding if missing
                 sqlx::query(
@@ -2123,7 +2376,8 @@ impl StateStore for SqliteStateStore {
             }
         } else {
             // No existing fact - insert new with embedding
-            sqlx::query(
+            // Ignore duplicate entry errors (code 2067) from concurrent inserts
+            let insert_result = sqlx::query(
                 "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy, embedding)
                  VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
             )
@@ -2137,7 +2391,17 @@ impl StateStore for SqliteStateStore {
             .bind(&privacy_str)
             .bind(&embedding_blob)
             .execute(&self.pool)
-            .await?;
+            .await;
+
+            match insert_result {
+                Ok(_) => {}
+                Err(sqlx::Error::Database(ref db_err))
+                    if db_err.code().as_deref() == Some("2067") =>
+                {
+                    // Duplicate entry — fact already exists, ignore
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(())
     }
@@ -2423,6 +2687,11 @@ impl StateStore for SqliteStateStore {
         }
         // Delete messages from DB
         sqlx::query("DELETE FROM messages WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        // Delete conversation summary
+        sqlx::query("DELETE FROM conversation_summaries WHERE session_id = ?")
             .bind(session_id)
             .execute(&self.pool)
             .await?;
@@ -2866,6 +3135,27 @@ impl StateStore for SqliteStateStore {
         Ok(row_id)
     }
 
+    async fn update_dynamic_bot_allowed_users(
+        &self,
+        bot_token: &str,
+        allowed_user_ids: &[String],
+    ) -> anyhow::Result<()> {
+        // Find the bot by resolved token (tokens may be stored as keychain refs)
+        let bots = self.get_dynamic_bots().await?;
+        let bot = bots
+            .iter()
+            .find(|b| b.bot_token == bot_token)
+            .ok_or_else(|| anyhow::anyhow!("Dynamic bot not found for token"))?;
+
+        let allowed_json = serde_json::to_string(allowed_user_ids)?;
+        sqlx::query("UPDATE dynamic_bots SET allowed_user_ids = ? WHERE id = ?")
+            .bind(&allowed_json)
+            .bind(bot.id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn get_dynamic_bots(&self) -> anyhow::Result<Vec<crate::traits::DynamicBot>> {
         let rows = sqlx::query(
             "SELECT id, channel_type, bot_token, app_token, allowed_user_ids, extra_config, created_at
@@ -2910,6 +3200,42 @@ impl StateStore for SqliteStateStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    // ==================== Session Channel Mapping ====================
+
+    async fn save_session_channel(
+        &self,
+        session_id: &str,
+        channel_name: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO session_channels (session_id, channel_name, updated_at)
+             VALUES (?, ?, datetime('now'))
+             ON CONFLICT(session_id) DO UPDATE SET
+                channel_name = excluded.channel_name,
+                updated_at = excluded.updated_at",
+        )
+        .bind(session_id)
+        .bind(channel_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn load_session_channels(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT session_id, channel_name FROM session_channels")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("session_id"),
+                    r.get::<String, _>("channel_name"),
+                )
+            })
+            .collect())
     }
 
     // ==================== Dynamic Skills ====================
@@ -3046,6 +3372,87 @@ impl StateStore for SqliteStateStore {
         Ok(procedures)
     }
 
+    // ==================== Skill Drafts ====================
+
+    async fn add_skill_draft(&self, draft: &crate::traits::SkillDraft) -> anyhow::Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO skill_drafts (name, description, triggers_json, body, source_procedure, status, created_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'))",
+        )
+        .bind(&draft.name)
+        .bind(&draft.description)
+        .bind(&draft.triggers_json)
+        .bind(&draft.body)
+        .bind(&draft.source_procedure)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    async fn get_pending_skill_drafts(&self) -> anyhow::Result<Vec<crate::traits::SkillDraft>> {
+        let rows = sqlx::query(
+            "SELECT id, name, description, triggers_json, body, source_procedure, status, created_at
+             FROM skill_drafts WHERE status = 'pending' ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut drafts = Vec::new();
+        for row in rows {
+            drafts.push(crate::traits::SkillDraft {
+                id: row.get::<i64, _>("id"),
+                name: row.get::<String, _>("name"),
+                description: row.get::<String, _>("description"),
+                triggers_json: row.get::<String, _>("triggers_json"),
+                body: row.get::<String, _>("body"),
+                source_procedure: row.get::<String, _>("source_procedure"),
+                status: row.get::<String, _>("status"),
+                created_at: row.get::<String, _>("created_at"),
+            });
+        }
+        Ok(drafts)
+    }
+
+    async fn get_skill_draft(&self, id: i64) -> anyhow::Result<Option<crate::traits::SkillDraft>> {
+        let row = sqlx::query(
+            "SELECT id, name, description, triggers_json, body, source_procedure, status, created_at
+             FROM skill_drafts WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| crate::traits::SkillDraft {
+            id: row.get::<i64, _>("id"),
+            name: row.get::<String, _>("name"),
+            description: row.get::<String, _>("description"),
+            triggers_json: row.get::<String, _>("triggers_json"),
+            body: row.get::<String, _>("body"),
+            source_procedure: row.get::<String, _>("source_procedure"),
+            status: row.get::<String, _>("status"),
+            created_at: row.get::<String, _>("created_at"),
+        }))
+    }
+
+    async fn update_skill_draft_status(&self, id: i64, status: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE skill_drafts SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn skill_draft_exists_for_procedure(&self, procedure_name: &str) -> anyhow::Result<bool> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM skill_drafts WHERE source_procedure = ? AND status = 'pending'",
+        )
+        .bind(procedure_name)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("cnt") > 0)
+    }
+
     // ==================== Dynamic MCP Servers ====================
 
     async fn save_dynamic_mcp_server(
@@ -3121,6 +3528,157 @@ impl StateStore for SqliteStateStore {
         Ok(())
     }
 
+    // ==================== Dynamic CLI Agents ====================
+
+    async fn save_dynamic_cli_agent(
+        &self,
+        agent: &crate::traits::DynamicCliAgent,
+    ) -> anyhow::Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO dynamic_cli_agents (name, command, args_json, description, timeout_secs, max_output_chars, enabled, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET command=excluded.command, args_json=excluded.args_json,
+             description=excluded.description, timeout_secs=excluded.timeout_secs,
+             max_output_chars=excluded.max_output_chars, enabled=excluded.enabled",
+        )
+        .bind(&agent.name)
+        .bind(&agent.command)
+        .bind(&agent.args_json)
+        .bind(&agent.description)
+        .bind(agent.timeout_secs.map(|v| v as i64))
+        .bind(agent.max_output_chars.map(|v| v as i64))
+        .bind(agent.enabled)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    async fn list_dynamic_cli_agents(&self) -> anyhow::Result<Vec<crate::traits::DynamicCliAgent>> {
+        let rows = sqlx::query(
+            "SELECT id, name, command, args_json, description, timeout_secs, max_output_chars, enabled, created_at
+             FROM dynamic_cli_agents ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut agents = Vec::new();
+        for row in rows {
+            agents.push(crate::traits::DynamicCliAgent {
+                id: row.get::<i64, _>("id"),
+                name: row.get::<String, _>("name"),
+                command: row.get::<String, _>("command"),
+                args_json: row.get::<String, _>("args_json"),
+                description: row.get::<String, _>("description"),
+                timeout_secs: row.get::<Option<i64>, _>("timeout_secs").map(|v| v as u64),
+                max_output_chars: row
+                    .get::<Option<i64>, _>("max_output_chars")
+                    .map(|v| v as usize),
+                enabled: row.get::<bool, _>("enabled"),
+                created_at: row.get::<String, _>("created_at"),
+            });
+        }
+        Ok(agents)
+    }
+
+    async fn delete_dynamic_cli_agent(&self, id: i64) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM dynamic_cli_agents WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_dynamic_cli_agent(
+        &self,
+        agent: &crate::traits::DynamicCliAgent,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE dynamic_cli_agents SET command = ?, args_json = ?, description = ?, timeout_secs = ?, max_output_chars = ?, enabled = ? WHERE id = ?",
+        )
+        .bind(&agent.command)
+        .bind(&agent.args_json)
+        .bind(&agent.description)
+        .bind(agent.timeout_secs.map(|v| v as i64))
+        .bind(agent.max_output_chars.map(|v| v as i64))
+        .bind(agent.enabled)
+        .bind(agent.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn log_cli_agent_start(
+        &self,
+        session_id: &str,
+        agent_name: &str,
+        prompt_summary: &str,
+        working_dir: Option<&str>,
+    ) -> anyhow::Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO cli_agent_invocations (session_id, agent_name, prompt_summary, working_dir, started_at)
+             VALUES (?, ?, ?, ?, datetime('now'))",
+        )
+        .bind(session_id)
+        .bind(agent_name)
+        .bind(prompt_summary)
+        .bind(working_dir)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    async fn log_cli_agent_complete(
+        &self,
+        id: i64,
+        exit_code: Option<i32>,
+        output_summary: &str,
+        success: bool,
+        duration_secs: f64,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE cli_agent_invocations SET completed_at = datetime('now'), exit_code = ?, output_summary = ?, success = ?, duration_secs = ? WHERE id = ?",
+        )
+        .bind(exit_code)
+        .bind(output_summary)
+        .bind(success)
+        .bind(duration_secs)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_cli_agent_invocations(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::traits::CliAgentInvocation>> {
+        let rows = sqlx::query(
+            "SELECT id, session_id, agent_name, prompt_summary, working_dir, started_at, completed_at, exit_code, output_summary, success, duration_secs
+             FROM cli_agent_invocations ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut invocations = Vec::new();
+        for row in rows {
+            invocations.push(crate::traits::CliAgentInvocation {
+                id: row.get::<i64, _>("id"),
+                session_id: row.get::<String, _>("session_id"),
+                agent_name: row.get::<String, _>("agent_name"),
+                prompt_summary: row.get::<String, _>("prompt_summary"),
+                working_dir: row.get::<Option<String>, _>("working_dir"),
+                started_at: row.get::<String, _>("started_at"),
+                completed_at: row.get::<Option<String>, _>("completed_at"),
+                exit_code: row.get::<Option<i32>, _>("exit_code"),
+                output_summary: row.get::<Option<String>, _>("output_summary"),
+                success: row.get::<Option<bool>, _>("success"),
+                duration_secs: row.get::<Option<f64>, _>("duration_secs"),
+            });
+        }
+        Ok(invocations)
+    }
+
     // ==================== Settings ====================
 
     async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -3168,8 +3726,11 @@ impl StateStore for SqliteStateStore {
             .await?;
             Ok(person.id)
         } else {
-            let result = sqlx::query(
-                "INSERT INTO people (name, aliases_json, relationship, platform_ids_json, notes, \
+            // Use INSERT OR IGNORE to handle the unique index on LOWER(name).
+            // If a duplicate exists, the INSERT silently does nothing and we
+            // return the existing row's id.
+            sqlx::query(
+                "INSERT OR IGNORE INTO people (name, aliases_json, relationship, platform_ids_json, notes, \
                  communication_style, language_preference, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
@@ -3184,7 +3745,13 @@ impl StateStore for SqliteStateStore {
             .bind(&now)
             .execute(&self.pool)
             .await?;
-            Ok(result.last_insert_rowid())
+
+            // Fetch the id — works whether we just inserted or the row already existed
+            let row = sqlx::query("SELECT id FROM people WHERE LOWER(name) = ?")
+                .bind(person.name.to_lowercase())
+                .fetch_one(&self.pool)
+                .await?;
+            Ok(row.get::<i64, _>("id"))
         }
     }
 
@@ -3580,6 +4147,1201 @@ impl StateStore for SqliteStateStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // ==================== V3 Orchestration Methods ====================
+
+    async fn create_goal_v3(&self, goal: &GoalV3) -> anyhow::Result<()> {
+        // Enforce hard cap of 10 active evergreen goals
+        if goal.goal_type == "continuous" {
+            let count = self.count_active_evergreen_goals().await?;
+            if count >= 10 {
+                anyhow::bail!(
+                    "Cannot create evergreen goal: hard cap of 10 active evergreen goals reached (current: {})",
+                    count
+                );
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO goals_v3 (id, description, goal_type, status, priority, conditions,
+             schedule, context, resources, budget_per_check, budget_daily, tokens_used_today,
+             last_useful_action, created_at, updated_at, completed_at, parent_goal_id, session_id, notified_at, notification_attempts, dispatch_failures)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&goal.id)
+        .bind(&goal.description)
+        .bind(&goal.goal_type)
+        .bind(&goal.status)
+        .bind(&goal.priority)
+        .bind(&goal.conditions)
+        .bind(&goal.schedule)
+        .bind(&goal.context)
+        .bind(&goal.resources)
+        .bind(goal.budget_per_check)
+        .bind(goal.budget_daily)
+        .bind(goal.tokens_used_today)
+        .bind(&goal.last_useful_action)
+        .bind(&goal.created_at)
+        .bind(&goal.updated_at)
+        .bind(&goal.completed_at)
+        .bind(&goal.parent_goal_id)
+        .bind(&goal.session_id)
+        .bind(&goal.notified_at)
+        .bind(goal.notification_attempts)
+        .bind(goal.dispatch_failures)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_goal_v3(&self, id: &str) -> anyhow::Result<Option<GoalV3>> {
+        let row = sqlx::query(
+            "SELECT id, description, goal_type, status, priority, conditions, schedule,
+             context, resources, budget_per_check, budget_daily, tokens_used_today,
+             last_useful_action, created_at, updated_at, completed_at, parent_goal_id, session_id, notified_at, notification_attempts, dispatch_failures
+             FROM goals_v3 WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| GoalV3 {
+            id: r.get("id"),
+            description: r.get("description"),
+            goal_type: r.get("goal_type"),
+            status: r.get("status"),
+            priority: r.get("priority"),
+            conditions: r.get("conditions"),
+            schedule: r.get("schedule"),
+            context: r.get("context"),
+            resources: r.get("resources"),
+            budget_per_check: r.get("budget_per_check"),
+            budget_daily: r.get("budget_daily"),
+            tokens_used_today: r.get("tokens_used_today"),
+            last_useful_action: r.get("last_useful_action"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+            completed_at: r.get("completed_at"),
+            parent_goal_id: r.get("parent_goal_id"),
+            session_id: r.get("session_id"),
+            notified_at: r.get("notified_at"),
+            notification_attempts: r.get::<i32, _>("notification_attempts"),
+            dispatch_failures: r.get::<i32, _>("dispatch_failures"),
+        }))
+    }
+
+    async fn update_goal_v3(&self, goal: &GoalV3) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE goals_v3 SET description = ?, goal_type = ?, status = ?, priority = ?,
+             conditions = ?, schedule = ?, context = ?, resources = ?,
+             budget_per_check = ?, budget_daily = ?, tokens_used_today = ?,
+             last_useful_action = ?, updated_at = ?, completed_at = ?,
+             parent_goal_id = ?, session_id = ?, notified_at = ?, notification_attempts = ?, dispatch_failures = ?
+             WHERE id = ?",
+        )
+        .bind(&goal.description)
+        .bind(&goal.goal_type)
+        .bind(&goal.status)
+        .bind(&goal.priority)
+        .bind(&goal.conditions)
+        .bind(&goal.schedule)
+        .bind(&goal.context)
+        .bind(&goal.resources)
+        .bind(goal.budget_per_check)
+        .bind(goal.budget_daily)
+        .bind(goal.tokens_used_today)
+        .bind(&goal.last_useful_action)
+        .bind(&now)
+        .bind(&goal.completed_at)
+        .bind(&goal.parent_goal_id)
+        .bind(&goal.session_id)
+        .bind(&goal.notified_at)
+        .bind(goal.notification_attempts)
+        .bind(goal.dispatch_failures)
+        .bind(&goal.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_active_goals_v3(&self) -> anyhow::Result<Vec<GoalV3>> {
+        let rows = sqlx::query(
+            "SELECT id, description, goal_type, status, priority, conditions, schedule,
+             context, resources, budget_per_check, budget_daily, tokens_used_today,
+             last_useful_action, created_at, updated_at, completed_at, parent_goal_id, session_id, notified_at, notification_attempts, dispatch_failures
+             FROM goals_v3 WHERE status IN ('active', 'pending')
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| GoalV3 {
+                id: r.get("id"),
+                description: r.get("description"),
+                goal_type: r.get("goal_type"),
+                status: r.get("status"),
+                priority: r.get("priority"),
+                conditions: r.get("conditions"),
+                schedule: r.get("schedule"),
+                context: r.get("context"),
+                resources: r.get("resources"),
+                budget_per_check: r.get("budget_per_check"),
+                budget_daily: r.get("budget_daily"),
+                tokens_used_today: r.get("tokens_used_today"),
+                last_useful_action: r.get("last_useful_action"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+                completed_at: r.get("completed_at"),
+                parent_goal_id: r.get("parent_goal_id"),
+                session_id: r.get("session_id"),
+                notified_at: r.get("notified_at"),
+                notification_attempts: r.get::<i32, _>("notification_attempts"),
+                dispatch_failures: r.get::<i32, _>("dispatch_failures"),
+            })
+            .collect())
+    }
+
+    async fn get_goals_for_session_v3(&self, session_id: &str) -> anyhow::Result<Vec<GoalV3>> {
+        let rows = sqlx::query(
+            "SELECT id, description, goal_type, status, priority, conditions, schedule,
+             context, resources, budget_per_check, budget_daily, tokens_used_today,
+             last_useful_action, created_at, updated_at, completed_at, parent_goal_id, session_id, notified_at, notification_attempts, dispatch_failures
+             FROM goals_v3 WHERE session_id = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| GoalV3 {
+                id: r.get("id"),
+                description: r.get("description"),
+                goal_type: r.get("goal_type"),
+                status: r.get("status"),
+                priority: r.get("priority"),
+                conditions: r.get("conditions"),
+                schedule: r.get("schedule"),
+                context: r.get("context"),
+                resources: r.get("resources"),
+                budget_per_check: r.get("budget_per_check"),
+                budget_daily: r.get("budget_daily"),
+                tokens_used_today: r.get("tokens_used_today"),
+                last_useful_action: r.get("last_useful_action"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+                completed_at: r.get("completed_at"),
+                parent_goal_id: r.get("parent_goal_id"),
+                session_id: r.get("session_id"),
+                notified_at: r.get("notified_at"),
+                notification_attempts: r.get::<i32, _>("notification_attempts"),
+                dispatch_failures: r.get::<i32, _>("dispatch_failures"),
+            })
+            .collect())
+    }
+
+    async fn migrate_legacy_scheduled_tasks_to_v3(&self) -> anyhow::Result<u64> {
+        let rows = sqlx::query(
+            "SELECT id, name, cron_expr, original_schedule, prompt, source, is_oneshot, is_paused,
+                    last_run_at, next_run_at, created_at, updated_at
+             FROM scheduled_tasks
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut migrated = 0u64;
+        let now_local = chrono::Local::now();
+        let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+
+        for r in &rows {
+            let legacy_id: String = r.get("id");
+            let legacy_name: String = r.get("name");
+            let legacy_cron: String = r.get("cron_expr");
+            let legacy_original_schedule: String = r.get("original_schedule");
+            let legacy_prompt: String = r.get("prompt");
+            let legacy_source: String = r.get("source");
+            let legacy_is_oneshot: bool = r.get::<i64, _>("is_oneshot") != 0;
+            let legacy_is_paused: bool = r.get::<i64, _>("is_paused") != 0;
+            let legacy_last_run: Option<String> = r.get("last_run_at");
+            let legacy_next_run: String = r.get("next_run_at");
+
+            // Deterministic migrated goal ID keeps migration idempotent.
+            let migrated_goal_id = format!("legacy-sched-{}", legacy_id);
+            if self.get_goal_v3(&migrated_goal_id).await?.is_some() {
+                continue;
+            }
+
+            let description = if !legacy_prompt.trim().is_empty() {
+                legacy_prompt.trim().to_string()
+            } else {
+                legacy_name.clone()
+            };
+
+            let schedule_for_goal = if legacy_is_oneshot {
+                // Legacy one-shot rows carry exact next_run_at. Convert to an
+                // absolute one-shot cron expression in system-local timezone.
+                let target_local = parse_legacy_datetime_to_local(&legacy_next_run)
+                    .unwrap_or_else(|| now_local + chrono::Duration::minutes(1));
+                let effective_target = if target_local <= now_local {
+                    // Catch up overdue legacy one-shots quickly.
+                    now_local + chrono::Duration::minutes(1)
+                } else {
+                    target_local
+                };
+                format!(
+                    "{} {} {} {} *",
+                    effective_target.minute(),
+                    effective_target.hour(),
+                    effective_target.day(),
+                    effective_target.month()
+                )
+            } else {
+                legacy_cron.clone()
+            };
+
+            let mut goal = if legacy_is_oneshot {
+                GoalV3::new_finite(&description, "system")
+            } else {
+                GoalV3::new_continuous(
+                    &description,
+                    "system",
+                    &schedule_for_goal,
+                    Some(5000),
+                    Some(20000),
+                )
+            };
+
+            goal.id = migrated_goal_id;
+            goal.schedule = Some(schedule_for_goal.clone());
+            goal.status = if legacy_is_paused {
+                "paused".to_string()
+            } else {
+                "active".to_string()
+            };
+
+            // Preserve historical timing where possible. If legacy timestamps
+            // are non-RFC3339, keep goal timestamps in canonical RFC3339 now.
+            goal.created_at = now_rfc3339.clone();
+            goal.updated_at = now_rfc3339.clone();
+            goal.last_useful_action = legacy_last_run
+                .as_deref()
+                .and_then(parse_legacy_datetime_to_local)
+                .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339());
+            goal.context = Some(
+                serde_json::json!({
+                    "migrated_from": "scheduled_tasks",
+                    "legacy_task_id": legacy_id,
+                    "legacy_name": legacy_name,
+                    "legacy_source": legacy_source,
+                    "legacy_original_schedule": legacy_original_schedule,
+                    "legacy_next_run_at": legacy_next_run,
+                })
+                .to_string(),
+            );
+
+            match self.create_goal_v3(&goal).await {
+                Ok(()) => migrated += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        legacy_task_id = %legacy_id,
+                        error = %e,
+                        "Failed to migrate legacy scheduled task to V3 goal"
+                    );
+                }
+            }
+        }
+
+        Ok(migrated)
+    }
+
+    async fn get_pending_confirmation_goals(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<GoalV3>> {
+        let rows = sqlx::query(
+            "SELECT id, description, goal_type, status, priority, conditions, schedule,
+             context, resources, budget_per_check, budget_daily, tokens_used_today,
+             last_useful_action, created_at, updated_at, completed_at, parent_goal_id, session_id, notified_at, notification_attempts, dispatch_failures
+             FROM goals_v3
+             WHERE session_id = ? AND status = 'pending_confirmation'
+             ORDER BY created_at DESC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| GoalV3 {
+                id: r.get("id"),
+                description: r.get("description"),
+                goal_type: r.get("goal_type"),
+                status: r.get("status"),
+                priority: r.get("priority"),
+                conditions: r.get("conditions"),
+                schedule: r.get("schedule"),
+                context: r.get("context"),
+                resources: r.get("resources"),
+                budget_per_check: r.get("budget_per_check"),
+                budget_daily: r.get("budget_daily"),
+                tokens_used_today: r.get("tokens_used_today"),
+                last_useful_action: r.get("last_useful_action"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+                completed_at: r.get("completed_at"),
+                parent_goal_id: r.get("parent_goal_id"),
+                session_id: r.get("session_id"),
+                notified_at: r.get("notified_at"),
+                notification_attempts: r.get::<i32, _>("notification_attempts"),
+                dispatch_failures: r.get::<i32, _>("dispatch_failures"),
+            })
+            .collect())
+    }
+
+    async fn activate_goal_v3(&self, goal_id: &str) -> anyhow::Result<bool> {
+        let goal_row = sqlx::query(
+            "SELECT goal_type
+             FROM goals_v3
+             WHERE id = ? AND status = 'pending_confirmation'",
+        )
+        .bind(goal_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = goal_row else {
+            return Ok(false);
+        };
+
+        let goal_type: String = row.get("goal_type");
+        if goal_type == "continuous" {
+            let active_evergreen = self.count_active_evergreen_goals().await?;
+            if active_evergreen >= 10 {
+                anyhow::bail!(
+                    "Cannot activate recurring goal: hard cap of 10 active evergreen goals reached (current: {})",
+                    active_evergreen
+                );
+            }
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE goals_v3
+             SET status = 'active', updated_at = ?
+             WHERE id = ? AND status = 'pending_confirmation'",
+        )
+        .bind(&now)
+        .bind(goal_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn create_task_v3(&self, task: &TaskV3) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO tasks_v3 (id, goal_id, description, status, priority, task_order,
+             parallel_group, depends_on, agent_id, context, result, error, blocker,
+             idempotent, retry_count, max_retries, created_at, started_at, completed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task.id)
+        .bind(&task.goal_id)
+        .bind(&task.description)
+        .bind(&task.status)
+        .bind(&task.priority)
+        .bind(task.task_order)
+        .bind(&task.parallel_group)
+        .bind(&task.depends_on)
+        .bind(&task.agent_id)
+        .bind(&task.context)
+        .bind(&task.result)
+        .bind(&task.error)
+        .bind(&task.blocker)
+        .bind(task.idempotent as i32)
+        .bind(task.retry_count)
+        .bind(task.max_retries)
+        .bind(&task.created_at)
+        .bind(&task.started_at)
+        .bind(&task.completed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_task_v3(&self, id: &str) -> anyhow::Result<Option<TaskV3>> {
+        let row = sqlx::query(
+            "SELECT id, goal_id, description, status, priority, task_order,
+             parallel_group, depends_on, agent_id, context, result, error, blocker,
+             idempotent, retry_count, max_retries, created_at, started_at, completed_at
+             FROM tasks_v3 WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| TaskV3 {
+            id: r.get("id"),
+            goal_id: r.get("goal_id"),
+            description: r.get("description"),
+            status: r.get("status"),
+            priority: r.get("priority"),
+            task_order: r.get("task_order"),
+            parallel_group: r.get("parallel_group"),
+            depends_on: r.get("depends_on"),
+            agent_id: r.get("agent_id"),
+            context: r.get("context"),
+            result: r.get("result"),
+            error: r.get("error"),
+            blocker: r.get("blocker"),
+            idempotent: r.get::<i32, _>("idempotent") != 0,
+            retry_count: r.get("retry_count"),
+            max_retries: r.get("max_retries"),
+            created_at: r.get("created_at"),
+            started_at: r.get("started_at"),
+            completed_at: r.get("completed_at"),
+        }))
+    }
+
+    async fn update_task_v3(&self, task: &TaskV3) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE tasks_v3 SET description = ?, status = ?, priority = ?, task_order = ?,
+             parallel_group = ?, depends_on = ?, agent_id = ?, context = ?,
+             result = ?, error = ?, blocker = ?, idempotent = ?,
+             retry_count = ?, max_retries = ?, started_at = ?, completed_at = ?
+             WHERE id = ?",
+        )
+        .bind(&task.description)
+        .bind(&task.status)
+        .bind(&task.priority)
+        .bind(task.task_order)
+        .bind(&task.parallel_group)
+        .bind(&task.depends_on)
+        .bind(&task.agent_id)
+        .bind(&task.context)
+        .bind(&task.result)
+        .bind(&task.error)
+        .bind(&task.blocker)
+        .bind(task.idempotent as i32)
+        .bind(task.retry_count)
+        .bind(task.max_retries)
+        .bind(&task.started_at)
+        .bind(&task.completed_at)
+        .bind(&task.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_tasks_for_goal_v3(&self, goal_id: &str) -> anyhow::Result<Vec<TaskV3>> {
+        let rows = sqlx::query(
+            "SELECT id, goal_id, description, status, priority, task_order,
+             parallel_group, depends_on, agent_id, context, result, error, blocker,
+             idempotent, retry_count, max_retries, created_at, started_at, completed_at
+             FROM tasks_v3 WHERE goal_id = ?
+             ORDER BY task_order ASC",
+        )
+        .bind(goal_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| TaskV3 {
+                id: r.get("id"),
+                goal_id: r.get("goal_id"),
+                description: r.get("description"),
+                status: r.get("status"),
+                priority: r.get("priority"),
+                task_order: r.get("task_order"),
+                parallel_group: r.get("parallel_group"),
+                depends_on: r.get("depends_on"),
+                agent_id: r.get("agent_id"),
+                context: r.get("context"),
+                result: r.get("result"),
+                error: r.get("error"),
+                blocker: r.get("blocker"),
+                idempotent: r.get::<i32, _>("idempotent") != 0,
+                retry_count: r.get("retry_count"),
+                max_retries: r.get("max_retries"),
+                created_at: r.get("created_at"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+            })
+            .collect())
+    }
+
+    async fn count_completed_tasks_for_goal(&self, goal_id: &str) -> anyhow::Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM tasks_v3
+             WHERE goal_id = ? AND status IN ('completed', 'skipped')",
+        )
+        .bind(goal_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("cnt"))
+    }
+
+    async fn claim_task_v3(&self, task_id: &str, agent_id: &str) -> anyhow::Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE tasks_v3 SET status = 'claimed', agent_id = ?, started_at = ?
+             WHERE id = ? AND status = 'pending'",
+        )
+        .bind(agent_id)
+        .bind(&now)
+        .bind(task_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn log_task_activity_v3(&self, activity: &TaskActivityV3) -> anyhow::Result<()> {
+        // Redact secrets from tool_args and result before persisting
+        let redacted_args = activity
+            .tool_args
+            .as_deref()
+            .map(crate::tools::sanitize::redact_secrets);
+        let redacted_result = activity
+            .result
+            .as_deref()
+            .map(crate::tools::sanitize::redact_secrets);
+
+        sqlx::query(
+            "INSERT INTO task_activity_v3 (task_id, activity_type, tool_name, tool_args,
+             result, success, tokens_used, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&activity.task_id)
+        .bind(&activity.activity_type)
+        .bind(&activity.tool_name)
+        .bind(&redacted_args)
+        .bind(&redacted_result)
+        .bind(activity.success.map(|b| b as i32))
+        .bind(activity.tokens_used)
+        .bind(&activity.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_task_activities_v3(&self, task_id: &str) -> anyhow::Result<Vec<TaskActivityV3>> {
+        let rows = sqlx::query(
+            "SELECT id, task_id, activity_type, tool_name, tool_args, result, success,
+             tokens_used, created_at
+             FROM task_activity_v3 WHERE task_id = ?
+             ORDER BY created_at ASC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| TaskActivityV3 {
+                id: r.get("id"),
+                task_id: r.get("task_id"),
+                activity_type: r.get("activity_type"),
+                tool_name: r.get("tool_name"),
+                tool_args: r.get("tool_args"),
+                result: r.get("result"),
+                success: r.get::<Option<i32>, _>("success").map(|v| v != 0),
+                tokens_used: r.get("tokens_used"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    async fn get_due_evergreen_goals(&self) -> anyhow::Result<Vec<GoalV3>> {
+        // Get all active continuous goals
+        let rows = sqlx::query(
+            "SELECT id, description, goal_type, status, priority, conditions, schedule,
+             context, resources, budget_per_check, budget_daily, tokens_used_today,
+             last_useful_action, created_at, updated_at, completed_at, parent_goal_id, session_id, notified_at, notification_attempts, dispatch_failures
+             FROM goals_v3
+             WHERE goal_type = 'continuous' AND status = 'active' AND schedule IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let now = chrono::Local::now();
+        let mut due_goals = Vec::new();
+
+        for r in &rows {
+            let goal = GoalV3 {
+                id: r.get("id"),
+                description: r.get("description"),
+                goal_type: r.get("goal_type"),
+                status: r.get("status"),
+                priority: r.get("priority"),
+                conditions: r.get("conditions"),
+                schedule: r.get("schedule"),
+                context: r.get("context"),
+                resources: r.get("resources"),
+                budget_per_check: r.get("budget_per_check"),
+                budget_daily: r.get("budget_daily"),
+                tokens_used_today: r.get("tokens_used_today"),
+                last_useful_action: r.get("last_useful_action"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+                completed_at: r.get("completed_at"),
+                parent_goal_id: r.get("parent_goal_id"),
+                session_id: r.get("session_id"),
+                notified_at: r.get("notified_at"),
+                notification_attempts: r.get::<i32, _>("notification_attempts"),
+                dispatch_failures: r.get::<i32, _>("dispatch_failures"),
+            };
+
+            // Check if the schedule is due using croner
+            let schedule_str = match &goal.schedule {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Parse cron expression
+            let cron: croner::Cron = match schedule_str.parse() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Determine last run time — use last_useful_action or created_at
+            let last_run = goal
+                .last_useful_action
+                .as_deref()
+                .or(Some(goal.created_at.as_str()));
+            let last_run_dt = match last_run {
+                Some(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
+                    Ok(dt) => dt.with_timezone(&chrono::Local),
+                    Err(_) => continue,
+                },
+                None => continue,
+            };
+
+            // Check if there's a scheduled time between last_run and now
+            if let Ok(next) = cron.find_next_occurrence(&last_run_dt, false) {
+                if next <= now {
+                    // Check daily budget
+                    if let Some(daily_budget) = goal.budget_daily {
+                        if goal.tokens_used_today >= daily_budget {
+                            continue; // Over budget
+                        }
+                    }
+                    due_goals.push(goal);
+                }
+            }
+        }
+
+        Ok(due_goals)
+    }
+
+    async fn get_due_scheduled_finite_goals(&self) -> anyhow::Result<Vec<GoalV3>> {
+        let rows = sqlx::query(
+            "SELECT id, description, goal_type, status, priority, conditions, schedule,
+             context, resources, budget_per_check, budget_daily, tokens_used_today,
+             last_useful_action, created_at, updated_at, completed_at, parent_goal_id, session_id, notified_at, notification_attempts, dispatch_failures
+             FROM goals_v3
+             WHERE goal_type = 'finite' AND status = 'active' AND schedule IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let now = chrono::Local::now();
+        let mut due_goals = Vec::new();
+
+        for r in &rows {
+            let goal = GoalV3 {
+                id: r.get("id"),
+                description: r.get("description"),
+                goal_type: r.get("goal_type"),
+                status: r.get("status"),
+                priority: r.get("priority"),
+                conditions: r.get("conditions"),
+                schedule: r.get("schedule"),
+                context: r.get("context"),
+                resources: r.get("resources"),
+                budget_per_check: r.get("budget_per_check"),
+                budget_daily: r.get("budget_daily"),
+                tokens_used_today: r.get("tokens_used_today"),
+                last_useful_action: r.get("last_useful_action"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+                completed_at: r.get("completed_at"),
+                parent_goal_id: r.get("parent_goal_id"),
+                session_id: r.get("session_id"),
+                notified_at: r.get("notified_at"),
+                notification_attempts: r.get::<i32, _>("notification_attempts"),
+                dispatch_failures: r.get::<i32, _>("dispatch_failures"),
+            };
+
+            let schedule_str = match &goal.schedule {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let cron: croner::Cron = match schedule_str.parse() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let anchor = goal
+                .last_useful_action
+                .as_deref()
+                .or(Some(goal.created_at.as_str()));
+            let anchor_dt = match anchor {
+                Some(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
+                    Ok(dt) => dt.with_timezone(&chrono::Local),
+                    Err(_) => continue,
+                },
+                None => continue,
+            };
+
+            if let Ok(next) = cron.find_next_occurrence(&anchor_dt, false) {
+                if next <= now {
+                    due_goals.push(goal);
+                }
+            }
+        }
+
+        Ok(due_goals)
+    }
+
+    async fn cancel_stale_pending_confirmation_goals(
+        &self,
+        max_age_secs: i64,
+    ) -> anyhow::Result<u64> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(max_age_secs)).to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE goals_v3
+             SET status = 'cancelled', updated_at = datetime('now'), completed_at = datetime('now')
+             WHERE status = 'pending_confirmation' AND created_at < ?",
+        )
+        .bind(&cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn get_scheduled_goals_v3(&self) -> anyhow::Result<Vec<GoalV3>> {
+        let rows = sqlx::query(
+            "SELECT id, description, goal_type, status, priority, conditions, schedule,
+             context, resources, budget_per_check, budget_daily, tokens_used_today,
+             last_useful_action, created_at, updated_at, completed_at, parent_goal_id, session_id, notified_at, notification_attempts, dispatch_failures
+             FROM goals_v3
+             WHERE schedule IS NOT NULL OR status = 'pending_confirmation'
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| GoalV3 {
+                id: r.get("id"),
+                description: r.get("description"),
+                goal_type: r.get("goal_type"),
+                status: r.get("status"),
+                priority: r.get("priority"),
+                conditions: r.get("conditions"),
+                schedule: r.get("schedule"),
+                context: r.get("context"),
+                resources: r.get("resources"),
+                budget_per_check: r.get("budget_per_check"),
+                budget_daily: r.get("budget_daily"),
+                tokens_used_today: r.get("tokens_used_today"),
+                last_useful_action: r.get("last_useful_action"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+                completed_at: r.get("completed_at"),
+                parent_goal_id: r.get("parent_goal_id"),
+                session_id: r.get("session_id"),
+                notified_at: r.get("notified_at"),
+                notification_attempts: r.get::<i32, _>("notification_attempts"),
+                dispatch_failures: r.get::<i32, _>("dispatch_failures"),
+            })
+            .collect())
+    }
+
+    async fn reset_daily_token_budgets(&self) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE goals_v3 SET tokens_used_today = 0
+             WHERE goal_type = 'continuous' AND status = 'active'",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn get_conversation_summary(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<ConversationSummary>> {
+        let row = sqlx::query(
+            "SELECT session_id, summary, message_count, last_message_id, updated_at
+             FROM conversation_summaries WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| ConversationSummary {
+            session_id: r.get("session_id"),
+            summary: r.get("summary"),
+            message_count: r.get::<i64, _>("message_count") as usize,
+            last_message_id: r.get("last_message_id"),
+            updated_at: r
+                .get::<String, _>("updated_at")
+                .parse::<DateTime<Utc>>()
+                .unwrap_or_else(|_| Utc::now()),
+        }))
+    }
+
+    async fn upsert_conversation_summary(
+        &self,
+        summary: &ConversationSummary,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO conversation_summaries (session_id, summary, message_count, last_message_id, updated_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&summary.session_id)
+        .bind(&summary.summary)
+        .bind(summary.message_count as i64)
+        .bind(&summary.last_message_id)
+        .bind(summary.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn health_check(&self) -> anyhow::Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn get_pending_tasks_by_priority(&self, limit: i64) -> anyhow::Result<Vec<TaskV3>> {
+        let rows = sqlx::query(
+            "SELECT t.id, t.goal_id, t.description, t.status, t.priority, t.task_order,
+             t.parallel_group, t.depends_on, t.agent_id, t.context, t.result, t.error,
+             t.blocker, t.idempotent, t.retry_count, t.max_retries, t.created_at,
+             t.started_at, t.completed_at
+             FROM tasks_v3 t
+             JOIN goals_v3 g ON t.goal_id = g.id AND g.status = 'active'
+             WHERE t.status = 'pending'
+             AND NOT EXISTS (
+                 SELECT 1 FROM json_each(COALESCE(t.depends_on, '[]')) AS dep
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM tasks_v3 d WHERE d.id = dep.value AND d.status = 'completed'
+                 )
+             )
+             ORDER BY
+                 CASE t.priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+                 t.task_order ASC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| TaskV3 {
+                id: r.get("id"),
+                goal_id: r.get("goal_id"),
+                description: r.get("description"),
+                status: r.get("status"),
+                priority: r.get("priority"),
+                task_order: r.get("task_order"),
+                parallel_group: r.get("parallel_group"),
+                depends_on: r.get("depends_on"),
+                agent_id: r.get("agent_id"),
+                context: r.get("context"),
+                result: r.get("result"),
+                error: r.get("error"),
+                blocker: r.get("blocker"),
+                idempotent: r.get::<i32, _>("idempotent") != 0,
+                retry_count: r.get("retry_count"),
+                max_retries: r.get("max_retries"),
+                created_at: r.get("created_at"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+            })
+            .collect())
+    }
+
+    async fn get_stuck_tasks(&self, timeout_secs: i64) -> anyhow::Result<Vec<TaskV3>> {
+        let rows = sqlx::query(
+            "SELECT id, goal_id, description, status, priority, task_order,
+             parallel_group, depends_on, agent_id, context, result, error,
+             blocker, idempotent, retry_count, max_retries, created_at,
+             started_at, completed_at
+             FROM tasks_v3
+             WHERE status IN ('running', 'claimed')
+             AND datetime(started_at) < datetime('now', '-' || ? || ' seconds')
+             ORDER BY started_at ASC",
+        )
+        .bind(timeout_secs)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| TaskV3 {
+                id: r.get("id"),
+                goal_id: r.get("goal_id"),
+                description: r.get("description"),
+                status: r.get("status"),
+                priority: r.get("priority"),
+                task_order: r.get("task_order"),
+                parallel_group: r.get("parallel_group"),
+                depends_on: r.get("depends_on"),
+                agent_id: r.get("agent_id"),
+                context: r.get("context"),
+                result: r.get("result"),
+                error: r.get("error"),
+                blocker: r.get("blocker"),
+                idempotent: r.get::<i32, _>("idempotent") != 0,
+                retry_count: r.get("retry_count"),
+                max_retries: r.get("max_retries"),
+                created_at: r.get("created_at"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+            })
+            .collect())
+    }
+
+    async fn get_recently_completed_tasks(&self, since: &str) -> anyhow::Result<Vec<TaskV3>> {
+        let rows = sqlx::query(
+            "SELECT id, goal_id, description, status, priority, task_order,
+             parallel_group, depends_on, agent_id, context, result, error,
+             blocker, idempotent, retry_count, max_retries, created_at,
+             started_at, completed_at
+             FROM tasks_v3
+             WHERE status = 'completed' AND completed_at > ?
+             ORDER BY completed_at DESC",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| TaskV3 {
+                id: r.get("id"),
+                goal_id: r.get("goal_id"),
+                description: r.get("description"),
+                status: r.get("status"),
+                priority: r.get("priority"),
+                task_order: r.get("task_order"),
+                parallel_group: r.get("parallel_group"),
+                depends_on: r.get("depends_on"),
+                agent_id: r.get("agent_id"),
+                context: r.get("context"),
+                result: r.get("result"),
+                error: r.get("error"),
+                blocker: r.get("blocker"),
+                idempotent: r.get::<i32, _>("idempotent") != 0,
+                retry_count: r.get("retry_count"),
+                max_retries: r.get("max_retries"),
+                created_at: r.get("created_at"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+            })
+            .collect())
+    }
+
+    async fn mark_task_interrupted(&self, task_id: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE tasks_v3 SET status = 'interrupted',
+             completed_at = datetime('now')
+             WHERE id = ? AND status IN ('running', 'claimed')",
+        )
+        .bind(task_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn count_active_evergreen_goals(&self) -> anyhow::Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM goals_v3
+             WHERE goal_type = 'continuous' AND status = 'active'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("cnt"))
+    }
+
+    async fn get_goals_needing_notification(&self) -> anyhow::Result<Vec<GoalV3>> {
+        let rows = sqlx::query(
+            "SELECT id, description, goal_type, status, priority, conditions, schedule,
+             context, resources, budget_per_check, budget_daily, tokens_used_today,
+             last_useful_action, created_at, updated_at, completed_at, parent_goal_id,
+             session_id, notified_at, notification_attempts, dispatch_failures
+             FROM goals_v3
+             WHERE status IN ('completed', 'failed', 'stalled') AND notified_at IS NULL
+             AND goal_type = 'finite' AND notification_attempts < 3",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| GoalV3 {
+                id: r.get("id"),
+                description: r.get("description"),
+                goal_type: r.get("goal_type"),
+                status: r.get("status"),
+                priority: r.get("priority"),
+                conditions: r.get("conditions"),
+                schedule: r.get("schedule"),
+                context: r.get("context"),
+                resources: r.get("resources"),
+                budget_per_check: r.get("budget_per_check"),
+                budget_daily: r.get("budget_daily"),
+                tokens_used_today: r.get("tokens_used_today"),
+                last_useful_action: r.get("last_useful_action"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+                completed_at: r.get("completed_at"),
+                parent_goal_id: r.get("parent_goal_id"),
+                session_id: r.get("session_id"),
+                notified_at: r.get("notified_at"),
+                notification_attempts: r.get::<i32, _>("notification_attempts"),
+                dispatch_failures: r.get::<i32, _>("dispatch_failures"),
+            })
+            .collect())
+    }
+
+    async fn mark_goal_notified(&self, goal_id: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE goals_v3 SET notified_at = datetime('now') WHERE id = ?")
+            .bind(goal_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn cleanup_stale_goals(&self, stale_hours: i64) -> anyhow::Result<(u64, u64)> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(stale_hours)).to_rfc3339();
+
+        // Legacy goals table: active → abandoned
+        let legacy = sqlx::query(
+            "UPDATE goals SET status = 'abandoned', updated_at = datetime('now')
+             WHERE status = 'active' AND updated_at < ?",
+        )
+        .bind(&cutoff)
+        .execute(&self.pool)
+        .await?;
+
+        // V3 finite goals: active/pending without schedule → failed.
+        // Scheduled finite goals are handled by dedicated scheduler phases.
+        let v3 = sqlx::query(
+            "UPDATE goals_v3 SET status = 'failed',
+                    updated_at = datetime('now'),
+                    completed_at = datetime('now')
+             WHERE status IN ('active', 'pending')
+               AND goal_type = 'finite'
+               AND schedule IS NULL
+               AND updated_at < ?",
+        )
+        .bind(&cutoff)
+        .execute(&self.pool)
+        .await?;
+
+        Ok((legacy.rows_affected(), v3.rows_affected()))
+    }
+
+    // --- Notification Queue ---
+
+    async fn enqueue_notification(
+        &self,
+        entry: &crate::traits::NotificationEntry,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO notification_queue (id, goal_id, session_id, notification_type, priority, message, created_at, delivered_at, attempts, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&entry.id)
+        .bind(&entry.goal_id)
+        .bind(&entry.session_id)
+        .bind(&entry.notification_type)
+        .bind(&entry.priority)
+        .bind(&entry.message)
+        .bind(&entry.created_at)
+        .bind(&entry.delivered_at)
+        .bind(entry.attempts)
+        .bind(&entry.expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_pending_notifications(
+        &self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::traits::NotificationEntry>> {
+        let rows = sqlx::query(
+            "SELECT id, goal_id, session_id, notification_type, priority, message, created_at, delivered_at, attempts, expires_at
+             FROM notification_queue
+             WHERE delivered_at IS NULL
+               AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
+             ORDER BY
+               CASE priority WHEN 'critical' THEN 0 ELSE 1 END ASC,
+               created_at ASC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in &rows {
+            entries.push(crate::traits::NotificationEntry {
+                id: row.get("id"),
+                goal_id: row.get("goal_id"),
+                session_id: row.get("session_id"),
+                notification_type: row.get("notification_type"),
+                priority: row.get("priority"),
+                message: row.get("message"),
+                created_at: row.get("created_at"),
+                delivered_at: row.get("delivered_at"),
+                attempts: row.get("attempts"),
+                expires_at: row.get("expires_at"),
+            });
+        }
+        Ok(entries)
+    }
+
+    async fn mark_notification_delivered(&self, notification_id: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE notification_queue SET delivered_at = datetime('now') WHERE id = ?")
+            .bind(notification_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn increment_notification_attempt(&self, notification_id: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE notification_queue SET attempts = attempts + 1 WHERE id = ?")
+            .bind(notification_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn cleanup_expired_notifications(&self) -> anyhow::Result<i64> {
+        let result = sqlx::query(
+            "DELETE FROM notification_queue
+             WHERE delivered_at IS NULL
+               AND expires_at IS NOT NULL
+               AND datetime(expires_at) <= datetime('now')",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() as i64)
     }
 }
 
@@ -4585,7 +6347,11 @@ mod tests {
         assert!(id > 0);
 
         // Get by service
-        let fetched = store.get_oauth_connection("twitter").await.unwrap().unwrap();
+        let fetched = store
+            .get_oauth_connection("twitter")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.service, "twitter");
         assert_eq!(fetched.auth_type, "oauth2_pkce");
         assert_eq!(fetched.username, Some("@testuser".to_string()));
@@ -4599,7 +6365,11 @@ mod tests {
             .update_oauth_token_expiry("twitter", Some("2026-06-30T00:00:00Z"))
             .await
             .unwrap();
-        let updated = store.get_oauth_connection("twitter").await.unwrap().unwrap();
+        let updated = store
+            .get_oauth_connection("twitter")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             updated.token_expires_at,
             Some("2026-06-30T00:00:00Z".to_string())
@@ -4617,7 +6387,11 @@ mod tests {
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
         store.save_oauth_connection(&conn2).await.unwrap();
-        let upserted = store.get_oauth_connection("twitter").await.unwrap().unwrap();
+        let upserted = store
+            .get_oauth_connection("twitter")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(upserted.username, Some("@newuser".to_string()));
         // Still just 1 connection (upserted, not duplicated)
         assert_eq!(store.list_oauth_connections().await.unwrap().len(), 1);
@@ -4637,5 +6411,760 @@ mod tests {
         let (store, _tmp) = setup_test_store().await;
         let result = store.get_oauth_connection("nonexistent").await.unwrap();
         assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dynamic CLI Agent CRUD tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_dynamic_cli_agent_crud() {
+        let (store, _db) = setup_test_store().await;
+
+        // Initially empty
+        let agents = store.list_dynamic_cli_agents().await.unwrap();
+        assert!(agents.is_empty());
+
+        // Save a new agent
+        let agent = crate::traits::DynamicCliAgent {
+            id: 0,
+            name: "test-agent".to_string(),
+            command: "echo".to_string(),
+            args_json: r#"["hello"]"#.to_string(),
+            description: "Test echo agent".to_string(),
+            timeout_secs: Some(30),
+            max_output_chars: Some(5000),
+            enabled: true,
+            created_at: String::new(),
+        };
+        let id = store.save_dynamic_cli_agent(&agent).await.unwrap();
+        assert!(id > 0);
+
+        // List should return it
+        let agents = store.list_dynamic_cli_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "test-agent");
+        assert_eq!(agents[0].command, "echo");
+        assert_eq!(agents[0].args_json, r#"["hello"]"#);
+        assert_eq!(agents[0].description, "Test echo agent");
+        assert_eq!(agents[0].timeout_secs, Some(30));
+        assert_eq!(agents[0].max_output_chars, Some(5000));
+        assert!(agents[0].enabled);
+
+        // Update the agent
+        let mut updated = agents[0].clone();
+        updated.command = "bash".to_string();
+        updated.enabled = false;
+        store.update_dynamic_cli_agent(&updated).await.unwrap();
+
+        let agents = store.list_dynamic_cli_agents().await.unwrap();
+        assert_eq!(agents[0].command, "bash");
+        assert!(!agents[0].enabled);
+
+        // Delete the agent
+        store.delete_dynamic_cli_agent(updated.id).await.unwrap();
+        let agents = store.list_dynamic_cli_agents().await.unwrap();
+        assert!(agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_cli_agent_upsert() {
+        let (store, _db) = setup_test_store().await;
+
+        let agent = crate::traits::DynamicCliAgent {
+            id: 0,
+            name: "upsert-agent".to_string(),
+            command: "echo".to_string(),
+            args_json: "[]".to_string(),
+            description: "v1".to_string(),
+            timeout_secs: None,
+            max_output_chars: None,
+            enabled: true,
+            created_at: String::new(),
+        };
+        store.save_dynamic_cli_agent(&agent).await.unwrap();
+
+        // Save again with same name — should upsert
+        let agent2 = crate::traits::DynamicCliAgent {
+            id: 0,
+            name: "upsert-agent".to_string(),
+            command: "bash".to_string(),
+            args_json: r#"["-c"]"#.to_string(),
+            description: "v2".to_string(),
+            timeout_secs: Some(60),
+            max_output_chars: Some(10000),
+            enabled: true,
+            created_at: String::new(),
+        };
+        store.save_dynamic_cli_agent(&agent2).await.unwrap();
+
+        // Should still be 1 agent (upserted)
+        let agents = store.list_dynamic_cli_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].command, "bash");
+        assert_eq!(agents[0].description, "v2");
+    }
+
+    // -----------------------------------------------------------------------
+    // CLI Agent Invocation logging tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cli_agent_invocation_logging() {
+        let (store, _db) = setup_test_store().await;
+
+        // Initially empty
+        let invocations = store.get_cli_agent_invocations(10).await.unwrap();
+        assert!(invocations.is_empty());
+
+        // Log a start
+        let inv_id = store
+            .log_cli_agent_start(
+                "session1",
+                "claude",
+                "Create a website",
+                Some("/tmp/project"),
+            )
+            .await
+            .unwrap();
+        assert!(inv_id > 0);
+
+        // Should appear in list
+        let invocations = store.get_cli_agent_invocations(10).await.unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].session_id, "session1");
+        assert_eq!(invocations[0].agent_name, "claude");
+        assert_eq!(invocations[0].prompt_summary, "Create a website");
+        assert_eq!(invocations[0].working_dir, Some("/tmp/project".to_string()));
+        assert!(invocations[0].success.is_none()); // Not completed yet
+
+        // Log completion
+        store
+            .log_cli_agent_complete(inv_id, Some(0), "Website created successfully", true, 45.5)
+            .await
+            .unwrap();
+
+        // Should be updated
+        let invocations = store.get_cli_agent_invocations(10).await.unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].exit_code, Some(0));
+        assert_eq!(invocations[0].success, Some(true));
+        assert_eq!(invocations[0].duration_secs, Some(45.5));
+        assert_eq!(
+            invocations[0].output_summary,
+            Some("Website created successfully".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_agent_invocation_limit() {
+        let (store, _db) = setup_test_store().await;
+
+        // Log 5 invocations
+        for i in 0..5 {
+            store
+                .log_cli_agent_start("session1", "claude", &format!("Task {}", i), None)
+                .await
+                .unwrap();
+        }
+
+        // Limit=3 should return exactly 3
+        let invocations = store.get_cli_agent_invocations(3).await.unwrap();
+        assert_eq!(invocations.len(), 3);
+
+        // All 5 should be retrievable
+        let all = store.get_cli_agent_invocations(100).await.unwrap();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_cli_agent_invocation_failure() {
+        let (store, _db) = setup_test_store().await;
+
+        let inv_id = store
+            .log_cli_agent_start("session1", "gemini", "Debug crash", None)
+            .await
+            .unwrap();
+
+        // Log failure
+        store
+            .log_cli_agent_complete(inv_id, Some(1), "Error: command not found", false, 2.1)
+            .await
+            .unwrap();
+
+        let invocations = store.get_cli_agent_invocations(10).await.unwrap();
+        assert_eq!(invocations[0].exit_code, Some(1));
+        assert_eq!(invocations[0].success, Some(false));
+    }
+
+    // ==================== V3 Orchestration Tests ====================
+
+    #[tokio::test]
+    async fn test_goals_v3_crud() {
+        let (store, _file) = setup_test_store().await;
+
+        // Create
+        let goal = crate::traits::GoalV3::new_finite("Build a website", "session_1");
+        store.create_goal_v3(&goal).await.unwrap();
+
+        // Get
+        let fetched = store.get_goal_v3(&goal.id).await.unwrap().unwrap();
+        assert_eq!(fetched.description, "Build a website");
+        assert_eq!(fetched.status, "active");
+        assert_eq!(fetched.goal_type, "finite");
+        assert_eq!(fetched.session_id, "session_1");
+
+        // Update
+        let mut updated = fetched;
+        updated.status = "completed".to_string();
+        updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        store.update_goal_v3(&updated).await.unwrap();
+
+        let fetched2 = store.get_goal_v3(&goal.id).await.unwrap().unwrap();
+        assert_eq!(fetched2.status, "completed");
+        assert!(fetched2.completed_at.is_some());
+
+        // Active goals should not include completed
+        let active = store.get_active_goals_v3().await.unwrap();
+        assert!(active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_goals_v3_session_filter() {
+        let (store, _file) = setup_test_store().await;
+
+        let goal1 = crate::traits::GoalV3::new_finite("Task A", "session_1");
+        let goal2 = crate::traits::GoalV3::new_finite("Task B", "session_2");
+        let goal3 = crate::traits::GoalV3::new_finite("Task C", "session_1");
+
+        store.create_goal_v3(&goal1).await.unwrap();
+        store.create_goal_v3(&goal2).await.unwrap();
+        store.create_goal_v3(&goal3).await.unwrap();
+
+        let session1_goals = store.get_goals_for_session_v3("session_1").await.unwrap();
+        assert_eq!(session1_goals.len(), 2);
+        assert!(session1_goals.iter().all(|g| g.session_id == "session_1"));
+
+        let session2_goals = store.get_goals_for_session_v3("session_2").await.unwrap();
+        assert_eq!(session2_goals.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_tasks_v3_crud() {
+        let (store, _file) = setup_test_store().await;
+
+        // Create parent goal first (FK)
+        let goal = crate::traits::GoalV3::new_finite("Parent goal", "session_1");
+        store.create_goal_v3(&goal).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let task = crate::traits::TaskV3 {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Step 1: create files".to_string(),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            task_order: 1,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: now.clone(),
+            started_at: None,
+            completed_at: None,
+        };
+        store.create_task_v3(&task).await.unwrap();
+
+        // Get
+        let fetched = store.get_task_v3(&task.id).await.unwrap().unwrap();
+        assert_eq!(fetched.description, "Step 1: create files");
+        assert_eq!(fetched.status, "pending");
+        assert!(fetched.idempotent);
+
+        // Update
+        let mut updated = fetched;
+        updated.status = "completed".to_string();
+        updated.result = Some("Files created successfully".to_string());
+        updated.completed_at = Some(now.clone());
+        store.update_task_v3(&updated).await.unwrap();
+
+        let fetched2 = store.get_task_v3(&task.id).await.unwrap().unwrap();
+        assert_eq!(fetched2.status, "completed");
+        assert!(fetched2.result.is_some());
+
+        // List for goal
+        let tasks = store.get_tasks_for_goal_v3(&goal.id).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_claim_task_v3() {
+        let (store, _file) = setup_test_store().await;
+
+        let goal = crate::traits::GoalV3::new_finite("Goal", "session_1");
+        store.create_goal_v3(&goal).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let task = crate::traits::TaskV3 {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Claimable task".to_string(),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: now,
+            started_at: None,
+            completed_at: None,
+        };
+        store.create_task_v3(&task).await.unwrap();
+
+        // First claim succeeds
+        let claimed = store.claim_task_v3(&task.id, "agent-1").await.unwrap();
+        assert!(claimed);
+
+        // Second claim fails (already claimed)
+        let claimed2 = store.claim_task_v3(&task.id, "agent-2").await.unwrap();
+        assert!(!claimed2);
+
+        // Verify agent_id was set
+        let fetched = store.get_task_v3(&task.id).await.unwrap().unwrap();
+        assert_eq!(fetched.agent_id, Some("agent-1".to_string()));
+        assert_eq!(fetched.status, "claimed");
+    }
+
+    #[tokio::test]
+    async fn test_task_activity_v3_log() {
+        let (store, _file) = setup_test_store().await;
+
+        let goal = crate::traits::GoalV3::new_finite("Goal", "session_1");
+        store.create_goal_v3(&goal).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let task = crate::traits::TaskV3 {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Task".to_string(),
+            status: "running".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: Some("agent-1".to_string()),
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: now.clone(),
+            started_at: Some(now.clone()),
+            completed_at: None,
+        };
+        store.create_task_v3(&task).await.unwrap();
+
+        // Log activity
+        let activity = crate::traits::TaskActivityV3 {
+            id: 0,
+            task_id: task.id.clone(),
+            activity_type: "tool_call".to_string(),
+            tool_name: Some("terminal".to_string()),
+            tool_args: Some("{\"command\":\"ls\"}".to_string()),
+            result: Some("file1.txt\nfile2.txt".to_string()),
+            success: Some(true),
+            tokens_used: Some(42),
+            created_at: now,
+        };
+        store.log_task_activity_v3(&activity).await.unwrap();
+
+        let activities = store.get_task_activities_v3(&task.id).await.unwrap();
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].activity_type, "tool_call");
+        assert_eq!(activities[0].tool_name, Some("terminal".to_string()));
+        assert_eq!(activities[0].success, Some(true));
+        assert_eq!(activities[0].tokens_used, Some(42));
+    }
+
+    // --- Notification Queue Tests ---
+
+    #[tokio::test]
+    async fn test_notification_queue_enqueue_and_fetch() {
+        let (store, _file) = setup_test_store().await;
+
+        let entry = crate::traits::NotificationEntry::new(
+            "goal-1",
+            "session-1",
+            "completed",
+            "Goal completed: build website",
+        );
+        store.enqueue_notification(&entry).await.unwrap();
+
+        let pending = store.get_pending_notifications(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].goal_id, "goal-1");
+        assert_eq!(pending[0].notification_type, "completed");
+        assert_eq!(pending[0].priority, "critical");
+        assert!(pending[0].expires_at.is_none()); // critical = no expiry
+        assert!(pending[0].delivered_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_notification_queue_status_update_has_expiry() {
+        let (store, _file) = setup_test_store().await;
+
+        let entry = crate::traits::NotificationEntry::new(
+            "goal-1",
+            "session-1",
+            "progress",
+            "Goal 50% complete",
+        );
+        assert_eq!(entry.priority, "status_update");
+        assert!(entry.expires_at.is_some());
+
+        store.enqueue_notification(&entry).await.unwrap();
+        let pending = store.get_pending_notifications(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].expires_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_notification_queue_mark_delivered() {
+        let (store, _file) = setup_test_store().await;
+
+        let entry = crate::traits::NotificationEntry::new(
+            "goal-1",
+            "session-1",
+            "failed",
+            "Goal failed: deployment error",
+        );
+        store.enqueue_notification(&entry).await.unwrap();
+
+        // Mark as delivered
+        store.mark_notification_delivered(&entry.id).await.unwrap();
+
+        // Should no longer appear in pending
+        let pending = store.get_pending_notifications(10).await.unwrap();
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_notification_queue_priority_ordering() {
+        let (store, _file) = setup_test_store().await;
+
+        // Enqueue status_update first
+        let status = crate::traits::NotificationEntry::new(
+            "goal-1",
+            "session-1",
+            "progress",
+            "Progress update",
+        );
+        store.enqueue_notification(&status).await.unwrap();
+
+        // Enqueue critical second
+        let critical =
+            crate::traits::NotificationEntry::new("goal-2", "session-1", "failed", "Goal failed");
+        store.enqueue_notification(&critical).await.unwrap();
+
+        let pending = store.get_pending_notifications(10).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        // Critical should come first despite being enqueued second
+        assert_eq!(pending[0].priority, "critical");
+        assert_eq!(pending[1].priority, "status_update");
+    }
+
+    #[tokio::test]
+    async fn test_notification_queue_cleanup_expired() {
+        let (store, _file) = setup_test_store().await;
+
+        // Insert a notification with an already-expired expires_at
+        let mut entry =
+            crate::traits::NotificationEntry::new("goal-1", "session-1", "stalled", "Goal stalled");
+        // Set expires_at to the past
+        entry.expires_at = Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
+        store.enqueue_notification(&entry).await.unwrap();
+
+        // Also insert a non-expired critical notification
+        let critical =
+            crate::traits::NotificationEntry::new("goal-2", "session-1", "failed", "Goal failed");
+        store.enqueue_notification(&critical).await.unwrap();
+
+        // Cleanup should remove the expired one
+        let cleaned = store.cleanup_expired_notifications().await.unwrap();
+        assert_eq!(cleaned, 1);
+
+        // Only the critical one remains
+        let pending = store.get_pending_notifications(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].notification_type, "failed");
+    }
+
+    #[tokio::test]
+    async fn test_notification_queue_increment_attempt() {
+        let (store, _file) = setup_test_store().await;
+
+        let entry =
+            crate::traits::NotificationEntry::new("goal-1", "session-1", "completed", "Goal done");
+        store.enqueue_notification(&entry).await.unwrap();
+
+        store
+            .increment_notification_attempt(&entry.id)
+            .await
+            .unwrap();
+        store
+            .increment_notification_attempt(&entry.id)
+            .await
+            .unwrap();
+
+        let pending = store.get_pending_notifications(10).await.unwrap();
+        assert_eq!(pending[0].attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_goals() {
+        let (store, _db) = setup_test_store().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let three_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+
+        // Legacy goals: one stale active, one recent active, one completed
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO goals (description, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind("stale legacy goal")
+        .bind("active")
+        .bind(&three_hours_ago)
+        .bind(&three_hours_ago)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO goals (description, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind("recent legacy goal")
+        .bind("active")
+        .bind(&now)
+        .bind(&now)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO goals (description, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind("completed goal")
+        .bind("completed")
+        .bind(&three_hours_ago)
+        .bind(&three_hours_ago)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        // V3 goals: one stale finite, one recent finite, one stale evergreen
+        fn make_goal_v3(id: &str, desc: &str, goal_type: &str, ts: &str) -> GoalV3 {
+            GoalV3 {
+                id: id.to_string(),
+                description: desc.to_string(),
+                goal_type: goal_type.to_string(),
+                status: "active".to_string(),
+                priority: "medium".to_string(),
+                conditions: None,
+                schedule: None,
+                context: None,
+                resources: None,
+                budget_per_check: None,
+                budget_daily: None,
+                tokens_used_today: 0,
+                last_useful_action: None,
+                created_at: ts.to_string(),
+                updated_at: ts.to_string(),
+                completed_at: None,
+                parent_goal_id: None,
+                session_id: "test".to_string(),
+                notified_at: None,
+                notification_attempts: 0,
+                dispatch_failures: 0,
+            }
+        }
+
+        store
+            .create_goal_v3(&make_goal_v3(
+                "stale-finite",
+                "stale finite goal",
+                "finite",
+                &three_hours_ago,
+            ))
+            .await
+            .unwrap();
+
+        let mut stale_scheduled_finite = make_goal_v3(
+            "stale-scheduled-finite",
+            "stale scheduled finite goal",
+            "finite",
+            &three_hours_ago,
+        );
+        stale_scheduled_finite.schedule = Some("0 9 12 2 *".to_string());
+        store.create_goal_v3(&stale_scheduled_finite).await.unwrap();
+
+        store
+            .create_goal_v3(&make_goal_v3(
+                "recent-finite",
+                "recent finite goal",
+                "finite",
+                &now,
+            ))
+            .await
+            .unwrap();
+
+        store
+            .create_goal_v3(&make_goal_v3(
+                "stale-evergreen",
+                "stale evergreen goal",
+                "evergreen",
+                &three_hours_ago,
+            ))
+            .await
+            .unwrap();
+
+        // Run cleanup with 2-hour threshold
+        let (legacy, v3) = store.cleanup_stale_goals(2).await.unwrap();
+        assert_eq!(legacy, 1, "should abandon 1 stale legacy goal");
+        assert_eq!(v3, 1, "should fail 1 stale finite v3 goal");
+
+        // Verify legacy: stale → abandoned, recent stays active
+        let row: (String,) = sqlx::query_as::<sqlx::Sqlite, _>(
+            "SELECT status FROM goals WHERE description = 'stale legacy goal'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "abandoned");
+
+        let row: (String,) = sqlx::query_as::<sqlx::Sqlite, _>(
+            "SELECT status FROM goals WHERE description = 'recent legacy goal'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "active");
+
+        // Verify V3: stale finite → failed, recent finite stays active, evergreen untouched
+        let g = store.get_goal_v3("stale-finite").await.unwrap().unwrap();
+        assert_eq!(g.status, "failed");
+        assert!(g.completed_at.is_some());
+
+        let g = store.get_goal_v3("recent-finite").await.unwrap().unwrap();
+        assert_eq!(g.status, "active");
+
+        let g = store
+            .get_goal_v3("stale-scheduled-finite")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            g.status, "active",
+            "scheduled finite goals should not be failed by stale cleanup"
+        );
+
+        let g = store.get_goal_v3("stale-evergreen").await.unwrap().unwrap();
+        assert_eq!(
+            g.status, "active",
+            "evergreen goals should not be cleaned up"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migrate_legacy_scheduled_tasks_to_v3() {
+        let (store, _db) = setup_test_store().await;
+        let now = chrono::Utc::now();
+        let next_hour = (now + chrono::Duration::hours(1)).to_rfc3339();
+
+        // Recurring active legacy task
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO scheduled_tasks
+             (id, name, cron_expr, original_schedule, prompt, source, is_oneshot, is_paused, is_trusted, last_run_at, next_run_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("legacy-recurring-1")
+        .bind("legacy recurring")
+        .bind("0 */6 * * *")
+        .bind("every 6h")
+        .bind("monitor API health")
+        .bind("tool")
+        .bind(0i64)
+        .bind(0i64)
+        .bind(0i64)
+        .bind::<Option<String>>(None)
+        .bind(&next_hour)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        // One-shot paused legacy task
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO scheduled_tasks
+             (id, name, cron_expr, original_schedule, prompt, source, is_oneshot, is_paused, is_trusted, last_run_at, next_run_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("legacy-oneshot-1")
+        .bind("legacy oneshot")
+        .bind("0 9 * * *")
+        .bind("tomorrow at 9am")
+        .bind("check deployment")
+        .bind("tool")
+        .bind(1i64)
+        .bind(1i64)
+        .bind(0i64)
+        .bind::<Option<String>>(None)
+        .bind(&next_hour)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let migrated = store.migrate_legacy_scheduled_tasks_to_v3().await.unwrap();
+        assert_eq!(migrated, 2);
+
+        // Idempotent rerun should not duplicate.
+        let migrated_again = store.migrate_legacy_scheduled_tasks_to_v3().await.unwrap();
+        assert_eq!(migrated_again, 0);
+
+        let g1 = store
+            .get_goal_v3("legacy-sched-legacy-recurring-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(g1.goal_type, "continuous");
+        assert_eq!(g1.status, "active");
+        assert_eq!(g1.session_id, "system");
+        assert_eq!(g1.schedule.as_deref(), Some("0 */6 * * *"));
+
+        let g2 = store
+            .get_goal_v3("legacy-sched-legacy-oneshot-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(g2.goal_type, "finite");
+        assert_eq!(g2.status, "paused");
+        assert_eq!(g2.session_id, "system");
+        assert!(g2.schedule.is_some());
     }
 }

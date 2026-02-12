@@ -137,6 +137,22 @@ pub fn wrap_untrusted_output(tool_name: &str, output: &str) -> String {
     )
 }
 
+/// Redact secret patterns from text (for activity logging, not user-facing output).
+/// Unlike `sanitize_output`, this replaces each match with a label like `[REDACTED:API key]`.
+pub fn redact_secrets(text: &str) -> String {
+    let mut result = text.to_string();
+    for pattern in SECRET_PATTERNS.iter() {
+        if pattern.regex.is_match(&result) {
+            let replacement = format!("[REDACTED:{}]", pattern.label);
+            result = pattern
+                .regex
+                .replace_all(&result, replacement.as_str())
+                .to_string();
+        }
+    }
+    result
+}
+
 /// Check if a tool's output should be treated as untrusted.
 pub fn is_trusted_tool(name: &str) -> bool {
     matches!(
@@ -144,6 +160,10 @@ pub fn is_trusted_tool(name: &str) -> bool {
         "remember_fact"
             | "system_info"
             | "manage_memories"
+            | "scheduled_goal_runs"
+            | "goal_trace"
+            | "tool_trace"
+            | "self_diagnose"
             | "share_memory"
             | "manage_goals"
             | "use_skill"
@@ -235,6 +255,28 @@ mod tests {
         let (result, redacted) = sanitize_output(input);
         assert!(!redacted);
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_redact_secrets_api_key() {
+        let input = r#"{"api_key": "sk-abc123456789012345678901234567890"}"#;
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED:API key]"));
+        assert!(!result.contains("sk-abc"));
+    }
+
+    #[test]
+    fn test_redact_secrets_preserves_normal() {
+        let input = "Normal tool args with no secrets";
+        let result = redact_secrets(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_redact_secrets_connection_string() {
+        let input = "Connect to postgres://admin:pass@host:5432/db";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED:Connection string]"));
     }
 
     #[test]

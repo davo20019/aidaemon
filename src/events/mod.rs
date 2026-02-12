@@ -15,7 +15,8 @@ mod store;
 pub use consolidation::{Consolidator, Pruner};
 pub use context::SessionContextCompiler;
 pub use payloads::*;
-pub use store::{EventEmitter, EventStore};
+#[allow(unused_imports)]
+pub use store::{EventEmitter, EventStore, PolicyGraduationReport, TaskWindowStats};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,10 @@ pub enum EventType {
     // === Agent Thinking ===
     /// Agent started a new thinking iteration
     ThinkingStart,
+    /// Policy routing shadow/enforcement decision emitted at task start.
+    PolicyDecision,
+    /// Structured decision-point emission for self-diagnosis flight recorder.
+    DecisionPoint,
 
     // === Task Lifecycle ===
     /// A task (user request) started processing
@@ -131,6 +136,8 @@ impl EventType {
             EventType::ToolCall => "tool_call",
             EventType::ToolResult => "tool_result",
             EventType::ThinkingStart => "thinking_start",
+            EventType::PolicyDecision => "policy_decision",
+            EventType::DecisionPoint => "decision_point",
             EventType::TaskStart => "task_start",
             EventType::TaskEnd => "task_end",
             EventType::Error => "error",
@@ -152,6 +159,8 @@ impl EventType {
             "tool_call" => Some(EventType::ToolCall),
             "tool_result" => Some(EventType::ToolResult),
             "thinking_start" => Some(EventType::ThinkingStart),
+            "policy_decision" => Some(EventType::PolicyDecision),
+            "decision_point" => Some(EventType::DecisionPoint),
             "task_start" => Some(EventType::TaskStart),
             "task_end" => Some(EventType::TaskEnd),
             "error" => Some(EventType::Error),
@@ -219,6 +228,8 @@ mod tests {
             EventType::SessionStart,
             EventType::UserMessage,
             EventType::ToolCall,
+            EventType::PolicyDecision,
+            EventType::DecisionPoint,
             EventType::TaskEnd,
             EventType::Error,
         ] {

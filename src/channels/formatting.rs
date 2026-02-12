@@ -472,7 +472,11 @@ fn convert_slack_inline(s: &str) -> String {
 /// `include_restart`: whether to show the /restart command (Telegram, Slack)
 /// `include_connect`: whether to show /connect and /bots (Telegram only)
 /// `prefix`: command prefix character ("/" for Telegram, "!" for Slack)
-pub(crate) fn build_help_text(include_restart: bool, include_connect: bool, prefix: &str) -> String {
+pub(crate) fn build_help_text(
+    include_restart: bool,
+    include_connect: bool,
+    prefix: &str,
+) -> String {
     let p = prefix;
     let mut text = String::from(
         "**What I can do**\n\

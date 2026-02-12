@@ -2,12 +2,16 @@ mod agent;
 mod channels;
 mod config;
 mod core;
+mod cron_utils;
 mod daemon;
 mod dashboard;
 #[allow(dead_code)]
 mod events;
+mod execution_policy;
+mod goal_tokens;
 #[allow(dead_code)]
 mod health;
+mod heartbeat;
 mod mcp;
 mod memory;
 mod oauth;
@@ -15,7 +19,6 @@ mod oauth;
 mod plans;
 mod providers;
 mod router;
-mod scheduler;
 mod skills;
 mod state;
 mod tasks;
@@ -29,6 +32,8 @@ mod wizard;
 
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod live_e2e_tests;
 #[cfg(test)]
 mod testing;
 
@@ -221,7 +226,10 @@ fn handle_keychain_command(args: &[String]) -> anyhow::Result<()> {
             println!("Deleted '{}' from OS keychain", key);
         }
         _ => {
-            eprintln!("Unknown keychain action: '{}'. Use set, get, or delete.", action);
+            eprintln!(
+                "Unknown keychain action: '{}'. Use set, get, or delete.",
+                action
+            );
             std::process::exit(1);
         }
     }

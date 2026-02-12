@@ -142,7 +142,10 @@ impl ManageOAuthTool {
             } else {
                 "credentials needed"
             };
-            result.push_str(&format!("  - {} ({}) [{}]\n", display_name, name, cred_status));
+            result.push_str(&format!(
+                "  - {} ({}) [{}]\n",
+                display_name, name, cred_status
+            ));
         }
         result.push_str(
             "\nTo connect: first set credentials with 'set_credentials', then use 'connect'.",
@@ -182,17 +185,12 @@ impl ManageOAuthTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
         // Start OAuth flow
-        let (authorize_url, result_rx) = self
-            .gateway
-            .start_oauth2_flow(service, session_id)
-            .await?;
+        let (authorize_url, result_rx) =
+            self.gateway.start_oauth2_flow(service, session_id).await?;
 
         // Send the authorize URL as a progress update so the user sees it
         if let Some(ref tx) = status_tx {
-            let msg = format!(
-                "Click this link to authorize:\n{}",
-                authorize_url
-            );
+            let msg = format!("Click this link to authorize:\n{}", authorize_url);
             let _ = tx
                 .send(StatusUpdate::ToolProgress {
                     name: "manage_oauth".to_string(),

@@ -34,7 +34,7 @@ pub struct DiscordChannel {
     /// Populated on first start() call.
     bot_username: std::sync::RwLock<String>,
     bot_token: String,
-    allowed_user_ids: Vec<u64>,
+    allowed_user_ids: std::sync::RwLock<Vec<u64>>,
     /// Discord user IDs recognized as owners (from `users.owner_ids.discord`).
     owner_user_ids: Vec<u64>,
     guild_id: Option<u64>,
@@ -75,7 +75,7 @@ impl DiscordChannel {
         Self {
             bot_username: std::sync::RwLock::new("discord".to_string()),
             bot_token: bot_token.to_string(),
-            allowed_user_ids,
+            allowed_user_ids: std::sync::RwLock::new(allowed_user_ids),
             owner_user_ids,
             guild_id,
             agent,
@@ -225,9 +225,54 @@ impl DiscordChannel {
     }
 
     fn is_authorized(&self, user_id: u64) -> bool {
-        // Fail-closed: deny access if no users configured or user not in list.
-        // Users must be explicitly allowed via allowed_user_ids in config.
-        !self.allowed_user_ids.is_empty() && self.allowed_user_ids.contains(&user_id)
+        let ids = self.allowed_user_ids.read().unwrap();
+        if ids.is_empty() {
+            // No allowed users configured — will be handled by auto-claim in handle_message_event.
+            return false;
+        }
+        ids.contains(&user_id)
+    }
+
+    /// Auto-claim: when allowed_user_ids is empty OR contains only stale IDs from
+    /// another platform (e.g. Telegram IDs saved for a Discord bot via /connect),
+    /// register the first DM user as the allowed user and persist to DB.
+    ///
+    /// Only applies to dynamic bots (owner_user_ids is empty). Config-based bots
+    /// with explicit owner_user_ids are never auto-claimable.
+    async fn try_auto_claim(&self, user_id: u64, is_dm: bool) -> bool {
+        if !is_dm {
+            return false;
+        }
+        // Config-based bots have owner_user_ids set — never auto-claim those.
+        if !self.owner_user_ids.is_empty() {
+            return false;
+        }
+
+        // Claim: replace any stale IDs with this user.
+        {
+            let mut ids = self.allowed_user_ids.write().unwrap();
+            if ids.contains(&user_id) {
+                return true; // Already authorized.
+            }
+            info!(
+                user_id,
+                old_ids = ?*ids,
+                "Auto-claiming Discord bot for DM user (replacing stale IDs)"
+            );
+            ids.clear();
+            ids.push(user_id);
+        }
+
+        // Persist to DB so it survives restarts
+        if let Err(e) = self
+            .state
+            .update_dynamic_bot_allowed_users(&self.bot_token, &[user_id.to_string()])
+            .await
+        {
+            warn!("Failed to persist auto-claimed user to DB: {}", e);
+        }
+
+        true
     }
 
     /// Build a session ID from a Discord message.
@@ -248,7 +293,10 @@ impl DiscordChannel {
         }
 
         let user_id = msg.author.id.get();
-        if !self.is_authorized(user_id) {
+        let is_dm = msg.guild_id.is_none();
+        // In guild channels, let all server members through — they get Guest role
+        // from determine_role(). Auth gate only applies to DMs.
+        if is_dm && !self.is_authorized(user_id) && !self.try_auto_claim(user_id, is_dm).await {
             warn!(user_id, "Unauthorized Discord user attempted access");
             let _ = msg.channel_id.say(&ctx.http, "Unauthorized.").await;
             return;
@@ -304,10 +352,15 @@ impl DiscordChannel {
 
         let session_id = self.session_id_from_message(&msg);
 
-        // Register this session with the channel hub
+        // Register this session with the channel hub (in-memory + persistent)
         {
+            let channel_name = self.channel_name();
             let mut map = self.session_map.write().await;
-            map.insert(session_id.clone(), self.channel_name());
+            map.insert(session_id.clone(), channel_name.clone());
+            let _ = self
+                .state
+                .save_session_channel(&session_id, &channel_name)
+                .await;
         }
 
         info!(session_id, "Received Discord message from user {}", user_id);
@@ -361,20 +414,10 @@ impl DiscordChannel {
         let status_task = tokio::spawn(async move {
             let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
             let min_interval = Duration::from_secs(3);
-            let mut sent_thinking = false;
             while let Some(update) = status_rx.recv().await {
-                // In non-DM channels: only send one "Thinking..." then suppress
+                // In non-DM channels: suppress all status messages.
+                // Discord's native "typing..." indicator is sufficient.
                 if !is_dm {
-                    if !sent_thinking
-                        && matches!(
-                            update,
-                            StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. }
-                        )
-                    {
-                        let _ = status_channel_id.say(&status_http, "Thinking...").await;
-                        sent_thinking = true;
-                        last_sent = tokio::time::Instant::now();
-                    }
                     continue;
                 }
                 let now = tokio::time::Instant::now();
@@ -385,7 +428,7 @@ impl DiscordChannel {
                     continue;
                 }
                 let text = match &update {
-                    StatusUpdate::Thinking(iter) => format!("Thinking... (step {})", iter + 1),
+                    StatusUpdate::Thinking(iter) => format!("Thinking... (step {})", iter),
                     StatusUpdate::ToolStart { name, summary } => {
                         if summary.is_empty() {
                             format!("Using {}...", name)
@@ -556,8 +599,7 @@ impl DiscordChannel {
             }
         };
 
-        let user_role =
-            super::telegram::determine_role(&self.owner_user_ids, msg.author.id.get());
+        let user_role = super::telegram::determine_role(&self.owner_user_ids, msg.author.id.get());
 
         let agent = Arc::clone(&self.agent);
         let channel_id = msg.channel_id;
@@ -610,7 +652,10 @@ impl DiscordChannel {
     /// Handle a slash command interaction.
     async fn handle_slash_command(&self, ctx: &Context, command: &CommandInteraction) {
         let user_id = command.user.id.get();
-        if !self.is_authorized(user_id) {
+        let is_dm = command.guild_id.is_none();
+        // In guild channels, let all server members through (Guest role).
+        // Auth gate only applies to DMs.
+        if is_dm && !self.is_authorized(user_id) {
             let _ = command
                 .create_response(
                     &ctx.http,
@@ -892,7 +937,9 @@ impl DiscordChannel {
         interaction: &ComponentInteraction,
     ) {
         let user_id = interaction.user.id.get();
-        if !self.is_authorized(user_id) {
+        // Approval buttons require owner or allowed-user authorization
+        // (guild membership alone is not sufficient for approving actions).
+        if !self.is_authorized(user_id) && !self.owner_user_ids.contains(&user_id) {
             let _ = interaction
                 .create_response(
                     &ctx.http,

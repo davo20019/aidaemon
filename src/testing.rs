@@ -3,28 +3,27 @@
 //! Provides a fully wired Agent with a mock LLM and in-memory state,
 //! suitable for integration tests that exercise the real agent loop.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value;
-use tokio::sync::Mutex;
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, Mutex};
 
+use crate::agent::Agent;
+use crate::channels::{ChannelHub, SessionMap};
 use crate::config::{IterationLimitConfig, ModelsConfig};
 use crate::events::EventStore;
 use crate::memory::embeddings::EmbeddingService;
-use crate::plans::{PlanStore, StepTracker};
-use crate::skills::SharedSkillRegistry;
 use crate::state::SqliteStateStore;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::memory::RememberFactTool;
-use crate::tools::SystemInfoTool;
+use crate::tools::{SystemInfoTool, TerminalTool};
 use crate::traits::{
     Channel, ChannelCapabilities, ModelProvider, ProviderResponse, TokenUsage, Tool, ToolCall,
 };
 use crate::types::{ApprovalResponse, MediaMessage};
-
-use crate::agent::Agent;
 
 // ---------------------------------------------------------------------------
 // MockProvider
@@ -72,6 +71,7 @@ impl MockProvider {
                 output_tokens: 5,
                 model: "mock".to_string(),
             }),
+            thinking: None,
         }
     }
 
@@ -90,6 +90,7 @@ impl MockProvider {
                 output_tokens: 5,
                 model: "mock".to_string(),
             }),
+            thinking: None,
         }
     }
 
@@ -225,6 +226,8 @@ pub struct TestHarness {
     pub channel: Arc<TestChannel>,
     /// Keep the temp file alive — DB is deleted when this drops.
     _db_file: tempfile::NamedTempFile,
+    /// Keep the skills temp dir alive.
+    _skills_dir: tempfile::TempDir,
 }
 
 /// Build a fully-wired agent with mock provider and temp-file SQLite DB.
@@ -235,17 +238,18 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();
 
+    // Temp dir for skills
+    let skills_dir = tempfile::TempDir::new()?;
+
     // Embedding service (downloads ~25MB model on first run, cached afterwards)
     let embedding_service = Arc::new(EmbeddingService::new()?);
 
     // State store
     let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
 
-    // Event store & plan store share the same SQLite pool
+    // Event store
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
-    let event_store = Arc::new(EventStore::new(pool.clone()).await?);
-    let plan_store = Arc::new(PlanStore::new(pool).await?);
-    let step_tracker = Arc::new(StepTracker::new(plan_store.clone()));
+    let event_store = Arc::new(EventStore::new(pool).await?);
 
     // Provider
     let provider = Arc::new(provider);
@@ -258,9 +262,6 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         )),
     ];
 
-    // Empty skill registry
-    let skills = SharedSkillRegistry::new(vec![]);
-
     // Models config (all tiers point to "mock-model")
     let models_config = ModelsConfig {
         primary: "mock-model".to_string(),
@@ -268,17 +269,103 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         smart: "mock-model".to_string(),
     };
 
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         provider.clone() as Arc<dyn ModelProvider>,
         state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
-        plan_store,
-        step_tracker,
         tools,
         "mock-model".to_string(),                        // model
         "You are a helpful test assistant.".to_string(), // system_prompt
         PathBuf::from("config.toml"),                    // config_path
-        skills,
+        skills_dir.path().to_path_buf(),                 // skills_dir
+        3,                                               // max_depth
+        50,                                              // max_iterations
+        100,                                             // max_iterations_cap
+        8000,                                            // max_response_chars
+        30,                                              // timeout_secs
+        models_config,
+        20,   // max_facts
+        None, // daily_token_budget
+        IterationLimitConfig::Unlimited,
+        None, // task_timeout_secs
+        None, // task_token_budget
+        None, // llm_call_timeout_secs
+        None, // mcp_registry
+        None, // goal_token_registry
+        None, // hub
+        true, // record_decision_points
+        crate::config::ContextWindowConfig {
+            progressive_facts: false,
+            ..Default::default()
+        },
+        crate::config::PolicyConfig::default(),
+    );
+
+    // V3: Set executor mode so integration tests exercise the execution loop directly,
+    // bypassing orchestrator routing (consultant pass, intent classification).
+    agent.set_test_executor_mode();
+
+    // Channel (not wired to hub — tests call agent.handle_message directly)
+    let channel = Arc::new(TestChannel::new());
+
+    Ok(TestHarness {
+        agent,
+        state,
+        provider,
+        channel,
+        _db_file: db_file,
+        _skills_dir: skills_dir,
+    })
+}
+
+/// Build a test agent with non-uniform model tiers (enables the smart router
+/// and consultant pass).
+///
+/// The `primary_model` name is used as the agent's default model and for the
+/// Primary router tier.  `smart_model` is used for the Smart tier (and Fast
+/// tier).  Because `MockProvider` ignores model names (pops from its response
+/// queue), the different names only affect routing logic and the consultant
+/// pass activation check (`first_turn_model != execution_model`).
+#[allow(dead_code)]
+pub async fn setup_test_agent_with_models(
+    provider: MockProvider,
+    primary_model: &str,
+    smart_model: &str,
+) -> anyhow::Result<TestHarness> {
+    let db_file = tempfile::NamedTempFile::new()?;
+    let db_path = db_file.path().to_str().unwrap().to_string();
+    let skills_dir = tempfile::TempDir::new()?;
+    let embedding_service = Arc::new(EmbeddingService::new()?);
+    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
+    let event_store = Arc::new(EventStore::new(pool).await?);
+
+    let provider = Arc::new(provider);
+
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(SystemInfoTool),
+        Arc::new(RememberFactTool::new(
+            state.clone() as Arc<dyn crate::traits::StateStore>
+        )),
+    ];
+
+    // Non-uniform: smart != primary → router is enabled, consultant pass activates
+    let models_config = ModelsConfig {
+        primary: primary_model.to_string(),
+        fast: smart_model.to_string(),
+        smart: smart_model.to_string(),
+    };
+
+    let agent = Agent::new(
+        provider.clone() as Arc<dyn ModelProvider>,
+        state.clone() as Arc<dyn crate::traits::StateStore>,
+        event_store,
+        tools,
+        primary_model.to_string(),
+        "You are a helpful test assistant.".to_string(),
+        PathBuf::from("config.toml"),
+        skills_dir.path().to_path_buf(),
         3,    // max_depth
         50,   // max_iterations
         100,  // max_iterations_cap
@@ -292,9 +379,17 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         None, // task_token_budget
         None, // llm_call_timeout_secs
         None, // mcp_registry
+        None, // goal_token_registry
+        None, // hub
+        true, // record_decision_points
+        crate::config::ContextWindowConfig {
+            progressive_facts: false,
+            ..Default::default()
+        },
+        crate::config::PolicyConfig::default(),
     );
+    // Note: keeps orchestrator mode (depth=0) — used by consultant pass tests
 
-    // Channel (not wired to hub — tests call agent.handle_message directly)
     let channel = Arc::new(TestChannel::new());
 
     Ok(TestHarness {
@@ -303,5 +398,298 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         provider,
         channel,
         _db_file: db_file,
+        _skills_dir: skills_dir,
+    })
+}
+
+/// Build a test agent with non-uniform model tiers (enables the smart router
+/// and consultant pass, which activates V3 routing — now always-on).
+#[allow(dead_code)]
+pub async fn setup_test_agent_v3(provider: MockProvider) -> anyhow::Result<TestHarness> {
+    let db_file = tempfile::NamedTempFile::new()?;
+    let db_path = db_file.path().to_str().unwrap().to_string();
+    let skills_dir = tempfile::TempDir::new()?;
+    let embedding_service = Arc::new(EmbeddingService::new()?);
+    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
+    let event_store = Arc::new(EventStore::new(pool).await?);
+
+    let provider = Arc::new(provider);
+
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(SystemInfoTool),
+        Arc::new(RememberFactTool::new(
+            state.clone() as Arc<dyn crate::traits::StateStore>
+        )),
+    ];
+
+    // Non-uniform: smart != primary → router is enabled, consultant pass activates
+    let models_config = ModelsConfig {
+        primary: "primary-model".to_string(),
+        fast: "fast-model".to_string(),
+        smart: "smart-model".to_string(),
+    };
+
+    let agent = Agent::new(
+        provider.clone() as Arc<dyn ModelProvider>,
+        state.clone() as Arc<dyn crate::traits::StateStore>,
+        event_store,
+        tools,
+        "primary-model".to_string(),
+        "You are a helpful test assistant.".to_string(),
+        PathBuf::from("config.toml"),
+        skills_dir.path().to_path_buf(),
+        3,    // max_depth
+        50,   // max_iterations
+        100,  // max_iterations_cap
+        8000, // max_response_chars
+        30,   // timeout_secs
+        models_config,
+        20,   // max_facts
+        None, // daily_token_budget
+        IterationLimitConfig::Unlimited,
+        None, // task_timeout_secs
+        None, // task_token_budget
+        None, // llm_call_timeout_secs
+        None, // mcp_registry
+        None, // goal_token_registry
+        None, // hub
+        true, // record_decision_points
+        crate::config::ContextWindowConfig {
+            progressive_facts: false,
+            ..Default::default()
+        },
+        crate::config::PolicyConfig::default(),
+    );
+
+    let channel = Arc::new(TestChannel::new());
+
+    Ok(TestHarness {
+        agent,
+        state,
+        provider,
+        channel,
+        _db_file: db_file,
+        _skills_dir: skills_dir,
+    })
+}
+
+/// Build a test agent with V3 orchestration + task leads enabled (same as setup_test_agent_v3
+/// since V3 is now always-on — kept for backward compatibility with existing tests).
+#[allow(dead_code)]
+pub async fn setup_test_agent_v3_task_leads(provider: MockProvider) -> anyhow::Result<TestHarness> {
+    setup_test_agent_v3(provider).await
+}
+
+// ---------------------------------------------------------------------------
+// MockTool — configurable fake tool for testing
+// ---------------------------------------------------------------------------
+
+/// A configurable mock tool for simulating any tool in tests.
+#[allow(dead_code)]
+pub struct MockTool {
+    tool_name: String,
+    tool_description: String,
+    return_value: String,
+}
+
+#[allow(dead_code)]
+impl MockTool {
+    pub fn new(name: &str, description: &str, return_value: &str) -> Self {
+        Self {
+            tool_name: name.to_string(),
+            tool_description: description.to_string(),
+            return_value: return_value.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MockTool {
+    fn name(&self) -> &str {
+        &self.tool_name
+    }
+
+    fn description(&self) -> &str {
+        &self.tool_description
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": self.tool_name,
+            "description": self.tool_description,
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, _args: &str) -> anyhow::Result<String> {
+        Ok(self.return_value.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FullStackTestHarness — agent + TerminalTool + ChannelHub wiring
+// ---------------------------------------------------------------------------
+
+/// Full-stack test harness with TerminalTool and ChannelHub approval wiring.
+///
+/// Unlike `TestHarness`, this includes a real `TerminalTool` in Yolo mode
+/// (auto-approves all commands) and a `ChannelHub` with an approval listener,
+/// enabling tests that exercise real shell commands through the agent loop.
+#[allow(dead_code)]
+pub struct FullStackTestHarness {
+    pub agent: Agent,
+    pub state: Arc<SqliteStateStore>,
+    pub provider: Arc<MockProvider>,
+    pub channel: Arc<TestChannel>,
+    pub hub: Arc<ChannelHub>,
+    pub session_map: SessionMap,
+    _db_file: tempfile::NamedTempFile,
+    _skills_dir: tempfile::TempDir,
+    _approval_task: tokio::task::JoinHandle<()>,
+}
+
+/// Build a full-stack agent with TerminalTool + ChannelHub approval wiring.
+///
+/// The TerminalTool runs in Yolo mode (auto-approves everything), so tests
+/// can exercise real shell commands without user interaction.
+#[allow(dead_code)]
+pub async fn setup_full_stack_test_agent(
+    provider: MockProvider,
+) -> anyhow::Result<FullStackTestHarness> {
+    setup_full_stack_test_agent_with_extra_tools(provider, vec![]).await
+}
+
+/// Build a full-stack agent with TerminalTool + ChannelHub + extra tools.
+///
+/// Use this when tests need additional mock tools (e.g., a mock `cli_agent`).
+#[allow(dead_code)]
+pub async fn setup_full_stack_test_agent_with_extra_tools(
+    provider: MockProvider,
+    extra_tools: Vec<Arc<dyn Tool>>,
+) -> anyhow::Result<FullStackTestHarness> {
+    // Temp file for SQLite
+    let db_file = tempfile::NamedTempFile::new()?;
+    let db_path = db_file.path().to_str().unwrap().to_string();
+
+    // Temp dir for skills
+    let skills_dir = tempfile::TempDir::new()?;
+
+    // Embedding service
+    let embedding_service = Arc::new(EmbeddingService::new()?);
+
+    // State store
+    let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+
+    // Event store
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
+    let event_store = Arc::new(EventStore::new(pool.clone()).await?);
+
+    // Approval channel
+    let (approval_tx, approval_rx) = mpsc::channel(16);
+
+    // TerminalTool in Yolo mode — auto-approves everything
+    let terminal_tool = Arc::new(
+        TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            30,
+            8000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await,
+    );
+
+    // Tools: SystemInfoTool + RememberFactTool + TerminalTool + extras
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(SystemInfoTool),
+        Arc::new(RememberFactTool::new(
+            state.clone() as Arc<dyn crate::traits::StateStore>
+        )),
+        terminal_tool,
+    ];
+    tools.extend(extra_tools);
+
+    // Provider
+    let provider = Arc::new(provider);
+
+    // Models config
+    let models_config = ModelsConfig {
+        primary: "mock-model".to_string(),
+        fast: "mock-model".to_string(),
+        smart: "mock-model".to_string(),
+    };
+
+    let mut agent = Agent::new(
+        provider.clone() as Arc<dyn ModelProvider>,
+        state.clone() as Arc<dyn crate::traits::StateStore>,
+        event_store,
+        tools,
+        "mock-model".to_string(),
+        "You are a helpful test assistant.".to_string(),
+        PathBuf::from("config.toml"),
+        skills_dir.path().to_path_buf(),
+        3,    // max_depth
+        50,   // max_iterations
+        100,  // max_iterations_cap
+        8000, // max_response_chars
+        30,   // timeout_secs
+        models_config,
+        20,   // max_facts
+        None, // daily_token_budget
+        IterationLimitConfig::Unlimited,
+        None, // task_timeout_secs
+        None, // task_token_budget
+        None, // llm_call_timeout_secs
+        None, // mcp_registry
+        None, // goal_token_registry
+        None, // hub
+        true, // record_decision_points
+        crate::config::ContextWindowConfig {
+            progressive_facts: false,
+            ..Default::default()
+        },
+        crate::config::PolicyConfig::default(),
+    );
+
+    // V3: Set executor mode so tests exercise the execution loop directly
+    agent.set_test_executor_mode();
+
+    // Channel
+    let channel = Arc::new(TestChannel::new());
+
+    // SessionMap pre-populated with a test session
+    let mut map = HashMap::new();
+    map.insert("telegram_test".to_string(), "test".to_string());
+    let session_map: SessionMap = Arc::new(tokio::sync::RwLock::new(map));
+
+    // ChannelHub
+    let hub = Arc::new(ChannelHub::new(
+        vec![channel.clone() as Arc<dyn Channel>],
+        session_map.clone(),
+    ));
+
+    // Spawn approval listener
+    let hub_for_approvals = hub.clone();
+    let approval_task = tokio::spawn(async move {
+        hub_for_approvals.approval_listener(approval_rx).await;
+    });
+
+    Ok(FullStackTestHarness {
+        agent,
+        state,
+        provider,
+        channel,
+        hub,
+        session_map,
+        _db_file: db_file,
+        _skills_dir: skills_dir,
+        _approval_task: approval_task,
     })
 }

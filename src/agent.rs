@@ -1,52 +1,235 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
+use croner::Cron;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::{IterationLimitConfig, ModelsConfig};
+use crate::channels::ChannelHub;
+use crate::config::{IterationLimitConfig, ModelsConfig, PolicyConfig};
 use crate::events::{
-    AssistantResponseData, ErrorData, EventStore, EventType, SubAgentCompleteData,
-    SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus, ThinkingStartData, ToolCallData,
-    ToolCallInfo, ToolResultData, UserMessageData,
+    AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
+    PolicyDecisionData, SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData,
+    TaskStatus, ThinkingStartData, ToolCallData, ToolCallInfo, ToolResultData, UserMessageData,
 };
+use crate::execution_policy::{
+    score_risk_from_capabilities, score_uncertainty_v1, ApprovalMode, ExecutionPolicy,
+    ModelProfile, PolicyBundle, UncertaintySignals,
+};
+use crate::goal_tokens::GoalTokenRegistry;
 use crate::mcp::McpRegistry;
-use crate::plans::{PlanStore, StepTracker};
 use crate::providers::{ProviderError, ProviderErrorKind};
 use crate::router::{self, Router};
-use crate::skills::{self, MemoryContext, SharedSkillRegistry};
+use crate::skills::{self, MemoryContext};
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::VerificationTracker;
-use crate::traits::{Message, ModelProvider, StateStore, Tool, ToolCall};
-use crate::types::{ChannelContext, ChannelVisibility, UserRole};
+use crate::traits::{
+    AgentRole, GoalV3, Message, ModelProvider, StateStore, TaskActivityV3, Tool, ToolCall,
+    ToolCapabilities, ToolRole,
+};
+use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
 pub use crate::types::StatusUpdate;
 
 /// Constants for stall and repetitive behavior detection
 const MAX_STALL_ITERATIONS: usize = 3;
-const MAX_REPETITIVE_CALLS: usize = 6;
-const RECENT_CALLS_WINDOW: usize = 8;
+const DEFERRED_NO_TOOL_SWITCH_THRESHOLD: usize = 2;
+const MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES: usize = 1;
+const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
+const MAX_REPETITIVE_CALLS: usize = 8;
+const RECENT_CALLS_WINDOW: usize = 12;
+/// After this many identical calls (same tool+args hash), skip execution and
+/// inject a coaching message so the LLM adapts before the hard stall fires.
+const REPETITIVE_REDIRECT_THRESHOLD: usize = 3;
 /// If the same tool NAME is called this many consecutive iterations (even with
 /// different arguments), treat it as a loop.  This catches the case where the
 /// LLM keeps calling e.g. `terminal` with varied commands without progress.
-/// Set high enough to allow complex multi-step investigations from mobile.
-const MAX_CONSECUTIVE_SAME_TOOL: usize = 12;
+/// Set high enough to allow complex multi-step investigations from mobile,
+/// and to leave room for follow-up work after cli_agent returns.
+const MAX_CONSECUTIVE_SAME_TOOL: usize = 16;
 /// Hard iteration cap even in "unlimited" mode — prevents runaway resource
 /// consumption if stall detection is bypassed (e.g. alternating tool names).
 const HARD_ITERATION_CAP: usize = 200;
 /// Window size for detecting alternating tool patterns (A-B-A-B cycles).
 const ALTERNATING_PATTERN_WINDOW: usize = 10;
 const PROGRESS_SUMMARY_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
+/// Marker for consultant mode so providers can enforce text-only behavior.
+const CONSULTANT_TEXT_ONLY_MARKER: &str = "[CONSULTANT_TEXT_ONLY_MODE]";
+/// Machine-readable intent decision line emitted by the consultant pass.
+const INTENT_GATE_MARKER: &str = "[INTENT_GATE]";
+/// Legacy fallback schedule text heuristics are disabled by default because they
+/// can misclassify "tell me about this scheduled goal" queries as new schedules.
+const ENABLE_SCHEDULE_HEURISTICS: bool = false;
+
+struct PolicyRuntimeMetrics {
+    router_shadow_total: AtomicU64,
+    router_shadow_diverged: AtomicU64,
+    tool_exposure_samples: AtomicU64,
+    tool_exposure_before_sum: AtomicU64,
+    tool_exposure_after_sum: AtomicU64,
+    ambiguity_detected_total: AtomicU64,
+    uncertainty_clarify_total: AtomicU64,
+    context_refresh_total: AtomicU64,
+    escalation_total: AtomicU64,
+    fallback_expansion_total: AtomicU64,
+}
+
+impl PolicyRuntimeMetrics {
+    const fn new() -> Self {
+        Self {
+            router_shadow_total: AtomicU64::new(0),
+            router_shadow_diverged: AtomicU64::new(0),
+            tool_exposure_samples: AtomicU64::new(0),
+            tool_exposure_before_sum: AtomicU64::new(0),
+            tool_exposure_after_sum: AtomicU64::new(0),
+            ambiguity_detected_total: AtomicU64::new(0),
+            uncertainty_clarify_total: AtomicU64::new(0),
+            context_refresh_total: AtomicU64::new(0),
+            escalation_total: AtomicU64::new(0),
+            fallback_expansion_total: AtomicU64::new(0),
+        }
+    }
+}
+
+static POLICY_METRICS: Lazy<PolicyRuntimeMetrics> = Lazy::new(PolicyRuntimeMetrics::new);
+
+struct PolicyRuntimeTunables {
+    initialized: AtomicBool,
+    // Stored as basis points (e.g. 0.55 => 5500) for lock-free updates.
+    uncertainty_threshold_bp: AtomicU64,
+}
+
+impl PolicyRuntimeTunables {
+    const fn new() -> Self {
+        Self {
+            initialized: AtomicBool::new(false),
+            uncertainty_threshold_bp: AtomicU64::new(5500),
+        }
+    }
+}
+
+static POLICY_TUNABLES: Lazy<PolicyRuntimeTunables> = Lazy::new(PolicyRuntimeTunables::new);
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PolicyMetricsSnapshot {
+    pub router_shadow_total: u64,
+    pub router_shadow_diverged: u64,
+    pub tool_exposure_samples: u64,
+    pub tool_exposure_before_sum: u64,
+    pub tool_exposure_after_sum: u64,
+    pub ambiguity_detected_total: u64,
+    pub uncertainty_clarify_total: u64,
+    pub context_refresh_total: u64,
+    pub escalation_total: u64,
+    pub fallback_expansion_total: u64,
+}
+
+pub fn policy_metrics_snapshot() -> PolicyMetricsSnapshot {
+    PolicyMetricsSnapshot {
+        router_shadow_total: POLICY_METRICS.router_shadow_total.load(Ordering::Relaxed),
+        router_shadow_diverged: POLICY_METRICS
+            .router_shadow_diverged
+            .load(Ordering::Relaxed),
+        tool_exposure_samples: POLICY_METRICS.tool_exposure_samples.load(Ordering::Relaxed),
+        tool_exposure_before_sum: POLICY_METRICS
+            .tool_exposure_before_sum
+            .load(Ordering::Relaxed),
+        tool_exposure_after_sum: POLICY_METRICS
+            .tool_exposure_after_sum
+            .load(Ordering::Relaxed),
+        ambiguity_detected_total: POLICY_METRICS
+            .ambiguity_detected_total
+            .load(Ordering::Relaxed),
+        uncertainty_clarify_total: POLICY_METRICS
+            .uncertainty_clarify_total
+            .load(Ordering::Relaxed),
+        context_refresh_total: POLICY_METRICS.context_refresh_total.load(Ordering::Relaxed),
+        escalation_total: POLICY_METRICS.escalation_total.load(Ordering::Relaxed),
+        fallback_expansion_total: POLICY_METRICS
+            .fallback_expansion_total
+            .load(Ordering::Relaxed),
+    }
+}
+
+pub fn init_policy_tunables_once(base_uncertainty_threshold: f32) {
+    if POLICY_TUNABLES
+        .initialized
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        let bp = (base_uncertainty_threshold.clamp(0.0, 1.0) * 10_000.0) as u64;
+        POLICY_TUNABLES
+            .uncertainty_threshold_bp
+            .store(bp, Ordering::SeqCst);
+    }
+}
+
+fn current_uncertainty_threshold(default_threshold: f32) -> f32 {
+    if POLICY_TUNABLES.initialized.load(Ordering::SeqCst) {
+        let bp = POLICY_TUNABLES
+            .uncertainty_threshold_bp
+            .load(Ordering::SeqCst);
+        (bp as f32 / 10_000.0).clamp(0.0, 1.0)
+    } else {
+        default_threshold
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PolicyAutotuneSnapshot {
+    pub uncertainty_threshold: f32,
+}
+
+pub fn policy_autotune_snapshot(default_threshold: f32) -> PolicyAutotuneSnapshot {
+    PolicyAutotuneSnapshot {
+        uncertainty_threshold: current_uncertainty_threshold(default_threshold),
+    }
+}
+
+/// Bounded auto-tuning: adjust uncertainty threshold within safe bounds.
+/// Returns (old, new) when a change is applied.
+pub fn apply_bounded_autotune_from_failure_ratio(
+    failure_ratio: f64,
+    enforce: bool,
+) -> Option<(f32, f32)> {
+    if !enforce {
+        return None;
+    }
+    let old_bp = POLICY_TUNABLES
+        .uncertainty_threshold_bp
+        .load(Ordering::SeqCst);
+    let old = old_bp as f32 / 10_000.0;
+    let mut next = old;
+    // High failure ratio -> tighten policy (ask clarification earlier).
+    if failure_ratio >= 0.25 {
+        next = (next - 0.02).max(0.45);
+    // Low failure ratio -> relax slightly.
+    } else if failure_ratio <= 0.05 {
+        next = (next + 0.01).min(0.75);
+    }
+    if (next - old).abs() < f32::EPSILON {
+        return None;
+    }
+    let next_bp = (next * 10_000.0) as u64;
+    POLICY_TUNABLES
+        .uncertainty_threshold_bp
+        .store(next_bp, Ordering::SeqCst);
+    Some((old, next))
+}
 
 /// Context accumulated during handle_message for post-task learning.
 struct LearningContext {
     user_text: String,
+    intent_domains: Vec<String>,
     tool_calls: Vec<String>,     // "tool_name(summary)"
     errors: Vec<(String, bool)>, // (error_text, was_recovered)
     first_error: Option<String>,
@@ -54,6 +237,8 @@ struct LearningContext {
     #[allow(dead_code)] // Reserved for duration-based learning
     start_time: chrono::DateTime<Utc>,
     completed_naturally: bool,
+    explicit_positive_signals: u32,
+    explicit_negative_signals: u32,
 }
 
 /// Best-effort send — never blocks the agent loop if the receiver is slow/full.
@@ -132,18 +317,1300 @@ fn summarize_tool_args(name: &str, arguments: &str) -> String {
     }
 }
 
+/// Remove a top-level markdown section and its body (until next "## " heading).
+fn strip_markdown_section(prompt: &str, heading: &str) -> String {
+    let mut out = String::with_capacity(prompt.len());
+    let mut skipping = false;
+
+    for line in prompt.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("## ") {
+            if trimmed.trim_end() == heading {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                skipping = false;
+            }
+        }
+
+        if !skipping {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(line);
+        }
+    }
+
+    out
+}
+
+/// Build a consultant prompt that keeps memory/context but strips tool docs.
+fn build_consultant_system_prompt(system_prompt: &str) -> String {
+    let without_tool_selection = strip_markdown_section(system_prompt, "## Tool Selection Guide");
+    let without_tools = strip_markdown_section(&without_tool_selection, "## Tools");
+    format!(
+        "{}\n[IMPORTANT: You are being consulted for your knowledge and reasoning.\n\
+         RULES:\n\
+         1. Respond with TEXT ONLY. No function calls, no tool_use blocks, no functionCall.\n\
+         2. You have no tools in this consultation step, but tools (terminal, file browsing, git, web search) \
+            ARE available in the next step. If the user asks you to perform an action that requires \
+            system access — checking files, browsing folders, running commands, git operations, \
+            inspecting code — you MUST say \"I'll need to check\" or \"Let me look into that\" \
+            instead of answering from memory alone. Do NOT say \"I cannot browse\" or \"I cannot access\".\n\
+         3. FIRST: carefully review the Known Facts and conversation history for relevant information.\n\
+         4. If you can answer fully FROM FACTS AND KNOWLEDGE (not requiring file/system access), \
+            answer directly with specific details.\n\
+         5. If the request is ambiguous and you know about multiple matching items, \
+            list what you know and ask the user which one they mean.\n\
+         6. If you don't have the information, say so clearly. \
+            State what you DO know that's related and ask the user to provide the missing detail.\n\
+         7. Be specific — reference actual names, facts, and details from your knowledge. \
+            Never give vague responses.\n\
+         8. End your response with [INTENT_GATE] followed by a JSON object. Fields:\n\
+            - `\"complexity\"`: `\"knowledge\"` if answerable from memory/facts alone, \
+            `\"simple\"` if it needs tools and can be completed in a single conversation — even if it involves multiple sequential steps \
+            (running commands, searching, writing files, etc.), \
+            `\"complex\"` ONLY if it's a persistent project requiring ongoing tracking across multiple sessions \
+            (e.g., multi-day projects, recurring monitoring, long-running deployments with follow-ups). \
+            Most requests with 2-10 tool calls are \"simple\", not \"complex\".\n\
+            - `\"cancel_intent\"`: `true` only if the user is explicitly asking to cancel/stop/abort existing in-progress work or scheduled goals. \
+            `false` for all other messages.\n\
+            - `\"cancel_scope\"`: only when `\"cancel_intent\"` is true. \
+            Use `\"generic\"` for broad cancellation requests without a specific target \
+            (e.g., \"cancel\" / \"stop current work\"). Use `\"targeted\"` when the user names \
+            a specific goal/task or provides identifying details.\n\
+            - `\"is_acknowledgment\"`: `true` if the user's message is a pure conversational acknowledgment, \
+            confirmation, or reaction (\"yes\", \"ok\", \"thanks\", \"got it\", \"sure\", \"👍\", etc. in any language) \
+            with NO embedded new request or instruction. `false` if it contains any actionable content \
+            (e.g., \"ok, now run the tests\" or \"yes, and also deploy it\").\n\
+            - If the user wants something done later or on a recurring basis, include \
+            `\"schedule_type\"` (\"one_shot\" or \"recurring\") and `\"schedule_cron\"` as a 5-field cron \
+            expression (minute hour day-of-month month day-of-week), interpreted in the system timezone. \
+            Always provide `schedule_cron` — you must normalize the user's timing into cron. \
+            Examples: \"every 5 minutes\" / \"each 5m\" → \"*/5 * * * *\", \"daily at 9am\" → \"0 9 * * *\", \
+            \"every 6h\" → \"0 */6 * * *\", \"in 2h\" → one-shot cron for 2 hours from now. \
+            Also include `\"schedule\"` with the user's original timing expression for display.\n\
+            - `\"domains\"`: optional array of explicit expertise domains for this task. \
+            Use only from this set: `\"rust\"`, `\"python\"`, `\"javascript\"`, `\"go\"`, `\"docker\"`, \
+            `\"kubernetes\"`, `\"infrastructure\"`, `\"web-frontend\"`, `\"web-backend\"`, `\"databases\"`, \
+            `\"git\"`, `\"system-admin\"`, `\"general\"`.]\n\n{}",
+        CONSULTANT_TEXT_ONLY_MARKER, without_tools
+    )
+}
+
+#[derive(Debug, Clone, Default)]
+struct IntentGateDecision {
+    can_answer_now: Option<bool>,
+    needs_tools: Option<bool>,
+    needs_clarification: Option<bool>,
+    clarifying_question: Option<String>,
+    missing_info: Vec<String>,
+    complexity: Option<String>,
+    /// LLM-classified: true when user explicitly asks to cancel active work.
+    cancel_intent: Option<bool>,
+    /// LLM-classified cancel scope: "generic" (broad cancel) or
+    /// "targeted" (specific goal/task).
+    cancel_scope: Option<String>,
+    /// LLM-classified: true when the user's message is a pure conversational
+    /// acknowledgment with no embedded request (works across all languages).
+    is_acknowledgment: Option<bool>,
+    schedule: Option<String>,
+    schedule_type: Option<String>,
+    schedule_cron: Option<String>,
+    domains: Vec<String>,
+}
+
+fn parse_intent_gate_json(text: &str) -> Option<IntentGateDecision> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    Some(IntentGateDecision {
+        can_answer_now: value.get("can_answer_now").and_then(|v| v.as_bool()),
+        needs_tools: value.get("needs_tools").and_then(|v| v.as_bool()),
+        needs_clarification: value.get("needs_clarification").and_then(|v| v.as_bool()),
+        clarifying_question: value
+            .get("clarifying_question")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        missing_info: value
+            .get("missing_info")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        complexity: value
+            .get("complexity")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty()),
+        cancel_intent: value.get("cancel_intent").and_then(|v| v.as_bool()),
+        cancel_scope: value
+            .get("cancel_scope")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| s == "generic" || s == "targeted"),
+        is_acknowledgment: value.get("is_acknowledgment").and_then(|v| v.as_bool()),
+        schedule: value
+            .get("schedule")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        schedule_type: value
+            .get("schedule_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty()),
+        schedule_cron: value
+            .get("schedule_cron")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        domains: value
+            .get("domains")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                let mut out = Vec::new();
+                for item in arr {
+                    if let Some(raw) = item.as_str() {
+                        let domain = raw.trim().to_ascii_lowercase();
+                        if !domain.is_empty() && !out.contains(&domain) {
+                            out.push(domain);
+                        }
+                    }
+                }
+                out
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn extract_intent_gate(text: &str) -> (String, Option<IntentGateDecision>) {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut cleaned = Vec::with_capacity(lines.len());
+    let mut decision: Option<IntentGateDecision> = None;
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if decision.is_none() {
+            if let Some(pos) = line.find(INTENT_GATE_MARKER) {
+                let after = line[(pos + INTENT_GATE_MARKER.len())..].trim();
+                if !after.is_empty() {
+                    decision = parse_intent_gate_json(after);
+                } else if i + 1 < lines.len() {
+                    let next = lines[i + 1].trim();
+                    if next.starts_with('{') {
+                        if let Some(parsed) = parse_intent_gate_json(next) {
+                            decision = Some(parsed);
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                i += 1;
+                continue;
+            }
+        }
+        cleaned.push(line.to_string());
+        i += 1;
+    }
+
+    // If no [INTENT_GATE] marker was found, check for a trailing JSON block
+    // at the end of the response. The model sometimes omits the marker and just
+    // appends the JSON (single-line, multi-line, or code-fenced).
+    if decision.is_none() {
+        decision = try_extract_trailing_intent_json(&mut cleaned);
+    }
+
+    (cleaned.join("\n").trim().to_string(), decision)
+}
+
+/// Scan backwards from the end of `lines` looking for a trailing JSON object
+/// that contains intent gate fields (complexity, can_answer_now, needs_tools).
+/// If found, remove those lines from `lines` and return the parsed decision.
+fn try_extract_trailing_intent_json(lines: &mut Vec<String>) -> Option<IntentGateDecision> {
+    // Find last non-empty line
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+
+    // Check for code-fence closing: strip trailing ```
+    let mut has_closing_fence = false;
+    let mut fence_end = end;
+    if lines[end - 1].trim() == "```" {
+        has_closing_fence = true;
+        fence_end = end;
+        end -= 1;
+        // Skip blanks before the closing fence
+        while end > 0 && lines[end - 1].trim().is_empty() {
+            end -= 1;
+        }
+    }
+
+    // Now find the JSON block: look for a line ending with `}` (end of JSON)
+    if end == 0 || !lines[end - 1].trim().ends_with('}') {
+        return None;
+    }
+
+    // Scan backwards to find the opening `{`
+    let json_end = end;
+    let mut json_start = end - 1;
+    let mut brace_depth = 0i32;
+    loop {
+        for ch in lines[json_start].chars().rev() {
+            if ch == '}' {
+                brace_depth += 1;
+            } else if ch == '{' {
+                brace_depth -= 1;
+            }
+        }
+        if brace_depth == 0 {
+            break;
+        }
+        if json_start == 0 {
+            return None; // Unbalanced braces, give up
+        }
+        json_start -= 1;
+    }
+
+    // Check for opening code fence before the JSON block
+    let mut has_opening_fence = false;
+    let mut actual_start = json_start;
+    if json_start > 0 {
+        let prev = lines[json_start - 1].trim();
+        if prev == "```json" || prev == "```JSON" || prev == "```" {
+            has_opening_fence = true;
+            actual_start = json_start - 1;
+        }
+    }
+
+    // Try to parse the JSON block
+    let json_text: String = lines[json_start..json_end]
+        .iter()
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        .join("");
+    let parsed = parse_intent_gate_json(&json_text)?;
+
+    // Only strip if it contains intent gate fields
+    if parsed.complexity.is_none()
+        && parsed.can_answer_now.is_none()
+        && parsed.needs_tools.is_none()
+    {
+        return None;
+    }
+
+    // Remove the JSON block (and fences if present)
+    let remove_end = if has_closing_fence {
+        fence_end
+    } else {
+        json_end
+    };
+    lines.drain(actual_start..remove_end);
+
+    // Also remove trailing empty lines that were before the JSON block
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+
+    // Require code fences to match (both present or neither)
+    if has_opening_fence != has_closing_fence {
+        // Mismatched fences — still return the parsed result but don't
+        // worry about the fence mismatch (model output is imperfect)
+    }
+
+    Some(parsed)
+}
+
+fn merge_intent_gate_decision(
+    model_decision: Option<IntentGateDecision>,
+    inferred: IntentGateDecision,
+) -> IntentGateDecision {
+    let Some(model) = model_decision else {
+        return inferred;
+    };
+    IntentGateDecision {
+        can_answer_now: model.can_answer_now.or(inferred.can_answer_now),
+        needs_tools: model.needs_tools.or(inferred.needs_tools),
+        needs_clarification: model.needs_clarification.or(inferred.needs_clarification),
+        clarifying_question: model.clarifying_question.or(inferred.clarifying_question),
+        missing_info: if model.missing_info.is_empty() {
+            inferred.missing_info
+        } else {
+            model.missing_info
+        },
+        complexity: model.complexity.or(inferred.complexity),
+        cancel_intent: model.cancel_intent.or(inferred.cancel_intent),
+        cancel_scope: model.cancel_scope.or(inferred.cancel_scope),
+        is_acknowledgment: model.is_acknowledgment.or(inferred.is_acknowledgment),
+        schedule: model.schedule.or(inferred.schedule),
+        schedule_type: model.schedule_type.or(inferred.schedule_type),
+        schedule_cron: model.schedule_cron.or(inferred.schedule_cron),
+        domains: if model.domains.is_empty() {
+            inferred.domains
+        } else {
+            model.domains
+        },
+    }
+}
+
+fn user_text_looks_ambiguous(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+
+    // If the message contains a filesystem path, the user is giving us
+    // concrete location info — never treat that as ambiguous.
+    if lower.contains('/') || lower.contains('\\') {
+        return false;
+    }
+
+    // Only flag truly bare/short references — when the entire message
+    // is basically just a pronoun or vague phrase with no actionable context.
+    // Longer messages (>40 chars) have enough context for the LLM to decide.
+    if lower.len() > 40 {
+        return false;
+    }
+
+    let phrase_ambiguous = [
+        "the site",
+        "that site",
+        "this site",
+        "that project",
+        "the project",
+        "that file",
+        "this file",
+        "that one",
+        "this one",
+        "the thing",
+        "that thing",
+    ]
+    .iter()
+    .any(|p| {
+        lower == *p || lower.starts_with(&format!("{} ", p)) || lower.contains(&format!(" {}", p))
+    });
+    if phrase_ambiguous {
+        return true;
+    }
+
+    matches!(lower.as_str(), "it" | "this" | "that")
+}
+
+#[allow(dead_code)] // Kept for potential future consultant/fallback handling.
+fn first_question_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| line.contains('?'))
+        .map(|s| s.to_string())
+}
+
+fn default_clarifying_question(user_text: &str, missing_info: &[String]) -> String {
+    if !missing_info.is_empty() {
+        return format!(
+            "Could you clarify {} so I can proceed correctly?",
+            missing_info.join(", ")
+        );
+    }
+    if user_text_looks_ambiguous(user_text) {
+        return "Could you clarify exactly which site/project/file you mean?".to_string();
+    }
+    "Could you share the missing details I need before I proceed?".to_string()
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| haystack.contains(n))
+}
+
+fn estimate_risk_from_text(user_text: &str) -> f32 {
+    let lower = user_text.to_ascii_lowercase();
+    let mut score = 0.18f32;
+
+    if contains_any(
+        &lower,
+        &[
+            "write ",
+            "edit ",
+            "change ",
+            "modify ",
+            "create ",
+            "delete ",
+            "remove ",
+            "fix ",
+            "deploy ",
+            "install ",
+            "run ",
+            "execute ",
+            "commit ",
+            "schedule ",
+        ],
+    ) {
+        score += 0.28;
+    }
+
+    if contains_any(
+        &lower,
+        &[
+            "api ",
+            "http",
+            "webhook",
+            "send ",
+            "post ",
+            "publish ",
+            "external",
+            "production",
+        ],
+    ) {
+        score += 0.20;
+    }
+
+    if contains_any(
+        &lower,
+        &[
+            "rm ",
+            "sudo",
+            "drop ",
+            "truncate ",
+            "force",
+            "dangerous",
+            "overwrite",
+        ],
+    ) {
+        score += 0.25;
+    }
+
+    score.clamp(0.0, 1.0)
+}
+
+fn infer_uncertainty_signals(user_text: &str, prior_immediate_failure: bool) -> UncertaintySignals {
+    let lower = user_text.trim().to_ascii_lowercase();
+    let missing_required_slot = user_text_looks_ambiguous(user_text)
+        || matches!(lower.as_str(), "do it" | "handle it" | "fix it" | "run it");
+
+    let conflicting_constraints = (lower.contains("quick") && lower.contains("detailed"))
+        || (lower.contains("short") && lower.contains("comprehensive"))
+        || (lower.contains("brief") && lower.contains("deep"));
+
+    let ambiguous_wording =
+        contains_any(
+            &lower,
+            &[
+                "sometime",
+                "later",
+                "soon",
+                "asap",
+                "next week",
+                "one day",
+                "eventually",
+                "whenever",
+            ],
+        ) && !contains_any(&lower, &[" at ", " on ", " by ", " cron", "every "]);
+
+    UncertaintySignals {
+        missing_required_slot,
+        conflicting_constraints,
+        ambiguous_wording,
+        prior_immediate_failure,
+    }
+}
+
+fn build_policy_bundle_v1(
+    user_text: &str,
+    available_capabilities: &HashMap<String, ToolCapabilities>,
+    prior_immediate_failure: bool,
+) -> PolicyBundle {
+    let text_risk = estimate_risk_from_text(user_text);
+    let cap_risk =
+        score_risk_from_capabilities(&available_capabilities.values().copied().collect::<Vec<_>>());
+    let risk_score = ((text_risk * 0.7) + (cap_risk * 0.3)).clamp(0.0, 1.0);
+    let uncertainty_score = score_uncertainty_v1(infer_uncertainty_signals(
+        user_text,
+        prior_immediate_failure,
+    ));
+    let confidence = (1.0 - uncertainty_score).clamp(0.0, 1.0);
+    PolicyBundle::from_scores(risk_score, uncertainty_score, confidence)
+}
+
+fn detect_explicit_outcome_signal(text: &str) -> Option<(&'static str, bool)> {
+    let lower = text.to_ascii_lowercase();
+    let positives = ["thanks", "perfect", "got it", "that worked"];
+    if positives.iter().any(|p| lower.contains(p)) {
+        return Some(("positive", true));
+    }
+    let negatives = [
+        "that's wrong",
+        "try again",
+        "not what i asked",
+        "you misunderstood",
+    ];
+    if negatives.iter().any(|n| lower.contains(n)) {
+        return Some(("negative", false));
+    }
+    None
+}
+
+fn tool_is_side_effecting(name: &str, capabilities: &HashMap<String, ToolCapabilities>) -> bool {
+    !capabilities
+        .get(name)
+        .copied()
+        .unwrap_or_default()
+        .read_only
+}
+
+/// Detect "about this scheduled goal" meta-queries so they aren't misread as
+/// fresh scheduling requests when quoted text contains timing words.
+fn is_schedule_reference_query(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    let mentions_schedule_subject = contains_keyword_as_words(&lower, "scheduled goal")
+        || contains_keyword_as_words(&lower, "recurring goal")
+        || contains_keyword_as_words(&lower, "schedule");
+
+    if !mentions_schedule_subject {
+        return false;
+    }
+
+    contains_keyword_as_words(&lower, "details about")
+        || contains_keyword_as_words(&lower, "tell me about")
+        || contains_keyword_as_words(&lower, "show me")
+        || contains_keyword_as_words(&lower, "list")
+        || contains_keyword_as_words(&lower, "what is")
+        || contains_keyword_as_words(&lower, "what's")
+        || contains_keyword_as_words(&lower, "explain")
+        || contains_keyword_as_words(&lower, "describe")
+        || lower.contains("scheduled goal:")
+}
+
+/// Detect obvious scheduling phrases in user text as a fallback when the model
+/// omits schedule fields in [INTENT_GATE].
+///
+/// Returns (schedule_raw, is_one_shot).
+fn detect_schedule_heuristic(user_text: &str) -> Option<(String, bool)> {
+    let text = user_text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if is_schedule_reference_query(text) {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+
+    // One-shot relative time, e.g. "in 2h", "in 30 minutes"
+    let re_in_time =
+        Regex::new(r"(?i)\bin\s+\d+\s*(?:m|min|mins|minutes?|h|hrs?|hours?)\b").ok()?;
+    if let Some(m) = re_in_time.find(text) {
+        return Some((m.as_str().trim().to_string(), true));
+    }
+
+    // One-shot absolute tomorrow time, e.g. "tomorrow at 9am"
+    let re_tomorrow_at =
+        Regex::new(r"(?i)\btomorrow\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b").ok()?;
+    if let Some(m) = re_tomorrow_at.find(text) {
+        return Some((m.as_str().trim().to_string(), true));
+    }
+
+    // One-shot today/tonight absolute time, optional timezone token.
+    let re_today_tonight_at = Regex::new(
+        r"(?i)\b(?:today|tonight)\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?(?:\s+[A-Za-z]{1,8}|[+-]\d{2}:?\d{2}|Z)?\b",
+    )
+    .ok()?;
+    if let Some(m) = re_today_tonight_at.find(text) {
+        return Some((m.as_str().trim().to_string(), true));
+    }
+
+    // One-shot tomorrow without explicit time (will likely require clarification later).
+    if contains_keyword_as_words(&lower, "tomorrow") {
+        return Some(("tomorrow".to_string(), true));
+    }
+
+    // Recurring intervals: "every 6h", "every 30m", "each 5 minutes"
+    let re_every_interval =
+        Regex::new(r"(?i)\b(?:every|each)\s+\d+\s*(?:m|min|mins|minutes?|h|hrs?|hours?)\b").ok()?;
+    if let Some(m) = re_every_interval.find(text) {
+        return Some((m.as_str().trim().to_string(), false));
+    }
+
+    // Recurring named schedules
+    let recurring_patterns = [
+        r"(?i)\bdaily\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
+        r"(?i)\bweekdays?\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
+        r"(?i)\bweekends?\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
+    ];
+    for pattern in recurring_patterns {
+        let re = Regex::new(pattern).ok()?;
+        if let Some(m) = re.find(text) {
+            return Some((m.as_str().trim().to_string(), false));
+        }
+    }
+
+    for kw in ["hourly", "daily", "weekly", "monthly"] {
+        if contains_keyword_as_words(&lower, kw) {
+            return Some((kw.to_string(), false));
+        }
+    }
+
+    None
+}
+
+/// Detect recurring-intent language when the user did not provide concrete timing.
+/// Used to prevent accidental fallback into non-recurring "complex" goals.
+fn looks_like_recurring_intent_without_timing(user_text: &str) -> bool {
+    if detect_schedule_heuristic(user_text).is_some() {
+        return false;
+    }
+
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    let re_times_per = match Regex::new(r"(?i)\b\d+\s+times?\s+per\s+(day|week|month)\b") {
+        Ok(re) => re,
+        Err(_) => return false,
+    };
+    if re_times_per.is_match(user_text) {
+        return true;
+    }
+
+    for kw in [
+        "monitor",
+        "recurring",
+        "ongoing",
+        "long-term",
+        "long term",
+        "regularly",
+        "consistently",
+        "every day",
+        "each day",
+        "per day",
+        "per week",
+        "per month",
+    ] {
+        if contains_keyword_as_words(&lower, kw) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Detect legacy internal-maintenance intents that should run via native
+/// heartbeat/memory jobs rather than goal orchestration.
+fn is_internal_maintenance_intent(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    if lower == "maintain knowledge base: process embeddings, consolidate memories, decay old facts"
+        || lower
+            == "maintain memory health: prune old events, clean up retention, remove stale data"
+    {
+        return true;
+    }
+
+    let knowledge_maintenance = contains_keyword_as_words(&lower, "process embeddings")
+        && contains_keyword_as_words(&lower, "consolidate memories")
+        && (contains_keyword_as_words(&lower, "decay old facts")
+            || contains_keyword_as_words(&lower, "memory decay"));
+
+    let memory_health = contains_keyword_as_words(&lower, "prune old events")
+        && (contains_keyword_as_words(&lower, "clean up retention")
+            || contains_keyword_as_words(&lower, "retention cleanup"))
+        && contains_keyword_as_words(&lower, "stale data");
+
+    knowledge_maintenance || memory_health
+}
+
+fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateDecision {
+    let user_lower = user_text.trim().to_ascii_lowercase();
+
+    // If the user's message contains a filesystem path, the request almost
+    // certainly requires tool access (terminal) — override the consultant's
+    // analysis and route to the tool loop directly.
+    let user_references_path =
+        user_lower.contains('/') || user_lower.contains('\\') || user_lower.contains("~/");
+
+    if user_references_path {
+        return IntentGateDecision {
+            can_answer_now: Some(false),
+            needs_tools: Some(true),
+            needs_clarification: Some(false),
+            clarifying_question: None,
+            missing_info: Vec::new(),
+            complexity: None,
+            cancel_intent: None,
+            cancel_scope: None,
+            is_acknowledgment: None,
+            schedule: None,
+            schedule_type: None,
+            schedule_cron: None,
+            domains: Vec::new(),
+        };
+    }
+
+    // No lexical guessing fallback: rely on explicit model intent-gate fields.
+    // Missing fields simply stay None.
+    IntentGateDecision {
+        can_answer_now: None,
+        needs_tools: None,
+        needs_clarification: None,
+        clarifying_question: None,
+        missing_info: Vec::new(),
+        complexity: None,
+        cancel_intent: None,
+        cancel_scope: None,
+        is_acknowledgment: None,
+        schedule: None,
+        schedule_type: None,
+        schedule_cron: None,
+        domains: Vec::new(),
+    }
+}
+
+// ==================== V3 Intent Classification ====================
+
+/// Complexity classification for V3 orchestration routing.
+#[derive(Debug, Clone, PartialEq)]
+enum IntentComplexity {
+    /// Answer from memory/knowledge, no executor needed.
+    Knowledge,
+    /// Simple task — falls through to full agent loop.
+    Simple,
+    /// Multi-step complex task, create a V3 goal and fall through to current agent loop.
+    Complex,
+    /// User asks for recurring/ongoing behavior but did not provide timing.
+    ScheduledMissingTiming,
+    /// Scheduled task intent requiring deferred/recurring goal creation.
+    Scheduled {
+        schedule_raw: String,
+        schedule_cron: Option<String>,
+        is_one_shot: bool,
+        schedule_type_explicit: bool,
+    },
+}
+
+/// Check if a phrase appears as complete words in text (word-boundary matching).
+/// Splits on whitespace, trims surrounding punctuation (preserving apostrophes),
+/// then checks for consecutive word matches. Case-insensitive.
+///
+/// Works for single keywords ("deploy"), multi-word phrases ("set up"),
+/// and contractions ("i'll check").
+fn contains_keyword_as_words(text: &str, keyword: &str) -> bool {
+    let normalize = |w: &str| -> String {
+        w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
+            .to_lowercase()
+    };
+    let text_words: Vec<String> = text
+        .split_whitespace()
+        .map(normalize)
+        .filter(|w| !w.is_empty())
+        .collect();
+    let kw_words: Vec<String> = keyword
+        .split_whitespace()
+        .map(normalize)
+        .filter(|w| !w.is_empty())
+        .collect();
+    if kw_words.is_empty() {
+        return false;
+    }
+    text_words
+        .windows(kw_words.len())
+        .any(|window| window == kw_words.as_slice())
+}
+
+/// Classify user intent complexity for V3 routing.
+///
+/// Uses the LLM-provided `complexity` field from the `[INTENT_GATE]` JSON.
+/// Falls back to `Simple` when the field is absent or unrecognized.
+///
+/// Guardrails override the LLM's "complex" classification for messages that
+/// are clearly simple — the consultant LLM over-classifies short commands,
+/// acknowledgments, and single-action requests as complex.
+fn classify_intent_complexity(
+    user_text: &str,
+    intent_gate: &IntentGateDecision,
+) -> (IntentComplexity, Vec<String>) {
+    // If user clearly wants recurring behavior but no timing could be extracted,
+    // ask for schedule details instead of silently creating a non-recurring goal.
+    if ENABLE_SCHEDULE_HEURISTICS
+        && intent_gate.schedule.is_none()
+        && intent_gate.schedule_cron.is_none()
+        && looks_like_recurring_intent_without_timing(user_text)
+    {
+        return (IntentComplexity::ScheduledMissingTiming, vec![]);
+    }
+
+    // Schedule takes priority over all other classifications.
+    if let Some(ref schedule_raw) = intent_gate.schedule {
+        let schedule_type_explicit = intent_gate.schedule_type.is_some();
+        let is_one_shot = intent_gate.schedule_type.as_deref() == Some("one_shot");
+        return (
+            IntentComplexity::Scheduled {
+                schedule_raw: schedule_raw.clone(),
+                schedule_cron: intent_gate.schedule_cron.clone(),
+                is_one_shot,
+                schedule_type_explicit,
+            },
+            vec![],
+        );
+    }
+    if let Some(ref schedule_cron) = intent_gate.schedule_cron {
+        let schedule_type_explicit = intent_gate.schedule_type.is_some();
+        let is_one_shot = intent_gate.schedule_type.as_deref() == Some("one_shot");
+        return (
+            IntentComplexity::Scheduled {
+                schedule_raw: schedule_cron.clone(),
+                schedule_cron: Some(schedule_cron.clone()),
+                is_one_shot,
+                schedule_type_explicit,
+            },
+            vec![],
+        );
+    }
+
+    if intent_gate.can_answer_now.unwrap_or(false) && !intent_gate.needs_tools.unwrap_or(false) {
+        return (IntentComplexity::Knowledge, vec![]);
+    }
+    // When can_answer_now=false, don't classify as Knowledge even if
+    // complexity="knowledge" — the model can't answer, so we should
+    // try tools (memory search, manage_people, etc.) as Simple.
+    match intent_gate.complexity.as_deref() {
+        Some("knowledge") => (IntentComplexity::Simple, vec![]),
+        Some("complex") => (IntentComplexity::Complex, vec![]),
+        _ => (IntentComplexity::Simple, vec![]),
+    }
+}
+
+/// Returns true if the message is a trivial acknowledgment, greeting, or
+/// single imperative command that should never be routed as Complex.
+#[allow(dead_code)] // Kept for potential future guardrail handling.
+fn is_trivial_message(lower: &str) -> bool {
+    let trivial_prefixes = [
+        "ok",
+        "okay",
+        "sure",
+        "thanks",
+        "thank you",
+        "thx",
+        "got it",
+        "cool",
+        "great",
+        "nice",
+        "yes",
+        "no",
+        "yep",
+        "nope",
+        "alright",
+        "sounds good",
+        "perfect",
+        "awesome",
+        "good",
+        "fine",
+        "right",
+        "hello",
+        "hi",
+        "hey",
+    ];
+    for prefix in &trivial_prefixes {
+        if lower.starts_with(prefix) {
+            // Exact match or followed by whitespace/punctuation
+            if lower.len() == prefix.len()
+                || lower
+                    .as_bytes()
+                    .get(prefix.len())
+                    .is_some_and(|b| !b.is_ascii_alphanumeric())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Returns true for short corrective follow-ups (not new requests), e.g.
+/// "you did send me the pdf". This is a deterministic guardrail when the
+/// consultant intent gate over-predicts `needs_tools=true`.
+fn is_short_user_correction(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower.contains('?') {
+        return false;
+    }
+
+    let word_count = lower.split_whitespace().count();
+    if word_count > 14 {
+        return false;
+    }
+
+    // If the user is clearly asking for a fresh action, this is not a correction-only turn.
+    let request_prefixes = [
+        "can you ",
+        "could you ",
+        "would you ",
+        "please ",
+        "run ",
+        "check ",
+        "find ",
+        "create ",
+        "generate ",
+        "make ",
+        "send ",
+        "open ",
+        "read ",
+        "write ",
+        "search ",
+        "install ",
+        "fix ",
+        "debug ",
+        "build ",
+        "edit ",
+        "move ",
+        "copy ",
+        "delete ",
+        "retry ",
+        "try again",
+        "proceed",
+    ];
+    if request_prefixes.iter().any(|p| lower.starts_with(p)) {
+        return false;
+    }
+    let request_phrases = [
+        " can you ",
+        " could you ",
+        " would you ",
+        " please ",
+        " try again",
+        " proceed",
+        " go ahead",
+    ];
+    if request_phrases.iter().any(|p| lower.contains(p)) {
+        return false;
+    }
+
+    let correction_markers = [
+        "you did",
+        "you already",
+        "you sent",
+        "you have sent",
+        "you did send",
+        "i already",
+        "i got",
+        "i received",
+        "that's right",
+        "thats right",
+        "correct",
+        "exactly",
+    ];
+    correction_markers.iter().any(|m| lower.contains(m))
+}
+
+/// Returns true if the message is a list of immediate tool operations that can
+/// be completed in a single agent session. These should be Simple, not Complex.
+#[allow(dead_code)] // Kept for potential future guardrail handling.
+fn is_sequential_tool_request(lower: &str) -> bool {
+    // Check for numbered list patterns (1), 2), 3) or 1. 2. 3.)
+    let has_numbered_steps = lower.contains("1)") || lower.contains("1.");
+    if !has_numbered_steps {
+        return false;
+    }
+
+    // Check if the steps are all immediate tool actions
+    let action_verbs = [
+        "run ",
+        "execute ",
+        "search ",
+        "write ",
+        "create ",
+        "check ",
+        "list ",
+        "read ",
+        "fetch ",
+        "download ",
+        "install ",
+        "find ",
+        "show ",
+        "display ",
+        "get ",
+        "send ",
+        "open ",
+        "save ",
+    ];
+    let step_count = lower.matches([')', '.']).count().min(10); // cap to avoid false positives on prose
+
+    // Count how many action verbs appear — if most steps are tool actions, it's sequential
+    let action_count = action_verbs.iter().filter(|v| lower.contains(*v)).count();
+    action_count >= 2 && step_count >= 2
+}
+
+fn is_pseudo_tool_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    lower.starts_with("[tool_use:")
+        || lower.starts_with("[tool_call:")
+        || lower.starts_with("[function_call:")
+        || lower.starts_with("[functioncall:")
+}
+
+fn is_tool_name_like(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "terminal"
+            | "browser"
+            | "web_search"
+            | "web_fetch"
+            | "system_info"
+            | "remember_fact"
+            | "manage_config"
+            | "send_file"
+            | "spawn_agent"
+            | "cli_agent"
+            | "manage_cli_agents"
+            | "health_probe"
+            | "manage_skills"
+            | "use_skill"
+            | "skill_resources"
+            | "manage_people"
+            | "http_request"
+            | "manage_oauth"
+            | "read_channel_history"
+    ) || lower.starts_with("mcp__")
+        || lower.contains("__")
+}
+
+fn parse_name_field(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let (key, value) = trimmed.split_once(':')?;
+    if !key.trim().eq_ignore_ascii_case("name") {
+        return None;
+    }
+    let name = value.trim();
+    if name.is_empty() || name.contains(' ') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn looks_like_deferred_action_response(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+
+    // Pattern-based detection: catch "I'll [verb]", "I will [verb]", "Let me [verb]",
+    // "Shall I [verb]", "Would you like me to [verb]" where verb needs tools.
+    // This is dynamic — any new action verb the LLM uses is automatically caught.
+    if has_action_promise(&lower) {
+        return true;
+    }
+
+    // Special-case phrases that don't fit the prefix+verb pattern
+    if contains_keyword_as_words(&lower, "i would typically") {
+        return true;
+    }
+
+    // Structural format markers — substring match appropriate for these patterns
+    lower.contains("[consultation]")
+        || lower.contains(&INTENT_GATE_MARKER.to_ascii_lowercase())
+        || lower.contains("[tool_use:")
+        || lower.contains("[tool_call:")
+        || lower.contains("arguments:")
+}
+
+/// Detect action-promise patterns like "I'll create", "I will run", "Let me check".
+/// Returns true when the verb following the prefix is NOT a knowledge-only verb
+/// (e.g., "explain", "describe", "summarize"), meaning the LLM needs tools to fulfill it.
+fn has_action_promise(text: &str) -> bool {
+    // Normalize common Unicode apostrophes so contractions like "I’ll"
+    // are treated the same as "I'll".
+    let normalized = text.replace(['\u{2018}', '\u{2019}', '`', '\u{02BC}'], "'");
+
+    // Verbs the LLM can fulfill without tools — pure knowledge/explanation verbs
+    const KNOWLEDGE_ONLY_VERBS: &[&str] = &[
+        "explain",
+        "describe",
+        "summarize",
+        "clarify",
+        "elaborate",
+        "outline",
+        "note",
+        "mention",
+        "address",
+        "highlight",
+        "tell",
+        "share",
+        "say",
+        "answer",
+        "provide",
+        "be",
+        "give",
+        "offer",
+        "rephrase",
+        "restate",
+    ];
+
+    let words: Vec<String> = normalized
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    for i in 0..words.len() {
+        // Determine the index of the verb after the action-promise prefix
+        let verb_idx = if words[i] == "i'll" {
+            // "I'll [verb]"
+            Some(i + 1)
+        } else if words[i] == "i" && words.get(i + 1).is_some_and(|w| w == "will") {
+            // "I will [verb]"
+            Some(i + 2)
+        } else if words[i] == "let" && words.get(i + 1).is_some_and(|w| w == "me") {
+            // "Let me [verb]"
+            Some(i + 2)
+        } else if words[i] == "shall" && words.get(i + 1).is_some_and(|w| w == "i") {
+            // "Shall I [verb]"
+            Some(i + 2)
+        } else if words[i] == "would"
+            && words.get(i + 1).is_some_and(|w| w == "you")
+            && words.get(i + 2).is_some_and(|w| w == "like")
+            && words.get(i + 3).is_some_and(|w| w == "me")
+            && words.get(i + 4).is_some_and(|w| w == "to")
+        {
+            // "Would you like me to [verb]"
+            Some(i + 5)
+        } else {
+            None
+        };
+
+        if let Some(vi) = verb_idx {
+            if let Some(verb) = words.get(vi) {
+                if !KNOWLEDGE_ONLY_VERBS.contains(&verb.as_str()) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Remove leaked consultant control markers and pseudo tool-call text.
+fn sanitize_consultant_analysis(analysis: &str) -> String {
+    let lines: Vec<&str> = analysis.lines().collect();
+    let has_pseudo_tool_block = lines.iter().any(|line| is_pseudo_tool_line(line));
+
+    let mut cleaned: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+
+        if lower == "arguments:" {
+            let mut j = i + 1;
+            let mut block_has_tool_signature = false;
+            while j < lines.len() {
+                let next = lines[j].trim();
+                if next.is_empty() {
+                    break;
+                }
+                if let Some(name) = parse_name_field(next) {
+                    if is_tool_name_like(&name) {
+                        block_has_tool_signature = true;
+                    }
+                }
+                let next_lower = next.to_ascii_lowercase();
+                if next_lower.starts_with("cmd:")
+                    || next_lower.starts_with("command:")
+                    || next_lower.starts_with("args:")
+                    || next_lower.starts_with("arguments:")
+                {
+                    block_has_tool_signature = true;
+                }
+                j += 1;
+            }
+
+            if block_has_tool_signature {
+                i = j;
+                continue;
+            }
+        }
+
+        if is_pseudo_tool_line(line) {
+            i += 1;
+            continue;
+        }
+
+        let replaced = line.replace(CONSULTANT_TEXT_ONLY_MARKER, "");
+        let trimmed_replaced = replaced.trim();
+        let lower_replaced = trimmed_replaced.to_ascii_lowercase();
+
+        if lower_replaced == "[consultation]" {
+            i += 1;
+            continue;
+        }
+
+        if lower_replaced.starts_with(&INTENT_GATE_MARKER.to_ascii_lowercase()) {
+            i += 1;
+            continue;
+        }
+
+        // Some models echo the consultant control instruction verbatim.
+        if lower_replaced.starts_with("[important:")
+            && lower_replaced.contains("you are being consulted")
+            && lower_replaced.contains("respond with text only")
+        {
+            i += 1;
+            continue;
+        }
+
+        if has_pseudo_tool_block
+            && (lower_replaced.starts_with("cmd:")
+                || lower_replaced.starts_with("command:")
+                || lower_replaced.starts_with("args:")
+                || lower_replaced.starts_with("arguments:")
+                || parse_name_field(trimmed_replaced)
+                    .as_deref()
+                    .is_some_and(is_tool_name_like))
+        {
+            i += 1;
+            continue;
+        }
+
+        if trimmed_replaced.is_empty() {
+            if cleaned.last().is_some_and(|prev| prev.is_empty()) {
+                i += 1;
+                continue;
+            }
+            cleaned.push(String::new());
+        } else {
+            cleaned.push(replaced.trim_end().to_string());
+        }
+        i += 1;
+    }
+
+    cleaned.join("\n").trim().to_string()
+}
+
 pub struct Agent {
     provider: Arc<dyn ModelProvider>,
     state: Arc<dyn StateStore>,
     event_store: Arc<EventStore>,
-    plan_store: Option<Arc<PlanStore>>,
-    step_tracker: Option<Arc<StepTracker>>,
     tools: Vec<Arc<dyn Tool>>,
     model: RwLock<String>,
     fallback_model: RwLock<String>,
     system_prompt: String,
     config_path: PathBuf,
-    skills: SharedSkillRegistry,
+    skills_dir: PathBuf,
     /// Current recursion depth (0 = root agent).
     depth: usize,
     /// Maximum allowed recursion depth for sub-agent spawning.
@@ -180,6 +1647,1002 @@ pub struct Agent {
     verification_tracker: Option<Arc<VerificationTracker>>,
     /// Optional MCP server registry for dynamic, context-aware MCP tool injection.
     mcp_registry: Option<McpRegistry>,
+    /// V3 role for this agent instance.
+    role: AgentRole,
+    /// V3 task ID for executor agents — enables activity logging.
+    v3_task_id: Option<String>,
+    /// V3 goal ID for task lead agents — enables context injection into spawn calls.
+    v3_goal_id: Option<String>,
+    /// Cancellation token — checked each iteration; cancelled by parent or user.
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Goal cancellation token registry — shared across agent hierarchy.
+    goal_token_registry: Option<GoalTokenRegistry>,
+    /// Weak reference to the ChannelHub for background notifications.
+    /// Uses RwLock because hub is created after Agent (core.rs ordering).
+    hub: RwLock<Option<Weak<ChannelHub>>>,
+    /// Weak self-reference for background task spawning.
+    /// Set after Arc creation via `set_self_ref()`.
+    self_ref: RwLock<Option<Weak<Agent>>>,
+    /// Context window management configuration.
+    context_window_config: crate::config::ContextWindowConfig,
+    /// Policy rollout and enforcement configuration.
+    policy_config: PolicyConfig,
+    /// Runtime state: whether legacy classify_query() routing has graduated/retired.
+    classify_query_retired: AtomicBool,
+    /// Last graduation check epoch seconds (throttles DB checks).
+    last_graduation_check_epoch: AtomicU64,
+    /// Full tool list from the root agent — used by TaskLead when spawning
+    /// Executor children so they can access Action tools that were filtered
+    /// out of the TaskLead's own `tools` vec.
+    root_tools: Option<Vec<Arc<dyn Tool>>>,
+    /// Emit structured decision points into the event store for self-diagnostics.
+    record_decision_points: bool,
+}
+
+/// Format goal context JSON into human-readable text for the task lead prompt.
+fn format_goal_context(ctx_json: &str) -> String {
+    let ctx: serde_json::Value = match serde_json::from_str(ctx_json) {
+        Ok(v) => v,
+        Err(_) => return ctx_json.to_string(),
+    };
+
+    let mut output = String::new();
+
+    if let Some(facts) = ctx.get("relevant_facts").and_then(|v| v.as_array()) {
+        if !facts.is_empty() {
+            output.push_str("\n### Relevant Facts\n");
+            for f in facts {
+                let cat = f.get("category").and_then(|v| v.as_str()).unwrap_or("?");
+                let key = f.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+                let val = f.get("value").and_then(|v| v.as_str()).unwrap_or("?");
+                output.push_str(&format!("- [{}] {}: {}\n", cat, key, val));
+            }
+        }
+    }
+
+    if let Some(procs) = ctx.get("relevant_procedures").and_then(|v| v.as_array()) {
+        if !procs.is_empty() {
+            output.push_str("\n### Relevant Procedures\n");
+            for p in procs {
+                let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let trigger = p.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
+                output.push_str(&format!("- **{}** (trigger: {})\n", name, trigger));
+                if let Some(steps) = p.get("steps").and_then(|v| v.as_array()) {
+                    for (i, step) in steps.iter().enumerate() {
+                        let s = step.as_str().unwrap_or("?");
+                        output.push_str(&format!("  {}. {}\n", i + 1, s));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(results) = ctx.get("task_results").and_then(|v| v.as_array()) {
+        if !results.is_empty() {
+            output.push_str("\n### Completed Task Results\n");
+            for r in results {
+                if let Some(s) = r.as_str() {
+                    // Compressed entry
+                    output.push_str(&format!("- {}\n", s));
+                } else {
+                    let desc = r.get("description").and_then(|v| v.as_str()).unwrap_or("?");
+                    let summary = r
+                        .get("result_summary")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no summary)");
+                    output.push_str(&format!("- {}: {}\n", desc, summary));
+                }
+            }
+        }
+    }
+
+    if output.is_empty() {
+        "(no relevant prior knowledge)".to_string()
+    } else {
+        output
+    }
+}
+
+/// Blocked path patterns for auto-sent files (mirrors SendFileTool).
+const AUTO_SEND_BLOCKED_PATTERNS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".env",
+    "credentials",
+    ".key",
+    ".pem",
+    ".aws/credentials",
+    ".netrc",
+    ".docker/config.json",
+    "config.toml",
+];
+
+/// Extract absolute file paths from text (e.g. goal completion messages).
+/// Only returns paths that exist on disk and aren't security-sensitive.
+pub(crate) fn extract_file_paths_from_text(text: &str) -> Vec<String> {
+    let re = regex::Regex::new(r"(/[\w./-]+\.\w{1,10})").unwrap();
+    let mut paths = Vec::new();
+    for cap in re.captures_iter(text) {
+        let path_str = &cap[1];
+        let path = std::path::Path::new(path_str);
+
+        // Must exist and be a regular file
+        if !path.exists() || !path.is_file() {
+            continue;
+        }
+
+        // Check against blocked patterns
+        let path_display = path.to_string_lossy();
+        let blocked = AUTO_SEND_BLOCKED_PATTERNS.iter().any(|pattern| {
+            if pattern.starts_with('.') || pattern.starts_with('/') {
+                path_display.contains(&format!("/{}", pattern))
+                    || path_display.contains(&format!("/{}/", pattern))
+            } else {
+                path.file_name()
+                    .map(|n| n.to_string_lossy() == *pattern)
+                    .unwrap_or(false)
+                    || path_display.contains(&format!("/{}", pattern))
+                    || path_display.contains(&format!("/{}/", pattern))
+            }
+        });
+        if blocked {
+            continue;
+        }
+
+        // Also block .key and .pem extensions
+        if let Some(ext) = path.extension() {
+            let ext = ext.to_string_lossy();
+            if ext == "key" || ext == "pem" {
+                continue;
+            }
+        }
+
+        paths.push(path_str.to_string());
+    }
+    paths
+}
+
+/// Parse simple wait instructions like "Wait for 5 minutes." into seconds.
+/// Returns None when the task is not a plain wait command.
+fn parse_wait_task_seconds(task_description: &str) -> Option<u64> {
+    static WAIT_TASK_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)^\s*wait\s+for\s+(\d+)\s*(seconds?|secs?|s|minutes?|mins?|min|m|hours?|hrs?|h)\b",
+        )
+        .expect("wait task regex should compile")
+    });
+
+    let caps = WAIT_TASK_RE.captures(task_description.trim())?;
+    let value: u64 = caps.get(1)?.as_str().parse().ok()?;
+    let unit = caps.get(2)?.as_str().to_ascii_lowercase();
+
+    match unit.as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => Some(value),
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(value.saturating_mul(60)),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(value.saturating_mul(3600)),
+        _ => None,
+    }
+}
+
+/// Check whether a session ID corresponds to a group/public channel (not a DM).
+/// Used to suppress noisy progress updates in shared channels.
+pub fn is_group_session(session_id: &str) -> bool {
+    // Discord guild channels: "discord:ch:{channel_id}" or "{bot}:discord:ch:{channel_id}"
+    if session_id.contains(":ch:") {
+        return true;
+    }
+    // Slack public/private channels: IDs start with C (public) or G (group/private).
+    // DMs start with D. Formats: "slack:C123", "slack:G123", "{bot}:slack:C123",
+    // "slack:C123:thread_ts"
+    if let Some(idx) = session_id.rfind("slack:") {
+        let after_slack = &session_id[idx + 6..];
+        if after_slack.starts_with('C') || after_slack.starts_with('G') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Spawn a V3 task lead in the background (free function to satisfy Send requirements).
+/// This runs `spawn_child` on the given agent with TaskLead role, then updates
+/// the goal and notifies the user when complete.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_background_task_lead(
+    agent: Arc<Agent>,
+    goal: crate::traits::GoalV3,
+    user_text: String,
+    session_id: String,
+    channel_ctx: ChannelContext,
+    user_role: UserRole,
+    state: Arc<dyn crate::traits::StateStore>,
+    hub: Option<Weak<crate::channels::ChannelHub>>,
+    goal_token_registry: Option<crate::goal_tokens::GoalTokenRegistry>,
+    dispatch_trigger_task_id: Option<String>,
+) {
+    tokio::spawn(async move {
+        let goal_id = goal.id.clone();
+        let mission = goal.description.clone();
+        // Clone channel_ctx and user_role for potential direct fallback and auto-dispatch
+        let fallback_channel_ctx = channel_ctx.clone();
+        let dispatch_channel_ctx = channel_ctx.clone();
+        let fallback_user_role = user_role;
+
+        // Heartbeat dispatch claims a "trigger" task before spawning this background
+        // lead. Mark that trigger task complete immediately so it does not remain
+        // stuck in claimed/interrupted state while real subtasks execute.
+        if let Some(trigger_task_id) = dispatch_trigger_task_id {
+            match state.get_task_v3(&trigger_task_id).await {
+                Ok(Some(task)) if task.status == "claimed" || task.status == "running" => {
+                    let mut updated = task.clone();
+                    updated.status = "completed".to_string();
+                    updated.result =
+                        Some("Task lead dispatched for deferred goal execution.".to_string());
+                    updated.error = None;
+                    updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    if let Err(e) = state.update_task_v3(&updated).await {
+                        warn!(
+                            task_id = %trigger_task_id,
+                            goal_id = %goal_id,
+                            error = %e,
+                            "Failed to mark dispatch trigger task completed"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        task_id = %trigger_task_id,
+                        goal_id = %goal_id,
+                        error = %e,
+                        "Failed to load dispatch trigger task"
+                    );
+                }
+            }
+        }
+
+        // Progress heartbeat: send periodic status updates while the task lead works.
+        // This prevents the "goal appears abandoned" UX problem where the user sees
+        // nothing between "On it." and the final notification.
+        // Only send progress updates to DM sessions — group channels already have the
+        // "Running scheduled task" notification and the final result. Progress updates
+        // every 30s are too noisy for shared channels.
+        let is_group_channel = is_group_session(&session_id);
+        let heartbeat_hub = hub.clone();
+        let heartbeat_session = session_id.clone();
+        let heartbeat_state = state.clone();
+        let heartbeat_goal_id = goal_id.clone();
+        let (heartbeat_cancel_tx, mut heartbeat_cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let heartbeat_handle = tokio::spawn(async move {
+            if is_group_channel {
+                // In group channels, just wait for cancellation — no progress spam
+                let _ = heartbeat_cancel_rx.await;
+                return;
+            }
+            let mut interval_count = 0u32;
+            loop {
+                // First update after 15s, then every 30s
+                let wait_secs = if interval_count == 0 { 15 } else { 30 };
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(wait_secs)) => {},
+                    _ = &mut heartbeat_cancel_rx => break,
+                }
+                interval_count += 1;
+
+                // Build progress message from task statuses
+                let tasks = heartbeat_state
+                    .get_tasks_for_goal_v3(&heartbeat_goal_id)
+                    .await
+                    .unwrap_or_default();
+                if tasks.is_empty() {
+                    // Tasks not yet created — generic message
+                    if let Some(hub_weak) = &heartbeat_hub {
+                        if let Some(hub_arc) = hub_weak.upgrade() {
+                            let _ = hub_arc
+                                .send_text(
+                                    &heartbeat_session,
+                                    "⏳ Still working on your request — planning the steps...",
+                                )
+                                .await;
+                        }
+                    }
+                } else {
+                    // Count genuinely completed tasks (exclude cancelled ones with errors)
+                    let completed = tasks
+                        .iter()
+                        .filter(|t| t.status == "completed" && t.error.is_none())
+                        .count();
+                    let total = tasks.len();
+                    let in_progress: Vec<&str> = tasks
+                        .iter()
+                        .filter(|t| t.status == "claimed" || t.status == "pending")
+                        .take(2)
+                        .map(|t| t.description.as_str())
+                        .collect();
+                    let progress_msg = if in_progress.is_empty() && completed == total {
+                        format!("⏳ Progress: {}/{} steps completed", completed, total)
+                    } else if in_progress.is_empty() {
+                        "⏳ Still working on your request...".to_string()
+                    } else {
+                        format!(
+                            "⏳ Progress: {}/{} steps completed. Working on: {}",
+                            completed,
+                            total,
+                            in_progress.join(", ")
+                        )
+                    };
+                    if let Some(hub_weak) = &heartbeat_hub {
+                        if let Some(hub_arc) = hub_weak.upgrade() {
+                            let _ = hub_arc.send_text(&heartbeat_session, &progress_msg).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let result = agent
+            .spawn_child(
+                &mission,
+                &user_text,
+                None,
+                channel_ctx,
+                fallback_user_role,
+                Some(AgentRole::TaskLead),
+                Some(goal_id.as_str()),
+                None,
+            )
+            .await;
+
+        // Deliver the task lead result to the originating channel.
+        // Without this, scheduled/background task results are stored in DB
+        // but never sent to the user (notifications only fire on goal completion).
+        let mut delivered_directly = false;
+        if let Ok(ref response) = result {
+            if !response.trim().is_empty() {
+                if let Some(hub_weak) = &hub {
+                    if let Some(hub_arc) = hub_weak.upgrade() {
+                        if hub_arc.send_text(&session_id, response).await.is_ok() {
+                            delivered_directly = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Auto-dispatch: dispatch remaining pending tasks after task lead returns.
+        // This handles both cases: LLMs that create tasks but don't spawn executors,
+        // AND task leads that completed some tasks but left others pending.
+        // Uses a loop to re-evaluate after each batch — completing a task may
+        // unblock dependent tasks that weren't dispatchable in the previous pass.
+        {
+            let max_dispatch_rounds = 10; // safety limit
+            for _round in 0..max_dispatch_rounds {
+                let all_tasks: Vec<crate::traits::TaskV3> = state
+                    .get_tasks_for_goal_v3(&goal_id)
+                    .await
+                    .unwrap_or_default();
+
+                // Build set of completed task IDs for dependency checking
+                let completed_ids: std::collections::HashSet<String> = all_tasks
+                    .iter()
+                    .filter(|t| t.status == "completed" || t.status == "skipped")
+                    .map(|t| t.id.clone())
+                    .collect();
+
+                // Filter to pending tasks whose dependencies are all met
+                let dispatchable: Vec<crate::traits::TaskV3> = all_tasks
+                    .iter()
+                    .filter(|t| t.status == "pending")
+                    .filter(|t| match &t.depends_on {
+                        None => true,
+                        Some(deps_json) => serde_json::from_str::<Vec<String>>(deps_json)
+                            .unwrap_or_default()
+                            .iter()
+                            .all(|dep_id| completed_ids.contains(dep_id)),
+                    })
+                    .cloned()
+                    .collect();
+
+                if dispatchable.is_empty() {
+                    break; // No more tasks to dispatch
+                }
+
+                // Conservative fallback behavior: only dispatch the earliest
+                // task_order in each round. This preserves intended sequencing
+                // when a task lead created ordered tasks but omitted depends_on.
+                let min_task_order = dispatchable.iter().map(|t| t.task_order).min().unwrap_or(0);
+                let dispatch_batch: Vec<crate::traits::TaskV3> = dispatchable
+                    .into_iter()
+                    .filter(|t| t.task_order == min_task_order)
+                    .collect();
+
+                info!(
+                    goal_id = %goal_id,
+                    count = dispatch_batch.len(),
+                    task_order = min_task_order,
+                    round = _round,
+                    "Auto-dispatching pending tasks after task lead"
+                );
+
+                for task in &dispatch_batch {
+                    // Claim the task
+                    let claimed = match state
+                        .claim_task_v3(&task.id, &format!("auto-dispatch-{}", goal_id))
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    if !claimed {
+                        continue;
+                    }
+
+                    // Execute pure wait tasks locally to avoid unnecessary LLM
+                    // calls and provider rate-limit churn.
+                    if let Some(wait_secs) = parse_wait_task_seconds(&task.description) {
+                        info!(
+                            goal_id = %goal_id,
+                            task_id = %task.id,
+                            wait_secs,
+                            "Executing wait task locally"
+                        );
+
+                        // Keep the claimed task fresh so heartbeat stuck-task
+                        // detection does not interrupt legitimate waits.
+                        let mut remaining = wait_secs;
+                        while remaining > 0 {
+                            let step = remaining.min(60);
+                            tokio::time::sleep(Duration::from_secs(step)).await;
+                            remaining = remaining.saturating_sub(step);
+                            if remaining > 0 {
+                                if let Ok(Some(mut claimed_task)) =
+                                    state.get_task_v3(&task.id).await
+                                {
+                                    claimed_task.started_at = Some(chrono::Utc::now().to_rfc3339());
+                                    claimed_task.status = "claimed".to_string();
+                                    let _ = state.update_task_v3(&claimed_task).await;
+                                }
+                            }
+                        }
+
+                        if let Ok(Some(mut completed_task)) = state.get_task_v3(&task.id).await {
+                            completed_task.status = "completed".to_string();
+                            completed_task.result =
+                                Some(format!("Waited for {} second(s).", wait_secs));
+                            completed_task.error = None;
+                            completed_task.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                            let _ = state.update_task_v3(&completed_task).await;
+                        }
+                        continue;
+                    }
+
+                    // Spawn executor
+                    let exec_result = agent
+                        .spawn_child(
+                            &task.description,
+                            &task.description,
+                            None,
+                            dispatch_channel_ctx.clone(),
+                            fallback_user_role,
+                            Some(AgentRole::Executor),
+                            Some(goal_id.as_str()),
+                            Some(task.id.as_str()),
+                        )
+                        .await;
+
+                    // Update task with result and deliver to channel
+                    let mut updated = task.clone();
+                    match exec_result {
+                        Ok(response) => {
+                            // Deliver executor result to the originating channel
+                            if !response.trim().is_empty() {
+                                if let Some(hub_weak) = &hub {
+                                    if let Some(hub_arc) = hub_weak.upgrade() {
+                                        let _ = hub_arc.send_text(&session_id, &response).await;
+                                    }
+                                }
+                            }
+                            updated.status = "completed".to_string();
+                            updated.result = Some(response);
+                            updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        }
+                        Err(e) => {
+                            updated.status = "failed".to_string();
+                            updated.error = Some(e.to_string());
+                        }
+                    }
+                    let _ = state.update_task_v3(&updated).await;
+                }
+            }
+        }
+
+        // Stop the heartbeat
+        let _ = heartbeat_cancel_tx.send(());
+        let _ = heartbeat_handle.await;
+
+        // Check the actual goal status from DB — the task lead may have already
+        // set it via complete_goal/fail_goal. Only update if still "active".
+        let current_goal = state.get_goal_v3(&goal.id).await;
+        let needs_status_update = match &current_goal {
+            Ok(Some(g)) => g.status == "active" || g.status == "pending",
+            _ => true, // fallback: update if we can't read
+        };
+
+        if needs_status_update {
+            // Task lead returned without explicitly completing/failing the goal.
+            // Use progress-based circuit breaker: compare completed task count
+            // before vs after to detect whether the dispatch made progress.
+            let completed_after = state
+                .count_completed_tasks_for_goal(&goal_id)
+                .await
+                .unwrap_or(0);
+
+            let tasks = state
+                .get_tasks_for_goal_v3(&goal_id)
+                .await
+                .unwrap_or_default();
+            let all_done = !tasks.is_empty()
+                && tasks
+                    .iter()
+                    .all(|t| t.status == "completed" || t.status == "skipped");
+
+            let mut updated_goal = match state.get_goal_v3(&goal_id).await {
+                Ok(Some(g)) => g,
+                _ => goal,
+            };
+
+            // For finite goals: detect when no tasks were completed after
+            // the task lead finished — fail immediately since there's no
+            // re-dispatch mechanism for finite goals.
+            let is_finite = updated_goal.goal_type == "finite";
+            let any_completed = tasks.iter().any(|t| t.status == "completed");
+            let no_tasks_completed_finite = is_finite && !tasks.is_empty() && !any_completed;
+
+            if all_done {
+                // All tasks finished — goal is complete
+                updated_goal.status = "completed".to_string();
+                updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                updated_goal.dispatch_failures = 0;
+            } else if no_tasks_completed_finite {
+                // Finite goal with zero completed tasks — fail fast.
+                // This covers tasks stuck in any non-completed status:
+                // pending, claimed, blocked, or failed. Since finite goals
+                // have no re-dispatch loop, waiting is pointless.
+                updated_goal.status = "failed".to_string();
+                updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                let pending = tasks
+                    .iter()
+                    .filter(|t| t.status == "pending" || t.status == "claimed")
+                    .count();
+                let blocked = tasks.iter().filter(|t| t.status == "blocked").count();
+                let failed = tasks.iter().filter(|t| t.status == "failed").count();
+                info!(
+                    goal_id = %goal_id,
+                    pending,
+                    blocked,
+                    failed,
+                    "Finite goal failed: no tasks completed after dispatch"
+                );
+            } else if result.is_err() {
+                // Task lead crashed — count as no progress
+                updated_goal.dispatch_failures += 1;
+                info!(
+                    goal_id = %goal_id,
+                    dispatch_failures = updated_goal.dispatch_failures,
+                    "Task lead errored, incrementing dispatch_failures"
+                );
+            } else if is_finite {
+                // Finite goal with some tasks completed but others remain.
+                // Since finite goals have no re-dispatch, mark as completed
+                // (partial success) rather than leaving it stuck.
+                let completed_count = tasks
+                    .iter()
+                    .filter(|t| t.status == "completed" && t.error.is_none())
+                    .count();
+                let failed_count = tasks.iter().filter(|t| t.status == "failed").count();
+                let blocked_count = tasks.iter().filter(|t| t.status == "blocked").count();
+                let remaining = tasks
+                    .iter()
+                    .filter(|t| t.status != "completed" && t.status != "skipped")
+                    .count();
+                updated_goal.status = "completed".to_string();
+                updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
+
+                // Store completion summary in context for notification enrichment
+                if failed_count > 0 || blocked_count > 0 {
+                    let summary = serde_json::json!({
+                        "partial_success": true,
+                        "completed": completed_count,
+                        "failed": failed_count,
+                        "blocked": blocked_count,
+                        "total": tasks.len(),
+                    });
+                    updated_goal.context = Some(summary.to_string());
+                }
+                info!(
+                    goal_id = %goal_id,
+                    completed_count,
+                    failed_count,
+                    blocked_count,
+                    remaining,
+                    "Finite goal partially completed after dispatch"
+                );
+            } else {
+                // Continuous goal: task lead returned Ok but tasks remain.
+                // Check if any tasks were completed recently during this dispatch.
+                let recently_completed = tasks.iter().any(|t| {
+                    t.status == "completed"
+                        && t.completed_at.as_ref().is_some_and(|ca| {
+                            chrono::DateTime::parse_from_rfc3339(ca)
+                                .map(|dt| {
+                                    let age = chrono::Utc::now() - dt.with_timezone(&chrono::Utc);
+                                    age.num_minutes() < 30
+                                })
+                                .unwrap_or(false)
+                        })
+                });
+
+                // Check if all remaining non-completed tasks are blocked
+                // (waiting on external input/dependencies). Blocked tasks are
+                // waiting, not failing — don't count as "no progress".
+                let all_remaining_blocked = tasks
+                    .iter()
+                    .filter(|t| t.status != "completed" && t.status != "skipped")
+                    .all(|t| t.status == "blocked");
+
+                if recently_completed {
+                    // Progress was made — reset failures
+                    updated_goal.dispatch_failures = 0;
+                } else if all_remaining_blocked && !tasks.is_empty() {
+                    // All remaining tasks are blocked — don't increment failures
+                    info!(
+                        goal_id = %goal_id,
+                        blocked_tasks = tasks.iter().filter(|t| t.status == "blocked").count(),
+                        "All remaining tasks are blocked — not incrementing dispatch_failures"
+                    );
+                } else {
+                    // No progress this cycle
+                    updated_goal.dispatch_failures += 1;
+                    info!(
+                        goal_id = %goal_id,
+                        dispatch_failures = updated_goal.dispatch_failures,
+                        completed_tasks = completed_after,
+                        remaining_tasks = tasks.iter().filter(|t| t.status == "pending" || t.status == "claimed").count(),
+                        "No progress this dispatch cycle"
+                    );
+                }
+            }
+
+            // Circuit breaker: stall after 3 consecutive failures
+            const MAX_DISPATCH_FAILURES: i32 = 3;
+            if updated_goal.dispatch_failures >= MAX_DISPATCH_FAILURES
+                && updated_goal.status != "completed"
+                && updated_goal.status != "failed"
+            {
+                updated_goal.status = "stalled".to_string();
+                info!(
+                    goal_id = %goal_id,
+                    dispatch_failures = updated_goal.dispatch_failures,
+                    "Goal stalled: {} consecutive dispatch cycles with no progress",
+                    updated_goal.dispatch_failures
+                );
+            }
+
+            updated_goal.updated_at = chrono::Utc::now().to_rfc3339();
+            let _ = state.update_goal_v3(&updated_goal).await;
+
+            // If goal is stalled or failed, cancel remaining pending tasks
+            if updated_goal.status == "stalled" || updated_goal.status == "failed" {
+                let mut cancelled = 0;
+                for task in &tasks {
+                    if task.status == "pending" || task.status == "claimed" {
+                        let mut t = task.clone();
+                        t.status = "completed".to_string();
+                        t.error = Some(
+                            "Cancelled: goal stalled (no progress after 3 dispatch cycles)"
+                                .to_string(),
+                        );
+                        t.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        let _ = state.update_task_v3(&t).await;
+                        cancelled += 1;
+                    }
+                }
+                if cancelled > 0 {
+                    info!(goal_id = %goal_id, cancelled, "Cancelled orphaned tasks for stalled goal");
+                }
+            }
+        }
+
+        // Enqueue notification for delivery (persisted in SQLite).
+        // Then attempt immediate delivery via hub if available.
+        let final_goal = state.get_goal_v3(&goal_id).await;
+        let status = final_goal
+            .as_ref()
+            .ok()
+            .and_then(|g| g.as_ref())
+            .map(|g| g.status.as_str())
+            .unwrap_or("unknown");
+        // Only notify for terminal states — "active" means it's still in progress
+        if status == "active" || status == "pending" {
+            // Goal is still active, no notification needed.
+            // Clean up cancellation token and return.
+            if let Some(ref registry) = goal_token_registry {
+                registry.remove(&goal_id).await;
+            }
+            return;
+        }
+
+        // For failed/stalled finite goals: attempt direct fallback before giving up.
+        // The goal system decomposed the request into subtasks but they weren't
+        // completed. Instead of sending a cryptic failure message, try handling
+        // the request directly through the agent's main capabilities.
+        //
+        // Skip fallback if the goal was already notified — this means another
+        // task lead (e.g., spawned by the heartbeat) already handled the failure.
+        let goal_already_notified = final_goal
+            .as_ref()
+            .ok()
+            .and_then(|g| g.as_ref())
+            .map(|g| g.notified_at.is_some())
+            .unwrap_or(false);
+        let (notification_type, msg) = if (status == "failed" || status == "stalled")
+            && !goal_already_notified
+            && final_goal
+                .as_ref()
+                .ok()
+                .and_then(|g| g.as_ref())
+                .map(|g| g.goal_type == "finite")
+                .unwrap_or(false)
+        {
+            info!(goal_id = %goal_id, "Finite goal failed — attempting direct fallback");
+
+            // Mark as notified immediately to prevent the heartbeat from
+            // sending a duplicate "Goal failed" notification while the
+            // fallback is in progress.
+            let _ = state.mark_goal_notified(&goal_id).await;
+
+            // Notify user we're retrying with a different approach
+            if let Some(hub_weak) = &hub {
+                if let Some(hub_arc) = hub_weak.upgrade() {
+                    let _ = hub_arc
+                        .send_text(
+                            &session_id,
+                            "The task planner couldn't complete this. Let me try handling it directly...",
+                        )
+                        .await;
+                }
+            }
+
+            // Spawn a direct executor to handle the original request
+            // without goal/task decomposition
+            let fallback_result = agent
+                .spawn_child(
+                    &user_text,
+                    &user_text,
+                    None,
+                    fallback_channel_ctx,
+                    fallback_user_role,
+                    None, // no specific role — gets full tool access
+                    None, // no goal_id — prevents goal re-entry
+                    None,
+                )
+                .await;
+
+            match fallback_result {
+                Ok(response) if !response.trim().is_empty() => {
+                    // Direct handling succeeded — update goal to completed
+                    if let Ok(Some(mut g)) = state.get_goal_v3(&goal_id).await {
+                        g.status = "completed".to_string();
+                        g.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        g.updated_at = chrono::Utc::now().to_rfc3339();
+                        let _ = state.update_goal_v3(&g).await;
+                    }
+                    info!(goal_id = %goal_id, "Direct fallback succeeded");
+                    (
+                        "completed",
+                        format!(
+                            "Goal completed: {}",
+                            response.chars().take(4000).collect::<String>()
+                        ),
+                    )
+                }
+                _ => {
+                    // Direct handling also failed — give detailed info
+                    let tasks = state
+                        .get_tasks_for_goal_v3(&goal_id)
+                        .await
+                        .unwrap_or_default();
+                    let task_summary: String = tasks
+                        .iter()
+                        .take(5)
+                        .map(|t| {
+                            let err = t.error.as_deref().unwrap_or("no details");
+                            format!("• {} ({})", t.description, err)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    info!(goal_id = %goal_id, "Direct fallback also failed");
+                    (
+                        "failed",
+                        format!(
+                            "I wasn't able to complete your request. Here's what I tried:\n{}\n\nYou could try rephrasing or breaking it into smaller steps.",
+                            if task_summary.is_empty() {
+                                "(no task details available)".to_string()
+                            } else {
+                                task_summary
+                            }
+                        ),
+                    )
+                }
+            }
+        } else {
+            match status {
+                "completed" => {
+                    // Build notification from actual task results, not the task lead's
+                    // planning message. The task lead response is just a plan outline;
+                    // the real outputs come from the executor tasks.
+                    let completed_tasks = state
+                        .get_tasks_for_goal_v3(&goal_id)
+                        .await
+                        .unwrap_or_default();
+
+                    // Build a result summary from completed tasks (skip the echo/setup tasks
+                    // and focus on tasks that produced meaningful output)
+                    let task_results: Vec<String> = completed_tasks
+                        .iter()
+                        .filter(|t| t.status == "completed" && t.error.is_none())
+                        .filter_map(|t| {
+                            t.result.as_ref().map(|r| {
+                                let truncated: String = r.chars().take(800).collect();
+                                format!("**{}**\n{}", t.description, truncated)
+                            })
+                        })
+                        .collect();
+
+                    let task_results_summary = if task_results.is_empty() {
+                        // Fall back to task lead response if no task results exist
+                        result
+                            .as_ref()
+                            .map(|r| r.chars().take(4000).collect::<String>())
+                            .unwrap_or_else(|_| "All tasks completed.".to_string())
+                    } else {
+                        // Use the last task's result as primary output (usually the final
+                        // deliverable like a report or summary), with a brief header
+                        let last_result = task_results.last().unwrap();
+                        if task_results.len() == 1 {
+                            last_result.clone()
+                        } else {
+                            // Show count and the final result
+                            format!(
+                                "{}/{} tasks completed.\n\n{}",
+                                completed_tasks
+                                    .iter()
+                                    .filter(|t| t.status == "completed" && t.error.is_none())
+                                    .count(),
+                                completed_tasks.len(),
+                                last_result
+                            )
+                        }
+                    };
+
+                    // Check for partial success metadata in the goal context
+                    let partial_info = final_goal
+                        .as_ref()
+                        .ok()
+                        .and_then(|g| g.as_ref())
+                        .and_then(|g| g.context.as_deref())
+                        .and_then(|ctx| serde_json::from_str::<serde_json::Value>(ctx).ok())
+                        .filter(|v| {
+                            v.get("partial_success")
+                                .and_then(|p| p.as_bool())
+                                .unwrap_or(false)
+                        });
+
+                    if let Some(summary) = partial_info {
+                        let completed = summary
+                            .get("completed")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let failed = summary.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let blocked = summary.get("blocked").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let total = summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                        (
+                            "completed",
+                            format!(
+                                "Goal partially completed ({}/{} tasks succeeded, {} failed, {} blocked):\n\n{}",
+                                completed,
+                                total,
+                                failed,
+                                blocked,
+                                task_results_summary.chars().take(3500).collect::<String>()
+                            ),
+                        )
+                    } else {
+                        (
+                            "completed",
+                            format!(
+                                "Goal completed:\n\n{}",
+                                task_results_summary.chars().take(4000).collect::<String>()
+                            ),
+                        )
+                    }
+                }
+                "cancelled" => ("completed", "Goal was cancelled.".to_string()),
+                "stalled" => (
+                    "failed",
+                    format!(
+                        "Goal stalled (no progress after 3 dispatch cycles): {}",
+                        goal_id
+                    ),
+                ),
+                _ => (
+                    "failed",
+                    format!(
+                        "Goal failed: {}",
+                        result
+                            .as_ref()
+                            .err()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| {
+                                "task lead exited without completing all tasks".to_string()
+                            })
+                    ),
+                ),
+            }
+        };
+
+        // Skip completion notification if we already delivered the result directly
+        // to avoid sending the same content twice. Still notify for failures/stalls
+        // since those carry different information.
+        if delivered_directly && notification_type == "completed" {
+            let _ = state.mark_goal_notified(&goal_id).await;
+            if let Some(ref registry) = goal_token_registry {
+                registry.remove(&goal_id).await;
+            }
+            return;
+        }
+
+        let entry =
+            crate::traits::NotificationEntry::new(&goal_id, &session_id, notification_type, &msg);
+        let notification_id = entry.id.clone();
+        let _ = state.enqueue_notification(&entry).await;
+
+        // Mark goal as notified so heartbeat doesn't double-enqueue
+        let _ = state.mark_goal_notified(&goal_id).await;
+
+        // Attempt immediate delivery — if it fails, heartbeat will retry from queue
+        if let Some(hub_weak) = &hub {
+            if let Some(hub_arc) = hub_weak.upgrade() {
+                if hub_arc.send_text(&session_id, &msg).await.is_ok() {
+                    let _ = state.mark_notification_delivered(&notification_id).await;
+
+                    // Auto-send any files referenced in the completion message
+                    let file_paths = extract_file_paths_from_text(&msg);
+                    for path in file_paths {
+                        let filename = std::path::Path::new(&path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "file".to_string());
+                        let media = crate::types::MediaMessage {
+                            session_id: session_id.clone(),
+                            caption: filename.clone(),
+                            kind: crate::types::MediaKind::Document {
+                                file_path: path.clone(),
+                                filename,
+                            },
+                        };
+                        if let Err(e) = hub_arc.send_media(&session_id, &media).await {
+                            warn!("Failed to auto-send goal file {}: {}", path, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clean up cancellation token
+        if let Some(ref registry) = goal_token_registry {
+            registry.remove(&goal_id).await;
+        }
+    });
 }
 
 impl Agent {
@@ -188,13 +2651,11 @@ impl Agent {
         provider: Arc<dyn ModelProvider>,
         state: Arc<dyn StateStore>,
         event_store: Arc<EventStore>,
-        plan_store: Arc<PlanStore>,
-        step_tracker: Arc<StepTracker>,
         tools: Vec<Arc<dyn Tool>>,
         model: String,
         system_prompt: String,
         config_path: PathBuf,
-        skills: SharedSkillRegistry,
+        skills_dir: PathBuf,
         max_depth: usize,
         max_iterations: usize,
         max_iterations_cap: usize,
@@ -208,7 +2669,13 @@ impl Agent {
         task_token_budget: Option<u64>,
         llm_call_timeout_secs: Option<u64>,
         mcp_registry: Option<McpRegistry>,
+        goal_token_registry: Option<GoalTokenRegistry>,
+        hub: Option<Weak<ChannelHub>>,
+        record_decision_points: bool,
+        context_window_config: crate::config::ContextWindowConfig,
+        policy_config: PolicyConfig,
     ) -> Self {
+        init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
         let fallback = model.clone();
         let router = Router::new(models_config);
         let router = if router.is_uniform() {
@@ -245,14 +2712,12 @@ impl Agent {
             provider,
             state,
             event_store,
-            plan_store: Some(plan_store),
-            step_tracker: Some(step_tracker),
             tools,
             model: RwLock::new(model),
             fallback_model: RwLock::new(fallback),
             system_prompt,
             config_path,
-            skills,
+            skills_dir,
             depth: 0,
             max_depth,
             iteration_config,
@@ -269,7 +2734,28 @@ impl Agent {
             task_token_budget,
             verification_tracker: Some(Arc::new(VerificationTracker::new())),
             mcp_registry,
+            role: AgentRole::Orchestrator,
+            v3_task_id: None,
+            v3_goal_id: None,
+            cancel_token: None,
+            goal_token_registry,
+            hub: RwLock::new(hub),
+            self_ref: RwLock::new(None),
+            context_window_config,
+            policy_config,
+            classify_query_retired: AtomicBool::new(false),
+            last_graduation_check_epoch: AtomicU64::new(0),
+            root_tools: None, // Root agent — its own tools ARE the root tools
+            record_decision_points,
         }
+    }
+
+    /// Override agent to executor mode (depth=1) for integration tests.
+    /// This bypasses orchestrator routing so tests exercise the execution loop directly.
+    #[cfg(test)]
+    pub fn set_test_executor_mode(&mut self) {
+        self.depth = 1;
+        self.role = AgentRole::Executor;
     }
 
     /// Create an Agent with explicit depth/max_depth (used internally for sub-agents).
@@ -283,7 +2769,7 @@ impl Agent {
         model: String,
         system_prompt: String,
         config_path: PathBuf,
-        skills: SharedSkillRegistry,
+        skills_dir: PathBuf,
         depth: usize,
         max_depth: usize,
         iteration_config: IterationLimitConfig,
@@ -297,20 +2783,28 @@ impl Agent {
         llm_call_timeout: Option<Duration>,
         mcp_registry: Option<McpRegistry>,
         verification_tracker: Option<Arc<VerificationTracker>>,
+        role: AgentRole,
+        v3_task_id: Option<String>,
+        v3_goal_id: Option<String>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        goal_token_registry: Option<GoalTokenRegistry>,
+        hub: Option<Weak<ChannelHub>>,
+        record_decision_points: bool,
+        context_window_config: crate::config::ContextWindowConfig,
+        policy_config: PolicyConfig,
+        root_tools: Option<Vec<Arc<dyn Tool>>>,
     ) -> Self {
         let fallback = model.clone();
         Self {
             provider,
             state,
             event_store,
-            plan_store: None,   // Sub-agents don't manage plans
-            step_tracker: None, // Sub-agents don't manage plans
             tools,
             model: RwLock::new(model),
             fallback_model: RwLock::new(fallback),
             system_prompt,
             config_path,
-            skills,
+            skills_dir,
             depth,
             max_depth,
             iteration_config,
@@ -327,7 +2821,31 @@ impl Agent {
             task_token_budget,
             verification_tracker,
             mcp_registry,
+            role,
+            v3_task_id,
+            v3_goal_id,
+            cancel_token,
+            goal_token_registry,
+            hub: RwLock::new(hub),
+            self_ref: RwLock::new(None),
+            context_window_config,
+            policy_config,
+            classify_query_retired: AtomicBool::new(false),
+            last_graduation_check_epoch: AtomicU64::new(0),
+            root_tools,
+            record_decision_points,
         }
+    }
+
+    /// Set the ChannelHub reference (called after hub creation in core.rs).
+    pub async fn set_hub(&self, hub: Weak<ChannelHub>) {
+        *self.hub.write().await = Some(hub);
+    }
+
+    /// Set a weak self-reference for background task spawning.
+    /// Must be called after wrapping the Agent in Arc.
+    pub async fn set_self_ref(&self, weak: Weak<Agent>) {
+        *self.self_ref.write().await = Some(weak);
     }
 
     /// Current recursion depth of this agent.
@@ -338,6 +2856,11 @@ impl Agent {
     /// Maximum recursion depth allowed.
     pub fn max_depth(&self) -> usize {
         self.max_depth
+    }
+
+    /// V3 role for this agent instance.
+    pub fn role(&self) -> AgentRole {
+        self.role
     }
 
     /// Maximum agentic loop iterations per invocation.
@@ -352,6 +2875,11 @@ impl Agent {
     /// final text response. It inherits the parent's provider, state, model,
     /// and non-spawn tools. If the child hasn't reached max_depth it also gets
     /// its own `spawn_agent` tool so it can recurse further.
+    ///
+    /// When `child_role` is `Some`, tools are scoped by role:
+    /// - TaskLead: Management + Universal tools + ManageGoalTasksTool + SpawnAgentTool
+    /// - Executor: Action + Universal tools + ReportBlockerTool, NO SpawnAgentTool
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child(
         self: &Arc<Self>,
         mission: &str,
@@ -359,6 +2887,9 @@ impl Agent {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         channel_ctx: ChannelContext,
         user_role: UserRole,
+        child_role: Option<AgentRole>,
+        goal_id: Option<&str>,
+        task_id: Option<&str>,
     ) -> anyhow::Result<String> {
         if self.depth >= self.max_depth {
             anyhow::bail!(
@@ -371,30 +2902,172 @@ impl Agent {
         let model = self.model.read().await.clone();
 
         // Collect parent's non-spawn tools for the child.
-        let base_tools: Vec<Arc<dyn Tool>> = self
-            .tools
+        // Use root_tools if available (TaskLead spawning Executor needs the full
+        // unfiltered set so Action tools aren't lost through double-filtering).
+        let full_tools: Vec<Arc<dyn Tool>> = self
+            .root_tools
+            .as_ref()
+            .unwrap_or(&self.tools)
             .iter()
             .filter(|t| t.name() != "spawn_agent")
             .cloned()
             .collect();
 
-        // Build the child's system prompt with the mission context.
-        let at_max_depth = child_depth >= self.max_depth;
-        let depth_note = if at_max_depth {
-            "\nYou are at the maximum sub-agent depth. You CANNOT spawn further sub-agents; \
-            the `spawn_agent` tool is not available to you. Complete the task directly."
+        // Apply role-based tool scoping when child_role is specified.
+        let (scoped_tools, child_system_prompt, child_root_tools) = if let Some(role) = child_role {
+            match role {
+                AgentRole::TaskLead => {
+                    // Task leads get Management + Universal tools
+                    let mut tools: Vec<Arc<dyn Tool>> = full_tools
+                        .iter()
+                        .filter(|t| {
+                            matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal)
+                        })
+                        .cloned()
+                        .collect();
+                    // Add ManageGoalTasksTool
+                    if let Some(gid) = goal_id {
+                        tools.push(Arc::new(crate::tools::ManageGoalTasksTool::new(
+                            gid.to_string(),
+                            self.state.clone(),
+                        )));
+                    }
+                    // SpawnAgentTool added below (for spawning executors)
+                    let prompt = Self::build_task_lead_prompt(
+                        goal_id.unwrap_or("unknown"),
+                        task,
+                        None, // No goal context for re-spawned task leads
+                        child_depth,
+                        self.max_depth,
+                    );
+                    // Pass the full unfiltered tools as root_tools so that when
+                    // this TaskLead spawns Executor children, they can access
+                    // Action tools that were filtered out of the TaskLead's set.
+                    (tools, prompt, Some(full_tools.clone()))
+                }
+                AgentRole::Executor => {
+                    // Executors get Action + Universal tools
+                    let mut tools: Vec<Arc<dyn Tool>> = full_tools
+                        .iter()
+                        .filter(|t| matches!(t.tool_role(), ToolRole::Action | ToolRole::Universal))
+                        .cloned()
+                        .collect();
+                    // Add ReportBlockerTool
+                    if let Some(tid) = task_id {
+                        tools.push(Arc::new(crate::tools::ReportBlockerTool::new(
+                            tid.to_string(),
+                            self.state.clone(),
+                        )));
+                    }
+                    let prompt = Self::build_executor_prompt(task, child_depth, self.max_depth);
+                    // Executors never get SpawnAgentTool
+                    return self
+                        .spawn_child_inner(
+                            &tools,
+                            model,
+                            prompt,
+                            child_depth,
+                            mission,
+                            task,
+                            status_tx,
+                            channel_ctx,
+                            user_role,
+                            role,
+                            false,                          // no spawn tool
+                            task_id.map(|s| s.to_string()), // v3_task_id
+                            None,                           // v3_goal_id
+                            None, // root_tools (executors don't spawn children)
+                        )
+                        .await;
+                }
+                AgentRole::Orchestrator => {
+                    // Orchestrator: legacy behavior
+                    let at_max_depth = child_depth >= self.max_depth;
+                    let depth_note = if at_max_depth {
+                        "\nYou are at the maximum sub-agent depth. You CANNOT spawn further sub-agents; \
+                        the `spawn_agent` tool is not available to you. Complete the task directly."
+                    } else {
+                        ""
+                    };
+                    let prompt = format!(
+                        "{}\n\n## Sub-Agent Context\n\
+                        You are a sub-agent (depth {}/{}) spawned to accomplish a specific mission.\n\
+                        **Mission:** {}\n\n\
+                        Focus exclusively on this mission. Be concise. Return your findings/results \
+                        directly — they will be consumed by the parent agent.{}",
+                        self.system_prompt, child_depth, self.max_depth, mission, depth_note
+                    );
+                    (full_tools, prompt, None)
+                }
+            }
         } else {
-            ""
+            // Legacy behavior: no role scoping
+            let at_max_depth = child_depth >= self.max_depth;
+            let depth_note = if at_max_depth {
+                "\nYou are at the maximum sub-agent depth. You CANNOT spawn further sub-agents; \
+                the `spawn_agent` tool is not available to you. Complete the task directly."
+            } else {
+                ""
+            };
+            let prompt = format!(
+                "{}\n\n## Sub-Agent Context\n\
+                You are a sub-agent (depth {}/{}) spawned to accomplish a specific mission.\n\
+                **Mission:** {}\n\n\
+                Focus exclusively on this mission. Be concise. Return your findings/results \
+                directly — they will be consumed by the parent agent.{}",
+                self.system_prompt, child_depth, self.max_depth, mission, depth_note
+            );
+            (full_tools, prompt, None)
         };
-        let child_system_prompt = format!(
-            "{}\n\n## Sub-Agent Context\n\
-            You are a sub-agent (depth {}/{}) spawned to accomplish a specific mission.\n\
-            **Mission:** {}\n\n\
-            Focus exclusively on this mission. Be concise. Return your findings/results \
-            directly — they will be consumed by the parent agent.{}",
-            self.system_prompt, child_depth, self.max_depth, mission, depth_note
-        );
 
+        let effective_role = child_role.unwrap_or(AgentRole::Orchestrator);
+        let can_spawn = child_depth < self.max_depth && effective_role != AgentRole::Executor;
+
+        // For TaskLead, pass goal_id; for Orchestrator/legacy, pass None
+        let v3_goal_for_child = if effective_role == AgentRole::TaskLead {
+            goal_id.map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        self.spawn_child_inner(
+            &scoped_tools,
+            model,
+            child_system_prompt,
+            child_depth,
+            mission,
+            task,
+            status_tx,
+            channel_ctx,
+            user_role,
+            effective_role,
+            can_spawn,
+            None,              // v3_task_id
+            v3_goal_for_child, // v3_goal_id
+            child_root_tools,  // root_tools for TaskLead → Executor inheritance
+        )
+        .await
+    }
+
+    /// Internal helper to create and run a child agent.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_child_inner(
+        self: &Arc<Self>,
+        tools: &[Arc<dyn Tool>],
+        model: String,
+        system_prompt: String,
+        child_depth: usize,
+        mission: &str,
+        task: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        channel_ctx: ChannelContext,
+        user_role: UserRole,
+        role: AgentRole,
+        add_spawn_tool: bool,
+        v3_task_id: Option<String>,
+        v3_goal_id: Option<String>,
+        root_tools: Option<Vec<Arc<dyn Tool>>>,
+    ) -> anyhow::Result<String> {
         let child_session = format!("sub-{}-{}", child_depth, Uuid::new_v4());
 
         info!(
@@ -402,6 +3075,7 @@ impl Agent {
             child_depth,
             child_session = %child_session,
             mission,
+            ?role,
             "Spawning sub-agent"
         );
 
@@ -424,17 +3098,20 @@ impl Agent {
         }
 
         let start = std::time::Instant::now();
+        // Save task_id for post-completion knowledge extraction (Phase 4)
+        let saved_v3_task_id = v3_task_id.clone();
 
-        // If the child can still recurse, give it a spawn tool with a deferred
-        // agent reference (set after wrapping in Arc).
-        let result = if child_depth < self.max_depth {
+        let result = if add_spawn_tool {
             let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(
                 self.max_response_chars,
                 self.timeout_secs,
             ));
 
-            let mut child_tools = base_tools;
+            let mut child_tools: Vec<Arc<dyn Tool>> = tools.to_vec();
             child_tools.push(spawn_tool.clone());
+
+            // Derive child cancel token from parent
+            let child_cancel = self.cancel_token.as_ref().map(|t| t.child_token());
 
             let child = Arc::new(Agent::with_depth(
                 self.provider.clone(),
@@ -442,9 +3119,9 @@ impl Agent {
                 self.event_store.clone(),
                 child_tools,
                 model,
-                child_system_prompt,
+                system_prompt,
                 self.config_path.clone(),
-                self.skills.clone(),
+                self.skills_dir.clone(),
                 child_depth,
                 self.max_depth,
                 self.iteration_config.clone(),
@@ -458,6 +3135,16 @@ impl Agent {
                 self.llm_call_timeout,
                 self.mcp_registry.clone(),
                 self.verification_tracker.clone(),
+                role,
+                v3_task_id,
+                v3_goal_id,
+                child_cancel,
+                self.goal_token_registry.clone(),
+                self.hub.read().await.clone(),
+                self.record_decision_points,
+                self.context_window_config.clone(),
+                self.policy_config.clone(),
+                root_tools,
             ));
 
             // Close the loop: give the spawn tool a weak ref to the child.
@@ -474,16 +3161,18 @@ impl Agent {
                 )
                 .await
         } else {
-            // At max depth — no spawn tool, no recursion.
+            // Derive child cancel token from parent
+            let child_cancel = self.cancel_token.as_ref().map(|t| t.child_token());
+
             let child = Arc::new(Agent::with_depth(
                 self.provider.clone(),
                 self.state.clone(),
                 self.event_store.clone(),
-                base_tools,
+                tools.to_vec(),
                 model,
-                child_system_prompt,
+                system_prompt,
                 self.config_path.clone(),
-                self.skills.clone(),
+                self.skills_dir.clone(),
                 child_depth,
                 self.max_depth,
                 self.iteration_config.clone(),
@@ -497,6 +3186,16 @@ impl Agent {
                 self.llm_call_timeout,
                 self.mcp_registry.clone(),
                 self.verification_tracker.clone(),
+                role,
+                v3_task_id,
+                v3_goal_id,
+                child_cancel,
+                self.goal_token_registry.clone(),
+                self.hub.read().await.clone(),
+                self.record_decision_points,
+                self.context_window_config.clone(),
+                self.policy_config.clone(),
+                root_tools,
             ));
 
             child
@@ -535,7 +3234,314 @@ impl Agent {
                 .await;
         }
 
+        // V3 Phase 4: Spawn background knowledge extraction for completed executor tasks
+        if let Some(ref task_id) = saved_v3_task_id {
+            if result.is_ok() {
+                if let Ok(Some(completed_task)) = self.state.get_task_v3(task_id).await {
+                    if completed_task.status == "completed" {
+                        let state = self.state.clone();
+                        let provider = self.provider.clone();
+                        let model = self.fallback_model.read().await.clone();
+                        let tid = task_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::memory::task_learning::extract_task_knowledge(
+                                state,
+                                provider,
+                                model,
+                                completed_task,
+                            )
+                            .await
+                            {
+                                warn!(
+                                    task_id = %tid,
+                                    error = %e,
+                                    "V3 task knowledge extraction failed"
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
         result
+    }
+
+    /// Spawn a task lead for a V3 goal. Called from handle_message (&self context).
+    ///
+    /// This is a simplified version of spawn_child that doesn't require &Arc<Self>,
+    /// since handle_message takes &self. The task lead gets management + universal tools
+    /// plus ManageGoalTasksTool and SpawnAgentTool (for spawning executors).
+    fn spawn_task_lead(
+        &self,
+        goal_id: &str,
+        goal_description: &str,
+        user_text: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        channel_ctx: ChannelContext,
+        user_role: UserRole,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>>
+    {
+        // Box::pin to break async recursion (handle_message -> spawn_task_lead -> handle_message)
+        let goal_id = goal_id.to_string();
+        let goal_description = goal_description.to_string();
+        let user_text = user_text.to_string();
+        Box::pin(async move {
+            let goal_id = &goal_id;
+            let goal_description = &goal_description;
+            let user_text = &user_text;
+            if self.depth >= self.max_depth {
+                anyhow::bail!(
+                    "Cannot spawn task lead: max recursion depth ({}) reached",
+                    self.max_depth
+                );
+            }
+
+            let child_depth = self.depth + 1;
+            let model = self.model.read().await.clone();
+
+            // Task leads get Management + Universal tools from parent
+            let mut tl_tools: Vec<Arc<dyn Tool>> = self
+                .tools
+                .iter()
+                .filter(|t| t.name() != "spawn_agent")
+                .filter(|t| matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal))
+                .cloned()
+                .collect();
+
+            // Add ManageGoalTasksTool scoped to this goal
+            tl_tools.push(Arc::new(crate::tools::ManageGoalTasksTool::new(
+                goal_id.to_string(),
+                self.state.clone(),
+            )));
+
+            // Read goal context for feed-forward (Phase 4)
+            let goal_context = self
+                .state
+                .get_goal_v3(goal_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|g| g.context);
+
+            let system_prompt = Self::build_task_lead_prompt(
+                goal_id,
+                user_text,
+                goal_context.as_deref(),
+                child_depth,
+                self.max_depth,
+            );
+
+            let task_text = format!(
+                "Plan and execute this goal by creating tasks and delegating to executors:\n\n{}",
+                user_text
+            );
+            let mission = format!(
+                "Task Lead for goal: {}",
+                &goal_description[..goal_description.len().min(100)]
+            );
+            let child_session = format!("sub-{}-{}", child_depth, Uuid::new_v4());
+
+            info!(
+                parent_depth = self.depth,
+                child_depth,
+                child_session = %child_session,
+                goal_id,
+                "Spawning V3 task lead"
+            );
+
+            // Emit SubAgentSpawn event
+            {
+                let emitter = crate::events::EventEmitter::new(
+                    self.event_store.clone(),
+                    child_session.clone(),
+                );
+                let _ = emitter
+                    .emit(
+                        EventType::SubAgentSpawn,
+                        SubAgentSpawnData {
+                            child_session_id: child_session.clone(),
+                            mission: mission.clone(),
+                            task: task_text.chars().take(500).collect(),
+                            depth: child_depth as u32,
+                            parent_task_id: None,
+                        },
+                    )
+                    .await;
+            }
+
+            let start = std::time::Instant::now();
+
+            // Task lead can spawn executors, so give it a SpawnAgentTool
+            let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(
+                self.max_response_chars,
+                self.timeout_secs,
+            ));
+            tl_tools.push(spawn_tool.clone());
+
+            // Get a child cancellation token from the goal's token
+            let child_cancel_token = if let Some(ref registry) = self.goal_token_registry {
+                registry.child_token(goal_id).await
+            } else {
+                None
+            };
+
+            // Collect root tools (full unfiltered set) for Executor inheritance.
+            // Use parent's root_tools if available, otherwise parent's full tool set.
+            let root_tools_for_tl: Vec<Arc<dyn Tool>> = self
+                .root_tools
+                .as_ref()
+                .unwrap_or(&self.tools)
+                .iter()
+                .filter(|t| t.name() != "spawn_agent")
+                .cloned()
+                .collect();
+
+            let child = Arc::new(Agent::with_depth(
+                self.provider.clone(),
+                self.state.clone(),
+                self.event_store.clone(),
+                tl_tools,
+                model,
+                system_prompt,
+                self.config_path.clone(),
+                self.skills_dir.clone(),
+                child_depth,
+                self.max_depth,
+                self.iteration_config.clone(),
+                self.max_iterations,
+                self.max_iterations_cap,
+                self.max_response_chars,
+                self.timeout_secs,
+                self.max_facts,
+                self.task_timeout,
+                self.task_token_budget,
+                self.llm_call_timeout,
+                self.mcp_registry.clone(),
+                self.verification_tracker.clone(),
+                AgentRole::TaskLead,
+                None,                             // v3_task_id
+                Some(goal_id.to_string()),        // v3_goal_id
+                child_cancel_token,               // cancel_token (derived from goal token)
+                self.goal_token_registry.clone(), // goal_token_registry
+                self.hub.read().await.clone(),    // hub
+                self.record_decision_points,
+                self.context_window_config.clone(),
+                self.policy_config.clone(),
+                Some(root_tools_for_tl), // root_tools for Executor inheritance
+            ));
+
+            spawn_tool.set_agent(Arc::downgrade(&child));
+
+            let result = child
+                .handle_message(
+                    &child_session,
+                    &task_text,
+                    status_tx,
+                    user_role,
+                    channel_ctx,
+                    None,
+                )
+                .await;
+
+            let duration = start.elapsed();
+
+            // Emit SubAgentComplete event
+            {
+                let emitter = crate::events::EventEmitter::new(
+                    self.event_store.clone(),
+                    child_session.clone(),
+                );
+                let (success, summary) = match &result {
+                    Ok(response) => (true, response.chars().take(200).collect()),
+                    Err(e) => (false, format!("{}", e)),
+                };
+                let _ = emitter
+                    .emit(
+                        EventType::SubAgentComplete,
+                        SubAgentCompleteData {
+                            child_session_id: child_session,
+                            success,
+                            result_summary: summary,
+                            duration_secs: duration.as_secs(),
+                            parent_task_id: None,
+                        },
+                    )
+                    .await;
+            }
+
+            result
+        }) // end Box::pin(async move { ... })
+    }
+
+    /// Build system prompt for a Task Lead agent.
+    fn build_task_lead_prompt(
+        goal_id: &str,
+        goal_description: &str,
+        goal_context: Option<&str>,
+        depth: usize,
+        max_depth: usize,
+    ) -> String {
+        let mut prompt = format!(
+            "You are a Task Lead managing goal: {goal_id}\n\
+             Goal: {goal_description}\n\n\
+             You are a sub-agent (depth {depth}/{max_depth}).\n\
+             Your job is to plan and delegate work. You MUST NOT execute tasks yourself.\n\n\
+             ## Workflow\n\
+             1. Analyze the goal and break it into concrete tasks using manage_goal_tasks(create_task)\n\
+                - Set `depends_on` (array of task IDs) for tasks that require prior tasks to complete\n\
+                - Set `parallel_group` for tasks that belong to the same logical phase\n\
+                - Set `idempotent: true` for tasks safe to retry on failure\n\
+                - Set `task_order` for display ordering\n\
+             2. Before spawning an executor, claim the task: manage_goal_tasks(claim_task, task_id=...)\n\
+                - This verifies dependencies are met and atomically reserves the task\n\
+                - If claiming fails due to unmet dependencies, work on other available tasks first\n\
+             3. Spawn an executor: spawn_agent(mission=..., task=..., task_id=<the task ID>)\n\
+                - Always pass the task_id so executor activity is tracked\n\
+             4. After each executor returns, update: manage_goal_tasks(update_task, task_id, status, result)\n\
+             5. If a task fails and is idempotent: manage_goal_tasks(retry_task, task_id) then re-spawn\n\
+                - If not idempotent or max retries exceeded: create alternative task or fail the goal\n\
+             6. When all tasks complete: manage_goal_tasks(complete_goal, summary)\n\n\
+             ## Rules\n\
+             - Create 2-5 tasks (keep scope focused)\n\
+             - Spawn executors one at a time (sequential execution)\n\
+             - Each executor gets a single, focused task\n\
+             - Always check list_tasks before spawning the next executor\n\
+             - If an executor reports a blocker, resolve it or adjust the plan"
+        );
+
+        if let Some(ctx) = goal_context {
+            prompt.push_str(&format!(
+                "\n\n## Prior Knowledge\n\
+                 The following knowledge was gathered from previous tasks and may be relevant:\n{}",
+                format_goal_context(ctx)
+            ));
+        }
+
+        prompt
+    }
+
+    /// Build system prompt for an Executor agent.
+    fn build_executor_prompt(task_description: &str, depth: usize, max_depth: usize) -> String {
+        format!(
+            "You are an Executor. Complete this single task and return your results.\n\n\
+             You are a sub-agent (depth {depth}/{max_depth}).\n\n\
+             Task: {task_description}\n\n\
+             Rules:\n\
+             - Focus ONLY on this task. Do not expand scope.\n\
+             - EXECUTE the task immediately. Do NOT ask for permission or confirmation.\n\
+             - Do NOT ask \"Shall I proceed?\" or \"Would you like me to...?\". Just do the work.\n\
+             - There is no human in this loop — you are an autonomous executor.\n\
+             - If you encounter ambiguity or a blocker you cannot resolve, use report_blocker immediately.\n\
+             - Return the FULL content you produced — not a meta-description of what you did.\n\
+             - If your task is research: return all findings, data points, and analysis in detail.\n\
+             - If your task is to write a report: return the complete report text.\n\
+             - If your task is to run a command: return the full output.\n\
+             - NEVER return just \"I researched X\" or \"Generated a report about Y\". Return the actual content.\n\
+             - Include specific outputs (file paths, data retrieved, commands run).\n\
+             - If you create or write a file, include its FULL ABSOLUTE PATH in your result text.\n\
+             - Do NOT spawn sub-agents."
+        )
     }
 
     /// Get the current model name.
@@ -579,41 +3585,232 @@ impl Agent {
         }
     }
 
-    /// Build the OpenAI-format tool definitions.
-    async fn tool_definitions(&self, user_message: &str) -> Vec<Value> {
-        let mut defs: Vec<Value> = self
-            .tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": t.schema()
-                })
-            })
-            .collect();
+    /// Build OpenAI-format tool definitions plus capability metadata map.
+    async fn tool_definitions_with_capabilities(
+        &self,
+        user_message: &str,
+    ) -> (Vec<Value>, HashMap<String, ToolCapabilities>) {
+        let mut defs: Vec<Value> = Vec::new();
+        let mut capabilities: HashMap<String, ToolCapabilities> = HashMap::new();
 
-        // Merge context-aware MCP tools based on user message triggers
-        if let Some(ref registry) = self.mcp_registry {
-            let mcp_tools = registry.match_tools(user_message).await;
-            defs.extend(mcp_tools.iter().map(|t| {
-                json!({
-                    "type": "function",
-                    "function": t.schema()
-                })
+        for tool in &self.tools {
+            let name = tool.name().to_string();
+            capabilities.insert(name.clone(), tool.capabilities());
+            defs.push(json!({
+                "type": "function",
+                "function": tool.schema()
             }));
         }
 
-        defs
+        // MCP composition stage 1: explicit trigger matching
+        if let Some(ref registry) = self.mcp_registry {
+            let mcp_tools = registry.match_tools(user_message).await;
+            for tool in mcp_tools {
+                let name = tool.name().to_string();
+                capabilities.entry(name).or_default();
+                defs.push(json!({
+                    "type": "function",
+                    "function": tool.schema()
+                }));
+            }
+        }
+
+        (defs, capabilities)
     }
 
-    /// Pick a fallback model: stored fallback if different from `failed_model`,
-    /// otherwise ask the router for any tier model that differs.
-    async fn pick_fallback(&self, failed_model: &str) -> Option<String> {
+    /// Build the OpenAI-format tool definitions.
+    #[allow(dead_code)]
+    async fn tool_definitions(&self, user_message: &str) -> Vec<Value> {
+        self.tool_definitions_with_capabilities(user_message)
+            .await
+            .0
+    }
+
+    fn tool_name_from_definition(def: &Value) -> Option<&str> {
+        def.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+    }
+
+    fn filter_tool_definitions_for_policy(
+        &self,
+        defs: &[Value],
+        capabilities: &HashMap<String, ToolCapabilities>,
+        policy: &ExecutionPolicy,
+        risk_score: f32,
+        widen: bool,
+    ) -> Vec<Value> {
+        let mut ordered: Vec<(Value, String, ToolCapabilities)> = defs
+            .iter()
+            .filter_map(|def| {
+                let name = Self::tool_name_from_definition(def)?.to_string();
+                let caps = capabilities.get(&name).copied().unwrap_or_default();
+                Some((def.clone(), name, caps))
+            })
+            .collect();
+
+        // Stable prioritization: read-only + idempotent first for low-risk turns.
+        ordered.sort_by_key(|(_, _, caps)| {
+            (
+                !caps.read_only,
+                caps.needs_approval,
+                !caps.idempotent,
+                caps.high_impact_write,
+                caps.external_side_effect,
+            )
+        });
+
+        if widen {
+            return ordered.into_iter().map(|(d, _, _)| d).collect();
+        }
+
+        let mut filtered: Vec<(Value, String, ToolCapabilities)> = ordered;
+        let low_risk = risk_score < 0.34 && matches!(policy.model_profile, ModelProfile::Cheap);
+
+        if low_risk {
+            let readonly: Vec<_> = filtered
+                .iter()
+                .filter(|(_, _, c)| c.read_only)
+                .cloned()
+                .collect();
+            let mut keep = readonly;
+            if keep.len() < 5 {
+                for candidate in filtered.iter().cloned() {
+                    if keep.iter().any(|(_, n, _)| n == &candidate.1) {
+                        continue;
+                    }
+                    keep.push(candidate);
+                    if keep.len() >= 5 {
+                        break;
+                    }
+                }
+            }
+            if keep.len() > 10 {
+                keep.truncate(10);
+            }
+            return keep.into_iter().map(|(d, _, _)| d).collect();
+        }
+
+        match policy.model_profile {
+            ModelProfile::Cheap => {
+                filtered.retain(|(_, _, caps)| caps.read_only || !caps.high_impact_write);
+                filtered.truncate(12);
+            }
+            ModelProfile::Balanced => {
+                if risk_score < 0.55 {
+                    filtered.retain(|(_, _, caps)| caps.read_only || !caps.high_impact_write);
+                }
+                filtered.truncate(20);
+            }
+            ModelProfile::Strong => {}
+        }
+
+        if matches!(policy.approval_mode, ApprovalMode::Auto) {
+            filtered.retain(|(_, _, caps)| caps.read_only || !caps.needs_approval);
+        }
+
+        filtered.into_iter().map(|(d, _, _)| d).collect()
+    }
+
+    async fn load_policy_tool_set(
+        &self,
+        user_message: &str,
+        channel_visibility: ChannelVisibility,
+        policy: &ExecutionPolicy,
+        risk_score: f32,
+        enforce_filter: bool,
+    ) -> (Vec<Value>, Vec<Value>, HashMap<String, ToolCapabilities>) {
+        let (mut defs, mut caps) = self.tool_definitions_with_capabilities(user_message).await;
+
+        if channel_visibility == ChannelVisibility::PublicExternal {
+            let allowed = ["web_search", "remember_fact", "system_info"];
+            defs.retain(|d| {
+                Self::tool_name_from_definition(d).is_some_and(|name| allowed.contains(&name))
+            });
+            caps.retain(|name, _| allowed.contains(&name.as_str()));
+        }
+
+        let base_defs = defs.clone();
+        if enforce_filter {
+            defs = self.filter_tool_definitions_for_policy(&defs, &caps, policy, risk_score, false);
+        }
+
+        (defs, base_defs, caps)
+    }
+
+    fn should_run_graduation_check(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = self.last_graduation_check_epoch.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 3600 {
+            return false;
+        }
+        self.last_graduation_check_epoch
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    async fn maybe_retire_classify_query(&self, session_id: &str) {
+        if !self.policy_config.classify_retirement_enabled {
+            return;
+        }
+        if self.classify_query_retired.load(Ordering::Relaxed) {
+            return;
+        }
+        if !self.should_run_graduation_check() {
+            return;
+        }
+        let report = match self
+            .event_store
+            .policy_graduation_report(self.policy_config.classify_retirement_window_days)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(session_id, error = %e, "Failed policy graduation check");
+                return;
+            }
+        };
+
+        let max_divergence = self.policy_config.classify_retirement_max_divergence as f64;
+        let passed = report.gate_passes(max_divergence);
+        info!(
+            session_id,
+            observed_days = report.observed_days,
+            window_days = report.window_days,
+            divergence_rate = report.divergence_rate,
+            completion_rate_current = report.current.completion_rate,
+            completion_rate_previous = report.previous.completion_rate,
+            error_rate_current = report.current.error_rate,
+            error_rate_previous = report.previous.error_rate,
+            stall_rate_current = report.current.stall_rate,
+            stall_rate_previous = report.previous.stall_rate,
+            passed,
+            "Policy graduation evaluation"
+        );
+        if passed {
+            self.classify_query_retired.store(true, Ordering::Relaxed);
+            info!(
+                session_id,
+                "Policy graduation gate passed - classify_query() retired for routing"
+            );
+        }
+    }
+
+    /// Pick a fallback model, skipping `failed_model` and any models in the `exclude` list.
+    /// Tries stored fallback first, then cycles through router tiers.
+    async fn pick_fallback_excluding(
+        &self,
+        failed_model: &str,
+        exclude: &[&str],
+    ) -> Option<String> {
         let stored = self.fallback_model.read().await.clone();
-        if stored != failed_model {
+        if stored != failed_model && !exclude.contains(&stored.as_str()) {
             return Some(stored);
         }
-        // Stored fallback is the same model — try the router tiers
+        // Stored fallback is the same or excluded — try the router tiers
         if let Some(ref router) = self.router {
             for tier in &[
                 crate::router::Tier::Primary,
@@ -621,7 +3818,7 @@ impl Agent {
                 crate::router::Tier::Fast,
             ] {
                 let candidate = router.select(*tier).to_string();
-                if candidate != failed_model {
+                if candidate != failed_model && !exclude.contains(&candidate.as_str()) {
                     return Some(candidate);
                 }
             }
@@ -629,10 +3826,57 @@ impl Agent {
         None
     }
 
+    /// Try up to 2 different fallback models after retries are exhausted.
+    /// On success, switches the active model.
+    async fn cascade_fallback(
+        &self,
+        failed_model: &str,
+        messages: &[Value],
+        tool_defs: &[Value],
+        last_err: &ProviderError,
+    ) -> anyhow::Result<crate::traits::ProviderResponse> {
+        let mut tried: Vec<String> = vec![failed_model.to_string()];
+
+        for attempt in 1..=2 {
+            let exclude_refs: Vec<&str> = tried.iter().map(|s| s.as_str()).collect();
+            let fallback = match self
+                .pick_fallback_excluding(failed_model, &exclude_refs)
+                .await
+            {
+                Some(f) => f,
+                None => break, // no more candidates
+            };
+
+            warn!(
+                fallback = %fallback,
+                attempt,
+                "Cascade fallback attempt"
+            );
+
+            match self.provider.chat(&fallback, messages, tool_defs).await {
+                Ok(resp) => {
+                    *self.model.write().await = fallback;
+                    self.stamp_lastgood().await;
+                    return Ok(resp);
+                }
+                Err(_) => {
+                    tried.push(fallback);
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("{}", last_err.user_message()))
+    }
+
+    /// Maximum number of retries for transient LLM errors.
+    const MAX_LLM_RETRIES: u32 = 3;
+    /// Base delay for exponential backoff on transient errors (seconds).
+    const RETRY_BASE_DELAY_SECS: u64 = 2;
+
     /// Attempt an LLM call with error-classified recovery:
-    /// - RateLimit → wait retry_after, retry once, then fallback
-    /// - Timeout/Network/ServerError → retry once, then fallback
-    /// - NotFound → fallback to previous model
+    /// - RateLimit → exponential backoff retries, then cascade fallback
+    /// - Timeout/Network/ServerError → exponential backoff retries, then cascade fallback
+    /// - NotFound → cascade fallback immediately
     /// - Auth/Billing → return user-facing error immediately
     async fn call_llm_with_recovery(
         &self,
@@ -662,77 +3906,73 @@ impl Agent {
 
                 match provider_err.kind {
                     // --- Non-retryable: tell the user, stop ---
-                    ProviderErrorKind::Auth | ProviderErrorKind::Billing => {
+                    ProviderErrorKind::Auth
+                    | ProviderErrorKind::Billing
+                    | ProviderErrorKind::BadRequest => {
                         Err(anyhow::anyhow!("{}", provider_err.user_message()))
                     }
 
-                    // --- Rate limit: wait, retry once, then fallback ---
+                    // --- Rate limit: exponential backoff, then cascade fallback ---
                     ProviderErrorKind::RateLimit => {
-                        let wait = provider_err.retry_after_secs.unwrap_or(5);
-                        let wait = wait.min(60); // cap at 60s
-                        info!(wait_secs = wait, "Rate limited, waiting before retry");
-                        tokio::time::sleep(Duration::from_secs(wait)).await;
-                        match self.provider.chat(model, messages, tool_defs).await {
-                            Ok(resp) => {
-                                self.stamp_lastgood().await;
-                                Ok(resp)
-                            }
-                            Err(_retry_err) => {
-                                // Still rate-limited — try a fallback model
-                                if let Some(fallback) = self.pick_fallback(model).await {
-                                    warn!(fallback = %fallback, "Rate limit retry failed, trying fallback model");
-                                    let resp =
-                                        self.provider.chat(&fallback, messages, tool_defs).await?;
-                                    *self.model.write().await = fallback;
-                                    Ok(resp)
-                                } else {
-                                    Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                        let base_wait = provider_err.retry_after_secs.unwrap_or(5);
+                        for attempt in 0..Self::MAX_LLM_RETRIES {
+                            let wait = (base_wait * 2u64.pow(attempt)).min(120); // cap at 120s
+                            info!(
+                                wait_secs = wait,
+                                attempt = attempt + 1,
+                                max = Self::MAX_LLM_RETRIES,
+                                "Rate limited, waiting before retry"
+                            );
+                            tokio::time::sleep(Duration::from_secs(wait)).await;
+                            match self.provider.chat(model, messages, tool_defs).await {
+                                Ok(resp) => {
+                                    self.stamp_lastgood().await;
+                                    return Ok(resp);
                                 }
+                                Err(_) => continue,
                             }
                         }
+                        // All retries exhausted — cascade through fallback models
+                        warn!("Rate limit retries exhausted, trying cascade fallback");
+                        self.cascade_fallback(model, messages, tool_defs, &provider_err)
+                            .await
                     }
 
-                    // --- Timeout / Network / Server: retry once ---
+                    // --- Timeout / Network / Server: exponential backoff, then cascade ---
                     ProviderErrorKind::Timeout
                     | ProviderErrorKind::Network
                     | ProviderErrorKind::ServerError => {
-                        info!("Retrying after transient error");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        match self.provider.chat(model, messages, tool_defs).await {
-                            Ok(resp) => {
-                                self.stamp_lastgood().await;
-                                Ok(resp)
-                            }
-                            Err(_retry_err) => {
-                                // Second failure — try a fallback model
-                                if let Some(fallback) = self.pick_fallback(model).await {
-                                    warn!(fallback = %fallback, "Retry failed, trying fallback model");
-                                    let resp =
-                                        self.provider.chat(&fallback, messages, tool_defs).await?;
-                                    *self.model.write().await = fallback;
-                                    Ok(resp)
-                                } else {
-                                    Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                        for attempt in 0..Self::MAX_LLM_RETRIES {
+                            let wait = Self::RETRY_BASE_DELAY_SECS * 2u64.pow(attempt); // 2s, 4s, 8s
+                            info!(
+                                wait_secs = wait,
+                                attempt = attempt + 1,
+                                max = Self::MAX_LLM_RETRIES,
+                                "Retrying after transient error"
+                            );
+                            tokio::time::sleep(Duration::from_secs(wait)).await;
+                            match self.provider.chat(model, messages, tool_defs).await {
+                                Ok(resp) => {
+                                    self.stamp_lastgood().await;
+                                    return Ok(resp);
                                 }
+                                Err(_) => continue,
                             }
                         }
+                        // All retries exhausted — cascade through fallback models
+                        warn!("Transient error retries exhausted, trying cascade fallback");
+                        self.cascade_fallback(model, messages, tool_defs, &provider_err)
+                            .await
                     }
 
-                    // --- NotFound (bad model name): fallback immediately ---
+                    // --- NotFound (bad model name): cascade fallback immediately ---
                     ProviderErrorKind::NotFound => {
-                        if let Some(fallback) = self.pick_fallback(model).await {
-                            warn!(
-                                bad_model = model,
-                                fallback = %fallback,
-                                "Model not found, reverting to fallback"
-                            );
-                            *self.model.write().await = fallback.clone();
-                            let resp = self.provider.chat(&fallback, messages, tool_defs).await?;
-                            self.stamp_lastgood().await;
-                            Ok(resp)
-                        } else {
-                            Err(anyhow::anyhow!("{}", provider_err.user_message()))
-                        }
+                        warn!(
+                            bad_model = model,
+                            "Model not found, trying cascade fallback"
+                        );
+                        self.cascade_fallback(model, messages, tool_defs, &provider_err)
+                            .await
                     }
 
                     // --- Unknown: propagate ---
@@ -743,6 +3983,8 @@ impl Agent {
             }
         }
     }
+
+    // ==================== V3 Orchestration Methods ====================
 
     /// Run the agentic loop for a user message in the given session.
     /// Returns the final assistant text response.
@@ -780,13 +4022,6 @@ impl Agent {
                 },
             )
             .await;
-
-        // Link any existing incomplete plan to this task
-        if let Some(ref ps) = self.plan_store {
-            if let Ok(Some(plan)) = ps.get_incomplete_for_session(session_id).await {
-                let _ = ps.set_task_id(&plan.id, &task_id).await;
-            }
-        }
 
         // 1. Persist the user message
         let user_msg = Message {
@@ -834,6 +4069,7 @@ impl Agent {
                     "cli_agent",
                     r#"{"action": "cancel_all"}"#,
                     session_id,
+                    Some(&task_id),
                     status_tx.clone(),
                     channel_ctx.visibility,
                     channel_ctx.channel_id.as_deref(),
@@ -851,57 +4087,335 @@ impl Agent {
             }
         }
 
+        // Scheduled-goal confirmation gate: intercept yes/no confirmations before
+        // the consultant pass to avoid an unnecessary LLM call.
+        {
+            let pending_goals = self
+                .state
+                .get_pending_confirmation_goals(session_id)
+                .await
+                .unwrap_or_default();
+            if !pending_goals.is_empty() {
+                let lower_trimmed = user_text.trim().to_lowercase();
+                let is_confirm = ["confirm", "yes", "go ahead", "schedule it", "do it"]
+                    .iter()
+                    .any(|kw| contains_keyword_as_words(&lower_trimmed, kw));
+                let is_reject = ["no", "cancel", "never mind", "nevermind"]
+                    .iter()
+                    .any(|kw| contains_keyword_as_words(&lower_trimmed, kw));
+
+                if is_confirm {
+                    let mut activated = Vec::new();
+                    let mut activation_errors = Vec::new();
+                    let tz_label = crate::cron_utils::system_timezone_display();
+
+                    for goal in &pending_goals {
+                        match self.state.activate_goal_v3(&goal.id).await {
+                            Ok(true) => {
+                                if let Some(ref registry) = self.goal_token_registry {
+                                    registry.register(&goal.id).await;
+                                }
+                                let next_run = goal
+                                    .schedule
+                                    .as_deref()
+                                    .and_then(|s| crate::cron_utils::compute_next_run_local(s).ok())
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
+                                    .unwrap_or_else(|| "unscheduled".to_string());
+                                activated
+                                    .push(format!("{} (next: {})", goal.description, next_run));
+                            }
+                            Ok(false) => {}
+                            Err(e) => activation_errors.push(e.to_string()),
+                        }
+                    }
+
+                    let msg = if !activated.is_empty() && activation_errors.is_empty() {
+                        if activated.len() == 1 {
+                            format!(
+                                "Scheduled: {}. I'll execute it when the time comes. System timezone: {}.",
+                                activated[0], tz_label
+                            )
+                        } else {
+                            format!(
+                                "Scheduled {} goals:\n- {}\nSystem timezone: {}.",
+                                activated.len(),
+                                activated.join("\n- "),
+                                tz_label
+                            )
+                        }
+                    } else if !activated.is_empty() {
+                        format!(
+                            "Scheduled {} goals:\n- {}\nBut {} could not be activated: {}",
+                            activated.len(),
+                            activated.join("\n- "),
+                            activation_errors.len(),
+                            activation_errors.join("; ")
+                        )
+                    } else {
+                        format!(
+                            "I couldn't activate scheduled goals: {}",
+                            activation_errors.join("; ")
+                        )
+                    };
+
+                    let assistant_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "assistant".to_string(),
+                        content: Some(msg.clone()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.5,
+                        embedding: None,
+                    };
+                    self.state.append_message(&assistant_msg).await?;
+                    return Ok(msg);
+                } else if is_reject {
+                    let mut cancelled = 0usize;
+                    for goal in &pending_goals {
+                        let mut updated = goal.clone();
+                        updated.status = "cancelled".to_string();
+                        updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        updated.updated_at = chrono::Utc::now().to_rfc3339();
+                        if self.state.update_goal_v3(&updated).await.is_ok() {
+                            cancelled += 1;
+                        }
+                    }
+
+                    let msg = if cancelled == 1 {
+                        "OK, cancelled the scheduled goal.".to_string()
+                    } else {
+                        format!("OK, cancelled {} scheduled goals.", cancelled)
+                    };
+
+                    let assistant_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "assistant".to_string(),
+                        content: Some(msg.clone()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.5,
+                        embedding: None,
+                    };
+                    self.state.append_message(&assistant_msg).await?;
+                    return Ok(msg);
+                } else {
+                    // User moved on without explicit confirmation/rejection.
+                    // Auto-cancel pending confirmations to avoid stale intents.
+                    for goal in &pending_goals {
+                        let mut updated = goal.clone();
+                        updated.status = "cancelled".to_string();
+                        updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        updated.updated_at = chrono::Utc::now().to_rfc3339();
+                        let _ = self.state.update_goal_v3(&updated).await;
+                    }
+                }
+            }
+        }
+
         // Initialize learning context for post-task learning
         let mut learning_ctx = LearningContext {
             user_text: user_text.to_string(),
+            intent_domains: Vec::new(),
             tool_calls: Vec::new(),
             errors: Vec::new(),
             first_error: None,
             recovery_actions: Vec::new(),
             start_time: Utc::now(),
             completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
         };
+        if let Some((label, is_positive)) = detect_explicit_outcome_signal(user_text) {
+            if is_positive {
+                learning_ctx.explicit_positive_signals =
+                    learning_ctx.explicit_positive_signals.saturating_add(1);
+            } else {
+                learning_ctx.explicit_negative_signals =
+                    learning_ctx.explicit_negative_signals.saturating_add(1);
+            }
+            info!(
+                session_id,
+                task_id = %task_id,
+                signal = label,
+                "Detected explicit outcome signal in user input"
+            );
+        }
 
-        let tool_defs = if user_role == UserRole::Public {
-            vec![]
-        } else {
-            let mut defs = self.tool_definitions(user_text).await;
+        // V3: Top-level orchestrator (depth 0) gets NO action tools.
+        // It classifies intent and delegates to task leads or falls through to the full agent loop.
+        // Sub-agents (depth > 0) get tools based on their role (set in spawn_child).
+        let is_top_level_orchestrator = self.depth == 0 && self.role == AgentRole::Orchestrator;
+
+        let mut available_capabilities: HashMap<String, ToolCapabilities> = HashMap::new();
+        let mut base_tool_defs: Vec<Value> = Vec::new();
+        let mut tool_defs: Vec<Value> = Vec::new();
+        if user_role != UserRole::Public && !is_top_level_orchestrator {
+            let (mut defs, mut caps) = self.tool_definitions_with_capabilities(user_text).await;
+
             // Filter tools by channel visibility
             if channel_ctx.visibility == ChannelVisibility::PublicExternal {
                 let allowed = ["web_search", "remember_fact", "system_info"];
                 defs.retain(|d| {
-                    d.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                        .is_some_and(|name| allowed.contains(&name))
+                    Self::tool_name_from_definition(d).is_some_and(|name| allowed.contains(&name))
                 });
+                caps.retain(|name, _| allowed.contains(&name.as_str()));
             }
-            defs
-        };
-        let model = {
+
+            available_capabilities = caps;
+            base_tool_defs = defs.clone();
+            tool_defs = defs;
+        }
+
+        let mut policy_bundle = build_policy_bundle_v1(user_text, &available_capabilities, false);
+
+        if self.depth == 0 {
+            self.maybe_retire_classify_query(session_id).await;
+        }
+
+        if !tool_defs.is_empty() {
+            let shadow_filtered = self.filter_tool_definitions_for_policy(
+                &tool_defs,
+                &available_capabilities,
+                &policy_bundle.policy,
+                policy_bundle.risk_score,
+                false,
+            );
+            POLICY_METRICS
+                .tool_exposure_samples
+                .fetch_add(1, Ordering::Relaxed);
+            POLICY_METRICS
+                .tool_exposure_before_sum
+                .fetch_add(tool_defs.len() as u64, Ordering::Relaxed);
+            POLICY_METRICS
+                .tool_exposure_after_sum
+                .fetch_add(shadow_filtered.len() as u64, Ordering::Relaxed);
+            if self.policy_config.policy_shadow_mode {
+                info!(
+                    session_id,
+                    task_id = %task_id,
+                    exposed_before = tool_defs.len(),
+                    exposed_after = shadow_filtered.len(),
+                    risk_score = policy_bundle.risk_score,
+                    profile = ?policy_bundle.policy.model_profile,
+                    "Policy tool filter shadow comparison"
+                );
+            }
+            if self.policy_config.tool_filter_enforce {
+                tool_defs = shadow_filtered;
+            }
+        }
+
+        // Model selection: route to the appropriate model tier.
+        // The consultant pass (iteration 1 without tools) uses the SAME model
+        // — it's about forcing text-only response, not needing a smarter model.
+        let (selected_model, consultant_pass_active) = {
             let is_override = *self.model_override.read().await;
             if !is_override {
                 if let Some(ref router) = self.router {
-                    let result = router::classify_query(user_text);
-                    let routed_model = router.select(result.tier).to_string();
+                    let new_model = router
+                        .select_for_profile(policy_bundle.policy.model_profile)
+                        .to_string();
+                    let classify_retired = self.classify_query_retired.load(Ordering::Relaxed);
+                    let routed_model = if classify_retired {
+                        if self.policy_config.policy_shadow_mode {
+                            info!(
+                                session_id,
+                                task_id = %task_id,
+                                new_profile = ?policy_bundle.policy.model_profile,
+                                new_model = %new_model,
+                                "classify_query retired; using thin router profile mapping only"
+                            );
+                        }
+                        new_model
+                    } else {
+                        let old_result = router::classify_query(user_text);
+                        let old_model = router.select(old_result.tier).to_string();
+                        let diverged = old_model != new_model;
+                        POLICY_METRICS
+                            .router_shadow_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        if diverged {
+                            POLICY_METRICS
+                                .router_shadow_diverged
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        let _ = emitter
+                            .emit(
+                                EventType::PolicyDecision,
+                                PolicyDecisionData {
+                                    task_id: task_id.clone(),
+                                    old_model: old_model.clone(),
+                                    new_model: new_model.clone(),
+                                    old_tier: old_result.tier.to_string(),
+                                    new_profile: format!(
+                                        "{:?}",
+                                        policy_bundle.policy.model_profile
+                                    )
+                                    .to_lowercase(),
+                                    diverged,
+                                    policy_enforce: self.policy_config.policy_enforce,
+                                    risk_score: policy_bundle.risk_score,
+                                    uncertainty_score: policy_bundle.uncertainty_score,
+                                },
+                            )
+                            .await;
+                        if self.policy_config.policy_shadow_mode {
+                            info!(
+                                session_id,
+                                task_id = %task_id,
+                                old_tier = %old_result.tier,
+                                old_reason = %old_result.reason,
+                                old_model = %old_model,
+                                new_profile = ?policy_bundle.policy.model_profile,
+                                new_model = %new_model,
+                                risk_score = policy_bundle.risk_score,
+                                uncertainty_score = policy_bundle.uncertainty_score,
+                                confidence = policy_bundle.confidence,
+                                diverged,
+                                "Router shadow comparison"
+                            );
+                        }
+                        if self.policy_config.policy_enforce {
+                            new_model
+                        } else {
+                            old_model
+                        }
+                    };
                     info!(
-                        tier = %result.tier,
-                        reason = %result.reason,
-                        model = %routed_model,
-                        "Smart router selected model"
+                        routed_model = %routed_model,
+                        policy_profile = ?policy_bundle.policy.model_profile,
+                        policy_enforce = self.policy_config.policy_enforce,
+                        "Selected model for task"
                     );
-                    routed_model
+                    // Consultant pass: mandatory for top-level orchestrator (all tiers),
+                    // skip for sub-agents (depth > 0) which have their own tool scoping.
+                    let do_consultant = is_top_level_orchestrator;
+                    (routed_model, do_consultant)
                 } else {
-                    self.model.read().await.clone()
+                    // No router: still enforce consultant pass for top-level orchestrator
+                    let m = self.model.read().await.clone();
+                    (m, is_top_level_orchestrator)
                 }
             } else {
-                self.model.read().await.clone()
+                // Model override: still enforce consultant pass for top-level orchestrator
+                let m = self.model.read().await.clone();
+                (m, is_top_level_orchestrator)
             }
         };
+        let mut model = selected_model.clone();
 
         // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
-        let skills_snapshot = self.skills.snapshot().await;
+        let skills_snapshot = skills::load_skills(&self.skills_dir);
         let mut active_skills = skills::match_skills(&skills_snapshot, user_text);
+        let keyword_skill_names: Vec<String> =
+            active_skills.iter().map(|s| s.name.clone()).collect();
+        let mut llm_confirmed_skills = false;
         if !active_skills.is_empty() {
             let names: Vec<&str> = active_skills.iter().map(|s| s.name.as_str()).collect();
             info!(session_id, skills = ?names, "Matched skills for message");
@@ -921,6 +4435,7 @@ impl Agent {
                         let confirmed_names: Vec<&str> =
                             confirmed.iter().map(|s| s.name.as_str()).collect();
                         info!(session_id, confirmed = ?confirmed_names, "LLM-confirmed skills");
+                        llm_confirmed_skills = true;
                         active_skills = confirmed;
                     }
                     Err(e) => {
@@ -928,6 +4443,36 @@ impl Agent {
                     }
                 }
             }
+        }
+
+        if self.record_decision_points {
+            let final_skill_names: Vec<String> =
+                active_skills.iter().map(|s| s.name.clone()).collect();
+            let final_set: HashSet<String> = final_skill_names.iter().cloned().collect();
+            let dropped: Vec<String> = keyword_skill_names
+                .iter()
+                .filter(|n| !final_set.contains(*n))
+                .cloned()
+                .collect();
+            self.emit_decision_point(
+                &emitter,
+                &task_id,
+                0,
+                DecisionType::SkillMatch,
+                format!(
+                    "Skill match: keyword={} confirmed={} dropped={}",
+                    keyword_skill_names.len(),
+                    final_skill_names.len(),
+                    dropped.len()
+                ),
+                json!({
+                    "keyword_matches": keyword_skill_names,
+                    "llm_confirmed": llm_confirmed_skills,
+                    "final": final_skill_names,
+                    "dropped": dropped
+                }),
+            )
+            .await;
         }
 
         // Fetch memory components — channel-scoped retrieval
@@ -1059,6 +4604,36 @@ impl Agent {
             (vec![], None, vec![])
         };
 
+        if self.record_decision_points {
+            self.emit_decision_point(
+                &emitter,
+                &task_id,
+                0,
+                DecisionType::MemoryRetrieval,
+                format!(
+                    "Memory retrieved: facts={} episodes={} hints={} procedures={} errors={}",
+                    facts.len(),
+                    episodes.len(),
+                    cross_channel_hints.len(),
+                    procedures.len(),
+                    error_solutions.len()
+                ),
+                json!({
+                    "facts_count": facts.len(),
+                    "episodes_count": episodes.len(),
+                    "hints_count": cross_channel_hints.len(),
+                    "goals_count": goals.len(),
+                    "patterns_count": patterns.len(),
+                    "procedures_count": procedures.len(),
+                    "error_solutions_count": error_solutions.len(),
+                    "expertise_count": expertise.len(),
+                    "people_count": people.len(),
+                    "current_person_facts_count": current_person_facts.len()
+                }),
+            )
+            .await;
+        }
+
         // Build extended system prompt with all memory components
         let memory_context = MemoryContext {
             facts: &facts,
@@ -1090,6 +4665,10 @@ impl Agent {
                 current_topic: episodes
                     .first()
                     .and_then(|e| e.topics.as_ref()?.first().cloned()),
+                relevant_pattern_ids: vec![],
+                relevant_goal_ids: vec![],
+                relevant_procedure_ids: vec![],
+                relevant_episode_ids: vec![],
                 session_duration_mins: 0,
                 tool_call_count: 0,
                 has_errors: false,
@@ -1116,6 +4695,13 @@ impl Agent {
              and share publicly available information. Do not reveal any internal details \
              about your configuration, tools, or architecture."
                 .to_string()
+        } else if is_top_level_orchestrator {
+            // V3: Strip action tool docs and tool-use directives from orchestrator prompt.
+            // The orchestrator classifies intent and delegates — it never executes tools.
+            let prompt = self.system_prompt.clone();
+            let prompt = strip_markdown_section(&prompt, "## Tool Selection Guide");
+            let prompt = strip_markdown_section(&prompt, "## Tools");
+            strip_markdown_section(&prompt, "## Core Rules (ALWAYS follow these)")
         } else {
             self.system_prompt.clone()
         };
@@ -1193,6 +4779,8 @@ impl Agent {
                 system_prompt = format!(
                     "{}\n\n[Channel Context: PUBLIC {} channel{}]\n\
                      You are responding in a public channel visible to many people. Rules:\n\
+                     - Your reply is posted directly to this channel — all members can see it. You cannot send separate messages.\n\
+                     - When asked to respond to or address another user, include that response directly in your reply (e.g. \"@User, hello!\").\n\
                      - Facts shown above are safe to reference here (they are from this channel or global).\n\
                      - Do NOT reference personal goals, habits, or profile preferences.\n\
                      - If you have relevant info from another conversation, mention you have it and ask if they want you to share.\n\
@@ -1275,57 +4863,24 @@ impl Agent {
             system_prompt = format!("{}\n\n{}", system_prompt, session_context_str);
         }
 
-        // Check for incomplete task plans and inject context
-        let incomplete_plan = if let Some(ref ps) = self.plan_store {
-            ps.get_incomplete_for_session(session_id)
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-        let has_incomplete_plan = incomplete_plan.is_some();
-        if let Some(ref plan) = incomplete_plan {
-            system_prompt = format!("{}\n\n{}", system_prompt, plan.format_for_prompt());
-        }
-
-        // If no incomplete plan, check if this task should have one
-        if incomplete_plan.is_none() {
-            let plan_trigger = crate::plans::should_create_plan(user_text);
-            if plan_trigger.is_auto_create() {
-                if let Some(ref ps) = self.plan_store {
-                    let reason = plan_trigger.reason().unwrap_or("high-stakes operation");
-                    info!(
-                        session_id,
-                        reason, "Auto-creating plan for high-stakes operation"
-                    );
-                    match crate::plans::generate_plan_steps(&*self.provider, &model, user_text)
-                        .await
-                    {
-                        Ok(steps) if !steps.is_empty() => {
-                            let plan = crate::plans::TaskPlan::new(
-                                session_id,
-                                user_text,
-                                user_text.chars().take(200).collect::<String>(),
-                                steps,
-                                format!("auto_create:{}", reason),
-                            );
-                            if let Err(e) = ps.create(&plan).await {
-                                warn!(error = %e, "Failed to auto-create plan");
-                            } else {
-                                let _ = ps.set_task_id(&plan.id, &task_id).await;
-                                system_prompt =
-                                    format!("{}\n\n{}", system_prompt, plan.format_for_prompt());
-                                info!(plan_id = %plan.id, steps = plan.steps.len(), "Auto-created plan");
-                            }
-                        }
-                        Ok(_) => warn!("Auto-create returned empty steps"),
-                        Err(e) => warn!(error = %e, "Failed to generate auto-create plan"),
-                    }
-                }
-            } else if let Some(hint) = crate::plans::get_plan_suggestion_prompt(&plan_trigger) {
-                system_prompt = format!("{}{}", system_prompt, hint);
-            }
+        if self.record_decision_points {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            system_prompt.hash(&mut hasher);
+            let prompt_hash = format!("{:016x}", hasher.finish());
+            self.emit_decision_point(
+                &emitter,
+                &task_id,
+                0,
+                DecisionType::InstructionsSnapshot,
+                "Prepared instruction snapshot for this interaction".to_string(),
+                json!({
+                    "prompt_hash": prompt_hash,
+                    "system_prompt_chars": system_prompt.len(),
+                    "tools_count": tool_defs.len(),
+                    "skills_count": active_skills.len()
+                }),
+            )
+            .await;
         }
 
         info!(
@@ -1337,7 +4892,6 @@ impl Agent {
             procedures = procedures.len(),
             expertise = expertise.len(),
             has_session_context = !session_context_str.is_empty(),
-            has_incomplete_plan,
             "Memory context loaded"
         );
 
@@ -1379,11 +4933,25 @@ impl Agent {
             "Context prepared"
         );
 
+        // 2c. Load conversation summary for context window management
+        let mut session_summary = if self.context_window_config.enabled {
+            self.state
+                .get_conversation_summary(session_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
         // 3. Agentic loop — runs until natural completion or safety limits
         let task_start = Instant::now();
         let mut last_progress_summary = Instant::now();
         let mut iteration: usize = 0;
         let mut stall_count: usize = 0;
+        let mut deferred_no_tool_streak: usize = 0;
+        let mut deferred_no_tool_model_switches: usize = 0;
+        let mut total_successful_tool_calls: usize = 0;
         let mut task_tokens_used: u64 = 0;
         let mut tool_failure_count: HashMap<String, usize> = HashMap::new();
         let mut tool_call_count: HashMap<String, usize> = HashMap::new();
@@ -1396,8 +4964,17 @@ impl Agent {
         let mut consecutive_same_tool: (String, usize) = (String::new(), 0);
         let mut consecutive_same_tool_arg_hashes: HashSet<u64> = HashSet::new();
         let mut soft_limit_warned = false;
+        // Force-stop flag: when true, strip tools from next LLM call to force
+        // a text response. Activated after too many tool calls without settling.
+        let mut force_text_response = false;
         // Track recent tool names for alternating pattern detection (A-B-A-B cycles)
         let mut recent_tool_names: VecDeque<String> = VecDeque::new();
+        // Mid-loop adaptation and fallback expansion controls.
+        let mut last_escalation_iteration: Option<usize> = None;
+        let mut consecutive_clean_iterations: usize = 0;
+        let mut fallback_expanded_once = false;
+        // Idempotency guard for send_file within a single task execution.
+        let mut successful_send_file_keys: HashSet<String> = HashSet::new();
 
         // Determine iteration limit behavior
         let (hard_cap, soft_threshold, soft_warn_at) = match &self.iteration_config {
@@ -1411,7 +4988,67 @@ impl Agent {
         loop {
             iteration += 1;
             touch_heartbeat(&heartbeat);
-            info!(iteration, session_id, model = %model, depth = self.depth, "Agent loop iteration");
+
+            // Check for cancellation (V3 goal cancellation cascades via token hierarchy)
+            if let Some(ref ct) = self.cancel_token {
+                if ct.is_cancelled() {
+                    info!(session_id, iteration, "Task cancelled by parent");
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        iteration,
+                        DecisionType::StoppingCondition,
+                        "Stopping condition fired: cancellation token set".to_string(),
+                        json!({"condition":"cancelled"}),
+                    )
+                    .await;
+
+                    // Mark remaining tasks as cancelled (V3 requirement)
+                    if let Some(ref gid) = self.v3_goal_id {
+                        if let Ok(tasks) = self.state.get_tasks_for_goal_v3(gid).await {
+                            for task in &tasks {
+                                if task.status != "completed"
+                                    && task.status != "failed"
+                                    && task.status != "cancelled"
+                                {
+                                    let mut ct = task.clone();
+                                    ct.status = "cancelled".to_string();
+                                    let _ = self.state.update_task_v3(&ct).await;
+                                }
+                            }
+                        }
+                    }
+
+                    self.emit_task_end(
+                        &emitter,
+                        &task_id,
+                        TaskStatus::Cancelled,
+                        task_start,
+                        iteration,
+                        0,
+                        None,
+                        Some("Task cancelled.".to_string()),
+                    )
+                    .await;
+                    return Ok("Task cancelled.".to_string());
+                }
+            }
+
+            info!(
+                iteration,
+                session_id,
+                model = %model,
+                depth = self.depth,
+                policy_profile = ?policy_bundle.policy.model_profile,
+                verify_level = ?policy_bundle.policy.verify_level,
+                approval_mode = ?policy_bundle.policy.approval_mode,
+                context_budget = policy_bundle.policy.context_budget,
+                tool_budget = policy_bundle.policy.tool_budget,
+                policy_rev = policy_bundle.policy.policy_rev,
+                risk_score = policy_bundle.risk_score,
+                uncertainty_score = policy_bundle.uncertainty_score,
+                "Agent loop iteration"
+            );
 
             // Emit ThinkingStart event
             let _ = emitter
@@ -1431,6 +5068,15 @@ impl Agent {
             if let Some(cap) = hard_cap {
                 if iteration > cap {
                     warn!(session_id, iteration, cap, "Hard iteration cap reached");
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        iteration,
+                        DecisionType::StoppingCondition,
+                        "Stopping condition fired: hard iteration cap".to_string(),
+                        json!({"condition":"hard_iteration_cap","cap":cap,"iteration":iteration}),
+                    )
+                    .await;
                     let result = self
                         .graceful_cap_response(session_id, &learning_ctx, iteration)
                         .await;
@@ -1465,6 +5111,19 @@ impl Agent {
                         elapsed_secs = task_start.elapsed().as_secs(),
                         "Task timeout reached"
                     );
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        iteration,
+                        DecisionType::StoppingCondition,
+                        "Stopping condition fired: task timeout".to_string(),
+                        json!({
+                            "condition":"task_timeout",
+                            "timeout_secs": timeout.as_secs(),
+                            "elapsed_secs": task_start.elapsed().as_secs()
+                        }),
+                    )
+                    .await;
                     let result = self
                         .graceful_timeout_response(session_id, &learning_ctx, task_start.elapsed())
                         .await;
@@ -1500,6 +5159,19 @@ impl Agent {
                         budget,
                         "Task token budget exhausted"
                     );
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        iteration,
+                        DecisionType::StoppingCondition,
+                        "Stopping condition fired: task token budget exhausted".to_string(),
+                        json!({
+                            "condition":"task_token_budget",
+                            "budget": budget,
+                            "task_tokens_used": task_tokens_used
+                        }),
+                    )
+                    .await;
                     let result = self
                         .graceful_budget_response(session_id, &learning_ctx, task_tokens_used)
                         .await;
@@ -1535,6 +5207,19 @@ impl Agent {
                         .map(|r| (r.input_tokens + r.output_tokens) as u64)
                         .sum();
                     if total >= daily_budget {
+                        self.emit_decision_point(
+                            &emitter,
+                            &task_id,
+                            iteration,
+                            DecisionType::StoppingCondition,
+                            "Stopping condition fired: daily token budget exhausted".to_string(),
+                            json!({
+                                "condition":"daily_token_budget",
+                                "daily_budget": daily_budget,
+                                "total_today": total
+                            }),
+                        )
+                        .await;
                         let error_msg = format!(
                             "Daily token budget of {} exceeded (used: {}). Resets at midnight UTC.",
                             daily_budget, total
@@ -1561,8 +5246,25 @@ impl Agent {
                     session_id,
                     stall_count, "Agent stalled - no progress detected"
                 );
+                self.emit_decision_point(
+                    &emitter,
+                    &task_id,
+                    iteration,
+                    DecisionType::StoppingCondition,
+                    "Stopping condition fired: stall threshold reached".to_string(),
+                    json!({
+                        "condition":"stall",
+                        "stall_count": stall_count,
+                        "max_stall_iterations": MAX_STALL_ITERATIONS
+                    }),
+                )
+                .await;
                 let result = self
-                    .graceful_stall_response(session_id, &learning_ctx)
+                    .graceful_stall_response(
+                        session_id,
+                        &learning_ctx,
+                        !successful_send_file_keys.is_empty(),
+                    )
                     .await;
                 let (status, error, summary) = match &result {
                     Ok(reply) => (
@@ -1590,6 +5292,20 @@ impl Agent {
             if let (Some(threshold), Some(warn_at)) = (soft_threshold, soft_warn_at) {
                 if iteration >= warn_at && !soft_limit_warned {
                     soft_limit_warned = true;
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        iteration,
+                        DecisionType::StoppingCondition,
+                        "Soft iteration warning threshold reached".to_string(),
+                        json!({
+                            "condition":"soft_iteration_warning",
+                            "warn_at": warn_at,
+                            "threshold": threshold,
+                            "iteration": iteration
+                        }),
+                    )
+                    .await;
                     send_status(
                         &status_tx,
                         StatusUpdate::IterationWarning {
@@ -1623,6 +5339,83 @@ impl Agent {
                 last_progress_summary = Instant::now();
             }
 
+            // 8. Mid-loop adaptation: refresh + bounded escalation/de-escalation
+            if self.policy_config.context_refresh_enforce {
+                let max_same_tool_failures =
+                    tool_failure_count.values().copied().max().unwrap_or(0);
+                let should_refresh =
+                    iteration >= 5 && (stall_count >= 1 || max_same_tool_failures >= 2);
+
+                if should_refresh {
+                    POLICY_METRICS
+                        .context_refresh_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    // Refresh summary context and re-score policy with fresh failure signal.
+                    if self.context_window_config.enabled {
+                        session_summary = self
+                            .state
+                            .get_conversation_summary(session_id)
+                            .await
+                            .ok()
+                            .flatten();
+                    }
+                    policy_bundle =
+                        build_policy_bundle_v1(user_text, &available_capabilities, true);
+
+                    let can_escalate = last_escalation_iteration
+                        .is_none_or(|last| iteration >= last.saturating_add(2));
+                    if can_escalate {
+                        let reason = format!(
+                            "refresh_trigger(iter={},stall={},same_tool_failures={})",
+                            iteration, stall_count, max_same_tool_failures
+                        );
+                        if policy_bundle.policy.escalate(reason.clone()) {
+                            POLICY_METRICS
+                                .escalation_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            last_escalation_iteration = Some(iteration);
+                            if let Some(ref router) = self.router {
+                                let next_model = router
+                                    .select_for_profile(policy_bundle.policy.model_profile)
+                                    .to_string();
+                                if next_model != model {
+                                    info!(
+                                        session_id,
+                                        iteration,
+                                        reason = %reason,
+                                        from_model = %model,
+                                        to_model = %next_model,
+                                        "Escalated model profile mid-loop"
+                                    );
+                                    model = next_model;
+                                }
+                            }
+                        }
+                    }
+                    consecutive_clean_iterations = 0;
+                } else if consecutive_clean_iterations >= 2 {
+                    // Bounded de-escalation only after a stable clean window.
+                    if policy_bundle.policy.deescalate() {
+                        if let Some(ref router) = self.router {
+                            let next_model = router
+                                .select_for_profile(policy_bundle.policy.model_profile)
+                                .to_string();
+                            if next_model != model {
+                                info!(
+                                    session_id,
+                                    iteration,
+                                    from_model = %model,
+                                    to_model = %next_model,
+                                    "De-escalated model profile after stable window"
+                                );
+                                model = next_model;
+                            }
+                        }
+                    }
+                    consecutive_clean_iterations = 0;
+                }
+            }
+
             // === BUILD MESSAGES ===
 
             // Fetch only recent history inside the loop
@@ -1637,6 +5430,38 @@ impl Agent {
                 .chain(recent_history.iter())
                 .filter(|m| seen_ids.insert(&m.id))
                 .collect();
+
+            // Collapse tool intermediates from previous interactions to prevent context bleeding.
+            // Without this, old tool call chains (e.g., manage_people calls from a prior question)
+            // overwhelm the current question's context and confuse the LLM.
+            // Only the current interaction (after the last user message) keeps full tool chains.
+            let last_user_pos = deduped_msgs.iter().rposition(|m| m.role == "user");
+            let pre_collapse_len = deduped_msgs.len();
+            let deduped_msgs: Vec<&Message> = if let Some(boundary) = last_user_pos {
+                deduped_msgs
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, m)| {
+                        if *i >= boundary {
+                            true // current interaction: keep everything
+                        } else {
+                            // old interactions: drop tool intermediates, keep user + final assistant
+                            m.role != "tool"
+                                && !(m.role == "assistant" && m.tool_calls_json.is_some())
+                        }
+                    })
+                    .map(|(_, m)| m)
+                    .collect()
+            } else {
+                deduped_msgs
+            };
+            let collapsed = pre_collapse_len.saturating_sub(deduped_msgs.len());
+            if collapsed > 0 {
+                info!(
+                    session_id,
+                    collapsed, "Collapsed tool intermediates from previous interactions"
+                );
+            }
 
             // Collect tool_call_ids that have valid tool responses (role=tool with a name)
             let valid_tool_call_ids: std::collections::HashSet<&str> = deduped_msgs
@@ -1757,11 +5582,47 @@ impl Agent {
                 }
             }
 
+            // Context window enforcement: trim messages to fit token budget
+            if self.context_window_config.enabled {
+                let model_budget = crate::memory::context_window::compute_available_budget(
+                    &model,
+                    &system_prompt,
+                    &tool_defs,
+                    &self.context_window_config,
+                );
+                let policy_budget = policy_bundle.policy.context_budget;
+                if self.policy_config.policy_shadow_mode && !self.policy_config.policy_enforce {
+                    info!(
+                        session_id,
+                        iteration, model_budget, policy_budget, "Context budget shadow comparison"
+                    );
+                }
+                let effective_budget = if self.policy_config.policy_enforce {
+                    policy_budget
+                } else {
+                    model_budget
+                };
+                messages = crate::memory::context_window::fit_messages_with_source_quotas(
+                    messages,
+                    effective_budget,
+                    session_summary.as_ref().map(|s| s.summary.as_str()),
+                );
+            }
+
+            // For the consultant pass, force text-only behavior and strip
+            // tool-heavy docs from the system prompt to reduce hallucinated
+            // functionCall output on Gemini thinking models.
+            let effective_system_prompt = if iteration == 1 && consultant_pass_active {
+                build_consultant_system_prompt(&system_prompt)
+            } else {
+                system_prompt.clone()
+            };
+
             messages.insert(
                 0,
                 json!({
                     "role": "system",
-                    "content": system_prompt,
+                    "content": effective_system_prompt,
                 }),
             );
 
@@ -1816,11 +5677,32 @@ impl Agent {
 
             // === CALL LLM ===
 
+            // Consultant pass: on iteration 1, omit tools so the smart model
+            // must respond from knowledge / injected facts instead of searching.
+            // Force-text: after too many tool calls, strip tools to force a response.
+            let effective_tools: &[Value] = if iteration == 1 && consultant_pass_active {
+                info!(
+                    session_id,
+                    "Consultant pass: calling without tools (iteration 1)"
+                );
+                &[]
+            } else if force_text_response {
+                info!(
+                    session_id,
+                    iteration,
+                    total_successful_tool_calls,
+                    "Force-text mode: stripping tools to force a response"
+                );
+                &[]
+            } else {
+                &tool_defs
+            };
+
             let resp = match self.llm_call_timeout {
                 Some(timeout_dur) => {
                     match tokio::time::timeout(
                         timeout_dur,
-                        self.call_llm_with_recovery(&model, &messages, &tool_defs),
+                        self.call_llm_with_recovery(&model, &messages, effective_tools),
                     )
                     .await
                     {
@@ -1832,13 +5714,30 @@ impl Agent {
                                 timeout_secs = timeout_dur.as_secs(),
                                 "LLM call timed out"
                             );
+                            let _ = emitter
+                                .emit(
+                                    EventType::Error,
+                                    ErrorData::llm_error(
+                                        format!(
+                                            "LLM call timed out after {}s",
+                                            timeout_dur.as_secs()
+                                        ),
+                                        Some(task_id.clone()),
+                                    )
+                                    .with_context("llm_call_timeout"),
+                                )
+                                .await;
+                            learning_ctx.errors.push((
+                                format!("LLM call timed out after {}s", timeout_dur.as_secs()),
+                                false,
+                            ));
                             stall_count += 1;
                             continue; // Retry from top of loop (stall detection will exit after 3)
                         }
                     }
                 }
                 None => {
-                    self.call_llm_with_recovery(&model, &messages, &tool_defs)
+                    self.call_llm_with_recovery(&model, &messages, effective_tools)
                         .await?
                 }
             };
@@ -1861,6 +5760,28 @@ impl Agent {
                 }
             }
 
+            // Log V3 LLM call activity for executor agents
+            if let Some(ref v3_tid) = self.v3_task_id {
+                let tokens = resp
+                    .usage
+                    .as_ref()
+                    .map(|u| (u.input_tokens + u.output_tokens) as i64);
+                let activity = TaskActivityV3 {
+                    id: 0,
+                    task_id: v3_tid.clone(),
+                    activity_type: "llm_call".to_string(),
+                    tool_name: None,
+                    tool_args: None,
+                    result: resp.content.as_ref().map(|c| c.chars().take(500).collect()),
+                    success: Some(true),
+                    tokens_used: tokens,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                };
+                if let Err(e) = self.state.log_task_activity_v3(&activity).await {
+                    warn!(task_id = %v3_tid, error = %e, "Failed to log V3 LLM activity");
+                }
+            }
+
             // Log tool call names for debugging
             let tc_names: Vec<&str> = resp.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
             info!(
@@ -1871,15 +5792,1014 @@ impl Agent {
                 "LLM response received"
             );
 
+            // === CONSULTANT PASS: intercept iteration 1 ===
+            // Gemini models can hallucinate tool calls from system prompt tool
+            // descriptions even when no function declarations are sent via the API.
+            // So we must intercept the response and DROP any tool calls, keeping
+            // only the text analysis.
+            if iteration == 1 && consultant_pass_active {
+                // Try regular content first, then fall back to thinking output.
+                // Gemini thinking models may put all useful content in thought
+                // parts and only produce hallucinated tool calls as regular output.
+                let raw_analysis = resp
+                    .content
+                    .as_ref()
+                    .filter(|s| !s.trim().is_empty())
+                    .cloned()
+                    .or_else(|| {
+                        resp.thinking.as_ref().filter(|s| !s.trim().is_empty()).map(|t| {
+                            info!(
+                                session_id,
+                                thinking_len = t.len(),
+                                "Consultant pass: using thinking output as fallback (no regular content)"
+                            );
+                            t.clone()
+                        })
+                    })
+                    .unwrap_or_default();
+                let (analysis_without_gate, model_intent_gate) = extract_intent_gate(&raw_analysis);
+                let analysis = sanitize_consultant_analysis(&analysis_without_gate);
+                let inferred_gate = infer_intent_gate(user_text, &analysis);
+                let intent_gate = merge_intent_gate_decision(model_intent_gate, inferred_gate);
+
+                // Override: if user references a filesystem path, the consultant
+                // (text-only, no tools) can never fulfil the request — force tools.
+                let user_lower_for_path = user_text.trim().to_ascii_lowercase();
+                let user_references_fs_path = user_lower_for_path.contains('/')
+                    || user_lower_for_path.contains('\\')
+                    || user_lower_for_path.contains("~/");
+                let user_is_short_correction = is_short_user_correction(user_text);
+                // Semantic overrides — these detect intent from the LLM's BEHAVIOR,
+                // not from word matching. They override the intent gate when there's
+                // strong evidence the LLM needs tools.
+                let had_hallucinated_tool_calls = !resp.tool_calls.is_empty();
+                let analysis_defers_execution = looks_like_deferred_action_response(&analysis);
+
+                let (can_answer_now, needs_tools, needs_clarification) = if user_references_fs_path
+                {
+                    (false, true, false)
+                } else if had_hallucinated_tool_calls {
+                    // Strongest signal: the LLM literally tried to call tools
+                    // in text-only mode. It clearly cannot answer without them.
+                    info!(
+                        session_id,
+                        dropped_tool_calls = resp.tool_calls.len(),
+                        "Consultant pass: LLM attempted tool calls — forcing tools mode"
+                    );
+                    (false, true, false)
+                } else if user_is_short_correction {
+                    info!(
+                        session_id,
+                        "Consultant pass: short user correction detected — forcing no-tools answer mode"
+                    );
+                    (true, false, false)
+                } else if analysis_defers_execution && !intent_gate.needs_tools.unwrap_or(false) {
+                    // The consultant text promises/delegates future action, but the
+                    // intent gate does not request tools. Trust the behavioral signal.
+                    info!(
+                        session_id,
+                        "Consultant pass: deferred-action text contradicts needs_tools=false — forcing tools mode"
+                    );
+                    (false, true, false)
+                } else {
+                    (
+                        intent_gate.can_answer_now.unwrap_or(false),
+                        intent_gate.needs_tools.unwrap_or(false),
+                        intent_gate.needs_clarification.unwrap_or(false),
+                    )
+                };
+
+                if analysis.len() != raw_analysis.len() {
+                    info!(
+                        session_id,
+                        raw_len = raw_analysis.len(),
+                        sanitized_len = analysis.len(),
+                        "Consultant pass: sanitized control/pseudo-tool text from analysis"
+                    );
+                }
+
+                info!(
+                    session_id,
+                    can_answer_now,
+                    needs_tools,
+                    needs_clarification,
+                    missing_info = ?intent_gate.missing_info,
+                    domains = ?intent_gate.domains,
+                    "Consultant pass: intent gate decision"
+                );
+
+                if self.record_decision_points {
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        iteration,
+                        DecisionType::IntentGate,
+                        format!(
+                            "Intent gate: answer_now={} needs_tools={} needs_clarification={}",
+                            can_answer_now, needs_tools, needs_clarification
+                        ),
+                        json!({
+                            "can_answer_now": can_answer_now,
+                            "needs_tools": needs_tools,
+                            "needs_clarification": needs_clarification,
+                            "domains": intent_gate.domains.clone(),
+                            "missing_info": intent_gate.missing_info.clone()
+                        }),
+                    )
+                    .await;
+                }
+
+                if !intent_gate.domains.is_empty() {
+                    learning_ctx.intent_domains = intent_gate.domains.clone();
+                }
+
+                // Hard intent gate: if the consultant says clarification is
+                // required, ask the user directly and do NOT execute tools.
+                if needs_clarification {
+                    POLICY_METRICS
+                        .ambiguity_detected_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    let clarification = intent_gate
+                        .clarifying_question
+                        .clone()
+                        .filter(|q| q.contains('?'))
+                        .unwrap_or_else(|| {
+                            default_clarifying_question(user_text, &intent_gate.missing_info)
+                        });
+                    info!(
+                        session_id,
+                        clarification = %clarification,
+                        "Consultant pass: requesting clarification before any tool use"
+                    );
+                    let assistant_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "assistant".to_string(),
+                        content: Some(clarification.clone()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.5,
+                        embedding: None,
+                    };
+                    self.state.append_message(&assistant_msg).await?;
+
+                    self.emit_task_end(
+                        &emitter,
+                        &task_id,
+                        TaskStatus::Completed,
+                        task_start,
+                        iteration,
+                        0,
+                        None,
+                        Some(clarification.chars().take(200).collect()),
+                    )
+                    .await;
+
+                    return Ok(clarification);
+                }
+
+                let lower = user_text.trim().to_lowercase();
+                let is_question = lower.contains('?')
+                    || lower.starts_with("what")
+                    || lower.starts_with("where")
+                    || lower.starts_with("how")
+                    || lower.starts_with("who")
+                    || lower.starts_with("when")
+                    || lower.starts_with("can you tell")
+                    || lower.starts_with("do you know")
+                    || lower.starts_with("is there")
+                    || lower.starts_with("are there");
+
+                if is_question && !needs_tools && can_answer_now && intent_gate.schedule.is_none() {
+                    // For knowledge questions where the consultant can answer,
+                    // return the answer directly. If the consultant CAN'T answer
+                    // (can_answer_now=false), fall through to the tool loop even
+                    // if needs_tools=false — the model may be wrong about not
+                    // needing tools (e.g., people lookup, memory search).
+                    {
+                        // Return the consultant's answer directly.
+                        let analysis = if analysis.is_empty() {
+                            info!(
+                                session_id,
+                                "Consultant pass: no text from consultant, using fallback for question"
+                            );
+                            "I don't have enough information to answer that. Could you provide more details or rephrase?".to_string()
+                        } else {
+                            analysis
+                        };
+
+                        info!(
+                            session_id,
+                            analysis_len = analysis.len(),
+                            "Consultant pass: returning analysis directly for question"
+                        );
+                        let assistant_msg = Message {
+                            id: Uuid::new_v4().to_string(),
+                            session_id: session_id.to_string(),
+                            role: "assistant".to_string(),
+                            content: Some(analysis.clone()),
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_calls_json: None,
+                            created_at: Utc::now(),
+                            importance: 0.5,
+                            embedding: None,
+                        };
+                        self.state.append_message(&assistant_msg).await?;
+
+                        self.emit_task_end(
+                            &emitter,
+                            &task_id,
+                            TaskStatus::Completed,
+                            task_start,
+                            iteration,
+                            0,
+                            None,
+                            Some(analysis.chars().take(200).collect()),
+                        )
+                        .await;
+
+                        return Ok(analysis);
+                    }
+                }
+
+                // Pure acknowledgments ("yes!", "ok thanks", "sure", "👍",
+                // or equivalents in any language) are conversational responses
+                // to the agent's own questions. The consultant classifies these
+                // via the `is_acknowledgment` field in the intent gate JSON —
+                // no hardcoded word lists needed. When true, return the
+                // consultant's response directly instead of routing to the
+                // tool loop (which would fail with no applicable tools).
+                if intent_gate.is_acknowledgment.unwrap_or(false) || user_is_short_correction {
+                    let reply = if analysis.is_empty() && user_is_short_correction {
+                        "You're right — thanks for the correction.".to_string()
+                    } else {
+                        analysis.clone()
+                    };
+                    info!(
+                        session_id,
+                        reply_len = reply.len(),
+                        short_correction = user_is_short_correction,
+                        "Consultant pass: returning direct response for acknowledgment/correction"
+                    );
+                    let assistant_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "assistant".to_string(),
+                        content: Some(reply.clone()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.5,
+                        embedding: None,
+                    };
+                    self.state.append_message(&assistant_msg).await?;
+
+                    self.emit_task_end(
+                        &emitter,
+                        &task_id,
+                        TaskStatus::Completed,
+                        task_start,
+                        iteration,
+                        0,
+                        None,
+                        Some(reply.chars().take(200).collect()),
+                    )
+                    .await;
+
+                    return Ok(reply);
+                }
+
+                // V3: Check for cancel/stop intent before routing
+                {
+                    let lower_trimmed = user_text.trim().to_lowercase();
+                    let explicit_cancel_command =
+                        lower_trimmed == "/cancel" || lower_trimmed.starts_with("/cancel ");
+                    let model_requests_generic_cancel = intent_gate.cancel_intent.unwrap_or(false)
+                        && intent_gate.cancel_scope.as_deref() == Some("generic");
+                    let generic_cancel_request =
+                        explicit_cancel_command || model_requests_generic_cancel;
+
+                    // Only auto-cancel on generic stop/cancel commands.
+                    // Targeted requests ("cancel this goal: X") should flow
+                    // through normal tool routing so selection can be explicit.
+                    if generic_cancel_request {
+                        let active_goals = self
+                            .state
+                            .get_goals_for_session_v3(session_id)
+                            .await
+                            .unwrap_or_default();
+                        let active: Vec<&GoalV3> = active_goals
+                            .iter()
+                            .filter(|g| {
+                                g.status == "active"
+                                    || g.status == "pending"
+                                    || g.status == "pending_confirmation"
+                            })
+                            .collect();
+
+                        if !active.is_empty() {
+                            let mut cancelled = Vec::new();
+                            for goal in &active {
+                                // Cancel via token hierarchy (cascades to task lead + executors)
+                                if let Some(ref registry) = self.goal_token_registry {
+                                    registry.cancel(&goal.id).await;
+                                }
+                                // Update goal DB status
+                                let mut updated = (*goal).clone();
+                                updated.status = "cancelled".to_string();
+                                updated.updated_at = chrono::Utc::now().to_rfc3339();
+                                let _ = self.state.update_goal_v3(&updated).await;
+
+                                // Cancel all remaining tasks for this goal
+                                if let Ok(tasks) = self.state.get_tasks_for_goal_v3(&goal.id).await
+                                {
+                                    for task in &tasks {
+                                        if task.status != "completed"
+                                            && task.status != "failed"
+                                            && task.status != "cancelled"
+                                        {
+                                            let mut cancelled_task = task.clone();
+                                            cancelled_task.status = "cancelled".to_string();
+                                            let _ =
+                                                self.state.update_task_v3(&cancelled_task).await;
+                                        }
+                                    }
+                                }
+
+                                cancelled
+                                    .push(goal.description.chars().take(100).collect::<String>());
+                            }
+                            info!(
+                                session_id,
+                                count = cancelled.len(),
+                                "V3: cancelled active goals"
+                            );
+
+                            let msg = if cancelled.len() == 1 {
+                                format!("Cancelled: {}", cancelled[0])
+                            } else {
+                                format!(
+                                    "Cancelled {} goals:\n{}",
+                                    cancelled.len(),
+                                    cancelled
+                                        .iter()
+                                        .map(|d| format!("- {}", d))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                )
+                            };
+                            self.emit_task_end(
+                                &emitter,
+                                &task_id,
+                                TaskStatus::Completed,
+                                task_start,
+                                iteration,
+                                0,
+                                None,
+                                Some(msg.clone()),
+                            )
+                            .await;
+                            return Ok(msg);
+                        }
+                    }
+                }
+
+                // V3 orchestration routing (always-on)
+                {
+                    let (complexity, _) = classify_intent_complexity(user_text, &intent_gate);
+                    match complexity {
+                        IntentComplexity::ScheduledMissingTiming => {
+                            // Fall through to the full agent loop instead of
+                            // giving up. The LLM with tools can ask for timing
+                            // or infer it from context.
+                            info!(
+                                session_id,
+                                "V3: ScheduledMissingTiming — falling through to agent loop"
+                            );
+                            if tool_defs.is_empty() {
+                                let (defs, base_defs, caps) = self
+                                    .load_policy_tool_set(
+                                        user_text,
+                                        channel_ctx.visibility,
+                                        &policy_bundle.policy,
+                                        policy_bundle.risk_score,
+                                        self.policy_config.tool_filter_enforce,
+                                    )
+                                    .await;
+                                tool_defs = defs;
+                                base_tool_defs = base_defs;
+                                available_capabilities = caps;
+                            }
+                            continue;
+                        }
+                        IntentComplexity::Scheduled {
+                            schedule_raw,
+                            schedule_cron,
+                            is_one_shot,
+                            schedule_type_explicit,
+                        } => {
+                            let cron_expr = schedule_cron
+                                .as_ref()
+                                .filter(|candidate| {
+                                    let parts: Vec<&str> =
+                                        candidate.split_whitespace().collect();
+                                    parts.len() == 5
+                                })
+                                .and_then(|candidate| {
+                                    candidate.parse::<Cron>().ok().map(|_| candidate.clone())
+                                })
+                                .or_else(|| {
+                                    if schedule_cron.is_some() {
+                                        warn!(
+                                            session_id,
+                                            schedule_raw = %schedule_raw,
+                                            schedule_cron = ?schedule_cron,
+                                            "INTENT_GATE provided invalid schedule_cron; falling back to parser"
+                                        );
+                                    }
+                                    crate::cron_utils::parse_schedule(&schedule_raw).ok()
+                                });
+
+                            let cron_expr = match cron_expr {
+                                Some(expr) => expr,
+                                None => {
+                                    // Schedule parse failed — fall through to the
+                                    // full agent loop instead of giving up. The LLM
+                                    // with tools can handle the request directly.
+                                    warn!(
+                                        session_id,
+                                        schedule_raw = %schedule_raw,
+                                        "Schedule parse failed — falling through to agent loop"
+                                    );
+                                    if tool_defs.is_empty() {
+                                        let (defs, base_defs, caps) = self
+                                            .load_policy_tool_set(
+                                                user_text,
+                                                channel_ctx.visibility,
+                                                &policy_bundle.policy,
+                                                policy_bundle.risk_score,
+                                                self.policy_config.tool_filter_enforce,
+                                            )
+                                            .await;
+                                        tool_defs = defs;
+                                        base_tool_defs = base_defs;
+                                        available_capabilities = caps;
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            // Use explicit schedule_type when present. Fallback cron-shape
+                            // heuristic is only trusted for obvious relative one-shots.
+                            let allow_one_shot_fallback = !schedule_type_explicit
+                                && (contains_keyword_as_words(&schedule_raw, "in")
+                                    || contains_keyword_as_words(&schedule_raw, "tomorrow"));
+                            let actually_one_shot = if schedule_type_explicit {
+                                is_one_shot
+                            } else if allow_one_shot_fallback {
+                                is_one_shot || crate::cron_utils::is_one_shot_schedule(&cron_expr)
+                            } else {
+                                is_one_shot
+                            };
+
+                            if is_internal_maintenance_intent(user_text) {
+                                let msg = "Memory maintenance already runs via built-in background jobs (embeddings, consolidation, decay, retention). I won't create a scheduled goal for that.".to_string();
+                                let assistant_msg = Message {
+                                    id: Uuid::new_v4().to_string(),
+                                    session_id: session_id.to_string(),
+                                    role: "assistant".to_string(),
+                                    content: Some(msg.clone()),
+                                    tool_call_id: None,
+                                    tool_name: None,
+                                    tool_calls_json: None,
+                                    created_at: Utc::now(),
+                                    importance: 0.5,
+                                    embedding: None,
+                                };
+                                self.state.append_message(&assistant_msg).await?;
+                                self.emit_task_end(
+                                    &emitter,
+                                    &task_id,
+                                    TaskStatus::Completed,
+                                    task_start,
+                                    iteration,
+                                    0,
+                                    None,
+                                    Some(msg.chars().take(200).collect()),
+                                )
+                                .await;
+                                return Ok(msg);
+                            }
+
+                            let mut goal = if actually_one_shot {
+                                GoalV3::new_deferred_finite(user_text, session_id, &cron_expr)
+                            } else {
+                                GoalV3::new_continuous_pending(
+                                    user_text,
+                                    session_id,
+                                    &cron_expr,
+                                    Some(5000),
+                                    Some(20000),
+                                )
+                            };
+
+                            let relevant_facts = self
+                                .state
+                                .get_relevant_facts(user_text, 10)
+                                .await
+                                .unwrap_or_default();
+                            let relevant_procedures = self
+                                .state
+                                .get_relevant_procedures(user_text, 5)
+                                .await
+                                .unwrap_or_default();
+
+                            if !relevant_facts.is_empty() || !relevant_procedures.is_empty() {
+                                let ctx = json!({
+                                    "relevant_facts": relevant_facts.iter().map(|f| {
+                                        json!({"category": f.category, "key": f.key, "value": f.value})
+                                    }).collect::<Vec<_>>(),
+                                    "relevant_procedures": relevant_procedures.iter().map(|p| {
+                                        json!({"name": p.name, "trigger": p.trigger_pattern, "steps": p.steps})
+                                    }).collect::<Vec<_>>(),
+                                    "task_results": [],
+                                });
+                                goal.context =
+                                    Some(serde_json::to_string(&ctx).unwrap_or_default());
+                            }
+
+                            self.state.create_goal_v3(&goal).await?;
+
+                            let tz_label = crate::cron_utils::system_timezone_display();
+                            let schedule_desc = if actually_one_shot {
+                                crate::cron_utils::compute_next_run_local(&cron_expr)
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
+                                    .unwrap_or_else(|_| schedule_raw.clone())
+                            } else {
+                                let next_local =
+                                    crate::cron_utils::compute_next_run_local(&cron_expr)
+                                        .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
+                                        .unwrap_or_else(|_| "n/a".to_string());
+                                format!("{} (next: {})", schedule_raw, next_local)
+                            };
+                            let schedule_kind = if actually_one_shot {
+                                "one-time"
+                            } else {
+                                "recurring"
+                            };
+
+                            // Prefer inline approval buttons for schedule confirmation
+                            // (Telegram/Discord/Slack). Non-inline channels keep the
+                            // existing text confirm/cancel fallback.
+                            let inline_approval = {
+                                let hub_weak = self.hub.read().await.clone();
+                                if let Some(hub_weak) = hub_weak {
+                                    if let Some(hub_arc) = hub_weak.upgrade() {
+                                        let approval_desc = format!(
+                                            "Schedule {} goal ({}): {}",
+                                            schedule_kind, schedule_desc, goal.description
+                                        );
+                                        let warnings = vec![
+                                            "This creates a scheduled goal.".to_string(),
+                                            "The goal will execute automatically when due."
+                                                .to_string(),
+                                        ];
+                                        Some(
+                                            hub_arc
+                                                .request_inline_approval(
+                                                    session_id,
+                                                    &approval_desc,
+                                                    RiskLevel::Medium,
+                                                    &warnings,
+                                                    PermissionMode::Cautious,
+                                                )
+                                                .await,
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(approval_result) = inline_approval {
+                                match approval_result {
+                                    Ok(ApprovalResponse::AllowOnce)
+                                    | Ok(ApprovalResponse::AllowSession)
+                                    | Ok(ApprovalResponse::AllowAlways) => {
+                                        let activation_msg = match self.state.activate_goal_v3(&goal.id).await {
+                                            Ok(true) => {
+                                                if let Some(ref registry) = self.goal_token_registry {
+                                                    registry.register(&goal.id).await;
+                                                }
+                                                let next_run = goal
+                                                    .schedule
+                                                    .as_deref()
+                                                    .and_then(|s| crate::cron_utils::compute_next_run_local(s).ok())
+                                                    .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
+                                                    .unwrap_or_else(|| "n/a".to_string());
+                                                format!(
+                                                    "Scheduled: {} (next: {}). I'll execute it when the time comes. System timezone: {}.",
+                                                    goal.description, next_run, tz_label
+                                                )
+                                            }
+                                            Ok(false) => {
+                                                "I couldn't activate that scheduled goal because it is no longer pending confirmation."
+                                                    .to_string()
+                                            }
+                                            Err(e) => {
+                                                format!("I couldn't activate the scheduled goal: {}", e)
+                                            }
+                                        };
+                                        let assistant_msg = Message {
+                                            id: Uuid::new_v4().to_string(),
+                                            session_id: session_id.to_string(),
+                                            role: "assistant".to_string(),
+                                            content: Some(activation_msg.clone()),
+                                            tool_call_id: None,
+                                            tool_name: None,
+                                            tool_calls_json: None,
+                                            created_at: Utc::now(),
+                                            importance: 0.5,
+                                            embedding: None,
+                                        };
+                                        self.state.append_message(&assistant_msg).await?;
+                                        self.emit_task_end(
+                                            &emitter,
+                                            &task_id,
+                                            TaskStatus::Completed,
+                                            task_start,
+                                            iteration,
+                                            0,
+                                            None,
+                                            Some(
+                                                "Scheduled goal confirmed via inline approval."
+                                                    .to_string(),
+                                            ),
+                                        )
+                                        .await;
+                                        return Ok(activation_msg);
+                                    }
+                                    Ok(ApprovalResponse::Deny) => {
+                                        let now = chrono::Utc::now().to_rfc3339();
+                                        goal.status = "cancelled".to_string();
+                                        goal.completed_at = Some(now.clone());
+                                        goal.updated_at = now;
+                                        let _ = self.state.update_goal_v3(&goal).await;
+
+                                        let cancel_msg =
+                                            "OK, cancelled the scheduled goal.".to_string();
+                                        let assistant_msg = Message {
+                                            id: Uuid::new_v4().to_string(),
+                                            session_id: session_id.to_string(),
+                                            role: "assistant".to_string(),
+                                            content: Some(cancel_msg.clone()),
+                                            tool_call_id: None,
+                                            tool_name: None,
+                                            tool_calls_json: None,
+                                            created_at: Utc::now(),
+                                            importance: 0.5,
+                                            embedding: None,
+                                        };
+                                        self.state.append_message(&assistant_msg).await?;
+                                        self.emit_task_end(
+                                            &emitter,
+                                            &task_id,
+                                            TaskStatus::Completed,
+                                            task_start,
+                                            iteration,
+                                            0,
+                                            None,
+                                            Some(
+                                                "Scheduled goal cancelled via inline approval."
+                                                    .to_string(),
+                                            ),
+                                        )
+                                        .await;
+                                        return Ok(cancel_msg);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            session_id,
+                                            error = %e,
+                                            "Inline schedule approval unavailable; falling back to text confirmation"
+                                        );
+                                    }
+                                }
+                            }
+
+                            let confirmation = format!(
+                                "I'll schedule this as a {} task ({}):\n> {}\nSystem timezone: {}.\nReply **confirm** to proceed or **cancel** to discard.",
+                                schedule_kind, schedule_desc, goal.description, tz_label
+                            );
+
+                            let assistant_msg = Message {
+                                id: Uuid::new_v4().to_string(),
+                                session_id: session_id.to_string(),
+                                role: "assistant".to_string(),
+                                content: Some(confirmation.clone()),
+                                tool_call_id: None,
+                                tool_name: None,
+                                tool_calls_json: None,
+                                created_at: Utc::now(),
+                                importance: 0.5,
+                                embedding: None,
+                            };
+                            self.state.append_message(&assistant_msg).await?;
+                            self.emit_task_end(
+                                &emitter,
+                                &task_id,
+                                TaskStatus::Completed,
+                                task_start,
+                                iteration,
+                                0,
+                                None,
+                                Some("Scheduled goal awaiting text confirmation.".to_string()),
+                            )
+                            .await;
+                            return Ok(confirmation);
+                        }
+                        IntentComplexity::Knowledge => {
+                            // Return the consultant's analysis directly.
+                            // The is_question block above catches most knowledge
+                            // requests; this catches the rest (e.g., "tell me about X").
+                            let answer = if analysis.is_empty() {
+                                "I don't have enough information to answer that. Could you provide more details or rephrase?".to_string()
+                            } else {
+                                analysis.clone()
+                            };
+
+                            info!(
+                                session_id,
+                                answer_len = answer.len(),
+                                "V3: Knowledge intent — returning consultant analysis"
+                            );
+                            let assistant_msg = Message {
+                                id: Uuid::new_v4().to_string(),
+                                session_id: session_id.to_string(),
+                                role: "assistant".to_string(),
+                                content: Some(answer.clone()),
+                                tool_call_id: None,
+                                tool_name: None,
+                                tool_calls_json: None,
+                                created_at: Utc::now(),
+                                importance: 0.5,
+                                embedding: None,
+                            };
+                            self.state.append_message(&assistant_msg).await?;
+
+                            self.emit_task_end(
+                                &emitter,
+                                &task_id,
+                                TaskStatus::Completed,
+                                task_start,
+                                iteration,
+                                0,
+                                None,
+                                Some(answer.chars().take(200).collect()),
+                            )
+                            .await;
+
+                            return Ok(answer);
+                        }
+                        IntentComplexity::Simple => {
+                            // Load tools if not already loaded. This also covers the case
+                            // where can_answer_now=false downgraded Knowledge→Simple — the
+                            // model couldn't answer, so we need tools to try (memory, people, etc.).
+                            if tool_defs.is_empty() {
+                                let (defs, base_defs, caps) = self
+                                    .load_policy_tool_set(
+                                        user_text,
+                                        channel_ctx.visibility,
+                                        &policy_bundle.policy,
+                                        policy_bundle.risk_score,
+                                        self.policy_config.tool_filter_enforce,
+                                    )
+                                    .await;
+                                tool_defs = defs;
+                                base_tool_defs = base_defs;
+                                available_capabilities = caps;
+                                info!(
+                                    session_id,
+                                    tool_count = tool_defs.len(),
+                                    "V3: Simple intent — loaded tools for orchestrator"
+                                );
+                            }
+                            info!(
+                                session_id,
+                                "V3: Simple intent — continuing to full agent loop"
+                            );
+                            // Skip to next iteration where the full agent loop
+                            // runs with all tools and full context.
+                            continue;
+                        }
+                        IntentComplexity::Complex => {
+                            if is_internal_maintenance_intent(user_text) {
+                                let msg = "Memory maintenance already runs via built-in background jobs (embeddings, consolidation, decay, retention). I won't create a goal for that.".to_string();
+                                let assistant_msg = Message {
+                                    id: Uuid::new_v4().to_string(),
+                                    session_id: session_id.to_string(),
+                                    role: "assistant".to_string(),
+                                    content: Some(msg.clone()),
+                                    tool_call_id: None,
+                                    tool_name: None,
+                                    tool_calls_json: None,
+                                    created_at: Utc::now(),
+                                    importance: 0.5,
+                                    embedding: None,
+                                };
+                                self.state.append_message(&assistant_msg).await?;
+                                self.emit_task_end(
+                                    &emitter,
+                                    &task_id,
+                                    TaskStatus::Completed,
+                                    task_start,
+                                    iteration,
+                                    0,
+                                    None,
+                                    Some(msg.chars().take(200).collect()),
+                                )
+                                .await;
+                                return Ok(msg);
+                            }
+
+                            // Create V3 goal
+                            let mut goal = GoalV3::new_finite(user_text, session_id);
+
+                            // Phase 4: Feed-forward relevant knowledge into goal context
+                            let relevant_facts = self
+                                .state
+                                .get_relevant_facts(user_text, 10)
+                                .await
+                                .unwrap_or_default();
+                            let relevant_procedures = self
+                                .state
+                                .get_relevant_procedures(user_text, 5)
+                                .await
+                                .unwrap_or_default();
+
+                            if !relevant_facts.is_empty() || !relevant_procedures.is_empty() {
+                                let ctx = json!({
+                                    "relevant_facts": relevant_facts.iter().map(|f| {
+                                        json!({"category": f.category, "key": f.key, "value": f.value})
+                                    }).collect::<Vec<_>>(),
+                                    "relevant_procedures": relevant_procedures.iter().map(|p| {
+                                        json!({"name": p.name, "trigger": p.trigger_pattern, "steps": p.steps})
+                                    }).collect::<Vec<_>>(),
+                                    "task_results": [],
+                                });
+                                goal.context =
+                                    Some(serde_json::to_string(&ctx).unwrap_or_default());
+                            }
+
+                            self.state.create_goal_v3(&goal).await?;
+
+                            // Register cancellation token for this goal
+                            if let Some(ref registry) = self.goal_token_registry {
+                                registry.register(&goal.id).await;
+                            }
+
+                            info!(
+                                session_id,
+                                goal_id = %goal.id,
+                                "V3: created goal for complex request, spawning task lead in background"
+                            );
+
+                            // Upgrade weak self-reference to Arc for background spawning
+                            let self_arc = {
+                                let self_ref = self.self_ref.read().await;
+                                self_ref.as_ref().and_then(|w| w.upgrade())
+                            };
+
+                            if let Some(agent_arc) = self_arc {
+                                // Spawn the task lead in the background — user gets immediate response
+                                let bg_hub = self.hub.read().await.clone();
+                                spawn_background_task_lead(
+                                    agent_arc,
+                                    goal.clone(),
+                                    user_text.to_string(),
+                                    session_id.to_string(),
+                                    channel_ctx.clone(),
+                                    user_role,
+                                    self.state.clone(),
+                                    bg_hub,
+                                    self.goal_token_registry.clone(),
+                                    None,
+                                );
+                            } else {
+                                // No self_ref available (sub-agent or test) — fall back to sync
+                                warn!("V3: No self_ref available, running task lead synchronously");
+                                let result = self
+                                    .spawn_task_lead(
+                                        &goal.id,
+                                        &goal.description,
+                                        user_text,
+                                        status_tx.clone(),
+                                        channel_ctx.clone(),
+                                        user_role,
+                                    )
+                                    .await;
+
+                                match result {
+                                    Ok(response) => {
+                                        let mut updated_goal = goal.clone();
+                                        updated_goal.status = "completed".to_string();
+                                        updated_goal.completed_at =
+                                            Some(chrono::Utc::now().to_rfc3339());
+                                        let _ = self.state.update_goal_v3(&updated_goal).await;
+                                        return Ok(response);
+                                    }
+                                    Err(e) => {
+                                        let mut updated_goal = goal.clone();
+                                        updated_goal.status = "failed".to_string();
+                                        let _ = self.state.update_goal_v3(&updated_goal).await;
+                                        return Ok(format!(
+                                            "I encountered an issue while working on your request: {}",
+                                            e
+                                        ));
+                                    }
+                                }
+                            }
+
+                            // Run progressive extraction on the Goal path so facts
+                            // and conversation summaries don't become stale when most
+                            // interactions route through Goals.
+                            let desc_preview: String = goal.description.chars().take(500).collect();
+                            let ellipsis = if goal.description.chars().count() > 500 {
+                                "..."
+                            } else {
+                                ""
+                            };
+                            let goal_response = format!(
+                                "On it. I'll plan this out and get started. Goal: {}{}",
+                                desc_preview, ellipsis
+                            );
+                            if self.context_window_config.progressive_facts
+                                && crate::memory::context_window::should_extract_facts(user_text)
+                            {
+                                let fast_model = self
+                                    .router
+                                    .as_ref()
+                                    .map(|r| r.select(crate::router::Tier::Fast).to_string())
+                                    .unwrap_or_else(|| model.clone());
+                                crate::memory::context_window::spawn_progressive_extraction(
+                                    self.provider.clone(),
+                                    fast_model.clone(),
+                                    self.state.clone(),
+                                    user_text.to_string(),
+                                    goal_response.clone(),
+                                );
+
+                                if self.context_window_config.enabled {
+                                    crate::memory::context_window::spawn_incremental_summarization(
+                                        self.provider.clone(),
+                                        fast_model,
+                                        self.state.clone(),
+                                        session_id.to_string(),
+                                        self.context_window_config.summarize_threshold,
+                                        self.context_window_config.summary_window,
+                                    );
+                                }
+                            }
+
+                            // Return immediately — user doesn't wait for task lead
+                            self.emit_task_end(
+                                &emitter,
+                                &task_id,
+                                TaskStatus::Completed,
+                                task_start,
+                                iteration,
+                                0,
+                                None,
+                                Some("Goal created, working in background.".to_string()),
+                            )
+                            .await;
+                            return Ok(goal_response);
+                        }
+                    }
+                }
+
+                // V3: Knowledge and Complex return above. Simple falls through
+                // to the full agent loop below (iteration 2+).
+            }
+
             // === NATURAL COMPLETION: No tool calls ===
             if resp.tool_calls.is_empty() {
-                let reply = resp.content.filter(|s| !s.is_empty()).unwrap_or_default();
+                let mut reply = resp.content.filter(|s| !s.is_empty()).unwrap_or_default();
+
                 if reply.is_empty() {
-                    // If the agent actually did work (iteration > 1 means tool calls happened)
+                    // If the agent actually executed tool calls successfully
                     // and this is the top-level agent (depth 0), send a brief completion note
                     // so the user knows the task finished. Without this, the user gets silence
                     // because the LLM decided the tool output already communicated the answer.
-                    if iteration > 1 && self.depth == 0 {
+                    // Note: we check total_successful_tool_calls, NOT iteration > 1, because
+                    // the consultant pass (iteration 1) doesn't count as real work.
+                    if total_successful_tool_calls > 0 && self.depth == 0 {
                         let task_hint: String = learning_ctx.user_text.chars().take(80).collect();
                         let task_hint = task_hint.trim();
                         let reply = if task_hint.is_empty() {
@@ -1895,9 +6815,196 @@ impl Agent {
                         );
                         return Ok(reply);
                     }
-                    // No work was done (first iteration) or sub-agent — stay silent
+                    // Top-level agent past the consultant pass but no tools were called
+                    // and no content returned — the LLM failed to act. Tell the user.
+                    if iteration > 1 && self.depth == 0 {
+                        let fallback =
+                            "I wasn't able to process that request. Could you try rephrasing?"
+                                .to_string();
+                        info!(
+                            session_id,
+                            iteration,
+                            "Agent completed with no work done — LLM returned empty with tools available"
+                        );
+                        let _ = emitter
+                            .emit(
+                                EventType::AssistantResponse,
+                                AssistantResponseData {
+                                    content: Some(fallback.clone()),
+                                    model: model.clone(),
+                                    tool_calls: None,
+                                    input_tokens: resp.usage.as_ref().map(|u| u.input_tokens),
+                                    output_tokens: resp.usage.as_ref().map(|u| u.output_tokens),
+                                },
+                            )
+                            .await;
+
+                        let assistant_msg = Message {
+                            id: Uuid::new_v4().to_string(),
+                            session_id: session_id.to_string(),
+                            role: "assistant".to_string(),
+                            content: Some(fallback.clone()),
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_calls_json: None,
+                            created_at: Utc::now(),
+                            importance: 0.5,
+                            embedding: None,
+                        };
+                        self.state.append_message(&assistant_msg).await?;
+
+                        self.emit_task_end(
+                            &emitter,
+                            &task_id,
+                            TaskStatus::Completed,
+                            task_start,
+                            iteration,
+                            learning_ctx.tool_calls.len(),
+                            None,
+                            Some(fallback.chars().take(200).collect()),
+                        )
+                        .await;
+
+                        return Ok(fallback);
+                    }
+                    // First iteration or sub-agent — stay silent
                     info!(session_id, iteration, "Agent completed with empty response");
                     return Ok(String::new());
+                }
+
+                // Guardrail: don't accept "I'll do X" / workflow narration as
+                // completion text. Either keep the loop alive (if tools exist)
+                // or return an explicit blocker (if no tools are available).
+                if self.depth == 0 && looks_like_deferred_action_response(&reply) {
+                    if tool_defs.is_empty() {
+                        warn!(
+                            session_id,
+                            iteration,
+                            "Deferred-action reply with no available tools; returning explicit blocker"
+                        );
+                        reply = "I wasn't able to complete that request because no execution tools are available in this context. Please try again in a context with tool access."
+                            .to_string();
+                    } else {
+                        stall_count += 1;
+                        consecutive_clean_iterations = 0;
+                        if total_successful_tool_calls == 0 {
+                            deferred_no_tool_streak =
+                                deferred_no_tool_streak.saturating_add(1);
+                        } else {
+                            deferred_no_tool_streak = 0;
+                        }
+                        warn!(
+                            session_id,
+                            iteration,
+                            stall_count,
+                            total_successful_tool_calls,
+                            "Deferred-action reply without concrete results; continuing loop"
+                        );
+
+                        let deferred_nudge = if total_successful_tool_calls == 0 {
+                            "[SYSTEM] You promised to perform an action but did not execute any tools. \
+                             Execute the required tools now, then return concrete results."
+                                .to_string()
+                        } else {
+                            "[SYSTEM] You narrated future work instead of providing results. \
+                             Execute any remaining required tools, or return concrete outcomes and blockers now."
+                                .to_string()
+                        };
+
+                        let nudge = Message {
+                            id: Uuid::new_v4().to_string(),
+                            session_id: session_id.to_string(),
+                            role: "tool".to_string(),
+                            content: Some(deferred_nudge),
+                            tool_call_id: Some("system-deferred-action".to_string()),
+                            tool_name: Some("system".to_string()),
+                            tool_calls_json: None,
+                            created_at: Utc::now(),
+                            importance: 0.1,
+                            embedding: None,
+                        };
+                        self.state.append_message(&nudge).await?;
+
+                        // Fallback expansion: widen tool set once after exactly two
+                        // no-progress iterations, even in no-tool-call paths.
+                        if stall_count == 2 && !fallback_expanded_once {
+                            fallback_expanded_once = true;
+                            let previous_count = tool_defs.len();
+                            let widened = self.filter_tool_definitions_for_policy(
+                                &base_tool_defs,
+                                &available_capabilities,
+                                &policy_bundle.policy,
+                                policy_bundle.risk_score,
+                                true,
+                            );
+                            if !widened.is_empty() {
+                                POLICY_METRICS
+                                    .fallback_expansion_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tool_defs = widened;
+                                info!(
+                                    session_id,
+                                    iteration,
+                                    previous_count,
+                                    widened_count = tool_defs.len(),
+                                    "No-progress fallback expansion applied (deferred-action path)"
+                                );
+                            }
+                        }
+
+                        if total_successful_tool_calls == 0
+                            && deferred_no_tool_streak >= DEFERRED_NO_TOOL_SWITCH_THRESHOLD
+                            && deferred_no_tool_model_switches
+                                < MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES
+                        {
+                            if let Some(next_model) =
+                                self.pick_fallback_excluding(&model, &[]).await
+                            {
+                                info!(
+                                    session_id,
+                                    iteration,
+                                    from_model = %model,
+                                    to_model = %next_model,
+                                    "Deferred/no-tool recovery: switching model for one retry window"
+                                );
+                                model = next_model;
+                                deferred_no_tool_model_switches += 1;
+                                // Strategy changed, give the new model a fresh stall budget.
+                                stall_count = 0;
+
+                                let recovery_nudge = Message {
+                                    id: Uuid::new_v4().to_string(),
+                                    session_id: session_id.to_string(),
+                                    role: "tool".to_string(),
+                                    content: Some(
+                                        "[SYSTEM] Recovery mode: a model switch was applied because prior replies kept promising actions without tool calls. Call the required tools now and return concrete results."
+                                            .to_string(),
+                                    ),
+                                    tool_call_id: Some("system-deferred-action-recovery".to_string()),
+                                    tool_name: Some("system".to_string()),
+                                    tool_calls_json: None,
+                                    created_at: Utc::now(),
+                                    importance: 0.1,
+                                    embedding: None,
+                                };
+                                self.state.append_message(&recovery_nudge).await?;
+                            }
+                        }
+
+                        if total_successful_tool_calls == 0
+                            && stall_count >= MAX_STALL_ITERATIONS
+                            && !learning_ctx
+                                .errors
+                                .iter()
+                                .any(|(e, _)| e == DEFERRED_NO_TOOL_ERROR_MARKER)
+                        {
+                            learning_ctx
+                                .errors
+                                .push((DEFERRED_NO_TOOL_ERROR_MARKER.to_string(), false));
+                        }
+
+                        continue;
+                    }
                 }
 
                 // Emit AssistantResponse event
@@ -1949,6 +7056,36 @@ impl Agent {
                         warn!("Learning failed: {}", e);
                     }
                 });
+
+                // Progressive fact extraction: extract durable facts immediately
+                if self.context_window_config.progressive_facts
+                    && crate::memory::context_window::should_extract_facts(user_text)
+                {
+                    let fast_model = self
+                        .router
+                        .as_ref()
+                        .map(|r| r.select(crate::router::Tier::Fast).to_string())
+                        .unwrap_or_else(|| model.clone());
+                    crate::memory::context_window::spawn_progressive_extraction(
+                        self.provider.clone(),
+                        fast_model.clone(),
+                        self.state.clone(),
+                        user_text.to_string(),
+                        reply.clone(),
+                    );
+
+                    // Incremental summarization: update summary if threshold reached
+                    if self.context_window_config.enabled {
+                        crate::memory::context_window::spawn_incremental_summarization(
+                            self.provider.clone(),
+                            fast_model,
+                            self.state.clone(),
+                            session_id.to_string(),
+                            self.context_window_config.summarize_threshold,
+                            self.context_window_config.summary_window,
+                        );
+                    }
+                }
 
                 // Sanitize output for public channels
                 let reply = match channel_ctx.visibility {
@@ -2043,9 +7180,66 @@ impl Agent {
                 continue; // Skip to next iteration — agent will narrate then retry
             }
 
+            let uncertainty_threshold =
+                current_uncertainty_threshold(self.policy_config.uncertainty_clarify_threshold);
+            if self.policy_config.uncertainty_clarify_enforce
+                && policy_bundle.uncertainty_score >= uncertainty_threshold
+            {
+                let has_side_effecting_call = resp
+                    .tool_calls
+                    .iter()
+                    .any(|tc| tool_is_side_effecting(&tc.name, &available_capabilities));
+                if has_side_effecting_call {
+                    let clarify = default_clarifying_question(user_text, &[]);
+                    POLICY_METRICS
+                        .uncertainty_clarify_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        session_id,
+                        iteration,
+                        uncertainty_score = policy_bundle.uncertainty_score,
+                        threshold = uncertainty_threshold,
+                        clarification = %clarify,
+                        "Uncertainty guard triggered before side-effecting tool execution"
+                    );
+                    let assistant_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "assistant".to_string(),
+                        content: Some(clarify.clone()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.5,
+                        embedding: None,
+                    };
+                    self.state.append_message(&assistant_msg).await?;
+                    self.emit_task_end(
+                        &emitter,
+                        &task_id,
+                        TaskStatus::Completed,
+                        task_start,
+                        iteration,
+                        learning_ctx.tool_calls.len(),
+                        None,
+                        Some("Asked clarification due to uncertainty policy.".to_string()),
+                    )
+                    .await;
+                    return Ok(clarify);
+                }
+            }
+
             let mut successful_tool_calls = 0;
+            let mut iteration_had_tool_failures = false;
 
             for tc in &resp.tool_calls {
+                let send_file_key = if tc.name == "send_file" {
+                    extract_send_file_dedupe_key_from_args(&tc.arguments)
+                } else {
+                    None
+                };
+
                 // Check for repetitive behavior (same tool call hash appearing too often)
                 let call_hash = hash_tool_call(&tc.name, &tc.arguments);
                 recent_tool_calls.push_back(call_hash);
@@ -2058,6 +7252,61 @@ impl Agent {
                     .iter()
                     .filter(|&&h| h == call_hash)
                     .count();
+
+                // Soft redirect: skip execution and coach the LLM to adapt.
+                // This fires BEFORE the hard stall, giving the agent a chance
+                // to change approach instead of just giving up.
+                if (REPETITIVE_REDIRECT_THRESHOLD..MAX_REPETITIVE_CALLS).contains(&repetitive_count)
+                {
+                    warn!(
+                        session_id,
+                        tool = %tc.name,
+                        repetitive_count,
+                        "Redirecting repetitive tool call — coaching agent to adapt"
+                    );
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        iteration,
+                        DecisionType::RepetitiveCallDetection,
+                        format!(
+                            "Repetitive tool call redirected for {} (count={})",
+                            tc.name, repetitive_count
+                        ),
+                        json!({
+                            "tool": tc.name,
+                            "count": repetitive_count,
+                            "action": "redirect"
+                        }),
+                    )
+                    .await;
+                    let redirect_msg = format!(
+                        "[SYSTEM] BLOCKED: You already called `{}` with these exact same arguments {} times \
+                         and got the same result. Repeating it will NOT produce a different outcome.\n\n\
+                         You MUST change your approach. Options:\n\
+                         - Use DIFFERENT arguments or a different command\n\
+                         - If you're missing information (URL, credentials, deployment method), \
+                         ASK the user instead of guessing\n\
+                         - If this sub-task is blocked, skip it and tell the user what you \
+                         accomplished and what still needs their input",
+                        tc.name, repetitive_count
+                    );
+                    let tool_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "tool".to_string(),
+                        content: Some(redirect_msg),
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.name.clone()),
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.3,
+                        embedding: None,
+                    };
+                    self.state.append_message(&tool_msg).await?;
+                    continue;
+                }
+
                 if repetitive_count >= MAX_REPETITIVE_CALLS {
                     warn!(
                         session_id,
@@ -2065,6 +7314,22 @@ impl Agent {
                         repetitive_count,
                         "Repetitive tool call detected - agent may be stuck"
                     );
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        iteration,
+                        DecisionType::RepetitiveCallDetection,
+                        format!(
+                            "Repetitive tool call hard-stopped for {} (count={})",
+                            tc.name, repetitive_count
+                        ),
+                        json!({
+                            "tool": tc.name,
+                            "count": repetitive_count,
+                            "action": "hard_stop"
+                        }),
+                    )
+                    .await;
                     let result = self
                         .graceful_repetitive_response(session_id, &learning_ctx, &tc.name)
                         .await;
@@ -2105,13 +7370,29 @@ impl Agent {
                 if consecutive_same_tool.1 >= MAX_CONSECUTIVE_SAME_TOOL {
                     let total = consecutive_same_tool.1;
                     let unique = consecutive_same_tool_arg_hashes.len();
-                    // If more than half the calls have unique args, the agent
-                    // is likely making progress (e.g. different terminal cmds).
-                    // Only bail when the ratio is low (recycling the same few
-                    // commands) or the streak is extremely long.
+                    // Diverse args get a small bonus (+4), not a full bypass.
+                    // Even with different commands, 20+ consecutive same-tool
+                    // calls without switching tools indicates a stuck loop.
                     let is_diverse = unique * 2 > total;
-                    let extreme = total >= MAX_CONSECUTIVE_SAME_TOOL * 2;
-                    if !is_diverse || extreme {
+                    let diverse_limit = MAX_CONSECUTIVE_SAME_TOOL + 4;
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        iteration,
+                        DecisionType::ConsecutiveSameToolDetection,
+                        format!(
+                            "Consecutive same-tool detection for {} (total={}, unique_args={})",
+                            tc.name, total, unique
+                        ),
+                        json!({
+                            "tool": tc.name,
+                            "consecutive_count": total,
+                            "unique_args": unique,
+                            "is_diverse": is_diverse
+                        }),
+                    )
+                    .await;
+                    if !is_diverse || total >= diverse_limit {
                         warn!(
                             session_id,
                             tool = %tc.name,
@@ -2146,43 +7427,78 @@ impl Agent {
                 }
 
                 // Check for alternating tool patterns (A-B-A-B cycles)
+                // Only detects when exactly 2 different tools alternate — a
+                // single tool used repeatedly is handled by consecutive-same-tool
+                // detection above (which has proper argument diversity checks).
                 recent_tool_names.push_back(tc.name.clone());
                 if recent_tool_names.len() > ALTERNATING_PATTERN_WINDOW {
                     recent_tool_names.pop_front();
                 }
                 if recent_tool_names.len() >= ALTERNATING_PATTERN_WINDOW {
                     let unique_tools: HashSet<&String> = recent_tool_names.iter().collect();
-                    // If only 2 unique tools in the last N calls, it's an alternating pattern
-                    if unique_tools.len() <= 2 {
-                        warn!(
-                            session_id,
-                            tools = ?unique_tools,
-                            window = ALTERNATING_PATTERN_WINDOW,
-                            "Alternating tool pattern detected - agent is looping"
-                        );
-                        let result = self
-                            .graceful_repetitive_response(session_id, &learning_ctx, &tc.name)
-                            .await;
-                        let (status, error, summary) = match &result {
-                            Ok(reply) => (
-                                TaskStatus::Failed,
-                                Some("Alternating tool loop".to_string()),
-                                Some(reply.chars().take(200).collect()),
-                            ),
-                            Err(e) => (TaskStatus::Failed, Some(e.to_string()), None),
+                    // Only fire for exactly 2 unique tools (true A-B-A-B pattern).
+                    // A single tool (unique_tools.len() == 1) is NOT an alternating
+                    // pattern — it's a legitimate streak of varied commands (e.g.
+                    // terminal with different args) and is guarded by the
+                    // consecutive-same-tool check instead.
+                    if unique_tools.len() == 2 {
+                        // Additional diversity check: if the argument hashes in the
+                        // window are mostly unique, the agent may be doing real work
+                        // that happens to bounce between two tools (e.g. terminal +
+                        // web_search).  Only trigger when diversity is low.
+                        let recent_hashes: HashSet<&u64> = recent_tool_calls.iter().collect();
+                        let diversity_ratio = if recent_tool_calls.is_empty() {
+                            1.0
+                        } else {
+                            recent_hashes.len() as f64 / recent_tool_calls.len() as f64
                         };
-                        self.emit_task_end(
-                            &emitter,
-                            &task_id,
-                            status,
-                            task_start,
-                            iteration,
-                            learning_ctx.tool_calls.len(),
-                            error,
-                            summary,
-                        )
-                        .await;
-                        return result;
+                        // High diversity (>60% unique calls) → productive work, skip
+                        if diversity_ratio <= 0.6 {
+                            let tool_names: Vec<String> =
+                                unique_tools.iter().map(|t| (*t).clone()).collect();
+                            self.emit_decision_point(
+                                &emitter,
+                                &task_id,
+                                iteration,
+                                DecisionType::AlternatingPatternDetection,
+                                "Alternating A-B loop detected".to_string(),
+                                json!({
+                                    "tools": tool_names,
+                                    "diversity_ratio": diversity_ratio
+                                }),
+                            )
+                            .await;
+                            warn!(
+                                session_id,
+                                tools = ?unique_tools,
+                                window = ALTERNATING_PATTERN_WINDOW,
+                                diversity_ratio,
+                                "Alternating tool pattern detected - agent is looping"
+                            );
+                            let result = self
+                                .graceful_repetitive_response(session_id, &learning_ctx, &tc.name)
+                                .await;
+                            let (status, error, summary) = match &result {
+                                Ok(reply) => (
+                                    TaskStatus::Failed,
+                                    Some("Alternating tool loop".to_string()),
+                                    Some(reply.chars().take(200).collect()),
+                                ),
+                                Err(e) => (TaskStatus::Failed, Some(e.to_string()), None),
+                            };
+                            self.emit_task_end(
+                                &emitter,
+                                &task_id,
+                                status,
+                                task_start,
+                                iteration,
+                                learning_ctx.tool_calls.len(),
+                                error,
+                                summary,
+                            )
+                            .await;
+                            return result;
+                        }
                     }
                 }
 
@@ -2196,11 +7512,19 @@ impl Agent {
                          answer the user with what you have.",
                         tc.name, prior_failures
                     ))
-                } else if prior_calls >= 3
+                } else if prior_calls >= 8
                     && !matches!(
                         tc.name.as_str(),
-                        "terminal" | "plan_manager" | "cli_agent" | "remember_fact" | "web_fetch"
+                        "terminal"
+                            | "cli_agent"
+                            | "remember_fact"
+                            | "manage_memories"
+                            | "manage_goal_tasks"
+                            | "spawn_agent"
+                            | "web_fetch"
                     )
+                    && !tc.name.contains("__")
+                // MCP tools (prefix__name)
                 {
                     if tc.name == "web_search" && prior_failures == 0 {
                         Some(format!(
@@ -2234,6 +7558,19 @@ impl Agent {
                         calls = prior_calls,
                         "Blocking repeated tool call"
                     );
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        iteration,
+                        DecisionType::ToolBudgetBlock,
+                        format!("Blocked tool {} due to repeated failures/calls", tc.name),
+                        json!({
+                            "tool": tc.name,
+                            "prior_failures": prior_failures,
+                            "prior_calls": prior_calls
+                        }),
+                    )
+                    .await;
                     let tool_msg = Message {
                         id: Uuid::new_v4().to_string(),
                         session_id: session_id.to_string(),
@@ -2244,6 +7581,111 @@ impl Agent {
                         tool_calls_json: None,
                         created_at: Utc::now(),
                         importance: 0.1,
+                        embedding: None,
+                    };
+                    self.state.append_message(&tool_msg).await?;
+                    // Count blocked calls as progress for stall detection, but
+                    // only if the agent has done real work before.  Without
+                    // this, 3 consecutive blocked iterations trigger
+                    // false-positive stall detection.  If the agent has never
+                    // succeeded, blocking shouldn't mask genuine failure.
+                    if total_successful_tool_calls > 0 {
+                        successful_tool_calls += 1;
+                    }
+                    continue;
+                }
+
+                if tc.name == "send_file"
+                    && send_file_key
+                        .as_ref()
+                        .is_some_and(|k| successful_send_file_keys.contains(k))
+                {
+                    info!(
+                        session_id,
+                        iteration,
+                        tool_call_id = %tc.id,
+                        "Suppressing duplicate send_file call in same task"
+                    );
+                    let result_text =
+                        "Duplicate send_file suppressed: this exact file+caption was already sent in this task."
+                            .to_string();
+
+                    // Count as a successful no-op so stall detection doesn't
+                    // treat idempotency suppression as lack of progress.
+                    successful_tool_calls += 1;
+                    total_successful_tool_calls += 1;
+
+                    // Track total calls per tool
+                    *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+
+                    // Track tool call for learning
+                    let tool_summary = format!(
+                        "{}({})",
+                        tc.name,
+                        summarize_tool_args(&tc.name, &tc.arguments)
+                    );
+                    learning_ctx.tool_calls.push(tool_summary);
+
+                    let _ = emitter
+                        .emit(
+                            EventType::ToolCall,
+                            ToolCallData::from_tool_call(
+                                tc.id.clone(),
+                                tc.name.clone(),
+                                serde_json::from_str(&tc.arguments)
+                                    .unwrap_or(serde_json::json!({})),
+                                Some(task_id.clone()),
+                            )
+                            .with_policy_metadata(
+                                Some(format!("{}:{}:{}", task_id, tc.name, tc.id)),
+                                Some(policy_bundle.policy.policy_rev),
+                                Some(policy_bundle.risk_score),
+                            ),
+                        )
+                        .await;
+
+                    let _ = emitter
+                        .emit(
+                            EventType::ToolResult,
+                            ToolResultData {
+                                tool_call_id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                result: result_text.clone(),
+                                success: true,
+                                duration_ms: 0,
+                                error: None,
+                                task_id: Some(task_id.clone()),
+                            },
+                        )
+                        .await;
+
+                    if let Some(ref v3_tid) = self.v3_task_id {
+                        let activity = TaskActivityV3 {
+                            id: 0,
+                            task_id: v3_tid.clone(),
+                            activity_type: "tool_call".to_string(),
+                            tool_name: Some(tc.name.clone()),
+                            tool_args: Some(tc.arguments.chars().take(1000).collect()),
+                            result: Some(result_text.chars().take(2000).collect()),
+                            success: Some(true),
+                            tokens_used: None,
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        };
+                        if let Err(e) = self.state.log_task_activity_v3(&activity).await {
+                            warn!(task_id = %v3_tid, error = %e, "Failed to log V3 task activity");
+                        }
+                    }
+
+                    let tool_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "tool".to_string(),
+                        content: Some(result_text),
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.name.clone()),
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.3,
                         embedding: None,
                     };
                     self.state.append_message(&tool_msg).await?;
@@ -2267,21 +7709,23 @@ impl Agent {
                             tc.name.clone(),
                             serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({})),
                             Some(task_id.clone()),
+                        )
+                        .with_policy_metadata(
+                            Some(format!("{}:{}:{}", task_id, tc.name, tc.id)),
+                            Some(policy_bundle.policy.policy_rev),
+                            Some(policy_bundle.risk_score),
                         ),
                     )
                     .await;
 
-                // Track tool call in step tracker for plan progress
-                if let Some(ref st) = self.step_tracker {
-                    let _ = st.record_tool_call(session_id, &tc.name, &tc.id).await;
-                }
-
+                let tool_exec_start = Instant::now();
                 touch_heartbeat(&heartbeat);
                 let result = self
                     .execute_tool(
                         &tc.name,
                         &tc.arguments,
                         session_id,
+                        Some(&task_id),
                         status_tx.clone(),
                         channel_ctx.visibility,
                         channel_ctx.channel_id.as_deref(),
@@ -2304,6 +7748,17 @@ impl Agent {
                     Err(e) => format!("Error: {}", e),
                 };
 
+                // Compress large tool results to save context budget
+                if self.context_window_config.enabled {
+                    result_text = crate::memory::context_window::compress_tool_result(
+                        &tc.name,
+                        &result_text,
+                        self.context_window_config.max_tool_result_chars,
+                    );
+                }
+                let tool_duration_ms =
+                    tool_exec_start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+
                 // Track total calls per tool
                 *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
 
@@ -2320,6 +7775,7 @@ impl Agent {
                     || result_text.starts_with("Error:")
                     || result_text.starts_with("Failed to ");
                 if is_error {
+                    iteration_had_tool_failures = true;
                     let count = tool_failure_count.entry(tc.name.clone()).or_insert(0);
                     *count += 1;
 
@@ -2374,6 +7830,29 @@ impl Agent {
                     learning_ctx.errors.push((result_text.clone(), false));
                 } else {
                     successful_tool_calls += 1;
+                    total_successful_tool_calls += 1;
+                    if tc.name == "send_file" {
+                        if let Some(key) = send_file_key {
+                            successful_send_file_keys.insert(key);
+                        }
+                        // Strongly bias the model to finish immediately after a
+                        // successful file delivery instead of continuing to
+                        // explore and risking follow-up path drift errors.
+                        result_text = format!(
+                            "{}\n\n[SYSTEM] send_file succeeded. Unless the user explicitly requested additional files or modifications, stop calling tools and reply to the user now.",
+                            result_text
+                        );
+                    }
+
+                    // After a cli_agent call completes, reset stall detection
+                    // counters — the follow-up work (e.g. git push, deploy) is
+                    // a fresh phase and shouldn't inherit stall state.
+                    if tc.name == "cli_agent" {
+                        recent_tool_calls.clear();
+                        consecutive_same_tool = (String::new(), 0);
+                        consecutive_same_tool_arg_hashes.clear();
+                        recent_tool_names.clear();
+                    }
 
                     if !learning_ctx.errors.is_empty() {
                         // Successful action after an error - this is recovery
@@ -2394,7 +7873,7 @@ impl Agent {
                             name: tc.name.clone(),
                             result: result_text.clone(),
                             success: !is_error,
-                            duration_ms: 0, // Could add timing if needed
+                            duration_ms: tool_duration_ms,
                             error: if is_error {
                                 Some(result_text.clone())
                             } else {
@@ -2419,32 +7898,21 @@ impl Agent {
                         .await;
                 }
 
-                // Track tool result in step tracker for plan progress
-                if tc.name != "plan_manager" {
-                    if let Some(ref st) = self.step_tracker {
-                        let summary = result_text.chars().take(200).collect::<String>();
-                        if let Ok(Some((_, step_completed))) = st
-                            .on_tool_result(session_id, &tc.name, !is_error, &summary)
-                            .await
-                        {
-                            if step_completed {
-                                info!(tool = %tc.name, "Plan step auto-completed by tool result");
-                            }
-                        }
-                    }
-                }
-
-                // Emit plan status updates for plan_manager tool calls
-                if tc.name == "plan_manager" && !is_error {
-                    if let Some(ref ps) = self.plan_store {
-                        self.emit_plan_status_update(
-                            ps,
-                            session_id,
-                            &tc.arguments,
-                            &result_text,
-                            &status_tx,
-                        )
-                        .await;
+                // Log V3 task activity for executor agents
+                if let Some(ref v3_tid) = self.v3_task_id {
+                    let activity = TaskActivityV3 {
+                        id: 0,
+                        task_id: v3_tid.clone(),
+                        activity_type: "tool_call".to_string(),
+                        tool_name: Some(tc.name.clone()),
+                        tool_args: Some(tc.arguments.chars().take(1000).collect()),
+                        result: Some(result_text.chars().take(2000).collect()),
+                        success: Some(!is_error),
+                        tokens_used: None,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    if let Err(e) = self.state.log_task_activity_v3(&activity).await {
+                        warn!(task_id = %v3_tid, error = %e, "Failed to log V3 task activity");
                     }
                 }
 
@@ -2463,11 +7931,107 @@ impl Agent {
                 self.state.append_message(&tool_msg).await?;
             }
 
+            // Escalating early-stop nudges: remind the LLM with increasing urgency
+            // to stop exploring and respond. After a hard threshold, strip tools
+            // entirely to force a text response on the next iteration.
+            const NUDGE_INTERVAL: usize = 8;
+            const FORCE_TEXT_AT: usize = 100;
+            if total_successful_tool_calls > 0
+                && total_successful_tool_calls.is_multiple_of(NUDGE_INTERVAL)
+                && total_successful_tool_calls < FORCE_TEXT_AT
+            {
+                let urgency = if total_successful_tool_calls >= 16 {
+                    "[SYSTEM] IMPORTANT: You have made many tool calls. You MUST stop calling \
+                     tools and respond to the user NOW with what you have found so far. \
+                     Summarize your findings immediately."
+                } else {
+                    "[SYSTEM] You have made several tool calls. If you already have enough \
+                     information to answer the user's question, stop calling tools and \
+                     respond now with your findings."
+                };
+                let nudge = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "tool".to_string(),
+                    content: Some(urgency.to_string()),
+                    tool_call_id: Some("system-nudge".to_string()),
+                    tool_name: Some("system".to_string()),
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.1,
+                    embedding: None,
+                };
+                self.state.append_message(&nudge).await?;
+                info!(
+                    session_id,
+                    total_successful_tool_calls, "Early-stop nudge injected (escalating)"
+                );
+            }
+            // Hard force-stop: after FORCE_TEXT_AT tool calls, strip tools on
+            // the next LLM call so the model MUST produce a text response.
+            if total_successful_tool_calls >= FORCE_TEXT_AT && !force_text_response {
+                force_text_response = true;
+                let force_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "tool".to_string(),
+                    content: Some(
+                        "[SYSTEM] Tool limit reached. You must now respond to the user with \
+                         a summary of everything you found. No more tool calls are available."
+                            .to_string(),
+                    ),
+                    tool_call_id: Some("system-force-stop".to_string()),
+                    tool_name: Some("system".to_string()),
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.1,
+                    embedding: None,
+                };
+                self.state.append_message(&force_msg).await?;
+                warn!(
+                    session_id,
+                    total_successful_tool_calls, "Force-text response activated — tools stripped"
+                );
+            }
+
             // Update stall detection
             if successful_tool_calls == 0 {
                 stall_count += 1;
+                consecutive_clean_iterations = 0;
+
+                // Fallback expansion: widen tool set once after exactly two no-progress iterations.
+                if stall_count == 2 && !fallback_expanded_once {
+                    fallback_expanded_once = true;
+                    let previous_count = tool_defs.len();
+                    let widened = self.filter_tool_definitions_for_policy(
+                        &base_tool_defs,
+                        &available_capabilities,
+                        &policy_bundle.policy,
+                        policy_bundle.risk_score,
+                        true,
+                    );
+                    if !widened.is_empty() {
+                        POLICY_METRICS
+                            .fallback_expansion_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        tool_defs = widened;
+                        info!(
+                            session_id,
+                            iteration,
+                            previous_count,
+                            widened_count = tool_defs.len(),
+                            "No-progress fallback expansion applied"
+                        );
+                    }
+                }
             } else {
                 stall_count = 0; // Reset on any successful progress
+                deferred_no_tool_streak = 0;
+                if !iteration_had_tool_failures {
+                    consecutive_clean_iterations = consecutive_clean_iterations.saturating_add(1);
+                } else {
+                    consecutive_clean_iterations = 0;
+                }
             }
         }
     }
@@ -2479,7 +8043,7 @@ impl Agent {
         learning_ctx: &LearningContext,
         elapsed: Duration,
     ) -> anyhow::Result<String> {
-        self.pause_active_plan(session_id, "timeout").await;
+        // Plan pausing removed (plans deprecated in favor of goals/tasks).
         let summary = format!(
             "I've been working on this task for {} minutes and reached the time limit. \
             Here's what I accomplished:\n\n\
@@ -2514,7 +8078,7 @@ impl Agent {
         learning_ctx: &LearningContext,
         tokens_used: u64,
     ) -> anyhow::Result<String> {
-        self.pause_active_plan(session_id, "token_budget").await;
+        // Plan pausing removed (plans deprecated in favor of goals/tasks).
         let summary = format!(
             "I've used {} tokens on this task and reached the budget limit. \
             Here's what I accomplished:\n\n\
@@ -2542,31 +8106,107 @@ impl Agent {
         Ok(summary)
     }
 
+    /// Classify the stall cause from recent errors for actionable guidance.
+    fn classify_stall(learning_ctx: &LearningContext) -> (&'static str, &'static str) {
+        let recent_errors: String = learning_ctx
+            .errors
+            .iter()
+            .rev()
+            .take(5)
+            .map(|(e, _)| e.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if recent_errors.contains("rate limit") || recent_errors.contains("429") {
+            (
+                "Rate Limited",
+                "The AI provider is throttling requests. Try again in a few minutes, or consider switching to a different model tier.",
+            )
+        } else if recent_errors.contains("timed out") || recent_errors.contains("timeout") {
+            (
+                "Timeout",
+                "The AI provider is responding slowly. This usually resolves on its own — try again shortly, or try a simpler request.",
+            )
+        } else if recent_errors.contains("network") || recent_errors.contains("connection") {
+            (
+                "Network Error",
+                "There's a connectivity issue reaching the AI provider. Check your network connection and try again.",
+            )
+        } else if recent_errors.contains("server error")
+            || recent_errors.contains("500")
+            || recent_errors.contains("502")
+            || recent_errors.contains("503")
+        {
+            (
+                "Server Error",
+                "The AI provider is experiencing issues. This is usually temporary — try again in a few minutes.",
+            )
+        } else if recent_errors.contains("auth")
+            || recent_errors.contains("unauthorized")
+            || recent_errors.contains("api key")
+        {
+            (
+                "Authentication",
+                "There may be an issue with API credentials. Check your provider configuration.",
+            )
+        } else if recent_errors.contains(DEFERRED_NO_TOOL_ERROR_MARKER) {
+            (
+                "Deferred No-Tool Loop",
+                "The model repeatedly promised actions but never called tools. Retry the request; if it recurs, switch model/profile or ask for a direct text answer.",
+            )
+        } else {
+            (
+                "Stuck",
+                "Try rephrasing your request or providing more specific guidance.",
+            )
+        }
+    }
+
     /// Graceful response when agent is stalled (no progress).
     async fn graceful_stall_response(
         &self,
         session_id: &str,
         learning_ctx: &LearningContext,
+        sent_file_successfully: bool,
     ) -> anyhow::Result<String> {
-        self.pause_active_plan(session_id, "stall").await;
-        let summary = format!(
-            "I seem to be stuck and not making progress. \
-            Here's what I tried:\n\n\
-            - {} tool calls executed\n\
-            - {} errors encountered\n\n\
-            Recent errors:\n{}\n\n\
-            Please try rephrasing your request or providing more specific guidance.",
-            learning_ctx.tool_calls.len(),
-            learning_ctx.errors.len(),
-            learning_ctx
-                .errors
-                .iter()
-                .rev()
-                .take(3)
-                .map(|(e, _)| format!("- {}", e.chars().take(100).collect::<String>()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        let (label, suggestion) = Self::classify_stall(learning_ctx);
+        let recent_errors = learning_ctx
+            .errors
+            .iter()
+            .rev()
+            .take(3)
+            .map(|(e, _)| format!("- {}", e.chars().take(100).collect::<String>()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary = if sent_file_successfully {
+            format!(
+                "I already sent at least one requested file, then got stuck in follow-up steps.\n\n\
+                Stopping reason: **{}**\n\
+                - {} tool calls executed\n\
+                - {} errors encountered\n\n\
+                {}\n\n\
+                Recent errors:\n{}",
+                label,
+                learning_ctx.tool_calls.len(),
+                learning_ctx.errors.len(),
+                suggestion,
+                recent_errors
+            )
+        } else {
+            format!(
+                "I'm unable to make progress — **{}**.\n\n\
+                Here's what I tried:\n\
+                - {} tool calls executed\n\
+                - {} errors encountered\n\n\
+                {}\n\n\
+                Recent errors:\n{}",
+                label,
+                learning_ctx.tool_calls.len(),
+                learning_ctx.errors.len(),
+                suggestion,
+                recent_errors
+            )
+        };
 
         let assistant_msg = Message {
             id: Uuid::new_v4().to_string(),
@@ -2591,7 +8231,7 @@ impl Agent {
         learning_ctx: &LearningContext,
         tool_name: &str,
     ) -> anyhow::Result<String> {
-        self.pause_active_plan(session_id, "repetitive").await;
+        // Plan pausing removed (plans deprecated in favor of goals/tasks).
         let summary = format!(
             "I noticed I'm calling `{}` repeatedly with similar parameters, which suggests I'm stuck in a loop. \
             Here's what I've done so far:\n\n\
@@ -2626,7 +8266,7 @@ impl Agent {
         learning_ctx: &LearningContext,
         iterations: usize,
     ) -> anyhow::Result<String> {
-        self.pause_active_plan(session_id, "iteration_cap").await;
+        // Plan pausing removed (plans deprecated in favor of goals/tasks).
         let summary = format!(
             "I've reached the maximum iteration limit ({} iterations). \
             Here's what I accomplished:\n\n\
@@ -2652,19 +8292,6 @@ impl Agent {
         };
         self.state.append_message(&assistant_msg).await?;
         Ok(summary)
-    }
-
-    /// Pause any active plan for the session when hitting a safety limit.
-    async fn pause_active_plan(&self, session_id: &str, reason: &str) {
-        if let Some(ref st) = self.step_tracker {
-            match st.pause_plan(session_id).await {
-                Ok(Some(plan)) => {
-                    info!(plan_id = %plan.id, reason, "Paused plan due to safety limit")
-                }
-                Ok(None) => {}
-                Err(e) => warn!(error = %e, "Failed to pause plan on safety exit"),
-            }
-        }
     }
 
     /// Emit a TaskEnd event. Called from every exit path in the agent loop.
@@ -2696,12 +8323,39 @@ impl Agent {
             .await;
     }
 
+    async fn emit_decision_point(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        iteration: usize,
+        decision_type: DecisionType,
+        summary: impl Into<String>,
+        metadata: Value,
+    ) {
+        if !self.record_decision_points {
+            return;
+        }
+        let _ = emitter
+            .emit(
+                EventType::DecisionPoint,
+                DecisionPointData {
+                    decision_type,
+                    task_id: task_id.to_string(),
+                    iteration: iteration.min(u32::MAX as usize) as u32,
+                    metadata,
+                    summary: summary.into(),
+                },
+            )
+            .await;
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_tool(
         &self,
         name: &str,
         arguments: &str,
         session_id: &str,
+        task_id: Option<&str>,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         channel_visibility: ChannelVisibility,
         channel_id: Option<&str>,
@@ -2721,6 +8375,9 @@ impl Agent {
                 if let Some(ch_id) = channel_id {
                     map.insert("_channel_id".to_string(), json!(ch_id));
                 }
+                if let Some(tid) = task_id {
+                    map.insert("_task_id".to_string(), json!(tid));
+                }
                 // Mark as untrusted if this session originated from an automated
                 // trigger (e.g., email) rather than direct user interaction.
                 // This forces tools like terminal to require explicit approval.
@@ -2733,10 +8390,13 @@ impl Agent {
                     map.insert("_trusted_session".to_string(), json!(true));
                 }
                 // Inject user role so tools can enforce role-based access control
-                map.insert(
-                    "_user_role".to_string(),
-                    json!(format!("{:?}", user_role)),
-                );
+                map.insert("_user_role".to_string(), json!(format!("{:?}", user_role)));
+                // Inject V3 context for task lead → executor spawning
+                if name == "spawn_agent" {
+                    if let Some(ref gid) = self.v3_goal_id {
+                        map.insert("_goal_id".to_string(), json!(gid));
+                    }
+                }
                 serde_json::to_string(&map)?
             }
             _ => arguments.to_string(),
@@ -2794,229 +8454,6 @@ impl Agent {
 
         anyhow::bail!("Unknown tool: {}", name)
     }
-
-    /// Emit status updates for plan_manager tool calls.
-    async fn emit_plan_status_update(
-        &self,
-        plan_store: &Arc<PlanStore>,
-        session_id: &str,
-        arguments: &str,
-        result_text: &str,
-        status_tx: &Option<mpsc::Sender<StatusUpdate>>,
-    ) {
-        // Parse action from arguments
-        let action = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|v| v["action"].as_str().map(String::from))
-            .unwrap_or_default();
-
-        // Get current plan state for accurate status info
-        let plan = plan_store
-            .get_incomplete_for_session(session_id)
-            .await
-            .ok()
-            .flatten();
-
-        match action.as_str() {
-            "create" => {
-                // Parse plan info from result: "Created plan 'X' with N steps..."
-                if result_text.contains("Created plan") {
-                    if let Some(plan) = plan {
-                        send_status(
-                            status_tx,
-                            StatusUpdate::PlanCreated {
-                                plan_id: plan.id.clone(),
-                                description: plan.description.clone(),
-                                total_steps: plan.steps.len(),
-                            },
-                        );
-                        // Also emit step start for first step
-                        if let Some(step) = plan.steps.first() {
-                            send_status(
-                                status_tx,
-                                StatusUpdate::PlanStepStart {
-                                    plan_id: plan.id.clone(),
-                                    step_index: 0,
-                                    total_steps: plan.steps.len(),
-                                    description: step.description.clone(),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-            "complete_step" => {
-                // Check if plan completed or moved to next step
-                if result_text.contains("All steps done") {
-                    // Plan completed - need to get the now-completed plan
-                    if let Ok(Some(completed_plan)) = plan_store
-                        .get_recent_for_session(session_id, 1)
-                        .await
-                        .map(|v| v.into_iter().next())
-                    {
-                        send_status(
-                            status_tx,
-                            StatusUpdate::PlanComplete {
-                                plan_id: completed_plan.id.clone(),
-                                description: completed_plan.description.clone(),
-                                total_steps: completed_plan.steps.len(),
-                                duration_secs: completed_plan.duration_secs(),
-                            },
-                        );
-                    }
-                } else if let Some(plan) = plan {
-                    // Step completed, now on next step
-                    let prev_step = plan.current_step.saturating_sub(1);
-                    if let Some(completed_step) = plan.steps.get(prev_step) {
-                        send_status(
-                            status_tx,
-                            StatusUpdate::PlanStepComplete {
-                                plan_id: plan.id.clone(),
-                                step_index: prev_step,
-                                total_steps: plan.steps.len(),
-                                description: completed_step.description.clone(),
-                                summary: completed_step.result_summary.clone(),
-                            },
-                        );
-                    }
-                    // Emit start for current step
-                    if let Some(current_step) = plan.steps.get(plan.current_step) {
-                        send_status(
-                            status_tx,
-                            StatusUpdate::PlanStepStart {
-                                plan_id: plan.id.clone(),
-                                step_index: plan.current_step,
-                                total_steps: plan.steps.len(),
-                                description: current_step.description.clone(),
-                            },
-                        );
-                    }
-                }
-            }
-            "fail_step" => {
-                if let Some(plan) = plan {
-                    if let Some(step) = plan.steps.get(plan.current_step) {
-                        send_status(
-                            status_tx,
-                            StatusUpdate::PlanStepFailed {
-                                plan_id: plan.id.clone(),
-                                step_index: plan.current_step,
-                                description: step.description.clone(),
-                                error: step
-                                    .error
-                                    .clone()
-                                    .unwrap_or_else(|| "Unknown error".to_string()),
-                            },
-                        );
-                    }
-                }
-            }
-            "skip_step" => {
-                // Similar to complete_step but the step was skipped
-                if result_text.contains("All steps done") {
-                    if let Ok(Some(completed_plan)) = plan_store
-                        .get_recent_for_session(session_id, 1)
-                        .await
-                        .map(|v| v.into_iter().next())
-                    {
-                        send_status(
-                            status_tx,
-                            StatusUpdate::PlanComplete {
-                                plan_id: completed_plan.id.clone(),
-                                description: completed_plan.description.clone(),
-                                total_steps: completed_plan.steps.len(),
-                                duration_secs: completed_plan.duration_secs(),
-                            },
-                        );
-                    }
-                } else if let Some(plan) = plan {
-                    // Now on next step after skip
-                    if let Some(current_step) = plan.steps.get(plan.current_step) {
-                        send_status(
-                            status_tx,
-                            StatusUpdate::PlanStepStart {
-                                plan_id: plan.id.clone(),
-                                step_index: plan.current_step,
-                                total_steps: plan.steps.len(),
-                                description: current_step.description.clone(),
-                            },
-                        );
-                    }
-                }
-            }
-            "abandon" => {
-                // Plan was abandoned - result contains the description
-                if result_text.contains("Abandoned plan") {
-                    // Extract description from result text
-                    let description = result_text
-                        .strip_prefix("Abandoned plan '")
-                        .and_then(|s| s.split('\'').next())
-                        .unwrap_or("Unknown")
-                        .to_string();
-
-                    send_status(
-                        status_tx,
-                        StatusUpdate::PlanAbandoned {
-                            plan_id: String::new(), // Plan is now abandoned so we can't get ID
-                            description,
-                        },
-                    );
-                }
-            }
-            "resume" => {
-                // Plan resumed - emit step start for current step
-                if let Some(plan) = plan {
-                    if let Some(step) = plan.steps.get(plan.current_step) {
-                        send_status(
-                            status_tx,
-                            StatusUpdate::PlanStepStart {
-                                plan_id: plan.id.clone(),
-                                step_index: plan.current_step,
-                                total_steps: plan.steps.len(),
-                                description: step.description.clone(),
-                            },
-                        );
-                    }
-                }
-            }
-            "revise" => {
-                // Plan was revised - emit revision status and current step
-                if result_text.contains("Revised plan") {
-                    if let Some(plan) = plan {
-                        // Extract reason from arguments
-                        let reason = serde_json::from_str::<Value>(arguments)
-                            .ok()
-                            .and_then(|v| v["revision_reason"].as_str().map(String::from))
-                            .unwrap_or_else(|| "User requested changes".to_string());
-
-                        send_status(
-                            status_tx,
-                            StatusUpdate::PlanRevised {
-                                plan_id: plan.id.clone(),
-                                description: plan.description.clone(),
-                                reason,
-                                new_total_steps: plan.steps.len(),
-                            },
-                        );
-
-                        // Also emit step start for current step
-                        if let Some(step) = plan.steps.get(plan.current_step) {
-                            send_status(
-                                status_tx,
-                                StatusUpdate::PlanStepStart {
-                                    plan_id: plan.id.clone(),
-                                    step_index: plan.current_step,
-                                    total_steps: plan.steps.len(),
-                                    description: step.description.clone(),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-            _ => {} // get, checkpoint, retry_step don't need status updates
-        }
-    }
 }
 
 /// Process learning from a completed task - runs in background.
@@ -3029,10 +8466,16 @@ async fn process_learning(state: &Arc<dyn StateStore>, ctx: LearningContext) -> 
         .iter()
         .filter(|(_, recovered)| !recovered)
         .count();
-    let task_success = ctx.completed_naturally && unrecovered_errors == 0;
+    let task_success = if ctx.explicit_negative_signals > 0 {
+        false
+    } else if ctx.explicit_positive_signals > 0 {
+        true
+    } else {
+        ctx.completed_naturally && unrecovered_errors == 0
+    };
 
     // 1. Update expertise for detected domains
-    let domains = expertise::detect_domains(&ctx.user_text);
+    let domains = expertise::detect_domains(&ctx.intent_domains);
     for domain in &domains {
         let error = if !task_success {
             ctx.errors.first().map(|(e, _)| e.as_str())
@@ -3367,6 +8810,23 @@ fn extract_file_path_from_args(args_json: &str) -> Option<String> {
         .and_then(|v| v.get("file_path")?.as_str().map(String::from))
 }
 
+/// Build a stable dedupe key for send_file calls within a single task.
+/// Key format: "{expanded_path}|{trimmed_caption}".
+fn extract_send_file_dedupe_key_from_args(args_json: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(args_json).ok()?;
+    let file_path = parsed.get("file_path")?.as_str()?.trim();
+    if file_path.is_empty() {
+        return None;
+    }
+    let expanded_path = shellexpand::tilde(file_path).to_string();
+    let caption = parsed
+        .get("caption")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    Some(format!("{}|{}", expanded_path, caption))
+}
+
 /// Check if a session ID indicates it was triggered by an automated source
 /// (e.g., email trigger) rather than direct user interaction via Telegram.
 fn is_trigger_session(session_id: &str) -> bool {
@@ -3633,5 +9093,1089 @@ mod heartbeat_tests {
     fn test_touch_heartbeat_none_is_noop() {
         // Should not panic
         touch_heartbeat(&None);
+    }
+}
+
+#[cfg(test)]
+mod group_session_tests {
+    use super::*;
+
+    #[test]
+    fn discord_guild_channel() {
+        assert!(is_group_session("discord:ch:123456"));
+        assert!(is_group_session("mybot:discord:ch:123456"));
+    }
+
+    #[test]
+    fn discord_dm() {
+        assert!(!is_group_session("discord:dm:123456"));
+        assert!(!is_group_session("mybot:discord:dm:123456"));
+    }
+
+    #[test]
+    fn slack_public_channel() {
+        assert!(is_group_session("slack:C123456"));
+        assert!(is_group_session("mybot:slack:C123456"));
+        assert!(is_group_session("slack:C123456:1234567890.123"));
+    }
+
+    #[test]
+    fn slack_private_channel() {
+        assert!(is_group_session("slack:G123456"));
+        assert!(is_group_session("mybot:slack:G123456"));
+    }
+
+    #[test]
+    fn slack_dm() {
+        assert!(!is_group_session("slack:D123456"));
+        assert!(!is_group_session("mybot:slack:D123456"));
+    }
+
+    #[test]
+    fn telegram_sessions() {
+        // Telegram uses numeric IDs — not detected as group
+        assert!(!is_group_session("123456789"));
+        assert!(!is_group_session("mybot:123456789"));
+    }
+}
+
+#[cfg(test)]
+mod consultant_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_markdown_section_removes_target_heading() {
+        let prompt = "## Identity\nKeep this\n## Tools\nDrop this\nline2\n## Built-in Channels\nKeep channels";
+        let stripped = strip_markdown_section(prompt, "## Tools");
+        assert!(stripped.contains("## Identity"));
+        assert!(stripped.contains("## Built-in Channels"));
+        assert!(!stripped.contains("Drop this"));
+        assert!(!stripped.contains("line2"));
+    }
+
+    #[test]
+    fn test_build_consultant_system_prompt_adds_marker_and_strips_tools() {
+        let prompt = "## Identity\nA\n## Tool Selection Guide\nB\n## Tools\nC\n## Behavior\nD";
+        let consultant = build_consultant_system_prompt(prompt);
+        assert!(consultant.contains(CONSULTANT_TEXT_ONLY_MARKER));
+        assert!(consultant.contains("## Identity"));
+        assert!(consultant.contains("## Behavior"));
+        assert!(!consultant.contains("## Tool Selection Guide"));
+        assert!(!consultant.contains("## Tools"));
+    }
+
+    #[test]
+    fn test_extract_intent_gate_single_line_json() {
+        let input = "Answer first.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[\"deployment_url\"]}";
+        let (cleaned, gate) = extract_intent_gate(input);
+        assert_eq!(cleaned, "Answer first.");
+        let gate = gate.expect("expected parsed intent gate");
+        assert_eq!(gate.can_answer_now, Some(false));
+        assert_eq!(gate.needs_tools, Some(true));
+        assert_eq!(gate.needs_clarification, Some(false));
+        assert_eq!(gate.missing_info, vec!["deployment_url".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_intent_gate_two_line_json() {
+        let input = "Answer first.\n[INTENT_GATE]\n{\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}";
+        let (cleaned, gate) = extract_intent_gate(input);
+        assert_eq!(cleaned, "Answer first.");
+        let gate = gate.expect("expected parsed intent gate");
+        assert_eq!(gate.can_answer_now, Some(true));
+        assert_eq!(gate.needs_tools, Some(false));
+    }
+
+    #[test]
+    fn test_infer_intent_gate_no_textual_fallback_inference() {
+        // With lexical fallback inference disabled, missing model fields remain None.
+        let gate = infer_intent_gate("check the site", "I can look it up.");
+        assert_eq!(gate.can_answer_now, None);
+        assert_eq!(gate.needs_tools, None);
+        assert_eq!(gate.needs_clarification, None);
+    }
+
+    #[test]
+    fn test_infer_intent_gate_path_still_forces_tools() {
+        // Deterministic fallback: filesystem paths always require tools.
+        let gate = infer_intent_gate("check /tmp/app.log", "I can look it up.");
+        assert_eq!(gate.can_answer_now, Some(false));
+        assert_eq!(gate.needs_tools, Some(true));
+        assert_eq!(gate.needs_clarification, Some(false));
+    }
+
+    #[test]
+    fn test_infer_intent_gate_does_not_guess_clarification_from_text() {
+        let gate = infer_intent_gate("update the site", "Could you clarify which site you mean?");
+        assert_eq!(gate.needs_clarification, None);
+    }
+
+    #[test]
+    fn test_infer_intent_gate_does_not_infer_schedule_from_user_text() {
+        let gate = infer_intent_gate("send me a reminder in 2h", "Let me do that.");
+        assert!(gate.schedule.is_none());
+        assert!(gate.schedule_type.is_none());
+    }
+
+    #[test]
+    fn test_sanitize_consultant_analysis_strips_marker_and_pseudo_tool_block() {
+        let input = "I recall it was deployed to Cloudflare Workers.\n\n\
+                     [CONSULTANT_TEXT_ONLY_MODE]\n\
+                     [tool_use: terminal]\n\
+                     cmd: find $HOME -name wrangler.toml\n\
+                     args: {\"x\":1}";
+        let out = sanitize_consultant_analysis(input);
+        assert!(out.contains("I recall it was deployed to Cloudflare Workers."));
+        assert!(!out.contains("CONSULTANT_TEXT_ONLY_MODE"));
+        assert!(!out.contains("[tool_use:"));
+        assert!(!out.contains("cmd:"));
+        assert!(!out.contains("args:"));
+    }
+
+    #[test]
+    fn test_sanitize_consultant_analysis_keeps_normal_cmd_text_without_tool_block() {
+        let input = "Run this command manually:\ncmd: wrangler whoami";
+        let out = sanitize_consultant_analysis(input);
+        assert!(out.contains("cmd: wrangler whoami"));
+    }
+
+    #[test]
+    fn test_sanitize_consultant_analysis_strips_arguments_name_terminal_block() {
+        let input = "I'll check config.\n\narguments:\nname: terminal";
+        let out = sanitize_consultant_analysis(input);
+        assert_eq!(out, "I'll check config.");
+    }
+
+    #[test]
+    fn test_sanitize_consultant_analysis_strips_echoed_important_instruction() {
+        let input = "I don't have the exact URL yet.\n\n\
+            [IMPORTANT: You are being consulted for your knowledge and reasoning. Respond with TEXT ONLY. Do NOT call any functions or tools. Do NOT output functionCall or tool_use blocks. Answer the user's question directly from your knowledge and the context provided.]";
+        let out = sanitize_consultant_analysis(input);
+        assert_eq!(out, "I don't have the exact URL yet.");
+    }
+
+    #[test]
+    fn test_looks_like_deferred_action_response_detects_planning_text() {
+        // Action promises — any verb after "I'll" / "Let me" / "I will" that isn't knowledge-only
+        assert!(looks_like_deferred_action_response(
+            "I'll check the configuration for the Cloudflare Worker."
+        ));
+        assert!(looks_like_deferred_action_response(
+            "Let me search and get back to you."
+        ));
+        assert!(looks_like_deferred_action_response(
+            "I'll create a Python script to check the status."
+        ));
+        assert!(looks_like_deferred_action_response(
+            "I'll run the tests and report back."
+        ));
+        assert!(looks_like_deferred_action_response(
+            "Let me write a script for that."
+        ));
+        assert!(looks_like_deferred_action_response(
+            "I will deploy the changes now."
+        ));
+        assert!(looks_like_deferred_action_response(
+            "I'll need to check the full content of the audit report."
+        ));
+        assert!(looks_like_deferred_action_response(
+            "I'll retrieve the complete text now."
+        ));
+        assert!(looks_like_deferred_action_response(
+            "Let me read the file and send it to you."
+        ));
+        assert!(looks_like_deferred_action_response(
+            "Shall I scan your projects folder?"
+        ));
+        assert!(looks_like_deferred_action_response(
+            "Would you like me to install the dependencies?"
+        ));
+        assert!(looks_like_deferred_action_response(
+            "I'll find your resume and send it over right away. Starting the send-resume workflow."
+        ));
+        // Structural markers
+        assert!(looks_like_deferred_action_response(
+            "I recall deploying to Workers.\n\n[Consultation]\nTo find the URL, I would typically inspect wrangler.toml."
+        ));
+
+        // Knowledge-only verbs — these DON'T need tools
+        assert!(!looks_like_deferred_action_response(
+            "I'll explain how it works."
+        ));
+        assert!(!looks_like_deferred_action_response(
+            "Let me describe the architecture."
+        ));
+        assert!(!looks_like_deferred_action_response(
+            "I will summarize the key points for you."
+        ));
+        assert!(!looks_like_deferred_action_response(
+            "I'll clarify what that means."
+        ));
+
+        // Not action promises at all
+        assert!(!looks_like_deferred_action_response(
+            "The URL is https://example.workers.dev"
+        ));
+        assert!(!looks_like_deferred_action_response(
+            "I checked the configuration already and it looks fine."
+        ));
+        assert!(!looks_like_deferred_action_response(
+            "The searching process was completed successfully."
+        ));
+    }
+
+    #[test]
+    fn test_has_action_promise() {
+        // Action verbs
+        assert!(has_action_promise("i'll create a script"));
+        assert!(has_action_promise("i will run the tests"));
+        assert!(has_action_promise("let me check the file"));
+        assert!(has_action_promise("i’ll find your resume and send it"));
+        assert!(has_action_promise("shall i scan the folder"));
+        assert!(has_action_promise("would you like me to install it"));
+
+        // Knowledge verbs — not action promises
+        assert!(!has_action_promise("i'll explain the concept"));
+        assert!(!has_action_promise("let me describe it"));
+        assert!(!has_action_promise("i will summarize the results"));
+        assert!(!has_action_promise("i'll clarify that for you"));
+        assert!(!has_action_promise("i'll provide an overview"));
+        assert!(!has_action_promise("i'll be happy to help"));
+
+        // No prefix pattern at all
+        assert!(!has_action_promise("the file is located at /tmp/test"));
+        assert!(!has_action_promise("here is the answer"));
+    }
+
+    #[test]
+    fn test_is_short_user_correction_detects_simple_correction() {
+        assert!(is_short_user_correction("You did send me the pdf"));
+        assert!(is_short_user_correction("that's right"));
+    }
+
+    #[test]
+    fn test_is_short_user_correction_ignores_new_action_requests() {
+        assert!(!is_short_user_correction(
+            "You did send me the pdf, can you make it nicer?"
+        ));
+        assert!(!is_short_user_correction("Please regenerate the PDF"));
+    }
+
+    #[test]
+    fn test_classify_stall_detects_deferred_no_tool_loop() {
+        let learning_ctx = LearningContext {
+            user_text: "Can you make the PDF nicer?".to_string(),
+            intent_domains: vec![],
+            tool_calls: vec![],
+            errors: vec![(DEFERRED_NO_TOOL_ERROR_MARKER.to_string(), false)],
+            first_error: None,
+            recovery_actions: vec![],
+            start_time: Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+        };
+
+        let (label, suggestion) = Agent::classify_stall(&learning_ctx);
+        assert_eq!(label, "Deferred No-Tool Loop");
+        assert!(suggestion.contains("never called tools"));
+    }
+
+    #[test]
+    fn test_parse_wait_task_seconds_parses_supported_units() {
+        assert_eq!(parse_wait_task_seconds("Wait for 5 minutes."), Some(300));
+        assert_eq!(parse_wait_task_seconds("wait for 45 sec"), Some(45));
+        assert_eq!(parse_wait_task_seconds("WAIT FOR 2 hours"), Some(7200));
+    }
+
+    #[test]
+    fn test_parse_wait_task_seconds_ignores_non_wait_tasks() {
+        assert_eq!(parse_wait_task_seconds("Send the second joke."), None);
+        assert_eq!(parse_wait_task_seconds("Wait until tomorrow."), None);
+    }
+
+    #[test]
+    fn test_sanitize_consultant_analysis_strips_consultation_heading() {
+        let input =
+            "I don't have the URL yet.\n\n[Consultation]\nTo find it I'd inspect wrangler.toml.";
+        let out = sanitize_consultant_analysis(input);
+        assert!(!out.contains("[Consultation]"));
+    }
+
+    #[test]
+    fn test_extract_intent_gate_bare_json_without_marker() {
+        let input = "The capital of France is Paris.\n{\"complexity\":\"knowledge\"}";
+        let (cleaned, gate) = extract_intent_gate(input);
+        assert_eq!(cleaned, "The capital of France is Paris.");
+        let gate = gate.expect("expected parsed intent gate from bare JSON");
+        assert_eq!(gate.complexity.as_deref(), Some("knowledge"));
+    }
+
+    #[test]
+    fn test_extract_intent_gate_code_fenced_json() {
+        let input = "The capital of France is Paris.\n```json\n{\"complexity\":\"knowledge\"}\n```";
+        let (cleaned, gate) = extract_intent_gate(input);
+        assert_eq!(cleaned, "The capital of France is Paris.");
+        let gate = gate.expect("expected parsed intent gate from fenced JSON");
+        assert_eq!(gate.complexity.as_deref(), Some("knowledge"));
+    }
+
+    #[test]
+    fn test_extract_intent_gate_bare_json_with_spaces() {
+        let input = "Answer here.\n\n{ \"complexity\": \"simple\", \"can_answer_now\": false, \"needs_tools\": true }";
+        let (cleaned, gate) = extract_intent_gate(input);
+        assert!(!cleaned.contains("complexity"));
+        let gate = gate.expect("expected parsed intent gate");
+        assert_eq!(gate.complexity.as_deref(), Some("simple"));
+        assert_eq!(gate.can_answer_now, Some(false));
+    }
+
+    #[test]
+    fn test_extract_intent_gate_multiline_bare_json() {
+        let input = "The largest planet is Jupiter.\n\n{\n  \"complexity\": \"knowledge\"\n}";
+        let (cleaned, gate) = extract_intent_gate(input);
+        assert_eq!(cleaned, "The largest planet is Jupiter.");
+        let gate = gate.expect("expected parsed intent gate from multi-line JSON");
+        assert_eq!(gate.complexity.as_deref(), Some("knowledge"));
+    }
+
+    #[test]
+    fn test_extract_intent_gate_bare_json_does_not_strip_unrelated_json() {
+        // JSON that doesn't contain intent gate fields should NOT be stripped
+        let input = "Here is the data:\n{\"name\":\"Alice\",\"age\":30}";
+        let (cleaned, gate) = extract_intent_gate(input);
+        assert!(gate.is_none());
+        assert!(cleaned.contains("{\"name\":\"Alice\""));
+    }
+}
+
+#[cfg(test)]
+mod v3_intent_tests {
+    use super::*;
+
+    fn gate_with_answer(can_answer: bool) -> IntentGateDecision {
+        IntentGateDecision {
+            can_answer_now: Some(can_answer),
+            needs_tools: Some(!can_answer),
+            needs_clarification: Some(false),
+            clarifying_question: None,
+            missing_info: vec![],
+            complexity: None,
+            cancel_intent: None,
+            cancel_scope: None,
+            is_acknowledgment: None,
+            schedule: None,
+            schedule_type: None,
+            schedule_cron: None,
+            domains: vec![],
+        }
+    }
+
+    #[test]
+    fn test_parse_intent_gate_is_acknowledgment() {
+        // The LLM classifies acknowledgments via the intent gate JSON —
+        // no hardcoded word lists needed, works in any language.
+        let gate = parse_intent_gate_json(r#"{"complexity":"knowledge","is_acknowledgment":true}"#);
+        assert_eq!(gate.unwrap().is_acknowledgment, Some(true));
+
+        let gate = parse_intent_gate_json(r#"{"complexity":"simple","is_acknowledgment":false}"#);
+        assert_eq!(gate.unwrap().is_acknowledgment, Some(false));
+
+        // Missing field → None (backward compatible)
+        let gate = parse_intent_gate_json(r#"{"complexity":"simple"}"#);
+        assert_eq!(gate.unwrap().is_acknowledgment, None);
+    }
+
+    #[test]
+    fn test_parse_intent_gate_cancel_intent() {
+        let gate = parse_intent_gate_json(r#"{"complexity":"simple","cancel_intent":true}"#)
+            .expect("expected parsed intent gate");
+        assert_eq!(gate.cancel_intent, Some(true));
+        assert_eq!(gate.cancel_scope, None);
+
+        let gate = parse_intent_gate_json(r#"{"complexity":"simple"}"#)
+            .expect("expected parsed intent gate");
+        assert_eq!(gate.cancel_intent, None);
+    }
+
+    #[test]
+    fn test_parse_intent_gate_cancel_scope() {
+        let gate = parse_intent_gate_json(
+            r#"{"complexity":"simple","cancel_intent":true,"cancel_scope":"targeted"}"#,
+        )
+        .expect("expected parsed intent gate");
+        assert_eq!(gate.cancel_intent, Some(true));
+        assert_eq!(gate.cancel_scope.as_deref(), Some("targeted"));
+
+        let gate = parse_intent_gate_json(
+            r#"{"complexity":"simple","cancel_intent":true,"cancel_scope":"generic"}"#,
+        )
+        .expect("expected parsed intent gate");
+        assert_eq!(gate.cancel_scope.as_deref(), Some("generic"));
+
+        let gate = parse_intent_gate_json(
+            r#"{"complexity":"simple","cancel_intent":true,"cancel_scope":"unexpected"}"#,
+        )
+        .expect("expected parsed intent gate");
+        assert_eq!(gate.cancel_scope, None);
+    }
+
+    #[test]
+    fn test_classify_intent_complexity_knowledge() {
+        let gate = gate_with_answer(true);
+        let (complexity, tools) = classify_intent_complexity("What's my name?", &gate);
+        assert_eq!(complexity, IntentComplexity::Knowledge);
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn test_classify_complexity_knowledge_requires_no_tools() {
+        let mut gate = gate_with_answer(true);
+        gate.needs_tools = Some(true);
+        let (complexity, _) = classify_intent_complexity("Send me my resume", &gate);
+        assert_eq!(complexity, IntentComplexity::Simple);
+    }
+
+    #[test]
+    fn test_classify_intent_complexity_simple() {
+        let gate = gate_with_answer(false);
+        let (complexity, _tools) = classify_intent_complexity("run ls -la", &gate);
+        assert_eq!(complexity, IntentComplexity::Simple);
+    }
+
+    #[test]
+    fn test_classify_intent_scheduled_one_shot() {
+        let mut gate = gate_with_answer(false);
+        gate.schedule = Some("in 2h".to_string());
+        gate.schedule_type = Some("one_shot".to_string());
+        let (complexity, _) = classify_intent_complexity("remind me in 2h", &gate);
+        assert!(matches!(
+            complexity,
+            IntentComplexity::Scheduled {
+                is_one_shot: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_intent_scheduled_recurring() {
+        let mut gate = gate_with_answer(false);
+        gate.schedule = Some("every 6h".to_string());
+        gate.schedule_type = Some("recurring".to_string());
+        let (complexity, _) = classify_intent_complexity("monitor every 6h", &gate);
+        assert!(matches!(
+            complexity,
+            IntentComplexity::Scheduled {
+                is_one_shot: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_intent_scheduled_with_llm_cron() {
+        let mut gate = gate_with_answer(false);
+        gate.schedule = Some("3 times per day".to_string());
+        gate.schedule_type = Some("recurring".to_string());
+        gate.schedule_cron = Some("0 */8 * * *".to_string());
+        let (complexity, _) = classify_intent_complexity("post 3 times per day", &gate);
+        assert!(matches!(
+            complexity,
+            IntentComplexity::Scheduled {
+                schedule_cron: Some(ref cron),
+                ..
+            } if cron == "0 */8 * * *"
+        ));
+    }
+
+    #[test]
+    fn test_classify_intent_scheduled_with_cron_only() {
+        let mut gate = gate_with_answer(false);
+        gate.schedule = None;
+        gate.schedule_type = Some("recurring".to_string());
+        gate.schedule_cron = Some("0 */8 * * *".to_string());
+        let (complexity, _) = classify_intent_complexity("post repeatedly", &gate);
+        assert!(matches!(
+            complexity,
+            IntentComplexity::Scheduled {
+                schedule_raw: ref raw,
+                schedule_cron: Some(ref cron),
+                ..
+            } if raw == "0 */8 * * *" && cron == "0 */8 * * *"
+        ));
+    }
+
+    #[test]
+    fn test_classify_intent_recurring_without_timing_no_heuristic_schedule() {
+        let mut gate = gate_with_answer(false);
+        gate.complexity = Some("complex".to_string());
+        gate.schedule = None;
+        gate.schedule_type = Some("recurring".to_string());
+        gate.schedule_cron = None;
+        let (complexity, _) =
+            classify_intent_complexity("monitor my account and post 3 times per day", &gate);
+        assert_eq!(complexity, IntentComplexity::Complex);
+    }
+
+    #[test]
+    fn test_classify_intent_schedule_takes_priority() {
+        let mut gate = gate_with_answer(false);
+        gate.complexity = Some("complex".to_string());
+        gate.schedule = Some("daily at 9am".to_string());
+        gate.schedule_type = Some("recurring".to_string());
+        let (complexity, _) = classify_intent_complexity("daily at 9am monitor deploy", &gate);
+        assert!(matches!(complexity, IntentComplexity::Scheduled { .. }));
+    }
+
+    #[test]
+    fn test_classify_intent_no_schedule_stays_simple() {
+        let mut gate = gate_with_answer(false);
+        gate.complexity = Some("simple".to_string());
+        gate.schedule = None;
+        gate.schedule_type = None;
+        let (complexity, _) = classify_intent_complexity("check status now", &gate);
+        assert_eq!(complexity, IntentComplexity::Simple);
+    }
+
+    #[test]
+    fn test_classify_intent_complexity_complex() {
+        let mut gate = gate_with_answer(false);
+        gate.complexity = Some("complex".to_string());
+        // Genuinely complex: long, persistent multi-session project description
+        let (complexity, _) = classify_intent_complexity(
+            "I need you to build a new microservice that handles user authentication. This should include JWT token generation, refresh token rotation, rate limiting, database schema design, API documentation, integration tests, load testing, and a CI/CD pipeline. Deploy to staging first, then production after review.",
+            &gate,
+        );
+        assert_eq!(complexity, IntentComplexity::Complex);
+    }
+
+    #[test]
+    fn test_classify_intent_medium_complex_trusted() {
+        // Messages over 50 chars with complexity="complex" are trusted as Complex
+        let mut gate = gate_with_answer(false);
+        gate.complexity = Some("complex".to_string());
+        let (complexity, _) = classify_intent_complexity(
+            "Build me a website with authentication and deploy it to Vercel with a custom domain setup",
+            &gate,
+        );
+        assert_eq!(complexity, IntentComplexity::Complex);
+    }
+
+    #[test]
+    fn test_classify_intent_compound_with_complexity_stays_complex() {
+        // No lexical guardrail downgrades: respect explicit model complexity.
+        let mut gate = gate_with_answer(false);
+        gate.complexity = Some("complex".to_string());
+        let (complexity, _) =
+            classify_intent_complexity("deploy the app and then set up monitoring", &gate);
+        assert_eq!(complexity, IntentComplexity::Complex);
+    }
+
+    #[test]
+    fn test_classify_intent_sequential_tool_request_stays_complex_when_marked() {
+        // Respect explicit model complexity even for numbered task lists.
+        let mut gate = gate_with_answer(false);
+        gate.complexity = Some("complex".to_string());
+        let (complexity, _) = classify_intent_complexity(
+            "I need you to do a complex multi-step project: 1) Run \"ls -la /tmp\" on the terminal, 2) Search the web for \"Rust async traits 2025\", 3) Run \"df -h\" on the terminal, 4) Write a report combining all the findings to /tmp/full_report.txt.",
+            &gate,
+        );
+        assert_eq!(complexity, IntentComplexity::Complex);
+    }
+
+    #[test]
+    fn test_classify_knowledge_downgraded_to_simple_when_cant_answer() {
+        // When can_answer_now=false but complexity="knowledge", the model can't
+        // answer from context. Downgrade to Simple so tools can try (memory,
+        // manage_people, etc.) instead of returning a fallback message.
+        let gate = IntentGateDecision {
+            can_answer_now: Some(false),
+            needs_tools: Some(false),
+            needs_clarification: Some(false),
+            clarifying_question: None,
+            missing_info: vec![],
+            complexity: Some("knowledge".to_string()),
+            cancel_intent: None,
+            cancel_scope: None,
+            is_acknowledgment: None,
+            schedule: None,
+            schedule_type: None,
+            schedule_cron: None,
+            domains: vec![],
+        };
+        let (complexity, _) = classify_intent_complexity("Who is bella?", &gate);
+        assert_eq!(complexity, IntentComplexity::Simple);
+    }
+
+    #[test]
+    fn test_classify_unknown_complexity_defaults_simple() {
+        let mut gate = gate_with_answer(false);
+        gate.complexity = Some("unknown_value".to_string());
+        let (complexity, _) = classify_intent_complexity("do something", &gate);
+        assert_eq!(complexity, IntentComplexity::Simple);
+    }
+
+    #[test]
+    fn test_classify_no_complexity_defaults_simple() {
+        let gate = gate_with_answer(false);
+        assert!(gate.complexity.is_none());
+        let (complexity, _) = classify_intent_complexity("do something", &gate);
+        assert_eq!(complexity, IntentComplexity::Simple);
+    }
+
+    #[test]
+    fn test_classify_complexity_knowledge_field_with_can_answer() {
+        // When can_answer_now=true, knowledge complexity stays Knowledge
+        let mut gate = gate_with_answer(true);
+        gate.complexity = Some("knowledge".to_string());
+        let (complexity, _) = classify_intent_complexity("what is rust?", &gate);
+        assert_eq!(complexity, IntentComplexity::Knowledge);
+    }
+
+    #[test]
+    fn test_classify_complexity_no_guardrail_downgrade_for_acknowledgments() {
+        // No lexical guardrail downgrades: respect explicit model complexity.
+        let mut gate = gate_with_answer(false);
+        gate.complexity = Some("complex".to_string());
+        for msg in &[
+            "ok cool thanks",
+            "sure",
+            "thanks!",
+            "yes please",
+            "got it!",
+            "hello there",
+        ] {
+            let (complexity, _) = classify_intent_complexity(msg, &gate);
+            assert_eq!(
+                complexity,
+                IntentComplexity::Complex,
+                "'{msg}' should remain Complex"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_complexity_no_guardrail_downgrade_for_short_commands() {
+        // No lexical guardrail downgrades: respect explicit model complexity.
+        let mut gate = gate_with_answer(false);
+        gate.complexity = Some("complex".to_string());
+        for msg in &["run ls -la", "echo hello", "check the status"] {
+            let (complexity, _) = classify_intent_complexity(msg, &gate);
+            assert_eq!(
+                complexity,
+                IntentComplexity::Complex,
+                "'{msg}' should remain Complex"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_complexity_guardrail_allows_real_complex() {
+        // Genuinely complex multi-step requests (50+ chars, persistent projects) should still be Complex
+        let mut gate = gate_with_answer(false);
+        gate.complexity = Some("complex".to_string());
+        let (complexity, _) = classify_intent_complexity(
+            "Build a REST API with authentication, set up a PostgreSQL database with migrations, create the Terraform infrastructure for AWS deployment, configure CI/CD with GitHub Actions, add comprehensive integration tests, set up monitoring with CloudWatch, and prepare documentation for the team.",
+            &gate,
+        );
+        assert_eq!(complexity, IntentComplexity::Complex);
+    }
+
+    #[test]
+    fn test_parse_intent_gate_with_complexity() {
+        let json = r#"{"can_answer_now": false, "needs_tools": true, "complexity": "complex"}"#;
+        let parsed = parse_intent_gate_json(json).unwrap();
+        assert_eq!(parsed.complexity.as_deref(), Some("complex"));
+    }
+
+    #[test]
+    fn test_parse_intent_gate_with_schedule() {
+        let json = r#"{"can_answer_now": false, "needs_tools": true, "schedule": "every 6h", "schedule_type": "recurring", "schedule_cron": "0 */6 * * *"}"#;
+        let parsed = parse_intent_gate_json(json).unwrap();
+        assert_eq!(parsed.schedule.as_deref(), Some("every 6h"));
+        assert_eq!(parsed.schedule_type.as_deref(), Some("recurring"));
+        assert_eq!(parsed.schedule_cron.as_deref(), Some("0 */6 * * *"));
+    }
+
+    #[test]
+    fn test_parse_intent_gate_with_domains() {
+        let json = r#"{"can_answer_now": false, "needs_tools": true, "domains": ["Rust", "docker", "rust"]}"#;
+        let parsed = parse_intent_gate_json(json).unwrap();
+        assert_eq!(
+            parsed.domains,
+            vec!["rust".to_string(), "docker".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_intent_gate_backward_compat() {
+        // Old JSON without complexity field should parse fine with None
+        let json = r#"{"can_answer_now": true, "needs_tools": false}"#;
+        let parsed = parse_intent_gate_json(json).unwrap();
+        assert!(parsed.complexity.is_none());
+        assert!(parsed.schedule.is_none());
+        assert!(parsed.schedule_type.is_none());
+        assert!(parsed.schedule_cron.is_none());
+    }
+
+    #[test]
+    fn test_detect_schedule_heuristic_in_time() {
+        let detected = detect_schedule_heuristic("remind me in 2h");
+        assert_eq!(detected, Some(("in 2h".to_string(), true)));
+    }
+
+    #[test]
+    fn test_detect_schedule_heuristic_recurring() {
+        let detected = detect_schedule_heuristic("monitor API every 6h");
+        assert_eq!(detected, Some(("every 6h".to_string(), false)));
+    }
+
+    #[test]
+    fn test_detect_schedule_heuristic_tomorrow() {
+        let detected = detect_schedule_heuristic("check deployment tomorrow at 9am");
+        assert_eq!(detected, Some(("tomorrow at 9am".to_string(), true)));
+    }
+
+    #[test]
+    fn test_detect_schedule_heuristic_today_with_timezone() {
+        let detected = detect_schedule_heuristic("send me a note today at 11:09pm EST");
+        assert_eq!(detected, Some(("today at 11:09pm EST".to_string(), true)));
+    }
+
+    #[test]
+    fn test_detect_schedule_heuristic_each_interval() {
+        let detected = detect_schedule_heuristic("give me 2 jokes. 1 each 5 minutes.");
+        assert_eq!(detected, Some(("each 5 minutes".to_string(), false)));
+    }
+
+    #[test]
+    fn test_detect_schedule_heuristic_no_schedule() {
+        let detected = detect_schedule_heuristic("check deployment status now");
+        assert!(detected.is_none());
+    }
+
+    #[test]
+    fn test_detect_schedule_heuristic_ignores_schedule_reference_query() {
+        let detected = detect_schedule_heuristic(
+            "i want you to give me the details about this scheduled goal: \
+             \"English Research: Researching English pronunciation/phonetics relevant to Spanish \
+             (3 recurring slots daily: 5 AM, 12 PM, and 7 PM EST).\"",
+        );
+        assert!(detected.is_none());
+    }
+
+    #[test]
+    fn test_looks_like_recurring_intent_without_timing_times_per_day() {
+        assert!(looks_like_recurring_intent_without_timing(
+            "create 3 posts per language 3 times per day"
+        ));
+    }
+
+    #[test]
+    fn test_looks_like_recurring_intent_without_timing_false_when_timed() {
+        assert!(!looks_like_recurring_intent_without_timing(
+            "monitor API every 6h"
+        ));
+    }
+
+    #[test]
+    fn test_internal_maintenance_intent_detects_legacy_phrases() {
+        assert!(is_internal_maintenance_intent(
+            "Maintain knowledge base: process embeddings, consolidate memories, decay old facts"
+        ));
+        assert!(is_internal_maintenance_intent(
+            "Maintain memory health: prune old events, clean up retention, remove stale data"
+        ));
+    }
+
+    #[test]
+    fn test_internal_maintenance_intent_ignores_normal_requests() {
+        assert!(!is_internal_maintenance_intent(
+            "Build a full-stack website with auth and CI/CD"
+        ));
+        assert!(!is_internal_maintenance_intent(
+            "monitor api every 6h and send status updates"
+        ));
+    }
+
+    #[test]
+    fn test_contains_keyword_as_words() {
+        // Exact word match
+        assert!(contains_keyword_as_words("deploy the app", "deploy"));
+        assert!(contains_keyword_as_words("please build it now", "build"));
+        // Multi-word keyword match
+        assert!(contains_keyword_as_words("set up monitoring", "set up"));
+        assert!(contains_keyword_as_words(
+            "create a project from scratch",
+            "create a project"
+        ));
+        // Should NOT match derived forms
+        assert!(!contains_keyword_as_words("the deployed site", "deploy"));
+        assert!(!contains_keyword_as_words("deployment configs", "deploy"));
+        assert!(!contains_keyword_as_words("building blocks", "build"));
+        assert!(!contains_keyword_as_words(
+            "implementation details",
+            "implement"
+        ));
+        assert!(!contains_keyword_as_words("refactoring code", "refactor"));
+        // Punctuation should act as word boundary
+        assert!(contains_keyword_as_words(
+            "build, test, and deploy.",
+            "deploy"
+        ));
+        assert!(contains_keyword_as_words("(deploy)", "deploy"));
+    }
+}
+
+#[cfg(test)]
+mod v3_tool_scoping_tests {
+    use super::*;
+    use crate::testing::MockTool;
+    use crate::traits::ToolRole;
+
+    /// Mock tool that returns a specific ToolRole.
+    struct MockRoleTool {
+        tool_name: String,
+        role: ToolRole,
+    }
+
+    impl MockRoleTool {
+        fn new(name: &str, role: ToolRole) -> Self {
+            Self {
+                tool_name: name.to_string(),
+                role,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for MockRoleTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+        fn description(&self) -> &str {
+            "mock"
+        }
+        fn schema(&self) -> Value {
+            json!({
+                "name": self.tool_name,
+                "description": "mock",
+                "parameters": { "type": "object", "properties": {} }
+            })
+        }
+        fn tool_role(&self) -> ToolRole {
+            self.role
+        }
+        async fn call(&self, _args: &str) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    #[test]
+    fn test_tool_scoping_task_lead() {
+        // Simulate tool filtering for task lead role
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockRoleTool::new("terminal", ToolRole::Action)),
+            Arc::new(MockRoleTool::new("web_search", ToolRole::Action)),
+            Arc::new(MockRoleTool::new("system_info", ToolRole::Universal)),
+            Arc::new(MockRoleTool::new("remember_fact", ToolRole::Universal)),
+            Arc::new(MockRoleTool::new("plan_manager", ToolRole::Management)),
+        ];
+
+        // Task lead filter: Management + Universal only
+        let tl_tools: Vec<String> = tools
+            .iter()
+            .filter(|t| t.name() != "spawn_agent")
+            .filter(|t| matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal))
+            .map(|t| t.name().to_string())
+            .collect();
+
+        assert!(tl_tools.contains(&"system_info".to_string()));
+        assert!(tl_tools.contains(&"remember_fact".to_string()));
+        assert!(tl_tools.contains(&"plan_manager".to_string()));
+        assert!(!tl_tools.contains(&"terminal".to_string()));
+        assert!(!tl_tools.contains(&"web_search".to_string()));
+        assert_eq!(tl_tools.len(), 3);
+    }
+
+    #[test]
+    fn test_tool_scoping_executor() {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockRoleTool::new("terminal", ToolRole::Action)),
+            Arc::new(MockRoleTool::new("web_search", ToolRole::Action)),
+            Arc::new(MockRoleTool::new("system_info", ToolRole::Universal)),
+            Arc::new(MockRoleTool::new("remember_fact", ToolRole::Universal)),
+            Arc::new(MockRoleTool::new("plan_manager", ToolRole::Management)),
+        ];
+
+        // Executor filter: Action + Universal only
+        let exec_tools: Vec<String> = tools
+            .iter()
+            .filter(|t| t.name() != "spawn_agent")
+            .filter(|t| matches!(t.tool_role(), ToolRole::Action | ToolRole::Universal))
+            .map(|t| t.name().to_string())
+            .collect();
+
+        assert!(exec_tools.contains(&"terminal".to_string()));
+        assert!(exec_tools.contains(&"web_search".to_string()));
+        assert!(exec_tools.contains(&"system_info".to_string()));
+        assert!(exec_tools.contains(&"remember_fact".to_string()));
+        assert!(!exec_tools.contains(&"plan_manager".to_string()));
+        assert_eq!(exec_tools.len(), 4);
+    }
+
+    #[test]
+    fn test_tool_scoping_legacy_no_filter() {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockRoleTool::new("terminal", ToolRole::Action)),
+            Arc::new(MockRoleTool::new("system_info", ToolRole::Universal)),
+            Arc::new(MockRoleTool::new("plan_manager", ToolRole::Management)),
+            Arc::new(MockRoleTool::new("spawn_agent", ToolRole::Action)),
+        ];
+
+        // Legacy: filter out spawn_agent only, keep everything else
+        let legacy_tools: Vec<String> = tools
+            .iter()
+            .filter(|t| t.name() != "spawn_agent")
+            .map(|t| t.name().to_string())
+            .collect();
+
+        assert_eq!(legacy_tools.len(), 3);
+        assert!(legacy_tools.contains(&"terminal".to_string()));
+        assert!(legacy_tools.contains(&"system_info".to_string()));
+        assert!(legacy_tools.contains(&"plan_manager".to_string()));
+    }
+
+    #[test]
+    fn test_agent_role_default() {
+        assert_eq!(AgentRole::Orchestrator, AgentRole::Orchestrator);
+        assert_ne!(AgentRole::TaskLead, AgentRole::Executor);
+    }
+
+    #[test]
+    fn test_tool_role_default() {
+        // Verify that MockTool (from testing.rs) defaults to Action
+        let mock = MockTool::new("test", "desc", "result");
+        assert_eq!(mock.tool_role(), ToolRole::Action);
+    }
+
+    #[test]
+    fn test_system_info_tool_is_universal() {
+        let tool = crate::tools::SystemInfoTool;
+        assert_eq!(tool.tool_role(), ToolRole::Universal);
+    }
+}
+
+#[cfg(test)]
+mod file_path_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn test_extracts_existing_file() {
+        // Use a file that definitely exists
+        let text = format!("Report generated at {}", file!());
+        // file!() returns a relative path, so this won't match (only absolute paths)
+        let paths = extract_file_paths_from_text(&text);
+        assert!(paths.is_empty(), "Relative paths should not match");
+    }
+
+    #[test]
+    fn test_extracts_absolute_path_with_extension() {
+        let tmp = std::env::temp_dir().join("aidaemon_test_extract.txt");
+        std::fs::write(&tmp, "test content").unwrap();
+
+        let text = format!("Final report generated at {}", tmp.display());
+        let paths = extract_file_paths_from_text(&text);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], tmp.to_string_lossy());
+
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_ignores_nonexistent_paths() {
+        let text = "Report at /tmp/nonexistent_aidaemon_xyz_12345.md";
+        let paths = extract_file_paths_from_text(text);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_blocks_sensitive_paths() {
+        let tmp = std::env::temp_dir().join(".ssh");
+        std::fs::create_dir_all(&tmp).ok();
+        let sensitive = tmp.join("id_rsa.pub");
+        std::fs::write(&sensitive, "fake key").unwrap();
+
+        let text = format!("Key at {}", sensitive.display());
+        let paths = extract_file_paths_from_text(&text);
+        assert!(paths.is_empty(), "Paths under .ssh should be blocked");
+
+        std::fs::remove_file(&sensitive).unwrap();
+    }
+
+    #[test]
+    fn test_blocks_pem_extension() {
+        let tmp = std::env::temp_dir().join("aidaemon_test.pem");
+        std::fs::write(&tmp, "fake cert").unwrap();
+
+        let text = format!("Cert at {}", tmp.display());
+        let paths = extract_file_paths_from_text(&text);
+        assert!(paths.is_empty(), ".pem files should be blocked");
+
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_multiple_paths() {
+        let tmp1 = std::env::temp_dir().join("aidaemon_test_a.md");
+        let tmp2 = std::env::temp_dir().join("aidaemon_test_b.csv");
+        std::fs::write(&tmp1, "report").unwrap();
+        std::fs::write(&tmp2, "data").unwrap();
+
+        let text = format!("Generated {} and also {}", tmp1.display(), tmp2.display());
+        let paths = extract_file_paths_from_text(&text);
+        assert_eq!(paths.len(), 2);
+
+        std::fs::remove_file(&tmp1).unwrap();
+        std::fs::remove_file(&tmp2).unwrap();
+    }
+
+    #[test]
+    fn test_no_paths_in_text() {
+        let text = "Goal completed successfully. All tasks done.";
+        let paths = extract_file_paths_from_text(text);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_ignores_directories() {
+        // /tmp exists but is a directory, not a file — and has no extension
+        let text = "Output in /tmp directory";
+        let paths = extract_file_paths_from_text(text);
+        assert!(paths.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod policy_signal_tests {
+    use super::*;
+
+    #[test]
+    fn detects_explicit_positive_signals_only() {
+        let detected = detect_explicit_outcome_signal("thanks, that worked");
+        assert_eq!(detected, Some(("positive", true)));
+    }
+
+    #[test]
+    fn detects_explicit_negative_signals_only() {
+        let detected = detect_explicit_outcome_signal("you misunderstood");
+        assert_eq!(detected, Some(("negative", false)));
+    }
+
+    #[test]
+    fn ignores_non_explicit_feedback() {
+        let detected = detect_explicit_outcome_signal("can you try a different approach");
+        assert!(detected.is_none());
     }
 }

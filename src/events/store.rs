@@ -11,12 +11,72 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
 
-use super::{Event, EventType};
+use super::{Event, EventType, PolicyDecisionData, TaskEndData, TaskStatus};
 use crate::traits::{Message, ToolCall};
 
 /// The event store backed by SQLite.
 pub struct EventStore {
     pool: SqlitePool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskWindowStats {
+    pub total: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub stalled: u64,
+    pub error_events: u64,
+    pub completion_rate: f64,
+    pub error_rate: f64,
+    pub stall_rate: f64,
+}
+
+impl Default for TaskWindowStats {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            completed: 0,
+            failed: 0,
+            cancelled: 0,
+            stalled: 0,
+            error_events: 0,
+            completion_rate: 1.0,
+            error_rate: 0.0,
+            stall_rate: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PolicyGraduationReport {
+    pub window_days: u32,
+    pub observed_days: f64,
+    pub total_decisions: u64,
+    pub diverged_decisions: u64,
+    pub divergence_rate: f64,
+    pub current: TaskWindowStats,
+    pub previous: TaskWindowStats,
+}
+
+impl PolicyGraduationReport {
+    pub fn gate_passes(&self, max_divergence: f64) -> bool {
+        if self.observed_days < self.window_days as f64 {
+            return false;
+        }
+        if self.total_decisions == 0 {
+            return false;
+        }
+        if self.divergence_rate >= max_divergence {
+            return false;
+        }
+        // No-regression gate:
+        // completion must not decrease; error/stall must not increase.
+        let completion_ok = self.current.completion_rate >= self.previous.completion_rate;
+        let error_ok = self.current.error_rate <= self.previous.error_rate;
+        let stall_ok = self.current.stall_rate <= self.previous.stall_rate;
+        completion_ok && error_ok && stall_ok
+    }
 }
 
 impl EventStore {
@@ -252,6 +312,86 @@ impl EventStore {
             ORDER BY created_at ASC
             "#,
         )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        self.rows_to_events(rows)
+    }
+
+    /// Query events for a specific task scoped to a session.
+    pub async fn query_task_events_for_session(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<Vec<Event>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            FROM events
+            WHERE session_id = ? AND task_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(session_id)
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        self.rows_to_events(rows)
+    }
+
+    /// Query recent task_end events for a session.
+    /// When failures_only is true, only failed task_end events are returned.
+    pub async fn query_recent_task_ends(
+        &self,
+        session_id: &str,
+        failures_only: bool,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        let fetch_limit = if failures_only { limit.saturating_mul(8) } else { limit }.max(1);
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            FROM events
+            WHERE session_id = ?
+              AND event_type = 'task_end'
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(session_id)
+        .bind(fetch_limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut events = self.rows_to_events(rows)?;
+        if failures_only {
+            events.retain(|e| {
+                e.parse_data::<TaskEndData>()
+                    .ok()
+                    .is_some_and(|d| matches!(d.status, TaskStatus::Failed))
+            });
+        }
+        events.truncate(limit.max(1));
+        Ok(events)
+    }
+
+    /// Query decision_point events for a specific task scoped to a session.
+    pub async fn query_decision_points(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<Vec<Event>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            FROM events
+            WHERE session_id = ? AND task_id = ? AND event_type = 'decision_point'
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(session_id)
         .bind(task_id)
         .fetch_all(&self.pool)
         .await?;
@@ -546,6 +686,162 @@ impl EventStore {
         Ok(events.into_iter().next())
     }
 
+    /// Query all events of a single type in [start, end).
+    pub async fn query_events_by_type_between(
+        &self,
+        event_type: EventType,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<Event>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            FROM events
+            WHERE event_type = ? AND created_at >= ? AND created_at < ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(event_type.as_str())
+        .bind(start.to_rfc3339())
+        .bind(end.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+        self.rows_to_events(rows)
+    }
+
+    /// Return the earliest created_at for an event type.
+    pub async fn earliest_event_time_by_type(
+        &self,
+        event_type: EventType,
+    ) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let row = sqlx::query(
+            r#"
+            SELECT created_at
+            FROM events
+            WHERE event_type = ?
+            ORDER BY created_at ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(event_type.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let raw: String = row.get("created_at");
+        let parsed = DateTime::parse_from_rfc3339(&raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .ok();
+        Ok(parsed)
+    }
+
+    /// Build a graduation report for policy routing gate checks.
+    pub async fn policy_graduation_report(
+        &self,
+        window_days: u32,
+    ) -> anyhow::Result<PolicyGraduationReport> {
+        let now = Utc::now();
+        let window = Duration::days(window_days as i64);
+        let start_current = now - window;
+        let start_previous = start_current - window;
+
+        let decisions = self
+            .query_events_by_type_between(EventType::PolicyDecision, start_current, now)
+            .await?;
+        let mut total_decisions = 0u64;
+        let mut diverged_decisions = 0u64;
+        for event in decisions {
+            if let Ok(data) = event.parse_data::<PolicyDecisionData>() {
+                total_decisions += 1;
+                if data.diverged {
+                    diverged_decisions += 1;
+                }
+            }
+        }
+        let divergence_rate = if total_decisions > 0 {
+            diverged_decisions as f64 / total_decisions as f64
+        } else {
+            0.0
+        };
+
+        let current = self
+            .task_window_stats(start_current, now)
+            .await
+            .unwrap_or_default();
+        let previous = self
+            .task_window_stats(start_previous, start_current)
+            .await
+            .unwrap_or_default();
+
+        let observed_days = match self
+            .earliest_event_time_by_type(EventType::PolicyDecision)
+            .await?
+        {
+            Some(first) => (now - first).num_seconds().max(0) as f64 / 86_400.0,
+            None => 0.0,
+        };
+
+        Ok(PolicyGraduationReport {
+            window_days,
+            observed_days,
+            total_decisions,
+            diverged_decisions,
+            divergence_rate,
+            current,
+            previous,
+        })
+    }
+
+    async fn task_window_stats(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> anyhow::Result<TaskWindowStats> {
+        let task_ends = self
+            .query_events_by_type_between(EventType::TaskEnd, start, end)
+            .await?;
+        let errors = self
+            .query_events_by_type_between(EventType::Error, start, end)
+            .await?;
+
+        let mut stats = TaskWindowStats {
+            total: task_ends.len() as u64,
+            ..TaskWindowStats::default()
+        };
+        for event in task_ends {
+            if let Ok(data) = event.parse_data::<TaskEndData>() {
+                match data.status {
+                    TaskStatus::Completed => stats.completed += 1,
+                    TaskStatus::Failed => stats.failed += 1,
+                    TaskStatus::Cancelled => stats.cancelled += 1,
+                }
+                let stalled = data
+                    .error
+                    .as_deref()
+                    .map(|e| e.to_ascii_lowercase().contains("stalled"))
+                    .unwrap_or(false)
+                    || data
+                        .summary
+                        .as_deref()
+                        .map(|s| s.to_ascii_lowercase().contains("stalled"))
+                        .unwrap_or(false);
+                if stalled {
+                    stats.stalled += 1;
+                }
+            }
+        }
+        stats.error_events = errors.len() as u64;
+
+        if stats.total > 0 {
+            stats.completion_rate = stats.completed as f64 / stats.total as f64;
+            stats.error_rate = stats.error_events as f64 / stats.total as f64;
+            stats.stall_rate = stats.stalled as f64 / stats.total as f64;
+        }
+
+        Ok(stats)
+    }
+
     // =========================================================================
     // Helper Methods
     // =========================================================================
@@ -651,5 +947,324 @@ impl EventEmitter {
     /// Get the session ID
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use serde_json::json;
+
+    async fn setup_store() -> (EventStore, tempfile::NamedTempFile) {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.expect("connect sqlite");
+        let store = EventStore::new(pool).await.expect("init event store");
+        (store, db_file)
+    }
+
+    async fn append_event_at(
+        store: &EventStore,
+        session_id: &str,
+        event_type: EventType,
+        data: serde_json::Value,
+        created_at: DateTime<Utc>,
+    ) {
+        let mut event = Event::new(session_id, event_type, data);
+        event.created_at = created_at;
+        store.append(event).await.expect("append event");
+    }
+
+    async fn append_policy_decision(
+        store: &EventStore,
+        session_id: &str,
+        task_id: &str,
+        diverged: bool,
+        created_at: DateTime<Utc>,
+    ) {
+        let payload = PolicyDecisionData {
+            task_id: task_id.to_string(),
+            old_model: "old-model".to_string(),
+            new_model: "new-model".to_string(),
+            old_tier: "primary".to_string(),
+            new_profile: "balanced".to_string(),
+            diverged,
+            policy_enforce: false,
+            risk_score: 0.3,
+            uncertainty_score: 0.2,
+        };
+        append_event_at(
+            store,
+            session_id,
+            EventType::PolicyDecision,
+            serde_json::to_value(payload).expect("serialize policy decision"),
+            created_at,
+        )
+        .await;
+    }
+
+    async fn append_task_end(
+        store: &EventStore,
+        session_id: &str,
+        task_id: &str,
+        status: TaskStatus,
+        created_at: DateTime<Utc>,
+        error: Option<&str>,
+        summary: Option<&str>,
+    ) {
+        let payload = TaskEndData {
+            task_id: task_id.to_string(),
+            status,
+            duration_secs: 1,
+            iterations: 1,
+            tool_calls_count: 0,
+            error: error.map(str::to_string),
+            summary: summary.map(str::to_string),
+        };
+        append_event_at(
+            store,
+            session_id,
+            EventType::TaskEnd,
+            serde_json::to_value(payload).expect("serialize task end"),
+            created_at,
+        )
+        .await;
+    }
+
+    async fn append_decision_point(
+        store: &EventStore,
+        session_id: &str,
+        task_id: &str,
+        created_at: DateTime<Utc>,
+    ) {
+        append_event_at(
+            store,
+            session_id,
+            EventType::DecisionPoint,
+            json!({
+                "decision_type":"intent_gate",
+                "task_id": task_id,
+                "iteration": 1,
+                "metadata":{"needs_tools":true},
+                "summary":"intent gate forced tool mode"
+            }),
+            created_at,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn graduation_report_passes_with_low_divergence_and_no_regression() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+        let session = "s-pass";
+
+        // Ensure observed_days >= 7
+        append_policy_decision(&store, session, "old-task", false, now - Duration::days(8)).await;
+        for i in 0..20 {
+            append_policy_decision(
+                &store,
+                session,
+                &format!("cur-{i}"),
+                false,
+                now - Duration::hours(6) + Duration::minutes(i as i64),
+            )
+            .await;
+        }
+
+        // Previous window: weaker quality
+        append_task_end(
+            &store,
+            session,
+            "prev-1",
+            TaskStatus::Completed,
+            now - Duration::days(10),
+            None,
+            Some("completed"),
+        )
+        .await;
+        append_task_end(
+            &store,
+            session,
+            "prev-2",
+            TaskStatus::Failed,
+            now - Duration::days(9),
+            Some("stalled waiting for output"),
+            Some("stalled"),
+        )
+        .await;
+        append_event_at(
+            &store,
+            session,
+            EventType::Error,
+            json!({"message":"previous error"}),
+            now - Duration::days(9),
+        )
+        .await;
+
+        // Current window: improved quality
+        append_task_end(
+            &store,
+            session,
+            "cur-1",
+            TaskStatus::Completed,
+            now - Duration::days(2),
+            None,
+            Some("done"),
+        )
+        .await;
+        append_task_end(
+            &store,
+            session,
+            "cur-2",
+            TaskStatus::Completed,
+            now - Duration::days(1),
+            None,
+            Some("done"),
+        )
+        .await;
+
+        let report = store.policy_graduation_report(7).await.expect("report");
+        assert!(report.observed_days >= 7.0);
+        assert_eq!(report.total_decisions, 20);
+        assert_eq!(report.diverged_decisions, 0);
+        assert!(report.gate_passes(0.05));
+        assert!(report.current.completion_rate >= report.previous.completion_rate);
+        assert!(report.current.error_rate <= report.previous.error_rate);
+        assert!(report.current.stall_rate <= report.previous.stall_rate);
+    }
+
+    #[tokio::test]
+    async fn graduation_report_fails_when_divergence_exceeds_threshold() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+        let session = "s-diverge";
+
+        append_policy_decision(&store, session, "old-task", false, now - Duration::days(8)).await;
+        for i in 0..20 {
+            append_policy_decision(
+                &store,
+                session,
+                &format!("cur-{i}"),
+                i < 2,
+                now - Duration::hours(3) + Duration::minutes(i as i64),
+            )
+            .await;
+        }
+
+        // Keep quality metrics equal so divergence is the failing reason.
+        append_task_end(
+            &store,
+            session,
+            "prev-1",
+            TaskStatus::Completed,
+            now - Duration::days(9),
+            None,
+            Some("done"),
+        )
+        .await;
+        append_task_end(
+            &store,
+            session,
+            "cur-1",
+            TaskStatus::Completed,
+            now - Duration::days(1),
+            None,
+            Some("done"),
+        )
+        .await;
+
+        let report = store.policy_graduation_report(7).await.expect("report");
+        assert!(report.observed_days >= 7.0);
+        assert!(report.divergence_rate > 0.05);
+        assert!(!report.gate_passes(0.05));
+    }
+
+    #[tokio::test]
+    async fn graduation_report_fails_when_observation_window_is_too_short() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+        let session = "s-short-window";
+
+        // Earliest policy decision is only 2 days old.
+        for i in 0..8 {
+            append_policy_decision(
+                &store,
+                session,
+                &format!("cur-{i}"),
+                false,
+                now - Duration::days(2) + Duration::hours(i as i64),
+            )
+            .await;
+        }
+
+        append_task_end(
+            &store,
+            session,
+            "cur-1",
+            TaskStatus::Completed,
+            now - Duration::hours(12),
+            None,
+            Some("done"),
+        )
+        .await;
+
+        let report = store.policy_graduation_report(7).await.expect("report");
+        assert!(report.observed_days < 7.0);
+        assert!(!report.gate_passes(0.05));
+    }
+
+    #[tokio::test]
+    async fn query_recent_task_ends_and_decision_points_are_session_scoped() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+
+        append_task_end(
+            &store,
+            "s1",
+            "task-failed",
+            TaskStatus::Failed,
+            now - Duration::minutes(2),
+            Some("boom"),
+            None,
+        )
+        .await;
+        append_task_end(
+            &store,
+            "s1",
+            "task-ok",
+            TaskStatus::Completed,
+            now - Duration::minutes(1),
+            None,
+            Some("ok"),
+        )
+        .await;
+        append_task_end(
+            &store,
+            "s2",
+            "task-s2",
+            TaskStatus::Failed,
+            now - Duration::minutes(1),
+            Some("other"),
+            None,
+        )
+        .await;
+        append_decision_point(&store, "s1", "task-failed", now - Duration::minutes(2)).await;
+        append_decision_point(&store, "s2", "task-failed", now - Duration::minutes(2)).await;
+
+        let s1_failed = store
+            .query_recent_task_ends("s1", true, 10)
+            .await
+            .expect("query failed");
+        assert_eq!(s1_failed.len(), 1);
+        assert_eq!(s1_failed[0].session_id, "s1");
+
+        let s1_decisions = store
+            .query_decision_points("s1", "task-failed")
+            .await
+            .expect("query decision points");
+        assert_eq!(s1_decisions.len(), 1);
+        assert_eq!(s1_decisions[0].session_id, "s1");
     }
 }

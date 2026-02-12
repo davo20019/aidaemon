@@ -16,8 +16,11 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::agent;
 use crate::config::ModelsConfig;
+use crate::events::EventStore;
 use crate::health::HealthProbeStore;
+use crate::heartbeat::HeartbeatTelemetry;
 use crate::oauth::OAuthGateway;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
@@ -36,6 +39,7 @@ const RATE_LIMIT_WINDOW_SECS: u64 = 900;
 #[derive(Clone)]
 pub struct DashboardState {
     pub pool: SqlitePool,
+    pub event_store: Option<Arc<EventStore>>,
     pub provider_kind: String,
     pub models: ModelsConfig,
     pub started_at: Instant,
@@ -43,7 +47,11 @@ pub struct DashboardState {
     pub token_created_at: Instant,
     pub daily_token_budget: Option<u64>,
     pub health_store: Option<Arc<HealthProbeStore>>,
+    pub heartbeat_telemetry: Option<Arc<HeartbeatTelemetry>>,
     pub oauth_gateway: Option<OAuthGateway>,
+    pub policy_window_days: u32,
+    pub policy_max_divergence: f64,
+    pub policy_uncertainty_threshold: f32,
     /// Rate limiter: maps IP address to (failure_count, first_failure_time).
     pub auth_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
 }
@@ -61,15 +69,8 @@ pub struct DashboardToken {
 pub fn get_or_create_dashboard_token() -> anyhow::Result<DashboardToken> {
     // Always generate a fresh token on startup (enforces TTL on restart)
     let tok = uuid::Uuid::new_v4().to_string();
-    match keyring::Entry::new("aidaemon", KEYCHAIN_FIELD) {
-        Ok(entry) => {
-            if let Err(e) = entry.set_password(&tok) {
-                warn!("Could not store dashboard token in keychain: {e}");
-            }
-        }
-        Err(e) => {
-            warn!("Keychain unavailable for dashboard token: {e}");
-        }
+    if let Err(e) = crate::config::store_in_keychain(KEYCHAIN_FIELD, &tok) {
+        warn!("Could not store dashboard token in keychain: {e}");
     }
     let prefix = tok.get(..8).unwrap_or("????????");
     info!(
@@ -92,6 +93,8 @@ pub fn build_router(state: DashboardState) -> Router {
         .route("/api/usage", get(api_usage))
         .route("/api/sessions", get(api_sessions))
         .route("/api/tasks", get(api_tasks))
+        .route("/api/heartbeat/jobs", get(api_heartbeat_jobs))
+        .route("/api/policy/metrics", get(api_policy_metrics))
         .route("/api/health/probes", get(api_health_probes))
         .route("/api/health/history", get(api_health_history))
         .route("/api/health/summary", get(api_health_summary))
@@ -193,7 +196,10 @@ async fn oauth_callback_handler(
     let state_param = match &params.state {
         Some(s) => s.as_str(),
         None => {
-            return Html("<html><body><h2>Error</h2><p>Missing state parameter.</p></body></html>".to_string());
+            return Html(
+                "<html><body><h2>Error</h2><p>Missing state parameter.</p></body></html>"
+                    .to_string(),
+            );
         }
     };
 
@@ -203,7 +209,8 @@ async fn oauth_callback_handler(
     {
         Ok(msg) => {
             let safe_msg = html_escape(&msg);
-            let is_error = msg.contains("denied") || msg.contains("failed") || msg.contains("expired");
+            let is_error =
+                msg.contains("denied") || msg.contains("failed") || msg.contains("expired");
             let (icon, title) = if is_error {
                 ("&#10060;", "OAuth Error")
             } else {
@@ -426,6 +433,99 @@ struct TaskRow {
     is_trusted: i64,
     last_run_at: Option<String>,
     next_run_at: String,
+}
+
+async fn api_heartbeat_jobs(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let Some(telemetry) = &state.heartbeat_telemetry else {
+        return Json(json!({
+            "error": "Heartbeat telemetry unavailable",
+            "jobs": [],
+            "maintenance_jobs": []
+        }));
+    };
+
+    let jobs = telemetry.snapshots();
+    let maintenance_names = [
+        "embeddings",
+        "consolidation",
+        "memory_decay",
+        "event_pruning",
+        "retention_cleanup",
+    ];
+    let maintenance_jobs: Vec<_> = jobs
+        .iter()
+        .filter(|job| maintenance_names.contains(&job.name.as_str()))
+        .cloned()
+        .collect();
+
+    Json(json!({
+        "jobs": jobs,
+        "maintenance_jobs": maintenance_jobs
+    }))
+}
+
+async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let metrics = agent::policy_metrics_snapshot();
+    let autotune = agent::policy_autotune_snapshot(state.policy_uncertainty_threshold);
+    let divergence_rate = if metrics.router_shadow_total > 0 {
+        metrics.router_shadow_diverged as f64 / metrics.router_shadow_total as f64
+    } else {
+        0.0
+    };
+    let avg_tools_before = if metrics.tool_exposure_samples > 0 {
+        metrics.tool_exposure_before_sum as f64 / metrics.tool_exposure_samples as f64
+    } else {
+        0.0
+    };
+    let avg_tools_after = if metrics.tool_exposure_samples > 0 {
+        metrics.tool_exposure_after_sum as f64 / metrics.tool_exposure_samples as f64
+    } else {
+        0.0
+    };
+    let mut graduation = serde_json::json!({
+        "window_days": state.policy_window_days,
+        "observed_days": 0.0,
+        "total_decisions": 0,
+        "diverged_decisions": 0,
+        "divergence_rate": 0.0,
+        "gate_passed": false,
+    });
+    if let Some(store) = &state.event_store {
+        match store
+            .policy_graduation_report(state.policy_window_days)
+            .await
+        {
+            Ok(report) => {
+                graduation = serde_json::json!({
+                    "window_days": report.window_days,
+                    "observed_days": report.observed_days,
+                    "total_decisions": report.total_decisions,
+                    "diverged_decisions": report.diverged_decisions,
+                    "divergence_rate": report.divergence_rate,
+                    "gate_passed": report.gate_passes(state.policy_max_divergence),
+                    "max_divergence": state.policy_max_divergence
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to load policy graduation report");
+            }
+        }
+    }
+    Json(json!({
+        "router_shadow_total": metrics.router_shadow_total,
+        "router_shadow_diverged": metrics.router_shadow_diverged,
+        "router_divergence_rate": divergence_rate,
+        "tool_exposure_samples": metrics.tool_exposure_samples,
+        "avg_tools_before_filter": avg_tools_before,
+        "avg_tools_after_filter": avg_tools_after,
+        "ambiguity_detected_total": metrics.ambiguity_detected_total,
+        "uncertainty_clarify_total": metrics.uncertainty_clarify_total,
+        "uncertainty_threshold": autotune.uncertainty_threshold,
+        "context_refresh_total": metrics.context_refresh_total,
+        "escalation_total": metrics.escalation_total,
+        "fallback_expansion_total": metrics.fallback_expansion_total,
+        "graduation": graduation
+    }))
 }
 
 // ---------------------------------------------------------------------------

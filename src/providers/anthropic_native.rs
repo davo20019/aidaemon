@@ -23,10 +23,8 @@ impl Drop for AnthropicNativeProvider {
 
 impl AnthropicNativeProvider {
     pub fn new(api_key: &str) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .expect("failed to build HTTP client");
+        let client = crate::providers::build_http_client(Duration::from_secs(120))
+            .unwrap_or_else(|e| panic!("failed to build HTTP client: {e}"));
         Self {
             client,
             base_url: "https://api.anthropic.com/v1".to_string(),
@@ -293,6 +291,7 @@ impl ModelProvider for AnthropicNativeProvider {
             },
             tool_calls,
             usage,
+            thinking: None,
         })
     }
 

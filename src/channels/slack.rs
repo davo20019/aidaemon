@@ -724,7 +724,9 @@ impl SlackChannel {
             }
             let session_id = self.build_session_id(&channel_id, thread_ts.as_deref());
             let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
-            let (reply, buttons) = self.dispatch_command_with_buttons(&agent_text, &session_id).await;
+            let (reply, buttons) = self
+                .dispatch_command_with_buttons(&agent_text, &session_id)
+                .await;
             let mrkdwn = markdown_to_slack_mrkdwn(&reply);
             let chunks = split_message(&mrkdwn, MAX_MESSAGE_LEN);
             let last_idx = chunks.len().saturating_sub(1);
@@ -742,7 +744,12 @@ impl SlackChannel {
                         }
                     ]);
                     let _ = self
-                        .post_message_with_blocks(&channel_id, &chunk, blocks, reply_thread.as_deref())
+                        .post_message_with_blocks(
+                            &channel_id,
+                            &chunk,
+                            blocks,
+                            reply_thread.as_deref(),
+                        )
                         .await;
                 } else {
                     let _ = self
@@ -793,10 +800,15 @@ impl SlackChannel {
             return;
         }
 
-        // Register this session with the channel hub
+        // Register this session with the channel hub (in-memory + persistent)
         {
+            let channel_name = self.channel_name();
             let mut map = self.session_map.write().await;
-            map.insert(session_id.clone(), self.channel_name());
+            map.insert(session_id.clone(), channel_name.clone());
+            let _ = self
+                .state
+                .save_session_channel(&session_id, &channel_name)
+                .await;
         }
 
         // Build channel context from Slack channel type
@@ -949,7 +961,7 @@ impl SlackChannel {
                     continue;
                 }
                 let text = match &update {
-                    StatusUpdate::Thinking(iter) => format!("_Thinking... (step {})_", iter + 1),
+                    StatusUpdate::Thinking(iter) => format!("_Thinking... (step {})_", iter),
                     StatusUpdate::ToolStart { name, summary } => {
                         if summary.is_empty() {
                             format!("_Using {}..._", name)
@@ -1195,7 +1207,7 @@ impl SlackChannel {
                             }
                             let text = match &update {
                                 StatusUpdate::Thinking(iter) => {
-                                    format!("_Thinking... (step {})_", iter + 1)
+                                    format!("_Thinking... (step {})_", iter)
                                 }
                                 StatusUpdate::ToolStart { name, summary } => {
                                     if summary.is_empty() {

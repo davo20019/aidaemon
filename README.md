@@ -28,19 +28,21 @@ If you don't care about resource usage and want more channels (WhatsApp, Signal,
 
 ### LLM Providers
 - **Multiple providers** - native Anthropic, Google Gemini, DeepSeek, and OpenAI-compatible (OpenAI, OpenRouter, Ollama, etc.)
-- **Smart model routing** - auto-selects Fast/Primary/Smart tier by query complexity (keyword heuristics, message length, code detection)
+- **ExecutionPolicy routing** - risk-based model selection using tool capabilities (read-only, side-effects, high-impact writes), uncertainty scoring, and mid-loop adaptation
 - **Token/cost tracking** - per-session and daily usage statistics with optional budget limits
 
 ### Tools & Agents
-- **Agentic tool use** - the LLM can call tools (system info, terminal commands, MCP servers) in a loop
+- **40+ tools** - file operations (read, write, edit, search), git info/commit, terminal, system info, web research, browser, HTTP requests, and more
 - **Dynamic MCP management** - add, remove, and configure MCP servers at runtime via the `manage_mcp` tool
 - **Browser tool** - headless Chrome with screenshot, click, fill, and JS execution
 - **Web research** - search (DuckDuckGo/Brave) and fetch tools for internet access
 - **HTTP requests** - authenticated API calls with OAuth 1.0a, Bearer, Header, and Basic auth profiles
 - **Sub-agent spawning** - recursive agents with configurable depth, iteration limit, and dynamic budget extension
 - **CLI agent delegation** - delegate tasks to claude, gemini, codex, aider, copilot (auto-discovered via `which`)
+- **Goal tracking** - long-running goals with task breakdown, scheduled runs, blockers, and diagnostic tracing
 - **Channel history** - read recent Slack channel messages with time filtering and user resolution
 - **Skills system** - trigger-based markdown instructions with dynamic management, remote registries, and auto-promotion from successful procedures
+- **Tool capability registry** - each tool declares read_only, external_side_effect, needs_approval, idempotent, high_impact_write for risk-based filtering
 
 ### OAuth & API Integration
 - **OAuth 2.0 PKCE** - built-in flows for Twitter/X and GitHub, plus custom providers
@@ -51,11 +53,15 @@ If you don't care about resource usage and want more channels (WhatsApp, Signal,
 ### Memory & State
 - **Persistent memory** - SQLite-backed conversation history + facts table, with fast in-memory working memory
 - **Memory consolidation** - background fact extraction with vector embeddings (AllMiniLML6V2) for semantic recall
+- **Evidence-gated learning** - stricter thresholds for auto-promoting procedures to skills (7+ successes, 90%+ success rate)
+- **Context window management** - role-based token quotas with sliding window summarization
 - **People intelligence** - organic contact management with auto-extracted facts, relationship tracking, and privacy controls
 - **Database encryption** - optional SQLCipher AES-256 encryption at rest (feature flag: `--features encryption`)
 
 ### Automation
 - **Scheduled tasks** - cron-style task scheduling with natural language time parsing
+- **HeartbeatCoordinator** - unified background task scheduler with jitter, semaphore-bounded concurrency, and exponential backoff
+- **Bounded auto-tuning** - adaptive uncertainty threshold that adjusts based on task failure ratios
 - **Email triggers** - IMAP IDLE monitors your inbox and notifies you on new emails
 - **Background task registry** - track and cancel long-running tasks
 
@@ -162,12 +168,13 @@ Requires building with `--features slack`:
 
 ```toml
 [slack]
-enabled = true
 app_token = "keychain"           # xapp-... Socket Mode token
 bot_token = "keychain"           # xoxb-... Bot token
 allowed_user_ids = ["U12345678"] # Slack user IDs (strings)
 use_threads = true               # Reply in threads (default: true)
 ```
+
+Slack is activated automatically when both `app_token` and `bot_token` are set.
 
 ### Terminal Tool
 
@@ -263,7 +270,7 @@ The `manage_skills` tool supports runtime management:
 - **install** — install a skill from a registry
 - **update** — re-fetch a skill from its source URL
 
-Successful procedures (>= 5 uses, >= 80% success rate) are automatically promoted to skills every 12 hours.
+Successful procedures (>= 7 uses, >= 90% success rate) are automatically promoted to skills every 12 hours via evidence-gated learning.
 
 ### OAuth
 
@@ -521,45 +528,47 @@ aidaemon is designed for users who want a lightweight daemon in Rust with essent
 ## Architecture
 
 ```
-Channels ──→ Agent ──→ Smart Router ──→ LLM Provider
-(Telegram,     │                         (OpenAI-compatible / Anthropic / Google Gemini)
- Slack,        │
- Discord)      ├──→ Tools
-               │     ├── System info
-               │     ├── Terminal (with approval flow)
+Channels ──→ Agent ──→ ExecutionPolicy ──→ Router ──→ LLM Provider
+(Telegram,     │        (risk gate,         (profile    (OpenAI-compatible /
+ Slack,        │         uncertainty,        → model      Anthropic /
+ Discord)      │         tool filtering)     mapping)     Google Gemini)
+               │
+               ├──→ Tools (40+, with ToolCapabilities)
+               │     ├── File ops (read, write, edit, search, project inspect)
+               │     ├── Terminal / RunCommand (with approval flow)
+               │     ├── Git (info, commit)
                │     ├── Browser (headless Chrome)
                │     ├── Web research (search + fetch)
                │     ├── HTTP requests (with auth profiles + OAuth)
-               │     ├── Config manager
                │     ├── MCP servers (JSON-RPC over stdio, dynamic management)
-               │     ├── Sub-agents (recursive, depth-limited)
-               │     ├── CLI agents (claude, gemini, codex, aider, copilot)
-               │     ├── Channel history (Slack message reading)
+               │     ├── Sub-agents / CLI agents (claude, gemini, codex, aider)
+               │     ├── Goals & tasks (manage, schedule, trace, blockers)
                │     ├── People intelligence (contact management)
-               │     ├── OAuth manager (connect/refresh/remove services)
-               │     └── Scheduler (create/list/cancel tasks)
+               │     ├── Skills (use, manage, resources)
+               │     └── OAuth, config, health probe, diagnostics
                │
                ├──→ State
-               │     ├── SQLite (conversation history + facts + usage)
+               │     ├── SQLite (messages, facts, episodes, goals, procedures)
                │     └── In-memory working memory (VecDeque, capped)
                │
                ├──→ Memory Manager
-               │     ├── Fact extraction (background consolidation)
+               │     ├── Fact extraction (evidence-gated consolidation)
                │     ├── Vector embeddings (AllMiniLML6V2)
+               │     ├── Context window (role-based token quotas)
                │     └── People intelligence (organic fact learning)
                │
-               ├──→ Task Registry (background task tracking)
+               ├──→ HeartbeatCoordinator (unified background tasks)
                │
                └──→ Skills (trigger-based, with registries + auto-promotion)
 
 Triggers ──→ EventBus ──→ Agent ──→ Channel notification
 ├── IMAP IDLE (email)
-└── Scheduler (cron tasks)
+└── Goal scheduler (60s tick)
 
 Health server (axum) ──→ GET /health + Web Dashboard + OAuth callbacks
 ```
 
-- **Agent loop**: user message -> build history -> smart router selects model tier -> call LLM -> if tool calls, execute and loop (max iterations) -> return final response
+- **Agent loop**: user message → ExecutionPolicy (risk score + uncertainty) → Router (profile → model) → call LLM → tool execution with capability filtering → mid-loop adaptation → return final response
 - **Working memory**: `VecDeque<Message>` in RAM, capped at N messages, hydrated from SQLite on cold start
 - **Session ID** = channel-specific chat/thread ID
 - **MCP**: spawns server subprocesses, communicates via JSON-RPC over stdio. Servers can be added/removed at runtime.

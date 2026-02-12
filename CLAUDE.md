@@ -84,6 +84,25 @@ Bots can be added two ways: **config-based** (in `config.toml`) or **dynamic** (
 
 Failing to check dynamic bots will cause features to silently not register even though the channel is connected and working.
 
+#### Keyword Matching (IMPORTANT)
+
+When matching keywords or phrases in user/LLM text (intent classification, deferred action detection, trigger matching, etc.), **always use word-boundary matching, never substring matching**. Substring matching causes false positives: e.g., `"deploy"` matches `"deployed"`, `"implement"` matches `"implementation"`.
+
+Use the `contains_keyword_as_words()` helper in `agent.rs` — it splits text on whitespace, trims surrounding punctuation (preserving apostrophes for contractions), and checks for exact consecutive word sequences. Both text and keyword sides are normalized the same way, so commas/brackets in keywords are handled correctly.
+
+```rust
+// CORRECT — word-boundary matching
+contains_keyword_as_words("check deployed sites", "deploy")  // false ✓
+contains_keyword_as_words("deploy the app", "deploy")         // true ✓
+contains_keyword_as_words("set up monitoring", "set up")      // true ✓
+contains_keyword_as_words("I'll check the report", "i'll check") // true ✓
+
+// WRONG — substring matching catches derived forms
+"check deployed sites".contains("deploy")  // true ✗ — false positive
+```
+
+**Exception:** Structural format markers like `[tool_use:`, `[tool_call:`, `[consultation]`, `[INTENT_GATE]` may use substring matching since they are format patterns, not natural language keywords.
+
 ### Module Map
 
 - **`core.rs`** — orchestrates startup: creates state store, event store, provider, router, tools, agent, channels, dashboard. Handles the deferred wiring for `SpawnAgentTool` (circular dep: Agent ↔ SpawnAgentTool resolved via weak reference + `set_agent()`).
@@ -173,3 +192,7 @@ cargo test test_tool_execution        # run a single integration test
 - **`setup_test_agent(provider)`** — creates a fully wired `Agent` with real `SqliteStateStore` (temp file), real `EventStore`/`PlanStore`, real `EmbeddingService`, and `SystemInfoTool` only. Returns `TestHarness { agent, state, provider, channel }`. Each call creates an isolated DB for safe parallel execution.
 
 First run downloads the fastembed model (~25MB, cached in `~/.cache/`).
+
+## MCP Tools
+
+- When using chrome-devtools, prefer `take_screenshot` over `take_snapshot` to save tokens. Only use `take_snapshot` when you specifically need element UIDs for interaction (clicking, filling, etc.).

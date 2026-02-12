@@ -1,16 +1,18 @@
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::skills::SharedSkillRegistry;
+use crate::skills;
 use crate::traits::Tool;
 
 pub struct UseSkillTool {
-    registry: SharedSkillRegistry,
+    skills_dir: PathBuf,
 }
 
 impl UseSkillTool {
-    pub fn new(registry: SharedSkillRegistry) -> Self {
-        Self { registry }
+    pub fn new(skills_dir: PathBuf) -> Self {
+        Self { skills_dir }
     }
 }
 
@@ -47,11 +49,11 @@ impl Tool for UseSkillTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: skill_name"))?;
 
-        let skills = self.registry.snapshot().await;
-        if let Some(skill) = skills.iter().find(|s| s.name == skill_name) {
+        let all_skills = skills::load_skills(&self.skills_dir);
+        if let Some(skill) = skills::find_skill_by_name(&all_skills, skill_name) {
             Ok(skill.body.clone())
         } else {
-            let available: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+            let available: Vec<&str> = all_skills.iter().map(|s| s.name.as_str()).collect();
             Ok(format!(
                 "Skill '{}' not found. Available skills: {}",
                 skill_name,
@@ -74,28 +76,30 @@ mod tests {
             body: body.to_string(),
             source: None,
             source_url: None,
-            id: None,
-            enabled: true,
             dir_path: None,
             resources: vec![],
         }
     }
 
+    fn write_skill(dir: &std::path::Path, skill: &Skill) {
+        skills::write_skill_to_file(dir, skill).unwrap();
+    }
+
     #[tokio::test]
     async fn found_skill_returns_body() {
-        let registry = SharedSkillRegistry::new(vec![make_skill("deploy", "Run deploy steps")]);
-        let tool = UseSkillTool::new(registry);
+        let dir = tempfile::TempDir::new().unwrap();
+        write_skill(dir.path(), &make_skill("deploy", "Run deploy steps"));
+        let tool = UseSkillTool::new(dir.path().to_path_buf());
         let result = tool.call(r#"{"skill_name": "deploy"}"#).await.unwrap();
         assert_eq!(result, "Run deploy steps");
     }
 
     #[tokio::test]
     async fn not_found_lists_available() {
-        let registry = SharedSkillRegistry::new(vec![
-            make_skill("deploy", "body1"),
-            make_skill("lint", "body2"),
-        ]);
-        let tool = UseSkillTool::new(registry);
+        let dir = tempfile::TempDir::new().unwrap();
+        write_skill(dir.path(), &make_skill("deploy", "body1"));
+        write_skill(dir.path(), &make_skill("lint", "body2"));
+        let tool = UseSkillTool::new(dir.path().to_path_buf());
         let result = tool.call(r#"{"skill_name": "missing"}"#).await.unwrap();
         assert!(result.contains("not found"));
         assert!(result.contains("deploy"));
@@ -104,19 +108,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_skills() {
-        let registry = SharedSkillRegistry::new(vec![]);
-        let tool = UseSkillTool::new(registry);
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = UseSkillTool::new(dir.path().to_path_buf());
         let result = tool.call(r#"{"skill_name": "any"}"#).await.unwrap();
-        assert!(result.contains("not found"));
-    }
-
-    #[tokio::test]
-    async fn disabled_skill_not_found() {
-        let mut skill = make_skill("deploy", "Run deploy steps");
-        skill.enabled = false;
-        let registry = SharedSkillRegistry::new(vec![skill]);
-        let tool = UseSkillTool::new(registry);
-        let result = tool.call(r#"{"skill_name": "deploy"}"#).await.unwrap();
         assert!(result.contains("not found"));
     }
 }

@@ -78,6 +78,8 @@ pub fn install_service() -> anyhow::Result<()> {
     <string>ai.aidaemon</string>
     <key>ProgramArguments</key>
     <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
         <string>{}</string>
     </array>
     <key>WorkingDirectory</key>

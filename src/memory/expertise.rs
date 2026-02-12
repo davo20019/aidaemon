@@ -27,97 +27,44 @@ pub fn calculate_expertise_level(succeeded: i32, failed: i32) -> (&'static str, 
     (level, confidence)
 }
 
-/// Detect which domains a task context relates to.
+/// Normalize explicit domain hints into canonical expertise domains.
+fn normalize_domain(domain: &str) -> Option<&'static str> {
+    match domain.trim().to_ascii_lowercase().as_str() {
+        "rust" => Some("rust"),
+        "python" => Some("python"),
+        "javascript" | "typescript" | "js" | "ts" => Some("javascript"),
+        "go" | "golang" => Some("go"),
+        "docker" => Some("docker"),
+        "kubernetes" | "k8s" => Some("kubernetes"),
+        "infrastructure" | "devops" => Some("infrastructure"),
+        "web-frontend" | "frontend" => Some("web-frontend"),
+        "web-backend" | "backend" => Some("web-backend"),
+        "databases" | "database" | "db" => Some("databases"),
+        "git" => Some("git"),
+        "system-admin" | "sysadmin" | "shell" => Some("system-admin"),
+        "general" => Some("general"),
+        _ => None,
+    }
+}
+
+/// Detect domains from explicit classifier hints only.
 ///
-/// This is a simple keyword-based detection. In the future, this could
-/// use embeddings for more sophisticated domain classification.
-pub fn detect_domains(task_context: &str) -> Vec<String> {
-    let lower = task_context.to_lowercase();
+/// Keyword-based message parsing is intentionally disabled to avoid false
+/// positives; callers must provide explicit domain hints.
+pub fn detect_domains(explicit_domains: &[String]) -> Vec<String> {
     let mut domains = Vec::new();
-
-    // Programming languages
-    if lower.contains("rust") || lower.contains("cargo") || lower.contains(".rs") {
-        domains.push("rust".to_string());
-    }
-    if lower.contains("python") || lower.contains(".py") || lower.contains("pip") {
-        domains.push("python".to_string());
-    }
-    if lower.contains("javascript")
-        || lower.contains("typescript")
-        || lower.contains(".js")
-        || lower.contains(".ts")
-        || lower.contains("npm")
-        || lower.contains("node")
-    {
-        domains.push("javascript".to_string());
-    }
-    if lower.contains("go ") || lower.contains("golang") || lower.contains(".go") {
-        domains.push("go".to_string());
+    for domain in explicit_domains {
+        if let Some(normalized) = normalize_domain(domain) {
+            let normalized = normalized.to_string();
+            if !domains.contains(&normalized) {
+                domains.push(normalized);
+            }
+        }
     }
 
-    // DevOps/Infrastructure
-    if lower.contains("docker") || lower.contains("container") {
-        domains.push("docker".to_string());
-    }
-    if lower.contains("kubernetes") || lower.contains("k8s") || lower.contains("kubectl") {
-        domains.push("kubernetes".to_string());
-    }
-    if lower.contains("terraform") || lower.contains("ansible") || lower.contains("infrastructure")
-    {
-        domains.push("infrastructure".to_string());
-    }
-
-    // Web development
-    if lower.contains("html")
-        || lower.contains("css")
-        || lower.contains("frontend")
-        || lower.contains("react")
-        || lower.contains("vue")
-    {
-        domains.push("web-frontend".to_string());
-    }
-    if lower.contains("api")
-        || lower.contains("backend")
-        || lower.contains("server")
-        || lower.contains("endpoint")
-    {
-        domains.push("web-backend".to_string());
-    }
-
-    // Databases
-    if lower.contains("sql")
-        || lower.contains("database")
-        || lower.contains("postgres")
-        || lower.contains("mysql")
-        || lower.contains("sqlite")
-    {
-        domains.push("databases".to_string());
-    }
-
-    // Git/Version control
-    if lower.contains("git")
-        || lower.contains("commit")
-        || lower.contains("branch")
-        || lower.contains("merge")
-    {
-        domains.push("git".to_string());
-    }
-
-    // System administration
-    if lower.contains("linux")
-        || lower.contains("unix")
-        || lower.contains("bash")
-        || lower.contains("shell")
-        || lower.contains("terminal")
-    {
-        domains.push("system-admin".to_string());
-    }
-
-    // If no specific domain detected, classify as general
     if domains.is_empty() {
         domains.push("general".to_string());
     }
-
     domains
 }
 
@@ -154,11 +101,18 @@ mod tests {
 
     #[test]
     fn test_detect_domains() {
-        let domains = detect_domains("Building a Rust CLI tool with cargo");
+        let domains = detect_domains(&["Rust".to_string(), "typescript".to_string()]);
         assert!(domains.contains(&"rust".to_string()));
+        assert!(domains.contains(&"javascript".to_string()));
 
-        let domains = detect_domains("Deploy to kubernetes using docker containers");
+        let domains = detect_domains(&["kubernetes".to_string(), "docker".to_string()]);
         assert!(domains.contains(&"docker".to_string()));
         assert!(domains.contains(&"kubernetes".to_string()));
+    }
+
+    #[test]
+    fn test_detect_domains_defaults_general_when_no_explicit_hints() {
+        let domains = detect_domains(&[]);
+        assert_eq!(domains, vec!["general".to_string()]);
     }
 }

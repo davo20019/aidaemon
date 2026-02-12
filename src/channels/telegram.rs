@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
@@ -6,12 +6,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use teloxide::prelude::*;
 use teloxide::types::{
     ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode,
 };
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::formatting::{
     build_help_text, format_number, html_escape, markdown_to_telegram_html, sanitize_filename,
@@ -684,6 +686,105 @@ impl TelegramChannel {
         reply
     }
 
+    /// Auto-send file attachments referenced as absolute paths in a reply.
+    async fn send_referenced_files_from_reply(
+        bot: &Bot,
+        chat_id: ChatId,
+        reply: &str,
+        files_enabled: bool,
+    ) {
+        let candidate_paths = extract_candidate_file_paths(reply);
+        if candidate_paths.is_empty() {
+            return;
+        }
+
+        if !files_enabled {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    "I found file path(s) in my response, but file attachments are disabled in config.",
+                )
+                .await;
+            return;
+        }
+
+        const MAX_FILES_PER_REPLY: usize = 3;
+        let sendable_paths: HashSet<String> = crate::agent::extract_file_paths_from_text(reply)
+            .into_iter()
+            .collect();
+        let mut seen = HashSet::new();
+        let mut sent = 0usize;
+        let mut skipped = 0usize;
+
+        for path in candidate_paths {
+            if sent >= MAX_FILES_PER_REPLY {
+                skipped += 1;
+                continue;
+            }
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+
+            if !sendable_paths.contains(&path) {
+                debug!(
+                    file = %path,
+                    "Skipping non-sendable auto-detected file path from reply"
+                );
+                continue;
+            }
+
+            let file_name = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+
+            let doc = InputFile::file(std::path::PathBuf::from(&path)).file_name(file_name.clone());
+            match bot
+                .send_document(chat_id, doc)
+                .caption(format!("📎 {}", file_name))
+                .await
+            {
+                Ok(_) => {
+                    sent += 1;
+                }
+                Err(e) => {
+                    warn!(file = %path, error = %e, "Failed to send referenced file");
+                    let _ = bot
+                        .send_message(
+                            chat_id,
+                            format!("I found `{}` but couldn't upload it: {}.", file_name, e),
+                        )
+                        .await;
+                }
+            }
+        }
+
+        if skipped > 0 {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    format!(
+                        "I found additional files but only sent the first {} attachments.",
+                        MAX_FILES_PER_REPLY
+                    ),
+                )
+                .await;
+        }
+
+        if sent > 0 {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    format!(
+                        "Sent {} file attachment{}.",
+                        sent,
+                        if sent == 1 { "" } else { "s" }
+                    ),
+                )
+                .await;
+        }
+    }
+
     /// Handle /connect command - add a new bot dynamically.
     /// Usage: /connect telegram <bot_token>
     ///        /connect discord <bot_token>
@@ -906,15 +1007,14 @@ impl TelegramChannel {
             }
         }
 
-        // Discord uses user IDs differently - for now, use current user_id
-        let allowed_user_ids_str = vec![user_id.to_string()];
-
+        // Discord user IDs differ from Telegram IDs — save empty and let
+        // the Discord bot auto-claim the first DM user as the owner.
         let new_bot = crate::traits::DynamicBot {
             id: 0,
             channel_type: "discord".to_string(),
             bot_token: token.to_string(),
             app_token: None,
-            allowed_user_ids: allowed_user_ids_str,
+            allowed_user_ids: vec![],
             extra_config: "{}".to_string(),
             created_at: String::new(),
         };
@@ -937,12 +1037,13 @@ impl TelegramChannel {
         let hub_ref = self.channel_hub.read().ok().and_then(|g| g.clone());
         if let Some(weak_hub) = hub_ref {
             if let Some(hub) = weak_hub.upgrade() {
-                // Create the new Discord channel with same config as this Telegram channel
+                // Create the new Discord channel with empty allowed_user_ids —
+                // the bot will auto-claim the first DM user.
                 let new_channel = Arc::new(DiscordChannel::new(
                     token,
-                    vec![user_id], // Discord uses u64 user IDs
-                    vec![user_id], // Dynamic bot creator is the owner
-                    None,          // No guild_id for dynamic bots
+                    vec![], // Empty: auto-claim on first DM
+                    vec![], // Owner set on auto-claim
+                    None,   // No guild_id for dynamic bots
                     Arc::clone(&self.agent),
                     self.config_path.clone(),
                     self.session_map.clone(),
@@ -968,7 +1069,7 @@ impl TelegramChannel {
 
                 return format!(
                     "✓ Discord bot {} connected and started!\n\n\
-                    The bot is now active and ready to receive messages.\n\
+                    Send a DM to the bot on Discord to claim it as yours.\n\
                     Use /bots to see all connected bots.",
                     bot_name
                 );
@@ -1287,8 +1388,13 @@ impl TelegramChannel {
         // Register this session with the channel hub so outbound messages
         // (approvals, media, notifications) route back to this Telegram bot.
         {
+            let channel_name = self.channel_name().await;
             let mut map = self.session_map.write().await;
-            map.insert(session_id.clone(), self.channel_name().await);
+            map.insert(session_id.clone(), channel_name.clone());
+            let _ = self
+                .state
+                .save_session_channel(&session_id, &channel_name)
+                .await;
         }
 
         // Build channel context from Telegram chat type
@@ -1353,6 +1459,24 @@ impl TelegramChannel {
 
         // Check if a task is already running - if so, queue this message
         if self.task_registry.has_running_task(&session_id).await {
+            if is_lightweight_interjection(&text) {
+                let current_task = self
+                    .task_registry
+                    .get_running_task_description(&session_id)
+                    .await
+                    .unwrap_or_else(|| "processing".to_string());
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        format!(
+                            "⏳ Still working on: {}. I ignored that short check-in. \
+                             Send `cancel` to stop the current task.",
+                            current_task
+                        ),
+                    )
+                    .await;
+                return;
+            }
             let queue_pos = self.task_registry.queue_message(&session_id, &text).await;
             let current_task = self
                 .task_registry
@@ -1451,7 +1575,7 @@ impl TelegramChannel {
                     continue;
                 }
                 let text = match &update {
-                    StatusUpdate::Thinking(iter) => format!("Thinking... (step {})", iter + 1),
+                    StatusUpdate::Thinking(iter) => format!("Thinking... (step {})", iter),
                     StatusUpdate::ToolStart { name, summary } => {
                         if summary.is_empty() {
                             format!("Using {}...", name)
@@ -1579,6 +1703,7 @@ impl TelegramChannel {
         let description: String = text.chars().take(80).collect();
         let (task_id, cancel_token) = self.task_registry.register(&session_id, &description).await;
         let registry = Arc::clone(&self.task_registry);
+        let files_enabled = self.files_enabled;
 
         // Spawn the agent work in a separate task so the dispatcher can continue
         // processing other updates (especially callback queries for tool approval).
@@ -1622,6 +1747,13 @@ impl TelegramChannel {
                                     warn!("Failed to send Telegram message: {}", e);
                                 }
                             }
+                            TelegramChannel::send_referenced_files_from_reply(
+                                &bot,
+                                chat_id,
+                                &reply,
+                                files_enabled,
+                            )
+                            .await;
                         }
                     }
                     Err(e) => {
@@ -1696,7 +1828,7 @@ impl TelegramChannel {
                             }
                             let text = match &update {
                                 StatusUpdate::Thinking(iter) => {
-                                    format!("Thinking... (step {})", iter + 1)
+                                    format!("Thinking... (step {})", iter)
                                 }
                                 StatusUpdate::ToolStart { name, summary } => {
                                     if summary.is_empty() {
@@ -2046,6 +2178,48 @@ pub fn determine_role(owner_ids: &[u64], user_id: u64) -> UserRole {
     }
 }
 
+/// Short conversational check-ins that should not be queued while work is running.
+fn is_lightweight_interjection(text: &str) -> bool {
+    let cleaned = text
+        .trim()
+        .trim_matches(|c: char| c.is_ascii_punctuation())
+        .to_ascii_lowercase();
+    if cleaned.is_empty() || cleaned.len() > 24 {
+        return false;
+    }
+    matches!(
+        cleaned.as_str(),
+        "hey"
+            | "hi"
+            | "hello"
+            | "yo"
+            | "ok"
+            | "okay"
+            | "thanks"
+            | "thank you"
+            | "thx"
+            | "got it"
+            | "cool"
+            | "sure"
+            | "yep"
+            | "yes"
+    )
+}
+
+fn extract_candidate_file_paths(text: &str) -> Vec<String> {
+    static PATH_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(/[\w./-]+\.\w{1,10})").unwrap());
+    let mut out = Vec::new();
+    for cap in PATH_RE.captures_iter(text) {
+        let token = cap[1].trim_matches(|c: char| {
+            c.is_whitespace() || matches!(c, ')' | ']' | '}' | ',' | ';' | ':' | '!' | '?')
+        });
+        if token.starts_with('/') && token.contains('.') {
+            out.push(token.to_string());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2102,6 +2276,43 @@ mod tests {
     #[test]
     fn role_user_not_in_owner_ids_is_guest() {
         assert_eq!(determine_role(&[111], 222), UserRole::Guest);
+    }
+
+    // --- interjection filtering ---
+
+    #[test]
+    fn lightweight_interjection_detects_short_checkins() {
+        assert!(is_lightweight_interjection("hey"));
+        assert!(is_lightweight_interjection("Thanks!"));
+        assert!(is_lightweight_interjection("OK"));
+        assert!(is_lightweight_interjection("  got it  "));
+    }
+
+    #[test]
+    fn lightweight_interjection_ignores_substantive_requests() {
+        assert!(!is_lightweight_interjection("can you send me my resume?"));
+        assert!(!is_lightweight_interjection("please run the tests"));
+        assert!(!is_lightweight_interjection("check logs and fix the error"));
+    }
+
+    #[test]
+    fn extract_candidate_file_paths_handles_trailing_punctuation() {
+        let text = "I found it at /Users/davidloor/projects/resume/david-loor-resume.pdf.";
+        let paths = extract_candidate_file_paths(text);
+        assert_eq!(
+            paths,
+            vec!["/Users/davidloor/projects/resume/david-loor-resume.pdf"]
+        );
+    }
+
+    #[test]
+    fn extract_candidate_file_paths_extracts_multiple_paths() {
+        let text = "Primary: `/tmp/aidaemon/report.md` and backup: /tmp/aidaemon/report.csv, done.";
+        let paths = extract_candidate_file_paths(text);
+        assert_eq!(
+            paths,
+            vec!["/tmp/aidaemon/report.md", "/tmp/aidaemon/report.csv"]
+        );
     }
 
     // --- persist_allowed_user_ids (config file update) ---

@@ -112,6 +112,15 @@ pub struct ToolCallData {
     /// Associated task ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Optional idempotency key for replay-safe execution tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Optional policy revision used when this tool call was emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_rev: Option<u32>,
+    /// Optional risk score (0.0-1.0) observed at tool-call time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_score: Option<f32>,
 }
 
 /// Data for ToolResult event
@@ -149,6 +158,95 @@ pub struct ThinkingStartData {
     /// Total tool calls so far in this task
     #[serde(default)]
     pub total_tool_calls: u32,
+}
+
+// =============================================================================
+// Policy / Routing Events
+// =============================================================================
+
+/// Data for PolicyDecision event (shadow vs thin-router decisions).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyDecisionData {
+    /// Associated task ID.
+    pub task_id: String,
+    /// Legacy classify_query()-based model decision.
+    pub old_model: String,
+    /// Policy profile-based model decision.
+    pub new_model: String,
+    /// Legacy tier ("fast" | "primary" | "smart").
+    pub old_tier: String,
+    /// Policy profile ("cheap" | "balanced" | "strong").
+    pub new_profile: String,
+    /// Whether old/new decisions differed.
+    pub diverged: bool,
+    /// Whether policy routing is enforced.
+    pub policy_enforce: bool,
+    /// Risk score at routing time.
+    pub risk_score: f32,
+    /// Uncertainty score at routing time.
+    pub uncertainty_score: f32,
+}
+
+/// Data for DecisionPoint event (flight recorder).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionPointData {
+    /// Decision type emitted at this point in the task.
+    pub decision_type: DecisionType,
+    /// Associated task ID.
+    pub task_id: String,
+    /// Iteration where this decision occurred (0 when outside loop).
+    pub iteration: u32,
+    /// Flexible structured data for this decision.
+    pub metadata: JsonValue,
+    /// Human-readable summary of the decision.
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionType {
+    SkillMatch,
+    MemoryRetrieval,
+    IntentGate,
+    RepetitiveCallDetection,
+    ConsecutiveSameToolDetection,
+    AlternatingPatternDetection,
+    ToolBudgetBlock,
+    StoppingCondition,
+    InstructionsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    BadAssumption,
+    MissingContext,
+    ToolFailure,
+    SandboxPermissionBlock,
+    InvalidEditPatch,
+    DependencyRuntimeMismatch,
+    PartialCompletionRegression,
+    AgentLoop,
+    ProviderError,
+    IncorrectResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceRef {
+    pub event_id: i64,
+    pub event_type: String,
+    pub timestamp: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootCauseCandidate {
+    pub category: FailureCategory,
+    pub confidence: f32,
+    pub description: String,
+    pub evidence: Vec<EvidenceRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why_previous_step_looked_valid: Option<String>,
 }
 
 // =============================================================================
@@ -333,7 +431,22 @@ impl ToolCallData {
             arguments,
             summary: Some(summary),
             task_id,
+            idempotency_key: None,
+            policy_rev: None,
+            risk_score: None,
         }
+    }
+
+    pub fn with_policy_metadata(
+        mut self,
+        idempotency_key: Option<String>,
+        policy_rev: Option<u32>,
+        risk_score: Option<f32>,
+    ) -> Self {
+        self.idempotency_key = idempotency_key;
+        self.policy_rev = policy_rev;
+        self.risk_score = risk_score;
+        self
     }
 
     fn generate_summary(name: &str, arguments: &JsonValue) -> String {
@@ -429,5 +542,63 @@ impl ErrorData {
     pub fn with_context(mut self, context: impl Into<String>) -> Self {
         self.context = Some(context.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_call_data_defaults_policy_metadata_to_none() {
+        let data: ToolCallData = serde_json::from_value(json!({
+            "tool_call_id": "c1",
+            "name": "read_file",
+            "arguments": {"path":"README.md"}
+        }))
+        .expect("deserialize ToolCallData");
+        assert!(data.idempotency_key.is_none());
+        assert!(data.policy_rev.is_none());
+        assert!(data.risk_score.is_none());
+    }
+
+    #[test]
+    fn tool_call_data_with_policy_metadata_sets_optional_fields() {
+        let data = ToolCallData::from_tool_call(
+            "c1",
+            "write_file",
+            json!({"path":"notes.txt"}),
+            Some("task-1".to_string()),
+        )
+        .with_policy_metadata(Some("idem-task-1-c1".to_string()), Some(3), Some(0.72));
+
+        assert_eq!(data.idempotency_key.as_deref(), Some("idem-task-1-c1"));
+        assert_eq!(data.policy_rev, Some(3));
+        assert_eq!(data.risk_score, Some(0.72));
+    }
+
+    #[test]
+    fn decision_point_data_serde_roundtrip() {
+        let data = DecisionPointData {
+            decision_type: DecisionType::IntentGate,
+            task_id: "task-123".to_string(),
+            iteration: 1,
+            metadata: json!({"needs_tools": true, "can_answer_now": false}),
+            summary: "Intent gate requested tool mode".to_string(),
+        };
+        let serialized = serde_json::to_string(&data).expect("serialize");
+        let parsed: DecisionPointData = serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(parsed.task_id, "task-123");
+        assert_eq!(parsed.iteration, 1);
+        assert_eq!(parsed.decision_type, DecisionType::IntentGate);
+    }
+
+    #[test]
+    fn failure_category_serde_roundtrip() {
+        let cat = FailureCategory::SandboxPermissionBlock;
+        let serialized = serde_json::to_string(&cat).expect("serialize");
+        let parsed: FailureCategory = serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(parsed, FailureCategory::SandboxPermissionBlock);
     }
 }

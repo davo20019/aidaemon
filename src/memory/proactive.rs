@@ -28,14 +28,25 @@ pub enum SuggestionSource {
 
 /// Context for generating suggestions.
 pub struct SuggestionContext {
+    #[allow(dead_code)] // Reserved for future explicit selection wiring.
     pub last_action: Option<String>,
+    #[allow(dead_code)] // Reserved for future explicit selection wiring.
     pub current_topic: Option<String>,
+    /// Explicitly selected behavior pattern IDs relevant to the current turn.
+    pub relevant_pattern_ids: Vec<i64>,
+    /// Explicitly selected goal IDs relevant to the current turn.
+    pub relevant_goal_ids: Vec<i64>,
+    /// Explicitly selected procedure IDs relevant to the current turn.
+    pub relevant_procedure_ids: Vec<i64>,
+    /// Explicitly selected episode IDs relevant to the current turn.
+    pub relevant_episode_ids: Vec<i64>,
     #[allow(dead_code)] // Reserved for time-based suggestions
     pub session_duration_mins: i32,
     #[allow(dead_code)] // Reserved for complexity-based suggestions
     pub tool_call_count: i32,
     #[allow(dead_code)] // Reserved for error-recovery suggestions
     pub has_errors: bool,
+    #[allow(dead_code)] // Reserved for future explicit selection wiring.
     pub user_message: String,
 }
 
@@ -120,28 +131,10 @@ impl ProactiveEngine {
                 continue;
             }
 
-            // Check if pattern trigger matches context
             let matches = match pattern.pattern_type.as_str() {
-                "sequence" => {
-                    // Sequence patterns: check if last action matches trigger
-                    pattern.trigger_context.as_ref().is_some_and(|trigger| {
-                        context.last_action.as_ref().is_some_and(|action| {
-                            action.to_lowercase().contains(&trigger.to_lowercase())
-                        })
-                    })
-                }
-                "trigger" => {
-                    // Trigger patterns: check user message
-                    pattern.trigger_context.as_ref().is_some_and(|trigger| {
-                        context
-                            .user_message
-                            .to_lowercase()
-                            .contains(&trigger.to_lowercase())
-                    })
-                }
+                "sequence" | "trigger" => context.relevant_pattern_ids.contains(&pattern.id),
                 "habit" => {
-                    // Habit patterns: time-based or frequency-based
-                    // For now, just check occurrence count
+                    // Habit patterns rely on observed recurring behavior frequency.
                     pattern.occurrence_count >= 3
                 }
                 _ => false,
@@ -170,18 +163,7 @@ impl ProactiveEngine {
                 continue;
             }
 
-            // Check if current context relates to the goal
-            let relevant = context.user_message.to_lowercase().contains(
-                goal.description
-                    .to_lowercase()
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or(""),
-            ) || context.current_topic.as_ref().is_some_and(|topic| {
-                goal.description
-                    .to_lowercase()
-                    .contains(&topic.to_lowercase())
-            });
+            let relevant = context.relevant_goal_ids.contains(&goal.id);
 
             if relevant {
                 let confidence = match goal.priority.as_str() {
@@ -211,11 +193,7 @@ impl ProactiveEngine {
                 continue;
             }
 
-            // Check if trigger pattern matches
-            let matches = context
-                .user_message
-                .to_lowercase()
-                .contains(&procedure.trigger_pattern.to_lowercase());
+            let matches = context.relevant_procedure_ids.contains(&procedure.id);
 
             if matches {
                 let success_rate = procedure.success_count as f32
@@ -237,15 +215,7 @@ impl ProactiveEngine {
         let mut suggestions = vec![];
 
         for episode in &self.recent_episodes {
-            // Check if topics overlap
-            let topic_match = episode.topics.as_ref().is_some_and(|topics| {
-                topics.iter().any(|t| {
-                    context
-                        .user_message
-                        .to_lowercase()
-                        .contains(&t.to_lowercase())
-                })
-            });
+            let topic_match = context.relevant_episode_ids.contains(&episode.id);
 
             if topic_match {
                 let confidence = episode.importance * 0.6; // Scale by importance
@@ -294,6 +264,10 @@ mod tests {
         let context = SuggestionContext {
             last_action: None,
             current_topic: None,
+            relevant_pattern_ids: vec![],
+            relevant_goal_ids: vec![],
+            relevant_procedure_ids: vec![],
+            relevant_episode_ids: vec![],
             session_duration_mins: 5,
             tool_call_count: 0,
             has_errors: false,
@@ -322,14 +296,50 @@ mod tests {
 
         let context = SuggestionContext {
             last_action: None,
-            current_topic: Some("rust".to_string()),
+            current_topic: None,
+            relevant_pattern_ids: vec![],
+            relevant_goal_ids: vec![1],
+            relevant_procedure_ids: vec![],
+            relevant_episode_ids: vec![],
             session_duration_mins: 5,
             tool_call_count: 0,
             has_errors: false,
-            user_message: "Help me with Rust".to_string(),
+            user_message: "Anything".to_string(),
         };
 
         let suggestions = engine.get_suggestions(&context);
         assert!(!suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_goal_suggestion_does_not_use_keyword_guessing() {
+        let goal = Goal {
+            id: 1,
+            description: "Complete the Rust migration".to_string(),
+            status: "active".to_string(),
+            priority: "high".to_string(),
+            progress_notes: None,
+            source_episode_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let engine = ProactiveEngine::new(vec![], vec![goal], vec![], vec![], make_profile(true));
+        let context = SuggestionContext {
+            last_action: None,
+            current_topic: Some("rust".to_string()),
+            relevant_pattern_ids: vec![],
+            relevant_goal_ids: vec![],
+            relevant_procedure_ids: vec![],
+            relevant_episode_ids: vec![],
+            session_duration_mins: 5,
+            tool_call_count: 0,
+            has_errors: false,
+            user_message: "help me with rust".to_string(),
+        };
+
+        let suggestions = engine.get_suggestions(&context);
+        assert!(suggestions.is_empty());
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -97,6 +98,63 @@ impl SendFileTool {
         }
         false
     }
+
+    /// If the requested absolute path doesn't exist, try a safe, bounded
+    /// recovery by looking for the same filename in known roots.
+    fn resolve_missing_path_by_filename(
+        &self,
+        requested: &Path,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        let file_name = match requested.file_name() {
+            Some(name) if !name.is_empty() => name.to_os_string(),
+            _ => return Ok(None),
+        };
+
+        let mut matches: Vec<PathBuf> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut check_candidate = |candidate: PathBuf| {
+            if !candidate.exists() {
+                return;
+            }
+            if let Ok(md) = std::fs::metadata(&candidate) {
+                if !md.is_file() {
+                    return;
+                }
+            } else {
+                return;
+            }
+            if let Ok(canonical) = candidate.canonicalize() {
+                if seen.insert(canonical.clone()) {
+                    matches.push(canonical);
+                }
+            }
+        };
+
+        if let Ok(cwd) = std::env::current_dir() {
+            check_candidate(cwd.join(&file_name));
+        }
+        check_candidate(self.inbox_dir.join(&file_name));
+        for outbox in &self.outbox_dirs {
+            check_candidate(outbox.join(&file_name));
+        }
+
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            _ => {
+                let candidates = matches
+                    .iter()
+                    .take(3)
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(anyhow::anyhow!(
+                    "Found multiple files with this name in allowed locations: {}",
+                    candidates
+                ))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -147,15 +205,23 @@ impl Tool for SendFileTool {
 
         // Expand ~ in the path
         let expanded = shellexpand::tilde(file_path).to_string();
-        let path = Path::new(&expanded);
-
-        // Check file exists
-        if !path.exists() {
-            return Ok(format!("Error: File not found: {}", file_path));
-        }
+        let requested_path = Path::new(&expanded);
+        let mut resolved_missing_path = false;
+        let path = if requested_path.exists() {
+            requested_path.to_path_buf()
+        } else {
+            match self.resolve_missing_path_by_filename(requested_path) {
+                Ok(Some(found)) => {
+                    resolved_missing_path = true;
+                    found
+                }
+                Ok(None) => return Ok(format!("Error: File not found: {}", file_path)),
+                Err(e) => return Ok(format!("Error: File not found: {}. {}", file_path, e)),
+            }
+        };
 
         // Must be a regular file
-        let metadata = std::fs::metadata(path)?;
+        let metadata = std::fs::metadata(&path)?;
         if !metadata.is_file() {
             return Ok(format!("Error: Not a regular file: {}", file_path));
         }
@@ -204,6 +270,92 @@ impl Tool for SendFileTool {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send file: {}", e))?;
 
-        Ok(format!("File sent: {} ({})", filename, size_display))
+        if resolved_missing_path {
+            Ok(format!(
+                "File sent: {} ({}) [resolved missing path to {}]",
+                filename,
+                size_display,
+                canonical.display()
+            ))
+        } else {
+            Ok(format!("File sent: {} ({})", filename, size_display))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_tool(outboxes: Vec<String>, inbox: String) -> SendFileTool {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        SendFileTool::new(tx, &outboxes, &inbox)
+    }
+
+    #[test]
+    fn resolve_missing_path_by_filename_finds_unique_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outbox = tmp.path().join("outbox");
+        std::fs::create_dir_all(&outbox).expect("create outbox");
+        let file = outbox.join("report.pdf");
+        std::fs::write(&file, b"pdf").expect("write file");
+
+        let tool = mk_tool(
+            vec![outbox.to_string_lossy().to_string()],
+            tmp.path().join("inbox").to_string_lossy().to_string(),
+        );
+
+        let requested = Path::new("/Users/davidloor/report.pdf");
+        let resolved = tool
+            .resolve_missing_path_by_filename(requested)
+            .expect("resolver should not error")
+            .expect("expected one match");
+        assert_eq!(
+            resolved,
+            file.canonicalize().expect("canonicalize expected file")
+        );
+    }
+
+    #[test]
+    fn resolve_missing_path_by_filename_errors_on_ambiguous_matches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outbox1 = tmp.path().join("outbox1");
+        let outbox2 = tmp.path().join("outbox2");
+        std::fs::create_dir_all(&outbox1).expect("create outbox1");
+        std::fs::create_dir_all(&outbox2).expect("create outbox2");
+        std::fs::write(outbox1.join("report.pdf"), b"one").expect("write outbox1 file");
+        std::fs::write(outbox2.join("report.pdf"), b"two").expect("write outbox2 file");
+
+        let tool = mk_tool(
+            vec![
+                outbox1.to_string_lossy().to_string(),
+                outbox2.to_string_lossy().to_string(),
+            ],
+            tmp.path().join("inbox").to_string_lossy().to_string(),
+        );
+
+        let requested = Path::new("/Users/davidloor/report.pdf");
+        let err = tool
+            .resolve_missing_path_by_filename(requested)
+            .expect_err("expected ambiguity error");
+        assert!(err.to_string().contains("multiple files"));
+    }
+
+    #[test]
+    fn resolve_missing_path_by_filename_returns_none_without_matches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outbox = tmp.path().join("outbox");
+        std::fs::create_dir_all(&outbox).expect("create outbox");
+
+        let tool = mk_tool(
+            vec![outbox.to_string_lossy().to_string()],
+            tmp.path().join("inbox").to_string_lossy().to_string(),
+        );
+
+        let requested = Path::new("/Users/davidloor/report.pdf");
+        let resolved = tool
+            .resolve_missing_path_by_filename(requested)
+            .expect("resolver should not error");
+        assert!(resolved.is_none());
     }
 }

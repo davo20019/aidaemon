@@ -12,11 +12,7 @@ mod recovery;
 mod store;
 mod tracking;
 
-pub use detection::{get_plan_suggestion_prompt, should_create_plan};
-pub use generation::generate_plan_steps;
-pub use recovery::PlanRecovery;
 pub use store::PlanStore;
-pub use tracking::StepTracker;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

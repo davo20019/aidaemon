@@ -92,3 +92,24 @@ health_port = 8080
 # [mcp.filesystem]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+# [policy]
+# All policy features are enabled by default. Uncomment to override.
+# policy_shadow_mode = true          # log old-vs-new routing comparisons
+# policy_enforce = true              # use policy-based model routing
+# tool_filter_enforce = true         # risk-based tool filtering
+# uncertainty_clarify_enforce = true  # ask for clarification on ambiguous requests
+# context_refresh_enforce = true      # mid-loop context budget refresh
+# learning_evidence_gate_enforce = true  # stricter evidence thresholds for auto-learning
+# autotune_shadow = true             # log auto-tune adjustments
+# autotune_enforce = true            # apply auto-tune adjustments
+# uncertainty_clarify_threshold = 0.55
+# classify_retirement_enabled = true
+# classify_retirement_window_days = 7
+# classify_retirement_max_divergence = 0.05
+
+[diagnostics]
+enabled = true
+record_decision_points = true
+max_events = 200
+include_raw_tool_args = false

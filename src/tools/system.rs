@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities, ToolRole};
 
 pub struct SystemInfoTool;
 
@@ -25,6 +25,20 @@ impl Tool for SystemInfoTool {
                 "required": []
             }
         })
+    }
+
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {

@@ -21,11 +21,26 @@ tarpaulin-report.html
 # Test artifacts
 proptest-regressions/
 
+# User-generated skills (auto-promoted, dynamic, etc.)
+skills/
+
 # Personal/temp files — not part of aidaemon
 *.py
+__pycache__/
 *.json
 !package.json
 *.png
+*.txt
+*.pdf
+*.marp.md
 projects/
 sh-vs-ch-pronunciation-guide/
-PLAN_*.md
+
+# Root-level markdown (reports, plans, etc.) — whitelist codebase ones
+/*.md
+!README.md
+!CLAUDE.md
+!CHANGELOG.md
+
+# Documentation (local only)
+docs/

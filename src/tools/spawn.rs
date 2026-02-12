@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use crate::agent::{Agent, StatusUpdate};
 use crate::channels::ChannelHub;
-use crate::traits::Tool;
+use crate::traits::{AgentRole, Tool};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
@@ -105,6 +105,9 @@ struct SpawnArgs {
     /// When true, spawn the sub-agent in the background and return immediately.
     #[serde(default)]
     background: bool,
+    /// V3 task ID — when provided by a task lead, the executor tracks activity against this task.
+    #[serde(default)]
+    task_id: Option<String>,
     /// Session ID injected by execute_tool — used for background completion notifications.
     #[serde(default)]
     _session_id: Option<String>,
@@ -115,6 +118,12 @@ struct SpawnArgs {
     /// privilege escalation (e.g., Guest user spawning Owner-level sub-agent).
     #[serde(default)]
     _user_role: Option<String>,
+    /// Task ID injected by execute_tool for task-lead → executor spawning.
+    #[serde(default)]
+    _task_id: Option<String>,
+    /// Goal ID injected by execute_tool for task-lead → executor spawning.
+    #[serde(default)]
+    _goal_id: Option<String>,
 }
 
 #[async_trait]
@@ -153,6 +162,10 @@ impl Tool for SpawnAgentTool {
                             The result will be sent as a message when the sub-agent finishes. \
                             Use this for long-running tasks where the user doesn't need to wait.",
                         "default": false
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "V3 task ID to associate with this executor (used by task leads to connect executor work to task tracking)"
                     }
                 },
                 "required": ["mission", "task"]
@@ -208,9 +221,29 @@ impl Tool for SpawnAgentTool {
             _ => UserRole::Guest,
         };
 
+        // Determine child role based on parent's role.
+        let child_role = if agent.role() == AgentRole::TaskLead {
+            Some(AgentRole::Executor)
+        } else {
+            None
+        };
+        // LLM-provided task_id takes priority; fall back to injected _task_id
+        let task_id_ref = args.task_id.or(args._task_id.clone());
+        let goal_id_ref = args._goal_id.clone();
+
         if !args.background {
             return self
-                .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx, user_role)
+                .run_sync(
+                    agent,
+                    &args.mission,
+                    &args.task,
+                    status_tx,
+                    channel_ctx,
+                    user_role,
+                    child_role,
+                    goal_id_ref.as_deref(),
+                    task_id_ref.as_deref(),
+                )
                 .await;
         }
 
@@ -220,7 +253,17 @@ impl Tool for SpawnAgentTool {
             None => {
                 info!("Background mode requested but hub not available, falling back to sync");
                 return self
-                    .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx, user_role)
+                    .run_sync(
+                        agent,
+                        &args.mission,
+                        &args.task,
+                        status_tx,
+                        channel_ctx,
+                        user_role,
+                        child_role,
+                        goal_id_ref.as_deref(),
+                        task_id_ref.as_deref(),
+                    )
                     .await;
             }
         };
@@ -229,7 +272,17 @@ impl Tool for SpawnAgentTool {
             _ => {
                 info!("Background mode requested but no session_id, falling back to sync");
                 return self
-                    .run_sync(agent, &args.mission, &args.task, status_tx, channel_ctx, user_role)
+                    .run_sync(
+                        agent,
+                        &args.mission,
+                        &args.task,
+                        status_tx,
+                        channel_ctx,
+                        user_role,
+                        child_role,
+                        goal_id_ref.as_deref(),
+                        task_id_ref.as_deref(),
+                    )
                     .await;
             }
         };
@@ -242,7 +295,16 @@ impl Tool for SpawnAgentTool {
             let timeout_duration = Duration::from_secs(timeout_secs);
             let result = tokio::time::timeout(
                 timeout_duration,
-                agent.spawn_child(&mission, &args.task, status_tx, channel_ctx, user_role),
+                agent.spawn_child(
+                    &mission,
+                    &args.task,
+                    status_tx,
+                    channel_ctx,
+                    user_role,
+                    child_role,
+                    goal_id_ref.as_deref(),
+                    task_id_ref.as_deref(),
+                ),
             )
             .await;
 
@@ -291,6 +353,7 @@ impl Tool for SpawnAgentTool {
 
 impl SpawnAgentTool {
     /// Run the sub-agent synchronously (blocking until completion or timeout).
+    #[allow(clippy::too_many_arguments)]
     async fn run_sync(
         &self,
         agent: Arc<Agent>,
@@ -299,11 +362,23 @@ impl SpawnAgentTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         channel_ctx: ChannelContext,
         user_role: UserRole,
+        child_role: Option<AgentRole>,
+        goal_id: Option<&str>,
+        task_id: Option<&str>,
     ) -> anyhow::Result<String> {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
         let result = tokio::time::timeout(
             timeout_duration,
-            agent.spawn_child(mission, task, status_tx, channel_ctx, user_role),
+            agent.spawn_child(
+                mission,
+                task,
+                status_tx,
+                channel_ctx,
+                user_role,
+                child_role,
+                goal_id,
+                task_id,
+            ),
         )
         .await;
 

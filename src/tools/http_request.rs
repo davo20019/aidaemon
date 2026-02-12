@@ -12,7 +12,7 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::sanitize::{sanitize_external_content, sanitize_output, wrap_untrusted_output};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::validate_url_for_ssrf;
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 /// Timeout for approval requests (5 minutes).
@@ -416,6 +416,16 @@ impl Tool for HttpRequestTool {
         })
     }
 
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
 
@@ -605,7 +615,13 @@ impl Tool for HttpRequestTool {
                         content_type.as_deref(),
                     )
                     .map_err(|e| {
-                        anyhow::anyhow!("{}", Self::strip_credentials_from_error_with(&profiles_guard, &e.to_string()))
+                        anyhow::anyhow!(
+                            "{}",
+                            Self::strip_credentials_from_error_with(
+                                &profiles_guard,
+                                &e.to_string()
+                            )
+                        )
                     })?;
                 } else {
                     warn!(
@@ -616,7 +632,10 @@ impl Tool for HttpRequestTool {
             }
 
             let resp = builder.send().await.map_err(|e| {
-                anyhow::anyhow!("{}", Self::strip_credentials_from_error_with(&profiles_guard, &e.to_string()))
+                anyhow::anyhow!(
+                    "{}",
+                    Self::strip_credentials_from_error_with(&profiles_guard, &e.to_string())
+                )
             })?;
 
             // Handle redirects manually
@@ -687,7 +706,10 @@ impl Tool for HttpRequestTool {
             .unwrap_or_default();
 
         let bytes = response.bytes().await.map_err(|e| {
-            anyhow::anyhow!("{}", Self::strip_credentials_from_error_with(&profiles_guard, &e.to_string()))
+            anyhow::anyhow!(
+                "{}",
+                Self::strip_credentials_from_error_with(&profiles_guard, &e.to_string())
+            )
         })?;
 
         // Binary detection: non-UTF8 returns metadata only
@@ -762,12 +784,14 @@ impl Tool for HttpRequestTool {
             // Try to parse common API error formats (JSON with detail/message/error fields)
             if let Ok(error_json) = serde_json::from_str::<Value>(&body_str) {
                 // Extract error details from common API patterns
-                let detail = error_json["detail"].as_str()
+                let detail = error_json["detail"]
+                    .as_str()
                     .or_else(|| error_json["message"].as_str())
                     .or_else(|| error_json["error"]["message"].as_str())
                     .or_else(|| error_json["error"].as_str())
                     .or_else(|| error_json["error_description"].as_str());
-                let title = error_json["title"].as_str()
+                let title = error_json["title"]
+                    .as_str()
                     .or_else(|| error_json["error"]["type"].as_str())
                     .or_else(|| error_json["error_code"].as_str());
                 let error_type = error_json["type"].as_str();
@@ -785,7 +809,8 @@ impl Tool for HttpRequestTool {
                 // Include any nested errors array
                 if let Some(errors) = error_json["errors"].as_array() {
                     for (i, err) in errors.iter().enumerate().take(3) {
-                        let msg = err["message"].as_str()
+                        let msg = err["message"]
+                            .as_str()
                             .or_else(|| err["detail"].as_str())
                             .unwrap_or("unknown");
                         result.push_str(&format!("  Error {}: {}\n", i + 1, msg));

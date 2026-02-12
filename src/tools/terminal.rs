@@ -11,7 +11,8 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::traits::Tool;
+use crate::events::{ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, EventStore, EventType};
+use crate::traits::{Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
@@ -52,6 +53,7 @@ pub struct TerminalTool {
     initial_timeout: Duration,
     max_output_chars: usize,
     pool: Option<SqlitePool>,
+    event_store: Option<Arc<EventStore>>,
 }
 
 /// Check if a command string contains shell operators.
@@ -177,7 +179,13 @@ impl TerminalTool {
             initial_timeout: Duration::from_secs(initial_timeout_secs),
             max_output_chars,
             pool: Some(pool),
+            event_store: None,
         }
+    }
+
+    pub fn with_event_store(mut self, event_store: Arc<EventStore>) -> Self {
+        self.event_store = Some(event_store);
+        self
     }
 
     async fn is_allowed(&self, command: &str) -> bool {
@@ -228,9 +236,26 @@ impl TerminalTool {
         command: &str,
         risk_level: RiskLevel,
         warnings: Vec<String>,
+        task_id: Option<&str>,
     ) -> anyhow::Result<ApprovalResponse> {
+        if let Some(store) = &self.event_store {
+            let emitter = crate::events::EventEmitter::new(store.clone(), session_id.to_string());
+            let _ = emitter
+                .emit(
+                    EventType::ApprovalRequested,
+                    ApprovalRequestedData {
+                        command: command.to_string(),
+                        risk_level: risk_level.to_string(),
+                        warnings: warnings.clone(),
+                        task_id: task_id.map(str::to_string),
+                    },
+                )
+                .await;
+        }
+
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.approval_tx
+        if let Err(send_err) = self
+            .approval_tx
             .send(ApprovalRequest {
                 command: command.to_string(),
                 session_id: session_id.to_string(),
@@ -240,18 +265,90 @@ impl TerminalTool {
                 response_tx,
             })
             .await
-            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-        match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => {
-                tracing::warn!(command, "Approval response channel closed");
-                Ok(ApprovalResponse::Deny)
+        {
+            if let Some(store) = &self.event_store {
+                let emitter =
+                    crate::events::EventEmitter::new(store.clone(), session_id.to_string());
+                let _ = emitter
+                    .emit(
+                        EventType::ApprovalDenied,
+                        ApprovalDeniedData {
+                            command: command.to_string(),
+                            task_id: task_id.map(str::to_string),
+                        },
+                    )
+                    .await;
             }
-            Err(_) => {
-                tracing::warn!(command, "Approval request timed out (300s), auto-denying");
-                Ok(ApprovalResponse::Deny)
+            return Err(anyhow::anyhow!("Approval channel closed: {}", send_err));
+        }
+
+        let response: ApprovalResponse =
+            match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) => {
+                    tracing::warn!(command, "Approval response channel closed");
+                    ApprovalResponse::Deny
+                }
+                Err(_) => {
+                    tracing::warn!(command, "Approval request timed out (300s), auto-denying");
+                    ApprovalResponse::Deny
+                }
+            };
+
+        if let Some(store) = &self.event_store {
+            let emitter = crate::events::EventEmitter::new(store.clone(), session_id.to_string());
+            match response {
+                ApprovalResponse::AllowOnce => {
+                    let _ = emitter
+                        .emit(
+                            EventType::ApprovalGranted,
+                            ApprovalGrantedData {
+                                command: command.to_string(),
+                                approval_type: "once".to_string(),
+                                task_id: task_id.map(str::to_string),
+                            },
+                        )
+                        .await;
+                }
+                ApprovalResponse::AllowSession => {
+                    let _ = emitter
+                        .emit(
+                            EventType::ApprovalGranted,
+                            ApprovalGrantedData {
+                                command: command.to_string(),
+                                approval_type: "session".to_string(),
+                                task_id: task_id.map(str::to_string),
+                            },
+                        )
+                        .await;
+                }
+                ApprovalResponse::AllowAlways => {
+                    let _ = emitter
+                        .emit(
+                            EventType::ApprovalGranted,
+                            ApprovalGrantedData {
+                                command: command.to_string(),
+                                approval_type: "always".to_string(),
+                                task_id: task_id.map(str::to_string),
+                            },
+                        )
+                        .await;
+                }
+                ApprovalResponse::Deny => {
+                    let _ = emitter
+                        .emit(
+                            EventType::ApprovalDenied,
+                            ApprovalDeniedData {
+                                command: command.to_string(),
+                                task_id: task_id.map(str::to_string),
+                            },
+                        )
+                        .await;
+                }
             }
         }
+
+        Ok(response)
     }
 
     async fn add_prefix(&self, command: &str) {
@@ -305,6 +402,7 @@ impl TerminalTool {
                     "This includes dangerous commands (rm, sudo, etc.)".to_string(),
                     "Persists across restarts".to_string(),
                 ],
+                None,
             )
             .await
         {
@@ -578,6 +676,8 @@ struct TerminalArgs {
     _untrusted_source: bool,
     #[serde(default)]
     _session_id: String,
+    #[serde(default)]
+    _task_id: Option<String>,
     /// Explicitly set by the agent from ChannelContext.trusted — never derived
     /// from session ID strings. Only trusted scheduled tasks set this to true.
     #[serde(default)]
@@ -622,6 +722,16 @@ impl Tool for TerminalTool {
                 "required": ["command"]
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -725,6 +835,7 @@ impl Tool for TerminalTool {
                             command,
                             assessment.level,
                             assessment.warnings.clone(),
+                            args._task_id.as_deref(),
                         )
                         .await
                     {

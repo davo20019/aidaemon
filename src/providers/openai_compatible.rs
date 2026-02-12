@@ -66,10 +66,7 @@ impl OpenAiCompatibleProvider {
         // Validate URL security before creating provider
         validate_base_url(base_url)?;
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        let client = crate::providers::build_http_client(Duration::from_secs(120))?;
 
         Ok(Self {
             client,
@@ -193,6 +190,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
             content,
             tool_calls,
             usage,
+            thinking: None,
         })
     }
 

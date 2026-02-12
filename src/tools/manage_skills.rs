@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -6,16 +7,16 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::skills::{SharedSkillRegistry, Skill};
+use crate::skills::{self, Skill};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::skill_registry;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::{build_browser_client, validate_url_for_ssrf};
-use crate::traits::{DynamicSkill, StateStore, Tool};
+use crate::traits::{StateStore, Tool};
 use crate::types::ApprovalResponse;
 
 pub struct ManageSkillsTool {
-    registry: SharedSkillRegistry,
+    skills_dir: PathBuf,
     state: Arc<dyn StateStore>,
     #[allow(dead_code)] // Available for future approval flow on add/install
     approval_tx: mpsc::Sender<ApprovalRequest>,
@@ -26,12 +27,12 @@ pub struct ManageSkillsTool {
 
 impl ManageSkillsTool {
     pub fn new(
-        registry: SharedSkillRegistry,
+        skills_dir: PathBuf,
         state: Arc<dyn StateStore>,
         approval_tx: mpsc::Sender<ApprovalRequest>,
     ) -> Self {
         Self {
-            registry,
+            skills_dir,
             state,
             approval_tx,
             client: build_browser_client(),
@@ -80,6 +81,29 @@ impl ManageSkillsTool {
         }
     }
 
+    /// Write a skill to the filesystem, checking for duplicate names.
+    async fn persist_to_filesystem(&self, skill: Skill) -> anyhow::Result<String> {
+        let existing = skills::load_skills(&self.skills_dir);
+        if skills::find_skill_by_name(&existing, &skill.name).is_some() {
+            return Ok(format!(
+                "A skill named '{}' already exists. Remove it first or choose a different name.",
+                skill.name
+            ));
+        }
+
+        let name = skill.name.clone();
+        let desc = skill.description.clone();
+        let path = skills::write_skill_to_file(&self.skills_dir, &skill)?;
+
+        info!(name = %name, path = %path.display(), "Skill added to filesystem");
+        Ok(format!(
+            "Skill '{}' added and saved to {}. Description: {}",
+            name,
+            path.display(),
+            desc
+        ))
+    }
+
     async fn handle_add_url(&self, url: &str) -> anyhow::Result<String> {
         // SSRF validation
         validate_url_for_ssrf(url).map_err(|e| anyhow::anyhow!("URL blocked: {}", e))?;
@@ -100,7 +124,7 @@ impl ManageSkillsTool {
             None => return Ok("Failed to parse skill from URL. The content must be valid skill markdown with --- frontmatter (name, description, triggers) and a body.".to_string()),
         };
 
-        self.persist_and_register(skill, None).await
+        self.persist_to_filesystem(skill).await
     }
 
     async fn handle_add_inline(&self, content: &str) -> anyhow::Result<String> {
@@ -112,71 +136,23 @@ impl ManageSkillsTool {
             None => return Ok("Failed to parse skill. Expected markdown with --- frontmatter containing name, description, triggers fields, followed by the skill body.".to_string()),
         };
 
-        self.persist_and_register(skill, None).await
-    }
-
-    async fn persist_and_register(
-        &self,
-        skill: Skill,
-        version: Option<String>,
-    ) -> anyhow::Result<String> {
-        // Check for duplicate name
-        if self.registry.find(&skill.name).await.is_some() {
-            return Ok(format!(
-                "A skill named '{}' already exists. Remove it first or choose a different name.",
-                skill.name
-            ));
-        }
-
-        // Persist to database
-        let triggers_json = serde_json::to_string(&skill.triggers)?;
-        let dynamic = DynamicSkill {
-            id: 0,
-            name: skill.name.clone(),
-            description: skill.description.clone(),
-            triggers_json,
-            body: skill.body.clone(),
-            source: skill.source.clone().unwrap_or_else(|| "inline".to_string()),
-            source_url: skill.source_url.clone(),
-            enabled: true,
-            version,
-            created_at: String::new(),
-            resources_json: serde_json::to_string(&skill.resources)
-                .unwrap_or_else(|_| "[]".to_string()),
-        };
-        let db_id = self.state.add_dynamic_skill(&dynamic).await?;
-
-        // Register in shared registry
-        let mut registered = skill;
-        registered.id = Some(db_id);
-        let name = registered.name.clone();
-        let desc = registered.description.clone();
-        self.registry.add(registered).await;
-
-        info!(name = %name, id = db_id, "Dynamic skill added");
-        Ok(format!(
-            "Skill '{}' added and activated (id: {}). Description: {}",
-            name, db_id, desc
-        ))
+        self.persist_to_filesystem(skill).await
     }
 
     async fn handle_list(&self) -> anyhow::Result<String> {
-        let skills = self.registry.snapshot_all().await;
-        if skills.is_empty() {
+        let mut all_skills = skills::load_skills(&self.skills_dir);
+        if all_skills.is_empty() {
             return Ok("No skills loaded.".to_string());
         }
 
-        let mut output = format!("**{} skills:**\n", skills.len());
-        for skill in &skills {
+        all_skills.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut output = format!("**{} skills:**\n", all_skills.len());
+        for skill in &all_skills {
             let source = skill.source.as_deref().unwrap_or("filesystem");
-            let status = if skill.enabled { "enabled" } else { "disabled" };
-            let id_str = skill
-                .id
-                .map(|id| format!(" (id: {})", id))
-                .unwrap_or_default();
             output.push_str(&format!(
-                "- **{}**{}: {} [source: {}, {}]\n",
-                skill.name, id_str, skill.description, source, status
+                "- **{}**: {} [source: {}]\n",
+                skill.name, skill.description, source
             ));
             if !skill.triggers.is_empty() {
                 output.push_str(&format!("  triggers: {}\n", skill.triggers.join(", ")));
@@ -198,50 +174,12 @@ impl ManageSkillsTool {
     }
 
     async fn handle_remove(&self, name: &str) -> anyhow::Result<String> {
-        // Find the skill to get its DB id
-        let all_skills = self.registry.snapshot_all().await;
-        let skill = all_skills.iter().find(|s| s.name == name);
-
-        match skill {
-            Some(s) => {
-                // Remove from DB if it has an ID (dynamic skill)
-                if let Some(id) = s.id {
-                    self.state.delete_dynamic_skill(id).await?;
-                }
-                // Remove from registry
-                self.registry.remove(name).await;
-                info!(name = %name, "Skill removed");
+        match skills::remove_skill_file(&self.skills_dir, name)? {
+            true => {
+                info!(name = %name, "Skill removed from filesystem");
                 Ok(format!("Skill '{}' removed.", name))
             }
-            None => Ok(format!("Skill '{}' not found.", name)),
-        }
-    }
-
-    async fn handle_enable(&self, name: &str) -> anyhow::Result<String> {
-        self.toggle_enabled(name, true).await
-    }
-
-    async fn handle_disable(&self, name: &str) -> anyhow::Result<String> {
-        self.toggle_enabled(name, false).await
-    }
-
-    async fn toggle_enabled(&self, name: &str, enabled: bool) -> anyhow::Result<String> {
-        let all_skills = self.registry.snapshot_all().await;
-        let skill = all_skills.iter().find(|s| s.name == name);
-
-        match skill {
-            Some(s) => {
-                // Update DB if dynamic
-                if let Some(id) = s.id {
-                    self.state.update_dynamic_skill_enabled(id, enabled).await?;
-                }
-                // Update registry
-                self.registry.set_enabled(name, enabled).await;
-                let action = if enabled { "enabled" } else { "disabled" };
-                info!(name = %name, action, "Skill toggled");
-                Ok(format!("Skill '{}' {}.", name, action))
-            }
-            None => Ok(format!("Skill '{}' not found.", name)),
+            false => Ok(format!("Skill '{}' not found.", name)),
         }
     }
 
@@ -316,13 +254,13 @@ impl ManageSkillsTool {
             }
         };
 
-        self.persist_and_register(skill, entry.version).await
+        self.persist_to_filesystem(skill).await
     }
 
     async fn handle_update(&self, name: &str) -> anyhow::Result<String> {
-        // Find the existing skill
-        let all_skills = self.registry.snapshot_all().await;
-        let existing = all_skills.iter().find(|s| s.name == name);
+        // Find the existing skill on disk
+        let all_skills = skills::load_skills(&self.skills_dir);
+        let existing = skills::find_skill_by_name(&all_skills, name);
 
         let existing = match existing {
             Some(s) => s,
@@ -355,16 +293,109 @@ impl ManageSkillsTool {
             None => return Ok("Failed to parse updated skill content.".to_string()),
         };
 
-        // Remove old and add new
-        if let Some(id) = existing.id {
-            self.state.delete_dynamic_skill(id).await?;
-        }
-        self.registry.remove(name).await;
+        // Remove old file and write new one
+        skills::remove_skill_file(&self.skills_dir, name)?;
 
         let mut skill = new_skill;
         skill.source = existing.source.clone();
         skill.source_url = Some(source_url);
-        self.persist_and_register(skill, None).await
+        let path = skills::write_skill_to_file(&self.skills_dir, &skill)?;
+
+        info!(name = %name, path = %path.display(), "Skill updated from source");
+        Ok(format!(
+            "Skill '{}' updated from source. Saved to {}.",
+            name,
+            path.display()
+        ))
+    }
+
+    async fn handle_review(
+        &self,
+        draft_id: Option<i64>,
+        approve: Option<bool>,
+    ) -> anyhow::Result<String> {
+        // If a draft_id is given with an approve/dismiss decision
+        if let Some(id) = draft_id {
+            let draft = match self.state.get_skill_draft(id).await? {
+                Some(d) => d,
+                None => return Ok(format!("Skill draft #{} not found.", id)),
+            };
+
+            if draft.status != "pending" {
+                return Ok(format!(
+                    "Skill draft #{} has already been {} and cannot be changed.",
+                    id, draft.status
+                ));
+            }
+
+            if approve == Some(true) {
+                // Parse draft into Skill and write to filesystem
+                let triggers: Vec<String> =
+                    serde_json::from_str(&draft.triggers_json).unwrap_or_default();
+                let skill = Skill {
+                    name: draft.name.clone(),
+                    description: draft.description.clone(),
+                    triggers,
+                    body: draft.body.clone(),
+                    source: Some("auto".to_string()),
+                    source_url: None,
+                    dir_path: None,
+                    resources: vec![],
+                };
+
+                // Check for duplicates
+                let existing = skills::load_skills(&self.skills_dir);
+                if skills::find_skill_by_name(&existing, &skill.name).is_some() {
+                    return Ok(format!(
+                        "A skill named '{}' already exists on disk. Dismiss this draft or remove the existing skill first.",
+                        skill.name
+                    ));
+                }
+
+                let path = skills::write_skill_to_file(&self.skills_dir, &skill)?;
+                self.state.update_skill_draft_status(id, "approved").await?;
+                info!(name = %draft.name, path = %path.display(), "Skill draft approved and written to filesystem");
+                Ok(format!(
+                    "Skill draft #{} '{}' approved and saved to {}.",
+                    id,
+                    draft.name,
+                    path.display()
+                ))
+            } else {
+                self.state
+                    .update_skill_draft_status(id, "dismissed")
+                    .await?;
+                info!(name = %draft.name, id, "Skill draft dismissed");
+                Ok(format!("Skill draft #{} '{}' dismissed.", id, draft.name))
+            }
+        } else {
+            // List all pending drafts
+            let drafts = self.state.get_pending_skill_drafts().await?;
+            if drafts.is_empty() {
+                return Ok("No pending skill drafts.".to_string());
+            }
+
+            let mut output = format!("**{} pending skill draft(s):**\n", drafts.len());
+            for draft in &drafts {
+                output.push_str(&format!(
+                    "- **#{}** '{}': {} (from procedure: '{}', created: {})\n",
+                    draft.id,
+                    draft.name,
+                    draft.description,
+                    draft.source_procedure,
+                    draft.created_at
+                ));
+                let triggers: Vec<String> =
+                    serde_json::from_str(&draft.triggers_json).unwrap_or_default();
+                if !triggers.is_empty() {
+                    output.push_str(&format!("  triggers: {}\n", triggers.join(", ")));
+                }
+            }
+            output.push_str(
+                "\nUse `manage_skills review` with `draft_id` and `approve: true/false` to approve or dismiss.",
+            );
+            Ok(output)
+        }
     }
 }
 
@@ -375,6 +406,8 @@ struct ManageSkillsArgs {
     content: Option<String>,
     name: Option<String>,
     query: Option<String>,
+    draft_id: Option<i64>,
+    approve: Option<bool>,
 }
 
 #[async_trait]
@@ -384,7 +417,7 @@ impl Tool for ManageSkillsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage skills at runtime. Actions: add (from URL), add_inline (raw markdown), list, remove, enable, disable, browse (search registries), install (from registry), update (re-fetch from source)."
+        "Manage skills at runtime. Actions: add (from URL), add_inline (raw markdown), list, remove, browse (search registries), install (from registry), update (re-fetch from source), review (approve/dismiss auto-promoted skill drafts)."
     }
 
     fn schema(&self) -> Value {
@@ -396,7 +429,7 @@ impl Tool for ManageSkillsTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "add_inline", "list", "remove", "enable", "disable", "browse", "install", "update"],
+                        "enum": ["add", "add_inline", "list", "remove", "browse", "install", "update", "review"],
                         "description": "The action to perform"
                     },
                     "url": {
@@ -409,11 +442,19 @@ impl Tool for ManageSkillsTool {
                     },
                     "name": {
                         "type": "string",
-                        "description": "Skill name (for 'remove', 'enable', 'disable', 'install', 'update' actions)"
+                        "description": "Skill name (for 'remove', 'install', 'update' actions)"
                     },
                     "query": {
                         "type": "string",
                         "description": "Search query (for 'browse' action)"
+                    },
+                    "draft_id": {
+                        "type": "integer",
+                        "description": "Skill draft ID to approve or dismiss (for 'review' action)"
+                    },
+                    "approve": {
+                        "type": "boolean",
+                        "description": "true to approve a draft, false to dismiss (for 'review' action with draft_id)"
                     }
                 },
                 "required": ["action"]
@@ -442,16 +483,6 @@ impl Tool for ManageSkillsTool {
                     .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'remove' action"))?;
                 self.handle_remove(name).await
             }
-            "enable" => {
-                let name = args.name.as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'enable' action"))?;
-                self.handle_enable(name).await
-            }
-            "disable" => {
-                let name = args.name.as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'disable' action"))?;
-                self.handle_disable(name).await
-            }
             "browse" => {
                 self.handle_browse(args.query.as_deref()).await
             }
@@ -465,7 +496,10 @@ impl Tool for ManageSkillsTool {
                     .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'update' action"))?;
                 self.handle_update(name).await
             }
-            other => Ok(format!("Unknown action '{}'. Valid actions: add, add_inline, list, remove, enable, disable, browse, install, update", other)),
+            "review" => {
+                self.handle_review(args.draft_id, args.approve).await
+            }
+            other => Ok(format!("Unknown action '{}'. Valid actions: add, add_inline, list, remove, browse, install, update, review", other)),
         }
     }
 }
