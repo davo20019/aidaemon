@@ -919,7 +919,7 @@ Rules: no invented event IDs; confidence 0..1.",
         for step in &analysis.verification_steps {
             out.push_str(&format!("- {}\n", step));
         }
-        out.push_str("\n");
+        out.push('\n');
         out.push_str(recovery_section);
         out.trim_end().to_string()
     }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -12,7 +12,7 @@ use crate::traits::{StateStore, Tool};
 
 pub async fn register_skills_tools(
     config: &AppConfig,
-    config_path: &PathBuf,
+    config_path: &Path,
     state: Arc<SqliteStateStore>,
     tools: &mut Vec<Arc<dyn Tool>>,
     approval_tx: mpsc::Sender<ApprovalRequest>,

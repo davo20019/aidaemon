@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -577,7 +577,7 @@ async fn register_runtime_tool_by_id(
 async fn build_base_tool(
     tool_id: BaseToolId,
     config: &AppConfig,
-    config_path: &PathBuf,
+    config_path: &Path,
     state: Arc<SqliteStateStore>,
     event_store: Arc<EventStore>,
     approval_tx: mpsc::Sender<ApprovalRequest>,
@@ -603,7 +603,7 @@ async fn build_base_tool(
         BaseToolId::GoalTrace => Arc::new(GoalTraceTool::new(state)),
         BaseToolId::ToolTrace => Arc::new(ToolTraceTool::new(state)),
         BaseToolId::ConfigManager => {
-            Arc::new(ConfigManagerTool::new(config_path.clone(), approval_tx))
+            Arc::new(ConfigManagerTool::new(config_path.to_path_buf(), approval_tx))
         }
         BaseToolId::WebFetch => Arc::new(WebFetchTool::new()),
         BaseToolId::WebSearch => Arc::new(WebSearchTool::new(&config.search)),

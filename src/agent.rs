@@ -502,14 +502,12 @@ fn truncate_for_resume(text: &str, max_chars: usize) -> String {
         return String::new();
     }
     let mut out = String::new();
-    let mut count = 0usize;
-    for ch in text.chars() {
+    for (count, ch) in text.chars().enumerate() {
         if count >= max_chars {
             out.push_str("...");
             return out;
         }
         out.push(ch);
-        count += 1;
     }
     out
 }

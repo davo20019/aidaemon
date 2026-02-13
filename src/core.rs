@@ -831,7 +831,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    queue_telemetry_for_events.mark_trigger_dropped(n as u64);
+                    queue_telemetry_for_events.mark_trigger_dropped(n);
                     tracing::warn!("Event listener lagged by {} events", n);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {

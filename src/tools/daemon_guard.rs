@@ -558,7 +558,7 @@ fn decode_base64_candidate(candidate: &str) -> Option<String> {
     }
 
     let mut attempts = vec![candidate.to_string()];
-    if candidate.len() % 4 != 0 {
+    if !candidate.len().is_multiple_of(4) {
         let pad_len = (4 - (candidate.len() % 4)) % 4;
         if pad_len > 0 {
             attempts.push(format!("{}{}", candidate, "=".repeat(pad_len)));
