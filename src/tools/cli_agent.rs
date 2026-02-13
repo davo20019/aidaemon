@@ -202,14 +202,18 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
         (
             "gemini",
             "gemini",
-            vec!["-p", "--sandbox=false", "--auto-approve"],
+            vec!["-p", "--sandbox=false", "--yolo"],
             "Gemini CLI — Google's AI coding agent (auto-approve mode)",
         ),
         (
             "codex",
             "codex",
-            vec!["exec", "--json", "--full-auto"],
-            "Codex CLI — OpenAI's AI coding agent",
+            vec![
+                "exec",
+                "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ],
+            "Codex CLI — OpenAI's AI coding agent (auto-approve mode)",
         ),
         (
             "copilot",

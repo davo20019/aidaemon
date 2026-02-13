@@ -602,9 +602,10 @@ async fn build_base_tool(
         BaseToolId::ScheduledGoalRuns => Arc::new(ScheduledGoalRunsTool::new(state)),
         BaseToolId::GoalTrace => Arc::new(GoalTraceTool::new(state)),
         BaseToolId::ToolTrace => Arc::new(ToolTraceTool::new(state)),
-        BaseToolId::ConfigManager => {
-            Arc::new(ConfigManagerTool::new(config_path.to_path_buf(), approval_tx))
-        }
+        BaseToolId::ConfigManager => Arc::new(ConfigManagerTool::new(
+            config_path.to_path_buf(),
+            approval_tx,
+        )),
         BaseToolId::WebFetch => Arc::new(WebFetchTool::new()),
         BaseToolId::WebSearch => Arc::new(WebSearchTool::new(&config.search)),
         BaseToolId::ReadFile => Arc::new(ReadFileTool),

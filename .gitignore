@@ -36,6 +36,11 @@ __pycache__/
 projects/
 sh-vs-ch-pronunciation-guide/
 cms_report/
+personal-finance-tracker/
+roses-website/
+telegram-modern-site/
+*.mvg
+*.svg
 
 # Root-level markdown (reports, plans, etc.) — whitelist codebase ones
 /*.md

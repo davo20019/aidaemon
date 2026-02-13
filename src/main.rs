@@ -46,8 +46,23 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
-    // Load .env if present
-    let _ = dotenvy::dotenv();
+    // Load environment file.
+    // - Default: .env discovered from current working directory and parents.
+    // - Override: AIDAEMON_ENV_FILE=/absolute/path/to/envfile
+    if let Ok(path) = std::env::var("AIDAEMON_ENV_FILE") {
+        if !path.trim().is_empty() {
+            if let Err(e) = dotenvy::from_path(&path) {
+                eprintln!(
+                    "Warning: failed to load AIDAEMON_ENV_FILE '{}': {}",
+                    path, e
+                );
+            }
+        } else {
+            let _ = dotenvy::dotenv();
+        }
+    } else {
+        let _ = dotenvy::dotenv();
+    }
 
     // Tracing
     tracing_subscriber::fmt()

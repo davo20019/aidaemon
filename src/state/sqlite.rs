@@ -66,45 +66,18 @@ impl SqliteStateStore {
         encryption_key: Option<&str>,
         embedding_service: Arc<EmbeddingService>,
     ) -> anyhow::Result<Self> {
-        let opts = SqliteConnectOptions::new()
+        let mut opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(opts)
-            .await?;
-
-        // Set restrictive file permissions (owner-only read/write)
-        set_db_file_permissions(db_path);
-
-        // SQLCipher: set encryption key if provided and the feature is enabled
+        // SQLCipher: set encryption key via connect options so it applies to
+        // every connection in the pool (PRAGMA key must be the first statement).
         #[cfg(feature = "encryption")]
         if let Some(key) = encryption_key {
             if !key.is_empty() {
-                // Validate key contains only safe characters (prevent SQL injection via PRAGMA)
-                if !key
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "!@#$%^&*_+-=.".contains(c))
-                {
-                    anyhow::bail!(
-                        "Encryption key contains invalid characters. Only alphanumeric and !@#$%^&*_+-=. are allowed."
-                    );
-                }
-                // PRAGMA key must be the first statement on a new connection.
-                // Use hex-encoded format for robustness against injection.
-                let hex_key: String = key
-                    .as_bytes()
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect();
-                sqlx::query(&format!("PRAGMA key = \"x'{}'\"", hex_key))
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to set SQLCipher encryption key: {}", e)
-                    })?;
+                let escaped_key = key.replace('\'', "''");
+                opts = opts.pragma("key", format!("'{}'", escaped_key));
                 tracing::info!("SQLCipher encryption enabled for database");
             }
         }
@@ -118,6 +91,14 @@ impl SqliteStateStore {
                 );
             }
         }
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(opts)
+            .await?;
+
+        // Set restrictive file permissions (owner-only read/write)
+        set_db_file_permissions(db_path);
 
         // Create tables
         sqlx::query(

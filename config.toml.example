@@ -27,7 +27,7 @@ allowed_user_ids = [123456789]
 db_path = "aidaemon.db"
 working_memory_cap = 50
 # consolidation_interval_hours = 6  # How often to run memory consolidation (extract durable facts from conversations)
-# encryption_key = "keychain"       # SQLCipher AES-256 encryption (requires: cargo build --features encryption)
+# encryption_key = "keychain"       # Optional override; default startup uses AIDAEMON_ENCRYPTION_KEY from .env
 # encryption_key = "${AIDAEMON_ENCRYPTION_KEY}"
 
 [terminal]
@@ -119,11 +119,11 @@ health_port = 8080
 #
 # [cli_agents.tools.gemini]
 # command = "gemini"
-# args = ["-p", "--output-format", "json", "--sandbox=false"]
+# args = ["-p", "--sandbox=false", "--yolo"]
 #
 # [cli_agents.tools.codex]
 # command = "codex"
-# args = ["exec", "--json", "--full-auto"]
+# args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
 
 # [mcp.filesystem]
 # command = "npx"

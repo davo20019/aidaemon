@@ -87,6 +87,9 @@ fn collect_default_alert_sessions(config: &AppConfig) -> Vec<String> {
 }
 
 pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::Result<()> {
+    let mut config = config;
+    crate::startup::db_security::enforce_database_encryption(&mut config, &config_path).await?;
+
     let write_consistency_thresholds = config.policy.write_consistency.thresholds();
     let queue_policy = config.daemon.queue_policy.normalized();
 

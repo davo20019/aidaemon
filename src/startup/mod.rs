@@ -1,4 +1,5 @@
 pub mod channels;
+pub mod db_security;
 pub mod mcp;
 pub mod memory_pipeline;
 pub mod provider_router;

@@ -56,7 +56,7 @@ If you don't care about resource usage and want more channels (WhatsApp, Signal,
 - **Evidence-gated learning** - stricter thresholds for auto-promoting procedures to skills (7+ successes, 90%+ success rate)
 - **Context window management** - role-based token quotas with sliding window summarization
 - **People intelligence** - organic contact management with auto-extracted facts, relationship tracking, and privacy controls
-- **Database encryption** - optional SQLCipher AES-256 encryption at rest (feature flag: `--features encryption`)
+- **Database encryption** - SQLCipher AES-256 encryption at rest enabled by default, with automatic plaintext migration
 
 ### Automation
 - **Scheduled tasks** - cron-style task scheduling with natural language time parsing
@@ -230,6 +230,12 @@ Sub-agents can request additional iterations via the `request_more_iterations` t
 
 ### CLI Agents
 
+For the smoothest unattended agent-to-agent workflows, run `aidaemon` on a dedicated machine (small VPS, mini PC, or spare laptop) and interact with it remotely from chat. This keeps your day-to-day workstation separate while letting delegated CLI agents run with minimal friction.
+
+If you prefer running on your primary machine, you can still use CLI agents with more conservative flags.
+
+Recommended unattended profile (dedicated host):
+
 ```toml
 [cli_agents]
 enabled = true
@@ -239,11 +245,23 @@ max_output_chars = 16000
 # Tools are auto-discovered via `which`. Override or add your own:
 [cli_agents.tools.claude]
 command = "claude"
-args = ["-p", "--output-format", "json"]
+args = ["-p", "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
 
 [cli_agents.tools.gemini]
 command = "gemini"
-args = ["-p", "--output-format", "json", "--sandbox=false"]
+args = ["-p", "--sandbox=false", "--yolo"]
+
+[cli_agents.tools.codex]
+command = "codex"
+args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
+```
+
+Conservative profile (primary machine):
+
+```toml
+[cli_agents.tools.codex]
+command = "codex"
+args = ["exec", "--json", "--full-auto"]
 ```
 
 ### Skills
@@ -440,8 +458,14 @@ working_memory_cap = 50
 consolidation_interval_hours = 6   # how often to run memory consolidation
 max_facts = 100                    # max facts to include in system prompt
 daily_token_budget = 1000000       # optional daily token limit (resets at midnight UTC)
-# encryption_key = "keychain"      # SQLCipher encryption (requires: --features encryption)
+# encryption_key = "keychain"      # optional override; defaults to AIDAEMON_ENCRYPTION_KEY from .env
 ```
+
+On startup, aidaemon now enforces encrypted state by default:
+- If `AIDAEMON_ENCRYPTION_KEY` is missing and the DB is new/plaintext, a key is generated and written to `.env`.
+- Existing plaintext SQLite DBs are migrated automatically to SQLCipher with backup + integrity checks.
+- Set `AIDAEMON_ALLOW_PLAINTEXT_DB=1` only for emergency recovery scenarios.
+Encryption at rest protects against database-file exposure, but if an attacker obtains both the DB and key, the data can be decrypted.
 
 ## Channel Commands
 
@@ -479,7 +503,7 @@ sudo systemctl enable --now aidaemon
 
 ### Where to Run It
 
-aidaemon works great on any dedicated machine — an old laptop, a Mac Mini, a Raspberry Pi, or a $5/mo VPS. Docker works too if that's your thing, but it's not required. The main recommendation is to give it its own machine rather than running it on your daily driver where you keep personal files and passwords. Any spare computer you have lying around works perfectly.
+aidaemon works great on any dedicated machine — an old laptop, a Mac Mini, a Raspberry Pi, or a $5/mo VPS. Docker works too if that's your thing, but it's not required. For the best long-running setup, give it its own machine and treat your everyday workstation as a separate environment. Any spare computer you have lying around works perfectly.
 
 ### Application-Level Protections
 
@@ -502,6 +526,7 @@ aidaemon works great on any dedicated machine — an old laptop, a Mac Mini, a R
 - **Config secrets redaction** — when the LLM reads config via the config manager tool, sensitive keys (`api_key`, `password`, `bot_token`, etc.) are replaced with `[REDACTED]`.
 - **Config change approval** — sensitive config modifications (API keys, allowed users, terminal wildcards) require explicit user approval.
 - **OAuth token security** — OAuth tokens and dynamic bot tokens are stored in the OS keychain, never in config files or chat history.
+- **Encrypted state by default** — database contents are encrypted at rest; startup auto-migrates legacy plaintext DBs with rollback-safe backup.
 - **Public channel protection** — public-facing channels use a minimal system prompt with no internal architecture details, and output is sanitized to redact secrets.
 - **Dashboard security** — bearer token authentication with rate limiting, token expiration (24h), and constant-time comparison.
 - **File permissions** — config backups are written with `0600` (owner-only read/write) on Unix.
@@ -519,7 +544,7 @@ Both projects share the same goal: a self-hosted AI assistant you control. The k
 | **Scope** | Lightweight daemon with web dashboard | Full-featured platform with web UI, canvas, TTS, browser control |
 | **Config** | Single `config.toml` with keychain secrets | JSON5 config with hot-reload and file watching |
 | **Error recovery** | Inline error classification per HTTP status, model fallback, config backup rotation | Multi-layer retry policies, auth profile cooldowns, provider rotation, restart sentinels |
-| **State** | SQLite + in-memory working memory (optional encryption) | Pluggable storage with session management |
+| **State** | SQLite + in-memory working memory (encrypted by default) | Pluggable storage with session management |
 | **Install** | `curl -sSfL https://get.aidaemon.ai \| bash` | npm/Docker |
 | **Dependencies** | ~30 crates, single static binary | Node.js ecosystem |
 
