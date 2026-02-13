@@ -1528,12 +1528,6 @@ impl TelegramChannel {
                             let now = SystemTime::now().duration_since(UNIX_EPOCH)
                                 .unwrap_or_default().as_secs();
                             if now.saturating_sub(last_hb) > stale_threshold_secs {
-                                let stale_mins = (now - last_hb) / 60;
-                                let _ = typing_bot.send_message(typing_chat_id, format!(
-                                    "⚠️ No activity for {} minutes. The task may be stuck. \
-                                     Send /cancel to stop it, or wait for it to recover.",
-                                    stale_mins
-                                )).await;
                                 break; // Stop typing indicator
                             }
                         }
@@ -1722,6 +1716,13 @@ impl TelegramChannel {
                 let result = tokio::select! {
                     r = agent.handle_message(&session_id, &current_text, Some(current_status_tx), user_role, channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
+                    stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 4), if stale_threshold_secs > 0 => {
+                        Err(anyhow::anyhow!(
+                            "Task auto-cancelled due to inactivity ({} minute{} without progress).",
+                            stale_mins,
+                            if stale_mins == 1 { "" } else { "s" }
+                        ))
+                    },
                 };
                 current_typing_cancel.cancel();
                 let _ = current_status_task.await;
@@ -1764,8 +1765,13 @@ impl TelegramChannel {
                             info!("Task #{} cancelled", current_task_id);
                             return; // Exit loop on cancellation
                         }
-                        warn!("Agent error: {}", e);
-                        let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
+                        if error_msg.starts_with("Task auto-cancelled due to inactivity") {
+                            info!("Task #{} auto-cancelled by stale watchdog", current_task_id);
+                            let _ = bot.send_message(chat_id, format!("⚠️ {}", error_msg)).await;
+                        } else {
+                            warn!("Agent error: {}", e);
+                            let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
+                        }
                     }
                 }
 
@@ -1870,12 +1876,6 @@ impl TelegramChannel {
                                         let now = SystemTime::now().duration_since(UNIX_EPOCH)
                                             .unwrap_or_default().as_secs();
                                         if now.saturating_sub(last_hb) > stale_threshold_secs {
-                                            let stale_mins = (now - last_hb) / 60;
-                                            let _ = typing_bot.send_message(chat_id, format!(
-                                                "⚠️ No activity for {} minutes. The task may be stuck. \
-                                                 Send /cancel to stop it, or wait for it to recover.",
-                                                stale_mins
-                                            )).await;
                                             break;
                                         }
                                     }

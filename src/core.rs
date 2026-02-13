@@ -1,45 +1,28 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::agent::Agent;
-#[cfg(feature = "discord")]
-use crate::channels::DiscordChannel;
-#[cfg(feature = "slack")]
-use crate::channels::SlackChannel;
-use crate::channels::{ChannelHub, SessionMap, TelegramChannel};
+use crate::channels::{ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::daemon;
-use crate::mcp;
 
-use crate::events::{EventStore, Pruner};
-use crate::health::{HealthProbeManager, HealthProbeStore};
-use crate::memory::embeddings::EmbeddingService;
-use crate::memory::manager::MemoryManager;
-use crate::plans::PlanStore;
+use crate::health::HealthProbeManager;
+use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
+use crate::queue_telemetry::QueueTelemetry;
 
-use crate::router::{Router, Tier};
+use crate::router::Tier;
 use crate::skills;
+use crate::startup::{
+    channels as startup_channels, mcp as startup_mcp, memory_pipeline, provider_router,
+    skills as startup_skills, stores, tools as startup_tools,
+};
 use crate::state::SqliteStateStore;
 use crate::tasks::TaskRegistry;
-#[cfg(feature = "browser")]
-use crate::tools::BrowserTool;
-#[cfg(feature = "slack")]
-use crate::tools::ReadChannelHistoryTool;
-use crate::tools::{
-    CheckEnvironmentTool, CliAgentTool, ConfigManagerTool, EditFileTool, GitCommitTool,
-    DiagnoseTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool,
-    ManageCliAgentsTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool,
-    ManageSkillsTool, ProjectInspectTool, ReadFileTool, RememberFactTool, RunCommandTool,
-    ScheduledGoalRunsTool, SearchFilesTool, SendFileTool, ServiceStatusTool, ShareMemoryTool,
-    SkillResourcesTool, SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, UseSkillTool,
-    WebFetchTool, WebSearchTool, WriteFileTool,
-};
-use crate::traits::{Channel, GoalV3, StateStore, Tool};
+use crate::traits::{GoalV3, StateStore};
 use crate::triggers::{self, TriggerManager};
 
 const LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC: &str =
@@ -56,292 +39,148 @@ struct LegacyMaintenanceMigrationStats {
     notifications_deleted: usize,
 }
 
+fn collect_default_alert_sessions(config: &AppConfig) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut sessions: Vec<String> = Vec::new();
+    let mut push = |session: String| {
+        let trimmed = session.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if seen.insert(trimmed.to_string()) {
+            sessions.push(trimmed.to_string());
+        }
+    };
+
+    for bot in config.all_telegram_bots() {
+        for uid in bot.allowed_user_ids {
+            push(uid.to_string());
+        }
+    }
+
+    #[cfg(feature = "discord")]
+    for bot in config.all_discord_bots() {
+        for uid in bot.allowed_user_ids {
+            push(format!("discord:dm:{}", uid));
+        }
+    }
+
+    #[cfg(feature = "slack")]
+    for bot in config.all_slack_bots() {
+        for uid in bot.allowed_user_ids {
+            push(format!("slack:{}", uid));
+        }
+    }
+
+    for (platform, ids) in &config.users.owner_ids {
+        for id in ids {
+            match platform.as_str() {
+                "telegram" => push(id.to_string()),
+                "discord" => push(format!("discord:dm:{}", id)),
+                "slack" => push(format!("slack:{}", id)),
+                _ => push(id.to_string()),
+            }
+        }
+    }
+
+    sessions
+}
+
 pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::Result<()> {
-    // 0. Embeddings (Vector Memory)
-    let embedding_service = Arc::new(
-        EmbeddingService::new().map_err(|e| anyhow::anyhow!("Failed to init embeddings: {}", e))?,
-    );
-    info!("Embedding service initialized (AllMiniLML6V2)");
+    let write_consistency_thresholds = config.policy.write_consistency.thresholds();
+    let queue_policy = config.daemon.queue_policy.normalized();
 
-    // 1. State store
-    let state = Arc::new(
-        SqliteStateStore::new(
-            &config.state.db_path,
-            config.state.working_memory_cap,
-            config.state.encryption_key.as_deref(),
-            embedding_service.clone(),
-        )
-        .await?,
-    );
-    info!("State store initialized ({})", config.state.db_path);
-
-    // Backfill any missing episode embeddings
-    if let Ok(count) = state.backfill_episode_embeddings().await {
-        if count > 0 {
-            info!(count, "Backfilled missing episode embeddings");
-        }
-    }
-
-    // Backfill any missing fact embeddings
-    if let Ok(count) = state.backfill_fact_embeddings().await {
-        if count > 0 {
-            info!(count, "Backfilled missing fact embeddings");
-        }
-    }
-
-    // 1b. Event store (shares database with state store)
-    let event_store = Arc::new(EventStore::new(state.pool()).await?);
-    info!("Event store initialized");
-
-    // 1c. Plan store (used by Consolidator for procedure extraction; PlanManagerTool deprecated)
-    let plan_store = Arc::new(PlanStore::new(state.pool()).await?);
-    info!("Plan store initialized");
-
-    // 1d. Health probe store (initialized early for tool access)
-    let health_store: Option<Arc<HealthProbeStore>> = if config.health.enabled {
-        Some(Arc::new(
-            HealthProbeStore::new(state.pool())
-                .await
-                .expect("Failed to initialize health probe store"),
-        ))
-    } else {
-        None
-    };
-
-    // 1e. Pruner setup is deferred until after provider/router init (see below)
-    // because Consolidator now needs provider + embedding_service for LLM-enhanced procedures.
-
-    // Note: Daily event consolidation is now handled by MemoryManager (unified pipeline).
-    // The Consolidator's extraction methods are called from MemoryManager.consolidate_memories().
-    // The Pruner still calls consolidator.consolidate_session() as a safety net before pruning.
-
-    // Pruning task spawn is deferred (see after provider init)
-
-    info!("Plan store and event store initialized");
-
-    // 2. Provider (moved before MemoryManager so provider is available)
-    let provider: Arc<dyn crate::traits::ModelProvider> = match config.provider.kind {
-        crate::config::ProviderKind::OpenaiCompatible => Arc::new(
-            crate::providers::OpenAiCompatibleProvider::new(
-                &config.provider.base_url,
-                &config.provider.api_key,
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
-        ),
-        crate::config::ProviderKind::GoogleGenai => Arc::new(
-            crate::providers::GoogleGenAiProvider::new(&config.provider.api_key),
-        ),
-        crate::config::ProviderKind::Anthropic => Arc::new(
-            crate::providers::AnthropicNativeProvider::new(&config.provider.api_key),
-        ),
-    };
-
-    // 3. Router
-    let router = Router::new(config.provider.models.clone());
-    let model = router.select(Tier::Primary).to_string();
-    info!(
-        primary = router.select(Tier::Primary),
-        fast = router.select(Tier::Fast),
-        smart = router.select(Tier::Smart),
-        "Model router configured"
-    );
-
-    // 3b. Consolidator (now needs provider + embedding_service for LLM-enhanced procedures)
-    let consolidator = Arc::new(
-        crate::events::Consolidator::new(
-            event_store.clone(),
-            plan_store.clone(),
-            state.pool(),
-            Some(provider.clone()),
-            router.select(Tier::Fast).to_string(),
-            Some(embedding_service.clone()),
-        )
-        .with_state(state.clone())
-        .with_learning_evidence_gate(config.policy.learning_evidence_gate_enforce),
-    );
-
-    // 3c. Pruner (uses consolidator for safety-net consolidation before deleting events)
-    let pruner = Arc::new(Pruner::new(
-        event_store.clone(),
-        consolidator.clone(),
-        7, // 7-day retention
+    let queue_telemetry = Arc::new(QueueTelemetry::new_with_policy(
+        queue_policy.approval_capacity,
+        queue_policy.media_capacity,
+        queue_policy.trigger_event_capacity,
+        queue_policy.warning_ratio,
+        queue_policy.overload_ratio,
     ));
 
-    // Pruning, plan cleanup, and retention are now registered with the heartbeat coordinator below.
+    let stores::StoreBundle {
+        embedding_service,
+        state,
+        event_store,
+        plan_store,
+        health_store,
+    } = stores::build_stores(&config).await?;
 
-    // 3d. Memory Manager (Background Tasks — needs provider + fast model)
-    let consolidation_interval =
-        Duration::from_secs(config.state.consolidation_interval_hours * 3600);
-    let memory_manager = Arc::new(
-        MemoryManager::new(
-            state.pool(),
-            embedding_service.clone(),
-            provider.clone(),
-            router.select(Tier::Fast).to_string(),
-            consolidation_interval,
-            Some(consolidator.clone()),
-        )
-        .with_state(state.clone())
-        .with_people_config(config.people.clone()),
+    let provider_router::ProviderRouterBundle {
+        provider,
+        router,
+        primary_model: model,
+    } = provider_router::build_provider_router(&config)?;
+
+    let memory_pipeline::MemoryPipelineBundle {
+        consolidator: _consolidator,
+        pruner,
+        memory_manager,
+    } = memory_pipeline::build_memory_pipeline(
+        &config,
+        state.clone(),
+        event_store.clone(),
+        plan_store.clone(),
+        provider.clone(),
+        &router,
+        embedding_service.clone(),
     );
-    // Memory background tasks are registered with heartbeat coordinator below.
 
-    // 4. Tools
-    let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(16);
-    let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SystemInfoTool),
-        Arc::new(
-            TerminalTool::new(
-                config.terminal.allowed_prefixes.clone(),
-                approval_tx.clone(),
-                config.terminal.initial_timeout_secs,
-                config.terminal.max_output_chars,
-                config.terminal.permission_mode,
-                state.pool(),
-            )
-            .await
-            .with_event_store(event_store.clone()),
-        ),
-        Arc::new(RememberFactTool::new(state.clone())),
-        Arc::new(ShareMemoryTool::new(state.clone(), approval_tx.clone())),
-        Arc::new(ManageMemoriesTool::new(state.clone())),
-        Arc::new(ScheduledGoalRunsTool::new(state.clone())),
-        Arc::new(GoalTraceTool::new(state.clone())),
-        Arc::new(ToolTraceTool::new(state.clone())),
-        Arc::new(ConfigManagerTool::new(
-            config_path.clone(),
-            approval_tx.clone(),
-        )),
-        Arc::new(WebFetchTool::new()),
-        Arc::new(WebSearchTool::new(&config.search)),
-        // Deterministic tools
-        Arc::new(ReadFileTool),
-        Arc::new(WriteFileTool),
-        Arc::new(EditFileTool),
-        Arc::new(SearchFilesTool),
-        Arc::new(ProjectInspectTool),
-        Arc::new(RunCommandTool),
-        Arc::new(GitInfoTool),
-        Arc::new(GitCommitTool),
-        Arc::new(CheckEnvironmentTool),
-        Arc::new(ServiceStatusTool),
-    ];
-
-    if config.diagnostics.enabled {
-        tools.push(Arc::new(DiagnoseTool::new(
-            event_store.clone(),
-            state.clone(),
-            provider.clone(),
-            router.select(Tier::Fast).to_string(),
-            config.diagnostics.max_events,
-            config.diagnostics.include_raw_tool_args,
-        )));
-        info!("self_diagnose tool enabled");
-    }
-
-    // Media channel — shared by browser tool, send_file tool, etc.
-    let (media_tx, media_rx) = tokio::sync::mpsc::channel::<crate::types::MediaMessage>(16);
-
-    // Browser tool (conditional — requires "browser" cargo feature)
-    #[cfg(feature = "browser")]
-    if config.browser.enabled {
-        tools.push(Arc::new(BrowserTool::new(
-            config.browser.clone(),
-            media_tx.clone(),
-        )));
-        info!("Browser tool enabled");
-    }
-
-    // File transfer tool (conditional)
-    let inbox_dir = shellexpand::tilde(&config.files.inbox_dir).to_string();
-    if config.files.enabled {
-        std::fs::create_dir_all(&inbox_dir)?;
-        tools.push(Arc::new(SendFileTool::new(
-            media_tx.clone(),
-            &config.files.outbox_dirs,
-            &inbox_dir,
-        )));
-        info!("Send-file tool enabled");
-    }
-
-    // CLI agent tools (conditional)
-    let has_cli_agents;
-    let cli_tool_arc: Option<Arc<CliAgentTool>>;
-    if config.cli_agents.enabled {
-        let cli_tool =
-            CliAgentTool::discover(config.cli_agents.clone(), state.clone(), provider.clone())
-                .await;
-        has_cli_agents = cli_tool.has_tools();
-        let arc = Arc::new(cli_tool);
-        if has_cli_agents {
-            tools.push(arc.clone());
-            info!("CLI agent tool enabled");
-        } else {
-            info!("CLI agents enabled but no tools found on system");
-        }
-        // Always register manage_cli_agents (so user can add agents even if none discovered)
-        let manage_cli = ManageCliAgentsTool::new(arc.clone(), state.clone(), approval_tx.clone());
-        tools.push(Arc::new(manage_cli));
-        info!("manage_cli_agents tool enabled");
-        cli_tool_arc = Some(arc);
-    } else {
-        has_cli_agents = false;
-        cli_tool_arc = None;
-    }
-    let _ = cli_tool_arc; // suppress unused warning
-
-    // Scheduler tool deprecated — evergreen goals replace it.
-
-    // Health probe tool (conditional)
-    if let Some(ref store) = health_store {
-        tools.push(Arc::new(HealthProbeTool::new(store.clone())));
-        info!("Health probe tool enabled");
-    }
-
-    // Channel history tool (conditional — requires "slack" cargo feature)
-    #[cfg(feature = "slack")]
-    {
-        let mut slack_tokens: Vec<String> = config
-            .all_slack_bots()
-            .iter()
-            .map(|bot| bot.bot_token.clone())
-            .collect();
-        // Also include tokens from dynamic Slack bots (added via /connect, stored in DB)
-        if let Ok(dynamic_bots) = state.get_dynamic_bots().await {
-            for bot in dynamic_bots {
-                if bot.channel_type == "slack" && !bot.bot_token.is_empty() {
-                    slack_tokens.push(bot.bot_token.clone());
-                }
-            }
-        }
-        if !slack_tokens.is_empty() {
-            info!(count = slack_tokens.len(), "Channel history tool enabled");
-            tools.push(Arc::new(ReadChannelHistoryTool::new(slack_tokens)));
-        }
-    }
+    let startup_tools::BaseToolsBundle {
+        mut tools,
+        approval_tx,
+        approval_rx,
+        media_tx,
+        media_rx,
+    } = startup_tools::build_base_tools(
+        &config,
+        config_path.clone(),
+        state.clone(),
+        event_store.clone(),
+        queue_policy.approval_capacity,
+        queue_policy.media_capacity,
+    )
+    .await?;
+    let startup_tools::OptionalToolsOutcome {
+        has_cli_agents,
+        inbox_dir,
+    } = startup_tools::register_optional_tools(
+        &mut tools,
+        &config,
+        state.clone(),
+        event_store.clone(),
+        provider.clone(),
+        &router,
+        health_store.clone(),
+        approval_tx.clone(),
+        media_tx.clone(),
+    )
+    .await?;
 
     // 5. MCP registry (static from config + dynamic from DB)
-    let mcp_registry = mcp::McpRegistry::new(state.clone());
+    let mcp_registry = startup_mcp::setup_mcp_registry(&config, state.clone()).await?;
 
-    // Load static MCP servers from config into registry
-    for (name, mcp_config) in &config.mcp {
-        match mcp_registry
-            .add_server(name, mcp_config.clone(), false)
-            .await
-        {
-            Ok(tool_names) => {
-                info!(server = %name, tools = ?tool_names, "Static MCP server registered");
-            }
-            Err(e) => {
-                tracing::error!(server = %name, error = %e, "Failed to spawn static MCP server");
-            }
-        }
-    }
+    // 6. Skills (filesystem as single source of truth)
+    let skills_dir = startup_skills::register_skills_tools(
+        &config,
+        &config_path,
+        state.clone(),
+        &mut tools,
+        approval_tx.clone(),
+    )
+    .await?;
 
-    // Load dynamic MCP servers from database
-    if let Err(e) = mcp_registry.load_from_db().await {
-        tracing::error!(error = %e, "Failed to load dynamic MCP servers from database");
-    }
+    let startup_tools::RuntimeToolsOutcome {
+        spawn_tool,
+        oauth_gateway,
+    } = startup_tools::register_runtime_tools(
+        &mut tools,
+        &config,
+        state.clone(),
+        mcp_registry.clone(),
+        approval_tx.clone(),
+    )
+    .await?;
 
     for tool in &tools {
         info!(
@@ -350,179 +189,6 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             "Registered tool"
         );
     }
-
-    // 6. Skills (filesystem as single source of truth)
-    let skills_dir: Option<PathBuf> = if config.skills.enabled {
-        let dir = config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join(&config.skills.dir);
-        std::fs::create_dir_all(&dir).ok();
-
-        // One-time migration: move dynamic_skills from DB to filesystem
-        if state
-            .get_setting("skill_migration_v1_done")
-            .await?
-            .is_none()
-        {
-            match state.get_dynamic_skills().await {
-                Ok(dynamic_skills) => {
-                    let existing = skills::load_skills(&dir);
-                    let existing_names: Vec<&str> =
-                        existing.iter().map(|s| s.name.as_str()).collect();
-                    let mut migrated = 0;
-                    for ds in &dynamic_skills {
-                        if existing_names.iter().any(|n| *n == ds.name) {
-                            info!(name = %ds.name, "Skipping migration — skill already exists on disk");
-                            continue;
-                        }
-                        let triggers: Vec<String> =
-                            serde_json::from_str(&ds.triggers_json).unwrap_or_default();
-                        let skill = skills::Skill {
-                            name: ds.name.clone(),
-                            description: ds.description.clone(),
-                            triggers,
-                            body: ds.body.clone(),
-                            source: Some(ds.source.clone()),
-                            source_url: ds.source_url.clone(),
-                            dir_path: None,
-                            resources: vec![],
-                        };
-                        match skills::write_skill_to_file(&dir, &skill) {
-                            Ok(path) => {
-                                info!(name = %ds.name, path = %path.display(), "Migrated dynamic skill to filesystem");
-                                migrated += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!(name = %ds.name, error = %e, "Failed to migrate dynamic skill");
-                            }
-                        }
-                    }
-                    if migrated > 0 {
-                        info!(count = migrated, "Dynamic skills migrated to filesystem");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load dynamic skills for migration: {}", e);
-                }
-            }
-            state.set_setting("skill_migration_v1_done", "true").await?;
-        }
-
-        // Load skills once at startup for filesystem resolver registration
-        let startup_skills = skills::load_skills(&dir);
-        info!(count = startup_skills.len(), dir = %dir.display(), "Filesystem skills loaded");
-
-        // Create filesystem resolver for directory-based skills
-        let fs_resolver = Arc::new(crate::skills::FileSystemResolver::new());
-        for skill in &startup_skills {
-            if let Some(ref dir_path) = skill.dir_path {
-                fs_resolver.register(&skill.name, dir_path.clone()).await;
-            }
-        }
-
-        // Register skill tools
-        tools.push(Arc::new(UseSkillTool::new(dir.clone())));
-        info!("use_skill tool enabled");
-
-        tools.push(Arc::new(SkillResourcesTool::new(
-            dir.clone(),
-            fs_resolver as Arc<dyn crate::skills::ResourceResolver>,
-        )));
-        info!("skill_resources tool enabled");
-
-        let manage_skills = ManageSkillsTool::new(dir.clone(), state.clone(), approval_tx.clone())
-            .with_registries(config.skills.registries.clone());
-        tools.push(Arc::new(manage_skills));
-        info!("manage_skills tool enabled");
-
-        Some(dir)
-    } else {
-        info!("Skills system disabled");
-        None
-    };
-
-    // manage_mcp tool (always available for dynamic MCP management)
-    let manage_mcp = ManageMcpTool::new(mcp_registry.clone(), approval_tx.clone());
-    tools.push(Arc::new(manage_mcp));
-    info!("manage_mcp tool enabled");
-
-    // manage_people tool (always registered; gated internally via runtime setting)
-    tools.push(Arc::new(ManagePeopleTool::new(state.clone())));
-    info!("manage_people tool registered");
-
-    // Seed the DB setting from config if not already set
-    if state.get_setting("people_enabled").await?.is_none() {
-        state
-            .set_setting(
-                "people_enabled",
-                if config.people.enabled {
-                    "true"
-                } else {
-                    "false"
-                },
-            )
-            .await?;
-    }
-
-    // Shared HTTP auth profiles (used by both HttpRequestTool and OAuthGateway)
-    let http_profiles: crate::oauth::SharedHttpProfiles =
-        Arc::new(RwLock::new(config.http_auth.clone()));
-
-    // HTTP request tool (always enabled when profiles exist or OAuth is enabled)
-    if !config.http_auth.is_empty() || config.oauth.enabled {
-        tools.push(Arc::new(HttpRequestTool::new(
-            http_profiles.clone(),
-            approval_tx.clone(),
-        )));
-        info!(
-            config_profiles = config.http_auth.len(),
-            oauth_enabled = config.oauth.enabled,
-            "HTTP request tool enabled"
-        );
-    }
-
-    // OAuth gateway (conditional)
-    let oauth_gateway: Option<crate::oauth::OAuthGateway> = if config.oauth.enabled {
-        let callback_url = config
-            .oauth
-            .callback_url
-            .clone()
-            .unwrap_or_else(|| format!("http://localhost:{}", config.daemon.health_port));
-
-        let gateway =
-            crate::oauth::OAuthGateway::new(state.clone(), http_profiles.clone(), callback_url);
-
-        // Register built-in providers
-        for name in crate::oauth::providers::builtin_provider_names() {
-            if let Some(provider) = crate::oauth::providers::get_builtin_provider(name) {
-                gateway.register_provider(provider).await;
-            }
-        }
-
-        // Register custom providers from config
-        for (name, provider_config) in &config.oauth.providers {
-            gateway
-                .register_config_provider(name, provider_config)
-                .await;
-        }
-
-        // Restore existing connections from DB + keychain
-        gateway.restore_connections().await;
-
-        // Register ManageOAuthTool
-        tools.push(Arc::new(ManageOAuthTool::new(
-            gateway.clone(),
-            state.clone(),
-        )));
-        info!("OAuth gateway and manage_oauth tool enabled");
-
-        // OAuth cleanup registered with heartbeat below (or standalone if heartbeat disabled)
-
-        Some(gateway)
-    } else {
-        None
-    };
 
     // 7. Agent (with deferred spawn tool wiring to break the circular dep)
     let skill_names: Vec<String> = if let Some(ref dir) = skills_dir {
@@ -534,20 +200,6 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         Vec::new()
     };
     let base_system_prompt = build_base_system_prompt(&config, &skill_names, has_cli_agents);
-
-    // Spawn-agent tool (conditional, like browser)
-    let spawn_tool: Option<Arc<SpawnAgentTool>> = if config.subagents.enabled {
-        let st = Arc::new(SpawnAgentTool::new_deferred(
-            config.subagents.max_response_chars,
-            config.subagents.timeout_secs,
-        ));
-        tools.push(st.clone());
-        info!("Spawn-agent tool enabled");
-        Some(st)
-    } else {
-        info!("Spawn-agent tool disabled");
-        None
-    };
 
     // Clone provider before passing to Agent (needed by skill promotion task below)
     let provider_for_promotion = provider.clone();
@@ -604,7 +256,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     agent.set_self_ref(Arc::downgrade(&agent)).await;
 
     // 8. Event bus for triggers
-    let (event_tx, mut event_rx) = triggers::event_bus(64);
+    let (event_tx, mut event_rx) = triggers::event_bus(queue_policy.trigger_event_capacity);
     // 9. Triggers
     let trigger_manager = Arc::new(TriggerManager::new(config.triggers.clone(), event_tx));
     trigger_manager.spawn();
@@ -673,6 +325,38 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                 }
             }
         });
+
+        // Reconcile stale event-only tasks that never emitted task_end.
+        // Uses a conservative timeout (2x watchdog stale threshold, minimum 5 min)
+        // to avoid false positives on legitimately long-running tasks.
+        if watchdog_stale_threshold_secs > 0 {
+            let event_store_for_reconcile = event_store.clone();
+            let stale_secs = watchdog_stale_threshold_secs.saturating_mul(2).max(300);
+            heartbeat.register_job(
+                "event_task_reconciliation",
+                Duration::from_secs(60),
+                move || {
+                    let store = event_store_for_reconcile.clone();
+                    async move {
+                        match store
+                            .reconcile_stale_task_starts(stale_secs as i64, 32)
+                            .await
+                        {
+                            Ok(count) if count > 0 => {
+                                info!(
+                                    reconciled = count,
+                                    stale_threshold_secs = stale_secs,
+                                    "Reconciled stale event tasks missing task_end"
+                                );
+                                Ok(())
+                            }
+                            Ok(_) => Ok(()),
+                            Err(e) => Err(e),
+                        }
+                    }
+                },
+            );
+        }
 
         // Retention cleanup (daily)
         let retention_pool = state.pool();
@@ -880,225 +564,25 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // 10b. Task registry for tracking background agent work
     let task_registry = Arc::new(TaskRegistry::new(50));
 
-    // 11. Channels — add new channels here (WhatsApp, Web, SMS, etc.)
-    // Parse owner IDs for Telegram from users config
-    let telegram_owner_ids: Vec<u64> = config
-        .users
-        .owner_ids
-        .get("telegram")
-        .map(|ids| ids.iter().filter_map(|id| id.parse::<u64>().ok()).collect())
-        .unwrap_or_default();
-
-    // Telegram bots (supports multiple bots)
-    let telegram_bots: Vec<Arc<TelegramChannel>> = config
-        .all_telegram_bots()
-        .into_iter()
-        .map(|bot_config| {
-            info!("Registering Telegram bot (username will be fetched from API)");
-            Arc::new(TelegramChannel::new(
-                &bot_config.bot_token,
-                bot_config.allowed_user_ids.clone(),
-                telegram_owner_ids.clone(),
-                Arc::clone(&agent),
-                config_path.clone(),
-                session_map.clone(),
-                task_registry.clone(),
-                config.files.enabled,
-                PathBuf::from(&inbox_dir),
-                config.files.max_file_size_mb,
-                state.clone(),
-                watchdog_stale_threshold_secs,
-            ))
-        })
-        .collect();
-
-    #[cfg(feature = "discord")]
-    let discord_owner_ids: Vec<u64> = config
-        .users
-        .owner_ids
-        .get("discord")
-        .map(|ids| ids.iter().filter_map(|id| id.parse::<u64>().ok()).collect())
-        .unwrap_or_default();
-    #[cfg(feature = "discord")]
-    let discord_bots: Vec<Arc<DiscordChannel>> = config
-        .all_discord_bots()
-        .into_iter()
-        .map(|bot_config| {
-            info!("Registering Discord bot (username will be fetched from API)");
-            Arc::new(DiscordChannel::new(
-                &bot_config.bot_token,
-                bot_config.allowed_user_ids.clone(),
-                discord_owner_ids.clone(),
-                bot_config.guild_id,
-                Arc::clone(&agent),
-                config_path.clone(),
-                session_map.clone(),
-                task_registry.clone(),
-                config.files.enabled,
-                PathBuf::from(&inbox_dir),
-                config.files.max_file_size_mb,
-                state.clone(),
-                watchdog_stale_threshold_secs,
-            ))
-        })
-        .collect();
-
-    #[cfg(feature = "slack")]
-    let slack_bots: Vec<Arc<SlackChannel>> = config
-        .all_slack_bots()
-        .into_iter()
-        .map(|bot_config| {
-            info!("Registering Slack bot (bot name will be fetched from API)");
-            Arc::new(SlackChannel::new(
-                &bot_config.app_token,
-                &bot_config.bot_token,
-                bot_config.allowed_user_ids.clone(),
-                bot_config.use_threads,
-                Arc::clone(&agent),
-                config_path.clone(),
-                session_map.clone(),
-                task_registry.clone(),
-                config.files.enabled,
-                PathBuf::from(&inbox_dir),
-                config.files.max_file_size_mb,
-                state.clone(),
-                watchdog_stale_threshold_secs,
-            ))
-        })
-        .collect();
-
-    // Load dynamic bots from database (added via /connect command)
-    let mut dynamic_telegram_bots: Vec<Arc<TelegramChannel>> = Vec::new();
-    #[cfg(feature = "discord")]
-    let mut dynamic_discord_bots: Vec<Arc<DiscordChannel>> = Vec::new();
-    #[cfg(feature = "slack")]
-    let mut dynamic_slack_bots: Vec<Arc<SlackChannel>> = Vec::new();
-
-    match state.get_dynamic_bots().await {
-        Ok(bots) => {
-            for bot in bots {
-                match bot.channel_type.as_str() {
-                    "telegram" => {
-                        let allowed_user_ids: Vec<u64> = bot
-                            .allowed_user_ids
-                            .iter()
-                            .filter_map(|s| s.parse::<u64>().ok())
-                            .collect();
-                        info!(bot_id = bot.id, "Loading dynamic Telegram bot");
-                        dynamic_telegram_bots.push(Arc::new(TelegramChannel::new(
-                            &bot.bot_token,
-                            allowed_user_ids,
-                            telegram_owner_ids.clone(),
-                            Arc::clone(&agent),
-                            config_path.clone(),
-                            session_map.clone(),
-                            task_registry.clone(),
-                            config.files.enabled,
-                            PathBuf::from(&inbox_dir),
-                            config.files.max_file_size_mb,
-                            state.clone(),
-                            watchdog_stale_threshold_secs,
-                        )));
-                    }
-                    #[cfg(feature = "discord")]
-                    "discord" => {
-                        let allowed_user_ids: Vec<u64> = bot
-                            .allowed_user_ids
-                            .iter()
-                            .filter_map(|s| s.parse::<u64>().ok())
-                            .collect();
-                        let extra: serde_json::Value =
-                            serde_json::from_str(&bot.extra_config).unwrap_or_default();
-                        let guild_id = extra["guild_id"].as_u64();
-                        info!(bot_id = bot.id, "Loading dynamic Discord bot");
-                        dynamic_discord_bots.push(Arc::new(DiscordChannel::new(
-                            &bot.bot_token,
-                            allowed_user_ids,
-                            discord_owner_ids.clone(),
-                            guild_id,
-                            Arc::clone(&agent),
-                            config_path.clone(),
-                            session_map.clone(),
-                            task_registry.clone(),
-                            config.files.enabled,
-                            PathBuf::from(&inbox_dir),
-                            config.files.max_file_size_mb,
-                            state.clone(),
-                            watchdog_stale_threshold_secs,
-                        )));
-                    }
-                    #[cfg(feature = "slack")]
-                    "slack" => {
-                        if let Some(app_token) = &bot.app_token {
-                            let extra: serde_json::Value =
-                                serde_json::from_str(&bot.extra_config).unwrap_or_default();
-                            let use_threads = extra["use_threads"].as_bool().unwrap_or(false);
-                            info!(bot_id = bot.id, "Loading dynamic Slack bot");
-                            dynamic_slack_bots.push(Arc::new(SlackChannel::new(
-                                app_token,
-                                &bot.bot_token,
-                                bot.allowed_user_ids.clone(),
-                                use_threads,
-                                Arc::clone(&agent),
-                                config_path.clone(),
-                                session_map.clone(),
-                                task_registry.clone(),
-                                config.files.enabled,
-                                PathBuf::from(&inbox_dir),
-                                config.files.max_file_size_mb,
-                                state.clone(),
-                                watchdog_stale_threshold_secs,
-                            )));
-                        }
-                    }
-                    _ => {
-                        tracing::warn!(
-                            bot_id = bot.id,
-                            channel_type = %bot.channel_type,
-                            "Unknown dynamic bot channel type, skipping"
-                        );
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to load dynamic bots: {}", e);
-        }
-    };
-
-    #[allow(unused_mut)]
-    let mut channels: Vec<Arc<dyn Channel>> = telegram_bots
-        .iter()
-        .map(|t| t.clone() as Arc<dyn Channel>)
-        .collect();
-    // Add dynamic Telegram bots to channels
-    channels.extend(
-        dynamic_telegram_bots
-            .iter()
-            .map(|t| t.clone() as Arc<dyn Channel>),
-    );
-    #[cfg(feature = "discord")]
-    {
-        channels.extend(discord_bots.iter().map(|d| d.clone() as Arc<dyn Channel>));
-        channels.extend(
-            dynamic_discord_bots
-                .iter()
-                .map(|d| d.clone() as Arc<dyn Channel>),
-        );
-    }
-    #[cfg(feature = "slack")]
-    {
-        channels.extend(slack_bots.iter().map(|s| s.clone() as Arc<dyn Channel>));
-        channels.extend(
-            dynamic_slack_bots
-                .iter()
-                .map(|s| s.clone() as Arc<dyn Channel>),
-        );
-    }
-    info!(count = channels.len(), "Channels registered");
+    // 11. Channels
+    let channel_bundle = startup_channels::build_channels(
+        &config,
+        agent.clone(),
+        config_path.clone(),
+        session_map.clone(),
+        task_registry.clone(),
+        &inbox_dir,
+        state.clone(),
+        watchdog_stale_threshold_secs,
+    )
+    .await;
 
     // 12. Channel Hub — routes approvals, media, and notifications
-    let hub = Arc::new(ChannelHub::new(channels, session_map));
+    let hub = Arc::new(
+        ChannelHub::new(channel_bundle.channels.clone(), session_map)
+            .with_queue_telemetry(queue_telemetry.clone())
+            .with_queue_policy(queue_policy.clone()),
+    );
 
     // Give the spawn tool a reference to the hub for background mode notifications.
     if let Some(st) = spawn_tool {
@@ -1118,30 +602,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // Give all channels a reference to the hub for dynamic bot registration
     let weak_hub = Arc::downgrade(&hub);
-    for tg in &telegram_bots {
-        tg.set_channel_hub(weak_hub.clone());
-    }
-    for tg in &dynamic_telegram_bots {
-        tg.set_channel_hub(weak_hub.clone());
-    }
-    #[cfg(feature = "discord")]
-    {
-        for dc in &discord_bots {
-            dc.set_channel_hub(weak_hub.clone());
-        }
-        for dc in &dynamic_discord_bots {
-            dc.set_channel_hub(weak_hub.clone());
-        }
-    }
-    #[cfg(feature = "slack")]
-    {
-        for sc in &slack_bots {
-            sc.set_channel_hub(weak_hub.clone());
-        }
-        for sc in &dynamic_slack_bots {
-            sc.set_channel_hub(weak_hub.clone());
-        }
-    }
+    channel_bundle.set_channel_hub_for_all(weak_hub);
 
     // Start approval listener (routes tool approval requests to the right channel)
     let hub_for_approvals = hub.clone();
@@ -1157,28 +618,23 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // Inbox cleanup is now registered with the heartbeat coordinator below.
 
+    let default_alert_sessions = collect_default_alert_sessions(&config);
+    match serde_json::to_string(&default_alert_sessions) {
+        Ok(serialized) => {
+            if let Err(e) = state
+                .set_setting("default_alert_sessions", &serialized)
+                .await
+            {
+                warn!(error = %e, "Failed to persist default alert sessions");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to serialize default alert sessions");
+        }
+    }
+
     // 12b. Health Probe Manager (uses health_store created earlier in 1d)
     if let Some(ref store) = health_store {
-        // Collect default alert session IDs from first bot of each platform
-        let mut default_alert_sessions: Vec<String> = Vec::new();
-        if let Some(first_telegram) = config.all_telegram_bots().first() {
-            for uid in &first_telegram.allowed_user_ids {
-                default_alert_sessions.push(uid.to_string());
-            }
-        }
-        #[cfg(feature = "discord")]
-        if let Some(first_discord) = config.all_discord_bots().first() {
-            for uid in &first_discord.allowed_user_ids {
-                default_alert_sessions.push(format!("discord:dm:{}", uid));
-            }
-        }
-        #[cfg(feature = "slack")]
-        if let Some(first_slack) = config.all_slack_bots().first() {
-            for uid in &first_slack.allowed_user_ids {
-                default_alert_sessions.push(format!("slack:{}", uid));
-            }
-        }
-
         let health_manager = Arc::new(HealthProbeManager::new(
             store.clone(),
             hub.clone(),
@@ -1224,6 +680,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                     policy_window_days: config.policy.classify_retirement_window_days,
                     policy_max_divergence: config.policy.classify_retirement_max_divergence as f64,
                     policy_uncertainty_threshold: config.policy.uncertainty_clarify_threshold,
+                    write_consistency_thresholds,
+                    queue_telemetry: queue_telemetry.clone(),
                     auth_failures: std::sync::Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
@@ -1287,11 +745,48 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         }
     }
     let notify_session_ids_for_events = notify_session_ids.clone();
+    let queue_telemetry_for_events = queue_telemetry.clone();
+    let queue_policy_for_events = queue_policy.clone();
     tokio::spawn(async move {
         let notify_session_ids = notify_session_ids_for_events;
+        let mut fair_session_budget: SessionFairnessBudget = HashMap::new();
         loop {
             match event_rx.recv().await {
                 Ok(event) => {
+                    let trigger_depth = event_rx.len().saturating_add(1);
+                    queue_telemetry_for_events.mark_trigger_received();
+                    let pressure = queue_telemetry_for_events.observe_trigger_depth(trigger_depth);
+                    if pressure.entered_warning {
+                        warn!(
+                            queue = "trigger_events",
+                            depth = trigger_depth,
+                            "Trigger event queue entered warning state"
+                        );
+                    }
+                    if pressure.entered_overload {
+                        warn!(
+                            queue = "trigger_events",
+                            depth = trigger_depth,
+                            "Trigger event queue entered overload state"
+                        );
+                    }
+                    let should_shed = !event.trusted
+                        && should_shed_due_to_overload(
+                            &queue_policy_for_events.lanes.trigger,
+                            pressure.pressure,
+                            &mut fair_session_budget,
+                            &event.session_id,
+                        );
+                    if should_shed {
+                        queue_telemetry_for_events.mark_trigger_dropped(1);
+                        queue_telemetry_for_events.mark_trigger_completed();
+                        warn!(
+                            source = %event.source,
+                            session_id = %event.session_id,
+                            "Dropping untrusted trigger event due to configured overload shedding policy"
+                        );
+                        continue;
+                    }
                     info!(source = %event.source, "Received trigger event");
                     // Wrap trigger content so the LLM sees it as external/untrusted data.
                     // The session_id also contains "trigger" which causes execute_tool to
@@ -1326,13 +821,17 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                             hub_for_events
                                 .broadcast_text(&notify_session_ids, &reply)
                                 .await;
+                            queue_telemetry_for_events.mark_trigger_completed();
                         }
                         Err(e) => {
+                            queue_telemetry_for_events.mark_trigger_failed();
+                            queue_telemetry_for_events.mark_trigger_completed();
                             tracing::error!("Agent error handling trigger event: {}", e);
                         }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    queue_telemetry_for_events.mark_trigger_dropped(n as u64);
                     tracing::warn!("Event listener lagged by {} events", n);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -1354,67 +853,12 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         info!(mode = ?config.updates.mode, "Self-updater initialized");
     }
 
-    // 15. Send startup notification to first Telegram bot's allowed users
-    // This lets users know the daemon is back after a /restart.
-    // For multi-bot setups, only the first bot sends notifications (others will show
-    // online status when users interact with them).
-    if let Some(first_tg) = telegram_bots.first() {
-        if let Some(first_config) = config.all_telegram_bots().first() {
-            for user_id in &first_config.allowed_user_ids {
-                let _ = first_tg
-                    .send_text(&user_id.to_string(), "aidaemon is online.")
-                    .await;
-            }
-        }
-    }
+    // 15. Send startup notification to first Telegram bot's allowed users.
+    channel_bundle.send_startup_notifications(&config).await;
 
     // 16. Start channels
     info!("Starting aidaemon v0.1.0");
-
-    // Spawn Discord and Slack as background tasks (non-blocking).
-    #[cfg(feature = "discord")]
-    {
-        for dc in discord_bots {
-            tokio::spawn(async move {
-                dc.start_with_retry().await;
-            });
-        }
-        // Spawn dynamic Discord bots
-        for dc in dynamic_discord_bots {
-            tokio::spawn(async move {
-                dc.start_with_retry().await;
-            });
-        }
-    }
-
-    #[cfg(feature = "slack")]
-    {
-        for sc in slack_bots {
-            tokio::spawn(async move {
-                sc.start_with_retry().await;
-            });
-        }
-        // Spawn dynamic Slack bots
-        for sc in dynamic_slack_bots {
-            tokio::spawn(async move {
-                sc.start_with_retry().await;
-            });
-        }
-    }
-
-    // Spawn dynamic Telegram bots as background tasks
-    for tg in dynamic_telegram_bots {
-        tokio::spawn(async move {
-            tg.start_with_retry().await;
-        });
-    }
-
-    // Spawn all config-based Telegram bots as background tasks.
-    for tg in telegram_bots {
-        tokio::spawn(async move {
-            tg.start_with_retry().await;
-        });
-    }
+    channel_bundle.spawn_all();
 
     // Wait for shutdown signal (ctrl+c), then gracefully pause plans
     info!("All subsystems started, waiting for shutdown signal (ctrl+c)");

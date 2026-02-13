@@ -104,7 +104,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-release-
 
       - name: Build release
-        run: cargo build --release --features "browser,slack,discord"
+        run: cargo build --release --features "browser"
 
   coverage:
     name: Code coverage

@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 
 use crate::traits::{Tool, ToolCapabilities, ToolRole};
 
+use super::daemon_guard::detect_daemonization_primitives;
 use super::fs_utils;
 
 pub struct RunCommandTool;
@@ -172,6 +173,15 @@ impl Tool for RunCommandTool {
             anyhow::bail!(
                 "Command '{}' is not in the safe command list. Use 'terminal' for this command.\n\nSafe prefixes include: cargo, npm, pytest, go, git (read-only), ls, make, etc.",
                 trimmed.split_whitespace().next().unwrap_or(trimmed)
+            );
+        }
+
+        let daemon_hits = detect_daemonization_primitives(trimmed);
+        if !daemon_hits.is_empty() {
+            anyhow::bail!(
+                "Daemonization primitives are blocked in run_command ({}). \
+                 Use terminal and explicit owner approval if detached/background execution is truly needed.",
+                daemon_hits.join(", ")
             );
         }
 
@@ -364,6 +374,17 @@ mod tests {
         let result = RunCommandTool.call(&args).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Shell operators"));
+    }
+
+    #[tokio::test]
+    async fn test_run_daemonization_rejected() {
+        let args = json!({"command": "cargo test &"}).to_string();
+        let result = RunCommandTool.call(&args).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Daemonization primitives"));
     }
 
     #[tokio::test]

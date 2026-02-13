@@ -391,12 +391,6 @@ impl DiscordChannel {
                             let now = SystemTime::now().duration_since(UNIX_EPOCH)
                                 .unwrap_or_default().as_secs();
                             if now.saturating_sub(last_hb) > stale_threshold_secs {
-                                let stale_mins = (now - last_hb) / 60;
-                                let _ = typing_channel.say(&typing_http, format!(
-                                    "⚠️ No activity for {} minutes. The task may be stuck. \
-                                     Type `cancel` to stop it, or wait for it to recover.",
-                                    stale_mins
-                                )).await;
                                 break; // Stop typing indicator
                             }
                         }
@@ -606,8 +600,15 @@ impl DiscordChannel {
         let http = ctx.http.clone();
         tokio::spawn(async move {
             let result = tokio::select! {
-                r = agent.handle_message(&session_id, &text, Some(status_tx), user_role, channel_ctx, Some(heartbeat)) => r,
+                r = agent.handle_message(&session_id, &text, Some(status_tx), user_role, channel_ctx, Some(heartbeat.clone())) => r,
                 _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
+                stale_mins = super::wait_for_stale_heartbeat(heartbeat.clone(), stale_threshold_secs, 8), if stale_threshold_secs > 0 => {
+                    Err(anyhow::anyhow!(
+                        "Task auto-cancelled due to inactivity ({} minute{} without progress).",
+                        stale_mins,
+                        if stale_mins == 1 { "" } else { "s" }
+                    ))
+                },
             };
             typing_cancel.cancel();
             let _ = status_task.await;
@@ -629,6 +630,11 @@ impl DiscordChannel {
                     // Don't notify user about task cancellation - it's expected when they send a new message
                     if error_msg == "Task cancelled" {
                         info!("Task #{} cancelled (new message received)", task_id);
+                        return;
+                    }
+                    if error_msg.starts_with("Task auto-cancelled due to inactivity") {
+                        info!("Task #{} auto-cancelled by stale watchdog", task_id);
+                        let _ = channel_id.say(&http, format!("⚠️ {}", error_msg)).await;
                         return;
                     }
                     warn!("Agent error: {}", e);

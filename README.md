@@ -21,8 +21,8 @@ If you don't care about resource usage and want more channels (WhatsApp, Signal,
 
 ### Channels
 - **Telegram interface** - chat with your AI assistant from any device
-- **Slack integration** - Socket Mode support with threads, file sharing, and inline approvals (feature flag: `--features slack`)
-- **Discord integration** - bot with slash commands and thread support (feature flag: `--features discord`)
+- **Slack integration** - Socket Mode support with threads, file sharing, and inline approvals
+- **Discord integration** - bot with slash commands and thread support
 - **Dynamic bot management** - add or list bots at runtime via `/connect` and `/bots` commands, no restart needed
 - **Multi-bot support** - run multiple Telegram, Slack, and Discord bots from a single daemon
 
@@ -117,7 +117,7 @@ cargo build --release
 The wizard will guide you through:
 1. Selecting your LLM provider (OpenAI, OpenRouter, Ollama, Google AI Studio, Anthropic, etc.)
 2. Entering your API key
-3. Setting up your Telegram bot token and user ID
+3. Selecting and setting up one or more channels (Telegram, Slack, Discord)
 
 ## Configuration
 
@@ -163,8 +163,7 @@ allowed_user_ids = [123456789]
 ```
 
 ### Slack
-
-Requires building with `--features slack`:
+Enabled by default in standard builds:
 
 ```toml
 [slack]
@@ -175,6 +174,7 @@ use_threads = true               # Reply in threads (default: true)
 ```
 
 Slack is activated automatically when both `app_token` and `bot_token` are set.
+If you want a minimal binary, build with `--no-default-features` and re-enable only what you need.
 
 ### Terminal Tool
 

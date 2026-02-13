@@ -1,8 +1,9 @@
 //! LLM-based plan step generation.
 
 use serde_json::json;
+use std::sync::Arc;
 
-use crate::traits::ModelProvider;
+use crate::traits::{ModelProvider, StateStore};
 
 const PLAN_GENERATION_PROMPT: &str = r#"You are a task planner. Given a user request, break it down into discrete, actionable steps.
 
@@ -40,12 +41,21 @@ pub async fn generate_plan_steps(
     provider: &dyn ModelProvider,
     model: &str,
     user_message: &str,
+    state: Option<&Arc<dyn StateStore>>,
 ) -> anyhow::Result<Vec<String>> {
     let prompt = format!("{}{}", PLAN_GENERATION_PROMPT, user_message);
 
     let messages = vec![json!({"role": "user", "content": prompt})];
 
     let response = provider.chat(model, &messages, &[]).await?;
+
+    // Track token usage for plan generation LLM calls
+    if let (Some(state), Some(usage)) = (state, &response.usage) {
+        let _ = state
+            .record_token_usage("background:plan_generation", usage)
+            .await;
+    }
+
     let text = response
         .content
         .ok_or_else(|| anyhow::anyhow!("Empty response from plan generation"))?;

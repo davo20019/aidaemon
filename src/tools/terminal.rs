@@ -11,12 +11,16 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::events::{ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, EventStore, EventType};
+use crate::events::{
+    ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, EventStore, EventType,
+};
 use crate::traits::{Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
 use super::command_risk::{classify_command, PermissionMode, RiskLevel};
+use super::daemon_guard::detect_daemonization_primitives;
+use super::process_control::{configure_command_for_process_group, send_sigkill, send_sigterm};
 
 /// Max bytes per stream buffer (1 MB) to prevent unbounded memory growth.
 const BUFFER_CAP: usize = 1_048_576;
@@ -112,16 +116,6 @@ fn format_output(stdout: &str, stderr: &str, max_chars: usize) -> String {
         result.push_str("\n... (truncated)");
     }
     result
-}
-
-/// Send SIGTERM to a process. Returns true if signal was sent successfully.
-fn send_sigterm(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
-}
-
-/// Send SIGKILL to a process. Returns true if signal was sent successfully.
-fn send_sigkill(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) == 0 }
 }
 
 impl TerminalTool {
@@ -457,12 +451,13 @@ impl TerminalTool {
 
     /// Run a command: spawn, wait up to initial_timeout, return output or move to background.
     async fn handle_run(&self, command: &str) -> anyhow::Result<String> {
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
             .arg(command)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .stderr(std::process::Stdio::piped());
+        configure_command_for_process_group(&mut cmd);
+        let mut child = cmd.spawn()?;
 
         let pid = child.id().unwrap_or(0);
 
@@ -678,6 +673,9 @@ struct TerminalArgs {
     _session_id: String,
     #[serde(default)]
     _task_id: Option<String>,
+    /// Injected by agent for role-aware safeguards.
+    #[serde(default)]
+    _user_role: Option<String>,
     /// Explicitly set by the agent from ChannelContext.trusted — never derived
     /// from session ID strings. Only trusted scheduled tasks set this to true.
     #[serde(default)]
@@ -761,6 +759,56 @@ impl Tool for TerminalTool {
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("command is required for action=\"run\""))?;
 
+                let daemon_hits = detect_daemonization_primitives(command);
+                let mut daemonization_approved = false;
+                if !daemon_hits.is_empty() {
+                    let is_owner = args
+                        ._user_role
+                        .as_deref()
+                        .is_some_and(|role| role.eq_ignore_ascii_case("owner"));
+                    if !is_owner {
+                        return Ok(format!(
+                            "Blocked: daemonization primitives detected ({}) and only owners can approve detached/background process commands.",
+                            daemon_hits.join(", ")
+                        ));
+                    }
+
+                    let mut warnings = vec![
+                        format!(
+                            "Daemonization primitives detected: {}",
+                            daemon_hits.join(", ")
+                        ),
+                        "Detached/background processes may survive cancellation and continue running.".to_string(),
+                    ];
+                    warnings.push("Approve only if this is intentional and necessary.".to_string());
+
+                    match self
+                        .request_approval(
+                            &args._session_id,
+                            command,
+                            RiskLevel::Critical,
+                            warnings,
+                            args._task_id.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(ApprovalResponse::AllowOnce)
+                        | Ok(ApprovalResponse::AllowSession)
+                        | Ok(ApprovalResponse::AllowAlways) => {
+                            daemonization_approved = true;
+                        }
+                        Ok(ApprovalResponse::Deny) => {
+                            return Ok("Daemonizing command denied by owner.".to_string());
+                        }
+                        Err(e) => {
+                            return Ok(format!(
+                                "Could not get owner approval for daemonizing command: {}",
+                                e
+                            ));
+                        }
+                    }
+                }
+
                 // Classify command risk
                 let mut assessment = classify_command(command);
 
@@ -808,7 +856,9 @@ impl Tool for TerminalTool {
                 // Determine if approval is needed
                 // Note: is_allowed() checks both permanent AND session-approved prefixes
                 let is_allowed = self.is_allowed(command).await;
-                let needs_approval = if args._untrusted_source {
+                let needs_approval = if daemonization_approved {
+                    false
+                } else if args._untrusted_source {
                     // External triggers always need approval regardless of mode
                     info!(command = %command, risk = %assessment.level, "Forcing approval: untrusted source");
                     true
@@ -881,6 +931,7 @@ impl Tool for TerminalTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::SqlitePool;
 
     // ── contains_shell_operator tests ──
 
@@ -951,5 +1002,30 @@ mod tests {
         // The content portion before the suffix should be exactly max_chars long
         let prefix = &result[..100];
         assert_eq!(prefix, "a".repeat(100));
+    }
+
+    #[tokio::test]
+    async fn test_daemonization_requires_owner_role() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            1000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"nohup sleep 1 &","_session_id":"s1","_user_role":"Guest"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(response.contains("only owners can approve"));
     }
 }

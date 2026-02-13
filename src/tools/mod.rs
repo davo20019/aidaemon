@@ -64,6 +64,7 @@ pub use skill_resources::SkillResourcesTool;
 pub use use_skill::UseSkillTool;
 pub mod command_patterns;
 pub mod command_risk;
+pub mod daemon_guard;
 pub mod verification;
 pub use verification::VerificationTracker;
 
@@ -82,6 +83,7 @@ pub use project_inspect::ProjectInspectTool;
 mod run_command;
 pub use run_command::RunCommandTool;
 mod git_info;
+pub(crate) mod process_control;
 pub use git_info::GitInfoTool;
 mod git_commit;
 pub use git_commit::GitCommitTool;

@@ -4,6 +4,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
+use crate::config::QueuePolicyConfig;
+use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
+use crate::queue_telemetry::{QueuePressure, QueueTelemetry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::traits::Channel;
@@ -24,6 +27,8 @@ pub struct ChannelHub {
     /// Registered channels. Uses RwLock to support dynamic registration.
     channels: RwLock<Vec<Arc<dyn Channel>>>,
     session_map: SessionMap,
+    queue_telemetry: Option<Arc<QueueTelemetry>>,
+    queue_policy: Option<QueuePolicyConfig>,
 }
 
 impl ChannelHub {
@@ -31,7 +36,19 @@ impl ChannelHub {
         Self {
             channels: RwLock::new(channels),
             session_map,
+            queue_telemetry: None,
+            queue_policy: None,
         }
+    }
+
+    pub fn with_queue_telemetry(mut self, queue_telemetry: Arc<QueueTelemetry>) -> Self {
+        self.queue_telemetry = Some(queue_telemetry);
+        self
+    }
+
+    pub fn with_queue_policy(mut self, queue_policy: QueuePolicyConfig) -> Self {
+        self.queue_policy = Some(queue_policy);
+        self
     }
 
     /// Register a new channel dynamically.
@@ -96,15 +113,73 @@ impl ChannelHub {
     /// Each approval is handled in its own task so the listener doesn't
     /// block while waiting for the user to respond.
     pub async fn approval_listener(self: Arc<Self>, mut rx: mpsc::Receiver<ApprovalRequest>) {
+        let mut fair_session_budget: SessionFairnessBudget = HashMap::new();
         loop {
             let request = match rx.recv().await {
                 Some(r) => r,
                 None => break, // channel closed
             };
+            let approval_depth = rx.len().saturating_add(1);
+            let mut pressure = QueuePressure::Normal;
+            if let Some(queue_telemetry) = &self.queue_telemetry {
+                queue_telemetry.mark_approval_received();
+                let observation = queue_telemetry.observe_approval_depth(approval_depth);
+                pressure = observation.pressure;
+                if observation.entered_warning {
+                    warn!(
+                        queue = "approval",
+                        depth = approval_depth,
+                        "Approval queue entered warning state"
+                    );
+                }
+                if observation.entered_overload {
+                    warn!(
+                        queue = "approval",
+                        depth = approval_depth,
+                        "Approval queue entered overload state"
+                    );
+                }
+            }
+
+            let should_shed = if let Some(queue_policy) = &self.queue_policy {
+                should_shed_due_to_overload(
+                    &queue_policy.lanes.approval,
+                    pressure,
+                    &mut fair_session_budget,
+                    &request.session_id,
+                )
+            } else {
+                false
+            };
+
+            if should_shed {
+                let mut had_error = false;
+                if request.response_tx.send(ApprovalResponse::Deny).is_err() {
+                    had_error = true;
+                    warn!(
+                        session_id = %request.session_id,
+                        "Approval response receiver dropped before overload-shed deny could be sent"
+                    );
+                }
+                if let Some(queue_telemetry) = &self.queue_telemetry {
+                    queue_telemetry.mark_approval_dropped(1);
+                    if had_error {
+                        queue_telemetry.mark_approval_failed();
+                    }
+                    queue_telemetry.mark_approval_completed();
+                }
+                warn!(
+                    session_id = %request.session_id,
+                    "Dropping approval request due to configured overload shedding policy"
+                );
+                continue;
+            }
 
             let hub = self.clone();
             tokio::spawn(async move {
+                let queue_telemetry = hub.queue_telemetry.clone();
                 let channel = hub.channel_for_session(&request.session_id).await;
+                let mut had_error = false;
                 let response = match channel {
                     Some(ch) => {
                         match ch
@@ -120,6 +195,7 @@ impl ChannelHub {
                             Ok(resp) => resp,
                             Err(e) => {
                                 warn!("Approval request failed on {}: {}", ch.name(), e);
+                                had_error = true;
                                 ApprovalResponse::Deny
                             }
                         }
@@ -129,25 +205,107 @@ impl ChannelHub {
                             "No channel found for session {}, denying",
                             request.session_id
                         );
+                        had_error = true;
                         ApprovalResponse::Deny
                     }
                 };
-                let _ = request.response_tx.send(response);
+                if request.response_tx.send(response).is_err() {
+                    had_error = true;
+                    warn!(
+                        session_id = %request.session_id,
+                        "Approval response receiver dropped before response could be sent"
+                    );
+                }
+                if let Some(queue_telemetry) = queue_telemetry {
+                    if had_error {
+                        queue_telemetry.mark_approval_failed();
+                    }
+                    queue_telemetry.mark_approval_completed();
+                }
             });
         }
     }
 
     /// Route media messages from tools to the appropriate channel.
     pub async fn media_listener(self: Arc<Self>, mut rx: mpsc::Receiver<MediaMessage>) {
+        let mut fair_session_budget: SessionFairnessBudget = HashMap::new();
         loop {
             let msg = match rx.recv().await {
                 Some(m) => m,
                 None => break, // channel closed
             };
+            let media_depth = rx.len().saturating_add(1);
+            let mut pressure = QueuePressure::Normal;
+            if let Some(queue_telemetry) = &self.queue_telemetry {
+                queue_telemetry.mark_media_received();
+                let observation = queue_telemetry.observe_media_depth(media_depth);
+                pressure = observation.pressure;
+                if observation.entered_warning {
+                    warn!(
+                        queue = "media",
+                        depth = media_depth,
+                        "Media queue entered warning state"
+                    );
+                }
+                if observation.entered_overload {
+                    warn!(
+                        queue = "media",
+                        depth = media_depth,
+                        "Media queue entered overload state; shedding non-critical media work"
+                    );
+                }
+            }
 
+            let should_shed = if let Some(queue_policy) = &self.queue_policy {
+                should_shed_due_to_overload(
+                    &queue_policy.lanes.media,
+                    pressure,
+                    &mut fair_session_budget,
+                    &msg.session_id,
+                )
+            } else {
+                false
+            };
+
+            if should_shed {
+                let mut had_error = false;
+                if let Some(channel) = self.channel_for_session(&msg.session_id).await {
+                    if let Err(e) = channel
+                        .send_text(
+                            &msg.session_id,
+                            "[Media skipped due high system load. Please retry shortly.]",
+                        )
+                        .await
+                    {
+                        had_error = true;
+                        warn!(
+                            "Failed to send overload media fallback via {}: {}",
+                            channel.name(),
+                            e
+                        );
+                    }
+                } else {
+                    had_error = true;
+                    warn!(
+                        "No channel found for overloaded media session {}",
+                        msg.session_id
+                    );
+                }
+                if let Some(queue_telemetry) = &self.queue_telemetry {
+                    queue_telemetry.mark_media_dropped();
+                    if had_error {
+                        queue_telemetry.mark_media_failed();
+                    }
+                    queue_telemetry.mark_media_completed();
+                }
+                continue;
+            }
+
+            let mut had_error = false;
             if let Some(channel) = self.channel_for_session(&msg.session_id).await {
                 if channel.capabilities().media {
                     if let Err(e) = channel.send_media(&msg.session_id, &msg).await {
+                        had_error = true;
                         warn!("Failed to send media via {}: {}", channel.name(), e);
                     }
                 } else {
@@ -156,11 +314,19 @@ impl ChannelHub {
                         .send_text(&msg.session_id, &format!("[Media] {}", msg.caption))
                         .await
                     {
+                        had_error = true;
                         warn!("Failed to send media caption via {}: {}", channel.name(), e);
                     }
                 }
             } else {
+                had_error = true;
                 warn!("No channel found for media session {}", msg.session_id);
+            }
+            if let Some(queue_telemetry) = &self.queue_telemetry {
+                if had_error {
+                    queue_telemetry.mark_media_failed();
+                }
+                queue_telemetry.mark_media_completed();
             }
         }
     }

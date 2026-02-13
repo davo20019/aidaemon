@@ -37,6 +37,42 @@ allowed_prefixes = ["ls", "cat", "head", "tail", "echo", "date", "whoami", "pwd"
 [daemon]
 health_port = 8080
 
+# [daemon.queue_policy]
+# # Capacity (bounded channels).
+# approval_capacity = 16
+# media_capacity = 16
+# trigger_event_capacity = 64
+#
+# # Depth thresholds as queue fill ratios (0.0-1.0).
+# warning_ratio = 0.75
+# overload_ratio = 0.90
+#
+# # Overload handling.
+# # Lane-specific overload and fairness settings.
+# [daemon.queue_policy.lanes.approval]
+# adaptive_shedding = true
+# fair_sessions = true
+# fair_session_window_secs = 60
+# fair_max_events_per_session = 4
+#
+# [daemon.queue_policy.lanes.media]
+# adaptive_shedding = true
+# fair_sessions = true
+# fair_session_window_secs = 60
+# fair_max_events_per_session = 4
+#
+# [daemon.queue_policy.lanes.trigger]
+# adaptive_shedding = true
+# fair_sessions = true
+# fair_session_window_secs = 60
+# fair_max_events_per_session = 4
+#
+# # Legacy shared knobs (still accepted; applied to all lanes when lane settings are default).
+# # adaptive_shedding = true
+# # fair_trigger_sessions = true
+# # fair_trigger_session_window_secs = 60
+# # fair_trigger_max_events_per_session = 4
+
 # [skills]
 # enabled = true
 # dir = "skills"    # relative to config.toml location
@@ -107,6 +143,13 @@ health_port = 8080
 # classify_retirement_enabled = true
 # classify_retirement_window_days = 7
 # classify_retirement_max_divergence = 0.05
+#
+# [policy.write_consistency]
+# # Guardrail thresholds for dual-write drift checks.
+# max_abs_global_delta = 3
+# max_session_mismatch_count = 0
+# max_stale_task_starts = 0
+# max_missing_message_id_events = 0
 
 [diagnostics]
 enabled = true

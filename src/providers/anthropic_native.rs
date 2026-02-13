@@ -292,6 +292,7 @@ impl ModelProvider for AnthropicNativeProvider {
             tool_calls,
             usage,
             thinking: None,
+            response_note: None,
         })
     }
 

@@ -35,6 +35,8 @@ tr:last-child td { border-bottom: none; }
 .badge { display: inline-block; font-size: .75rem; padding: .1rem .4rem; border-radius: 4px; }
 .badge-ok { background: #34c75920; color: #30d158; }
 .badge-paused { background: #ff9f0a20; color: #ff9f0a; }
+.badge-warn { background: #ffcc0022; color: #b45309; }
+.badge-err { background: #ff3b3022; color: #d70015; }
 .empty { color: var(--fg2); font-style: italic; font-size: .85rem; }
 #auth-overlay { position: fixed; inset: 0; background: var(--bg); display: flex; align-items: center; justify-content: center; z-index: 100; }
 #auth-box { text-align: center; }
@@ -72,9 +74,17 @@ tr:last-child td { border-bottom: none; }
       <h2>Maintenance Jobs</h2>
       <div id="maintenance-body"></div>
     </div>
+    <div class="card wide" id="queues-card">
+      <h2>Queue Health</h2>
+      <div id="queues-body"></div>
+    </div>
     <div class="card wide" id="policy-card">
       <h2>Policy Metrics</h2>
       <div id="policy-body"></div>
+    </div>
+    <div class="card wide" id="writes-card">
+      <h2>Write Consistency</h2>
+      <div id="writes-body"></div>
     </div>
     <div class="card wide" id="usage-card">
       <h2>Token Usage (7 days)</h2>
@@ -246,7 +256,98 @@ async function fetchPolicyMetrics() {
   }
 }
 
-function fetchAll() { fetchStatus(); fetchUsage(); fetchSessions(); fetchTasks(); fetchMaintenanceJobs(); fetchPolicyMetrics(); }
+async function fetchQueues() {
+  try {
+    const payload = await api('/api/queues');
+    const rows = payload.queues || [];
+    if (!rows.length) {
+      document.getElementById('queues-body').innerHTML = '<p class="empty">Queue telemetry unavailable</p>';
+      return;
+    }
+    let html = '<table><tr><th>Queue</th><th>Depth</th><th>Saturation</th><th>High-Water</th><th>Dropped</th><th>Failed</th><th>Overload Events</th><th>Status</th></tr>';
+    for (const r of rows) {
+      const saturation = ((r.saturation || 0) * 100).toFixed(0) + '%';
+      const depth = String(r.current_depth) + ' / ' + String(r.capacity);
+      let status = '<span class="badge badge-ok">normal</span>';
+      if (r.overload_active) status = '<span class="badge badge-err">overload</span>';
+      else if (r.current_depth >= r.warn_depth) status = '<span class="badge badge-warn">warning</span>';
+      html += '<tr>'
+        + '<td class="mono">' + esc(r.name) + '</td>'
+        + '<td class="mono">' + esc(depth) + '</td>'
+        + '<td>' + esc(saturation) + '</td>'
+        + '<td>' + fmtNum(r.high_watermark) + '</td>'
+        + '<td>' + fmtNum(r.dropped_total) + '</td>'
+        + '<td>' + fmtNum(r.failed_total) + '</td>'
+        + '<td>' + fmtNum(r.overload_events_total) + '</td>'
+        + '<td>' + status + '</td>'
+        + '</tr>';
+    }
+    html += '</table>';
+    document.getElementById('queues-body').innerHTML = html;
+  } catch {
+    document.getElementById('queues-body').innerHTML = '<p class="empty">Queue telemetry unavailable</p>';
+  }
+}
+
+async function fetchWriteConsistency() {
+  try {
+    const d = await api('/api/writes/consistency');
+    if (d.error) {
+      document.getElementById('writes-body').innerHTML = '<p class="empty">' + esc(d.error) + '</p>';
+      return;
+    }
+    const gate = d.gate || {};
+    const gateBadge = gate.passed
+      ? '<span class="badge badge-ok">PASS</span>'
+      : '<span class="badge badge-warn">WARN</span>';
+    const thresholds = gate.thresholds || {};
+    let html = '<table><tr><th>Metric</th><th>Value</th></tr>';
+    html += '<tr><td>Generated At</td><td class="mono">' + esc(fmtTs(d.generated_at)) + '</td></tr>';
+    html += '<tr><td>Consistency Gate</td><td>' + gateBadge + '</td></tr>';
+    html += '<tr><td>Messages Table Present</td><td class="mono">' + (d.messages_table_present ? 'yes' : 'no (event-only mode)') + '</td></tr>';
+    html += '<tr><td>Message Rows</td><td class="mono">' + fmtNum(d.conversation_message_rows) + '</td></tr>';
+    html += '<tr><td>Event Rows</td><td class="mono">' + fmtNum(d.conversation_event_rows) + '</td></tr>';
+    html += '<tr><td>Missing Message IDs</td><td class="mono">' + fmtNum(d.missing_message_id_events) + '</td></tr>';
+    html += '<tr><td>Global Delta</td><td class="mono">' + fmtNum(d.global_delta) + '</td></tr>';
+    html += '<tr><td>Sessions with Drift</td><td class="mono">' + fmtNum(d.session_mismatch_count) + '</td></tr>';
+    html += '<tr><td>Stale Task Starts</td><td class="mono">' + fmtNum(d.stale_task_starts) + '</td></tr>';
+    if (thresholds.max_abs_global_delta != null) {
+      html += '<tr><td>Gate Thresholds</td><td class="mono">delta&lt;=' + fmtNum(thresholds.max_abs_global_delta)
+        + ', mismatches&lt;=' + fmtNum(thresholds.max_session_mismatch_count)
+        + ', stale&lt;=' + fmtNum(thresholds.max_stale_task_starts)
+        + ', missing_ids&lt;=' + fmtNum(thresholds.max_missing_message_id_events) + '</td></tr>';
+    }
+    html += '</table>';
+    if (gate.reasons && gate.reasons.length) {
+      html += '<div style="margin-top:.5rem"></div>';
+      html += '<table><tr><th>Guardrail Warnings</th></tr>';
+      for (const reason of gate.reasons) {
+        html += '<tr><td>' + esc(reason) + '</td></tr>';
+      }
+      html += '</table>';
+    }
+
+    const drifts = d.top_session_drifts || [];
+    if (drifts.length) {
+      html += '<div style="margin-top:.75rem"></div>';
+      html += '<table><tr><th>Session</th><th>Messages</th><th>Events</th><th>Delta</th></tr>';
+      for (const r of drifts) {
+        html += '<tr>'
+          + '<td class="mono truncate">' + esc(r.session_id) + '</td>'
+          + '<td>' + fmtNum(r.message_rows) + '</td>'
+          + '<td>' + fmtNum(r.event_rows) + '</td>'
+          + '<td class="mono">' + fmtNum(r.delta) + '</td>'
+          + '</tr>';
+      }
+      html += '</table>';
+    }
+    document.getElementById('writes-body').innerHTML = html;
+  } catch {
+    document.getElementById('writes-body').innerHTML = '<p class="empty">Write consistency report unavailable</p>';
+  }
+}
+
+function fetchAll() { fetchStatus(); fetchUsage(); fetchSessions(); fetchTasks(); fetchMaintenanceJobs(); fetchQueues(); fetchPolicyMetrics(); fetchWriteConsistency(); }
 
 // Startup
 if (TOKEN) { tryConnect(); } else { showAuth(); }

@@ -272,6 +272,7 @@ pub async fn summarize_messages(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
     messages: &[Value],
+    state: Option<&Arc<dyn StateStore>>,
 ) -> anyhow::Result<String> {
     // Build a condensed representation of messages for the LLM
     let mut conversation_text = String::new();
@@ -310,6 +311,13 @@ pub async fn summarize_messages(
     ];
 
     let response = provider.chat(model, &llm_messages, &[]).await?;
+
+    // Track token usage for summarization LLM calls
+    if let (Some(state), Some(usage)) = (state, &response.usage) {
+        let _ = state
+            .record_token_usage("background:summarization", usage)
+            .await;
+    }
 
     response
         .content
@@ -386,6 +394,7 @@ pub async fn extract_inline_facts(
     model: &str,
     user_message: &str,
     assistant_response: &str,
+    state: Option<&Arc<dyn StateStore>>,
 ) -> anyhow::Result<Vec<InlineFact>> {
     // Acquire semaphore permit to limit concurrent extraction calls
     let _permit = EXTRACTION_SEMAPHORE.acquire().await?;
@@ -420,6 +429,13 @@ pub async fn extract_inline_facts(
     ];
 
     let response = provider.chat(model, &llm_messages, &[]).await?;
+
+    // Track token usage for progressive extraction LLM calls
+    if let (Some(state), Some(usage)) = (state, &response.usage) {
+        let _ = state
+            .record_token_usage("background:progressive_extraction", usage)
+            .await;
+    }
 
     let text = match response.content {
         Some(t) => t,
@@ -472,7 +488,15 @@ pub fn spawn_progressive_extraction(
     assistant_response: String,
 ) {
     tokio::spawn(async move {
-        match extract_inline_facts(&provider, &fast_model, &user_text, &assistant_response).await {
+        match extract_inline_facts(
+            &provider,
+            &fast_model,
+            &user_text,
+            &assistant_response,
+            Some(&state),
+        )
+        .await
+        {
             Ok(facts) if !facts.is_empty() => {
                 for fact in facts {
                     if let Err(e) = state
@@ -537,7 +561,7 @@ pub fn spawn_incremental_summarization(
             })
             .collect();
 
-        match summarize_messages(&provider, &fast_model, &to_summarize).await {
+        match summarize_messages(&provider, &fast_model, &to_summarize, Some(&state)).await {
             Ok(text) => {
                 let last_msg_id = history[to_summarize_count - 1].id.clone();
                 let summary = crate::traits::ConversationSummary {

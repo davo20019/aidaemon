@@ -4537,6 +4537,7 @@ async fn test_consultant_pass_empty_response_not_intercepted() {
                 model: "mock".to_string(),
             }),
             thinking: None,
+            response_note: None,
         },
         MockProvider::text_response("Fallback response."),
     ]);
@@ -4563,9 +4564,9 @@ async fn test_consultant_pass_empty_response_not_intercepted() {
     // The exact behavior depends on depth/iteration, but it should not panic.
 }
 
-/// Regression: when the execution loop returns empty content with no tool calls
-/// after consultant pass, the fallback response should be persisted and task
-/// completion should be emitted (no silent early return).
+/// Regression: when the execution loop keeps returning empty content with no
+/// tool calls after consultant pass, the agent should attempt one recovery
+/// pass, then persist the fallback response and emit task completion.
 #[tokio::test]
 async fn test_empty_execution_response_persists_fallback_message() {
     let provider = MockProvider::with_responses(vec![
@@ -4579,8 +4580,9 @@ async fn test_empty_execution_response_persists_fallback_message() {
                 model: "mock".to_string(),
             }),
             thinking: None,
+            response_note: None,
         },
-        // Execution loop (iteration 2): also empty -> fallback string path.
+        // Execution loop (iteration 2): empty -> one retry nudge.
         ProviderResponse {
             content: Some(String::new()),
             tool_calls: vec![],
@@ -4590,6 +4592,19 @@ async fn test_empty_execution_response_persists_fallback_message() {
                 model: "mock".to_string(),
             }),
             thinking: None,
+            response_note: None,
+        },
+        // Execution loop (iteration 3): still empty -> fallback.
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 20,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
         },
     ]);
 
@@ -4612,7 +4627,7 @@ async fn test_empty_execution_response_persists_fallback_message() {
 
     let expected = "I wasn't able to process that request. Could you try rephrasing?";
     assert_eq!(response, expected);
-    assert_eq!(harness.provider.call_count().await, 2);
+    assert_eq!(harness.provider.call_count().await, 3);
 
     let history = harness.state.get_history("test_session", 10).await.unwrap();
     assert!(
@@ -4622,6 +4637,137 @@ async fn test_empty_execution_response_persists_fallback_message() {
         "Fallback response should be persisted in history. History: {:?}",
         history
     );
+}
+
+#[tokio::test]
+async fn test_empty_execution_response_surfaces_provider_note() {
+    let provider = MockProvider::with_responses(vec![
+        // Consultant pass (iteration 1): empty response, falls through.
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        // Execution loop (iteration 2): empty response with provider note
+        // -> one retry nudge.
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 20,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: Some(
+                "finish reason: SAFETY; candidate safety categories: HARM_CATEGORY_HATE_SPEECH"
+                    .to_string(),
+            ),
+        },
+        // Execution loop (iteration 3): still empty, no note.
+        // The fallback should still surface the previous retry note.
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 20,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+    ]);
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Find my resume and send it",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(response.starts_with("I wasn't able to process that request."));
+    assert!(response.contains("The model returned no usable output (finish reason: SAFETY; candidate safety categories: HARM_CATEGORY_HATE_SPEECH)."));
+    assert!(response.ends_with("Could you try rephrasing?"));
+    assert_eq!(harness.provider.call_count().await, 3);
+
+    let history = harness.state.get_history("test_session", 10).await.unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.as_deref() == Some(response.as_str())),
+        "Fallback response with provider note should be persisted in history. History: {:?}",
+        history
+    );
+}
+
+#[tokio::test]
+async fn test_empty_execution_response_retry_recovers_with_text() {
+    let provider = MockProvider::with_responses(vec![
+        // Consultant pass (iteration 1): empty response, falls through.
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        // Execution loop (iteration 2): empty response -> retry nudge.
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 20,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        // Execution loop (iteration 3): recovery succeeds with text.
+        MockProvider::text_response("Recovered response."),
+    ]);
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Create a page",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Recovered response.");
+    assert_eq!(harness.provider.call_count().await, 3);
+    assert!(!response.contains("I wasn't able to process that request."));
 }
 
 /// When the consultant pass model returns BOTH text AND tool calls on
@@ -4657,6 +4803,7 @@ async fn test_consultant_pass_drops_hallucinated_tool_calls() {
                 model: "mock".to_string(),
             }),
             thinking: None,
+            response_note: None,
         },
         // Iteration 2+: execution loop response
         MockProvider::text_response(
@@ -5792,6 +5939,7 @@ async fn test_orchestrator_drops_tool_calls_for_action_requests() {
                 model: "mock".to_string(),
             }),
             thinking: None,
+            response_note: None,
         },
         // Lightweight executor: tool call
         MockProvider::tool_call_response("system_info", "{}"),

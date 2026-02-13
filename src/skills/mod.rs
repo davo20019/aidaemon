@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 pub mod resources;
@@ -10,7 +11,7 @@ pub use resources::{FileSystemResolver, ResourceEntry, ResourceResolver};
 use crate::tools::sanitize::sanitize_external_content;
 use crate::traits::{
     BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, ModelProvider, Person,
-    PersonFact, Procedure, UserProfile,
+    PersonFact, Procedure, StateStore, UserProfile,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,6 +403,7 @@ pub async fn confirm_skills<'a>(
     fast_model: &str,
     candidates: Vec<&'a Skill>,
     user_message: &str,
+    state: Option<&Arc<dyn StateStore>>,
 ) -> anyhow::Result<Vec<&'a Skill>> {
     if candidates.is_empty() {
         return Ok(candidates);
@@ -427,6 +429,14 @@ pub async fn confirm_skills<'a>(
     ];
 
     let response = provider.chat(fast_model, &messages, &[]).await?;
+
+    // Track token usage for skill confirmation LLM calls
+    if let (Some(state), Some(usage)) = (state, &response.usage) {
+        let _ = state
+            .record_token_usage("background:skill_confirmation", usage)
+            .await;
+    }
+
     let text = response
         .content
         .ok_or_else(|| anyhow::anyhow!("Empty response from skill confirmation LLM"))?;

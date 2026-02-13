@@ -66,6 +66,9 @@ pub struct UserMessageData {
 /// Data for AssistantResponse event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantResponseData {
+    /// Canonical message ID from the messages table (when dual-write is enabled)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     /// The response text content
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -91,6 +94,9 @@ pub struct ToolCallInfo {
     pub name: String,
     /// Arguments as JSON value (not string, for better querying)
     pub arguments: JsonValue,
+    /// Provider-specific metadata (e.g., Gemini thought_signature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<JsonValue>,
 }
 
 // =============================================================================
@@ -126,6 +132,9 @@ pub struct ToolCallData {
 /// Data for ToolResult event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResultData {
+    /// Canonical message ID from the messages table (when dual-write is enabled)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     /// Tool call ID (matches ToolCall event)
     pub tool_call_id: String,
     /// Tool name

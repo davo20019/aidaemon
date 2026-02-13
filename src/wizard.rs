@@ -3,9 +3,9 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(feature = "browser")]
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, MultiSelect, Select};
 #[cfg(not(feature = "browser"))]
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, MultiSelect, Select};
 
 struct ProviderPreset {
     name: &'static str,
@@ -111,6 +111,15 @@ const PRESETS: &[ProviderPreset] = &[
     },
 ];
 
+#[derive(Clone, Copy)]
+enum ChannelSetupChoice {
+    Telegram,
+    #[cfg(feature = "discord")]
+    Discord,
+    #[cfg(feature = "slack")]
+    Slack,
+}
+
 /// Returns true if the wizard ran and we should start the daemon immediately.
 pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     println!();
@@ -214,58 +223,106 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
             .interact_text()?;
     }
 
-    // ── Step 2: Telegram ────────────────────────────────────────────────
+    // ── Step 2: Channels ────────────────────────────────────────────────
     println!();
-    println!("  STEP 2 of 3 — Connect Telegram");
+    println!("  STEP 2 of 3 — Connect channels");
     println!("  ───────────────────────────────");
     println!();
-    println!("  You'll control your AI agent through a Telegram bot.");
-    println!("  Setting this up takes about 60 seconds:");
-    println!();
-    println!("  1. Open Telegram and search for @BotFather");
-    println!("  2. Send /newbot and follow the prompts to name your bot");
-    println!("  3. BotFather will give you a token like 123456:ABC-DEF...");
+    println!("  Select one or more channels to set up now.");
+    println!("  You can always add more later with /connect.");
     println!();
 
-    let bot_token: String = Input::new()
-        .with_prompt("Paste your bot token from BotFather")
-        .interact_text()?;
+    #[cfg(not(feature = "discord"))]
+    println!("  TIP: Rebuild with `--features discord` to enable Discord onboarding.");
+    #[cfg(not(feature = "slack"))]
+    println!("  TIP: Rebuild with `--features slack` to enable Slack onboarding.");
 
-    // Validate bot token
-    println!();
-    println!("  Checking bot token...");
-    match validate_bot_token(&bot_token) {
-        Ok(bot_name) => {
-            println!("  Connected to bot @{}", bot_name);
+    #[allow(unused_mut)]
+    let mut channel_choices: Vec<(String, ChannelSetupChoice)> = vec![(
+        "Telegram (recommended baseline)".to_string(),
+        ChannelSetupChoice::Telegram,
+    )];
+    #[cfg(feature = "discord")]
+    channel_choices.push((
+        "Discord (bot + slash commands)".to_string(),
+        ChannelSetupChoice::Discord,
+    ));
+    #[cfg(feature = "slack")]
+    channel_choices.push((
+        "Slack (Socket Mode + threads)".to_string(),
+        ChannelSetupChoice::Slack,
+    ));
+
+    let channel_labels: Vec<&str> = channel_choices
+        .iter()
+        .map(|(label, _)| label.as_str())
+        .collect();
+    let channel_defaults: Vec<bool> = channel_choices
+        .iter()
+        .map(|(_, choice)| matches!(choice, ChannelSetupChoice::Telegram))
+        .collect();
+
+    let selected_indices = loop {
+        let selected = MultiSelect::new()
+            .with_prompt("Which channels do you want to configure now?")
+            .items(&channel_labels)
+            .defaults(&channel_defaults)
+            .interact()?;
+        if selected.is_empty() {
+            println!("  Please select at least one channel.");
+            continue;
         }
-        Err(e) => {
-            println!("  Warning: Could not verify bot token ({})", e);
-            println!("  The token has been saved — you can fix it later in config.toml.");
+        break selected;
+    };
+
+    let mut selected_channel_names: Vec<String> = Vec::new();
+
+    let mut telegram_bot_token: Option<String> = None;
+    let mut telegram_user_id: Option<u64> = None;
+
+    #[cfg(feature = "discord")]
+    let mut discord_bot_token: Option<String> = None;
+    #[cfg(feature = "discord")]
+    let mut discord_user_id: Option<u64> = None;
+    #[cfg(feature = "discord")]
+    let mut discord_guild_id: Option<u64> = None;
+
+    #[cfg(feature = "slack")]
+    let mut slack_app_token: Option<String> = None;
+    #[cfg(feature = "slack")]
+    let mut slack_bot_token: Option<String> = None;
+    #[cfg(feature = "slack")]
+    let mut slack_user_id: Option<String> = None;
+    #[cfg(feature = "slack")]
+    let mut slack_use_threads: Option<bool> = None;
+
+    for idx in selected_indices {
+        match channel_choices[idx].1 {
+            ChannelSetupChoice::Telegram => {
+                let (bot_token, user_id) = prompt_telegram_setup()?;
+                telegram_bot_token = Some(bot_token);
+                telegram_user_id = Some(user_id);
+                selected_channel_names.push("Telegram".to_string());
+            }
+            #[cfg(feature = "discord")]
+            ChannelSetupChoice::Discord => {
+                let (bot_token, user_id, guild_id) = prompt_discord_setup()?;
+                discord_bot_token = Some(bot_token);
+                discord_user_id = Some(user_id);
+                discord_guild_id = guild_id;
+                selected_channel_names.push("Discord".to_string());
+            }
+            #[cfg(feature = "slack")]
+            ChannelSetupChoice::Slack => {
+                let (app_token, bot_token, user_id, use_threads) = prompt_slack_setup()?;
+                slack_app_token = Some(app_token);
+                slack_bot_token = Some(bot_token);
+                slack_user_id = Some(user_id);
+                slack_use_threads = Some(use_threads);
+                selected_channel_names.push("Slack".to_string());
+            }
         }
     }
-
-    println!();
-    println!("  Now we need your Telegram user ID (a number) so only YOU can");
-    println!("  control the bot. Here's how to find it:");
-    println!();
-    println!("  Option A: Search for @userinfobot on Telegram, send /start");
-    println!("  Option B: Search for @RawDataBot on Telegram, send /start");
-    println!("  Either will reply with your numeric user ID.");
-    println!();
-
-    let user_id: u64 = Input::new()
-        .with_prompt("Your Telegram user ID (numeric)")
-        .validate_with(|input: &String| -> Result<(), &str> {
-            input
-                .trim()
-                .parse::<u64>()
-                .map(|_| ())
-                .map_err(|_| "Please enter a valid numeric user ID")
-        })
-        .interact_text()?
-        .trim()
-        .parse()
-        .expect("already validated");
 
     // ── Step 3: Browser (optional) ──────────────────────────────────────
     println!();
@@ -352,37 +409,111 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     }
 
     // ── Store secrets in OS keychain if available ───────────────────────
-    let (api_key_config, bot_token_config) = {
-        let mut api_val = format!("\"{}\"", api_key);
-        let mut bot_val = format!("\"{}\"", bot_token);
+    let mut any_secret_in_keychain = false;
 
-        match crate::config::store_in_keychain("api_key", &api_key) {
-            Ok(()) => {
-                api_val = "\"keychain\"".to_string();
-                println!("  API key stored in OS keychain.");
-            }
-            Err(e) => {
-                tracing::debug!("Keychain unavailable for api_key: {}", e);
-            }
-        }
-        match crate::config::store_in_keychain("bot_token", &bot_token) {
-            Ok(()) => {
-                bot_val = "\"keychain\"".to_string();
-                println!("  Bot token stored in OS keychain.");
-            }
-            Err(e) => {
-                tracing::debug!("Keychain unavailable for bot_token: {}", e);
-            }
-        }
+    let (api_key_config, api_stored) = secret_config_value("api_key", &api_key);
+    if api_stored {
+        any_secret_in_keychain = true;
+        println!("  API key stored in OS keychain.");
+    }
 
-        if api_val == "\"keychain\"" || bot_val == "\"keychain\"" {
-            println!();
-            println!("  Secrets stored in OS keychain (not in config file).");
-            println!("  To move to a different machine, use environment variables instead.");
+    let mut telegram_bot_token_config: Option<String> = None;
+    if let Some(token) = telegram_bot_token.as_deref() {
+        let (value, stored) = secret_config_value("bot_token", token);
+        telegram_bot_token_config = Some(value);
+        if stored {
+            any_secret_in_keychain = true;
+            println!("  Telegram bot token stored in OS keychain.");
         }
+    }
 
-        (api_val, bot_val)
-    };
+    #[cfg(feature = "discord")]
+    let mut discord_bot_token_config: Option<String> = None;
+    #[cfg(feature = "discord")]
+    if let Some(token) = discord_bot_token.as_deref() {
+        let (value, stored) = secret_config_value("discord_bot_token", token);
+        discord_bot_token_config = Some(value);
+        if stored {
+            any_secret_in_keychain = true;
+            println!("  Discord bot token stored in OS keychain.");
+        }
+    }
+
+    #[cfg(feature = "slack")]
+    let mut slack_app_token_config: Option<String> = None;
+    #[cfg(feature = "slack")]
+    if let Some(token) = slack_app_token.as_deref() {
+        let (value, stored) = secret_config_value("slack_app_token", token);
+        slack_app_token_config = Some(value);
+        if stored {
+            any_secret_in_keychain = true;
+            println!("  Slack app token stored in OS keychain.");
+        }
+    }
+
+    #[cfg(feature = "slack")]
+    let mut slack_bot_token_config: Option<String> = None;
+    #[cfg(feature = "slack")]
+    if let Some(token) = slack_bot_token.as_deref() {
+        let (value, stored) = secret_config_value("slack_bot_token", token);
+        slack_bot_token_config = Some(value);
+        if stored {
+            any_secret_in_keychain = true;
+            println!("  Slack bot token stored in OS keychain.");
+        }
+    }
+
+    if any_secret_in_keychain {
+        println!();
+        println!("  Secrets stored in OS keychain (not in config file).");
+        println!("  To move to a different machine, use environment variables instead.");
+    }
+
+    let mut channel_sections = String::new();
+    let mut owner_ids: Vec<(String, String)> = Vec::new();
+
+    if let (Some(bot_token), Some(user_id)) = (telegram_bot_token_config, telegram_user_id) {
+        channel_sections.push_str("\n[telegram]\n");
+        channel_sections.push_str(&format!("bot_token = {bot_token}\n"));
+        channel_sections.push_str(&format!("allowed_user_ids = [{user_id}]\n"));
+        owner_ids.push(("telegram".to_string(), user_id.to_string()));
+    }
+
+    #[cfg(feature = "discord")]
+    if let (Some(bot_token), Some(user_id)) = (discord_bot_token_config, discord_user_id) {
+        channel_sections.push_str("\n[discord]\n");
+        channel_sections.push_str(&format!("bot_token = {bot_token}\n"));
+        channel_sections.push_str(&format!("allowed_user_ids = [{user_id}]\n"));
+        if let Some(guild_id) = discord_guild_id {
+            channel_sections.push_str(&format!("guild_id = {guild_id}\n"));
+        }
+        owner_ids.push(("discord".to_string(), user_id.to_string()));
+    }
+
+    #[cfg(feature = "slack")]
+    if let (Some(app_token), Some(bot_token), Some(user_id), Some(use_threads)) = (
+        slack_app_token_config,
+        slack_bot_token_config,
+        slack_user_id,
+        slack_use_threads,
+    ) {
+        channel_sections.push_str("\n[slack]\n");
+        channel_sections.push_str(&format!("app_token = {app_token}\n"));
+        channel_sections.push_str(&format!("bot_token = {bot_token}\n"));
+        channel_sections.push_str(&format!(
+            "allowed_user_ids = [{}]\n",
+            quote_toml_string(&user_id)
+        ));
+        channel_sections.push_str(&format!("use_threads = {use_threads}\n"));
+        owner_ids.push(("slack".to_string(), user_id));
+    }
+
+    if !owner_ids.is_empty() {
+        channel_sections.push_str("\n[users.owner_ids]\n");
+        for (platform, user_id) in owner_ids {
+            channel_sections.push_str(&format!("{platform} = [{}]\n", quote_toml_string(&user_id)));
+        }
+    }
 
     // ── Write config ────────────────────────────────────────────────────
     let base_url_line = if base_url.is_empty() {
@@ -398,11 +529,7 @@ api_key = {api_key_config}
 [provider.models]
 primary = "{primary}"
 fast = "{fast}"
-smart = "{smart}"
-
-[telegram]
-bot_token = {bot_token_config}
-allowed_user_ids = [{user_id}]
+smart = "{smart}"{channel_sections}
 
 [state]
 db_path = "aidaemon.db"
@@ -427,7 +554,8 @@ health_port = 8080
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 "#,
-        preset.kind
+        preset.kind,
+        channel_sections = channel_sections
     );
 
     std::fs::write(config_path, &config)?;
@@ -453,7 +581,10 @@ health_port = 8080
 
     if start_now {
         println!();
-        println!("  Starting... Send a message to your bot on Telegram!");
+        println!(
+            "  Starting... Send a message on {} to begin!",
+            human_list(&selected_channel_names)
+        );
         println!();
     } else {
         println!();
@@ -462,6 +593,201 @@ health_port = 8080
     }
 
     Ok(start_now)
+}
+
+fn prompt_telegram_setup() -> anyhow::Result<(String, u64)> {
+    println!();
+    println!("  Telegram setup");
+    println!("  1. Open Telegram and search for @BotFather");
+    println!("  2. Send /newbot and follow the prompts");
+    println!("  3. Copy the bot token (looks like 123456:ABC-DEF...)");
+    println!();
+
+    let bot_token: String = Input::new()
+        .with_prompt("Telegram bot token")
+        .interact_text()?;
+
+    println!();
+    println!("  Checking Telegram token...");
+    match validate_bot_token(&bot_token) {
+        Ok(bot_name) => {
+            println!("  Connected to Telegram bot @{}", bot_name);
+        }
+        Err(e) => {
+            println!("  Warning: Could not verify Telegram token ({})", e);
+            println!("  The token has been saved — you can fix it later in config.toml.");
+        }
+    }
+
+    println!();
+    println!("  Find your Telegram user ID via @userinfobot or @RawDataBot.");
+    println!();
+
+    let user_id: u64 = Input::new()
+        .with_prompt("Your Telegram user ID (numeric)")
+        .validate_with(|input: &String| -> Result<(), &str> {
+            input
+                .trim()
+                .parse::<u64>()
+                .map(|_| ())
+                .map_err(|_| "Please enter a valid numeric user ID")
+        })
+        .interact_text()?
+        .trim()
+        .parse()
+        .expect("already validated");
+
+    Ok((bot_token, user_id))
+}
+
+#[cfg(feature = "discord")]
+fn prompt_discord_setup() -> anyhow::Result<(String, u64, Option<u64>)> {
+    println!();
+    println!("  Discord setup");
+    println!("  1. Create an app at https://discord.com/developers/applications");
+    println!("  2. Add a bot user and copy its token");
+    println!("  3. Invite the bot to your server (or use DMs)");
+    println!();
+
+    let bot_token: String = Input::new()
+        .with_prompt("Discord bot token")
+        .interact_text()?;
+
+    println!();
+    println!("  Checking Discord token...");
+    match validate_discord_bot_token(&bot_token) {
+        Ok(bot_name) => println!("  Connected to Discord bot {}", bot_name),
+        Err(e) => {
+            println!("  Warning: Could not verify Discord token ({})", e);
+            println!("  The token has been saved — you can fix it later in config.toml.");
+        }
+    }
+
+    println!();
+    println!("  Turn on Developer Mode in Discord to copy your numeric user ID.");
+    println!();
+    let user_id: u64 = Input::new()
+        .with_prompt("Your Discord user ID (numeric)")
+        .validate_with(|input: &String| -> Result<(), &str> {
+            input
+                .trim()
+                .parse::<u64>()
+                .map(|_| ())
+                .map_err(|_| "Please enter a valid numeric user ID")
+        })
+        .interact_text()?
+        .trim()
+        .parse()
+        .expect("already validated");
+
+    let guild_input: String = Input::new()
+        .with_prompt("Optional Discord server (guild) ID (leave blank for any)")
+        .allow_empty(true)
+        .validate_with(|input: &String| -> Result<(), &str> {
+            if input.trim().is_empty() || input.trim().parse::<u64>().is_ok() {
+                Ok(())
+            } else {
+                Err("Please enter a numeric guild ID or leave blank")
+            }
+        })
+        .interact_text()?;
+    let guild_id = if guild_input.trim().is_empty() {
+        None
+    } else {
+        Some(guild_input.trim().parse().expect("already validated"))
+    };
+
+    Ok((bot_token, user_id, guild_id))
+}
+
+#[cfg(feature = "slack")]
+fn prompt_slack_setup() -> anyhow::Result<(String, String, String, bool)> {
+    println!();
+    println!("  Slack setup");
+    println!("  1. Create a Slack app at https://api.slack.com/apps");
+    println!("  2. Enable Socket Mode and copy the app token (xapp-...)");
+    println!("  3. Install the app and copy the bot token (xoxb-...)");
+    println!();
+
+    let bot_token: String = Input::new()
+        .with_prompt("Slack bot token (xoxb-...)")
+        .interact_text()?;
+    let app_token: String = Input::new()
+        .with_prompt("Slack app token (xapp-...)")
+        .interact_text()?;
+
+    println!();
+    println!("  Checking Slack bot token...");
+    match validate_slack_bot_token(&bot_token) {
+        Ok((bot_name, team_name)) => {
+            println!("  Connected to Slack bot {} in {}", bot_name, team_name)
+        }
+        Err(e) => {
+            println!("  Warning: Could not verify Slack bot token ({})", e);
+            println!("  The token has been saved — you can fix it later in config.toml.");
+        }
+    }
+
+    println!("  Checking Slack app token...");
+    match validate_slack_app_token(&app_token) {
+        Ok(()) => println!("  Slack app token is valid."),
+        Err(e) => {
+            println!("  Warning: Could not verify Slack app token ({})", e);
+            println!("  The token has been saved — you can fix it later in config.toml.");
+        }
+    }
+
+    println!();
+    println!("  Find your Slack user ID in your Slack profile (or use /whoami app tools).");
+    println!();
+    let user_id: String = Input::new()
+        .with_prompt("Your Slack user ID (e.g., U12345678)")
+        .validate_with(|input: &String| -> Result<(), &str> {
+            if input.trim().is_empty() {
+                Err("Please enter a Slack user ID")
+            } else {
+                Ok(())
+            }
+        })
+        .interact_text()?;
+    let use_threads = Confirm::new()
+        .with_prompt("Reply in Slack threads?")
+        .default(true)
+        .interact()?;
+
+    Ok((
+        app_token,
+        bot_token,
+        user_id.trim().to_string(),
+        use_threads,
+    ))
+}
+
+fn quote_toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn secret_config_value(keychain_key: &str, secret: &str) -> (String, bool) {
+    match crate::config::store_in_keychain(keychain_key, secret) {
+        Ok(()) => ("\"keychain\"".to_string(), true),
+        Err(e) => {
+            tracing::debug!("Keychain unavailable for {}: {}", keychain_key, e);
+            (quote_toml_string(secret), false)
+        }
+    }
+}
+
+fn human_list(items: &[String]) -> String {
+    match items {
+        [] => "your configured channel".to_string(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let head = &items[..items.len() - 1];
+            let last = &items[items.len() - 1];
+            format!("{}, and {}", head.join(", "), last)
+        }
+    }
 }
 
 /// Validate an API key by making a lightweight request to the provider.
@@ -537,6 +863,73 @@ fn validate_bot_token(token: &str) -> anyhow::Result<String> {
         .unwrap_or("unknown")
         .to_string();
     Ok(username)
+}
+
+#[cfg(feature = "discord")]
+fn validate_discord_bot_token(token: &str) -> anyhow::Result<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let resp = client
+        .get("https://discord.com/api/v10/users/@me")
+        .header("Authorization", format!("Bot {}", token))
+        .send()?;
+    let status = resp.status();
+    let data: serde_json::Value = resp.json().unwrap_or_default();
+
+    if !status.is_success() {
+        let message = data["message"].as_str().unwrap_or("invalid token");
+        anyhow::bail!("{} (HTTP {})", message, status.as_u16());
+    }
+
+    let username = data["username"].as_str().unwrap_or("unknown").to_string();
+    Ok(username)
+}
+
+#[cfg(feature = "slack")]
+fn validate_slack_bot_token(token: &str) -> anyhow::Result<(String, String)> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let resp = client
+        .get("https://slack.com/api/auth.test")
+        .header("Authorization", format!("Bearer {}", token))
+        .send()?;
+    let data: serde_json::Value = resp.json()?;
+
+    if data["ok"].as_bool() != Some(true) {
+        anyhow::bail!(
+            "{}",
+            data["error"].as_str().unwrap_or("invalid Slack bot token")
+        );
+    }
+
+    let user = data["user"].as_str().unwrap_or("unknown").to_string();
+    let team = data["team"].as_str().unwrap_or("unknown").to_string();
+    Ok((user, team))
+}
+
+#[cfg(feature = "slack")]
+fn validate_slack_app_token(token: &str) -> anyhow::Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let resp = client
+        .post("https://slack.com/api/apps.connections.open")
+        .header("Authorization", format!("Bearer {}", token))
+        .send()?;
+    let data: serde_json::Value = resp.json()?;
+
+    if data["ok"].as_bool() != Some(true) {
+        anyhow::bail!(
+            "{}",
+            data["error"].as_str().unwrap_or("invalid Slack app token")
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "browser")]

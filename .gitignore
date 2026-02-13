@@ -35,6 +35,7 @@ __pycache__/
 *.marp.md
 projects/
 sh-vs-ch-pronunciation-guide/
+cms_report/
 
 # Root-level markdown (reports, plans, etc.) — whitelist codebase ones
 /*.md

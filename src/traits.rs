@@ -23,6 +23,7 @@ pub struct Message {
     #[serde(default = "default_importance")]
     pub importance: f32,
     #[serde(skip)] // Don't serialize embedding to JSON (client doesn't need it)
+    #[allow(dead_code)] // Reserved for semantic-memory paths that may be feature-gated.
     pub embedding: Option<Vec<f32>>,
 }
 
@@ -363,6 +364,9 @@ pub struct ProviderResponse {
     /// Internal reasoning from thinking models (e.g. Gemini thought parts).
     /// Not shown to users directly but available as fallback when content is empty.
     pub thinking: Option<String>,
+    /// Optional provider-specific note about why no useful output was returned
+    /// (for example Gemini finishReason/safety blocking metadata).
+    pub response_note: Option<String>,
 }
 
 /// A record of token usage from the database.
@@ -373,6 +377,15 @@ pub struct TokenUsageRecord {
     pub output_tokens: i64,
     #[allow(dead_code)] // Used for database queries
     pub created_at: String,
+}
+
+/// Snapshot of a goal's token budget state.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Goal budget enforcement wiring is staged.
+pub struct GoalTokenBudgetStatus {
+    pub budget_per_check: Option<i64>,
+    pub budget_daily: Option<i64>,
+    pub tokens_used_today: i64,
 }
 
 /// Persistent state store (SQLite + working memory).
@@ -468,6 +481,15 @@ pub trait StateStore: Send + Sync {
     }
     /// Get token usage records since a given datetime string (ISO 8601).
     async fn get_token_usage_since(&self, _since: &str) -> anyhow::Result<Vec<TokenUsageRecord>> {
+        Ok(vec![]) // default no-op
+    }
+    /// Get token usage grouped by session_id since a given datetime.
+    /// Returns Vec of (session_id, total_input_tokens, total_output_tokens, request_count).
+    #[allow(dead_code)] // Used by token usage tooling when that tool is enabled.
+    async fn get_token_usage_by_session(
+        &self,
+        _since: &str,
+    ) -> anyhow::Result<Vec<(String, i64, i64, i64)>> {
         Ok(vec![]) // default no-op
     }
 
@@ -1056,6 +1078,18 @@ pub trait StateStore: Send + Sync {
         Ok(0)
     }
 
+    /// Atomically add tokens to a goal's daily usage counter and return budget status.
+    ///
+    /// Use `delta_tokens = 0` to read the latest counters without modifying them.
+    #[allow(dead_code)] // Goal budget enforcement wiring is staged.
+    async fn add_goal_tokens_and_get_budget_status(
+        &self,
+        _goal_id: &str,
+        _delta_tokens: i64,
+    ) -> anyhow::Result<Option<GoalTokenBudgetStatus>> {
+        Ok(None)
+    }
+
     // ==================== Conversation Summary Methods ====================
     // For context window management — sliding window summarization.
 
@@ -1461,7 +1495,7 @@ pub struct NotificationEntry {
     pub id: String,
     pub goal_id: String,
     pub session_id: String,
-    /// "completed", "failed", "escalation", "progress", "stalled", "evergreen_alert"
+    /// "completed", "failed", "escalation", "progress", "stalled", "evergreen_alert", "token_alert"
     pub notification_type: String,
     /// "critical" (persist indefinitely) or "status_update" (expire after 24h)
     pub priority: String,
@@ -1478,7 +1512,7 @@ impl NotificationEntry {
     pub fn new(goal_id: &str, session_id: &str, notification_type: &str, message: &str) -> Self {
         let now = chrono::Utc::now();
         let priority = match notification_type {
-            "completed" | "failed" | "escalation" | "evergreen_alert" => "critical",
+            "completed" | "failed" | "escalation" | "evergreen_alert" | "token_alert" => "critical",
             _ => "status_update",
         };
         let expires_at = if priority == "status_update" {

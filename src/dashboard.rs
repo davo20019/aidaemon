@@ -18,10 +18,11 @@ use tracing::{info, warn};
 
 use crate::agent;
 use crate::config::ModelsConfig;
-use crate::events::EventStore;
+use crate::events::{EventStore, WriteConsistencyThresholds};
 use crate::health::HealthProbeStore;
 use crate::heartbeat::HeartbeatTelemetry;
 use crate::oauth::OAuthGateway;
+use crate::queue_telemetry::QueueTelemetry;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 const KEYCHAIN_FIELD: &str = "dashboard_token";
@@ -52,6 +53,8 @@ pub struct DashboardState {
     pub policy_window_days: u32,
     pub policy_max_divergence: f64,
     pub policy_uncertainty_threshold: f32,
+    pub write_consistency_thresholds: WriteConsistencyThresholds,
+    pub queue_telemetry: Arc<QueueTelemetry>,
     /// Rate limiter: maps IP address to (failure_count, first_failure_time).
     pub auth_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
 }
@@ -94,6 +97,8 @@ pub fn build_router(state: DashboardState) -> Router {
         .route("/api/sessions", get(api_sessions))
         .route("/api/tasks", get(api_tasks))
         .route("/api/heartbeat/jobs", get(api_heartbeat_jobs))
+        .route("/api/queues", get(api_queues))
+        .route("/api/writes/consistency", get(api_writes_consistency))
         .route("/api/policy/metrics", get(api_policy_metrics))
         .route("/api/health/probes", get(api_health_probes))
         .route("/api/health/history", get(api_health_history))
@@ -450,6 +455,7 @@ async fn api_heartbeat_jobs(State(state): State<DashboardState>) -> Json<serde_j
         "consolidation",
         "memory_decay",
         "event_pruning",
+        "event_task_reconciliation",
         "retention_cleanup",
     ];
     let maintenance_jobs: Vec<_> = jobs
@@ -462,6 +468,43 @@ async fn api_heartbeat_jobs(State(state): State<DashboardState>) -> Json<serde_j
         "jobs": jobs,
         "maintenance_jobs": maintenance_jobs
     }))
+}
+
+async fn api_queues(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let queues = state.queue_telemetry.snapshots();
+    Json(json!({ "queues": queues }))
+}
+
+async fn api_writes_consistency(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let Some(store) = &state.event_store else {
+        return Json(json!({
+            "error": "Event store unavailable"
+        }));
+    };
+
+    match store.write_consistency_report(10).await {
+        Ok(report) => {
+            let gate = report.evaluate_gate_with(state.write_consistency_thresholds);
+            Json(json!({
+                "generated_at": report.generated_at,
+                "messages_table_present": report.messages_table_present,
+                "conversation_message_rows": report.conversation_message_rows,
+                "conversation_event_rows": report.conversation_event_rows,
+                "missing_message_id_events": report.missing_message_id_events,
+                "global_delta": report.global_delta,
+                "session_mismatch_count": report.session_mismatch_count,
+                "stale_task_starts": report.stale_task_starts,
+                "top_session_drifts": report.top_session_drifts,
+                "gate": gate
+            }))
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to build write consistency report");
+            Json(json!({
+                "error": format!("failed to generate report: {}", e)
+            }))
+        }
+    }
 }
 
 async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_json::Value> {

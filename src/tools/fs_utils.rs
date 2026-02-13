@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
+
+use super::process_control::{configure_command_for_process_group, terminate_process_tree};
+
 /// Directories to skip during recursive file walks.
 pub const DEFAULT_IGNORE_DIRS: &[&str] = &[
     ".git",
@@ -114,23 +118,70 @@ pub async fn run_cmd(
     }
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
+    configure_command_for_process_group(&mut command);
 
-    let child = command.spawn()?;
+    let mut child = command.spawn()?;
+    let child_pid = child.id().unwrap_or(0);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
+
+    let stdout_task = tokio::spawn(async move {
+        let mut reader = stdout;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut reader = stderr;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    });
+
     let timeout = Duration::from_secs(timeout_secs);
-
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => {
-            let duration_ms = start.elapsed().as_millis() as u64;
-            Ok(CommandOutput {
-                exit_code: output.status.code().unwrap_or(-1),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                duration_ms,
-            })
-        }
+    let mut timed_out = false;
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
         Ok(Err(e)) => anyhow::bail!("Command failed to execute: {}", e),
-        Err(_) => anyhow::bail!("Command timed out after {}s", timeout_secs),
+        Err(_) => {
+            timed_out = true;
+            terminate_process_tree(child_pid, &mut child, Duration::from_secs(2)).await;
+            None
+        }
+    };
+
+    if timed_out {
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        anyhow::bail!("Command timed out after {}s", timeout_secs);
     }
+
+    let stdout = match stdout_task.await {
+        Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).to_string(),
+        _ => String::new(),
+    };
+    let stderr = match stderr_task.await {
+        Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).to_string(),
+        _ => String::new(),
+    };
+    let status = status.expect("status must exist when command did not time out");
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    Ok(CommandOutput {
+        exit_code: status.code().unwrap_or(-1),
+        stdout,
+        stderr,
+        duration_ms,
+    })
 }
 
 /// Returns true if the directory entry name should be skipped.
@@ -228,6 +279,27 @@ mod tests {
         let result = run_cmd("sleep 10", None, 1).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_cmd_timeout_kills_child_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("leaked.txt");
+        let cmd = format!(
+            "(sleep 2; echo leaked > \"{}\") & wait",
+            marker.to_string_lossy()
+        );
+
+        let result = run_cmd(&cmd, None, 1).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !marker.exists(),
+            "timed out command should not leave detached child writing files"
+        );
     }
 
     #[tokio::test]

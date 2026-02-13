@@ -602,6 +602,9 @@ pub struct DaemonConfig {
     /// Watchdog configuration for detecting stuck agent tasks.
     #[serde(default)]
     pub watchdog: WatchdogConfig,
+    /// Queue policy for approval/media/trigger pipelines.
+    #[serde(default)]
+    pub queue_policy: QueuePolicyConfig,
 }
 
 impl Default for DaemonConfig {
@@ -611,6 +614,7 @@ impl Default for DaemonConfig {
             health_bind: default_health_bind(),
             dashboard_enabled: default_dashboard_enabled(),
             watchdog: WatchdogConfig::default(),
+            queue_policy: QueuePolicyConfig::default(),
         }
     }
 }
@@ -625,6 +629,186 @@ fn default_health_bind() -> String {
 
 fn default_dashboard_enabled() -> bool {
     true
+}
+
+fn default_queue_capacity_approval() -> usize {
+    16
+}
+
+fn default_queue_capacity_media() -> usize {
+    16
+}
+
+fn default_queue_capacity_trigger_events() -> usize {
+    64
+}
+
+fn default_queue_warning_ratio() -> f32 {
+    0.75
+}
+
+fn default_queue_overload_ratio() -> f32 {
+    0.90
+}
+
+fn default_queue_adaptive_shedding() -> bool {
+    true
+}
+
+fn default_queue_fair_trigger_sessions() -> bool {
+    true
+}
+
+fn default_queue_fair_window_secs() -> u64 {
+    60
+}
+
+fn default_queue_fair_max_events_per_session() -> u32 {
+    4
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct QueueLanePolicyConfig {
+    #[serde(default = "default_queue_adaptive_shedding")]
+    pub adaptive_shedding: bool,
+    #[serde(default = "default_queue_fair_trigger_sessions")]
+    pub fair_sessions: bool,
+    #[serde(default = "default_queue_fair_window_secs")]
+    pub fair_session_window_secs: u64,
+    #[serde(default = "default_queue_fair_max_events_per_session")]
+    pub fair_max_events_per_session: u32,
+}
+
+impl Default for QueueLanePolicyConfig {
+    fn default() -> Self {
+        Self {
+            adaptive_shedding: default_queue_adaptive_shedding(),
+            fair_sessions: default_queue_fair_trigger_sessions(),
+            fair_session_window_secs: default_queue_fair_window_secs(),
+            fair_max_events_per_session: default_queue_fair_max_events_per_session(),
+        }
+    }
+}
+
+impl QueueLanePolicyConfig {
+    pub fn normalized(&self) -> Self {
+        let mut lane = self.clone();
+        lane.fair_session_window_secs = lane.fair_session_window_secs.max(1);
+        lane.fair_max_events_per_session = lane.fair_max_events_per_session.max(1);
+        lane
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct QueueLanePoliciesConfig {
+    #[serde(default)]
+    pub approval: QueueLanePolicyConfig,
+    #[serde(default)]
+    pub media: QueueLanePolicyConfig,
+    #[serde(default)]
+    pub trigger: QueueLanePolicyConfig,
+}
+
+impl QueueLanePoliciesConfig {
+    pub fn normalized(&self) -> Self {
+        Self {
+            approval: self.approval.normalized(),
+            media: self.media.normalized(),
+            trigger: self.trigger.normalized(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct QueuePolicyConfig {
+    #[serde(default = "default_queue_capacity_approval")]
+    pub approval_capacity: usize,
+    #[serde(default = "default_queue_capacity_media")]
+    pub media_capacity: usize,
+    #[serde(default = "default_queue_capacity_trigger_events")]
+    pub trigger_event_capacity: usize,
+    #[serde(default = "default_queue_warning_ratio")]
+    pub warning_ratio: f32,
+    #[serde(default = "default_queue_overload_ratio")]
+    pub overload_ratio: f32,
+    #[serde(default)]
+    pub lanes: QueueLanePoliciesConfig,
+
+    // Legacy shared overload knobs retained for backward compatibility.
+    #[serde(default)]
+    pub adaptive_shedding: Option<bool>,
+    #[serde(default)]
+    pub fair_trigger_sessions: Option<bool>,
+    #[serde(default)]
+    pub fair_trigger_session_window_secs: Option<u64>,
+    #[serde(default)]
+    pub fair_trigger_max_events_per_session: Option<u32>,
+}
+
+impl Default for QueuePolicyConfig {
+    fn default() -> Self {
+        Self {
+            approval_capacity: default_queue_capacity_approval(),
+            media_capacity: default_queue_capacity_media(),
+            trigger_event_capacity: default_queue_capacity_trigger_events(),
+            warning_ratio: default_queue_warning_ratio(),
+            overload_ratio: default_queue_overload_ratio(),
+            lanes: QueueLanePoliciesConfig::default(),
+            adaptive_shedding: None,
+            fair_trigger_sessions: None,
+            fair_trigger_session_window_secs: None,
+            fair_trigger_max_events_per_session: None,
+        }
+    }
+}
+
+impl QueuePolicyConfig {
+    pub fn normalized(&self) -> Self {
+        let mut policy = self.clone();
+        policy.approval_capacity = policy.approval_capacity.max(1);
+        policy.media_capacity = policy.media_capacity.max(1);
+        policy.trigger_event_capacity = policy.trigger_event_capacity.max(1);
+        policy.warning_ratio = if policy.warning_ratio.is_finite() {
+            policy.warning_ratio.clamp(0.0, 1.0)
+        } else {
+            default_queue_warning_ratio()
+        };
+        policy.overload_ratio = if policy.overload_ratio.is_finite() {
+            policy.overload_ratio.clamp(policy.warning_ratio, 1.0)
+        } else {
+            default_queue_overload_ratio().clamp(policy.warning_ratio, 1.0)
+        };
+
+        let default_lane = QueueLanePolicyConfig::default().normalized();
+        let legacy_lane = QueueLanePolicyConfig {
+            adaptive_shedding: policy
+                .adaptive_shedding
+                .unwrap_or(default_queue_adaptive_shedding()),
+            fair_sessions: policy
+                .fair_trigger_sessions
+                .unwrap_or(default_queue_fair_trigger_sessions()),
+            fair_session_window_secs: policy
+                .fair_trigger_session_window_secs
+                .unwrap_or(default_queue_fair_window_secs()),
+            fair_max_events_per_session: policy
+                .fair_trigger_max_events_per_session
+                .unwrap_or(default_queue_fair_max_events_per_session()),
+        }
+        .normalized();
+
+        policy.lanes = policy.lanes.normalized();
+        if policy.lanes.approval == default_lane {
+            policy.lanes.approval = legacy_lane.clone();
+        }
+        if policy.lanes.media == default_lane {
+            policy.lanes.media = legacy_lane.clone();
+        }
+        if policy.lanes.trigger == default_lane {
+            policy.lanes.trigger = legacy_lane;
+        }
+
+        policy
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -1339,6 +1523,18 @@ fn default_classify_retirement_window_days() -> u32 {
 fn default_classify_retirement_max_divergence() -> f32 {
     0.05
 }
+fn default_write_consistency_max_abs_global_delta() -> u64 {
+    3
+}
+fn default_write_consistency_max_session_mismatch_count() -> u64 {
+    0
+}
+fn default_write_consistency_max_stale_task_starts() -> u64 {
+    0
+}
+fn default_write_consistency_max_missing_message_id_events() -> u64 {
+    0
+}
 fn default_diagnostics_max_events() -> usize {
     200
 }
@@ -1389,6 +1585,41 @@ impl Default for HeartbeatConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct WriteConsistencyConfig {
+    #[serde(default = "default_write_consistency_max_abs_global_delta")]
+    pub max_abs_global_delta: u64,
+    #[serde(default = "default_write_consistency_max_session_mismatch_count")]
+    pub max_session_mismatch_count: u64,
+    #[serde(default = "default_write_consistency_max_stale_task_starts")]
+    pub max_stale_task_starts: u64,
+    #[serde(default = "default_write_consistency_max_missing_message_id_events")]
+    pub max_missing_message_id_events: u64,
+}
+
+impl Default for WriteConsistencyConfig {
+    fn default() -> Self {
+        Self {
+            max_abs_global_delta: default_write_consistency_max_abs_global_delta(),
+            max_session_mismatch_count: default_write_consistency_max_session_mismatch_count(),
+            max_stale_task_starts: default_write_consistency_max_stale_task_starts(),
+            max_missing_message_id_events: default_write_consistency_max_missing_message_id_events(
+            ),
+        }
+    }
+}
+
+impl WriteConsistencyConfig {
+    pub fn thresholds(&self) -> crate::events::WriteConsistencyThresholds {
+        crate::events::WriteConsistencyThresholds {
+            max_abs_global_delta: self.max_abs_global_delta,
+            max_session_mismatch_count: self.max_session_mismatch_count,
+            max_stale_task_starts: self.max_stale_task_starts,
+            max_missing_message_id_events: self.max_missing_message_id_events,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct PolicyConfig {
     #[serde(default = "default_policy_shadow_mode")]
     pub policy_shadow_mode: bool,
@@ -1414,6 +1645,8 @@ pub struct PolicyConfig {
     pub classify_retirement_window_days: u32,
     #[serde(default = "default_classify_retirement_max_divergence")]
     pub classify_retirement_max_divergence: f32,
+    #[serde(default)]
+    pub write_consistency: WriteConsistencyConfig,
 }
 
 impl Default for PolicyConfig {
@@ -1431,6 +1664,7 @@ impl Default for PolicyConfig {
             classify_retirement_enabled: default_classify_retirement_enabled(),
             classify_retirement_window_days: default_classify_retirement_window_days(),
             classify_retirement_max_divergence: default_classify_retirement_max_divergence(),
+            write_consistency: WriteConsistencyConfig::default(),
         }
     }
 }
@@ -1441,6 +1675,7 @@ impl AppConfig {
         let expanded = expand_env_vars(&content)?;
         let mut config: AppConfig = toml::from_str(&expanded)?;
         config.provider.models.apply_defaults(&config.provider.kind);
+        config.daemon.queue_policy = config.daemon.queue_policy.normalized();
         config.resolve_secrets()?;
         Ok(config)
     }
@@ -1733,6 +1968,159 @@ mod tests {
     fn task_timeout_default_is_30_minutes() {
         let config = SubagentsConfig::default();
         assert_eq!(config.task_timeout_secs, Some(1800));
+    }
+
+    #[test]
+    fn write_consistency_policy_defaults_are_applied() {
+        let policy = PolicyConfig::default();
+        assert_eq!(policy.write_consistency.max_abs_global_delta, 3);
+        assert_eq!(policy.write_consistency.max_session_mismatch_count, 0);
+        assert_eq!(policy.write_consistency.max_stale_task_starts, 0);
+        assert_eq!(policy.write_consistency.max_missing_message_id_events, 0);
+    }
+
+    #[test]
+    fn write_consistency_policy_can_be_overridden_in_toml() {
+        let toml = r#"
+[provider]
+api_key = "test-key"
+kind = "openai_compatible"
+
+[provider.models]
+primary = "gpt-4o"
+fast = "gpt-4o-mini"
+smart = "gpt-4o"
+
+[terminal]
+allowed_prefixes = ["ls"]
+
+[policy.write_consistency]
+max_abs_global_delta = 7
+max_session_mismatch_count = 2
+max_stale_task_starts = 1
+max_missing_message_id_events = 4
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        assert_eq!(cfg.policy.write_consistency.max_abs_global_delta, 7);
+        assert_eq!(cfg.policy.write_consistency.max_session_mismatch_count, 2);
+        assert_eq!(cfg.policy.write_consistency.max_stale_task_starts, 1);
+        assert_eq!(
+            cfg.policy.write_consistency.max_missing_message_id_events,
+            4
+        );
+    }
+
+    #[test]
+    fn queue_policy_normalizes_invalid_values() {
+        let policy = QueuePolicyConfig {
+            approval_capacity: 0,
+            media_capacity: 0,
+            trigger_event_capacity: 0,
+            warning_ratio: f32::NAN,
+            overload_ratio: f32::INFINITY,
+            lanes: QueueLanePoliciesConfig::default(),
+            adaptive_shedding: Some(true),
+            fair_trigger_sessions: Some(true),
+            fair_trigger_session_window_secs: Some(0),
+            fair_trigger_max_events_per_session: Some(0),
+        };
+        let normalized = policy.normalized();
+        assert_eq!(normalized.approval_capacity, 1);
+        assert_eq!(normalized.media_capacity, 1);
+        assert_eq!(normalized.trigger_event_capacity, 1);
+        assert_eq!(normalized.warning_ratio, 0.75);
+        assert_eq!(normalized.overload_ratio, 0.90);
+        assert_eq!(normalized.lanes.approval.fair_session_window_secs, 1);
+        assert_eq!(normalized.lanes.media.fair_session_window_secs, 1);
+        assert_eq!(normalized.lanes.trigger.fair_session_window_secs, 1);
+        assert_eq!(normalized.lanes.approval.fair_max_events_per_session, 1);
+        assert_eq!(normalized.lanes.media.fair_max_events_per_session, 1);
+        assert_eq!(normalized.lanes.trigger.fair_max_events_per_session, 1);
+    }
+
+    #[test]
+    fn queue_policy_legacy_shared_knobs_apply_to_all_lanes() {
+        let policy = QueuePolicyConfig {
+            adaptive_shedding: Some(false),
+            fair_trigger_sessions: Some(false),
+            fair_trigger_session_window_secs: Some(13),
+            fair_trigger_max_events_per_session: Some(2),
+            ..QueuePolicyConfig::default()
+        };
+        let normalized = policy.normalized();
+        for lane in [
+            &normalized.lanes.approval,
+            &normalized.lanes.media,
+            &normalized.lanes.trigger,
+        ] {
+            assert!(!lane.adaptive_shedding);
+            assert!(!lane.fair_sessions);
+            assert_eq!(lane.fair_session_window_secs, 13);
+            assert_eq!(lane.fair_max_events_per_session, 2);
+        }
+    }
+
+    #[test]
+    fn queue_policy_lane_specific_overrides_take_precedence() {
+        let mut policy = QueuePolicyConfig {
+            adaptive_shedding: Some(false),
+            fair_trigger_sessions: Some(false),
+            fair_trigger_session_window_secs: Some(13),
+            fair_trigger_max_events_per_session: Some(2),
+            ..QueuePolicyConfig::default()
+        };
+        policy.lanes.media = QueueLanePolicyConfig {
+            adaptive_shedding: true,
+            fair_sessions: true,
+            fair_session_window_secs: 99,
+            fair_max_events_per_session: 9,
+        };
+        let normalized = policy.normalized();
+        assert!(!normalized.lanes.approval.adaptive_shedding);
+        assert!(!normalized.lanes.trigger.adaptive_shedding);
+        assert_eq!(normalized.lanes.approval.fair_session_window_secs, 13);
+        assert_eq!(normalized.lanes.trigger.fair_session_window_secs, 13);
+        assert!(normalized.lanes.media.adaptive_shedding);
+        assert!(normalized.lanes.media.fair_sessions);
+        assert_eq!(normalized.lanes.media.fair_session_window_secs, 99);
+        assert_eq!(normalized.lanes.media.fair_max_events_per_session, 9);
+    }
+
+    #[test]
+    fn queue_policy_lane_specific_toml_is_supported() {
+        let toml = r#"
+[provider]
+api_key = "test-key"
+kind = "openai_compatible"
+
+[provider.models]
+primary = "gpt-4o"
+fast = "gpt-4o-mini"
+smart = "gpt-4o"
+
+[terminal]
+allowed_prefixes = ["ls"]
+
+[daemon.queue_policy.lanes.approval]
+adaptive_shedding = false
+fair_sessions = false
+fair_session_window_secs = 45
+fair_max_events_per_session = 3
+
+[daemon.queue_policy.lanes.media]
+adaptive_shedding = true
+fair_sessions = true
+fair_session_window_secs = 20
+fair_max_events_per_session = 2
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        let queue = cfg.daemon.queue_policy.normalized();
+        assert!(!queue.lanes.approval.adaptive_shedding);
+        assert_eq!(queue.lanes.approval.fair_session_window_secs, 45);
+        assert_eq!(queue.lanes.approval.fair_max_events_per_session, 3);
+        assert!(queue.lanes.media.adaptive_shedding);
+        assert_eq!(queue.lanes.media.fair_session_window_secs, 20);
+        assert_eq!(queue.lanes.media.fair_max_events_per_session, 2);
     }
 
     #[cfg(feature = "slack")]

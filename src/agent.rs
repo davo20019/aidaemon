@@ -21,10 +21,7 @@ use crate::events::{
     PolicyDecisionData, SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData,
     TaskStatus, ThinkingStartData, ToolCallData, ToolCallInfo, ToolResultData, UserMessageData,
 };
-use crate::execution_policy::{
-    score_risk_from_capabilities, score_uncertainty_v1, ApprovalMode, ExecutionPolicy,
-    ModelProfile, PolicyBundle, UncertaintySignals,
-};
+use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
 use crate::mcp::McpRegistry;
 use crate::providers::{ProviderError, ProviderErrorKind};
@@ -69,6 +66,36 @@ const INTENT_GATE_MARKER: &str = "[INTENT_GATE]";
 /// Legacy fallback schedule text heuristics are disabled by default because they
 /// can misclassify "tell me about this scheduled goal" queries as new schedules.
 const ENABLE_SCHEDULE_HEURISTICS: bool = false;
+
+mod intent_gate;
+use intent_gate::extract_intent_gate;
+#[cfg(test)]
+use intent_gate::parse_intent_gate_json;
+mod consultant_analysis;
+#[cfg(test)]
+use consultant_analysis::has_action_promise;
+use consultant_analysis::{looks_like_deferred_action_response, sanitize_consultant_analysis};
+mod intent_routing;
+use intent_routing::{
+    classify_intent_complexity, contains_keyword_as_words, infer_intent_gate,
+    is_internal_maintenance_intent, IntentComplexity,
+};
+#[cfg(test)]
+use intent_routing::{detect_schedule_heuristic, looks_like_recurring_intent_without_timing};
+mod policy_signals;
+use policy_signals::{
+    build_policy_bundle_v1, default_clarifying_question, detect_explicit_outcome_signal,
+    is_short_user_correction, tool_is_side_effecting,
+};
+mod loop_utils;
+#[cfg(test)]
+use loop_utils::merge_consecutive_messages;
+use loop_utils::{
+    extract_command_from_args, extract_file_path_from_args, extract_send_file_dedupe_key_from_args,
+    fixup_message_ordering, hash_tool_call, is_trigger_session,
+};
+mod post_task;
+use post_task::LearningContext;
 
 struct PolicyRuntimeMetrics {
     router_shadow_total: AtomicU64,
@@ -224,21 +251,6 @@ pub fn apply_bounded_autotune_from_failure_ratio(
         .uncertainty_threshold_bp
         .store(next_bp, Ordering::SeqCst);
     Some((old, next))
-}
-
-/// Context accumulated during handle_message for post-task learning.
-struct LearningContext {
-    user_text: String,
-    intent_domains: Vec<String>,
-    tool_calls: Vec<String>,     // "tool_name(summary)"
-    errors: Vec<(String, bool)>, // (error_text, was_recovered)
-    first_error: Option<String>,
-    recovery_actions: Vec<String>,
-    #[allow(dead_code)] // Reserved for duration-based learning
-    start_time: chrono::DateTime<Utc>,
-    completed_naturally: bool,
-    explicit_positive_signals: u32,
-    explicit_negative_signals: u32,
 }
 
 /// Best-effort send — never blocks the agent loop if the receiver is slow/full.
@@ -421,213 +433,142 @@ struct IntentGateDecision {
     domains: Vec<String>,
 }
 
-fn parse_intent_gate_json(text: &str) -> Option<IntentGateDecision> {
-    let value: Value = serde_json::from_str(text).ok()?;
-    Some(IntentGateDecision {
-        can_answer_now: value.get("can_answer_now").and_then(|v| v.as_bool()),
-        needs_tools: value.get("needs_tools").and_then(|v| v.as_bool()),
-        needs_clarification: value.get("needs_clarification").and_then(|v| v.as_bool()),
-        clarifying_question: value
-            .get("clarifying_question")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
-        missing_info: value
-            .get("missing_info")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default(),
-        complexity: value
-            .get("complexity")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty()),
-        cancel_intent: value.get("cancel_intent").and_then(|v| v.as_bool()),
-        cancel_scope: value
-            .get("cancel_scope")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| s == "generic" || s == "targeted"),
-        is_acknowledgment: value.get("is_acknowledgment").and_then(|v| v.as_bool()),
-        schedule: value
-            .get("schedule")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
-        schedule_type: value
-            .get("schedule_type")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty()),
-        schedule_cron: value
-            .get("schedule_cron")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
-        domains: value
-            .get("domains")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                let mut out = Vec::new();
-                for item in arr {
-                    if let Some(raw) = item.as_str() {
-                        let domain = raw.trim().to_ascii_lowercase();
-                        if !domain.is_empty() && !out.contains(&domain) {
-                            out.push(domain);
-                        }
-                    }
-                }
-                out
-            })
-            .unwrap_or_default(),
-    })
+#[derive(Debug, Clone)]
+struct ResumeCheckpoint {
+    task_id: String,
+    description: String,
+    original_user_message: Option<String>,
+    elapsed_secs: u64,
+    last_iteration: u32,
+    tool_results_count: u32,
+    pending_tool_call_ids: Vec<String>,
+    last_assistant_summary: Option<String>,
+    last_tool_summary: Option<String>,
+    last_error: Option<String>,
 }
 
-fn extract_intent_gate(text: &str) -> (String, Option<IntentGateDecision>) {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut cleaned = Vec::with_capacity(lines.len());
-    let mut decision: Option<IntentGateDecision> = None;
-    let mut i = 0usize;
+impl ResumeCheckpoint {
+    fn render_prompt_section(&self) -> String {
+        let mut lines = vec![
+            "## Resume Checkpoint".to_string(),
+            "The user explicitly asked to continue prior in-progress work. Resume from this checkpoint and avoid restarting completed steps."
+                .to_string(),
+            format!("- Previous task_id: {}", self.task_id),
+            format!("- Original task: {}", self.description),
+            format!("- Elapsed before interruption: {}s", self.elapsed_secs),
+            format!("- Last completed iteration: {}", self.last_iteration),
+            format!("- Completed tool results: {}", self.tool_results_count),
+            format!(
+                "- Pending unresolved tool calls: {}",
+                self.pending_tool_call_ids.len()
+            ),
+        ];
 
-    while i < lines.len() {
-        let line = lines[i];
-        if decision.is_none() {
-            if let Some(pos) = line.find(INTENT_GATE_MARKER) {
-                let after = line[(pos + INTENT_GATE_MARKER.len())..].trim();
-                if !after.is_empty() {
-                    decision = parse_intent_gate_json(after);
-                } else if i + 1 < lines.len() {
-                    let next = lines[i + 1].trim();
-                    if next.starts_with('{') {
-                        if let Some(parsed) = parse_intent_gate_json(next) {
-                            decision = Some(parsed);
-                            i += 2;
-                            continue;
-                        }
-                    }
-                }
-                i += 1;
-                continue;
-            }
+        if !self.pending_tool_call_ids.is_empty() {
+            let pending = self
+                .pending_tool_call_ids
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("- Pending tool call IDs: {}", pending));
         }
-        cleaned.push(line.to_string());
-        i += 1;
+        if let Some(msg) = &self.original_user_message {
+            lines.push(format!(
+                "- Original user request: {}",
+                truncate_for_resume(msg, 180)
+            ));
+        }
+        if let Some(summary) = &self.last_assistant_summary {
+            lines.push(format!("- Last assistant output: {}", summary));
+        }
+        if let Some(summary) = &self.last_tool_summary {
+            lines.push(format!("- Last tool result: {}", summary));
+        }
+        if let Some(err) = &self.last_error {
+            lines.push(format!("- Last error: {}", err));
+        }
+        lines.push(
+            "Resume from the next concrete step immediately. Re-run tools only if needed to verify or recover."
+                .to_string(),
+        );
+        lines.join("\n")
     }
-
-    // If no [INTENT_GATE] marker was found, check for a trailing JSON block
-    // at the end of the response. The model sometimes omits the marker and just
-    // appends the JSON (single-line, multi-line, or code-fenced).
-    if decision.is_none() {
-        decision = try_extract_trailing_intent_json(&mut cleaned);
-    }
-
-    (cleaned.join("\n").trim().to_string(), decision)
 }
 
-/// Scan backwards from the end of `lines` looking for a trailing JSON object
-/// that contains intent gate fields (complexity, can_answer_now, needs_tools).
-/// If found, remove those lines from `lines` and return the parsed decision.
-fn try_extract_trailing_intent_json(lines: &mut Vec<String>) -> Option<IntentGateDecision> {
-    // Find last non-empty line
-    let mut end = lines.len();
-    while end > 0 && lines[end - 1].trim().is_empty() {
-        end -= 1;
+fn truncate_for_resume(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
     }
-    if end == 0 {
-        return None;
-    }
-
-    // Check for code-fence closing: strip trailing ```
-    let mut has_closing_fence = false;
-    let mut fence_end = end;
-    if lines[end - 1].trim() == "```" {
-        has_closing_fence = true;
-        fence_end = end;
-        end -= 1;
-        // Skip blanks before the closing fence
-        while end > 0 && lines[end - 1].trim().is_empty() {
-            end -= 1;
+    let mut out = String::new();
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if count >= max_chars {
+            out.push_str("...");
+            return out;
         }
+        out.push(ch);
+        count += 1;
     }
+    out
+}
 
-    // Now find the JSON block: look for a line ending with `}` (end of JSON)
-    if end == 0 || !lines[end - 1].trim().ends_with('}') {
-        return None;
-    }
-
-    // Scan backwards to find the opening `{`
-    let json_end = end;
-    let mut json_start = end - 1;
-    let mut brace_depth = 0i32;
-    loop {
-        for ch in lines[json_start].chars().rev() {
-            if ch == '}' {
-                brace_depth += 1;
-            } else if ch == '{' {
-                brace_depth -= 1;
-            }
-        }
-        if brace_depth == 0 {
-            break;
-        }
-        if json_start == 0 {
-            return None; // Unbalanced braces, give up
-        }
-        json_start -= 1;
-    }
-
-    // Check for opening code fence before the JSON block
-    let mut has_opening_fence = false;
-    let mut actual_start = json_start;
-    if json_start > 0 {
-        let prev = lines[json_start - 1].trim();
-        if prev == "```json" || prev == "```JSON" || prev == "```" {
-            has_opening_fence = true;
-            actual_start = json_start - 1;
-        }
-    }
-
-    // Try to parse the JSON block
-    let json_text: String = lines[json_start..json_end]
-        .iter()
-        .map(|l| l.trim())
-        .collect::<Vec<_>>()
-        .join("");
-    let parsed = parse_intent_gate_json(&json_text)?;
-
-    // Only strip if it contains intent gate fields
-    if parsed.complexity.is_none()
-        && parsed.can_answer_now.is_none()
-        && parsed.needs_tools.is_none()
-    {
-        return None;
-    }
-
-    // Remove the JSON block (and fences if present)
-    let remove_end = if has_closing_fence {
-        fence_end
-    } else {
-        json_end
+fn build_empty_response_fallback(response_note: Option<&str>) -> String {
+    let base = "I wasn't able to process that request.";
+    let generic = format!("{base} Could you try rephrasing?");
+    let Some(note) = response_note.map(str::trim).filter(|s| !s.is_empty()) else {
+        return generic;
     };
-    lines.drain(actual_start..remove_end);
 
-    // Also remove trailing empty lines that were before the JSON block
-    while lines.last().is_some_and(|l| l.trim().is_empty()) {
-        lines.pop();
+    let flattened = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = flattened.trim_matches(|c: char| c == '"' || c == '\'');
+    let trimmed = trimmed.trim_end_matches(['.', '!', '?']);
+    if trimmed.is_empty() {
+        return generic;
     }
 
-    // Require code fences to match (both present or neither)
-    if has_opening_fence != has_closing_fence {
-        // Mismatched fences — still return the parsed result but don't
-        // worry about the fence mismatch (model output is imperfect)
+    let note_preview = truncate_for_resume(trimmed, 180);
+    format!(
+        "{base} The model returned no usable output ({note_preview}). Could you try rephrasing?"
+    )
+}
+
+fn normalize_for_resume_intent(text: &str) -> String {
+    text.split_whitespace()
+        .map(|part| part.trim_matches(|c: char| c.is_ascii_punctuation()))
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_resume_request(text: &str) -> bool {
+    let normalized = normalize_for_resume_intent(text);
+    if normalized.is_empty() {
+        return false;
     }
 
-    Some(parsed)
+    const EXACT: &[&str] = &[
+        "continue",
+        "resume",
+        "keep going",
+        "go on",
+        "carry on",
+        "next phase",
+        "next step",
+    ];
+    if EXACT.contains(&normalized.as_str()) {
+        return true;
+    }
+
+    normalized.starts_with("continue ")
+        || normalized.starts_with("resume ")
+        || normalized.starts_with("keep going ")
+        || normalized.starts_with("go on ")
+        || normalized.starts_with("carry on ")
+        || normalized.starts_with("next phase ")
+        || normalized.starts_with("next step ")
 }
 
 fn merge_intent_gate_decision(
@@ -660,945 +601,6 @@ fn merge_intent_gate_decision(
             model.domains
         },
     }
-}
-
-fn user_text_looks_ambiguous(user_text: &str) -> bool {
-    let lower = user_text.trim().to_ascii_lowercase();
-
-    // If the message contains a filesystem path, the user is giving us
-    // concrete location info — never treat that as ambiguous.
-    if lower.contains('/') || lower.contains('\\') {
-        return false;
-    }
-
-    // Only flag truly bare/short references — when the entire message
-    // is basically just a pronoun or vague phrase with no actionable context.
-    // Longer messages (>40 chars) have enough context for the LLM to decide.
-    if lower.len() > 40 {
-        return false;
-    }
-
-    let phrase_ambiguous = [
-        "the site",
-        "that site",
-        "this site",
-        "that project",
-        "the project",
-        "that file",
-        "this file",
-        "that one",
-        "this one",
-        "the thing",
-        "that thing",
-    ]
-    .iter()
-    .any(|p| {
-        lower == *p || lower.starts_with(&format!("{} ", p)) || lower.contains(&format!(" {}", p))
-    });
-    if phrase_ambiguous {
-        return true;
-    }
-
-    matches!(lower.as_str(), "it" | "this" | "that")
-}
-
-#[allow(dead_code)] // Kept for potential future consultant/fallback handling.
-fn first_question_line(text: &str) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .find(|line| line.contains('?'))
-        .map(|s| s.to_string())
-}
-
-fn default_clarifying_question(user_text: &str, missing_info: &[String]) -> String {
-    if !missing_info.is_empty() {
-        return format!(
-            "Could you clarify {} so I can proceed correctly?",
-            missing_info.join(", ")
-        );
-    }
-    if user_text_looks_ambiguous(user_text) {
-        return "Could you clarify exactly which site/project/file you mean?".to_string();
-    }
-    "Could you share the missing details I need before I proceed?".to_string()
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|n| haystack.contains(n))
-}
-
-fn estimate_risk_from_text(user_text: &str) -> f32 {
-    let lower = user_text.to_ascii_lowercase();
-    let mut score = 0.18f32;
-
-    if contains_any(
-        &lower,
-        &[
-            "write ",
-            "edit ",
-            "change ",
-            "modify ",
-            "create ",
-            "delete ",
-            "remove ",
-            "fix ",
-            "deploy ",
-            "install ",
-            "run ",
-            "execute ",
-            "commit ",
-            "schedule ",
-        ],
-    ) {
-        score += 0.28;
-    }
-
-    if contains_any(
-        &lower,
-        &[
-            "api ",
-            "http",
-            "webhook",
-            "send ",
-            "post ",
-            "publish ",
-            "external",
-            "production",
-        ],
-    ) {
-        score += 0.20;
-    }
-
-    if contains_any(
-        &lower,
-        &[
-            "rm ",
-            "sudo",
-            "drop ",
-            "truncate ",
-            "force",
-            "dangerous",
-            "overwrite",
-        ],
-    ) {
-        score += 0.25;
-    }
-
-    score.clamp(0.0, 1.0)
-}
-
-fn infer_uncertainty_signals(user_text: &str, prior_immediate_failure: bool) -> UncertaintySignals {
-    let lower = user_text.trim().to_ascii_lowercase();
-    let missing_required_slot = user_text_looks_ambiguous(user_text)
-        || matches!(lower.as_str(), "do it" | "handle it" | "fix it" | "run it");
-
-    let conflicting_constraints = (lower.contains("quick") && lower.contains("detailed"))
-        || (lower.contains("short") && lower.contains("comprehensive"))
-        || (lower.contains("brief") && lower.contains("deep"));
-
-    let ambiguous_wording =
-        contains_any(
-            &lower,
-            &[
-                "sometime",
-                "later",
-                "soon",
-                "asap",
-                "next week",
-                "one day",
-                "eventually",
-                "whenever",
-            ],
-        ) && !contains_any(&lower, &[" at ", " on ", " by ", " cron", "every "]);
-
-    UncertaintySignals {
-        missing_required_slot,
-        conflicting_constraints,
-        ambiguous_wording,
-        prior_immediate_failure,
-    }
-}
-
-fn build_policy_bundle_v1(
-    user_text: &str,
-    available_capabilities: &HashMap<String, ToolCapabilities>,
-    prior_immediate_failure: bool,
-) -> PolicyBundle {
-    let text_risk = estimate_risk_from_text(user_text);
-    let cap_risk =
-        score_risk_from_capabilities(&available_capabilities.values().copied().collect::<Vec<_>>());
-    let risk_score = ((text_risk * 0.7) + (cap_risk * 0.3)).clamp(0.0, 1.0);
-    let uncertainty_score = score_uncertainty_v1(infer_uncertainty_signals(
-        user_text,
-        prior_immediate_failure,
-    ));
-    let confidence = (1.0 - uncertainty_score).clamp(0.0, 1.0);
-    PolicyBundle::from_scores(risk_score, uncertainty_score, confidence)
-}
-
-fn detect_explicit_outcome_signal(text: &str) -> Option<(&'static str, bool)> {
-    let lower = text.to_ascii_lowercase();
-    let positives = ["thanks", "perfect", "got it", "that worked"];
-    if positives.iter().any(|p| lower.contains(p)) {
-        return Some(("positive", true));
-    }
-    let negatives = [
-        "that's wrong",
-        "try again",
-        "not what i asked",
-        "you misunderstood",
-    ];
-    if negatives.iter().any(|n| lower.contains(n)) {
-        return Some(("negative", false));
-    }
-    None
-}
-
-fn tool_is_side_effecting(name: &str, capabilities: &HashMap<String, ToolCapabilities>) -> bool {
-    !capabilities
-        .get(name)
-        .copied()
-        .unwrap_or_default()
-        .read_only
-}
-
-/// Detect "about this scheduled goal" meta-queries so they aren't misread as
-/// fresh scheduling requests when quoted text contains timing words.
-fn is_schedule_reference_query(user_text: &str) -> bool {
-    let lower = user_text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    let mentions_schedule_subject = contains_keyword_as_words(&lower, "scheduled goal")
-        || contains_keyword_as_words(&lower, "recurring goal")
-        || contains_keyword_as_words(&lower, "schedule");
-
-    if !mentions_schedule_subject {
-        return false;
-    }
-
-    contains_keyword_as_words(&lower, "details about")
-        || contains_keyword_as_words(&lower, "tell me about")
-        || contains_keyword_as_words(&lower, "show me")
-        || contains_keyword_as_words(&lower, "list")
-        || contains_keyword_as_words(&lower, "what is")
-        || contains_keyword_as_words(&lower, "what's")
-        || contains_keyword_as_words(&lower, "explain")
-        || contains_keyword_as_words(&lower, "describe")
-        || lower.contains("scheduled goal:")
-}
-
-/// Detect obvious scheduling phrases in user text as a fallback when the model
-/// omits schedule fields in [INTENT_GATE].
-///
-/// Returns (schedule_raw, is_one_shot).
-fn detect_schedule_heuristic(user_text: &str) -> Option<(String, bool)> {
-    let text = user_text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    if is_schedule_reference_query(text) {
-        return None;
-    }
-    let lower = text.to_ascii_lowercase();
-
-    // One-shot relative time, e.g. "in 2h", "in 30 minutes"
-    let re_in_time =
-        Regex::new(r"(?i)\bin\s+\d+\s*(?:m|min|mins|minutes?|h|hrs?|hours?)\b").ok()?;
-    if let Some(m) = re_in_time.find(text) {
-        return Some((m.as_str().trim().to_string(), true));
-    }
-
-    // One-shot absolute tomorrow time, e.g. "tomorrow at 9am"
-    let re_tomorrow_at =
-        Regex::new(r"(?i)\btomorrow\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b").ok()?;
-    if let Some(m) = re_tomorrow_at.find(text) {
-        return Some((m.as_str().trim().to_string(), true));
-    }
-
-    // One-shot today/tonight absolute time, optional timezone token.
-    let re_today_tonight_at = Regex::new(
-        r"(?i)\b(?:today|tonight)\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?(?:\s+[A-Za-z]{1,8}|[+-]\d{2}:?\d{2}|Z)?\b",
-    )
-    .ok()?;
-    if let Some(m) = re_today_tonight_at.find(text) {
-        return Some((m.as_str().trim().to_string(), true));
-    }
-
-    // One-shot tomorrow without explicit time (will likely require clarification later).
-    if contains_keyword_as_words(&lower, "tomorrow") {
-        return Some(("tomorrow".to_string(), true));
-    }
-
-    // Recurring intervals: "every 6h", "every 30m", "each 5 minutes"
-    let re_every_interval =
-        Regex::new(r"(?i)\b(?:every|each)\s+\d+\s*(?:m|min|mins|minutes?|h|hrs?|hours?)\b").ok()?;
-    if let Some(m) = re_every_interval.find(text) {
-        return Some((m.as_str().trim().to_string(), false));
-    }
-
-    // Recurring named schedules
-    let recurring_patterns = [
-        r"(?i)\bdaily\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
-        r"(?i)\bweekdays?\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
-        r"(?i)\bweekends?\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
-    ];
-    for pattern in recurring_patterns {
-        let re = Regex::new(pattern).ok()?;
-        if let Some(m) = re.find(text) {
-            return Some((m.as_str().trim().to_string(), false));
-        }
-    }
-
-    for kw in ["hourly", "daily", "weekly", "monthly"] {
-        if contains_keyword_as_words(&lower, kw) {
-            return Some((kw.to_string(), false));
-        }
-    }
-
-    None
-}
-
-/// Detect recurring-intent language when the user did not provide concrete timing.
-/// Used to prevent accidental fallback into non-recurring "complex" goals.
-fn looks_like_recurring_intent_without_timing(user_text: &str) -> bool {
-    if detect_schedule_heuristic(user_text).is_some() {
-        return false;
-    }
-
-    let lower = user_text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    let re_times_per = match Regex::new(r"(?i)\b\d+\s+times?\s+per\s+(day|week|month)\b") {
-        Ok(re) => re,
-        Err(_) => return false,
-    };
-    if re_times_per.is_match(user_text) {
-        return true;
-    }
-
-    for kw in [
-        "monitor",
-        "recurring",
-        "ongoing",
-        "long-term",
-        "long term",
-        "regularly",
-        "consistently",
-        "every day",
-        "each day",
-        "per day",
-        "per week",
-        "per month",
-    ] {
-        if contains_keyword_as_words(&lower, kw) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Detect legacy internal-maintenance intents that should run via native
-/// heartbeat/memory jobs rather than goal orchestration.
-fn is_internal_maintenance_intent(user_text: &str) -> bool {
-    let lower = user_text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    if lower == "maintain knowledge base: process embeddings, consolidate memories, decay old facts"
-        || lower
-            == "maintain memory health: prune old events, clean up retention, remove stale data"
-    {
-        return true;
-    }
-
-    let knowledge_maintenance = contains_keyword_as_words(&lower, "process embeddings")
-        && contains_keyword_as_words(&lower, "consolidate memories")
-        && (contains_keyword_as_words(&lower, "decay old facts")
-            || contains_keyword_as_words(&lower, "memory decay"));
-
-    let memory_health = contains_keyword_as_words(&lower, "prune old events")
-        && (contains_keyword_as_words(&lower, "clean up retention")
-            || contains_keyword_as_words(&lower, "retention cleanup"))
-        && contains_keyword_as_words(&lower, "stale data");
-
-    knowledge_maintenance || memory_health
-}
-
-fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateDecision {
-    let user_lower = user_text.trim().to_ascii_lowercase();
-
-    // If the user's message contains a filesystem path, the request almost
-    // certainly requires tool access (terminal) — override the consultant's
-    // analysis and route to the tool loop directly.
-    let user_references_path =
-        user_lower.contains('/') || user_lower.contains('\\') || user_lower.contains("~/");
-
-    if user_references_path {
-        return IntentGateDecision {
-            can_answer_now: Some(false),
-            needs_tools: Some(true),
-            needs_clarification: Some(false),
-            clarifying_question: None,
-            missing_info: Vec::new(),
-            complexity: None,
-            cancel_intent: None,
-            cancel_scope: None,
-            is_acknowledgment: None,
-            schedule: None,
-            schedule_type: None,
-            schedule_cron: None,
-            domains: Vec::new(),
-        };
-    }
-
-    // No lexical guessing fallback: rely on explicit model intent-gate fields.
-    // Missing fields simply stay None.
-    IntentGateDecision {
-        can_answer_now: None,
-        needs_tools: None,
-        needs_clarification: None,
-        clarifying_question: None,
-        missing_info: Vec::new(),
-        complexity: None,
-        cancel_intent: None,
-        cancel_scope: None,
-        is_acknowledgment: None,
-        schedule: None,
-        schedule_type: None,
-        schedule_cron: None,
-        domains: Vec::new(),
-    }
-}
-
-// ==================== V3 Intent Classification ====================
-
-/// Complexity classification for V3 orchestration routing.
-#[derive(Debug, Clone, PartialEq)]
-enum IntentComplexity {
-    /// Answer from memory/knowledge, no executor needed.
-    Knowledge,
-    /// Simple task — falls through to full agent loop.
-    Simple,
-    /// Multi-step complex task, create a V3 goal and fall through to current agent loop.
-    Complex,
-    /// User asks for recurring/ongoing behavior but did not provide timing.
-    ScheduledMissingTiming,
-    /// Scheduled task intent requiring deferred/recurring goal creation.
-    Scheduled {
-        schedule_raw: String,
-        schedule_cron: Option<String>,
-        is_one_shot: bool,
-        schedule_type_explicit: bool,
-    },
-}
-
-/// Check if a phrase appears as complete words in text (word-boundary matching).
-/// Splits on whitespace, trims surrounding punctuation (preserving apostrophes),
-/// then checks for consecutive word matches. Case-insensitive.
-///
-/// Works for single keywords ("deploy"), multi-word phrases ("set up"),
-/// and contractions ("i'll check").
-fn contains_keyword_as_words(text: &str, keyword: &str) -> bool {
-    let normalize = |w: &str| -> String {
-        w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
-            .to_lowercase()
-    };
-    let text_words: Vec<String> = text
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty())
-        .collect();
-    let kw_words: Vec<String> = keyword
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty())
-        .collect();
-    if kw_words.is_empty() {
-        return false;
-    }
-    text_words
-        .windows(kw_words.len())
-        .any(|window| window == kw_words.as_slice())
-}
-
-/// Classify user intent complexity for V3 routing.
-///
-/// Uses the LLM-provided `complexity` field from the `[INTENT_GATE]` JSON.
-/// Falls back to `Simple` when the field is absent or unrecognized.
-///
-/// Guardrails override the LLM's "complex" classification for messages that
-/// are clearly simple — the consultant LLM over-classifies short commands,
-/// acknowledgments, and single-action requests as complex.
-fn classify_intent_complexity(
-    user_text: &str,
-    intent_gate: &IntentGateDecision,
-) -> (IntentComplexity, Vec<String>) {
-    // If user clearly wants recurring behavior but no timing could be extracted,
-    // ask for schedule details instead of silently creating a non-recurring goal.
-    if ENABLE_SCHEDULE_HEURISTICS
-        && intent_gate.schedule.is_none()
-        && intent_gate.schedule_cron.is_none()
-        && looks_like_recurring_intent_without_timing(user_text)
-    {
-        return (IntentComplexity::ScheduledMissingTiming, vec![]);
-    }
-
-    // Schedule takes priority over all other classifications.
-    if let Some(ref schedule_raw) = intent_gate.schedule {
-        let schedule_type_explicit = intent_gate.schedule_type.is_some();
-        let is_one_shot = intent_gate.schedule_type.as_deref() == Some("one_shot");
-        return (
-            IntentComplexity::Scheduled {
-                schedule_raw: schedule_raw.clone(),
-                schedule_cron: intent_gate.schedule_cron.clone(),
-                is_one_shot,
-                schedule_type_explicit,
-            },
-            vec![],
-        );
-    }
-    if let Some(ref schedule_cron) = intent_gate.schedule_cron {
-        let schedule_type_explicit = intent_gate.schedule_type.is_some();
-        let is_one_shot = intent_gate.schedule_type.as_deref() == Some("one_shot");
-        return (
-            IntentComplexity::Scheduled {
-                schedule_raw: schedule_cron.clone(),
-                schedule_cron: Some(schedule_cron.clone()),
-                is_one_shot,
-                schedule_type_explicit,
-            },
-            vec![],
-        );
-    }
-
-    if intent_gate.can_answer_now.unwrap_or(false) && !intent_gate.needs_tools.unwrap_or(false) {
-        return (IntentComplexity::Knowledge, vec![]);
-    }
-    // When can_answer_now=false, don't classify as Knowledge even if
-    // complexity="knowledge" — the model can't answer, so we should
-    // try tools (memory search, manage_people, etc.) as Simple.
-    match intent_gate.complexity.as_deref() {
-        Some("knowledge") => (IntentComplexity::Simple, vec![]),
-        Some("complex") => (IntentComplexity::Complex, vec![]),
-        _ => (IntentComplexity::Simple, vec![]),
-    }
-}
-
-/// Returns true if the message is a trivial acknowledgment, greeting, or
-/// single imperative command that should never be routed as Complex.
-#[allow(dead_code)] // Kept for potential future guardrail handling.
-fn is_trivial_message(lower: &str) -> bool {
-    let trivial_prefixes = [
-        "ok",
-        "okay",
-        "sure",
-        "thanks",
-        "thank you",
-        "thx",
-        "got it",
-        "cool",
-        "great",
-        "nice",
-        "yes",
-        "no",
-        "yep",
-        "nope",
-        "alright",
-        "sounds good",
-        "perfect",
-        "awesome",
-        "good",
-        "fine",
-        "right",
-        "hello",
-        "hi",
-        "hey",
-    ];
-    for prefix in &trivial_prefixes {
-        if lower.starts_with(prefix) {
-            // Exact match or followed by whitespace/punctuation
-            if lower.len() == prefix.len()
-                || lower
-                    .as_bytes()
-                    .get(prefix.len())
-                    .is_some_and(|b| !b.is_ascii_alphanumeric())
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Returns true for short corrective follow-ups (not new requests), e.g.
-/// "you did send me the pdf". This is a deterministic guardrail when the
-/// consultant intent gate over-predicts `needs_tools=true`.
-fn is_short_user_correction(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() || lower.contains('?') {
-        return false;
-    }
-
-    let word_count = lower.split_whitespace().count();
-    if word_count > 14 {
-        return false;
-    }
-
-    // If the user is clearly asking for a fresh action, this is not a correction-only turn.
-    let request_prefixes = [
-        "can you ",
-        "could you ",
-        "would you ",
-        "please ",
-        "run ",
-        "check ",
-        "find ",
-        "create ",
-        "generate ",
-        "make ",
-        "send ",
-        "open ",
-        "read ",
-        "write ",
-        "search ",
-        "install ",
-        "fix ",
-        "debug ",
-        "build ",
-        "edit ",
-        "move ",
-        "copy ",
-        "delete ",
-        "retry ",
-        "try again",
-        "proceed",
-    ];
-    if request_prefixes.iter().any(|p| lower.starts_with(p)) {
-        return false;
-    }
-    let request_phrases = [
-        " can you ",
-        " could you ",
-        " would you ",
-        " please ",
-        " try again",
-        " proceed",
-        " go ahead",
-    ];
-    if request_phrases.iter().any(|p| lower.contains(p)) {
-        return false;
-    }
-
-    let correction_markers = [
-        "you did",
-        "you already",
-        "you sent",
-        "you have sent",
-        "you did send",
-        "i already",
-        "i got",
-        "i received",
-        "that's right",
-        "thats right",
-        "correct",
-        "exactly",
-    ];
-    correction_markers.iter().any(|m| lower.contains(m))
-}
-
-/// Returns true if the message is a list of immediate tool operations that can
-/// be completed in a single agent session. These should be Simple, not Complex.
-#[allow(dead_code)] // Kept for potential future guardrail handling.
-fn is_sequential_tool_request(lower: &str) -> bool {
-    // Check for numbered list patterns (1), 2), 3) or 1. 2. 3.)
-    let has_numbered_steps = lower.contains("1)") || lower.contains("1.");
-    if !has_numbered_steps {
-        return false;
-    }
-
-    // Check if the steps are all immediate tool actions
-    let action_verbs = [
-        "run ",
-        "execute ",
-        "search ",
-        "write ",
-        "create ",
-        "check ",
-        "list ",
-        "read ",
-        "fetch ",
-        "download ",
-        "install ",
-        "find ",
-        "show ",
-        "display ",
-        "get ",
-        "send ",
-        "open ",
-        "save ",
-    ];
-    let step_count = lower.matches([')', '.']).count().min(10); // cap to avoid false positives on prose
-
-    // Count how many action verbs appear — if most steps are tool actions, it's sequential
-    let action_count = action_verbs.iter().filter(|v| lower.contains(*v)).count();
-    action_count >= 2 && step_count >= 2
-}
-
-fn is_pseudo_tool_line(line: &str) -> bool {
-    let lower = line.trim().to_ascii_lowercase();
-    lower.starts_with("[tool_use:")
-        || lower.starts_with("[tool_call:")
-        || lower.starts_with("[function_call:")
-        || lower.starts_with("[functioncall:")
-}
-
-fn is_tool_name_like(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    let lower = name.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "terminal"
-            | "browser"
-            | "web_search"
-            | "web_fetch"
-            | "system_info"
-            | "remember_fact"
-            | "manage_config"
-            | "send_file"
-            | "spawn_agent"
-            | "cli_agent"
-            | "manage_cli_agents"
-            | "health_probe"
-            | "manage_skills"
-            | "use_skill"
-            | "skill_resources"
-            | "manage_people"
-            | "http_request"
-            | "manage_oauth"
-            | "read_channel_history"
-    ) || lower.starts_with("mcp__")
-        || lower.contains("__")
-}
-
-fn parse_name_field(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let (key, value) = trimmed.split_once(':')?;
-    if !key.trim().eq_ignore_ascii_case("name") {
-        return None;
-    }
-    let name = value.trim();
-    if name.is_empty() || name.contains(' ') {
-        return None;
-    }
-    Some(name.to_string())
-}
-
-fn looks_like_deferred_action_response(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-
-    // Pattern-based detection: catch "I'll [verb]", "I will [verb]", "Let me [verb]",
-    // "Shall I [verb]", "Would you like me to [verb]" where verb needs tools.
-    // This is dynamic — any new action verb the LLM uses is automatically caught.
-    if has_action_promise(&lower) {
-        return true;
-    }
-
-    // Special-case phrases that don't fit the prefix+verb pattern
-    if contains_keyword_as_words(&lower, "i would typically") {
-        return true;
-    }
-
-    // Structural format markers — substring match appropriate for these patterns
-    lower.contains("[consultation]")
-        || lower.contains(&INTENT_GATE_MARKER.to_ascii_lowercase())
-        || lower.contains("[tool_use:")
-        || lower.contains("[tool_call:")
-        || lower.contains("arguments:")
-}
-
-/// Detect action-promise patterns like "I'll create", "I will run", "Let me check".
-/// Returns true when the verb following the prefix is NOT a knowledge-only verb
-/// (e.g., "explain", "describe", "summarize"), meaning the LLM needs tools to fulfill it.
-fn has_action_promise(text: &str) -> bool {
-    // Normalize common Unicode apostrophes so contractions like "I’ll"
-    // are treated the same as "I'll".
-    let normalized = text.replace(['\u{2018}', '\u{2019}', '`', '\u{02BC}'], "'");
-
-    // Verbs the LLM can fulfill without tools — pure knowledge/explanation verbs
-    const KNOWLEDGE_ONLY_VERBS: &[&str] = &[
-        "explain",
-        "describe",
-        "summarize",
-        "clarify",
-        "elaborate",
-        "outline",
-        "note",
-        "mention",
-        "address",
-        "highlight",
-        "tell",
-        "share",
-        "say",
-        "answer",
-        "provide",
-        "be",
-        "give",
-        "offer",
-        "rephrase",
-        "restate",
-    ];
-
-    let words: Vec<String> = normalized
-        .split_whitespace()
-        .map(|w| {
-            w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
-                .to_lowercase()
-        })
-        .filter(|w| !w.is_empty())
-        .collect();
-
-    for i in 0..words.len() {
-        // Determine the index of the verb after the action-promise prefix
-        let verb_idx = if words[i] == "i'll" {
-            // "I'll [verb]"
-            Some(i + 1)
-        } else if words[i] == "i" && words.get(i + 1).is_some_and(|w| w == "will") {
-            // "I will [verb]"
-            Some(i + 2)
-        } else if words[i] == "let" && words.get(i + 1).is_some_and(|w| w == "me") {
-            // "Let me [verb]"
-            Some(i + 2)
-        } else if words[i] == "shall" && words.get(i + 1).is_some_and(|w| w == "i") {
-            // "Shall I [verb]"
-            Some(i + 2)
-        } else if words[i] == "would"
-            && words.get(i + 1).is_some_and(|w| w == "you")
-            && words.get(i + 2).is_some_and(|w| w == "like")
-            && words.get(i + 3).is_some_and(|w| w == "me")
-            && words.get(i + 4).is_some_and(|w| w == "to")
-        {
-            // "Would you like me to [verb]"
-            Some(i + 5)
-        } else {
-            None
-        };
-
-        if let Some(vi) = verb_idx {
-            if let Some(verb) = words.get(vi) {
-                if !KNOWLEDGE_ONLY_VERBS.contains(&verb.as_str()) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-/// Remove leaked consultant control markers and pseudo tool-call text.
-fn sanitize_consultant_analysis(analysis: &str) -> String {
-    let lines: Vec<&str> = analysis.lines().collect();
-    let has_pseudo_tool_block = lines.iter().any(|line| is_pseudo_tool_line(line));
-
-    let mut cleaned: Vec<String> = Vec::with_capacity(lines.len());
-    let mut i = 0usize;
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-
-        if lower == "arguments:" {
-            let mut j = i + 1;
-            let mut block_has_tool_signature = false;
-            while j < lines.len() {
-                let next = lines[j].trim();
-                if next.is_empty() {
-                    break;
-                }
-                if let Some(name) = parse_name_field(next) {
-                    if is_tool_name_like(&name) {
-                        block_has_tool_signature = true;
-                    }
-                }
-                let next_lower = next.to_ascii_lowercase();
-                if next_lower.starts_with("cmd:")
-                    || next_lower.starts_with("command:")
-                    || next_lower.starts_with("args:")
-                    || next_lower.starts_with("arguments:")
-                {
-                    block_has_tool_signature = true;
-                }
-                j += 1;
-            }
-
-            if block_has_tool_signature {
-                i = j;
-                continue;
-            }
-        }
-
-        if is_pseudo_tool_line(line) {
-            i += 1;
-            continue;
-        }
-
-        let replaced = line.replace(CONSULTANT_TEXT_ONLY_MARKER, "");
-        let trimmed_replaced = replaced.trim();
-        let lower_replaced = trimmed_replaced.to_ascii_lowercase();
-
-        if lower_replaced == "[consultation]" {
-            i += 1;
-            continue;
-        }
-
-        if lower_replaced.starts_with(&INTENT_GATE_MARKER.to_ascii_lowercase()) {
-            i += 1;
-            continue;
-        }
-
-        // Some models echo the consultant control instruction verbatim.
-        if lower_replaced.starts_with("[important:")
-            && lower_replaced.contains("you are being consulted")
-            && lower_replaced.contains("respond with text only")
-        {
-            i += 1;
-            continue;
-        }
-
-        if has_pseudo_tool_block
-            && (lower_replaced.starts_with("cmd:")
-                || lower_replaced.starts_with("command:")
-                || lower_replaced.starts_with("args:")
-                || lower_replaced.starts_with("arguments:")
-                || parse_name_field(trimmed_replaced)
-                    .as_deref()
-                    .is_some_and(is_tool_name_like))
-        {
-            i += 1;
-            continue;
-        }
-
-        if trimmed_replaced.is_empty() {
-            if cleaned.last().is_some_and(|prev| prev.is_empty()) {
-                i += 1;
-                continue;
-            }
-            cleaned.push(String::new());
-        } else {
-            cleaned.push(replaced.trim_end().to_string());
-        }
-        i += 1;
-    }
-
-    cleaned.join("\n").trim().to_string()
 }
 
 pub struct Agent {
@@ -2869,6 +1871,289 @@ impl Agent {
         self.max_iterations
     }
 
+    async fn append_message_canonical(&self, msg: &Message) -> anyhow::Result<()> {
+        self.state.append_message(msg).await
+    }
+
+    async fn append_user_message_with_event(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        msg: &Message,
+        has_attachments: bool,
+    ) -> anyhow::Result<()> {
+        emitter
+            .emit(
+                EventType::UserMessage,
+                UserMessageData {
+                    content: msg.content.clone().unwrap_or_default(),
+                    message_id: Some(msg.id.clone()),
+                    has_attachments,
+                },
+            )
+            .await?;
+        self.append_message_canonical(msg).await?;
+        Ok(())
+    }
+
+    async fn append_assistant_message_with_event(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        msg: &Message,
+        model: &str,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+    ) -> anyhow::Result<()> {
+        let tool_calls = msg.tool_calls_json.as_ref().and_then(|raw| {
+            serde_json::from_str::<Vec<ToolCall>>(raw)
+                .ok()
+                .map(|calls| {
+                    calls
+                        .into_iter()
+                        .map(|tc| ToolCallInfo {
+                            id: tc.id,
+                            name: tc.name,
+                            arguments: serde_json::from_str(&tc.arguments)
+                                .unwrap_or(serde_json::json!({})),
+                            extra_content: tc.extra_content,
+                        })
+                        .collect::<Vec<_>>()
+                })
+        });
+        emitter
+            .emit(
+                EventType::AssistantResponse,
+                AssistantResponseData {
+                    message_id: Some(msg.id.clone()),
+                    content: msg.content.clone(),
+                    model: model.to_string(),
+                    tool_calls,
+                    input_tokens,
+                    output_tokens,
+                },
+            )
+            .await?;
+        self.append_message_canonical(msg).await?;
+        Ok(())
+    }
+
+    async fn append_tool_message_with_result_event(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        msg: &Message,
+        success: bool,
+        duration_ms: u64,
+        error: Option<String>,
+        task_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        emitter
+            .emit(
+                EventType::ToolResult,
+                ToolResultData {
+                    message_id: Some(msg.id.clone()),
+                    tool_call_id: msg.tool_call_id.clone().unwrap_or_else(|| msg.id.clone()),
+                    name: msg
+                        .tool_name
+                        .clone()
+                        .unwrap_or_else(|| "system".to_string()),
+                    result: msg.content.clone().unwrap_or_default(),
+                    success,
+                    duration_ms,
+                    error,
+                    task_id: task_id.map(str::to_string),
+                },
+            )
+            .await?;
+        self.append_message_canonical(msg).await?;
+        Ok(())
+    }
+
+    async fn load_initial_history(
+        &self,
+        session_id: &str,
+        user_text: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
+        match self
+            .event_store
+            .get_conversation_history(session_id, limit)
+            .await
+        {
+            Ok(history) if !history.is_empty() => {
+                return Ok(history);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    session_id,
+                    error = %e,
+                    "Event history load failed; falling back to state context retrieval"
+                );
+            }
+        }
+
+        self.state.get_context(session_id, user_text, limit).await
+    }
+
+    async fn load_recent_history(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
+        match self
+            .event_store
+            .get_conversation_history(session_id, limit)
+            .await
+        {
+            Ok(history) if !history.is_empty() => Ok(history),
+            Ok(_) => self.state.get_history(session_id, limit).await,
+            Err(e) => {
+                warn!(
+                    session_id,
+                    error = %e,
+                    "Event recent-history load failed; falling back to state history retrieval"
+                );
+                self.state.get_history(session_id, limit).await
+            }
+        }
+    }
+
+    async fn build_resume_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<ResumeCheckpoint>> {
+        let Some(active_task_event) = self.event_store.get_active_task(session_id).await? else {
+            return Ok(None);
+        };
+        let Some(task_id) = active_task_event.task_id.clone() else {
+            return Ok(None);
+        };
+
+        let start_data = active_task_event.parse_data::<TaskStartData>().ok();
+        let description = start_data
+            .as_ref()
+            .map(|d| d.description.clone())
+            .unwrap_or_else(|| "in-progress task".to_string());
+        let original_user_message = start_data.and_then(|d| d.user_message);
+
+        let events = self
+            .event_store
+            .query_task_events_for_session(session_id, &task_id)
+            .await
+            .unwrap_or_default();
+
+        let mut last_iteration: u32 = 0;
+        let mut tool_results_count: u32 = 0;
+        let mut pending_tool_calls: HashSet<String> = HashSet::new();
+        let mut last_assistant_summary: Option<String> = None;
+        let mut last_tool_summary: Option<String> = None;
+        let mut last_error: Option<String> = None;
+
+        for event in &events {
+            match event.event_type {
+                EventType::ThinkingStart => {
+                    if let Ok(data) = event.parse_data::<ThinkingStartData>() {
+                        last_iteration = last_iteration.max(data.iteration);
+                    }
+                }
+                EventType::AssistantResponse => {
+                    if let Ok(data) = event.parse_data::<AssistantResponseData>() {
+                        if let Some(calls) = data.tool_calls.as_ref() {
+                            for call in calls {
+                                pending_tool_calls.insert(call.id.clone());
+                            }
+                        }
+                        if let Some(content) = data.content.as_deref() {
+                            let trimmed = content.trim();
+                            if !trimmed.is_empty() {
+                                last_assistant_summary = Some(truncate_for_resume(trimmed, 180));
+                            }
+                        }
+                    }
+                }
+                EventType::ToolResult => {
+                    if let Ok(data) = event.parse_data::<ToolResultData>() {
+                        tool_results_count = tool_results_count.saturating_add(1);
+                        pending_tool_calls.remove(&data.tool_call_id);
+                        let detail = if data.success {
+                            data.result
+                        } else {
+                            data.error.unwrap_or(data.result)
+                        };
+                        let detail = detail.trim();
+                        if !detail.is_empty() {
+                            last_tool_summary = Some(truncate_for_resume(detail, 180));
+                        }
+                    }
+                }
+                EventType::Error => {
+                    if let Ok(data) = event.parse_data::<ErrorData>() {
+                        last_error = Some(truncate_for_resume(&data.message, 180));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let elapsed_secs = (Utc::now() - active_task_event.created_at)
+            .num_seconds()
+            .max(0) as u64;
+        let mut pending_tool_call_ids: Vec<String> = pending_tool_calls.into_iter().collect();
+        pending_tool_call_ids.sort();
+
+        Ok(Some(ResumeCheckpoint {
+            task_id,
+            description,
+            original_user_message,
+            elapsed_secs,
+            last_iteration,
+            tool_results_count,
+            pending_tool_call_ids,
+            last_assistant_summary,
+            last_tool_summary,
+            last_error,
+        }))
+    }
+
+    async fn mark_task_interrupted_for_resume(
+        &self,
+        session_id: &str,
+        checkpoint: &ResumeCheckpoint,
+        resumed_task_id: &str,
+    ) {
+        // Best-effort: if task already has task_end, skip.
+        let already_ended = self
+            .event_store
+            .query_task_events_for_session(session_id, &checkpoint.task_id)
+            .await
+            .ok()
+            .is_some_and(|events| events.iter().any(|e| e.event_type == EventType::TaskEnd));
+        if already_ended {
+            return;
+        }
+
+        let resume_emitter =
+            crate::events::EventEmitter::new(self.event_store.clone(), session_id.to_string())
+                .with_task_id(checkpoint.task_id.clone());
+        let error = format!(
+            "Agent process interrupted before completion. Resumed in task {}.",
+            resumed_task_id
+        );
+        let _ = resume_emitter
+            .emit(
+                EventType::TaskEnd,
+                TaskEndData {
+                    task_id: checkpoint.task_id.clone(),
+                    status: TaskStatus::Failed,
+                    duration_secs: checkpoint.elapsed_secs,
+                    iterations: checkpoint.last_iteration,
+                    tool_calls_count: checkpoint.tool_results_count,
+                    error: Some(error),
+                    summary: Some("Recovered from checkpoint after interruption".to_string()),
+                },
+            )
+            .await;
+    }
+
     /// Spawn a child agent with an incremented depth and a focused mission.
     ///
     /// The child runs its own agentic loop in a fresh session and returns the
@@ -4002,13 +3287,47 @@ impl Agent {
     ) -> anyhow::Result<String> {
         touch_heartbeat(&heartbeat);
 
+        let resume_checkpoint = if is_resume_request(user_text) {
+            match self.build_resume_checkpoint(session_id).await {
+                Ok(checkpoint) => checkpoint,
+                Err(e) => {
+                    warn!(
+                        session_id,
+                        error = %e,
+                        "Failed to build resume checkpoint; continuing without resume context"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let resumed_from_task_id = resume_checkpoint.as_ref().map(|c| c.task_id.clone());
+
         // Generate task ID for this request
         let task_id = Uuid::new_v4().to_string();
+
+        if let Some(checkpoint) = resume_checkpoint.as_ref() {
+            self.mark_task_interrupted_for_resume(session_id, checkpoint, &task_id)
+                .await;
+            info!(
+                session_id,
+                resumed_task_id = %checkpoint.task_id,
+                new_task_id = %task_id,
+                "Recovered in-progress task from checkpoint"
+            );
+        }
 
         // Create event emitter for this session/task
         let emitter =
             crate::events::EventEmitter::new(self.event_store.clone(), session_id.to_string())
                 .with_task_id(task_id.clone());
+
+        let task_description = if let Some(checkpoint) = resume_checkpoint.as_ref() {
+            format!("resume: {}", checkpoint.description)
+        } else {
+            user_text.to_string()
+        };
 
         // Emit TaskStart event
         let _ = emitter
@@ -4016,8 +3335,8 @@ impl Agent {
                 EventType::TaskStart,
                 TaskStartData {
                     task_id: task_id.clone(),
-                    description: user_text.chars().take(200).collect(),
-                    parent_task_id: None,
+                    description: task_description.chars().take(200).collect(),
+                    parent_task_id: resumed_from_task_id,
                     user_message: Some(user_text.to_string()),
                 },
             )
@@ -4041,19 +3360,8 @@ impl Agent {
         let mut user_msg = user_msg;
         user_msg.importance = score;
 
-        self.state.append_message(&user_msg).await?;
-
-        // Emit UserMessage event
-        let _ = emitter
-            .emit(
-                EventType::UserMessage,
-                UserMessageData {
-                    content: user_text.to_string(),
-                    message_id: None,
-                    has_attachments: false,
-                },
-            )
-            .await;
+        self.append_user_message_with_event(&emitter, &user_msg, false)
+            .await?;
 
         // Detect stop/cancel commands and automatically cancel running cli_agents
         let lower = user_text.to_lowercase();
@@ -4065,7 +3373,7 @@ impl Agent {
         if is_stop_command {
             // Cancel all running cli_agents for this session
             let cancel_result = self
-                .execute_tool(
+                .execute_tool_with_watchdog(
                     "cli_agent",
                     r#"{"action": "cancel_all"}"#,
                     session_id,
@@ -4170,7 +3478,14 @@ impl Agent {
                         importance: 0.5,
                         embedding: None,
                     };
-                    self.state.append_message(&assistant_msg).await?;
+                    self.append_assistant_message_with_event(
+                        &emitter,
+                        &assistant_msg,
+                        "system",
+                        None,
+                        None,
+                    )
+                    .await?;
                     return Ok(msg);
                 } else if is_reject {
                     let mut cancelled = 0usize;
@@ -4202,7 +3517,14 @@ impl Agent {
                         importance: 0.5,
                         embedding: None,
                     };
-                    self.state.append_message(&assistant_msg).await?;
+                    self.append_assistant_message_with_event(
+                        &emitter,
+                        &assistant_msg,
+                        "system",
+                        None,
+                        None,
+                    )
+                    .await?;
                     return Ok(msg);
                 } else {
                     // User moved on without explicit confirmation/rejection.
@@ -4428,6 +3750,7 @@ impl Agent {
                     fast_model,
                     active_skills.clone(),
                     user_text,
+                    Some(&self.state),
                 )
                 .await
                 {
@@ -4863,6 +4186,33 @@ impl Agent {
             system_prompt = format!("{}\n\n{}", system_prompt, session_context_str);
         }
 
+        if let Some(checkpoint) = resume_checkpoint.as_ref() {
+            system_prompt = format!(
+                "{}\n\n{}",
+                system_prompt,
+                checkpoint.render_prompt_section()
+            );
+            if self.record_decision_points {
+                self.emit_decision_point(
+                    &emitter,
+                    &task_id,
+                    0,
+                    DecisionType::InstructionsSnapshot,
+                    format!(
+                        "Resume checkpoint injected from task {}",
+                        checkpoint.task_id.as_str()
+                    ),
+                    json!({
+                        "resume_from_task_id": checkpoint.task_id.as_str(),
+                        "resume_last_iteration": checkpoint.last_iteration,
+                        "resume_pending_tool_calls": checkpoint.pending_tool_call_ids.len(),
+                        "resume_elapsed_secs": checkpoint.elapsed_secs
+                    }),
+                )
+                .await;
+            }
+        }
+
         if self.record_decision_points {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             system_prompt.hash(&mut hasher);
@@ -4896,20 +4246,8 @@ impl Agent {
         );
 
         // 2b. Retrieve Context ONCE (Optimization)
-        // Use Tri-Hybrid Retrieval to get relevant history
-        let mut initial_history = self.state.get_context(session_id, user_text, 50).await?;
-
-        // Fallback: if messages table is empty, try event store for conversation history
-        if initial_history.is_empty() {
-            info!(
-                session_id,
-                "Messages table empty, falling back to event store history"
-            );
-            initial_history = self
-                .event_store
-                .get_conversation_history(session_id, 50)
-                .await?;
-        }
+        // Canonical read path: events first, legacy context fallback.
+        let mut initial_history = self.load_initial_history(session_id, user_text, 50).await?;
 
         // Optimize: Identify "Pinned" memories (Relevant/Salient but old) to avoid re-fetching
         let recency_window = 20;
@@ -4973,6 +4311,10 @@ impl Agent {
         let mut last_escalation_iteration: Option<usize> = None;
         let mut consecutive_clean_iterations: usize = 0;
         let mut fallback_expanded_once = false;
+        // One-shot recovery for empty execution responses (no text + no tool calls).
+        let mut empty_response_retry_used = false;
+        let mut empty_response_retry_pending = false;
+        let mut empty_response_retry_note: Option<String> = None;
         // Idempotency guard for send_file within a single task execution.
         let mut successful_send_file_keys: HashSet<String> = HashSet::new();
 
@@ -5078,7 +4420,7 @@ impl Agent {
                     )
                     .await;
                     let result = self
-                        .graceful_cap_response(session_id, &learning_ctx, iteration)
+                        .graceful_cap_response(&emitter, session_id, &learning_ctx, iteration)
                         .await;
                     let (status, error, summary) = match &result {
                         Ok(reply) => (
@@ -5125,7 +4467,12 @@ impl Agent {
                     )
                     .await;
                     let result = self
-                        .graceful_timeout_response(session_id, &learning_ctx, task_start.elapsed())
+                        .graceful_timeout_response(
+                            &emitter,
+                            session_id,
+                            &learning_ctx,
+                            task_start.elapsed(),
+                        )
                         .await;
                     let (status, error, summary) = match &result {
                         Ok(reply) => (
@@ -5172,8 +4519,26 @@ impl Agent {
                         }),
                     )
                     .await;
+                    let alert_msg = format!(
+                        "Token alert: execution in session '{}' hit task token budget (used {} / limit {}). The run was stopped to prevent overspending.",
+                        session_id,
+                        task_tokens_used,
+                        budget
+                    );
+                    self.fanout_token_alert(
+                        self.v3_goal_id.as_deref(),
+                        session_id,
+                        &alert_msg,
+                        Some(session_id),
+                    )
+                    .await;
                     let result = self
-                        .graceful_budget_response(session_id, &learning_ctx, task_tokens_used)
+                        .graceful_budget_response(
+                            &emitter,
+                            session_id,
+                            &learning_ctx,
+                            task_tokens_used,
+                        )
                         .await;
                     let (status, error, summary) = match &result {
                         Ok(reply) => (
@@ -5220,6 +4585,19 @@ impl Agent {
                             }),
                         )
                         .await;
+                        let alert_msg = format!(
+                            "Token alert: global daily token budget was exceeded (used {} / limit {}) while running session '{}'.",
+                            total,
+                            daily_budget,
+                            session_id
+                        );
+                        self.fanout_token_alert(
+                            self.v3_goal_id.as_deref(),
+                            session_id,
+                            &alert_msg,
+                            None,
+                        )
+                        .await;
                         let error_msg = format!(
                             "Daily token budget of {} exceeded (used: {}). Resets at midnight UTC.",
                             daily_budget, total
@@ -5242,6 +4620,58 @@ impl Agent {
 
             // 5. Stall detection — agent spinning without progress
             if stall_count >= MAX_STALL_ITERATIONS {
+                if !successful_send_file_keys.is_empty() && learning_ctx.errors.is_empty() {
+                    let reply = "I already sent the requested file. If you want any changes or another file, tell me exactly what to send.".to_string();
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        iteration,
+                        DecisionType::StoppingCondition,
+                        "Stopping condition fired after successful send_file; resolving as completed".to_string(),
+                        json!({
+                            "condition":"post_send_file_stall",
+                            "stall_count": stall_count,
+                            "max_stall_iterations": MAX_STALL_ITERATIONS,
+                            "successful_send_file_count": successful_send_file_keys.len()
+                        }),
+                    )
+                    .await;
+
+                    let assistant_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "assistant".to_string(),
+                        content: Some(reply.clone()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.5,
+                        embedding: None,
+                    };
+                    self.append_assistant_message_with_event(
+                        &emitter,
+                        &assistant_msg,
+                        &model,
+                        None,
+                        None,
+                    )
+                    .await?;
+
+                    self.emit_task_end(
+                        &emitter,
+                        &task_id,
+                        TaskStatus::Completed,
+                        task_start,
+                        iteration,
+                        learning_ctx.tool_calls.len(),
+                        None,
+                        Some(reply.chars().take(200).collect()),
+                    )
+                    .await;
+                    return Ok(reply);
+                }
+
                 warn!(
                     session_id,
                     stall_count, "Agent stalled - no progress detected"
@@ -5261,6 +4691,7 @@ impl Agent {
                 .await;
                 let result = self
                     .graceful_stall_response(
+                        &emitter,
                         session_id,
                         &learning_ctx,
                         !successful_send_file_keys.is_empty(),
@@ -5418,8 +4849,8 @@ impl Agent {
 
             // === BUILD MESSAGES ===
 
-            // Fetch only recent history inside the loop
-            let recent_history = self.state.get_history(session_id, 20).await?;
+            // Fetch recent history from canonical event stream (legacy fallback).
+            let recent_history = self.load_recent_history(session_id, 20).await?;
 
             // Merge Pinned + Recent using iterators to avoid cloning the Message structs
             let mut seen_ids: std::collections::HashSet<&String> = std::collections::HashSet::new();
@@ -5792,6 +5223,14 @@ impl Agent {
                 "LLM response received"
             );
 
+            // Clear pending empty-response retry context once the model produces
+            // any actionable output (text or tool calls).
+            let has_non_empty_content = resp.content.as_ref().is_some_and(|s| !s.is_empty());
+            if !resp.tool_calls.is_empty() || has_non_empty_content {
+                empty_response_retry_pending = false;
+                empty_response_retry_note = None;
+            }
+
             // === CONSULTANT PASS: intercept iteration 1 ===
             // Gemini models can hallucinate tool calls from system prompt tool
             // descriptions even when no function declarations are sent via the API.
@@ -5943,7 +5382,14 @@ impl Agent {
                         importance: 0.5,
                         embedding: None,
                     };
-                    self.state.append_message(&assistant_msg).await?;
+                    self.append_assistant_message_with_event(
+                        &emitter,
+                        &assistant_msg,
+                        "system",
+                        None,
+                        None,
+                    )
+                    .await?;
 
                     self.emit_task_end(
                         &emitter,
@@ -6007,7 +5453,14 @@ impl Agent {
                             importance: 0.5,
                             embedding: None,
                         };
-                        self.state.append_message(&assistant_msg).await?;
+                        self.append_assistant_message_with_event(
+                            &emitter,
+                            &assistant_msg,
+                            "system",
+                            None,
+                            None,
+                        )
+                        .await?;
 
                         self.emit_task_end(
                             &emitter,
@@ -6056,7 +5509,14 @@ impl Agent {
                         importance: 0.5,
                         embedding: None,
                     };
-                    self.state.append_message(&assistant_msg).await?;
+                    self.append_assistant_message_with_event(
+                        &emitter,
+                        &assistant_msg,
+                        "system",
+                        None,
+                        None,
+                    )
+                    .await?;
 
                     self.emit_task_end(
                         &emitter,
@@ -6280,7 +5740,14 @@ impl Agent {
                                     importance: 0.5,
                                     embedding: None,
                                 };
-                                self.state.append_message(&assistant_msg).await?;
+                                self.append_assistant_message_with_event(
+                                    &emitter,
+                                    &assistant_msg,
+                                    "system",
+                                    None,
+                                    None,
+                                )
+                                .await?;
                                 self.emit_task_end(
                                     &emitter,
                                     &task_id,
@@ -6428,7 +5895,14 @@ impl Agent {
                                             importance: 0.5,
                                             embedding: None,
                                         };
-                                        self.state.append_message(&assistant_msg).await?;
+                                        self.append_assistant_message_with_event(
+                                            &emitter,
+                                            &assistant_msg,
+                                            "system",
+                                            None,
+                                            None,
+                                        )
+                                        .await?;
                                         self.emit_task_end(
                                             &emitter,
                                             &task_id,
@@ -6466,7 +5940,14 @@ impl Agent {
                                             importance: 0.5,
                                             embedding: None,
                                         };
-                                        self.state.append_message(&assistant_msg).await?;
+                                        self.append_assistant_message_with_event(
+                                            &emitter,
+                                            &assistant_msg,
+                                            "system",
+                                            None,
+                                            None,
+                                        )
+                                        .await?;
                                         self.emit_task_end(
                                             &emitter,
                                             &task_id,
@@ -6510,7 +5991,14 @@ impl Agent {
                                 importance: 0.5,
                                 embedding: None,
                             };
-                            self.state.append_message(&assistant_msg).await?;
+                            self.append_assistant_message_with_event(
+                                &emitter,
+                                &assistant_msg,
+                                "system",
+                                None,
+                                None,
+                            )
+                            .await?;
                             self.emit_task_end(
                                 &emitter,
                                 &task_id,
@@ -6551,7 +6039,14 @@ impl Agent {
                                 importance: 0.5,
                                 embedding: None,
                             };
-                            self.state.append_message(&assistant_msg).await?;
+                            self.append_assistant_message_with_event(
+                                &emitter,
+                                &assistant_msg,
+                                "system",
+                                None,
+                                None,
+                            )
+                            .await?;
 
                             self.emit_task_end(
                                 &emitter,
@@ -6613,7 +6108,14 @@ impl Agent {
                                     importance: 0.5,
                                     embedding: None,
                                 };
-                                self.state.append_message(&assistant_msg).await?;
+                                self.append_assistant_message_with_event(
+                                    &emitter,
+                                    &assistant_msg,
+                                    "system",
+                                    None,
+                                    None,
+                                )
+                                .await?;
                                 self.emit_task_end(
                                     &emitter,
                                     &task_id,
@@ -6818,27 +6320,69 @@ impl Agent {
                     // Top-level agent past the consultant pass but no tools were called
                     // and no content returned — the LLM failed to act. Tell the user.
                     if iteration > 1 && self.depth == 0 {
-                        let fallback =
-                            "I wasn't able to process that request. Could you try rephrasing?"
-                                .to_string();
+                        if !empty_response_retry_used {
+                            empty_response_retry_used = true;
+                            empty_response_retry_pending = true;
+                            empty_response_retry_note = resp
+                                .response_note
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string);
+
+                            stall_count += 1;
+                            consecutive_clean_iterations = 0;
+
+                            info!(
+                                session_id,
+                                iteration,
+                                response_note = ?resp.response_note,
+                                "Empty-response recovery: issuing one retry before fallback"
+                            );
+
+                            let retry_nudge = Message {
+                                id: Uuid::new_v4().to_string(),
+                                session_id: session_id.to_string(),
+                                role: "tool".to_string(),
+                                content: Some(
+                                    "[SYSTEM] Your previous reply was empty (no text and no tool calls). Retry once now: call the required tools, or provide a concrete blocker and the missing info."
+                                        .to_string(),
+                                ),
+                                tool_call_id: Some("system-empty-response-retry".to_string()),
+                                tool_name: Some("system".to_string()),
+                                tool_calls_json: None,
+                                created_at: Utc::now(),
+                                importance: 0.1,
+                                embedding: None,
+                            };
+                            self.append_tool_message_with_result_event(
+                                &emitter,
+                                &retry_nudge,
+                                true,
+                                0,
+                                None,
+                                Some(&task_id),
+                            )
+                            .await?;
+
+                            continue;
+                        }
+
+                        let response_note = if empty_response_retry_pending {
+                            resp.response_note
+                                .as_deref()
+                                .or(empty_response_retry_note.as_deref())
+                        } else {
+                            resp.response_note.as_deref()
+                        };
+                        let fallback = build_empty_response_fallback(response_note);
                         info!(
                             session_id,
                             iteration,
+                            response_note = ?resp.response_note,
+                            retry_response_note = ?empty_response_retry_note,
                             "Agent completed with no work done — LLM returned empty with tools available"
                         );
-                        let _ = emitter
-                            .emit(
-                                EventType::AssistantResponse,
-                                AssistantResponseData {
-                                    content: Some(fallback.clone()),
-                                    model: model.clone(),
-                                    tool_calls: None,
-                                    input_tokens: resp.usage.as_ref().map(|u| u.input_tokens),
-                                    output_tokens: resp.usage.as_ref().map(|u| u.output_tokens),
-                                },
-                            )
-                            .await;
-
                         let assistant_msg = Message {
                             id: Uuid::new_v4().to_string(),
                             session_id: session_id.to_string(),
@@ -6851,7 +6395,14 @@ impl Agent {
                             importance: 0.5,
                             embedding: None,
                         };
-                        self.state.append_message(&assistant_msg).await?;
+                        self.append_assistant_message_with_event(
+                            &emitter,
+                            &assistant_msg,
+                            &model,
+                            resp.usage.as_ref().map(|u| u.input_tokens),
+                            resp.usage.as_ref().map(|u| u.output_tokens),
+                        )
+                        .await?;
 
                         self.emit_task_end(
                             &emitter,
@@ -6888,8 +6439,7 @@ impl Agent {
                         stall_count += 1;
                         consecutive_clean_iterations = 0;
                         if total_successful_tool_calls == 0 {
-                            deferred_no_tool_streak =
-                                deferred_no_tool_streak.saturating_add(1);
+                            deferred_no_tool_streak = deferred_no_tool_streak.saturating_add(1);
                         } else {
                             deferred_no_tool_streak = 0;
                         }
@@ -6923,7 +6473,15 @@ impl Agent {
                             importance: 0.1,
                             embedding: None,
                         };
-                        self.state.append_message(&nudge).await?;
+                        self.append_tool_message_with_result_event(
+                            &emitter,
+                            &nudge,
+                            true,
+                            0,
+                            None,
+                            Some(&task_id),
+                        )
+                        .await?;
 
                         // Fallback expansion: widen tool set once after exactly two
                         // no-progress iterations, even in no-tool-call paths.
@@ -6954,8 +6512,7 @@ impl Agent {
 
                         if total_successful_tool_calls == 0
                             && deferred_no_tool_streak >= DEFERRED_NO_TOOL_SWITCH_THRESHOLD
-                            && deferred_no_tool_model_switches
-                                < MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES
+                            && deferred_no_tool_model_switches < MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES
                         {
                             if let Some(next_model) =
                                 self.pick_fallback_excluding(&model, &[]).await
@@ -6987,7 +6544,15 @@ impl Agent {
                                     importance: 0.1,
                                     embedding: None,
                                 };
-                                self.state.append_message(&recovery_nudge).await?;
+                                self.append_tool_message_with_result_event(
+                                    &emitter,
+                                    &recovery_nudge,
+                                    true,
+                                    0,
+                                    None,
+                                    Some(&task_id),
+                                )
+                                .await?;
                             }
                         }
 
@@ -7007,20 +6572,6 @@ impl Agent {
                     }
                 }
 
-                // Emit AssistantResponse event
-                let _ = emitter
-                    .emit(
-                        EventType::AssistantResponse,
-                        AssistantResponseData {
-                            content: Some(reply.clone()),
-                            model: model.clone(),
-                            tool_calls: None,
-                            input_tokens: resp.usage.as_ref().map(|u| u.input_tokens),
-                            output_tokens: resp.usage.as_ref().map(|u| u.output_tokens),
-                        },
-                    )
-                    .await;
-
                 let assistant_msg = Message {
                     id: Uuid::new_v4().to_string(),
                     session_id: session_id.to_string(),
@@ -7033,7 +6584,14 @@ impl Agent {
                     importance: 0.5,
                     embedding: None,
                 };
-                self.state.append_message(&assistant_msg).await?;
+                self.append_assistant_message_with_event(
+                    &emitter,
+                    &assistant_msg,
+                    &model,
+                    resp.usage.as_ref().map(|u| u.input_tokens),
+                    resp.usage.as_ref().map(|u| u.output_tokens),
+                )
+                .await?;
 
                 // Emit TaskEnd event
                 self.emit_task_end(
@@ -7052,7 +6610,7 @@ impl Agent {
                 learning_ctx.completed_naturally = true;
                 let state = self.state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = process_learning(&state, learning_ctx).await {
+                    if let Err(e) = post_task::process_learning(&state, learning_ctx).await {
                         warn!("Learning failed: {}", e);
                     }
                 });
@@ -7122,30 +6680,14 @@ impl Agent {
                 importance: 0.5,
                 embedding: None,
             };
-            self.state.append_message(&assistant_msg).await?;
-
-            // Emit AssistantResponse event with tool calls
-            let tool_call_infos: Vec<ToolCallInfo> = resp
-                .tool_calls
-                .iter()
-                .map(|tc| ToolCallInfo {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    arguments: serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({})),
-                })
-                .collect();
-            let _ = emitter
-                .emit(
-                    EventType::AssistantResponse,
-                    AssistantResponseData {
-                        content: resp.content.clone(),
-                        model: model.clone(),
-                        tool_calls: Some(tool_call_infos),
-                        input_tokens: resp.usage.as_ref().map(|u| u.input_tokens),
-                        output_tokens: resp.usage.as_ref().map(|u| u.output_tokens),
-                    },
-                )
-                .await;
+            self.append_assistant_message_with_event(
+                &emitter,
+                &assistant_msg,
+                &model,
+                resp.usage.as_ref().map(|u| u.input_tokens),
+                resp.usage.as_ref().map(|u| u.output_tokens),
+            )
+            .await?;
 
             // Intent gate: on first iteration, require narration before tool calls.
             // Forces the agent to "show its work" so the user can catch misunderstandings.
@@ -7175,7 +6717,15 @@ impl Agent {
                         importance: 0.3,
                         embedding: None,
                     };
-                    self.state.append_message(&tool_msg).await?;
+                    self.append_tool_message_with_result_event(
+                        &emitter,
+                        &tool_msg,
+                        true,
+                        0,
+                        None,
+                        Some(&task_id),
+                    )
+                    .await?;
                 }
                 continue; // Skip to next iteration — agent will narrate then retry
             }
@@ -7214,7 +6764,14 @@ impl Agent {
                         importance: 0.5,
                         embedding: None,
                     };
-                    self.state.append_message(&assistant_msg).await?;
+                    self.append_assistant_message_with_event(
+                        &emitter,
+                        &assistant_msg,
+                        "system",
+                        None,
+                        None,
+                    )
+                    .await?;
                     self.emit_task_end(
                         &emitter,
                         &task_id,
@@ -7303,7 +6860,15 @@ impl Agent {
                         importance: 0.3,
                         embedding: None,
                     };
-                    self.state.append_message(&tool_msg).await?;
+                    self.append_tool_message_with_result_event(
+                        &emitter,
+                        &tool_msg,
+                        true,
+                        0,
+                        None,
+                        Some(&task_id),
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -7331,7 +6896,7 @@ impl Agent {
                     )
                     .await;
                     let result = self
-                        .graceful_repetitive_response(session_id, &learning_ctx, &tc.name)
+                        .graceful_repetitive_response(&emitter, session_id, &learning_ctx, &tc.name)
                         .await;
                     let (status, error, summary) = match &result {
                         Ok(reply) => (
@@ -7401,7 +6966,12 @@ impl Agent {
                             "Same tool called too many consecutive times - agent is looping"
                         );
                         let result = self
-                            .graceful_repetitive_response(session_id, &learning_ctx, &tc.name)
+                            .graceful_repetitive_response(
+                                &emitter,
+                                session_id,
+                                &learning_ctx,
+                                &tc.name,
+                            )
                             .await;
                         let (status, error, summary) = match &result {
                             Ok(reply) => (
@@ -7476,7 +7046,12 @@ impl Agent {
                                 "Alternating tool pattern detected - agent is looping"
                             );
                             let result = self
-                                .graceful_repetitive_response(session_id, &learning_ctx, &tc.name)
+                                .graceful_repetitive_response(
+                                    &emitter,
+                                    session_id,
+                                    &learning_ctx,
+                                    &tc.name,
+                                )
                                 .await;
                             let (status, error, summary) = match &result {
                                 Ok(reply) => (
@@ -7583,7 +7158,15 @@ impl Agent {
                         importance: 0.1,
                         embedding: None,
                     };
-                    self.state.append_message(&tool_msg).await?;
+                    self.append_tool_message_with_result_event(
+                        &emitter,
+                        &tool_msg,
+                        true,
+                        0,
+                        None,
+                        Some(&task_id),
+                    )
+                    .await?;
                     // Count blocked calls as progress for stall detection, but
                     // only if the agent has done real work before.  Without
                     // this, 3 consecutive blocked iterations trigger
@@ -7644,20 +7227,27 @@ impl Agent {
                         )
                         .await;
 
-                    let _ = emitter
-                        .emit(
-                            EventType::ToolResult,
-                            ToolResultData {
-                                tool_call_id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                result: result_text.clone(),
-                                success: true,
-                                duration_ms: 0,
-                                error: None,
-                                task_id: Some(task_id.clone()),
-                            },
-                        )
-                        .await;
+                    let tool_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "tool".to_string(),
+                        content: Some(result_text.clone()),
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.name.clone()),
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.3,
+                        embedding: None,
+                    };
+                    self.append_tool_message_with_result_event(
+                        &emitter,
+                        &tool_msg,
+                        true,
+                        0,
+                        None,
+                        Some(&task_id),
+                    )
+                    .await?;
 
                     if let Some(ref v3_tid) = self.v3_task_id {
                         let activity = TaskActivityV3 {
@@ -7676,19 +7266,6 @@ impl Agent {
                         }
                     }
 
-                    let tool_msg = Message {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: session_id.to_string(),
-                        role: "tool".to_string(),
-                        content: Some(result_text),
-                        tool_call_id: Some(tc.id.clone()),
-                        tool_name: Some(tc.name.clone()),
-                        tool_calls_json: None,
-                        created_at: Utc::now(),
-                        importance: 0.3,
-                        embedding: None,
-                    };
-                    self.state.append_message(&tool_msg).await?;
                     continue;
                 }
 
@@ -7721,7 +7298,7 @@ impl Agent {
                 let tool_exec_start = Instant::now();
                 touch_heartbeat(&heartbeat);
                 let result = self
-                    .execute_tool(
+                    .execute_tool_with_watchdog(
                         &tc.name,
                         &tc.arguments,
                         session_id,
@@ -7864,25 +7441,31 @@ impl Agent {
                     }
                 }
 
-                // Emit ToolResult event
-                let _ = emitter
-                    .emit(
-                        EventType::ToolResult,
-                        ToolResultData {
-                            tool_call_id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            result: result_text.clone(),
-                            success: !is_error,
-                            duration_ms: tool_duration_ms,
-                            error: if is_error {
-                                Some(result_text.clone())
-                            } else {
-                                None
-                            },
-                            task_id: Some(task_id.clone()),
-                        },
-                    )
-                    .await;
+                let tool_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "tool".to_string(),
+                    content: Some(result_text.clone()),
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_name: Some(tc.name.clone()),
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.3, // Tool outputs default to lower importance
+                    embedding: None,
+                };
+                self.append_tool_message_with_result_event(
+                    &emitter,
+                    &tool_msg,
+                    !is_error,
+                    tool_duration_ms,
+                    if is_error {
+                        Some(result_text.clone())
+                    } else {
+                        None
+                    },
+                    Some(&task_id),
+                )
+                .await?;
 
                 // Emit Error event if tool failed
                 if is_error {
@@ -7915,20 +7498,6 @@ impl Agent {
                         warn!(task_id = %v3_tid, error = %e, "Failed to log V3 task activity");
                     }
                 }
-
-                let tool_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "tool".to_string(),
-                    content: Some(result_text),
-                    tool_call_id: Some(tc.id.clone()),
-                    tool_name: Some(tc.name.clone()),
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.3, // Tool outputs default to lower importance
-                    embedding: None,
-                };
-                self.state.append_message(&tool_msg).await?;
             }
 
             // Escalating early-stop nudges: remind the LLM with increasing urgency
@@ -7961,7 +7530,15 @@ impl Agent {
                     importance: 0.1,
                     embedding: None,
                 };
-                self.state.append_message(&nudge).await?;
+                self.append_tool_message_with_result_event(
+                    &emitter,
+                    &nudge,
+                    true,
+                    0,
+                    None,
+                    Some(&task_id),
+                )
+                .await?;
                 info!(
                     session_id,
                     total_successful_tool_calls, "Early-stop nudge injected (escalating)"
@@ -7987,7 +7564,15 @@ impl Agent {
                     importance: 0.1,
                     embedding: None,
                 };
-                self.state.append_message(&force_msg).await?;
+                self.append_tool_message_with_result_event(
+                    &emitter,
+                    &force_msg,
+                    true,
+                    0,
+                    None,
+                    Some(&task_id),
+                )
+                .await?;
                 warn!(
                     session_id,
                     total_successful_tool_calls, "Force-text response activated — tools stripped"
@@ -8036,25 +7621,12 @@ impl Agent {
         }
     }
 
-    /// Graceful response when task timeout is reached.
-    async fn graceful_timeout_response(
+    async fn append_graceful_assistant_summary(
         &self,
+        emitter: &crate::events::EventEmitter,
         session_id: &str,
-        learning_ctx: &LearningContext,
-        elapsed: Duration,
+        summary: String,
     ) -> anyhow::Result<String> {
-        // Plan pausing removed (plans deprecated in favor of goals/tasks).
-        let summary = format!(
-            "I've been working on this task for {} minutes and reached the time limit. \
-            Here's what I accomplished:\n\n\
-            - {} tool calls executed\n\
-            - {} errors encountered\n\n\
-            The task may be incomplete. You can continue where I left off or try breaking it into smaller parts.",
-            elapsed.as_secs() / 60,
-            learning_ctx.tool_calls.len(),
-            learning_ctx.errors.len()
-        );
-
         let assistant_msg = Message {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
@@ -8067,231 +7639,178 @@ impl Agent {
             importance: 0.5,
             embedding: None,
         };
-        self.state.append_message(&assistant_msg).await?;
+        self.append_assistant_message_with_event(emitter, &assistant_msg, "system", None, None)
+            .await?;
         Ok(summary)
+    }
+
+    /// Graceful response when task timeout is reached.
+    async fn graceful_timeout_response(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        session_id: &str,
+        learning_ctx: &LearningContext,
+        elapsed: Duration,
+    ) -> anyhow::Result<String> {
+        let summary = post_task::graceful_timeout_response(learning_ctx, elapsed);
+        self.append_graceful_assistant_summary(emitter, session_id, summary)
+            .await
     }
 
     /// Graceful response when task token budget is exhausted.
     async fn graceful_budget_response(
         &self,
+        emitter: &crate::events::EventEmitter,
         session_id: &str,
         learning_ctx: &LearningContext,
         tokens_used: u64,
     ) -> anyhow::Result<String> {
-        // Plan pausing removed (plans deprecated in favor of goals/tasks).
-        let summary = format!(
-            "I've used {} tokens on this task and reached the budget limit. \
-            Here's what I accomplished:\n\n\
-            - {} tool calls executed\n\
-            - {} errors encountered\n\n\
-            The task may be incomplete. You can continue where I left off.",
-            tokens_used,
-            learning_ctx.tool_calls.len(),
-            learning_ctx.errors.len()
-        );
+        let summary = post_task::graceful_budget_response(learning_ctx, tokens_used);
+        self.append_graceful_assistant_summary(emitter, session_id, summary)
+            .await
+    }
 
-        let assistant_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "assistant".to_string(),
-            content: Some(summary.clone()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.5,
-            embedding: None,
-        };
-        self.state.append_message(&assistant_msg).await?;
-        Ok(summary)
+    fn dedupe_alert_sessions(sessions: Vec<String>) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for session in sessions {
+            let trimmed = session.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                out.push(trimmed.to_string());
+            }
+        }
+        out
+    }
+
+    fn sanitize_alert_scope(scope: &str) -> String {
+        scope
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
+    async fn load_default_alert_sessions(&self) -> Vec<String> {
+        match self.state.get_setting("default_alert_sessions").await {
+            Ok(Some(raw)) => match serde_json::from_str::<Vec<String>>(&raw) {
+                Ok(sessions) => Self::dedupe_alert_sessions(sessions),
+                Err(e) => {
+                    warn!(error = %e, "Invalid default_alert_sessions setting");
+                    Vec::new()
+                }
+            },
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                warn!(error = %e, "Failed to read default_alert_sessions setting");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Fan-out token alerts to owner sessions plus the triggering session.
+    async fn fanout_token_alert(
+        &self,
+        goal_id: Option<&str>,
+        trigger_session_id: &str,
+        message: &str,
+        suppress_session_id: Option<&str>,
+    ) {
+        let mut targets = self.load_default_alert_sessions().await;
+        targets.push(trigger_session_id.to_string());
+        targets = Self::dedupe_alert_sessions(targets);
+
+        let goal_ref = goal_id.map(ToString::to_string).unwrap_or_else(|| {
+            format!(
+                "token-budget:{}",
+                Self::sanitize_alert_scope(trigger_session_id)
+            )
+        });
+
+        let hub = self.hub.read().await.clone();
+        for target in targets {
+            let entry =
+                crate::traits::NotificationEntry::new(&goal_ref, &target, "token_alert", message);
+
+            if let Err(e) = self.state.enqueue_notification(&entry).await {
+                warn!(
+                    session_id = %target,
+                    goal_id = %goal_ref,
+                    error = %e,
+                    "Failed to enqueue token alert"
+                );
+                continue;
+            }
+
+            if suppress_session_id == Some(target.as_str()) {
+                let _ = self.state.mark_notification_delivered(&entry.id).await;
+                continue;
+            }
+
+            if let Some(hub_weak) = &hub {
+                if let Some(hub_arc) = hub_weak.upgrade() {
+                    if hub_arc.send_text(&target, message).await.is_ok() {
+                        let _ = self.state.mark_notification_delivered(&entry.id).await;
+                    }
+                }
+            }
+        }
     }
 
     /// Classify the stall cause from recent errors for actionable guidance.
+    #[allow(dead_code)] // Used in tests; production path delegates through post_task.
     fn classify_stall(learning_ctx: &LearningContext) -> (&'static str, &'static str) {
-        let recent_errors: String = learning_ctx
-            .errors
-            .iter()
-            .rev()
-            .take(5)
-            .map(|(e, _)| e.to_lowercase())
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        if recent_errors.contains("rate limit") || recent_errors.contains("429") {
-            (
-                "Rate Limited",
-                "The AI provider is throttling requests. Try again in a few minutes, or consider switching to a different model tier.",
-            )
-        } else if recent_errors.contains("timed out") || recent_errors.contains("timeout") {
-            (
-                "Timeout",
-                "The AI provider is responding slowly. This usually resolves on its own — try again shortly, or try a simpler request.",
-            )
-        } else if recent_errors.contains("network") || recent_errors.contains("connection") {
-            (
-                "Network Error",
-                "There's a connectivity issue reaching the AI provider. Check your network connection and try again.",
-            )
-        } else if recent_errors.contains("server error")
-            || recent_errors.contains("500")
-            || recent_errors.contains("502")
-            || recent_errors.contains("503")
-        {
-            (
-                "Server Error",
-                "The AI provider is experiencing issues. This is usually temporary — try again in a few minutes.",
-            )
-        } else if recent_errors.contains("auth")
-            || recent_errors.contains("unauthorized")
-            || recent_errors.contains("api key")
-        {
-            (
-                "Authentication",
-                "There may be an issue with API credentials. Check your provider configuration.",
-            )
-        } else if recent_errors.contains(DEFERRED_NO_TOOL_ERROR_MARKER) {
-            (
-                "Deferred No-Tool Loop",
-                "The model repeatedly promised actions but never called tools. Retry the request; if it recurs, switch model/profile or ask for a direct text answer.",
-            )
-        } else {
-            (
-                "Stuck",
-                "Try rephrasing your request or providing more specific guidance.",
-            )
-        }
+        post_task::classify_stall(learning_ctx, DEFERRED_NO_TOOL_ERROR_MARKER)
     }
 
     /// Graceful response when agent is stalled (no progress).
     async fn graceful_stall_response(
         &self,
+        emitter: &crate::events::EventEmitter,
         session_id: &str,
         learning_ctx: &LearningContext,
         sent_file_successfully: bool,
     ) -> anyhow::Result<String> {
-        let (label, suggestion) = Self::classify_stall(learning_ctx);
-        let recent_errors = learning_ctx
-            .errors
-            .iter()
-            .rev()
-            .take(3)
-            .map(|(e, _)| format!("- {}", e.chars().take(100).collect::<String>()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let summary = if sent_file_successfully {
-            format!(
-                "I already sent at least one requested file, then got stuck in follow-up steps.\n\n\
-                Stopping reason: **{}**\n\
-                - {} tool calls executed\n\
-                - {} errors encountered\n\n\
-                {}\n\n\
-                Recent errors:\n{}",
-                label,
-                learning_ctx.tool_calls.len(),
-                learning_ctx.errors.len(),
-                suggestion,
-                recent_errors
-            )
-        } else {
-            format!(
-                "I'm unable to make progress — **{}**.\n\n\
-                Here's what I tried:\n\
-                - {} tool calls executed\n\
-                - {} errors encountered\n\n\
-                {}\n\n\
-                Recent errors:\n{}",
-                label,
-                learning_ctx.tool_calls.len(),
-                learning_ctx.errors.len(),
-                suggestion,
-                recent_errors
-            )
-        };
-
-        let assistant_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "assistant".to_string(),
-            content: Some(summary.clone()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.5,
-            embedding: None,
-        };
-        self.state.append_message(&assistant_msg).await?;
-        Ok(summary)
+        let summary = post_task::graceful_stall_response(
+            learning_ctx,
+            sent_file_successfully,
+            DEFERRED_NO_TOOL_ERROR_MARKER,
+        );
+        self.append_graceful_assistant_summary(emitter, session_id, summary)
+            .await
     }
 
     /// Graceful response when repetitive tool calls are detected.
     async fn graceful_repetitive_response(
         &self,
+        emitter: &crate::events::EventEmitter,
         session_id: &str,
         learning_ctx: &LearningContext,
         tool_name: &str,
     ) -> anyhow::Result<String> {
-        // Plan pausing removed (plans deprecated in favor of goals/tasks).
-        let summary = format!(
-            "I noticed I'm calling `{}` repeatedly with similar parameters, which suggests I'm stuck in a loop. \
-            Here's what I've done so far:\n\n\
-            - {} tool calls executed\n\
-            - {} errors encountered\n\n\
-            Please try a different approach or provide more specific instructions.",
-            tool_name,
-            learning_ctx.tool_calls.len(),
-            learning_ctx.errors.len()
-        );
-
-        let assistant_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "assistant".to_string(),
-            content: Some(summary.clone()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.5,
-            embedding: None,
-        };
-        self.state.append_message(&assistant_msg).await?;
-        Ok(summary)
+        let summary = post_task::graceful_repetitive_response(learning_ctx, tool_name);
+        self.append_graceful_assistant_summary(emitter, session_id, summary)
+            .await
     }
 
     /// Graceful response when hard iteration cap is reached (legacy mode).
     async fn graceful_cap_response(
         &self,
+        emitter: &crate::events::EventEmitter,
         session_id: &str,
         learning_ctx: &LearningContext,
         iterations: usize,
     ) -> anyhow::Result<String> {
-        // Plan pausing removed (plans deprecated in favor of goals/tasks).
-        let summary = format!(
-            "I've reached the maximum iteration limit ({} iterations). \
-            Here's what I accomplished:\n\n\
-            - {} tool calls executed\n\
-            - {} errors encountered\n\n\
-            The task may be incomplete. Consider increasing the iteration limit in config or using unlimited mode.",
-            iterations,
-            learning_ctx.tool_calls.len(),
-            learning_ctx.errors.len()
-        );
-
-        let assistant_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "assistant".to_string(),
-            content: Some(summary.clone()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.5,
-            embedding: None,
-        };
-        self.state.append_message(&assistant_msg).await?;
-        Ok(summary)
+        let summary = post_task::graceful_cap_response(learning_ctx, iterations);
+        self.append_graceful_assistant_summary(emitter, session_id, summary)
+            .await
     }
 
     /// Emit a TaskEnd event. Called from every exit path in the agent loop.
@@ -8347,6 +7866,63 @@ impl Agent {
                 },
             )
             .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_tool_with_watchdog(
+        &self,
+        name: &str,
+        arguments: &str,
+        session_id: &str,
+        task_id: Option<&str>,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        channel_visibility: ChannelVisibility,
+        channel_id: Option<&str>,
+        trusted: bool,
+        user_role: UserRole,
+    ) -> anyhow::Result<String> {
+        if let Some(timeout_dur) = self.llm_call_timeout {
+            match tokio::time::timeout(
+                timeout_dur,
+                self.execute_tool(
+                    name,
+                    arguments,
+                    session_id,
+                    task_id,
+                    status_tx,
+                    channel_visibility,
+                    channel_id,
+                    trusted,
+                    user_role,
+                ),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        session_id,
+                        tool = name,
+                        timeout_secs = timeout_dur.as_secs(),
+                        "Tool call timed out"
+                    );
+                    anyhow::bail!("Tool '{}' timed out after {}s", name, timeout_dur.as_secs());
+                }
+            }
+        } else {
+            self.execute_tool(
+                name,
+                arguments,
+                session_id,
+                task_id,
+                status_tx,
+                channel_visibility,
+                channel_id,
+                trusted,
+                user_role,
+            )
+            .await
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8454,391 +8030,6 @@ impl Agent {
 
         anyhow::bail!("Unknown tool: {}", name)
     }
-}
-
-/// Process learning from a completed task - runs in background.
-async fn process_learning(state: &Arc<dyn StateStore>, ctx: LearningContext) -> anyhow::Result<()> {
-    use crate::memory::{expertise, procedures};
-
-    // Determine if task was successful
-    let unrecovered_errors = ctx
-        .errors
-        .iter()
-        .filter(|(_, recovered)| !recovered)
-        .count();
-    let task_success = if ctx.explicit_negative_signals > 0 {
-        false
-    } else if ctx.explicit_positive_signals > 0 {
-        true
-    } else {
-        ctx.completed_naturally && unrecovered_errors == 0
-    };
-
-    // 1. Update expertise for detected domains
-    let domains = expertise::detect_domains(&ctx.intent_domains);
-    for domain in &domains {
-        let error = if !task_success {
-            ctx.errors.first().map(|(e, _)| e.as_str())
-        } else {
-            None
-        };
-        if let Err(e) = state.increment_expertise(domain, task_success, error).await {
-            warn!(domain = %domain, error = %e, "Failed to update expertise");
-        }
-    }
-
-    // 2. Save procedure if successful with 2+ actions
-    if task_success && ctx.tool_calls.len() >= 2 {
-        let generalized = procedures::generalize_procedure(&ctx.tool_calls);
-        let procedure = procedures::create_procedure(
-            procedures::generate_procedure_name(&ctx.user_text),
-            procedures::extract_trigger_pattern(&ctx.user_text),
-            generalized,
-        );
-        if let Err(e) = state.upsert_procedure(&procedure).await {
-            warn!(procedure = %procedure.name, error = %e, "Failed to save procedure");
-        }
-    }
-
-    // 3. Learn error-solution if error was recovered
-    if let Some(error) = ctx.first_error {
-        if !ctx.recovery_actions.is_empty() {
-            let solution = procedures::create_error_solution(
-                procedures::extract_error_pattern(&error),
-                domains.into_iter().next(),
-                procedures::summarize_solution(&ctx.recovery_actions),
-                Some(ctx.recovery_actions),
-            );
-            if let Err(e) = state.insert_error_solution(&solution).await {
-                warn!(error_pattern = %solution.error_pattern, error = %e, "Failed to save error solution");
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Merge consecutive same-role messages (assistant or user) to satisfy
-/// provider ordering constraints (Gemini, Anthropic). Combines content
-/// text and tool_calls arrays.
-fn merge_consecutive_messages(messages: &mut Vec<Value>) {
-    let mut i = 1;
-    while i < messages.len() {
-        let prev_role = messages[i - 1]
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-        let curr_role = messages[i]
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-        if prev_role == curr_role && (curr_role == "assistant" || curr_role == "user") {
-            // Merge content text
-            let curr_content = messages[i]
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            let prev_content = messages[i - 1]
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !curr_content.is_empty() {
-                let merged = if prev_content.is_empty() {
-                    curr_content
-                } else {
-                    format!("{}\n{}", prev_content, curr_content)
-                };
-                messages[i - 1]["content"] = json!(merged);
-            }
-            // Combine tool_calls arrays (not replace)
-            let curr_tcs = messages[i]
-                .get("tool_calls")
-                .and_then(|v| v.as_array())
-                .cloned();
-            if let Some(curr_arr) = curr_tcs {
-                if let Some(prev_arr) = messages[i - 1]
-                    .get_mut("tool_calls")
-                    .and_then(|v| v.as_array_mut())
-                {
-                    prev_arr.extend(curr_arr);
-                } else {
-                    messages[i - 1]["tool_calls"] = json!(curr_arr);
-                }
-            }
-            messages.remove(i);
-        } else {
-            i += 1;
-        }
-    }
-}
-
-/// Three-pass fixup for provider message ordering constraints.
-///
-/// 1. Merge consecutive same-role messages
-/// 2. Drop orphaned tool results and strip orphaned tool_calls
-/// 3. Merge again (dropping orphans can create new consecutive messages)
-///
-/// Returns the number of messages before the first non-system message
-/// that is a tool-role message (should always be 0 after fixup).
-fn fixup_message_ordering(messages: &mut Vec<Value>) {
-    // Pass 1
-    merge_consecutive_messages(messages);
-
-    // Pass 2: drop orphans in both directions
-    {
-        let assistant_tc_ids: std::collections::HashSet<String> = messages
-            .iter()
-            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-            .filter_map(|m| m.get("tool_calls"))
-            .filter_map(|tcs| tcs.as_array())
-            .flat_map(|arr| arr.iter())
-            .filter_map(|tc| tc.get("id").and_then(|id| id.as_str()))
-            .map(|s| s.to_string())
-            .collect();
-
-        let tool_result_ids: std::collections::HashSet<String> = messages
-            .iter()
-            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-            .filter_map(|m| m.get("tool_call_id").and_then(|id| id.as_str()))
-            .map(|s| s.to_string())
-            .collect();
-
-        // Drop orphaned tool results
-        messages.retain(|m| {
-            if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
-                let tc_id = m
-                    .get("tool_call_id")
-                    .and_then(|id| id.as_str())
-                    .unwrap_or("");
-                assistant_tc_ids.contains(tc_id)
-            } else {
-                true
-            }
-        });
-
-        // Strip orphaned tool_calls from assistant messages
-        for m in messages.iter_mut() {
-            if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-                continue;
-            }
-            if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()).cloned() {
-                let filtered: Vec<Value> = tcs
-                    .into_iter()
-                    .filter(|tc| {
-                        tc.get("id")
-                            .and_then(|id| id.as_str())
-                            .is_some_and(|id| tool_result_ids.contains(id))
-                    })
-                    .collect();
-                if filtered.is_empty() {
-                    m.as_object_mut().map(|o| o.remove("tool_calls"));
-                } else {
-                    m["tool_calls"] = json!(filtered);
-                }
-            }
-        }
-
-        // Drop assistant messages that became empty
-        messages.retain(|m| {
-            if m.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                let has_content = m
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|s| !s.is_empty());
-                let has_tool_calls = m
-                    .get("tool_calls")
-                    .and_then(|tc| tc.as_array())
-                    .is_some_and(|a| !a.is_empty());
-                has_content || has_tool_calls
-            } else {
-                true
-            }
-        });
-    }
-
-    // Pass 3
-    merge_consecutive_messages(messages);
-
-    // Pass 4: Ensure the first non-system message is a user message.
-    // Gemini requires that assistant/tool messages come after a user turn.
-    // If history eviction dropped the original user message but kept later
-    // assistant+tool pairs, we need to drop those leading non-user messages.
-    if let Some(first_non_system) = messages
-        .iter()
-        .position(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
-    {
-        let first_role = messages[first_non_system]
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-        if first_role != "user" {
-            if let Some(first_user_rel) = messages[first_non_system..]
-                .iter()
-                .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            {
-                let abs_end = first_non_system + first_user_rel;
-                warn!(
-                    dropped = abs_end - first_non_system,
-                    "Dropping leading non-user messages to satisfy provider ordering"
-                );
-                messages.drain(first_non_system..abs_end);
-            }
-        }
-    }
-
-    // Pass 5: Gemini-specific - ensure assistant messages with tool_calls only follow
-    // user or tool messages (not other assistant messages).
-    // If we find assistant→assistant where the second has tool_calls, merge them.
-    let mut i = 1;
-    while i < messages.len() {
-        let prev_role = messages[i - 1]
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-        let curr_role = messages[i]
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-        let curr_has_tc = messages[i]
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .is_some_and(|a| !a.is_empty());
-
-        // If current is assistant with tool_calls, and previous is also assistant
-        // (which shouldn't happen after Pass 3, but just in case), merge them
-        if prev_role == "assistant" && curr_role == "assistant" && curr_has_tc {
-            warn!(
-                "Pass 5: Found consecutive assistant messages, merging to satisfy Gemini constraint"
-            );
-            // Merge content
-            let curr_content = messages[i]
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            let prev_content = messages[i - 1]
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !curr_content.is_empty() {
-                let merged = if prev_content.is_empty() {
-                    curr_content
-                } else {
-                    format!("{}\n{}", prev_content, curr_content)
-                };
-                messages[i - 1]["content"] = json!(merged);
-            }
-            // Merge tool_calls
-            if let Some(curr_tcs) = messages[i]
-                .get("tool_calls")
-                .and_then(|v| v.as_array())
-                .cloned()
-            {
-                if let Some(prev_tcs) = messages[i - 1]
-                    .get_mut("tool_calls")
-                    .and_then(|v| v.as_array_mut())
-                {
-                    prev_tcs.extend(curr_tcs);
-                } else {
-                    messages[i - 1]["tool_calls"] = json!(curr_tcs);
-                }
-            }
-            messages.remove(i);
-        } else {
-            i += 1;
-        }
-    }
-
-    // Pass 6: Gemini-specific - ensure assistant messages with tool_calls only follow
-    // user or tool messages. If an assistant(tc) follows another assistant(tc) or
-    // a plain assistant, strip the tool_calls from the second one (keeping any content).
-    // This handles edge cases not caught by Pass 5.
-    let mut i = 1;
-    while i < messages.len() {
-        let curr_role = messages[i]
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-        let curr_has_tc = messages[i]
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .is_some_and(|a| !a.is_empty());
-
-        if curr_role == "assistant" && curr_has_tc {
-            let prev_role = messages[i - 1]
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("");
-            // Valid predecessors for assistant with tool_calls: "user" or "tool"
-            if prev_role != "user" && prev_role != "tool" {
-                warn!(
-                    prev_role,
-                    "Pass 6: Stripping tool_calls from assistant that doesn't follow user/tool"
-                );
-                // Remove tool_calls but keep content
-                messages[i].as_object_mut().map(|o| o.remove("tool_calls"));
-                // If this leaves an empty assistant, it will be caught by the retain logic
-                // but since we're past that, let's check now
-                let has_content = messages[i]
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|s| !s.is_empty());
-                if !has_content {
-                    messages.remove(i);
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-}
-
-/// Extract the "command" field from tool arguments JSON (for terminal tool).
-fn extract_command_from_args(args_json: &str) -> Option<String> {
-    serde_json::from_str::<Value>(args_json)
-        .ok()
-        .and_then(|v| v.get("command")?.as_str().map(String::from))
-}
-
-/// Extract the "file_path" field from tool arguments JSON (for send_file tool).
-fn extract_file_path_from_args(args_json: &str) -> Option<String> {
-    serde_json::from_str::<Value>(args_json)
-        .ok()
-        .and_then(|v| v.get("file_path")?.as_str().map(String::from))
-}
-
-/// Build a stable dedupe key for send_file calls within a single task.
-/// Key format: "{expanded_path}|{trimmed_caption}".
-fn extract_send_file_dedupe_key_from_args(args_json: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<Value>(args_json).ok()?;
-    let file_path = parsed.get("file_path")?.as_str()?.trim();
-    if file_path.is_empty() {
-        return None;
-    }
-    let expanded_path = shellexpand::tilde(file_path).to_string();
-    let caption = parsed
-        .get("caption")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    Some(format!("{}|{}", expanded_path, caption))
-}
-
-/// Check if a session ID indicates it was triggered by an automated source
-/// (e.g., email trigger) rather than direct user interaction via Telegram.
-fn is_trigger_session(session_id: &str) -> bool {
-    session_id.contains("trigger") || session_id.starts_with("event_")
-}
-
-/// Hash a tool call (name + arguments) for repetitive behavior detection.
-fn hash_tool_call(name: &str, arguments: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hasher);
-    arguments.hash(&mut hasher);
-    hasher.finish()
 }
 
 #[cfg(test)]
@@ -9093,6 +8284,101 @@ mod heartbeat_tests {
     fn test_touch_heartbeat_none_is_noop() {
         // Should not panic
         touch_heartbeat(&None);
+    }
+}
+
+#[cfg(test)]
+mod tool_watchdog_tests {
+    use super::*;
+    use crate::testing::{setup_test_agent, MockProvider};
+
+    struct SlowTool;
+
+    #[async_trait::async_trait]
+    impl Tool for SlowTool {
+        fn name(&self) -> &str {
+            "slow_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Sleeps before returning"
+        }
+
+        fn schema(&self) -> Value {
+            json!({
+                "name": "slow_tool",
+                "description": "Sleeps before returning",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            })
+        }
+
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok("done".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_tool_watchdog_times_out_slow_tool() {
+        let mut harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("setup test harness");
+        harness.agent.tools.push(Arc::new(SlowTool));
+        harness.agent.llm_call_timeout = Some(Duration::from_millis(30));
+
+        let result = harness
+            .agent
+            .execute_tool_with_watchdog(
+                "slow_tool",
+                "{}",
+                "test-session",
+                Some("task-1"),
+                None,
+                ChannelVisibility::Private,
+                None,
+                false,
+                UserRole::Owner,
+            )
+            .await;
+
+        let err = result.expect_err("slow tool should time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "timeout error expected, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tool_watchdog_allows_fast_tool() {
+        let mut harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("setup test harness");
+        harness.agent.llm_call_timeout = Some(Duration::from_secs(1));
+
+        let result = harness
+            .agent
+            .execute_tool_with_watchdog(
+                "system_info",
+                "{}",
+                "test-session",
+                Some("task-2"),
+                None,
+                ChannelVisibility::Private,
+                None,
+                false,
+                UserRole::Owner,
+            )
+            .await
+            .expect("fast tool should succeed");
+
+        assert!(
+            !result.is_empty(),
+            "system_info should return a non-empty payload"
+        );
     }
 }
 
@@ -9446,6 +8732,169 @@ mod consultant_prompt_tests {
         let (cleaned, gate) = extract_intent_gate(input);
         assert!(gate.is_none());
         assert!(cleaned.contains("{\"name\":\"Alice\""));
+    }
+}
+
+#[cfg(test)]
+mod resume_checkpoint_tests {
+    use super::*;
+    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::types::{ChannelContext, UserRole};
+    use serde_json::json;
+
+    #[test]
+    fn test_is_resume_request_detects_continue_variants() {
+        assert!(is_resume_request("continue"));
+        assert!(is_resume_request("Continue with next phase"));
+        assert!(is_resume_request("resume the previous task"));
+        assert!(is_resume_request("next phase"));
+        assert!(!is_resume_request("How do I continue learning Rust?"));
+    }
+
+    #[tokio::test]
+    async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
+        let provider =
+            MockProvider::with_responses(vec![MockProvider::text_response("Resumed and done.")]);
+        let harness = setup_test_agent(provider).await.unwrap();
+        let session_id = "resume_session";
+        let orphan_task_id = "task-orphan-1";
+
+        let emitter = crate::events::EventEmitter::new(
+            harness.agent.event_store.clone(),
+            session_id.to_string(),
+        )
+        .with_task_id(orphan_task_id.to_string());
+
+        emitter
+            .emit(
+                EventType::TaskStart,
+                TaskStartData {
+                    task_id: orphan_task_id.to_string(),
+                    description: "Build website and deploy".to_string(),
+                    parent_task_id: None,
+                    user_message: Some("Build website and deploy".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        emitter
+            .emit(
+                EventType::ThinkingStart,
+                ThinkingStartData {
+                    iteration: 2,
+                    task_id: orphan_task_id.to_string(),
+                    total_tool_calls: 1,
+                },
+            )
+            .await
+            .unwrap();
+        emitter
+            .emit(
+                EventType::AssistantResponse,
+                AssistantResponseData {
+                    message_id: None,
+                    content: Some("I'll continue by checking the config.".to_string()),
+                    tool_calls: Some(vec![ToolCallInfo {
+                        id: "call_pending".to_string(),
+                        name: "system_info".to_string(),
+                        arguments: json!({}),
+                        extra_content: None,
+                    }]),
+                    model: "mock-model".to_string(),
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+            )
+            .await
+            .unwrap();
+        emitter
+            .emit(
+                EventType::ToolResult,
+                ToolResultData {
+                    message_id: None,
+                    tool_call_id: "call_done".to_string(),
+                    name: "system_info".to_string(),
+                    result: "ok".to_string(),
+                    success: true,
+                    duration_ms: 12,
+                    error: None,
+                    task_id: Some(orphan_task_id.to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let reply = harness
+            .agent
+            .handle_message(
+                session_id,
+                "continue",
+                None,
+                UserRole::Owner,
+                ChannelContext::private("test"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, "Resumed and done.");
+
+        let calls = harness.provider.call_log.lock().await;
+        assert!(!calls.is_empty());
+        let first_call = &calls[0];
+        let system_prompt = first_call
+            .messages
+            .iter()
+            .find_map(|msg| {
+                if msg.get("role").and_then(|v| v.as_str()) == Some("system") {
+                    return msg
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+                None
+            })
+            .expect("expected system prompt");
+        assert!(system_prompt.contains("## Resume Checkpoint"));
+        assert!(system_prompt.contains(orphan_task_id));
+
+        let orphan_events = harness
+            .agent
+            .event_store
+            .query_task_events_for_session(session_id, orphan_task_id)
+            .await
+            .unwrap();
+        let orphan_end = orphan_events
+            .iter()
+            .find(|e| e.event_type == EventType::TaskEnd)
+            .expect("expected orphan task_end after resume");
+        let orphan_end_data = orphan_end.parse_data::<TaskEndData>().unwrap();
+        assert_eq!(orphan_end_data.status, TaskStatus::Failed);
+        assert!(
+            orphan_end_data
+                .error
+                .unwrap_or_default()
+                .contains("Resumed in task"),
+            "expected interruption reason to reference resumed task"
+        );
+
+        let starts = harness
+            .agent
+            .event_store
+            .query_events_by_types(session_id, &[EventType::TaskStart], 10)
+            .await
+            .unwrap();
+        let resumed_start = starts.into_iter().find_map(|event| {
+            let data = event.parse_data::<TaskStartData>().ok()?;
+            if data.parent_task_id.as_deref() == Some(orphan_task_id) {
+                Some(data)
+            } else {
+                None
+            }
+        });
+        assert!(
+            resumed_start.is_some(),
+            "expected resumed task_start to reference orphan as parent"
+        );
     }
 }
 

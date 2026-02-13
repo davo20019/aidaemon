@@ -59,6 +59,42 @@ pub struct PolicyGraduationReport {
     pub previous: TaskWindowStats,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionWriteDrift {
+    pub session_id: String,
+    pub message_rows: u64,
+    pub event_rows: u64,
+    pub delta: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WriteConsistencyReport {
+    pub generated_at: String,
+    pub messages_table_present: bool,
+    pub conversation_message_rows: u64,
+    pub conversation_event_rows: u64,
+    pub missing_message_id_events: u64,
+    pub global_delta: i64,
+    pub session_mismatch_count: u64,
+    pub stale_task_starts: u64,
+    pub top_session_drifts: Vec<SessionWriteDrift>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct WriteConsistencyThresholds {
+    pub max_abs_global_delta: u64,
+    pub max_session_mismatch_count: u64,
+    pub max_stale_task_starts: u64,
+    pub max_missing_message_id_events: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WriteConsistencyGateStatus {
+    pub passed: bool,
+    pub reasons: Vec<String>,
+    pub thresholds: WriteConsistencyThresholds,
+}
+
 impl PolicyGraduationReport {
     pub fn gate_passes(&self, max_divergence: f64) -> bool {
         if self.observed_days < self.window_days as f64 {
@@ -76,6 +112,65 @@ impl PolicyGraduationReport {
         let error_ok = self.current.error_rate <= self.previous.error_rate;
         let stall_ok = self.current.stall_rate <= self.previous.stall_rate;
         completion_ok && error_ok && stall_ok
+    }
+}
+
+impl Default for WriteConsistencyThresholds {
+    fn default() -> Self {
+        Self {
+            // Canonical event-path defaults.
+            max_abs_global_delta: 3,
+            max_session_mismatch_count: 0,
+            max_stale_task_starts: 0,
+            max_missing_message_id_events: 0,
+        }
+    }
+}
+
+impl WriteConsistencyReport {
+    pub fn evaluate_gate(&self) -> WriteConsistencyGateStatus {
+        self.evaluate_gate_with(WriteConsistencyThresholds::default())
+    }
+
+    pub fn evaluate_gate_with(
+        &self,
+        thresholds: WriteConsistencyThresholds,
+    ) -> WriteConsistencyGateStatus {
+        let mut reasons = Vec::new();
+
+        let abs_global_delta = self.global_delta.unsigned_abs();
+        if abs_global_delta > thresholds.max_abs_global_delta {
+            reasons.push(format!(
+                "global delta {} exceeds threshold {}",
+                abs_global_delta, thresholds.max_abs_global_delta
+            ));
+        }
+        if self.session_mismatch_count > thresholds.max_session_mismatch_count {
+            reasons.push(format!(
+                "session mismatch count {} exceeds threshold {}",
+                self.session_mismatch_count, thresholds.max_session_mismatch_count
+            ));
+        }
+
+        if self.stale_task_starts > thresholds.max_stale_task_starts {
+            reasons.push(format!(
+                "stale task starts {} exceeds threshold {}",
+                self.stale_task_starts, thresholds.max_stale_task_starts
+            ));
+        }
+
+        if self.missing_message_id_events > thresholds.max_missing_message_id_events {
+            reasons.push(format!(
+                "events missing message_id {} exceeds threshold {}",
+                self.missing_message_id_events, thresholds.max_missing_message_id_events
+            ));
+        }
+
+        WriteConsistencyGateStatus {
+            passed: reasons.is_empty(),
+            reasons,
+            thresholds,
+        }
     }
 }
 
@@ -349,7 +444,12 @@ impl EventStore {
         failures_only: bool,
         limit: usize,
     ) -> anyhow::Result<Vec<Event>> {
-        let fetch_limit = if failures_only { limit.saturating_mul(8) } else { limit }.max(1);
+        let fetch_limit = if failures_only {
+            limit.saturating_mul(8)
+        } else {
+            limit
+        }
+        .max(1);
         let rows = sqlx::query(
             r#"
             SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
@@ -482,8 +582,12 @@ impl EventStore {
             match event.event_type {
                 EventType::UserMessage => {
                     if let Ok(data) = event.parse_data::<super::UserMessageData>() {
+                        let message_id = data
+                            .message_id
+                            .clone()
+                            .unwrap_or_else(|| event.id.to_string());
                         messages.push(Message {
-                            id: event.id.to_string(),
+                            id: message_id,
                             session_id: event.session_id.clone(),
                             role: "user".to_string(),
                             content: Some(data.content),
@@ -498,6 +602,10 @@ impl EventStore {
                 }
                 EventType::AssistantResponse => {
                     if let Ok(data) = event.parse_data::<super::AssistantResponseData>() {
+                        let message_id = data
+                            .message_id
+                            .clone()
+                            .unwrap_or_else(|| event.id.to_string());
                         let tool_calls_json = data.tool_calls.as_ref().map(|calls| {
                             let tool_calls: Vec<ToolCall> = calls
                                 .iter()
@@ -505,14 +613,14 @@ impl EventStore {
                                     id: tc.id.clone(),
                                     name: tc.name.clone(),
                                     arguments: tc.arguments.to_string(),
-                                    extra_content: None,
+                                    extra_content: tc.extra_content.clone(),
                                 })
                                 .collect();
                             serde_json::to_string(&tool_calls).unwrap_or_default()
                         });
 
                         messages.push(Message {
-                            id: event.id.to_string(),
+                            id: message_id,
                             session_id: event.session_id.clone(),
                             role: "assistant".to_string(),
                             content: data.content,
@@ -527,8 +635,12 @@ impl EventStore {
                 }
                 EventType::ToolResult => {
                     if let Ok(data) = event.parse_data::<super::ToolResultData>() {
+                        let message_id = data
+                            .message_id
+                            .clone()
+                            .unwrap_or_else(|| event.id.to_string());
                         messages.push(Message {
-                            id: event.id.to_string(),
+                            id: message_id,
                             session_id: event.session_id.clone(),
                             role: "tool".to_string(),
                             content: Some(data.result),
@@ -651,6 +763,105 @@ impl EventStore {
         }
 
         Ok(None)
+    }
+
+    /// Reconcile stale TaskStart events that never received a matching TaskEnd.
+    ///
+    /// This emits synthetic failed TaskEnd events so UI/DB task state self-heals
+    /// even when an agent process died outside channel watchdog loops.
+    pub async fn reconcile_stale_task_starts(
+        &self,
+        stale_after_secs: i64,
+        batch_size: usize,
+    ) -> anyhow::Result<u64> {
+        let stale_after_secs = stale_after_secs.max(1);
+        let cutoff = Utc::now() - Duration::seconds(stale_after_secs);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        let rows = sqlx::query(
+            r#"
+            SELECT s.session_id AS session_id,
+                   s.task_id AS task_id,
+                   MIN(s.created_at) AS started_at
+            FROM events s
+            WHERE s.event_type = 'task_start'
+              AND s.task_id IS NOT NULL
+              AND s.created_at < ?
+              AND NOT EXISTS (
+                SELECT 1
+                FROM events e
+                WHERE e.session_id = s.session_id
+                  AND e.task_id = s.task_id
+                  AND e.event_type = 'task_end'
+              )
+            GROUP BY s.session_id, s.task_id
+            ORDER BY MIN(s.created_at) ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(&cutoff_str)
+        .bind(batch_size.max(1) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut reconciled = 0u64;
+        for row in rows {
+            let session_id: String = row.get("session_id");
+            let task_id: String = row.get("task_id");
+            let started_at_raw: String = row.get("started_at");
+
+            // Re-check to avoid duplicate synthetic task_end if a real one was
+            // written between candidate query and append.
+            let has_end = sqlx::query(
+                r#"
+                SELECT 1
+                FROM events
+                WHERE session_id = ? AND task_id = ? AND event_type = 'task_end'
+                LIMIT 1
+                "#,
+            )
+            .bind(&session_id)
+            .bind(&task_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+            if has_end {
+                continue;
+            }
+
+            let started_at = DateTime::parse_from_rfc3339(&started_at_raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(cutoff);
+            let duration_secs = (Utc::now() - started_at).num_seconds().max(0) as u64;
+            let stale_after_mins = (stale_after_secs / 60).max(1);
+
+            let event = Event::new(
+                session_id.clone(),
+                EventType::TaskEnd,
+                serde_json::to_value(TaskEndData {
+                    task_id: task_id.clone(),
+                    status: TaskStatus::Failed,
+                    duration_secs,
+                    iterations: 0,
+                    tool_calls_count: 0,
+                    error: Some(format!(
+                        "Auto-failed by watchdog after {} minute(s) without task_end",
+                        stale_after_mins
+                    )),
+                    summary: Some("Recovered stale in-flight task".to_string()),
+                })?,
+            );
+            self.append(event).await?;
+            reconciled += 1;
+            info!(
+                session_id = %session_id,
+                task_id = %task_id,
+                duration_secs,
+                "Reconciled stale task_start with synthetic task_end"
+            );
+        }
+
+        Ok(reconciled)
     }
 
     /// Get recent tool calls for a session
@@ -793,6 +1004,76 @@ impl EventStore {
         })
     }
 
+    /// Return canonical write-path consistency metrics from the event stream.
+    ///
+    /// This report is event-native and does not compare against legacy
+    /// messages table writes.
+    pub async fn write_consistency_report(
+        &self,
+        _top_n_sessions: usize,
+    ) -> anyhow::Result<WriteConsistencyReport> {
+        let conversation_event_rows: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM events
+            WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        let missing_message_id_events: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM events
+            WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+              AND (
+                json_extract(data, '$.message_id') IS NULL
+                OR TRIM(CAST(json_extract(data, '$.message_id') AS TEXT)) = ''
+              )
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        let stale_task_starts: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM (
+                SELECT s.session_id, s.task_id
+                FROM events s
+                WHERE s.event_type = 'task_start'
+                  AND s.task_id IS NOT NULL
+                GROUP BY s.session_id, s.task_id
+                HAVING NOT EXISTS (
+                    SELECT 1
+                    FROM events e
+                    WHERE e.session_id = s.session_id
+                      AND e.task_id = s.task_id
+                      AND e.event_type = 'task_end'
+                )
+            )
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        Ok(WriteConsistencyReport {
+            generated_at: Utc::now().to_rfc3339(),
+            messages_table_present: false,
+            conversation_message_rows: to_u64(conversation_event_rows),
+            conversation_event_rows: to_u64(conversation_event_rows),
+            missing_message_id_events: to_u64(missing_message_id_events),
+            global_delta: 0,
+            session_mismatch_count: 0,
+            stale_task_starts: to_u64(stale_task_starts),
+            top_session_drifts: Vec::new(),
+        })
+    }
+
     async fn task_window_stats(
         &self,
         start: DateTime<Utc>,
@@ -890,6 +1171,14 @@ impl EventStore {
             });
         }
         Ok(events)
+    }
+}
+
+fn to_u64(value: i64) -> u64 {
+    if value <= 0 {
+        0
+    } else {
+        value as u64
     }
 }
 
@@ -1027,6 +1316,25 @@ mod tests {
             session_id,
             EventType::TaskEnd,
             serde_json::to_value(payload).expect("serialize task end"),
+            created_at,
+        )
+        .await;
+    }
+
+    async fn append_task_start(
+        store: &EventStore,
+        session_id: &str,
+        task_id: &str,
+        created_at: DateTime<Utc>,
+    ) {
+        append_event_at(
+            store,
+            session_id,
+            EventType::TaskStart,
+            json!({
+                "task_id": task_id,
+                "description": format!("task {}", task_id)
+            }),
             created_at,
         )
         .await;
@@ -1266,5 +1574,274 @@ mod tests {
             .expect("query decision points");
         assert_eq!(s1_decisions.len(), 1);
         assert_eq!(s1_decisions[0].session_id, "s1");
+    }
+
+    #[tokio::test]
+    async fn reconcile_stale_task_starts_appends_failed_task_end() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+
+        // Stale task with no task_end -> should be reconciled.
+        append_task_start(
+            &store,
+            "s-reconcile",
+            "task-stale",
+            now - Duration::minutes(10),
+        )
+        .await;
+
+        // Stale task with task_end already present -> should be ignored.
+        append_task_start(
+            &store,
+            "s-reconcile",
+            "task-complete",
+            now - Duration::minutes(10),
+        )
+        .await;
+        append_task_end(
+            &store,
+            "s-reconcile",
+            "task-complete",
+            TaskStatus::Completed,
+            now - Duration::minutes(9),
+            None,
+            Some("ok"),
+        )
+        .await;
+
+        // Recent task start -> should remain active.
+        append_task_start(
+            &store,
+            "s-reconcile",
+            "task-recent",
+            now - Duration::minutes(1),
+        )
+        .await;
+
+        let reconciled = store
+            .reconcile_stale_task_starts(300, 10)
+            .await
+            .expect("reconcile stale starts");
+        assert_eq!(reconciled, 1);
+
+        let stale_events = store
+            .query_task_events_for_session("s-reconcile", "task-stale")
+            .await
+            .expect("query stale task events");
+        assert_eq!(stale_events.len(), 2, "task-stale should have start+end");
+        assert_eq!(stale_events[1].event_type, EventType::TaskEnd);
+        let stale_end = stale_events[1]
+            .parse_data::<TaskEndData>()
+            .expect("parse stale task_end");
+        assert_eq!(stale_end.status, TaskStatus::Failed);
+        assert!(
+            stale_end
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Auto-failed by watchdog")),
+            "synthetic task_end should include watchdog reason"
+        );
+
+        let recent_events = store
+            .query_task_events_for_session("s-reconcile", "task-recent")
+            .await
+            .expect("query recent task events");
+        assert_eq!(recent_events.len(), 1, "recent task should stay open");
+
+        // Running again should be idempotent.
+        let reconciled_again = store
+            .reconcile_stale_task_starts(300, 10)
+            .await
+            .expect("second reconcile");
+        assert_eq!(reconciled_again, 0);
+    }
+
+    #[tokio::test]
+    async fn conversation_history_preserves_tool_call_extra_content() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+
+        append_event_at(
+            &store,
+            "s-extra",
+            EventType::AssistantResponse,
+            json!({
+                "message_id": "assistant-msg-1",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "name": "run_command",
+                    "arguments": { "command": "ls -la" },
+                    "extra_content": { "thought_signature": "sig-123" }
+                }],
+                "model": "gemini-2.5-pro",
+                "input_tokens": 12,
+                "output_tokens": 3
+            }),
+            now,
+        )
+        .await;
+
+        let history = store
+            .get_conversation_history("s-extra", 10)
+            .await
+            .expect("conversation history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "assistant");
+
+        let tool_calls_json = history[0]
+            .tool_calls_json
+            .as_deref()
+            .expect("assistant tool calls should exist");
+        let tool_calls: Vec<crate::traits::ToolCall> =
+            serde_json::from_str(tool_calls_json).expect("parse tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        let extra = tool_calls[0]
+            .extra_content
+            .as_ref()
+            .expect("extra_content should be preserved");
+        assert_eq!(extra["thought_signature"], "sig-123");
+    }
+
+    #[tokio::test]
+    async fn write_consistency_report_works_without_messages_table() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+
+        append_event_at(
+            &store,
+            "s-no-messages",
+            EventType::UserMessage,
+            json!({
+                "content": "hello from event stream",
+                "message_id": "event-msg-1",
+                "has_attachments": false
+            }),
+            now,
+        )
+        .await;
+
+        let report = store
+            .write_consistency_report(5)
+            .await
+            .expect("write consistency");
+        assert!(!report.messages_table_present);
+        assert_eq!(report.conversation_message_rows, 1);
+        assert_eq!(report.conversation_event_rows, 1);
+        assert_eq!(report.missing_message_id_events, 0);
+        assert_eq!(report.global_delta, 0);
+        assert_eq!(report.session_mismatch_count, 0);
+        assert!(report.top_session_drifts.is_empty());
+        assert!(
+            report.evaluate_gate().passed,
+            "event-only mode should pass with complete message IDs"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_consistency_report_ignores_legacy_messages_table_drift() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                created_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&store.pool())
+        .await
+        .expect("create messages table");
+
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("m-1")
+        .bind("s-drift")
+        .bind("user")
+        .bind("hello")
+        .bind(&now)
+        .execute(&store.pool())
+        .await
+        .expect("insert message 1");
+
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("m-2")
+        .bind("s-drift")
+        .bind("assistant")
+        .bind("hi")
+        .bind(&now)
+        .execute(&store.pool())
+        .await
+        .expect("insert message 2");
+
+        append_event_at(
+            &store,
+            "s-drift",
+            EventType::UserMessage,
+            json!({
+                "content": "hello from event stream",
+                "message_id": null,
+                "has_attachments": false
+            }),
+            Utc::now(),
+        )
+        .await;
+
+        let report = store
+            .write_consistency_report(5)
+            .await
+            .expect("write consistency");
+
+        assert!(!report.messages_table_present);
+        assert_eq!(report.conversation_message_rows, 1);
+        assert_eq!(report.conversation_event_rows, 1);
+        assert_eq!(report.missing_message_id_events, 1);
+        assert_eq!(report.global_delta, 0);
+        assert_eq!(report.session_mismatch_count, 0);
+        assert!(report.top_session_drifts.is_empty());
+        assert!(
+            !report.evaluate_gate().passed,
+            "default gate should fail when event payloads are missing message_id"
+        );
+    }
+
+    #[test]
+    fn write_consistency_gate_can_be_tuned_with_custom_thresholds() {
+        let report = WriteConsistencyReport {
+            generated_at: Utc::now().to_rfc3339(),
+            messages_table_present: true,
+            conversation_message_rows: 12,
+            conversation_event_rows: 10,
+            missing_message_id_events: 1,
+            global_delta: 2,
+            session_mismatch_count: 1,
+            stale_task_starts: 0,
+            top_session_drifts: Vec::new(),
+        };
+
+        let strict = report.evaluate_gate_with(WriteConsistencyThresholds {
+            max_abs_global_delta: 0,
+            max_session_mismatch_count: 0,
+            max_stale_task_starts: 0,
+            max_missing_message_id_events: 0,
+        });
+        assert!(!strict.passed);
+        assert!(!strict.reasons.is_empty());
+
+        let relaxed = report.evaluate_gate_with(WriteConsistencyThresholds {
+            max_abs_global_delta: 2,
+            max_session_mismatch_count: 1,
+            max_stale_task_starts: 0,
+            max_missing_message_id_events: 1,
+        });
+        assert!(relaxed.passed);
     }
 }

@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::events::{
-    ApprovalDeniedData, DecisionPointData, DecisionType, ErrorData, ErrorType, Event,
-    EventStore, EventType, FailureCategory, RootCauseCandidate, TaskEndData, TaskStartData,
-    ToolCallData, ToolResultData,
+    ApprovalDeniedData, AssistantResponseData, DecisionPointData, DecisionType, ErrorData,
+    ErrorType, Event, EventStore, EventType, FailureCategory, RootCauseCandidate, TaskEndData,
+    TaskStartData, ThinkingStartData, ToolCallData, ToolResultData,
 };
 use crate::tools::sanitize::redact_secrets;
 use crate::traits::{ModelProvider, ProviderResponse, StateStore, Tool, ToolCapabilities};
@@ -160,7 +160,11 @@ impl DiagnoseTool {
             }
             EventType::Error => {
                 if let Ok(data) = event.parse_data::<ErrorData>() {
-                    format!("error {:?}: {}", data.error_type, truncate_str(&data.message, 160))
+                    format!(
+                        "error {:?}: {}",
+                        data.error_type,
+                        truncate_str(&data.message, 160)
+                    )
                 } else {
                     "error".to_string()
                 }
@@ -302,10 +306,7 @@ impl DiagnoseTool {
                                 | DecisionType::ConsecutiveSameToolDetection
                                 | DecisionType::AlternatingPatternDetection
                         ) || matches!(data.decision_type, DecisionType::StoppingCondition)
-                            && data
-                                .summary
-                                .to_ascii_lowercase()
-                                .contains("stall")
+                            && data.summary.to_ascii_lowercase().contains("stall")
                         {
                             loop_signals.push(ev);
                         }
@@ -346,8 +347,8 @@ impl DiagnoseTool {
             candidates.push(RootCauseCandidate {
                 category: FailureCategory::SandboxPermissionBlock,
                 confidence: 0.9,
-                description:
-                    "Execution required approval and the command was denied or timed out.".to_string(),
+                description: "Execution required approval and the command was denied or timed out."
+                    .to_string(),
                 evidence: approval_denied.iter().take(3).cloned().collect(),
                 why_previous_step_looked_valid: Some(
                     "The agent selected an executable path, but approval policy blocked execution."
@@ -487,12 +488,16 @@ impl DiagnoseTool {
         let allowed_categories: Vec<String> = deterministic
             .candidates
             .iter()
-            .map(|c| serde_json::to_string(&c.category).unwrap_or_else(|_| "\"incorrect_result\"".to_string()))
+            .map(|c| {
+                serde_json::to_string(&c.category)
+                    .unwrap_or_else(|_| "\"incorrect_result\"".to_string())
+            })
             .map(|s| s.trim_matches('"').to_string())
             .collect();
         let deterministic_json = serde_json::to_string_pretty(&deterministic).ok()?;
 
-        let system = "You are a strict diagnostics ranker. Ground every claim in provided event IDs. \
+        let system =
+            "You are a strict diagnostics ranker. Ground every claim in provided event IDs. \
 Return JSON only, no markdown.";
         let user = format!(
             "Task: {task_id}\n\
@@ -517,10 +522,18 @@ Rules: no invented event IDs; confidence 0..1.",
             json!({"role":"user","content":user}),
         ];
 
-        let resp: ProviderResponse = match self.provider.chat(&self.fast_model, &messages, &[]).await {
-            Ok(r) => r,
-            Err(_) => return None,
-        };
+        let resp: ProviderResponse =
+            match self.provider.chat(&self.fast_model, &messages, &[]).await {
+                Ok(r) => r,
+                Err(_) => return None,
+            };
+        // Track token usage for diagnostic LLM calls
+        if let Some(usage) = &resp.usage {
+            let _ = self
+                .state
+                .record_token_usage("background:diagnose", usage)
+                .await;
+        }
         let raw = resp.content.or(resp.thinking)?;
         let json_text = extract_json_object(&raw)?;
         serde_json::from_str::<LlmDiagnosisResponse>(&json_text).ok()
@@ -550,7 +563,8 @@ Rules: no invented event IDs; confidence 0..1.",
                 if let Some(idx) = by_category.get(&cand.category).copied() {
                     let existing = &mut deterministic.candidates[idx];
                     let llm_conf = cand.confidence.clamp(0.0, 1.0);
-                    existing.confidence = (existing.confidence * 0.6 + llm_conf * 0.4).clamp(0.0, 1.0);
+                    existing.confidence =
+                        (existing.confidence * 0.6 + llm_conf * 0.4).clamp(0.0, 1.0);
                     if !cand.description.trim().is_empty() {
                         existing.description = redact_secrets(&cand.description);
                     }
@@ -611,7 +625,243 @@ Rules: no invented event IDs; confidence 0..1.",
         deterministic
     }
 
-    fn format_diagnosis(&self, task_id: &str, analysis: &DeterministicAnalysis) -> String {
+    fn parse_resumed_task_id_from_error(&self, text: &str) -> Option<String> {
+        const MARKER: &str = "Resumed in task ";
+        let idx = text.find(MARKER)?;
+        let tail = text[idx + MARKER.len()..].trim();
+        let first_token = tail
+            .trim_start_matches('`')
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('.')
+            .trim_end_matches('`')
+            .trim();
+        if first_token.is_empty() {
+            None
+        } else {
+            Some(first_token.to_string())
+        }
+    }
+
+    fn checkpoint_snapshot_from_events(
+        &self,
+        task_id: &str,
+        events: &[Event],
+    ) -> ResumeCheckpointSnapshot {
+        let mut description: Option<String> = None;
+        let mut original_user_message: Option<String> = None;
+        let mut parent_task_id: Option<String> = None;
+        let mut resumed_into_task_id: Option<String> = None;
+        let mut duration_secs: Option<u64> = None;
+        let mut last_iteration: u32 = 0;
+        let mut tool_results_count: u32 = 0;
+        let mut pending_tool_calls: HashSet<String> = HashSet::new();
+        let mut last_assistant_summary: Option<String> = None;
+        let mut last_tool_summary: Option<String> = None;
+        let mut last_error: Option<String> = None;
+
+        for event in events {
+            match event.event_type {
+                EventType::TaskStart => {
+                    if let Ok(data) = event.parse_data::<TaskStartData>() {
+                        if description.is_none() {
+                            description = Some(data.description);
+                        }
+                        if original_user_message.is_none() {
+                            original_user_message = data.user_message;
+                        }
+                        if parent_task_id.is_none() {
+                            parent_task_id = data.parent_task_id;
+                        }
+                    }
+                }
+                EventType::ThinkingStart => {
+                    if let Ok(data) = event.parse_data::<ThinkingStartData>() {
+                        last_iteration = last_iteration.max(data.iteration);
+                    }
+                }
+                EventType::AssistantResponse => {
+                    if let Ok(data) = event.parse_data::<AssistantResponseData>() {
+                        if let Some(calls) = data.tool_calls {
+                            for call in calls {
+                                pending_tool_calls.insert(call.id);
+                            }
+                        }
+                        if let Some(content) = data.content {
+                            let trimmed = content.trim();
+                            if !trimmed.is_empty() {
+                                last_assistant_summary = Some(truncate_str(trimmed, 180));
+                            }
+                        }
+                    }
+                }
+                EventType::ToolResult => {
+                    if let Ok(data) = event.parse_data::<ToolResultData>() {
+                        tool_results_count = tool_results_count.saturating_add(1);
+                        pending_tool_calls.remove(&data.tool_call_id);
+                        let detail = data.error.unwrap_or(data.result);
+                        let trimmed = detail.trim();
+                        if !trimmed.is_empty() {
+                            last_tool_summary = Some(truncate_str(trimmed, 180));
+                        }
+                    }
+                }
+                EventType::Error => {
+                    if let Ok(data) = event.parse_data::<ErrorData>() {
+                        let trimmed = data.message.trim();
+                        if !trimmed.is_empty() {
+                            last_error = Some(truncate_str(trimmed, 180));
+                        }
+                    }
+                }
+                EventType::TaskEnd => {
+                    if let Ok(data) = event.parse_data::<TaskEndData>() {
+                        duration_secs = Some(data.duration_secs);
+                        if let Some(err) = data.error {
+                            let trimmed = err.trim();
+                            if !trimmed.is_empty() {
+                                last_error = Some(truncate_str(trimmed, 180));
+                                resumed_into_task_id =
+                                    self.parse_resumed_task_id_from_error(trimmed);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut pending_tool_call_ids: Vec<String> = pending_tool_calls.into_iter().collect();
+        pending_tool_call_ids.sort();
+
+        ResumeCheckpointSnapshot {
+            task_id: task_id.to_string(),
+            description,
+            original_user_message,
+            parent_task_id,
+            resumed_into_task_id,
+            duration_secs,
+            last_iteration,
+            tool_results_count,
+            pending_tool_call_ids,
+            last_assistant_summary,
+            last_tool_summary,
+            last_error,
+        }
+    }
+
+    async fn build_resume_recovery_section(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        task_events: &[Event],
+    ) -> String {
+        let current = self.checkpoint_snapshot_from_events(task_id, task_events);
+
+        let mut lines = vec!["### Resume Recovery State".to_string()];
+        lines.push(format!(
+            "- Current task: `{}` (iteration {}, tool_results {}, pending_tool_calls {})",
+            current.task_id,
+            current.last_iteration,
+            current.tool_results_count,
+            current.pending_tool_call_ids.len()
+        ));
+
+        if let Some(desc) = current.description.as_ref() {
+            lines.push(format!("- Current description: {}", redact_secrets(desc)));
+        }
+        if let Some(parent) = current.parent_task_id.as_ref() {
+            lines.push(format!("- Resumed from previous task: `{}`", parent));
+            let parent_events = self
+                .event_store
+                .query_task_events_for_session(session_id, parent)
+                .await
+                .unwrap_or_default();
+            if !parent_events.is_empty() {
+                let parent_snapshot = self.checkpoint_snapshot_from_events(parent, &parent_events);
+                if let Some(duration) = parent_snapshot.duration_secs {
+                    lines.push(format!(
+                        "- Previous elapsed before interruption: {}s",
+                        duration
+                    ));
+                }
+                lines.push(format!(
+                    "- Previous checkpoint: iteration {}, tool_results {}, pending_tool_calls {}",
+                    parent_snapshot.last_iteration,
+                    parent_snapshot.tool_results_count,
+                    parent_snapshot.pending_tool_call_ids.len()
+                ));
+                if let Some(desc) = parent_snapshot.description.as_ref() {
+                    lines.push(format!("- Previous description: {}", redact_secrets(desc)));
+                }
+                if let Some(msg) = parent_snapshot.original_user_message.as_ref() {
+                    lines.push(format!(
+                        "- Previous user request: {}",
+                        redact_secrets(&truncate_str(msg, 180))
+                    ));
+                }
+                if let Some(summary) = parent_snapshot.last_assistant_summary.as_ref() {
+                    lines.push(format!(
+                        "- Previous last assistant output: {}",
+                        redact_secrets(summary)
+                    ));
+                }
+                if let Some(summary) = parent_snapshot.last_tool_summary.as_ref() {
+                    lines.push(format!(
+                        "- Previous last tool result: {}",
+                        redact_secrets(summary)
+                    ));
+                }
+                if let Some(err) = parent_snapshot.last_error.as_ref() {
+                    lines.push(format!(
+                        "- Previous interruption/error: {}",
+                        redact_secrets(err)
+                    ));
+                }
+                if let Some(next_task) = parent_snapshot.resumed_into_task_id.as_ref() {
+                    lines.push(format!("- Previous task resumed into: `{}`", next_task));
+                }
+            } else {
+                lines.push("- Previous task events not found in this session.".to_string());
+            }
+        } else if let Some(next_task) = current.resumed_into_task_id.as_ref() {
+            lines.push(format!(
+                "- This task was interrupted and resumed into: `{}`",
+                next_task
+            ));
+            if let Some(duration) = current.duration_secs {
+                lines.push(format!("- Elapsed before interruption: {}s", duration));
+            }
+        } else {
+            lines.push("- No resume linkage detected for this task.".to_string());
+        }
+
+        if let Some(err) = current.last_error.as_ref() {
+            lines.push(format!("- Current last error: {}", redact_secrets(err)));
+        }
+        if let Some(summary) = current.last_assistant_summary.as_ref() {
+            lines.push(format!(
+                "- Current last assistant output: {}",
+                redact_secrets(summary)
+            ));
+        }
+        if let Some(summary) = current.last_tool_summary.as_ref() {
+            lines.push(format!(
+                "- Current last tool result: {}",
+                redact_secrets(summary)
+            ));
+        }
+
+        lines.join("\n")
+    }
+
+    fn format_diagnosis(
+        &self,
+        task_id: &str,
+        analysis: &DeterministicAnalysis,
+        recovery_section: &str,
+    ) -> String {
         let mut out = format!(
             "## Diagnosis for Task {}\n\n### What Failed\n{}\n\n### Most Likely Cause(s)\n",
             task_id, analysis.what_failed
@@ -647,7 +897,13 @@ Rules: no invented event IDs; confidence 0..1.",
         if let Some(why) = analysis
             .why_previous_step_looked_valid
             .as_ref()
-            .or_else(|| analysis.candidates.first()?.why_previous_step_looked_valid.as_ref())
+            .or_else(|| {
+                analysis
+                    .candidates
+                    .first()?
+                    .why_previous_step_looked_valid
+                    .as_ref()
+            })
         {
             out.push_str(why);
         } else {
@@ -663,6 +919,8 @@ Rules: no invented event IDs; confidence 0..1.",
         for step in &analysis.verification_steps {
             out.push_str(&format!("- {}\n", step));
         }
+        out.push_str("\n");
+        out.push_str(recovery_section);
         out.trim_end().to_string()
     }
 
@@ -687,7 +945,9 @@ Rules: no invented event IDs; confidence 0..1.",
             }
         };
 
-        let events = self.collect_task_timeline(session_id, &resolved_task).await?;
+        let events = self
+            .collect_task_timeline(session_id, &resolved_task)
+            .await?;
         if events.is_empty() {
             return Ok(format!(
                 "No events found for task `{}` in session `{}`.",
@@ -701,14 +961,21 @@ Rules: no invented event IDs; confidence 0..1.",
             .llm_rank_candidates(&resolved_task, &timeline_text, &deterministic)
             .await;
         let merged = self.merge_llm_analysis(deterministic, llm, &events);
-        Ok(self.format_diagnosis(&resolved_task, &merged))
+        let recovery_section = self
+            .build_resume_recovery_section(session_id, &resolved_task, &events)
+            .await;
+        Ok(self.format_diagnosis(&resolved_task, &merged, &recovery_section))
     }
 
     fn signature_for_event(&self, event: &Event) -> String {
         match event.event_type {
             EventType::DecisionPoint => {
                 if let Ok(dp) = event.parse_data::<DecisionPointData>() {
-                    format!("decision:{:?}:{}", dp.decision_type, truncate_str(&dp.summary, 40))
+                    format!(
+                        "decision:{:?}:{}",
+                        dp.decision_type,
+                        truncate_str(&dp.summary, 40)
+                    )
                 } else {
                     "decision".to_string()
                 }
@@ -738,15 +1005,26 @@ Rules: no invented event IDs; confidence 0..1.",
         }
     }
 
-    async fn compare(&self, session_id: &str, task_a: &str, task_b: &str) -> anyhow::Result<String> {
+    async fn compare(
+        &self,
+        session_id: &str,
+        task_a: &str,
+        task_b: &str,
+    ) -> anyhow::Result<String> {
         let timeline_a = self.collect_task_timeline(session_id, task_a).await?;
         let timeline_b = self.collect_task_timeline(session_id, task_b).await?;
         if timeline_a.is_empty() || timeline_b.is_empty() {
             return Ok("One or both tasks have no events in this session.".to_string());
         }
 
-        let sig_a: Vec<String> = timeline_a.iter().map(|e| self.signature_for_event(e)).collect();
-        let sig_b: Vec<String> = timeline_b.iter().map(|e| self.signature_for_event(e)).collect();
+        let sig_a: Vec<String> = timeline_a
+            .iter()
+            .map(|e| self.signature_for_event(e))
+            .collect();
+        let sig_b: Vec<String> = timeline_b
+            .iter()
+            .map(|e| self.signature_for_event(e))
+            .collect();
         let mut divergence_at = None;
         for i in 0..sig_a.len().min(sig_b.len()) {
             if sig_a[i] != sig_b[i] {
@@ -842,6 +1120,22 @@ struct LlmCandidate {
     evidence_event_ids: Vec<i64>,
     #[serde(default)]
     why_previous_step_looked_valid: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResumeCheckpointSnapshot {
+    task_id: String,
+    description: Option<String>,
+    original_user_message: Option<String>,
+    parent_task_id: Option<String>,
+    resumed_into_task_id: Option<String>,
+    duration_secs: Option<u64>,
+    last_iteration: u32,
+    tool_results_count: u32,
+    pending_tool_call_ids: Vec<String>,
+    last_assistant_summary: Option<String>,
+    last_tool_summary: Option<String>,
+    last_error: Option<String>,
 }
 
 fn extract_json_object(raw: &str) -> Option<String> {
@@ -1013,6 +1307,7 @@ mod tests {
                     model: "mock".to_string(),
                 }),
                 thinking: None,
+                response_note: None,
             })
         }
 
@@ -1061,8 +1356,11 @@ mod tests {
         data: T,
         task_id: Option<&str>,
     ) {
-        let mut event =
-            crate::events::Event::new(session_id.to_string(), event_type, serde_json::to_value(data).unwrap());
+        let mut event = crate::events::Event::new(
+            session_id.to_string(),
+            event_type,
+            serde_json::to_value(data).unwrap(),
+        );
         event.task_id = task_id.map(str::to_string);
         event.created_at = Utc::now();
         tool.event_store.append(event).await.expect("append");
@@ -1170,7 +1468,11 @@ mod tests {
             &tool,
             "s1",
             EventType::Error,
-            ErrorData::tool_error("terminal", "No such file or directory", Some("t1".to_string())),
+            ErrorData::tool_error(
+                "terminal",
+                "No such file or directory",
+                Some("t1".to_string()),
+            ),
             Some("t1"),
         )
         .await;
@@ -1200,6 +1502,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_diagnose_includes_resume_recovery_state() {
+        let tool = setup_tool().await;
+
+        // Parent task (interrupted and resumed)
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskStart,
+            TaskStartData {
+                task_id: "parent-1".to_string(),
+                description: "Build website and deploy".to_string(),
+                parent_task_id: None,
+                user_message: Some("Build website and deploy".to_string()),
+            },
+            Some("parent-1"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::ThinkingStart,
+            ThinkingStartData {
+                iteration: 3,
+                task_id: "parent-1".to_string(),
+                total_tool_calls: 2,
+            },
+            Some("parent-1"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::AssistantResponse,
+            AssistantResponseData {
+                message_id: None,
+                content: Some("I'll continue by checking deployment config.".to_string()),
+                tool_calls: Some(vec![crate::events::ToolCallInfo {
+                    id: "call-parent-pending".to_string(),
+                    name: "system_info".to_string(),
+                    arguments: json!({}),
+                    extra_content: None,
+                }]),
+                model: "mock-fast".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            },
+            Some("parent-1"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskEnd,
+            TaskEndData {
+                task_id: "parent-1".to_string(),
+                status: TaskStatus::Failed,
+                duration_secs: 42,
+                iterations: 3,
+                tool_calls_count: 1,
+                error: Some(
+                    "Agent process interrupted before completion. Resumed in task child-1."
+                        .to_string(),
+                ),
+                summary: Some("Recovered from checkpoint after interruption".to_string()),
+            },
+            Some("parent-1"),
+        )
+        .await;
+
+        // Child resumed task
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskStart,
+            TaskStartData {
+                task_id: "child-1".to_string(),
+                description: "resume: Build website and deploy".to_string(),
+                parent_task_id: Some("parent-1".to_string()),
+                user_message: Some("continue".to_string()),
+            },
+            Some("child-1"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskEnd,
+            TaskEndData {
+                task_id: "child-1".to_string(),
+                status: TaskStatus::Failed,
+                duration_secs: 10,
+                iterations: 1,
+                tool_calls_count: 0,
+                error: Some("still failing".to_string()),
+                summary: None,
+            },
+            Some("child-1"),
+        )
+        .await;
+
+        let res = tool
+            .call(r#"{"action":"diagnose","task_id":"child-1","_session_id":"s1"}"#)
+            .await
+            .unwrap();
+
+        assert!(res.contains("### Resume Recovery State"));
+        assert!(res.contains("Resumed from previous task: `parent-1`"));
+        assert!(res.contains("Previous checkpoint: iteration 3"));
+        assert!(res.contains("Previous task resumed into: `child-1`"));
+    }
+
+    #[tokio::test]
     async fn test_pii_redaction_in_timeline() {
         let tool = setup_tool().await;
         append_event(
@@ -1207,6 +1621,7 @@ mod tests {
             "s1",
             EventType::ToolResult,
             ToolResultData {
+                message_id: None,
                 tool_call_id: "c1".to_string(),
                 name: "web_fetch".to_string(),
                 result: "token sk-abc123456789012345678901234567890 leaked".to_string(),

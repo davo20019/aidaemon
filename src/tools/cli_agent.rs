@@ -12,8 +12,15 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::process_control::{configure_command_for_process_group, send_sigkill, send_sigterm};
+use super::{
+    command_risk::{PermissionMode, RiskLevel},
+    daemon_guard::detect_daemonization_primitives,
+};
 use crate::config::CliAgentsConfig;
+use crate::tools::terminal::ApprovalRequest;
 use crate::traits::{DynamicCliAgent, ModelProvider, StateStore, Tool, ToolCapabilities};
+use crate::types::ApprovalResponse;
 use crate::types::StatusUpdate;
 use crate::utils::{truncate_str, truncate_with_note};
 
@@ -112,20 +119,19 @@ fn is_process_alive(_pid: u32) -> bool {
 /// Kill a process by PID (SIGTERM then SIGKILL).
 #[cfg(unix)]
 async fn kill_process(pid: u32) {
-    use std::process::Command;
-    // Send SIGTERM
-    let _ = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status();
+    if pid == 0 {
+        return;
+    }
+
+    // Send SIGTERM to process group (fallback to pid).
+    let _ = send_sigterm(pid);
 
     // Wait a bit
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Send SIGKILL if still alive
+    // Send SIGKILL if still alive.
     if is_process_alive(pid) {
-        let _ = Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status();
+        let _ = send_sigkill(pid);
     }
 }
 
@@ -174,6 +180,7 @@ pub struct CliAgentTool {
     default_timeout: Duration,
     default_max_output: usize,
     max_concurrent: usize,
+    approval_tx: mpsc::Sender<ApprovalRequest>,
 }
 
 /// Default tool definitions when the user enables cli_agents but doesn't specify tools.
@@ -230,10 +237,55 @@ async fn command_exists(command: &str) -> bool {
 }
 
 impl CliAgentTool {
+    fn is_owner_role(user_role: Option<&str>) -> bool {
+        user_role.is_some_and(|role| role.eq_ignore_ascii_case("owner"))
+    }
+
+    async fn request_daemonization_approval(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        prompt: &str,
+        hits: &[&str],
+    ) -> anyhow::Result<ApprovalResponse> {
+        let prompt_preview: String = prompt.chars().take(180).collect();
+        let command = format!(
+            "cli_agent '{}' requested detached/background execution markers: {}. Prompt preview: {}",
+            tool_name,
+            hits.join(", "),
+            prompt_preview
+        );
+        let warnings = vec![
+            format!("Daemonization primitives detected: {}", hits.join(", ")),
+            "Detached/background processes may survive cancellation and continue running."
+                .to_string(),
+        ];
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.approval_tx
+            .send(ApprovalRequest {
+                command,
+                session_id: session_id.to_string(),
+                risk_level: RiskLevel::Critical,
+                warnings,
+                permission_mode: PermissionMode::Default,
+                response_tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
+
+        match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Ok(ApprovalResponse::Deny),
+            Err(_) => Ok(ApprovalResponse::Deny),
+        }
+    }
+
     pub async fn discover(
         config: CliAgentsConfig,
         state: Arc<dyn StateStore>,
         provider: Arc<dyn ModelProvider>,
+        approval_tx: mpsc::Sender<ApprovalRequest>,
     ) -> Self {
         let default_timeout = Duration::from_secs(config.timeout_secs);
         let default_max_output = config.max_output_chars;
@@ -317,6 +369,7 @@ impl CliAgentTool {
             default_timeout,
             default_max_output,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
+            approval_tx,
         };
 
         // Load dynamic agents from DB
@@ -887,6 +940,7 @@ impl CliAgentTool {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        configure_command_for_process_group(&mut cmd);
 
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
         let short_summary: String = prompt.chars().take(50).collect();
@@ -1532,6 +1586,9 @@ struct CliAgentArgs {
     /// Injected by agent - session ID for cancel_all filtering
     #[serde(default)]
     _session_id: Option<String>,
+    /// Injected by agent for role-aware safeguards.
+    #[serde(default)]
+    _user_role: Option<String>,
 }
 
 /// Check if a string looks like JSON (starts with { or [).
@@ -1876,6 +1933,53 @@ impl Tool for CliAgentTool {
                     .prompt
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter for action=run"))?;
+
+                let mut daemon_hits = detect_daemonization_primitives(prompt);
+                if let Some(system_instruction) = args.system_instruction.as_deref() {
+                    for hit in detect_daemonization_primitives(system_instruction) {
+                        if !daemon_hits.contains(&hit) {
+                            daemon_hits.push(hit);
+                        }
+                    }
+                }
+                if !daemon_hits.is_empty() {
+                    if !Self::is_owner_role(args._user_role.as_deref()) {
+                        return Ok(format!(
+                            "Blocked: daemonization primitives detected in cli_agent prompt ({}) and only owners can approve detached/background execution.",
+                            daemon_hits.join(", ")
+                        ));
+                    }
+                    if session_id.trim().is_empty() {
+                        return Ok(
+                            "Blocked: daemonization primitives require owner approval in an interactive session, but no session_id was provided."
+                                .to_string(),
+                        );
+                    }
+                    match self
+                        .request_daemonization_approval(
+                            session_id.trim(),
+                            tool,
+                            prompt,
+                            &daemon_hits,
+                        )
+                        .await
+                    {
+                        Ok(ApprovalResponse::Deny) => {
+                            return Ok("Daemonizing cli_agent run denied by owner.".to_string());
+                        }
+                        Ok(
+                            ApprovalResponse::AllowOnce
+                            | ApprovalResponse::AllowSession
+                            | ApprovalResponse::AllowAlways,
+                        ) => {}
+                        Err(e) => {
+                            return Ok(format!(
+                                "Could not get owner approval for daemonizing cli_agent run: {}",
+                                e
+                            ));
+                        }
+                    }
+                }
                 self.handle_run(
                     tool,
                     prompt,
@@ -1936,6 +2040,7 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -1960,6 +2065,7 @@ mod tests {
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
+            approval_tx,
         };
 
         (tool, db_file)
@@ -1980,6 +2086,7 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -2004,6 +2111,7 @@ mod tests {
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
+            approval_tx,
         };
 
         (tool, db_file)
@@ -2037,6 +2145,22 @@ mod tests {
         assert!(
             result.contains("test output 42"),
             "Expected 'test output 42' in output, got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_daemonization_prompt_blocked_for_non_owner() {
+        let (tool, _db) = setup_echo_tool().await;
+        let result = tool
+            .call(
+                r#"{"action":"run","tool":"echo","prompt":"nohup echo hi &","_session_id":"sess1","_user_role":"Guest"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.contains("Blocked: daemonization primitives"),
+            "Expected daemonization guard block, got: {}",
             result
         );
     }
@@ -2612,6 +2736,7 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
 
         // Config with echo as a custom tool
         let mut tools = HashMap::new();
@@ -2636,6 +2761,7 @@ mod tests {
             config,
             state as Arc<dyn StateStore>,
             provider as Arc<dyn crate::traits::ModelProvider>,
+            approval_tx,
         )
         .await;
         assert!(tool.has_tools());
@@ -2659,6 +2785,7 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
 
         let mut tools = HashMap::new();
         tools.insert(
@@ -2682,6 +2809,7 @@ mod tests {
             config,
             state as Arc<dyn StateStore>,
             provider as Arc<dyn crate::traits::ModelProvider>,
+            approval_tx,
         )
         .await;
         assert!(!tool.has_tools());
@@ -2707,6 +2835,7 @@ mod tests {
         );
         let state_clone = state.clone();
         let provider = Arc::new(MockProvider::new());
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -2731,6 +2860,7 @@ mod tests {
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
+            approval_tx,
         };
 
         // Run a command

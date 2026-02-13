@@ -72,6 +72,7 @@ impl MockProvider {
                 model: "mock".to_string(),
             }),
             thinking: None,
+            response_note: None,
         }
     }
 
@@ -91,6 +92,7 @@ impl MockProvider {
                 model: "mock".to_string(),
             }),
             thinking: None,
+            response_note: None,
         }
     }
 

@@ -101,6 +101,13 @@ pub async fn extract_task_knowledge(
 
     let response = provider.chat(&model, &messages, &[]).await?;
 
+    // Track token usage for task learning LLM calls
+    if let Some(usage) = &response.usage {
+        let _ = state
+            .record_token_usage("background:task_learning", usage)
+            .await;
+    }
+
     let response_text = response
         .content
         .as_deref()

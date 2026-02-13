@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use zeroize::Zeroize;
 
 use crate::providers::ProviderError;
@@ -29,6 +29,141 @@ fn strip_unsupported_fields(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn blocked_safety_categories(ratings: Option<&Vec<Value>>) -> Vec<String> {
+    let mut categories = Vec::new();
+    if let Some(ratings) = ratings {
+        for rating in ratings {
+            let blocked = rating
+                .get("blocked")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !blocked {
+                continue;
+            }
+            if let Some(category) = rating.get("category").and_then(|v| v.as_str()) {
+                if !categories.iter().any(|c| c == category) {
+                    categories.push(category.to_string());
+                }
+            }
+        }
+    }
+    categories
+}
+
+fn build_gemini_response_note(
+    finish_reason: Option<&str>,
+    prompt_block_reason: Option<&str>,
+    prompt_blocked_categories: &[String],
+    candidate_blocked_categories: &[String],
+) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if let Some(reason) = prompt_block_reason {
+        parts.push(format!("prompt blocked ({})", reason));
+    }
+    if !prompt_blocked_categories.is_empty() {
+        parts.push(format!(
+            "prompt safety categories: {}",
+            prompt_blocked_categories.join(", ")
+        ));
+    }
+    if let Some(reason) = finish_reason {
+        let upper = reason.to_ascii_uppercase();
+        if upper != "STOP" && upper != "MAX_TOKENS" {
+            parts.push(format!("finish reason: {}", reason));
+        }
+    }
+    if !candidate_blocked_categories.is_empty() {
+        parts.push(format!(
+            "candidate safety categories: {}",
+            candidate_blocked_categories.join(", ")
+        ));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
+fn part_has_thought_signature(part: &Value) -> bool {
+    part.get("thought_signature").is_some() || part.get("thoughtSignature").is_some()
+}
+
+fn inject_thought_signature_aliases(part: &mut serde_json::Map<String, Value>) {
+    let sig = part
+        .get("thought_signature")
+        .cloned()
+        .or_else(|| part.get("thoughtSignature").cloned());
+    if let Some(sig) = sig {
+        part.entry("thought_signature".to_string())
+            .or_insert_with(|| sig.clone());
+        part.entry("thoughtSignature".to_string()).or_insert(sig);
+    }
+}
+
+/// Gemini thinking models can reject historical functionCall parts that are
+/// missing thought signatures. Strip those parts (and paired function responses)
+/// as a one-shot malformed-request recovery strategy.
+fn strip_unsigned_function_call_history(contents: &[Value]) -> (Vec<Value>, usize, usize) {
+    let mut sanitized = Vec::with_capacity(contents.len());
+    let mut pending_response_drops = 0usize;
+    let mut dropped_calls = 0usize;
+    let mut dropped_responses = 0usize;
+
+    for msg in contents {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role == "model" {
+            let Some(parts) = msg.get("parts").and_then(|p| p.as_array()) else {
+                sanitized.push(msg.clone());
+                continue;
+            };
+
+            let mut kept_parts = Vec::with_capacity(parts.len());
+            let mut dropped_in_msg = 0usize;
+            for part in parts {
+                if part.get("functionCall").is_none() {
+                    kept_parts.push(part.clone());
+                    continue;
+                }
+
+                if part_has_thought_signature(part) {
+                    kept_parts.push(part.clone());
+                } else {
+                    dropped_calls += 1;
+                    dropped_in_msg += 1;
+                }
+            }
+
+            pending_response_drops = pending_response_drops.saturating_add(dropped_in_msg);
+            if !kept_parts.is_empty() {
+                let mut kept_msg = msg.clone();
+                kept_msg["parts"] = json!(kept_parts);
+                sanitized.push(kept_msg);
+            }
+            continue;
+        }
+
+        if role == "function" && pending_response_drops > 0 {
+            pending_response_drops -= 1;
+            dropped_responses += 1;
+            continue;
+        }
+
+        sanitized.push(msg.clone());
+    }
+
+    (sanitized, dropped_calls, dropped_responses)
+}
+
+fn is_missing_thought_signature_error(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("missing a thought_signature")
+        || lower.contains("missing thought_signature")
+        || lower.contains("missing thoughtsignature")
 }
 
 pub struct GoogleGenAiProvider {
@@ -108,6 +243,7 @@ impl GoogleGenAiProvider {
                                     for (k, v) in extra {
                                         part_map.insert(k.clone(), v.clone());
                                     }
+                                    inject_thought_signature_aliases(part_map);
                                 }
                             }
                             parts.push(part_obj);
@@ -268,9 +404,53 @@ impl GoogleGenAiProvider {
 
     /// Parse a Gemini generateContent response into a ProviderResponse.
     fn parse_response(&self, data: &Value, model: &str) -> anyhow::Result<ProviderResponse> {
-        let candidate = data["candidates"]
-            .get(0)
-            .ok_or_else(|| anyhow::anyhow!("No candidates in Google GenAI response: {}", data))?;
+        let usage = data.get("usageMetadata").and_then(|u| {
+            Some(TokenUsage {
+                input_tokens: u.get("promptTokenCount")?.as_u64()? as u32,
+                output_tokens: u.get("candidatesTokenCount")?.as_u64()? as u32,
+                model: model.to_string(),
+            })
+        });
+
+        let prompt_feedback = data.get("promptFeedback");
+        let prompt_block_reason = prompt_feedback
+            .and_then(|pf| pf.get("blockReason"))
+            .and_then(|v| v.as_str());
+        let prompt_blocked_categories = blocked_safety_categories(
+            prompt_feedback
+                .and_then(|pf| pf.get("safetyRatings"))
+                .and_then(|v| v.as_array()),
+        );
+
+        let Some(candidate) = data["candidates"].get(0) else {
+            let response_note = build_gemini_response_note(
+                None,
+                prompt_block_reason,
+                &prompt_blocked_categories,
+                &[],
+            )
+            .or_else(|| Some("no candidates returned by provider".to_string()));
+            return Ok(ProviderResponse {
+                content: None,
+                tool_calls: vec![],
+                usage,
+                thinking: None,
+                response_note,
+            });
+        };
+
+        let finish_reason = candidate.get("finishReason").and_then(|v| v.as_str());
+        let candidate_blocked_categories = blocked_safety_categories(
+            candidate
+                .get("safetyRatings")
+                .and_then(|ratings| ratings.as_array()),
+        );
+        let response_note = build_gemini_response_note(
+            finish_reason,
+            prompt_block_reason,
+            &prompt_blocked_categories,
+            &candidate_blocked_categories,
+        );
 
         let empty_parts = vec![];
         let content_parts = candidate["content"]["parts"]
@@ -350,14 +530,6 @@ impl GoogleGenAiProvider {
             }
         }
 
-        let usage = data.get("usageMetadata").and_then(|u| {
-            Some(TokenUsage {
-                input_tokens: u.get("promptTokenCount")?.as_u64()? as u32,
-                output_tokens: u.get("candidatesTokenCount")?.as_u64()? as u32,
-                model: model.to_string(),
-            })
-        });
-
         Ok(ProviderResponse {
             content: if final_text.is_empty() {
                 None
@@ -371,6 +543,7 @@ impl GoogleGenAiProvider {
             } else {
                 Some(thinking_text)
             },
+            response_note,
         })
     }
 }
@@ -384,6 +557,7 @@ impl ModelProvider for GoogleGenAiProvider {
         tools: &[Value],
     ) -> anyhow::Result<ProviderResponse> {
         let (system_instruction, contents) = self.convert_messages(messages);
+        let original_contents = contents.clone();
         let has_function_tools = !tools.is_empty();
         let (body, consultant_text_only_mode, include_grounding, disable_function_calling) =
             self.build_request_body(system_instruction, contents, tools);
@@ -421,6 +595,49 @@ impl ModelProvider for GoogleGenAiProvider {
         let text = resp.text().await?;
 
         if !status.is_success() {
+            if status.as_u16() == 400 && is_missing_thought_signature_error(&text) {
+                let (sanitized_contents, dropped_calls, dropped_responses) =
+                    strip_unsigned_function_call_history(&original_contents);
+                if dropped_calls > 0 {
+                    let mut retry_body = body.clone();
+                    retry_body["contents"] = json!(sanitized_contents);
+                    warn!(
+                        model,
+                        dropped_calls,
+                        dropped_responses,
+                        "Google GenAI rejected missing thought signatures; retrying with unsigned function-call history stripped"
+                    );
+                    let retry_resp = match self
+                        .client
+                        .post(&url)
+                        .header("x-goog-api-key", &self.api_key)
+                        .json(&retry_body)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("Google GenAI retry HTTP request failed: {}", e);
+                            return Err(ProviderError::network(&e).into());
+                        }
+                    };
+
+                    let retry_status = retry_resp.status();
+                    let retry_text = retry_resp.text().await?;
+                    if retry_status.is_success() {
+                        let data: Value = serde_json::from_str(&retry_text)?;
+                        return self.parse_response(&data, model);
+                    }
+                    error!(
+                        status = %retry_status,
+                        "Google GenAI API error after thought-signature recovery retry: {}",
+                        retry_text
+                    );
+                    return Err(
+                        ProviderError::from_status(retry_status.as_u16(), &retry_text).into(),
+                    );
+                }
+            }
             error!(status = %status, "Google GenAI API error: {}", text);
             return Err(ProviderError::from_status(status.as_u16(), &text).into());
         }
@@ -784,6 +1001,137 @@ mod tests {
             parts[0]["thought_signature"], "abc123-sig",
             "thought_signature must survive the round-trip"
         );
+        assert_eq!(
+            parts[0]["thoughtSignature"], "abc123-sig",
+            "camelCase thoughtSignature alias must also be present"
+        );
+    }
+
+    #[test]
+    fn test_convert_messages_normalizes_thought_signature_aliases() {
+        let p = provider();
+        let messages = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": "{\"path\":\"/tmp/a.txt\",\"content\":\"hello\"}"
+                },
+                "extra_content": {
+                    "thoughtSignature": "sig-camel-only"
+                }
+            }]
+        })];
+
+        let (_sys, contents) = p.convert_messages(&messages);
+        let parts = contents[0]["parts"].as_array().expect("parts");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["thoughtSignature"], "sig-camel-only");
+        assert_eq!(parts[0]["thought_signature"], "sig-camel-only");
+    }
+
+    #[test]
+    fn test_strip_unsigned_function_call_history_drops_orphaned_function_response() {
+        let contents = vec![
+            json!({
+                "role": "user",
+                "parts": [{"text": "do it"}]
+            }),
+            json!({
+                "role": "model",
+                "parts": [{
+                    "functionCall": {
+                        "name": "write_file",
+                        "args": {"path": "/tmp/out.txt", "content": "x"}
+                    }
+                }]
+            }),
+            json!({
+                "role": "function",
+                "parts": [{
+                    "functionResponse": {
+                        "name": "write_file",
+                        "response": {"result": "ok"}
+                    }
+                }]
+            }),
+            json!({
+                "role": "model",
+                "parts": [{"text": "Done"}]
+            }),
+        ];
+
+        let (sanitized, dropped_calls, dropped_responses) =
+            strip_unsigned_function_call_history(&contents);
+        assert_eq!(dropped_calls, 1);
+        assert_eq!(dropped_responses, 1);
+        assert_eq!(sanitized.len(), 2);
+        assert_eq!(sanitized[0]["role"], "user");
+        assert_eq!(sanitized[1]["role"], "model");
+        assert_eq!(sanitized[1]["parts"][0]["text"], "Done");
+    }
+
+    #[test]
+    fn test_parse_response_surfaces_finish_reason_and_safety_block() {
+        let p = provider();
+        let gemini_response = json!({
+            "candidates": [{
+                "finishReason": "SAFETY",
+                "safetyRatings": [
+                    { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "blocked": true }
+                ],
+                "content": { "role": "model", "parts": [] }
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 0
+            }
+        });
+
+        let parsed = p
+            .parse_response(&gemini_response, "gemini-2.5-flash")
+            .unwrap();
+
+        assert!(parsed.content.is_none());
+        assert!(parsed.tool_calls.is_empty());
+        let note = parsed
+            .response_note
+            .as_deref()
+            .expect("expected response note");
+        assert!(note.contains("finish reason: SAFETY"));
+        assert!(note.contains("HARM_CATEGORY_DANGEROUS_CONTENT"));
+    }
+
+    #[test]
+    fn test_parse_response_with_prompt_feedback_only_returns_note() {
+        let p = provider();
+        let gemini_response = json!({
+            "promptFeedback": {
+                "blockReason": "SAFETY",
+                "safetyRatings": [
+                    { "category": "HARM_CATEGORY_HATE_SPEECH", "blocked": true }
+                ]
+            },
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "candidatesTokenCount": 0
+            }
+        });
+
+        let parsed = p
+            .parse_response(&gemini_response, "gemini-2.5-flash")
+            .unwrap();
+
+        assert!(parsed.content.is_none());
+        assert!(parsed.tool_calls.is_empty());
+        let note = parsed
+            .response_note
+            .as_deref()
+            .expect("expected response note");
+        assert!(note.contains("prompt blocked (SAFETY)"));
+        assert!(note.contains("HARM_CATEGORY_HATE_SPEECH"));
     }
 
     /// Recursively check that no object in `value` contains an `additionalProperties` key.

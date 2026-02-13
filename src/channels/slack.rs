@@ -902,8 +902,6 @@ impl SlackChannel {
             let watchdog_heartbeat = heartbeat.clone();
             let watchdog_cancel = typing_cancel.clone();
             let watchdog_channel = channel_id.clone();
-            let watchdog_thread = reply_thread.clone();
-            let watchdog_self = self.clone_for_status();
             let watchdog_ts = ts.clone();
             let watchdog_typing_self = self.clone_for_typing();
             tokio::spawn(async move {
@@ -914,21 +912,12 @@ impl SlackChannel {
                             let now = SystemTime::now().duration_since(UNIX_EPOCH)
                                 .unwrap_or_default().as_secs();
                             if now.saturating_sub(last_hb) > stale_threshold_secs {
-                                let stale_mins = (now - last_hb) / 60;
                                 // Swap hourglass for warning
                                 let _ = watchdog_typing_self.remove_reaction(
                                     &watchdog_channel, &watchdog_ts, "hourglass_flowing_sand"
                                 ).await;
                                 let _ = watchdog_typing_self.add_reaction(
                                     &watchdog_channel, &watchdog_ts, "warning"
-                                ).await;
-                                let _ = watchdog_self.post_message(
-                                    &watchdog_channel,
-                                    &format!(
-                                        "⚠️ No activity for {} minutes. The task may be stuck.",
-                                        stale_mins
-                                    ),
-                                    watchdog_thread.as_deref(),
                                 ).await;
                                 break;
                             }
@@ -1112,6 +1101,13 @@ impl SlackChannel {
                 let result = tokio::select! {
                     r = agent.handle_message(&session_id, &current_text, Some(current_status_tx), user_role, channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
+                    stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 10), if stale_threshold_secs > 0 => {
+                        Err(anyhow::anyhow!(
+                            "Task auto-cancelled due to inactivity ({} minute{} without progress).",
+                            stale_mins,
+                            if stale_mins == 1 { "" } else { "s" }
+                        ))
+                    },
                 };
                 current_typing_cancel.cancel();
                 let _ = current_status_task.await;
@@ -1142,15 +1138,27 @@ impl SlackChannel {
                             info!("Task #{} cancelled", current_task_id);
                             return; // Exit loop on cancellation
                         }
-                        warn!("Agent error: {}", e);
-                        let _ = slack_post_message(
-                            &http,
-                            &bot_token,
-                            &reply_channel,
-                            &format!("Error: {}", e),
-                            reply_thread_ts.as_deref(),
-                        )
-                        .await;
+                        if error_msg.starts_with("Task auto-cancelled due to inactivity") {
+                            info!("Task #{} auto-cancelled by stale watchdog", current_task_id);
+                            let _ = slack_post_message(
+                                &http,
+                                &bot_token,
+                                &reply_channel,
+                                &format!("⚠️ {}", error_msg),
+                                reply_thread_ts.as_deref(),
+                            )
+                            .await;
+                        } else {
+                            warn!("Agent error: {}", e);
+                            let _ = slack_post_message(
+                                &http,
+                                &bot_token,
+                                &reply_channel,
+                                &format!("Error: {}", e),
+                                reply_thread_ts.as_deref(),
+                            )
+                            .await;
+                        }
                     }
                 }
 

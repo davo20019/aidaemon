@@ -8,9 +8,9 @@ use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock;
 
 use crate::traits::{
-    BehaviorPattern, ConversationSummary, Episode, ErrorSolution, Expertise, Fact, Goal, GoalV3,
-    Message, Procedure, StateStore, TaskActivityV3, TaskV3, TokenUsage, TokenUsageRecord,
-    UserProfile,
+    BehaviorPattern, ConversationSummary, Episode, ErrorSolution, Expertise, Fact, Goal,
+    GoalTokenBudgetStatus, GoalV3, Message, Procedure, StateStore, TaskActivityV3, TaskV3,
+    TokenUsage, TokenUsageRecord, UserProfile,
 };
 use crate::types::{ChannelVisibility, FactPrivacy};
 
@@ -429,6 +429,20 @@ impl SqliteStateStore {
         .execute(&pool)
         .await?;
 
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_token_usage_created_at
+             ON token_usage(created_at)",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_token_usage_session_created_at
+             ON token_usage(session_id, created_at)",
+        )
+        .execute(&pool)
+        .await?;
+
         // Token usage daily aggregates (for retention cleanup)
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS token_usage_daily (
@@ -776,6 +790,13 @@ impl SqliteStateStore {
         .execute(&pool)
         .await?;
 
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_task_activity_v3_created_at
+             ON task_activity_v3(created_at)",
+        )
+        .execute(&pool)
+        .await?;
+
         // Notification queue — queued when channel unavailable, delivered on reconnect.
         // Retention: status_update expires after 24h, critical persists indefinitely.
         sqlx::query(
@@ -799,6 +820,20 @@ impl SqliteStateStore {
             "CREATE INDEX IF NOT EXISTS idx_notification_queue_pending
              ON notification_queue(delivered_at, priority, created_at)
              WHERE delivered_at IS NULL",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Token alert detector dedupe/cooldown state.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS token_alert_state (
+                scope_type TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                last_alert_at TEXT NOT NULL,
+                last_metric_tokens INTEGER NOT NULL DEFAULT 0,
+                last_metric_calls INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (scope_type, scope_id)
+            )",
         )
         .execute(&pool)
         .await?;
@@ -839,14 +874,175 @@ impl SqliteStateStore {
         })
     }
 
-    /// Hydrate working memory for a session from the database.
-    async fn hydrate(&self, session_id: &str) -> anyhow::Result<VecDeque<Message>> {
+    async fn hydrate_from_events(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<VecDeque<Message>> {
         let rows = sqlx::query(
-            "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
-             FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT ?"
+            r#"
+            SELECT id, session_id, event_type, data, created_at
+            FROM events
+            WHERE session_id = ?
+              AND event_type IN ('user_message', 'assistant_response', 'tool_result')
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
         )
         .bind(session_id)
-        .bind(self.cap as i64)
+        .bind(limit.max(1) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut deque = VecDeque::with_capacity(rows.len());
+        for row in rows.into_iter().rev() {
+            let event_id: i64 = row.get("id");
+            let event_type: String = row.get("event_type");
+            let created_str: String = row.get("created_at");
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+            let data_raw: String = row.get("data");
+            let data: serde_json::Value = match serde_json::from_str(&data_raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id,
+                        event_id,
+                        event_type = %event_type,
+                        error = %e,
+                        "hydrate_from_events: skipping malformed event payload"
+                    );
+                    continue;
+                }
+            };
+
+            let message_id = data
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| event_id.to_string());
+
+            let message = match event_type.as_str() {
+                "user_message" => Some(Message {
+                    id: message_id,
+                    session_id: row.get("session_id"),
+                    role: "user".to_string(),
+                    content: Some(
+                        data.get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    ),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls_json: None,
+                    created_at,
+                    importance: 0.5,
+                    embedding: None,
+                }),
+                "assistant_response" => {
+                    let tool_calls_json = data
+                        .get("tool_calls")
+                        .and_then(|v| v.as_array())
+                        .and_then(|calls| {
+                            let mapped: Vec<crate::traits::ToolCall> = calls
+                                .iter()
+                                .filter_map(|tc| {
+                                    let id = tc.get("id").and_then(|v| v.as_str())?;
+                                    let name = tc.get("name").and_then(|v| v.as_str())?;
+                                    Some(crate::traits::ToolCall {
+                                        id: id.to_string(),
+                                        name: name.to_string(),
+                                        arguments: tc
+                                            .get("arguments")
+                                            .cloned()
+                                            .unwrap_or_else(|| serde_json::json!({}))
+                                            .to_string(),
+                                        extra_content: tc.get("extra_content").cloned(),
+                                    })
+                                })
+                                .collect();
+                            if mapped.is_empty() {
+                                None
+                            } else {
+                                serde_json::to_string(&mapped).ok()
+                            }
+                        });
+
+                    Some(Message {
+                        id: message_id,
+                        session_id: row.get("session_id"),
+                        role: "assistant".to_string(),
+                        content: data
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json,
+                        created_at,
+                        importance: 0.5,
+                        embedding: None,
+                    })
+                }
+                "tool_result" => Some(Message {
+                    id: message_id,
+                    session_id: row.get("session_id"),
+                    role: "tool".to_string(),
+                    content: Some(
+                        data.get("result")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    ),
+                    tool_call_id: Some(
+                        data.get("tool_call_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("event-tool-{}", event_id)),
+                    ),
+                    tool_name: Some(
+                        data.get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("system")
+                            .to_string(),
+                    ),
+                    tool_calls_json: None,
+                    created_at,
+                    importance: 0.5,
+                    embedding: None,
+                }),
+                _ => None,
+            };
+
+            if let Some(message) = message {
+                deque.push_back(message);
+            }
+        }
+
+        Ok(deque)
+    }
+
+    async fn hydrate_from_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<VecDeque<Message>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(session_id)
+        .bind(limit.max(1) as i64)
         .fetch_all(&self.pool)
         .await?;
 
@@ -856,9 +1052,6 @@ impl SqliteStateStore {
             let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
-
-            let importance: f32 = row.try_get("importance").unwrap_or(0.5);
-
             deque.push_back(Message {
                 id: row.get("id"),
                 session_id: row.get("session_id"),
@@ -868,11 +1061,43 @@ impl SqliteStateStore {
                 tool_name: row.get("tool_name"),
                 tool_calls_json: row.get("tool_calls_json"),
                 created_at,
-                importance,
-                embedding: None, // Don't load embeddings into working memory by default
+                importance: row.try_get("importance").unwrap_or(0.5),
+                embedding: None,
             });
         }
+
         Ok(deque)
+    }
+
+    /// Hydrate working memory for a session from the database.
+    async fn hydrate(&self, session_id: &str) -> anyhow::Result<VecDeque<Message>> {
+        match self.hydrate_from_events(session_id, self.cap).await {
+            Ok(deque) => {
+                tracing::debug!(
+                    session_id,
+                    hydrated_count = deque.len(),
+                    "hydrate: loaded conversation from canonical event stream"
+                );
+                Ok(deque)
+            }
+            Err(e) => {
+                if e.to_string().contains("no such table: events") {
+                    tracing::warn!(
+                        session_id,
+                        "hydrate: events table missing, falling back to legacy messages table"
+                    );
+                    let deque = self.hydrate_from_messages(session_id, self.cap).await?;
+                    tracing::debug!(
+                        session_id,
+                        hydrated_count = deque.len(),
+                        "hydrate: loaded conversation from legacy messages table"
+                    );
+                    Ok(deque)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
     pub fn pool(&self) -> SqlitePool {
         self.pool.clone()
@@ -2156,25 +2381,8 @@ fn days_until_date(value: &str, today: chrono::NaiveDate) -> Option<i64> {
 #[async_trait]
 impl StateStore for SqliteStateStore {
     async fn append_message(&self, msg: &Message) -> anyhow::Result<()> {
-        // Persist to DB
-        sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance, embedding)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&msg.id)
-        .bind(&msg.session_id)
-        .bind(&msg.role)
-        .bind(&msg.content)
-        .bind(&msg.tool_call_id)
-        .bind(&msg.tool_name)
-        .bind(&msg.tool_calls_json)
-        .bind(msg.created_at.to_rfc3339())
-        .bind(msg.importance)
-        .bind(msg.embedding.as_ref().map(|v| encode_embedding(v)))
-        .execute(&self.pool)
-        .await?;
-
-        // Update working memory
+        // Canonical persistence is event-sourced (EventStore). We only keep
+        // an in-memory session window here for fast hot-path reads.
         let mut wm = self.working_memory.write().await;
         let deque = wm
             .entry(msg.session_id.clone())
@@ -2510,173 +2718,12 @@ impl StateStore for SqliteStateStore {
     async fn get_context(
         &self,
         session_id: &str,
-        query: &str,
-        _limit: usize,
+        _query: &str,
+        limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
-        // 1. Recency (Last 10 conversation messages) - Critical for conversational flow
-        // Only get user messages and final assistant responses (not tool calls/results)
-        // This prevents intermediate tool messages from pushing out important context
-        let recency_count = 10;
-        let recency_rows = sqlx::query(
-            "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
-             FROM messages
-             WHERE session_id = ?
-               AND (role = 'user' OR (role = 'assistant' AND tool_calls_json IS NULL))
-             ORDER BY created_at DESC
-             LIMIT ?"
-        )
-        .bind(session_id)
-        .bind(recency_count)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut messages: Vec<Message> = recency_rows
-            .into_iter()
-            .map(|row| {
-                let created_str: String = row.get("created_at");
-                let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                Message {
-                    id: row.get("id"),
-                    session_id: row.get("session_id"),
-                    role: row.get("role"),
-                    content: row.get("content"),
-                    tool_call_id: row.get("tool_call_id"),
-                    tool_name: row.get("tool_name"),
-                    tool_calls_json: row.get("tool_calls_json"),
-                    created_at,
-                    importance: row.try_get("importance").unwrap_or(0.5),
-                    embedding: None,
-                }
-            })
-            .collect();
-
-        let mut seen_ids: std::collections::HashSet<String> =
-            messages.iter().map(|m| m.id.clone()).collect();
-
-        // 2. Salience (Importance >= 0.8) - Critical memory
-        // Added session_id filter to prevent bleeding context from other sessions
-        let limit_salience = 5;
-        let salience = sqlx::query(
-            "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
-             FROM messages 
-             WHERE session_id = ? AND importance >= 0.8 
-             ORDER BY created_at DESC 
-             LIMIT ?"
-        )
-        .bind(session_id)
-        .bind(limit_salience)
-        .fetch_all(&self.pool)
-        .await?;
-
-        for row in salience {
-            let id: String = row.get("id");
-            if seen_ids.contains(&id) {
-                continue;
-            }
-
-            let created_str: String = row.get("created_at");
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-
-            messages.push(Message {
-                id: id.clone(),
-                session_id: row.get("session_id"),
-                role: row.get("role"),
-                content: row.get("content"),
-                tool_call_id: row.get("tool_call_id"),
-                tool_name: row.get("tool_name"),
-                tool_calls_json: row.get("tool_calls_json"),
-                created_at,
-                importance: row.try_get("importance").unwrap_or(0.5),
-                embedding: None,
-            });
-            seen_ids.insert(id);
-        }
-
-        // 3. Relevance (Vector Search)
-        // Only run if we have a query
-        if !query.trim().is_empty() {
-            if let Ok(query_vec) = self.embedding_service.embed(query.to_string()).await {
-                // Fetch candidate embeddings (limit to recent 2000 to save compute)
-                // Added session_id filter
-                let candidates = sqlx::query(
-                    "SELECT id, embedding FROM messages WHERE session_id = ? AND embedding IS NOT NULL ORDER BY created_at DESC LIMIT 2000"
-                 )
-                 .bind(session_id)
-                 .fetch_all(&self.pool)
-                 .await?;
-
-                let mut scored = Vec::new();
-                for row in candidates {
-                    let id: String = row.get("id");
-                    if seen_ids.contains(&id) {
-                        continue;
-                    }
-                    let embedding: Option<Vec<u8>> = row.get("embedding");
-
-                    if let Some(blob) = embedding {
-                        if let Ok(vec) = decode_embedding(&blob) {
-                            let score = crate::memory::math::cosine_similarity(&query_vec, &vec);
-                            if score > 0.65 {
-                                // Relevance threshold
-                                scored.push((id, score));
-                            }
-                        }
-                    }
-                }
-                // Sort by score DESC
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-                // Take top 5
-                for (id, _score) in scored.into_iter().take(5) {
-                    // Fetch full message
-                    let row = sqlx::query(
-                        "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
-                         FROM messages WHERE id = ?"
-                     )
-                     .bind(&id)
-                     .fetch_optional(&self.pool)
-                     .await?;
-
-                    if let Some(row) = row {
-                        let created_str: String = row.get("created_at");
-                        let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now());
-
-                        let msg = Message {
-                            id: row.get("id"),
-                            session_id: row.get("session_id"),
-                            role: row.get("role"),
-                            content: row.get("content"),
-                            tool_call_id: row.get("tool_call_id"),
-                            tool_name: row.get("tool_name"),
-                            tool_calls_json: row.get("tool_calls_json"),
-                            created_at,
-                            importance: row.try_get("importance").unwrap_or(0.5),
-                            embedding: None,
-                        };
-                        // (Optional) Append score to content for debugging?
-                        // if let Some(c) = &mut msg.content {
-                        //    *c = format!("(Similarity: {:.2}) {}", score, c);
-                        // }
-                        messages.push(msg);
-                        seen_ids.insert(id);
-                    }
-                }
-            }
-        }
-
-        // Sort final list by created_at (Chronological)
-        messages.sort_by_key(|m| m.created_at);
-
-        // Enforce limit if we somehow exceeded it (we might have up to 20 now)
-        // But we want to keep *all* relevant context we found, so maybe flexible limit.
-        // We just return what we gathered.
-        Ok(messages)
+        // Canonical context retrieval is event-backed. The in-memory working
+        // window is hydrated from events on cold start by get_history().
+        self.get_history(session_id, limit).await
     }
 
     async fn clear_session(&self, session_id: &str) -> anyhow::Result<()> {
@@ -2685,16 +2732,22 @@ impl StateStore for SqliteStateStore {
             let mut wm = self.working_memory.write().await;
             wm.remove(session_id);
         }
-        // Delete messages from DB
-        sqlx::query("DELETE FROM messages WHERE session_id = ?")
-            .bind(session_id)
-            .execute(&self.pool)
-            .await?;
-        // Delete conversation summary
-        sqlx::query("DELETE FROM conversation_summaries WHERE session_id = ?")
-            .bind(session_id)
-            .execute(&self.pool)
-            .await?;
+
+        // Delete session rows across canonical + legacy tables.
+        // Some test/legacy DBs may not have all tables yet; treat missing tables as best-effort.
+        for table in ["events", "messages", "conversation_summaries"] {
+            let query = format!("DELETE FROM {table} WHERE session_id = ?");
+            if let Err(e) = sqlx::query(&query)
+                .bind(session_id)
+                .execute(&self.pool)
+                .await
+            {
+                let missing_table = format!("no such table: {table}");
+                if !e.to_string().contains(&missing_table) {
+                    return Err(e.into());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2731,6 +2784,32 @@ impl StateStore for SqliteStateStore {
             });
         }
         Ok(records)
+    }
+
+    async fn get_token_usage_by_session(
+        &self,
+        since: &str,
+    ) -> anyhow::Result<Vec<(String, i64, i64, i64)>> {
+        let rows = sqlx::query(
+            "SELECT session_id, SUM(input_tokens) as total_input, \
+             SUM(output_tokens) as total_output, COUNT(*) as request_count \
+             FROM token_usage WHERE created_at >= ? \
+             GROUP BY session_id ORDER BY (total_input + total_output) DESC",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            results.push((
+                row.get::<String, _>("session_id"),
+                row.get::<i64, _>("total_input"),
+                row.get::<i64, _>("total_output"),
+                row.get::<i64, _>("request_count"),
+            ));
+        }
+        Ok(results)
     }
 
     // ==================== Extended Memory Trait Methods ====================
@@ -4976,6 +5055,43 @@ impl StateStore for SqliteStateStore {
         Ok(result.rows_affected())
     }
 
+    async fn add_goal_tokens_and_get_budget_status(
+        &self,
+        goal_id: &str,
+        delta_tokens: i64,
+    ) -> anyhow::Result<Option<GoalTokenBudgetStatus>> {
+        let mut tx = self.pool.begin().await?;
+
+        if delta_tokens != 0 {
+            sqlx::query(
+                "UPDATE goals_v3
+                 SET tokens_used_today = MAX(0, tokens_used_today + ?)
+                 WHERE id = ?",
+            )
+            .bind(delta_tokens)
+            .bind(goal_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let row = sqlx::query(
+            "SELECT budget_per_check, budget_daily, tokens_used_today
+             FROM goals_v3
+             WHERE id = ?",
+        )
+        .bind(goal_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(row.map(|r| GoalTokenBudgetStatus {
+            budget_per_check: r.get("budget_per_check"),
+            budget_daily: r.get("budget_daily"),
+            tokens_used_today: r.get("tokens_used_today"),
+        }))
+    }
+
     async fn get_conversation_summary(
         &self,
         session_id: &str,
@@ -5399,6 +5515,45 @@ mod tests {
         }
     }
 
+    async fn create_events_table_for_tests(store: &SqliteStateStore) {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                consolidated_at TEXT,
+                task_id TEXT,
+                tool_name TEXT
+            )
+            "#,
+        )
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn insert_conversation_event_for_tests(
+        store: &SqliteStateStore,
+        session_id: &str,
+        event_type: &str,
+        data: serde_json::Value,
+        created_at: chrono::DateTime<Utc>,
+    ) {
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind(event_type)
+        .bind(data.to_string())
+        .bind(created_at.to_rfc3339())
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    }
+
     // ==================== Message Tests ====================
 
     #[tokio::test]
@@ -5499,6 +5654,99 @@ mod tests {
             "Expected <= 5 messages in working memory, got {}",
             history.len()
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_history_hydrates_from_events_when_available() {
+        let (store, _db) = setup_test_store().await;
+        let session = "sess-events";
+        let now = Utc::now();
+
+        create_events_table_for_tests(&store).await;
+        insert_conversation_event_for_tests(
+            &store,
+            session,
+            "user_message",
+            serde_json::json!({
+                "content": "Hello from events",
+                "message_id": "msg-user-1",
+                "has_attachments": false
+            }),
+            now,
+        )
+        .await;
+        insert_conversation_event_for_tests(
+            &store,
+            session,
+            "assistant_response",
+            serde_json::json!({
+                "content": "Hi from assistant event",
+                "message_id": "msg-assistant-1",
+                "model": "test",
+                "tool_calls": []
+            }),
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        insert_conversation_event_for_tests(
+            &store,
+            session,
+            "tool_result",
+            serde_json::json!({
+                "message_id": "msg-tool-1",
+                "tool_call_id": "tc-1",
+                "name": "terminal",
+                "result": "ok",
+                "success": true,
+                "duration_ms": 7,
+                "error": null,
+                "task_id": null
+            }),
+            now + chrono::Duration::seconds(2),
+        )
+        .await;
+
+        let history = store.get_history(session, 100).await.unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].id, "msg-user-1");
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[1].id, "msg-assistant-1");
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[2].id, "msg-tool-1");
+        assert_eq!(history[2].role, "tool");
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("tc-1"));
+    }
+
+    #[tokio::test]
+    async fn test_get_context_falls_back_to_history_when_messages_table_missing() {
+        let (store, _db) = setup_test_store().await;
+        let session = "sess-context-fallback";
+        let now = Utc::now();
+
+        create_events_table_for_tests(&store).await;
+        insert_conversation_event_for_tests(
+            &store,
+            session,
+            "user_message",
+            serde_json::json!({
+                "content": "Context from events",
+                "message_id": "msg-context-1",
+                "has_attachments": false
+            }),
+            now,
+        )
+        .await;
+
+        sqlx::query("DROP TABLE messages")
+            .execute(&store.pool())
+            .await
+            .unwrap();
+
+        let context = store.get_context(session, "context", 10).await.unwrap();
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].id, "msg-context-1");
+        assert_eq!(context[0].role, "user");
+        assert_eq!(context[0].content.as_deref(), Some("Context from events"));
     }
 
     // ==================== Fact Tests ====================

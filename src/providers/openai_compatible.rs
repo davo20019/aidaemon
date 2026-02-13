@@ -191,6 +191,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
             tool_calls,
             usage,
             thinking: None,
+            response_note: None,
         })
     }
 
