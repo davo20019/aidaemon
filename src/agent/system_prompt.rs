@@ -67,13 +67,18 @@ pub(super) fn build_consultant_system_prompt(system_prompt: &str) -> String {
             confirmation, or reaction (\"yes\", \"ok\", \"thanks\", \"got it\", \"sure\", \"👍\", etc. in any language) \
             with NO embedded new request or instruction. `false` if it contains any actionable content \
             (e.g., \"ok, now run the tests\" or \"yes, and also deploy it\").\n\
-            - If the user wants something done later or on a recurring basis, include \
-            `\"schedule_type\"` (\"one_shot\" or \"recurring\") and `\"schedule_cron\"` as a 5-field cron \
-            expression (minute hour day-of-month month day-of-week), interpreted in the system timezone. \
-            Always provide `schedule_cron` — you must normalize the user's timing into cron. \
-            Examples: \"every 5 minutes\" / \"each 5m\" → \"*/5 * * * *\", \"daily at 9am\" → \"0 9 * * *\", \
-            \"every 6h\" → \"0 */6 * * *\", \"in 2h\" → one-shot cron for 2 hours from now. \
-            Also include `\"schedule\"` with the user's original timing expression for display.\n\
+            - `\"schedule_type\"`, `\"schedule_cron\"`, and `\"schedule\"` — ONLY include these \
+            when the user **explicitly** asks for deferred or recurring execution using time expressions \
+            like \"in 2 hours\", \"tomorrow at 9am\", \"every day\", \"weekly\", etc. \
+            Do NOT schedule multi-step tasks that the user wants done NOW — even complex workflows \
+            with many steps (search → build → test → deploy) should be classified as \"simple\" and \
+            executed immediately, not scheduled. \
+            When scheduling IS requested: use `\"schedule_type\"` (\"one_shot\" or \"recurring\"), \
+            `\"schedule_cron\"` as a 5-field cron expression (minute hour day-of-month month day-of-week) \
+            in the system timezone, and `\"schedule\"` with the user's original timing expression. \
+            Always provide `schedule_cron` — normalize the user's timing into cron. \
+            Examples: \"every 5 minutes\" → \"*/5 * * * *\", \"daily at 9am\" → \"0 9 * * *\", \
+            \"in 2h\" → one-shot cron for 2 hours from now.\n\
             - `\"domains\"`: optional array of explicit expertise domains for this task. \
             Use only from this set: `\"rust\"`, `\"python\"`, `\"javascript\"`, `\"go\"`, `\"docker\"`, \
             `\"kubernetes\"`, `\"infrastructure\"`, `\"web-frontend\"`, `\"web-backend\"`, `\"databases\"`, \
