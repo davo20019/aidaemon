@@ -11,7 +11,7 @@ I built this because I wanted to control my computer from my phone, from anywher
 aidaemon runs 24/7 as a background daemon. It needs to be small, fast, and run on anything:
 
 - **Runs on cheap/old hardware** - a lightweight Rust binary. On a Raspberry Pi or a $5 VPS with 512 MB RAM, it runs comfortably where heavier runtimes won't.
-- **Single binary, zero runtime** - one binary, copy it to any machine and run it. Install with `curl -sSfL https://get.aidaemon.ai | bash` or `cargo install aidaemon`.
+- **Single binary, zero runtime** - one binary, copy it to any machine and run it. Works on Linux, macOS, and Windows. Install with `curl -sSfL https://get.aidaemon.ai | bash` or `cargo install aidaemon`.
 - **Startup in milliseconds** - restarts after a crash are near-instant, which matters for the auto-recovery retry loop.
 - **No garbage collector** - predictable latency. No GC pauses between receiving the LLM response and sending the reply.
 
@@ -56,7 +56,7 @@ If you don't care about resource usage and want more channels (WhatsApp, Signal,
 - **Evidence-gated learning** - stricter thresholds for auto-promoting procedures to skills (7+ successes, 90%+ success rate)
 - **Context window management** - role-based token quotas with sliding window summarization
 - **People intelligence** - organic contact management with auto-extracted facts, relationship tracking, and privacy controls
-- **Database encryption** - SQLCipher AES-256 encryption at rest enabled by default, with automatic plaintext migration
+- **Database encryption** - optional SQLCipher AES-256 encryption at rest with automatic plaintext migration (enable with `--features encryption`)
 
 ### Automation
 - **Scheduled tasks** - cron-style task scheduling with natural language time parsing
@@ -111,7 +111,31 @@ aidaemon
 
 ```bash
 cargo build --release
-./target/release/aidaemon
+./target/release/aidaemon        # Linux / macOS
+.\target\release\aidaemon.exe    # Windows
+```
+
+#### Windows
+
+Building on Windows requires the MSVC toolchain (Visual Studio Build Tools). A `build.bat` is included that sets up the MSVC environment and runs `cargo build`:
+
+```cmd
+build.bat
+```
+
+Or manually:
+
+```cmd
+cargo build --release
+.\target\release\aidaemon.exe
+```
+
+To enable database encryption on Windows, install [OpenSSL for Windows](https://slproweb.com/products/Win32OpenSSL.html) and build with:
+
+```cmd
+set OPENSSL_DIR=C:\OpenSSL-Win64
+set OPENSSL_LIB_DIR=C:\OpenSSL-Win64\lib\VC\x64\MD
+cargo build --release --features encryption
 ```
 
 The wizard will guide you through:
@@ -465,11 +489,12 @@ daily_token_budget = 1000000       # optional daily token limit (resets at midni
 # encryption_key = "keychain"      # optional override; defaults to AIDAEMON_ENCRYPTION_KEY from .env
 ```
 
-On startup, aidaemon now enforces encrypted state by default:
+When built with `--features encryption`, aidaemon encrypts the database at rest using SQLCipher:
 - If `AIDAEMON_ENCRYPTION_KEY` is missing and the DB is new/plaintext, a key is generated and written to `.env`.
 - Existing plaintext SQLite DBs are migrated automatically to SQLCipher with backup + integrity checks.
-- Set `AIDAEMON_ALLOW_PLAINTEXT_DB=1` only for emergency recovery scenarios.
-Encryption at rest protects against database-file exposure, but if an attacker obtains both the DB and key, the data can be decrypted.
+- Set `AIDAEMON_ALLOW_PLAINTEXT_DB=1` to bypass encryption even when the feature is compiled in.
+
+Without the `encryption` feature, the database is stored as plain SQLite. Encryption at rest protects against database-file exposure, but if an attacker obtains both the DB and key, the data can be decrypted.
 
 ## Channel Commands
 
@@ -503,11 +528,13 @@ sudo aidaemon install-service
 sudo systemctl enable --now aidaemon
 ```
 
+On Windows, you can run aidaemon at startup using Task Scheduler or register it as a Windows service with tools like [NSSM](https://nssm.cc/) or `sc create`.
+
 ## Security Model
 
 ### Where to Run It
 
-aidaemon works great on any dedicated machine — an old laptop, a Mac Mini, a Raspberry Pi, or a $5/mo VPS. Docker works too if that's your thing, but it's not required. For the best long-running setup, give it its own machine and treat your everyday workstation as a separate environment. Any spare computer you have lying around works perfectly.
+aidaemon works great on any dedicated machine — an old laptop, a Mac Mini, a Raspberry Pi, a Windows PC, or a $5/mo VPS. Docker works too if that's your thing, but it's not required. The main recommendation is to give it its own machine rather than running it on your daily driver where you keep personal files and passwords. Any spare computer you have lying around works perfectly.
 
 ### Application-Level Protections
 
@@ -530,10 +557,10 @@ aidaemon works great on any dedicated machine — an old laptop, a Mac Mini, a R
 - **Config secrets redaction** — when the LLM reads config via the config manager tool, sensitive keys (`api_key`, `password`, `bot_token`, etc.) are replaced with `[REDACTED]`.
 - **Config change approval** — sensitive config modifications (API keys, allowed users, terminal wildcards) require explicit user approval.
 - **OAuth token security** — OAuth tokens and dynamic bot tokens are stored in the OS keychain, never in config files or chat history.
-- **Encrypted state by default** — database contents are encrypted at rest; startup auto-migrates legacy plaintext DBs with rollback-safe backup.
+- **Optional encrypted state** — when built with `--features encryption`, database contents are encrypted at rest via SQLCipher; startup auto-migrates legacy plaintext DBs with rollback-safe backup.
 - **Public channel protection** — public-facing channels use a minimal system prompt with no internal architecture details, and output is sanitized to redact secrets.
 - **Dashboard security** — bearer token authentication with rate limiting, token expiration (24h), and constant-time comparison.
-- **File permissions** — config backups are written with `0600` (owner-only read/write) on Unix.
+- **File permissions** — config backups are written with `0600` (owner-only read/write) on Unix. On Windows, file permissions are managed by the OS via ACLs.
 
 ## Inspired by OpenClaw
 
@@ -548,7 +575,7 @@ Both projects share the same goal: a self-hosted AI assistant you control. The k
 | **Scope** | Lightweight daemon with web dashboard | Full-featured platform with web UI, canvas, TTS, browser control |
 | **Config** | Single `config.toml` with keychain secrets | JSON5 config with hot-reload and file watching |
 | **Error recovery** | Inline error classification per HTTP status, model fallback, config backup rotation | Multi-layer retry policies, auth profile cooldowns, provider rotation, restart sentinels |
-| **State** | SQLite + in-memory working memory (encrypted by default) | Pluggable storage with session management |
+| **State** | SQLite + in-memory working memory (optional encryption) | Pluggable storage with session management |
 | **Install** | `curl -sSfL https://get.aidaemon.ai \| bash` | npm/Docker |
 | **Dependencies** | ~30 crates, single static binary | Node.js ecosystem |
 

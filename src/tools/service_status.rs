@@ -124,7 +124,11 @@ async fn get_listening_ports(filters: &[String]) -> String {
 
 async fn get_docker_status(filters: &[String]) -> String {
     // Check if docker is available
-    let which_result = tokio::process::Command::new("which")
+    #[cfg(unix)]
+    let which_cmd = "which";
+    #[cfg(windows)]
+    let which_cmd = "where";
+    let which_result = tokio::process::Command::new(which_cmd)
         .arg("docker")
         .output()
         .await;

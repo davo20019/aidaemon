@@ -350,7 +350,7 @@ async function fetchWriteConsistency() {
 function fetchAll() { fetchStatus(); fetchUsage(); fetchSessions(); fetchTasks(); fetchMaintenanceJobs(); fetchQueues(); fetchPolicyMetrics(); fetchWriteConsistency(); }
 
 // Startup
-if (TOKEN) { tryConnect(); } else { showAuth(); }
+if (TOKEN && TOKEN.length > 0) { tryConnect(); } else { showAuth(); }
 setInterval(fetchAll, 30000);
 </script>
 </body>

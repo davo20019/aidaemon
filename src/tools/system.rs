@@ -51,6 +51,7 @@ impl Tool for SystemInfoTool {
         }
 
         // OS info
+        #[cfg(unix)]
         if let Ok(output) = tokio::process::Command::new("uname")
             .arg("-a")
             .output()
@@ -60,13 +61,34 @@ impl Tool for SystemInfoTool {
             info.push_str(&format!("OS: {}\n", uname));
         }
 
+        #[cfg(windows)]
+        if let Ok(output) = tokio::process::Command::new("cmd")
+            .args(["/C", "ver"])
+            .output()
+            .await
+        {
+            let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            info.push_str(&format!("OS: {}\n", ver));
+        }
+
         // Uptime
+        #[cfg(unix)]
         if let Ok(output) = tokio::process::Command::new("uptime").output().await {
             let uptime = String::from_utf8_lossy(&output.stdout).trim().to_string();
             info.push_str(&format!("Uptime: {}\n", uptime));
         }
 
-        // Memory (works on both Linux and macOS)
+        #[cfg(windows)]
+        if let Ok(output) = tokio::process::Command::new("wmic")
+            .args(["os", "get", "LastBootUpTime"])
+            .output()
+            .await
+        {
+            let boot = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            info.push_str(&format!("Last Boot: {}\n", boot));
+        }
+
+        // Memory (works on Linux, macOS, and Windows)
         #[cfg(target_os = "linux")]
         {
             if let Ok(output) = tokio::process::Command::new("free")
@@ -82,6 +104,23 @@ impl Tool for SystemInfoTool {
         #[cfg(target_os = "macos")]
         {
             if let Ok(output) = tokio::process::Command::new("vm_stat").output().await {
+                let mem = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                info.push_str(&format!("Memory:\n{}\n", mem));
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(output) = tokio::process::Command::new("wmic")
+                .args([
+                    "OS",
+                    "get",
+                    "FreePhysicalMemory,TotalVisibleMemorySize",
+                    "/FORMAT:LIST",
+                ])
+                .output()
+                .await
+            {
                 let mem = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 info.push_str(&format!("Memory:\n{}\n", mem));
             }

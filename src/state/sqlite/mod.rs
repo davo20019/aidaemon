@@ -19,6 +19,7 @@ use crate::memory::embeddings::EmbeddingService;
 use crate::utils::truncate_str;
 
 /// Set restrictive file permissions (0600) on the database and WAL files.
+#[cfg(unix)]
 fn set_db_file_permissions(db_path: &str) {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::Permissions::from_mode(0o600);
@@ -36,6 +37,10 @@ fn set_db_file_permissions(db_path: &str) {
         }
     }
 }
+
+/// No-op on Windows; file permissions are managed by the OS via ACLs.
+#[cfg(not(unix))]
+fn set_db_file_permissions(_db_path: &str) {}
 
 /// Migrate facts schema to allow supersession history.
 ///
@@ -165,6 +170,7 @@ impl SqliteStateStore {
         encryption_key: Option<&str>,
         embedding_service: Arc<EmbeddingService>,
     ) -> anyhow::Result<Self> {
+        #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
         let mut opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)

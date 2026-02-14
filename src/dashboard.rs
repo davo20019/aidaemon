@@ -75,10 +75,9 @@ pub fn get_or_create_dashboard_token() -> anyhow::Result<DashboardToken> {
     if let Err(e) = crate::config::store_in_keychain(KEYCHAIN_FIELD, &tok) {
         warn!("Could not store dashboard token in keychain: {e}");
     }
-    let prefix = tok.get(..8).unwrap_or("????????");
     info!(
-        "Dashboard token created (prefix: {}..., expires in 24h)",
-        prefix
+        "Dashboard token (expires in 24h): {}",
+        tok
     );
     Ok(DashboardToken {
         token: tok,
@@ -159,13 +158,16 @@ async fn auth_middleware(
         .unwrap_or("");
 
     if !constant_time_eq(token.as_bytes(), state.dashboard_token.as_bytes()) {
-        // Track failed attempt
-        let mut failures = state.auth_failures.lock().await;
-        let entry = failures
-            .entry(client_ip.clone())
-            .or_insert((0, Instant::now()));
-        entry.0 += 1;
-        warn!(ip = %client_ip, attempts = entry.0, "Failed dashboard auth attempt");
+        // Only count non-empty tokens as real failed attempts; empty bearer
+        // is just the page loading before the user has entered a token.
+        if !token.is_empty() {
+            let mut failures = state.auth_failures.lock().await;
+            let entry = failures
+                .entry(client_ip.clone())
+                .or_insert((0, Instant::now()));
+            entry.0 += 1;
+            warn!(ip = %client_ip, attempts = entry.0, "Failed dashboard auth attempt");
+        }
         return Err(StatusCode::UNAUTHORIZED);
     }
 

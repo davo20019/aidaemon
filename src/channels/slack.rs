@@ -2199,6 +2199,7 @@ impl Channel for SlackChannel {
 }
 
 /// Replace the current process with a fresh instance of itself.
+#[cfg(unix)]
 fn restart_process() {
     use std::os::unix::process::CommandExt;
 
@@ -2215,6 +2216,26 @@ fn restart_process() {
 
     let err = std::process::Command::new(&exe).args(&args).exec();
     tracing::error!("exec failed: {}", err);
+}
+
+/// Restart on Windows: spawn a new process then exit the current one.
+#[cfg(windows)]
+fn restart_process() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("Failed to get current exe path: {}", e);
+            return;
+        }
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    tracing::info!(exe = %exe.display(), "Spawning new process and exiting");
+
+    match std::process::Command::new(&exe).args(&args).spawn() {
+        Ok(_) => std::process::exit(0),
+        Err(e) => tracing::error!("Failed to spawn new process: {}", e),
+    }
 }
 
 /// Spawn a SlackChannel in a background task.

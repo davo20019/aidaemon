@@ -68,7 +68,7 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 keyring = { version = "3", features = ["windows-native"] }
 
 [features]
-default = ["discord", "slack", "encryption"]
+default = ["discord", "slack"]
 browser = ["dep:chromiumoxide"]
 discord = ["dep:serenity"]
 slack = ["dep:tokio-tungstenite"]
