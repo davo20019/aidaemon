@@ -56,9 +56,7 @@ fn strip_latex_inner(text: &str) -> String {
     s = s.replace("\\pi", "π");
 
     // Common trig/log functions: \sin → sin, \cos → cos, etc.
-    for func in &[
-        "sin", "cos", "tan", "log", "ln", "exp", "lim", "max", "min",
-    ] {
+    for func in &["sin", "cos", "tan", "log", "ln", "exp", "lim", "max", "min"] {
         s = s.replace(&format!("\\{}", func), func);
     }
 
@@ -829,8 +827,16 @@ mod tests {
         let input = r"$$x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$";
         let result = strip_latex(input);
         // Should not contain any LaTeX commands
-        assert!(!result.contains("\\frac"), "still contains \\frac: {}", result);
-        assert!(!result.contains("\\sqrt"), "still contains \\sqrt: {}", result);
+        assert!(
+            !result.contains("\\frac"),
+            "still contains \\frac: {}",
+            result
+        );
+        assert!(
+            !result.contains("\\sqrt"),
+            "still contains \\sqrt: {}",
+            result
+        );
         assert!(!result.contains("\\pm"), "still contains \\pm: {}", result);
         assert!(!result.contains("$$"), "still contains $$: {}", result);
         // Should contain readable math
@@ -870,10 +876,22 @@ mod tests {
     fn test_strip_latex_preserves_code_blocks() {
         let input = "Here is math: $x^2$\n```\n$\\frac{a}{b}$\n```\nMore math: $y^3$";
         let result = strip_latex(input);
-        assert!(result.contains("x²"), "should strip latex outside code: {}", result);
-        assert!(result.contains("y³"), "should strip latex outside code: {}", result);
+        assert!(
+            result.contains("x²"),
+            "should strip latex outside code: {}",
+            result
+        );
+        assert!(
+            result.contains("y³"),
+            "should strip latex outside code: {}",
+            result
+        );
         // Inside code block, LaTeX should be preserved
-        assert!(result.contains("\\frac{a}{b}"), "should preserve latex in code: {}", result);
+        assert!(
+            result.contains("\\frac{a}{b}"),
+            "should preserve latex in code: {}",
+            result
+        );
     }
 
     mod proptest_formatting {

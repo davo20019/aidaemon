@@ -9,16 +9,22 @@ impl Agent {
         &self,
         emitter: &crate::events::EventEmitter,
         msg: &Message,
+        channel_ctx: &ChannelContext,
         has_attachments: bool,
     ) -> anyhow::Result<()> {
         emitter
             .emit(
                 EventType::UserMessage,
-                UserMessageData {
-                    content: msg.content.clone().unwrap_or_default(),
-                    message_id: Some(msg.id.clone()),
-                    has_attachments,
-                },
+                json!({
+                    "content": msg.content.clone().unwrap_or_default(),
+                    "message_id": msg.id.clone(),
+                    "has_attachments": has_attachments,
+                    // Provenance for downstream projections/consolidation.
+                    "channel_visibility": channel_ctx.visibility.to_string(),
+                    "channel_id": channel_ctx.channel_id.clone(),
+                    "platform": channel_ctx.platform.clone(),
+                    "sender_id": channel_ctx.sender_id.clone(),
+                }),
             )
             .await?;
         self.append_message_canonical(msg).await?;

@@ -617,7 +617,7 @@ async fn init_heartbeat_coordinator(
             });
         }
 
-        // Daily token budget reset for evergreen goals
+        // Daily token budget reset for active goals
         let state_for_budget = state.clone();
         heartbeat.register_job(
             "daily_budget_reset",
@@ -627,7 +627,27 @@ async fn init_heartbeat_coordinator(
                 async move {
                     match s.reset_daily_token_budgets().await {
                         Ok(count) if count > 0 => {
-                            info!(count, "Reset daily token budgets for evergreen goals");
+                            info!(count, "Reset daily token budgets for active goals");
+                            Ok(())
+                        }
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(e),
+                    }
+                }
+            },
+        );
+
+        // Stale CLI agent invocation cleanup (every 15 min)
+        let state_for_cli_cleanup = state.clone();
+        heartbeat.register_job(
+            "cli_agent_invocation_cleanup",
+            Duration::from_secs(15 * 60),
+            move || {
+                let s = state_for_cli_cleanup.clone();
+                async move {
+                    match s.cleanup_stale_cli_agent_invocations(2).await {
+                        Ok(count) if count > 0 => {
+                            info!(count, "Auto-closed stale CLI agent invocations");
                             Ok(())
                         }
                         Ok(_) => Ok(()),

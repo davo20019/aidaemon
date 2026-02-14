@@ -3,8 +3,10 @@ mod channels;
 mod config;
 mod core;
 mod cron_utils;
+mod db;
 mod daemon;
 mod dashboard;
+mod conversation;
 #[allow(dead_code)]
 mod events;
 mod execution_policy;
@@ -12,6 +14,7 @@ mod goal_tokens;
 #[allow(dead_code)]
 mod health;
 mod heartbeat;
+mod llm_markers;
 mod mcp;
 mod memory;
 mod oauth;
@@ -25,6 +28,7 @@ mod skills;
 mod startup;
 mod state;
 mod tasks;
+mod session;
 mod token_alerts;
 mod tools;
 mod traits;

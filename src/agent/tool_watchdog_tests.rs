@@ -122,7 +122,9 @@ async fn execute_tool_watchdog_allows_fast_tool() {
     let mut harness = setup_test_agent(MockProvider::new())
         .await
         .expect("setup test harness");
-    harness.agent.llm_call_timeout = Some(Duration::from_secs(1));
+    // system_info runs multiple subprocesses; allow a bit of slack to avoid
+    // flakiness on slower/loaded machines.
+    harness.agent.llm_call_timeout = Some(Duration::from_secs(5));
 
     let result = harness
         .agent

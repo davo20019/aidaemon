@@ -220,15 +220,10 @@ pub(super) fn is_internal_maintenance_intent(user_text: &str) -> bool {
 }
 
 pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateDecision {
-    let user_lower = user_text.trim().to_ascii_lowercase();
-
     // If the user's message contains a filesystem path, the request almost
     // certainly requires tool access (terminal) — override the consultant's
     // analysis and route to the tool loop directly.
-    let user_references_path =
-        user_lower.contains('/') || user_lower.contains('\\') || user_lower.contains("~/");
-
-    if user_references_path {
+    if super::user_text_references_filesystem_path(user_text) {
         return IntentGateDecision {
             can_answer_now: Some(false),
             needs_tools: Some(true),
@@ -262,6 +257,52 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
         schedule_type: None,
         schedule_cron: None,
         domains: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod intent_routing_path_override_tests {
+    use super::*;
+
+    #[test]
+    fn infer_intent_gate_does_not_force_tools_for_urls() {
+        let d = infer_intent_gate("https://example.com/foo/bar", "");
+        assert!(
+            d.needs_tools.is_none(),
+            "expected needs_tools=None for URL, got {:?}",
+            d.needs_tools
+        );
+    }
+
+    #[test]
+    fn infer_intent_gate_does_not_force_tools_for_common_slash_shorthand() {
+        for text in ["3/4", "2/14", "yes/no", "w/o"] {
+            let d = infer_intent_gate(text, "");
+            assert!(
+                d.needs_tools.is_none(),
+                "expected needs_tools=None for '{}', got {:?}",
+                text,
+                d.needs_tools
+            );
+        }
+    }
+
+    #[test]
+    fn infer_intent_gate_forces_tools_for_unix_paths() {
+        let d = infer_intent_gate("/Users/alice/project/file.txt", "");
+        assert_eq!(d.needs_tools, Some(true));
+    }
+
+    #[test]
+    fn infer_intent_gate_forces_tools_for_tilde_paths() {
+        let d = infer_intent_gate("~/project/file.txt", "");
+        assert_eq!(d.needs_tools, Some(true));
+    }
+
+    #[test]
+    fn infer_intent_gate_forces_tools_for_windows_paths() {
+        let d = infer_intent_gate(r"C:\Users\alice\file.txt", "");
+        assert_eq!(d.needs_tools, Some(true));
     }
 }
 

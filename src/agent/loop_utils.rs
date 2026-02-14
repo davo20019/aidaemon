@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use serde_json::{json, Value};
@@ -281,6 +282,66 @@ pub(super) fn fixup_message_ordering(messages: &mut Vec<Value>) {
         }
         i += 1;
     }
+}
+
+fn tool_content_is_error_prefix(s: &str) -> bool {
+    s.starts_with("ERROR:") || s.starts_with("Error:") || s.starts_with("Failed to ")
+}
+
+/// Collapse repeated tool error payloads in the current interaction to avoid
+/// runaway context growth.
+///
+/// Strategy: for each tool name, keep only the most recent error details and
+/// replace earlier errors with a short note. A successful (non-error) tool
+/// result resets the error streak for that tool.
+pub(super) fn collapse_repeated_tool_errors(messages: &mut Vec<Value>) -> usize {
+    let Some(boundary) = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+    else {
+        return 0;
+    };
+
+    let mut collapsed = 0usize;
+    let mut last_error_idx_by_tool: HashMap<String, usize> = HashMap::new();
+
+    for idx in boundary.saturating_add(1)..messages.len() {
+        let role = messages[idx]
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        if role != "tool" {
+            continue;
+        }
+        let name = messages[idx]
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let content = messages[idx]
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        let is_error = tool_content_is_error_prefix(content);
+
+        if is_error {
+            if let Some(prev_idx) = last_error_idx_by_tool.insert(name.clone(), idx) {
+                // Keep the latest error details; earlier errors become a short note.
+                messages[prev_idx]["content"] = json!(format!(
+                    "Error: (previous {} error collapsed; see the most recent {} error for details)",
+                    name, name
+                ));
+                collapsed += 1;
+            }
+        } else {
+            last_error_idx_by_tool.remove(&name);
+        }
+    }
+
+    collapsed
 }
 
 /// Extract the "command" field from tool arguments JSON (for terminal tool).

@@ -19,7 +19,7 @@ use crate::config::{IterationLimitConfig, ModelsConfig, PolicyConfig};
 use crate::events::{
     AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
     PolicyDecisionData, SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData,
-    TaskStatus, ThinkingStartData, ToolCallData, ToolCallInfo, ToolResultData, UserMessageData,
+    TaskStatus, ThinkingStartData, ToolCallData, ToolCallInfo, ToolResultData,
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
@@ -34,6 +34,7 @@ use crate::traits::{
     ToolCapabilities, ToolRole,
 };
 use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
+use crate::llm_markers::{CONSULTANT_TEXT_ONLY_MARKER, INTENT_GATE_MARKER};
 // Re-export StatusUpdate from types for backwards compatibility
 pub use crate::types::StatusUpdate;
 
@@ -63,13 +64,10 @@ const MAX_OLD_ASSISTANT_CONTENT_CHARS: usize = 200;
 /// Window size for detecting alternating tool patterns (A-B-A-B cycles).
 const ALTERNATING_PATTERN_WINDOW: usize = 10;
 const PROGRESS_SUMMARY_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
-/// Marker for consultant mode so providers can enforce text-only behavior.
-const CONSULTANT_TEXT_ONLY_MARKER: &str = "[CONSULTANT_TEXT_ONLY_MODE]";
-/// Machine-readable intent decision line emitted by the consultant pass.
-const INTENT_GATE_MARKER: &str = "[INTENT_GATE]";
-/// Legacy fallback schedule text heuristics are disabled by default because they
-/// can misclassify "tell me about this scheduled goal" queries as new schedules.
-const ENABLE_SCHEDULE_HEURISTICS: bool = false;
+/// Legacy fallback schedule text heuristics used as a guardrail when the model
+/// omits schedule fields. These heuristics explicitly ignore "tell me about this
+/// scheduled goal" meta-queries to avoid accidental schedule creation.
+const ENABLE_SCHEDULE_HEURISTICS: bool = true;
 
 mod intent_gate;
 use intent_gate::extract_intent_gate;
@@ -112,7 +110,7 @@ mod system_prompt;
 mod tool_defs;
 mod tool_exec;
 
-use system_prompt::{build_consultant_system_prompt, format_goal_context};
+use system_prompt::{build_consultant_system_prompt, format_goal_context, ConsultantPromptStyle};
 
 #[cfg(test)]
 use system_prompt::strip_markdown_section;
@@ -507,6 +505,104 @@ fn is_resume_request(text: &str) -> bool {
         || normalized.starts_with("next step ")
 }
 
+fn user_text_references_filesystem_path(user_text: &str) -> bool {
+    // Conservative: only treat as a filesystem reference when there's strong evidence the user is
+    // pointing at a local path or a concrete filename.
+    //
+    // This intentionally avoids broad `text.contains('/')` checks which misfire on fractions/dates
+    // (e.g. "3/4", "2/14") and common shorthand like "yes/no" or "w/o".
+    if user_text.trim().is_empty() {
+        return false;
+    }
+
+    const NON_PATH_SLASH_PHRASES: &[&str] = &["yes/no", "no/yes", "and/or", "w/o", "on/off"];
+    const FILE_EXTS: &[&str] = &[
+        "rs", "py", "js", "ts", "tsx", "json", "toml", "yaml", "yml", "md", "txt", "log", "env",
+        "sql", "csv", "go", "java", "c", "cc", "cpp", "h", "hpp", "sh", "zsh", "bash",
+    ];
+    const COMMON_RELATIVE_DIRS: &[&str] = &[
+        "src", "tests", "test", "target", "crates", "apps", "packages", "scripts", "bin", "lib",
+        "include", "cmd", "internal", "docs",
+    ];
+
+    for raw in user_text.split_whitespace() {
+        let token = raw.trim_matches(|c: char| c.is_ascii_punctuation());
+        if token.is_empty() {
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+
+        // Obvious URLs are not filesystem paths.
+        if lower.contains("://") {
+            continue;
+        }
+
+        // Windows / UNC
+        if lower.starts_with("\\\\") {
+            return true;
+        }
+        if lower.len() >= 3 {
+            let bytes = lower.as_bytes();
+            let drive = bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+            let sep = bytes[2] == b'\\' || bytes[2] == b'/';
+            if drive && sep {
+                return true;
+            }
+        }
+        if lower.contains('\\') {
+            return true;
+        }
+
+        // Unix-ish absolute / relative anchors
+        if lower.starts_with("~/") || lower.starts_with("./") || lower.starts_with("../") {
+            return true;
+        }
+        if lower.starts_with('/') {
+            return true;
+        }
+
+        // Concrete filenames (no slashes required)
+        if let Some((_, ext)) = lower.rsplit_once('.') {
+            if FILE_EXTS.contains(&ext) {
+                return true;
+            }
+        }
+
+        if !lower.contains('/') {
+            continue;
+        }
+
+        // Avoid false positives: fractions/dates and a few common slash phrases.
+        if NON_PATH_SLASH_PHRASES.contains(&lower.as_str()) {
+            continue;
+        }
+        let is_simple_fraction_or_date = {
+            let parts: Vec<&str> = lower.split('/').collect();
+            (parts.len() == 2 || parts.len() == 3) && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        };
+        if is_simple_fraction_or_date {
+            continue;
+        }
+
+        // Multi-segment paths are strong evidence.
+        if lower.matches('/').count() >= 2 {
+            return true;
+        }
+
+        // One slash: treat as a path only for common repo directories, or when the token contains a dot.
+        if lower.contains('.') {
+            return true;
+        }
+        if let Some((first, _rest)) = lower.split_once('/') {
+            if COMMON_RELATIVE_DIRS.contains(&first) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn merge_intent_gate_decision(
     model_decision: Option<IntentGateDecision>,
     inferred: IntentGateDecision,
@@ -701,20 +797,7 @@ fn parse_wait_task_seconds(task_description: &str) -> Option<u64> {
 /// Check whether a session ID corresponds to a group/public channel (not a DM).
 /// Used to suppress noisy progress updates in shared channels.
 pub fn is_group_session(session_id: &str) -> bool {
-    // Discord guild channels: "discord:ch:{channel_id}" or "{bot}:discord:ch:{channel_id}"
-    if session_id.contains(":ch:") {
-        return true;
-    }
-    // Slack public/private channels: IDs start with C (public) or G (group/private).
-    // DMs start with D. Formats: "slack:C123", "slack:G123", "{bot}:slack:C123",
-    // "slack:C123:thread_ts"
-    if let Some(idx) = session_id.rfind("slack:") {
-        let after_slack = &session_id[idx + 6..];
-        if after_slack.starts_with('C') || after_slack.starts_with('G') {
-            return true;
-        }
-    }
-    false
+    crate::session::is_group_session(session_id)
 }
 
 /// Spawn a V3 task lead in the background (free function to satisfy Send requirements).
@@ -889,6 +972,7 @@ pub fn spawn_background_task_lead(
         // unblock dependent tasks that weren't dispatchable in the previous pass.
         {
             let max_dispatch_rounds = 10; // safety limit
+            let mut budget_exhausted = false;
             for _round in 0..max_dispatch_rounds {
                 let all_tasks: Vec<crate::traits::TaskV3> = state
                     .get_tasks_for_goal_v3(&goal_id)
@@ -938,6 +1022,22 @@ pub fn spawn_background_task_lead(
                 );
 
                 for task in &dispatch_batch {
+                    // Stop dispatching as soon as the goal hits its daily token budget.
+                    if let Ok(Some(g)) = state.get_goal_v3(&goal_id).await {
+                        if let Some(budget_daily) = g.budget_daily {
+                            if g.tokens_used_today >= budget_daily {
+                                budget_exhausted = true;
+                                info!(
+                                    goal_id = %goal_id,
+                                    tokens_used = g.tokens_used_today,
+                                    budget = budget_daily,
+                                    "Stopping auto-dispatch — goal daily budget exhausted"
+                                );
+                                break;
+                            }
+                        }
+                    }
+
                     // Claim the task
                     let claimed = match state
                         .claim_task_v3(&task.id, &format!("auto-dispatch-{}", goal_id))
@@ -1026,6 +1126,10 @@ pub fn spawn_background_task_lead(
                     }
                     let _ = state.update_task_v3(&updated).await;
                 }
+
+                if budget_exhausted {
+                    break;
+                }
             }
         }
 
@@ -1064,6 +1168,10 @@ pub fn spawn_background_task_lead(
                 _ => goal,
             };
 
+            let goal_budget_exhausted = updated_goal
+                .budget_daily
+                .is_some_and(|b| updated_goal.tokens_used_today >= b);
+
             // For finite goals: detect when no tasks were completed after
             // the task lead finished — fail immediately since there's no
             // re-dispatch mechanism for finite goals.
@@ -1076,6 +1184,16 @@ pub fn spawn_background_task_lead(
                 updated_goal.status = "completed".to_string();
                 updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
                 updated_goal.dispatch_failures = 0;
+            } else if goal_budget_exhausted {
+                // Budget exhausted is a safety stop, not "no progress". Keep the goal active
+                // and avoid stalling it; it can resume after budgets reset.
+                updated_goal.dispatch_failures = 0;
+                info!(
+                    goal_id = %goal_id,
+                    tokens_used = updated_goal.tokens_used_today,
+                    budget = updated_goal.budget_daily.unwrap_or(0),
+                    "Goal dispatch paused: daily token budget exhausted"
+                );
             } else if no_tasks_completed_finite {
                 // Finite goal with zero completed tasks — fail fast.
                 // This covers tasks stuck in any non-completed status:

@@ -1,4 +1,4 @@
-use super::{contains_keyword_as_words, CONSULTANT_TEXT_ONLY_MARKER, INTENT_GATE_MARKER};
+use super::{CONSULTANT_TEXT_ONLY_MARKER, INTENT_GATE_MARKER};
 
 fn is_pseudo_tool_line(line: &str) -> bool {
     let lower = line.trim().to_ascii_lowercase();
@@ -61,17 +61,11 @@ pub(super) fn looks_like_deferred_action_response(text: &str) -> bool {
         return true;
     }
 
-    // Special-case phrases that don't fit the prefix+verb pattern
-    if contains_keyword_as_words(&lower, "i would typically") {
-        return true;
-    }
-
     // Structural format markers — substring match appropriate for these patterns
     lower.contains("[consultation]")
         || lower.contains(&INTENT_GATE_MARKER.to_ascii_lowercase())
         || lower.contains("[tool_use:")
         || lower.contains("[tool_call:")
-        || lower.contains("arguments:")
 }
 
 /// Detect action-promise patterns like "I'll create", "I will run", "Let me check".
@@ -215,10 +209,32 @@ pub(super) fn sanitize_consultant_analysis(analysis: &str) -> String {
             continue;
         }
 
-        // Some models echo the consultant control instruction verbatim.
+        // Some models echo the consultant control instructions verbatim.
+        // Strip the control header and nearby instruction lines so they don't
+        // pollute the injected warm-start context for iteration 2.
         if lower_replaced.starts_with("[important:")
-            && lower_replaced.contains("you are being consulted")
-            && lower_replaced.contains("respond with text only")
+            && (lower_replaced.contains("consultation")
+                || (lower_replaced.contains("you are being consulted")
+                    && lower_replaced.contains("respond with text only")))
+        {
+            i += 1;
+            continue;
+        }
+        if lower_replaced.contains("text only")
+            && (lower_replaced.contains("no tools")
+                || lower_replaced.contains("no function calls")
+                || lower_replaced.contains("tool_use")
+                || lower_replaced.contains("functioncall"))
+        {
+            i += 1;
+            continue;
+        }
+        if lower_replaced.starts_with("end your response with")
+            || lower_replaced.starts_with("end with one line")
+            || lower_replaced == "guidelines:"
+            || lower_replaced.starts_with("- complexity:")
+            || lower_replaced.starts_with("- only include schedule")
+            || lower_replaced.starts_with("- domains is optional")
         {
             i += 1;
             continue;

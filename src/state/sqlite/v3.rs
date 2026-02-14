@@ -820,7 +820,7 @@ impl crate::traits::V3Store for SqliteStateStore {
     async fn reset_daily_token_budgets(&self) -> anyhow::Result<u64> {
         let result = sqlx::query(
             "UPDATE goals_v3 SET tokens_used_today = 0
-             WHERE goal_type = 'continuous' AND status = 'active'",
+             WHERE status = 'active'",
         )
         .execute(&self.pool)
         .await?;

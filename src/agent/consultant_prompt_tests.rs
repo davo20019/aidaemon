@@ -14,7 +14,7 @@ fn test_strip_markdown_section_removes_target_heading() {
 #[test]
 fn test_build_consultant_system_prompt_adds_marker_and_strips_tools() {
     let prompt = "## Identity\nA\n## Tool Selection Guide\nB\n## Tools\nC\n## Behavior\nD";
-    let consultant = build_consultant_system_prompt(prompt);
+    let consultant = build_consultant_system_prompt(prompt, ConsultantPromptStyle::Full);
     assert!(consultant.contains(CONSULTANT_TEXT_ONLY_MARKER));
     assert!(consultant.contains("## Identity"));
     assert!(consultant.contains("## Behavior"));
@@ -45,6 +45,20 @@ fn test_extract_intent_gate_two_line_json() {
 }
 
 #[test]
+fn test_extract_intent_gate_trailing_json_braces_in_strings() {
+    // Fallback path: no [INTENT_GATE] marker, trailing JSON in a code fence.
+    // The JSON contains a '{' inside a string, which breaks naive brace-counting.
+    let input = "Answer here.\n\n```json\n{\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":true,\"clarifying_question\":\"contains { brace\",\"missing_info\":[\"deployment_url\"],\"complexity\":\"simple\"}\n```";
+    let (cleaned, gate) = extract_intent_gate(input);
+    assert_eq!(cleaned, "Answer here.");
+    let gate = gate.expect("expected parsed intent gate");
+    assert_eq!(gate.can_answer_now, Some(false));
+    assert_eq!(gate.needs_tools, Some(true));
+    assert_eq!(gate.needs_clarification, Some(true));
+    assert_eq!(gate.missing_info, vec!["deployment_url".to_string()]);
+}
+
+#[test]
 fn test_infer_intent_gate_no_textual_fallback_inference() {
     // With lexical fallback inference disabled, missing model fields remain None.
     let gate = infer_intent_gate("check the site", "I can look it up.");
@@ -60,6 +74,23 @@ fn test_infer_intent_gate_path_still_forces_tools() {
     assert_eq!(gate.can_answer_now, Some(false));
     assert_eq!(gate.needs_tools, Some(true));
     assert_eq!(gate.needs_clarification, Some(false));
+}
+
+#[test]
+fn test_user_text_references_filesystem_path_ignores_fractions_and_shorthand() {
+    assert!(!user_text_references_filesystem_path("3/4"));
+    assert!(!user_text_references_filesystem_path("2/14"));
+    assert!(!user_text_references_filesystem_path("yes/no"));
+    assert!(!user_text_references_filesystem_path("w/o"));
+}
+
+#[test]
+fn test_user_text_references_filesystem_path_detects_common_paths_and_files() {
+    assert!(user_text_references_filesystem_path("/Users/alice/project/file.txt"));
+    assert!(user_text_references_filesystem_path("~/project/file.txt"));
+    assert!(user_text_references_filesystem_path("src/agent/main_loop.rs"));
+    assert!(user_text_references_filesystem_path("Cargo.toml"));
+    assert!(user_text_references_filesystem_path(r"C:\\Users\\alice\\file.txt"));
 }
 
 #[test]

@@ -1937,19 +1937,19 @@ impl Channel for TelegramChannel {
     }
 
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
-        let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
+        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
+            .unwrap_or_else(|| {
             self.allowed_user_ids
                 .read()
                 .unwrap()
                 .first()
                 .copied()
                 .unwrap_or(0) as i64
-        });
+            });
         let html = markdown_to_telegram_html(text);
         let plain = strip_latex(text);
         for chunk in split_message(&html, 4096) {
-            if let Err(e) =
-                send_html_or_fallback(&self.bot, ChatId(chat_id), &chunk, &plain).await
+            if let Err(e) = send_html_or_fallback(&self.bot, ChatId(chat_id), &chunk, &plain).await
             {
                 warn!("Failed to send message: {}", e);
             }
@@ -1958,14 +1958,15 @@ impl Channel for TelegramChannel {
     }
 
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
-        let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
+        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
+            .unwrap_or_else(|| {
             self.allowed_user_ids
                 .read()
                 .unwrap()
                 .first()
                 .copied()
                 .unwrap_or(0) as i64
-        });
+            });
         match &media.kind {
             MediaKind::Photo { data } => {
                 let photo = InputFile::memory(data.clone()).file_name("screenshot.png");
@@ -1999,14 +2000,15 @@ impl Channel for TelegramChannel {
         warnings: &[String],
         permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse> {
-        let chat_id: i64 = session_id.parse().unwrap_or_else(|_| {
+        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
+            .unwrap_or_else(|| {
             self.allowed_user_ids
                 .read()
                 .unwrap()
                 .first()
                 .copied()
                 .unwrap_or(0) as i64
-        });
+            });
 
         info!(session_id, command, chat_id, risk = %risk_level, mode = %permission_mode, "Approval requested");
 

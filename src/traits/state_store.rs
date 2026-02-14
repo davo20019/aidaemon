@@ -463,6 +463,17 @@ pub trait DynamicCliAgentStore: Send + Sync {
     ) -> anyhow::Result<Vec<super::CliAgentInvocation>> {
         Ok(vec![])
     }
+
+    /// Auto-close stale CLI agent invocations that never completed (e.g. crashed worker).
+    ///
+    /// Implementations should mark rows with `completed_at IS NULL` and older than
+    /// `max_age_hours` as completed with `success=false`.
+    async fn cleanup_stale_cli_agent_invocations(
+        &self,
+        _max_age_hours: i64,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
+    }
 }
 
 /// Generic key/value settings persistence.
@@ -748,7 +759,7 @@ pub trait V3Store: Send + Sync {
         Ok(vec![])
     }
 
-    /// Reset tokens_used_today to 0 for all active continuous goals.
+    /// Reset tokens_used_today to 0 for all active goals.
     async fn reset_daily_token_budgets(&self) -> anyhow::Result<u64> {
         Ok(0)
     }
@@ -756,7 +767,6 @@ pub trait V3Store: Send + Sync {
     /// Atomically add tokens to a goal's daily usage counter and return budget status.
     ///
     /// Use `delta_tokens = 0` to read the latest counters without modifying them.
-    #[allow(dead_code)] // Goal budget enforcement wiring is staged.
     async fn add_goal_tokens_and_get_budget_status(
         &self,
         _goal_id: &str,

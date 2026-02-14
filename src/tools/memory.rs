@@ -73,7 +73,8 @@ impl Tool for RememberFactTool {
         let args: RememberArgs = serde_json::from_str(arguments)?;
 
         // Reject persona/identity manipulation saves
-        let combined = format!("{} {} {}", args.category, args.key, args.value).to_ascii_lowercase();
+        let combined =
+            format!("{} {} {}", args.category, args.key, args.value).to_ascii_lowercase();
         let persona_patterns = [
             "talk like",
             "speak like",

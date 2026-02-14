@@ -148,7 +148,8 @@ async fn main() -> anyhow::Result<()> {
                             println!(
                                 "  - {} tool={:?} at={}  {}",
                                 ctx_row.get::<String, _>("role"),
-                                ctx_row.try_get::<Option<String>, _>("tool_name")
+                                ctx_row
+                                    .try_get::<Option<String>, _>("tool_name")
                                     .unwrap_or(None),
                                 ctx_row.get::<String, _>("created_at"),
                                 ctx_row
@@ -167,7 +168,8 @@ async fn main() -> anyhow::Result<()> {
                             println!(
                                 "  - {} tool={:?} at={}  {}",
                                 ctx_row.get::<String, _>("role"),
-                                ctx_row.try_get::<Option<String>, _>("tool_name")
+                                ctx_row
+                                    .try_get::<Option<String>, _>("tool_name")
                                     .unwrap_or(None),
                                 ctx_row.get::<String, _>("created_at"),
                                 ctx_row
@@ -548,8 +550,7 @@ async fn main() -> anyhow::Result<()> {
                     row.try_get::<Option<String>, _>("tool_name")
                         .unwrap_or(None),
                     row.get::<String, _>("created_at"),
-                    row.get::<String, _>("content_preview")
-                        .replace('\n', " ")
+                    row.get::<String, _>("content_preview").replace('\n', " ")
                 );
             }
         }

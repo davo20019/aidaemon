@@ -9,10 +9,10 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use crate::config::TriggersConfig;
-use crate::traits::Event;
+use crate::traits::TriggerEvent;
 
-pub type EventSender = broadcast::Sender<Event>;
-pub type EventReceiver = broadcast::Receiver<Event>;
+pub type EventSender = broadcast::Sender<TriggerEvent>;
+pub type EventReceiver = broadcast::Receiver<TriggerEvent>;
 
 /// Create a new event bus (broadcast channel).
 pub fn event_bus(capacity: usize) -> (EventSender, EventReceiver) {
@@ -39,13 +39,15 @@ impl TriggerManager {
             let folder = email_config.folder.clone();
             let sender = self.sender.clone();
 
-            tokio::spawn(async move {
+            // async-imap/async-std types are easiest to run on the async-std executor.
+            // The tokio broadcast channel is runtime-agnostic, so cross-runtime send is fine.
+            async_std::task::spawn(async move {
                 loop {
                     if let Err(e) =
                         imap_idle_loop(&host, port, &username, &password, &folder, &sender).await
                     {
                         error!("IMAP IDLE error: {}. Reconnecting in 30s...", e);
-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        async_std::task::sleep(std::time::Duration::from_secs(30)).await;
                     }
                 }
             });
@@ -114,7 +116,7 @@ async fn imap_idle_loop(
                         })
                         .unwrap_or_else(|| "unknown".to_string());
 
-                    let event = Event {
+                    let event = TriggerEvent {
                         source: "email".to_string(),
                         session_id: "email_trigger".to_string(),
                         content: format!("New email from {}: {}", from, subject),

@@ -154,7 +154,7 @@ fn test_classify_intent_scheduled_with_cron_only() {
 }
 
 #[test]
-fn test_classify_intent_recurring_without_timing_no_heuristic_schedule() {
+fn test_classify_intent_recurring_without_timing_returns_scheduled_missing_timing() {
     let mut gate = gate_with_answer(false);
     gate.complexity = Some("complex".to_string());
     gate.schedule = None;
@@ -162,7 +162,7 @@ fn test_classify_intent_recurring_without_timing_no_heuristic_schedule() {
     gate.schedule_cron = None;
     let (complexity, _) =
         classify_intent_complexity("monitor my account and post 3 times per day", &gate);
-    assert_eq!(complexity, IntentComplexity::Complex);
+    assert_eq!(complexity, IntentComplexity::ScheduledMissingTiming);
 }
 
 #[test]

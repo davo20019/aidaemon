@@ -141,72 +141,71 @@ fn try_extract_trailing_intent_json(lines: &mut Vec<String>) -> Option<IntentGat
         return None;
     }
 
-    // Scan backwards to find the opening `{`
+    // Find a parseable trailing JSON object by trying increasingly large suffixes.
+    // This avoids naive brace counting (which breaks on `{`/`}` inside JSON strings).
     let json_end = end;
-    let mut json_start = end - 1;
-    let mut brace_depth = 0i32;
-    loop {
-        for ch in lines[json_start].chars().rev() {
-            if ch == '}' {
-                brace_depth += 1;
-            } else if ch == '{' {
-                brace_depth -= 1;
+    for json_start in (0..json_end).rev() {
+        let first = lines[json_start].trim();
+        if first.is_empty() {
+            continue;
+        }
+        // Skip code-fence lines; we'll handle them when removing.
+        if first.starts_with("```") {
+            continue;
+        }
+        if !first.starts_with('{') {
+            continue;
+        }
+
+        let json_text: String = lines[json_start..json_end]
+            .iter()
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join("");
+        let Some(parsed) = parse_intent_gate_json(&json_text) else {
+            continue;
+        };
+
+        // Only strip if it contains intent gate fields.
+        if parsed.complexity.is_none()
+            && parsed.can_answer_now.is_none()
+            && parsed.needs_tools.is_none()
+        {
+            continue;
+        }
+
+        // Check for opening code fence before the JSON block.
+        let mut has_opening_fence = false;
+        let mut actual_start = json_start;
+        if json_start > 0 {
+            let prev = lines[json_start - 1].trim();
+            if prev == "```json" || prev == "```JSON" || prev == "```" {
+                has_opening_fence = true;
+                actual_start = json_start - 1;
             }
         }
-        if brace_depth == 0 {
-            break;
+
+        // Remove the JSON block (and fences if present).
+        let remove_end = if has_closing_fence {
+            fence_end
+        } else {
+            json_end
+        };
+        lines.drain(actual_start..remove_end);
+
+        // Also remove trailing empty lines that were before the JSON block.
+        while lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.pop();
         }
-        if json_start == 0 {
-            return None; // Unbalanced braces, give up
+
+        // Require code fences to match (both present or neither).
+        if has_opening_fence != has_closing_fence {
+            // Mismatched fences — still return the parsed result but don't
+            // worry about the fence mismatch (model output is imperfect).
         }
-        json_start -= 1;
+
+        return Some(parsed);
     }
 
-    // Check for opening code fence before the JSON block
-    let mut has_opening_fence = false;
-    let mut actual_start = json_start;
-    if json_start > 0 {
-        let prev = lines[json_start - 1].trim();
-        if prev == "```json" || prev == "```JSON" || prev == "```" {
-            has_opening_fence = true;
-            actual_start = json_start - 1;
-        }
-    }
-
-    // Try to parse the JSON block
-    let json_text: String = lines[json_start..json_end]
-        .iter()
-        .map(|l| l.trim())
-        .collect::<Vec<_>>()
-        .join("");
-    let parsed = parse_intent_gate_json(&json_text)?;
-
-    // Only strip if it contains intent gate fields
-    if parsed.complexity.is_none()
-        && parsed.can_answer_now.is_none()
-        && parsed.needs_tools.is_none()
-    {
-        return None;
-    }
-
-    // Remove the JSON block (and fences if present)
-    let remove_end = if has_closing_fence {
-        fence_end
-    } else {
-        json_end
-    };
-    lines.drain(actual_start..remove_end);
-
-    // Also remove trailing empty lines that were before the JSON block
-    while lines.last().is_some_and(|l| l.trim().is_empty()) {
-        lines.pop();
-    }
-
-    // Require code fences to match (both present or neither)
-    if has_opening_fence != has_closing_fence {
-        // Mismatched fences — still return the parsed result but don't
-        // worry about the fence mismatch (model output is imperfect)
-    }
-
-    Some(parsed)
+    None
 }

@@ -26,13 +26,26 @@ pub fn get_builtin_provider(name: &str) -> Option<OAuthProvider> {
             scopes: vec!["read:user".to_string(), "repo".to_string()],
             allowed_domains: vec!["api.github.com".to_string()],
         }),
+        "google" => Some(OAuthProvider {
+            name: "google".to_string(),
+            display_name: "Google (Gmail, Calendar, Tasks)".to_string(),
+            auth_type: OAuthType::OAuth2Pkce,
+            authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+            token_url: "https://oauth2.googleapis.com/token".to_string(),
+            scopes: vec![
+                "https://www.googleapis.com/auth/gmail.modify".to_string(),
+                "https://www.googleapis.com/auth/calendar".to_string(),
+                "https://www.googleapis.com/auth/tasks".to_string(),
+            ],
+            allowed_domains: vec!["googleapis.com".to_string()],
+        }),
         _ => None,
     }
 }
 
 /// List all built-in provider names.
 pub fn builtin_provider_names() -> Vec<&'static str> {
-    vec!["twitter", "github"]
+    vec!["twitter", "github", "google"]
 }
 
 #[cfg(test)]
@@ -69,9 +82,32 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_google_provider() {
+        let p = get_builtin_provider("google").unwrap();
+        assert_eq!(p.name, "google");
+        assert_eq!(p.auth_type, OAuthType::OAuth2Pkce);
+        assert!(p
+            .scopes
+            .iter()
+            .any(|s| s.contains("gmail")));
+        assert!(p
+            .scopes
+            .iter()
+            .any(|s| s.contains("calendar")));
+        assert!(p
+            .scopes
+            .iter()
+            .any(|s| s.contains("tasks")));
+        assert!(p
+            .allowed_domains
+            .contains(&"googleapis.com".to_string()));
+    }
+
+    #[test]
     fn test_builtin_provider_names() {
         let names = builtin_provider_names();
         assert!(names.contains(&"twitter"));
         assert!(names.contains(&"github"));
+        assert!(names.contains(&"google"));
     }
 }

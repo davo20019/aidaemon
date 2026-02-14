@@ -486,8 +486,15 @@ pub fn spawn_progressive_extraction(
     state: Arc<dyn StateStore>,
     user_text: String,
     assistant_response: String,
+    channel_id: Option<String>,
+    visibility: crate::types::ChannelVisibility,
 ) {
     tokio::spawn(async move {
+        // Never extract or persist memory from untrusted public platforms.
+        if matches!(visibility, crate::types::ChannelVisibility::PublicExternal) {
+            return;
+        }
+
         match extract_inline_facts(
             &provider,
             &fast_model,
@@ -499,14 +506,21 @@ pub fn spawn_progressive_extraction(
         {
             Ok(facts) if !facts.is_empty() => {
                 for fact in facts {
+                    // Progressive extraction can capture personal info; default to
+                    // conservative privacy unless explicitly promoted later.
+                    let privacy = if fact.category.trim().eq_ignore_ascii_case("user") {
+                        crate::types::FactPrivacy::Private
+                    } else {
+                        crate::types::FactPrivacy::Channel
+                    };
                     if let Err(e) = state
                         .upsert_fact(
                             &fact.category,
                             &fact.key,
                             &fact.value,
                             "progressive",
-                            None,
-                            crate::types::FactPrivacy::Global,
+                            channel_id.as_deref(),
+                            privacy,
                         )
                         .await
                     {

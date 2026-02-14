@@ -26,6 +26,14 @@ pub async fn extract_task_knowledge(
     model: String,
     task: TaskV3,
 ) -> anyhow::Result<()> {
+    // Derive channel provenance from the parent goal (tasks do not carry session_id).
+    let derived_channel_id: Option<String> = state
+        .get_goal_v3(&task.goal_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|g| crate::memory::derive_channel_id_from_session(&g.session_id));
+
     // Fetch activity log for this task
     let activities = state.get_task_activities_v3(&task.id).await?;
     if activities.is_empty() {
@@ -129,8 +137,8 @@ pub async fn extract_task_knowledge(
                 &fact.key,
                 &fact.value,
                 "v3_task_learning",
-                None,
-                FactPrivacy::Global,
+                derived_channel_id.as_deref(),
+                FactPrivacy::Channel,
             )
             .await
         {

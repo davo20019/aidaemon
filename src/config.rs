@@ -54,9 +54,19 @@ fn keychain_disabled() -> bool {
 }
 
 pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
+    // Try env var first (uppercased key name, e.g. oauth_google_access_token → OAUTH_GOOGLE_ACCESS_TOKEN).
+    // This allows .env-based credential storage for headless/remote operation.
+    let env_key = field_name.to_uppercase();
+    if let Ok(val) = std::env::var(&env_key) {
+        if !val.is_empty() {
+            return Ok(val);
+        }
+    }
+
     if keychain_disabled() {
         anyhow::bail!(
-            "Keychain disabled (AIDAEMON_NO_KEYCHAIN=1), skipping '{}'",
+            "Keychain disabled and env var '{}' not set for '{}'",
+            env_key,
             field_name
         );
     }
@@ -69,6 +79,11 @@ pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
 /// Store a secret in the OS keychain under the `aidaemon` service.
 pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
     if keychain_disabled() {
+        tracing::warn!(
+            "Keychain disabled — set env var {}={} to persist this credential",
+            field_name.to_uppercase(),
+            "[REDACTED]"
+        );
         return Ok(());
     }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
@@ -962,8 +977,9 @@ pub struct SubagentsConfig {
     /// Optional time limit per task in seconds. Default: 1800 (30 minutes).
     #[serde(default = "default_task_timeout_secs")]
     pub task_timeout_secs: Option<u64>,
-    /// Optional token budget per task. When exceeded, agent gracefully summarizes and stops.
-    #[serde(default)]
+    /// Token budget per task. When exceeded, agent gracefully summarizes and stops.
+    /// Defaults to 500,000. Set to 0 to disable (unlimited).
+    #[serde(default = "default_task_token_budget")]
     pub task_token_budget: Option<u64>,
 }
 
@@ -1000,7 +1016,7 @@ impl Default for SubagentsConfig {
             timeout_secs: default_subagents_timeout_secs(),
             iteration_limit: IterationLimitConfig::default(),
             task_timeout_secs: default_task_timeout_secs(),
-            task_token_budget: None,
+            task_token_budget: default_task_token_budget(),
         }
     }
 }
@@ -1025,6 +1041,9 @@ fn default_subagents_timeout_secs() -> u64 {
 }
 fn default_task_timeout_secs() -> Option<u64> {
     Some(1800) // 30 minutes default
+}
+fn default_task_token_budget() -> Option<u64> {
+    Some(500_000)
 }
 
 #[derive(Debug, Deserialize, Clone)]

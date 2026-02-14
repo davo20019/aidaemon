@@ -219,6 +219,55 @@ fn test_assistant_with_null_content_and_tool_calls() {
 }
 
 #[test]
+fn test_collapse_repeated_tool_errors_keeps_latest() {
+    let mut msgs = vec![
+        json!({"role": "user", "content": "do it"}),
+        json!({"role": "assistant", "content": "ok", "tool_calls": [tc("c1", "terminal")]}),
+        json!({"role": "tool", "tool_call_id": "c1", "name": "terminal", "content": "Error: first failure"}),
+        json!({"role": "assistant", "content": "retry", "tool_calls": [tc("c2", "terminal")]}),
+        json!({"role": "tool", "tool_call_id": "c2", "name": "terminal", "content": "Error: second failure"}),
+    ];
+    fixup_message_ordering(&mut msgs);
+    let collapsed = super::loop_utils::collapse_repeated_tool_errors(&mut msgs);
+    assert_eq!(collapsed, 1);
+
+    let first_tool = msgs
+        .iter()
+        .find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("c1"))
+        .unwrap();
+    let second_tool = msgs
+        .iter()
+        .find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("c2"))
+        .unwrap();
+
+    assert!(first_tool
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .contains("collapsed"));
+    assert_eq!(
+        second_tool.get("content").and_then(|v| v.as_str()),
+        Some("Error: second failure")
+    );
+}
+
+#[test]
+fn test_collapse_repeated_tool_errors_resets_after_success() {
+    let mut msgs = vec![
+        json!({"role": "user", "content": "do it"}),
+        json!({"role": "assistant", "content": "ok", "tool_calls": [tc("c1", "terminal")]}),
+        json!({"role": "tool", "tool_call_id": "c1", "name": "terminal", "content": "Error: first failure"}),
+        json!({"role": "assistant", "content": "try different", "tool_calls": [tc("c2", "terminal")]}),
+        json!({"role": "tool", "tool_call_id": "c2", "name": "terminal", "content": "ok"}),
+        json!({"role": "assistant", "content": "oops", "tool_calls": [tc("c3", "terminal")]}),
+        json!({"role": "tool", "tool_call_id": "c3", "name": "terminal", "content": "Error: second failure"}),
+    ];
+    fixup_message_ordering(&mut msgs);
+    let collapsed = super::loop_utils::collapse_repeated_tool_errors(&mut msgs);
+    assert_eq!(collapsed, 0, "success should reset the error streak");
+}
+
+#[test]
 fn test_merge_combines_tool_calls() {
     // Two consecutive assistants with different tool_calls → merge should combine.
     let mut msgs = vec![

@@ -3,13 +3,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 use crate::providers::ProviderError;
 use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
-
-const CONSULTANT_TEXT_ONLY_MARKER: &str = "[CONSULTANT_TEXT_ONLY_MODE]";
+use crate::llm_markers::CONSULTANT_TEXT_ONLY_MARKER;
 
 /// Recursively strip fields unsupported by Gemini API from a JSON value.
 /// Google Gemini rejects `$schema` and `additionalProperties` in function parameter schemas.
@@ -423,6 +422,17 @@ impl GoogleGenAiProvider {
         );
 
         let Some(candidate) = data["candidates"].get(0) else {
+            warn!(
+                model,
+                prompt_block_reason = prompt_block_reason.unwrap_or(""),
+                prompt_blocked_categories = ?prompt_blocked_categories,
+                "Gemini returned no candidates"
+            );
+            debug!(
+                model,
+                response_json = %serde_json::to_string(data).unwrap_or_else(|_| "<unserializable>".to_string()),
+                "Gemini raw response JSON (no candidates)"
+            );
             let response_note = build_gemini_response_note(
                 None,
                 prompt_block_reason,
@@ -445,7 +455,7 @@ impl GoogleGenAiProvider {
                 .get("safetyRatings")
                 .and_then(|ratings| ratings.as_array()),
         );
-        let response_note = build_gemini_response_note(
+        let mut response_note = build_gemini_response_note(
             finish_reason,
             prompt_block_reason,
             &prompt_blocked_categories,
@@ -456,6 +466,7 @@ impl GoogleGenAiProvider {
         let content_parts = candidate["content"]["parts"]
             .as_array()
             .unwrap_or(&empty_parts);
+        let content_parts_len = content_parts.len();
 
         let mut final_text = String::new();
         let mut thinking_text = String::new();
@@ -528,6 +539,37 @@ impl GoogleGenAiProvider {
                     final_text.push_str(&sources.join("\n"));
                 }
             }
+        }
+
+        // Diagnostics: Some Gemini models occasionally return a candidate with
+        // empty content parts and no tool calls. Surface this so the agent can
+        // produce a meaningful fallback and logs capture the cause.
+        let is_empty_response =
+            final_text.trim().is_empty() && thinking_text.trim().is_empty() && tool_calls.is_empty();
+        if is_empty_response {
+            let extra = format!(
+                "empty response (finishReason={}, parts={})",
+                finish_reason.unwrap_or("unknown"),
+                content_parts_len
+            );
+            response_note = Some(match response_note {
+                Some(existing) if !existing.trim().is_empty() => format!("{}; {}", existing, extra),
+                _ => extra,
+            });
+            warn!(
+                model,
+                finish_reason = finish_reason.unwrap_or(""),
+                prompt_block_reason = prompt_block_reason.unwrap_or(""),
+                prompt_blocked_categories = ?prompt_blocked_categories,
+                candidate_blocked_categories = ?candidate_blocked_categories,
+                parts = content_parts_len,
+                "Gemini returned empty response (no text/thought/tool calls)"
+            );
+            debug!(
+                model,
+                response_json = %serde_json::to_string(data).unwrap_or_else(|_| "<unserializable>".to_string()),
+                "Gemini raw response JSON (empty response)"
+            );
         }
 
         Ok(ProviderResponse {
@@ -1102,6 +1144,36 @@ mod tests {
             .expect("expected response note");
         assert!(note.contains("finish reason: SAFETY"));
         assert!(note.contains("HARM_CATEGORY_DANGEROUS_CONTENT"));
+    }
+
+    #[test]
+    fn test_parse_response_empty_parts_adds_response_note() {
+        let p = provider();
+        let gemini_response = json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": { "role": "model", "parts": [] }
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 1,
+                "candidatesTokenCount": 0
+            }
+        });
+
+        let parsed = p
+            .parse_response(&gemini_response, "gemini-2.5-flash-lite")
+            .unwrap();
+
+        assert!(parsed.content.is_none());
+        assert!(parsed.tool_calls.is_empty());
+        assert!(parsed.thinking.is_none());
+        let note = parsed
+            .response_note
+            .as_deref()
+            .expect("expected response note");
+        assert!(note.contains("empty response"));
+        assert!(note.contains("finishReason=STOP"));
+        assert!(note.contains("parts=0"));
     }
 
     #[test]

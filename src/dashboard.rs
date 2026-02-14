@@ -355,7 +355,9 @@ async fn api_sessions(
     let rows = sqlx::query_as::<_, SessionRow>(
         "SELECT session_id, MAX(created_at) as last_activity, \
          COUNT(*) as message_count, MIN(created_at) as first_message \
-         FROM messages GROUP BY session_id \
+         FROM events \
+         WHERE event_type IN ('user_message', 'assistant_response', 'tool_result') \
+         GROUP BY session_id \
          ORDER BY last_activity DESC LIMIT ?",
     )
     .bind(limit)

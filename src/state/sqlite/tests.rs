@@ -483,6 +483,32 @@ async fn test_increment_fact_recall() {
 }
 
 #[tokio::test]
+async fn test_get_relevant_facts_increments_recall() {
+    let (store, _db) = setup_test_store().await;
+
+    store
+        .upsert_fact(
+            "project",
+            "language",
+            "Rust",
+            "user",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+
+    let facts = store.get_relevant_facts("rust language", 10).await.unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].key, "language");
+
+    let updated = store.get_facts(Some("project")).await.unwrap();
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].recall_count, 1);
+    assert!(updated[0].last_recalled_at.is_some());
+}
+
+#[tokio::test]
 async fn test_fact_privacy_channel_scoped() {
     let (store, _db) = setup_test_store().await;
 
@@ -1807,6 +1833,41 @@ async fn test_cli_agent_invocation_failure() {
     let invocations = store.get_cli_agent_invocations(10).await.unwrap();
     assert_eq!(invocations[0].exit_code, Some(1));
     assert_eq!(invocations[0].success, Some(false));
+}
+
+#[tokio::test]
+async fn test_cli_agent_invocation_cleanup_stale() {
+    let (store, _db) = setup_test_store().await;
+
+    let inv_id = store
+        .log_cli_agent_start("session1", "claude", "Long running task", None)
+        .await
+        .unwrap();
+
+    // Force the invocation to look stale.
+    sqlx::query(
+        "UPDATE cli_agent_invocations SET started_at = datetime('now', '-3 hours') WHERE id = ?",
+    )
+    .bind(inv_id)
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    let count = store.cleanup_stale_cli_agent_invocations(2).await.unwrap();
+    assert_eq!(count, 1);
+
+    let invocations = store.get_cli_agent_invocations(10).await.unwrap();
+    let inv = invocations.iter().find(|i| i.id == inv_id).unwrap();
+    assert!(inv.completed_at.is_some());
+    assert_eq!(inv.success, Some(false));
+    assert!(inv
+        .output_summary
+        .as_ref()
+        .is_some_and(|s| s.contains("Auto-closed stale invocation")));
+
+    // Idempotent: second run should do nothing.
+    let count2 = store.cleanup_stale_cli_agent_invocations(2).await.unwrap();
+    assert_eq!(count2, 0);
 }
 
 // ==================== V3 Orchestration Tests ====================

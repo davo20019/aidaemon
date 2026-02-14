@@ -624,6 +624,19 @@ impl HeartbeatCoordinator {
                 continue;
             }
 
+            // Skip dispatch if the goal is already over its daily budget.
+            if let Some(budget_daily) = goal.budget_daily {
+                if goal.tokens_used_today >= budget_daily {
+                    tracing::info!(
+                        goal_id = %goal.id,
+                        tokens_used = goal.tokens_used_today,
+                        budget = budget_daily,
+                        "Skipping pending-task dispatch — goal daily budget exhausted"
+                    );
+                    continue;
+                }
+            }
+
             // Check if any tasks are still running (task lead is alive)
             let all_tasks = match self.state.get_tasks_for_goal_v3(goal_id).await {
                 Ok(t) => t,

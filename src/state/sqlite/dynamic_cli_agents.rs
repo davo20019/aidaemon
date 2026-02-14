@@ -150,4 +150,29 @@ impl crate::traits::DynamicCliAgentStore for SqliteStateStore {
         }
         Ok(invocations)
     }
+
+    async fn cleanup_stale_cli_agent_invocations(&self, max_age_hours: i64) -> anyhow::Result<u64> {
+        if max_age_hours <= 0 {
+            return Ok(0);
+        }
+        let note = format!(
+            "Auto-closed stale invocation (no completion recorded; older than {} hour(s)).",
+            max_age_hours
+        );
+        let result = sqlx::query(
+            "UPDATE cli_agent_invocations
+             SET completed_at = datetime('now'),
+                 exit_code = NULL,
+                 output_summary = ?,
+                 success = 0,
+                 duration_secs = (julianday('now') - julianday(started_at)) * 86400.0
+             WHERE completed_at IS NULL
+               AND started_at < datetime('now', '-' || ? || ' hours')",
+        )
+        .bind(note)
+        .bind(max_age_hours)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }

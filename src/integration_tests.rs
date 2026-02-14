@@ -42,6 +42,83 @@ async fn test_basic_message_response() {
 }
 
 #[tokio::test]
+async fn test_empty_llm_response_retried_then_fallback() {
+    // Script: consultant pass empty -> execution empty -> execution empty -> fallback.
+    // Assert that the retry iteration includes the empty-response nudge as a system message
+    // (not a tool message that gets dropped by message ordering fixups).
+    let provider = MockProvider::with_responses(vec![
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 20,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        ProviderResponse {
+            content: Some(String::new()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 20,
+                output_tokens: 0,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+    ]);
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Hello!",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let expected = "I wasn't able to process that request. Could you try rephrasing?";
+    assert_eq!(harness.provider.call_count().await, 3);
+    assert_eq!(response, expected);
+
+    // Verify the retry iteration included a system nudge for the LLM.
+    let calls = harness.provider.call_log.lock().await.clone();
+    assert!(calls.len() >= 3, "expected at least 3 LLM calls");
+    let retry_messages = &calls[2].messages;
+    let saw_retry_nudge = retry_messages.iter().any(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("system")
+            && m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.contains("previous reply was empty"))
+    });
+    assert!(
+        saw_retry_nudge,
+        "expected retry nudge system message on second call"
+    );
+}
+
+#[tokio::test]
 async fn test_tool_execution() {
     // Script: first call → tool call, second call → final text response
     let provider = MockProvider::with_responses(vec![
@@ -3180,6 +3257,19 @@ async fn test_public_external_no_memory() {
         )
         .await
         .unwrap();
+    // Non-personal global fact should also NOT be injected in PublicExternal
+    harness
+        .state
+        .upsert_fact(
+            "project",
+            "publicext_leak_test",
+            "ZXQ_PUBLICEXT_SHOULD_NOT_APPEAR",
+            "user",
+            None,
+            crate::types::FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
     harness
         .state
         .upsert_fact(
@@ -3241,6 +3331,10 @@ async fn test_public_external_no_memory() {
     assert!(
         !content.contains("Alice"),
         "PublicExternal should NOT have personal facts"
+    );
+    assert!(
+        !content.contains("ZXQ_PUBLICEXT_SHOULD_NOT_APPEAR"),
+        "PublicExternal should NOT have any stored facts injected"
     );
     assert!(
         !content.contains("Ship v3"),
@@ -6222,10 +6316,7 @@ async fn test_synthesized_done_persisted() {
         )
         .await
         .unwrap();
-    assert!(
-        !r2.is_empty(),
-        "Turn 2 should produce a non-empty response"
-    );
+    assert!(!r2.is_empty(), "Turn 2 should produce a non-empty response");
 
     // Verify: Turn 2's first LLM call should have >= 2 separate user messages (not merged)
     let call_log = harness.provider.call_log.lock().await;
@@ -6405,8 +6496,7 @@ async fn test_old_short_assistant_response_preserved_unmodified() {
         content
     );
     assert_eq!(
-        content,
-        "Here are 20 .rs files in the tools directory.",
+        content, "Here are 20 .rs files in the tools directory.",
         "Short old assistant content should be preserved unmodified"
     );
 }

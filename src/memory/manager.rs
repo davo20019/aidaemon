@@ -4,7 +4,7 @@ use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::scoring::calculate_episode_importance;
 use crate::traits::{BehaviorPattern, Message, ModelProvider, Person, StateStore, UserProfile};
-use crate::types::FactPrivacy;
+use crate::types::{ChannelVisibility, FactPrivacy};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
@@ -64,6 +64,17 @@ impl MemoryManager {
         self: &Arc<Self>,
         heartbeat: &mut crate::heartbeat::HeartbeatCoordinator,
     ) {
+        // Event → messages projection (every 30s)
+        // Keeps the legacy `messages` table populated for MemoryManager jobs and dashboards.
+        let mgr = self.clone();
+        heartbeat.register_job("event_projection", Duration::from_secs(30), move || {
+            let m = mgr.clone();
+            async move {
+                let _ = m.project_events_to_messages().await?;
+                Ok(())
+            }
+        });
+
         // Embedding generation (every 5s)
         let mgr = self.clone();
         heartbeat.register_job("embeddings", Duration::from_secs(5), move || {
@@ -121,7 +132,199 @@ impl MemoryManager {
         info!("Memory background tasks registered with heartbeat");
     }
 
+    async fn project_events_to_messages(&self) -> anyhow::Result<bool> {
+        let Some(ref state) = self.state else {
+            return Ok(false);
+        };
+
+        // Cursor stored in settings to avoid rescanning from the beginning.
+        const CURSOR_KEY: &str = "event_projection_last_id";
+        let last_id: i64 = state
+            .get_setting(CURSOR_KEY)
+            .await?
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        // Fetch a small batch of conversation events after the cursor.
+        let rows = match sqlx::query(
+            r#"
+            SELECT id, session_id, event_type, data, created_at
+            FROM events
+            WHERE id > ?
+              AND event_type IN ('user_message', 'assistant_response', 'tool_result')
+            ORDER BY id ASC
+            LIMIT 200
+            "#,
+        )
+        .bind(last_id)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Legacy/test DBs may not have the events table.
+                if e.to_string().contains("no such table: events") {
+                    return Ok(false);
+                }
+                return Err(e.into());
+            }
+        };
+
+        if rows.is_empty() {
+            return Ok(false);
+        }
+
+        let mut max_seen = last_id;
+        for row in rows {
+            let event_id: i64 = row.get("id");
+            let session_id: String = row.get("session_id");
+            let event_type: String = row.get("event_type");
+            let created_at: String = row.get("created_at");
+            let data_raw: String = row.get("data");
+            let data: serde_json::Value =
+                serde_json::from_str(&data_raw).unwrap_or_else(|_| serde_json::json!({}));
+
+            max_seen = max_seen.max(event_id);
+
+            // message_id is preferred; fall back to event id for robustness.
+            let message_id = data
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| event_id.to_string());
+
+            let mut role: &str = "assistant";
+            let mut content: Option<String> = None;
+            let mut tool_call_id: Option<String> = None;
+            let mut tool_name: Option<String> = None;
+            let mut tool_calls_json: Option<String> = None;
+            let mut importance: f32 = 0.5;
+
+            match event_type.as_str() {
+                "user_message" => {
+                    role = "user";
+                    content = data
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let msg = Message {
+                        id: message_id.clone(),
+                        session_id: session_id.clone(),
+                        role: role.to_string(),
+                        content: content.clone(),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.5,
+                        embedding: None,
+                    };
+                    importance = crate::memory::scoring::score_message(&msg);
+                }
+                "assistant_response" => {
+                    role = "assistant";
+                    content = data
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    // Normalize event tool calls into the same ToolCall shape used by MessageStore.
+                    tool_calls_json =
+                        data.get("tool_calls")
+                            .and_then(|v| v.as_array())
+                            .and_then(|calls| {
+                                let mapped: Vec<crate::traits::ToolCall> = calls
+                                    .iter()
+                                    .filter_map(|tc| {
+                                        let id = tc.get("id").and_then(|v| v.as_str())?;
+                                        let name = tc.get("name").and_then(|v| v.as_str())?;
+                                        Some(crate::traits::ToolCall {
+                                            id: id.to_string(),
+                                            name: name.to_string(),
+                                            arguments: tc
+                                                .get("arguments")
+                                                .cloned()
+                                                .unwrap_or_else(|| serde_json::json!({}))
+                                                .to_string(),
+                                            extra_content: tc.get("extra_content").cloned(),
+                                        })
+                                    })
+                                    .collect();
+                                if mapped.is_empty() {
+                                    None
+                                } else {
+                                    serde_json::to_string(&mapped).ok()
+                                }
+                            });
+                }
+                "tool_result" => {
+                    role = "tool";
+                    content = data
+                        .get("result")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    tool_call_id = data
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| Some(format!("event-tool-{}", event_id)));
+                    tool_name = data
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    importance = 0.3;
+                }
+                _ => {}
+            }
+
+            // Insert/update message projection row. Best-effort.
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO messages
+                    (id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance)
+                VALUES
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    role = excluded.role,
+                    content = excluded.content,
+                    tool_call_id = excluded.tool_call_id,
+                    tool_name = excluded.tool_name,
+                    tool_calls_json = excluded.tool_calls_json,
+                    created_at = excluded.created_at,
+                    importance = excluded.importance
+                "#,
+            )
+            .bind(&message_id)
+            .bind(&session_id)
+            .bind(role)
+            .bind(&content)
+            .bind(&tool_call_id)
+            .bind(&tool_name)
+            .bind(&tool_calls_json)
+            .bind(&created_at)
+            .bind(importance)
+            .execute(&self.pool)
+            .await;
+        }
+
+        // Advance cursor after processing the batch.
+        let _ = state.set_setting(CURSOR_KEY, &max_seen.to_string()).await;
+
+        Ok(true)
+    }
+
     async fn process_embeddings(&self) -> anyhow::Result<bool> {
+        let mut did_work = false;
+        did_work |= self.process_message_embeddings().await?;
+        did_work |= self.process_procedure_embeddings().await?;
+        did_work |= self.process_error_solution_embeddings().await?;
+        Ok(did_work)
+    }
+
+    async fn process_message_embeddings(&self) -> anyhow::Result<bool> {
         // Fetch messages without embeddings AND without errors
         // LIMIT 10 to check incrementally.
         let rows = sqlx::query(
@@ -169,6 +372,124 @@ impl MemoryManager {
         Ok(true)
     }
 
+    async fn process_procedure_embeddings(&self) -> anyhow::Result<bool> {
+        let rows = sqlx::query(
+            "SELECT id, trigger_pattern FROM procedures WHERE trigger_embedding IS NULL AND trigger_pattern IS NOT NULL LIMIT 10",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(false);
+        }
+
+        info!(
+            "Generating trigger embeddings for {} procedures",
+            rows.len()
+        );
+        for row in rows {
+            let id: i64 = row.get("id");
+            let trigger: String = row.get("trigger_pattern");
+            let trigger = trigger.trim();
+            if trigger.is_empty() {
+                continue;
+            }
+            match self.embedding_service.embed(trigger.to_string()).await {
+                Ok(embedding) => {
+                    let blob = encode_embedding(&embedding);
+                    let _ = sqlx::query("UPDATE procedures SET trigger_embedding = ? WHERE id = ?")
+                        .bind(blob)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await;
+                }
+                Err(e) => {
+                    warn!(
+                        procedure_id = id,
+                        error = %e,
+                        "Failed to generate trigger embedding for procedure"
+                    );
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    async fn process_error_solution_embeddings(&self) -> anyhow::Result<bool> {
+        let rows = sqlx::query(
+            "SELECT id, error_pattern FROM error_solutions WHERE error_embedding IS NULL AND error_pattern IS NOT NULL LIMIT 10",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(false);
+        }
+
+        info!("Generating embeddings for {} error solutions", rows.len());
+        for row in rows {
+            let id: i64 = row.get("id");
+            let pat: String = row.get("error_pattern");
+            let pat = pat.trim();
+            if pat.is_empty() {
+                continue;
+            }
+            match self.embedding_service.embed(pat.to_string()).await {
+                Ok(embedding) => {
+                    let blob = encode_embedding(&embedding);
+                    let _ =
+                        sqlx::query("UPDATE error_solutions SET error_embedding = ? WHERE id = ?")
+                            .bind(blob)
+                            .bind(id)
+                            .execute(&self.pool)
+                            .await;
+                }
+                Err(e) => {
+                    warn!(
+                        error_solution_id = id,
+                        error = %e,
+                        "Failed to generate embedding for error solution"
+                    );
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    async fn session_visibility_from_events(&self, session_id: &str) -> Option<ChannelVisibility> {
+        let row = sqlx::query(
+            r#"
+            SELECT data
+            FROM events
+            WHERE session_id = ?
+              AND event_type = 'user_message'
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await;
+
+        let row = match row {
+            Ok(r) => r,
+            Err(e) => {
+                if e.to_string().contains("no such table: events") {
+                    return None;
+                }
+                warn!(session_id, error = %e, "Failed to fetch session visibility from events");
+                return None;
+            }
+        }?;
+
+        let raw: String = row.get("data");
+        let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let vis = val.get("channel_visibility").and_then(|v| v.as_str())?;
+        Some(ChannelVisibility::from_str_lossy(vis))
+    }
+
     async fn consolidate_memories(&self) -> anyhow::Result<()> {
         // Find unconsolidated high-importance messages older than 1 hour, grouped by session
         let one_hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
@@ -214,6 +535,11 @@ impl MemoryManager {
             sessions.len()
         );
 
+        // PublicExternal sessions are untrusted: do not learn durable facts from them.
+        // (Progressive extraction is already disabled; this closes the consolidation path.)
+        let mut skipped_public_external: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         let system_prompt = "You are a memory consolidation system. Given a conversation excerpt, \
             extract durable facts worth remembering long-term. Output ONLY a JSON array: \
             [{\"category\": \"...\", \"key\": \"...\", \"value\": \"...\", \"privacy\": \"...\"}]. \
@@ -245,6 +571,27 @@ impl MemoryManager {
             Only extract facts useful in future conversations. If nothing worth remembering, return [].";
 
         for (session_id, messages) in &sessions {
+            if self
+                .session_visibility_from_events(session_id)
+                .await
+                .is_some_and(|v| v == ChannelVisibility::PublicExternal)
+            {
+                skipped_public_external.insert(session_id.clone());
+                let now = chrono::Utc::now().to_rfc3339();
+                for (id, _role, _content) in messages {
+                    let _ = sqlx::query("UPDATE messages SET consolidated_at = ? WHERE id = ?")
+                        .bind(&now)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await;
+                }
+                info!(
+                    session_id = session_id.as_str(),
+                    "Skipping memory fact consolidation for PublicExternal session"
+                );
+                continue;
+            }
+
             // Build conversation text for this session batch
             let conversation: String = messages
                 .iter()
@@ -273,7 +620,8 @@ impl MemoryManager {
                     if let Some(text) = &response.content {
                         match parse_consolidation_response(text) {
                             Ok(facts) => {
-                                let ch_id = derive_channel_id_from_session(session_id);
+                                let ch_id =
+                                    crate::memory::derive_channel_id_from_session(session_id);
                                 for fact in &facts {
                                     // Route "people" facts to the person_facts table
                                     if fact.category == "people" {
@@ -348,7 +696,11 @@ impl MemoryManager {
         // After fact extraction, run event-based extraction (procedures, errors, expertise)
         // via the Consolidator. This unifies both pipelines into a single cycle.
         if let Some(ref consolidator) = self.consolidator {
-            let session_ids: Vec<String> = sessions.keys().cloned().collect();
+            let session_ids: Vec<String> = sessions
+                .keys()
+                .filter(|sid| !skipped_public_external.contains(*sid))
+                .cloned()
+                .collect();
             for session_id in &session_ids {
                 if let Err(e) = consolidator.consolidate_session(session_id).await {
                     warn!(
@@ -1498,30 +1850,6 @@ struct ExtractedFact {
 ///   - "slack:CHANNEL_ID:thread_ts" or "slack:CHANNEL_ID"
 ///   - "bot:telegram:CHAT_ID" or "telegram:CHAT_ID" or just "CHAT_ID"
 ///   - "discord:ch:ID" or "discord:dm:ID"
-fn derive_channel_id_from_session(session_id: &str) -> Option<String> {
-    if session_id.starts_with("slack:") {
-        // "slack:C12345" or "slack:C12345:ts123" → "slack:C12345"
-        let parts: Vec<&str> = session_id.splitn(3, ':').collect();
-        if parts.len() >= 2 {
-            return Some(format!("slack:{}", parts[1]));
-        }
-    }
-    if session_id.starts_with("discord:") {
-        // "discord:ch:123" or "discord:dm:456" → keep as-is
-        return Some(session_id.to_string());
-    }
-    // Telegram patterns: "bot:telegram:CHAT_ID", "bot:CHAT_ID", "telegram:CHAT_ID", or just numeric
-    let stripped = session_id.strip_prefix("bot:").unwrap_or(session_id);
-    if stripped.starts_with("telegram:") {
-        return Some(stripped.to_string());
-    }
-    // Bare numeric chat ID → assume telegram
-    if stripped.chars().all(|c| c.is_ascii_digit() || c == '-') && !stripped.is_empty() {
-        return Some(format!("telegram:{}", stripped));
-    }
-    None
-}
-
 #[derive(Debug, Deserialize)]
 struct SessionAnalysis {
     summary: String,
@@ -1553,4 +1881,116 @@ fn parse_consolidation_response(text: &str) -> anyhow::Result<Vec<ExtractedFact>
 
     let facts: Vec<ExtractedFact> = serde_json::from_str(json_str)?;
     Ok(facts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use crate::testing::MockProvider;
+    use crate::traits::store_prelude::*;
+    use chrono::Utc;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_consolidation_skips_public_external_sessions() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let store = SqliteStateStore::new(
+            db_file.path().to_str().unwrap(),
+            100,
+            None,
+            embedding_service.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Ensure events table exists for visibility lookup.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                consolidated_at TEXT,
+                task_id TEXT,
+                tool_name TEXT
+            )
+            "#,
+        )
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        let session_id = "pubext_session_consolidation";
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        let msg = Message {
+            id: msg_id.clone(),
+            session_id: session_id.to_string(),
+            role: "user".to_string(),
+            content: Some("hello world".to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: Utc::now() - chrono::Duration::hours(2),
+            importance: 0.9,
+            embedding: None,
+        };
+        store.append_message(&msg).await.unwrap();
+
+        // Mark the session as PublicExternal via the latest user_message event metadata.
+        let data = serde_json::json!({
+            "content": "hello world",
+            "message_id": msg_id,
+            "has_attachments": false,
+            "channel_visibility": "public_external",
+            "channel_id": "twitter:ext_999",
+            "platform": "twitter",
+        });
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind("user_message")
+        .bind(data.to_string())
+        .bind((Utc::now() - chrono::Duration::hours(2)).to_rfc3339())
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        let provider = Arc::new(MockProvider::new());
+        let mgr = MemoryManager::new(
+            store.pool(),
+            embedding_service,
+            provider.clone(),
+            "mock".to_string(),
+            Duration::from_secs(60),
+            None,
+        );
+
+        mgr.consolidate_memories().await.unwrap();
+
+        // Provider should not be called for PublicExternal sessions.
+        assert_eq!(provider.call_count().await, 0);
+
+        // Message should be marked consolidated to avoid repeated attempts.
+        let row = sqlx::query("SELECT consolidated_at FROM messages WHERE id = ?")
+            .bind(&msg_id)
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+        let consolidated_at: Option<String> = row.get("consolidated_at");
+        assert!(consolidated_at.is_some());
+
+        // No facts should be learned.
+        let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM facts")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+        assert_eq!(cnt, 0);
+    }
 }

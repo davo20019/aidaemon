@@ -50,6 +50,24 @@ impl Agent {
             .await
     }
 
+    /// Graceful response when a goal hits its daily token budget.
+    pub(super) async fn graceful_goal_daily_budget_response(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        session_id: &str,
+        learning_ctx: &LearningContext,
+        tokens_used_today: i64,
+        budget_daily: i64,
+    ) -> anyhow::Result<String> {
+        let summary = post_task::graceful_goal_daily_budget_response(
+            learning_ctx,
+            tokens_used_today,
+            budget_daily,
+        );
+        self.append_graceful_assistant_summary(emitter, session_id, summary)
+            .await
+    }
+
     fn dedupe_alert_sessions(sessions: Vec<String>) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();

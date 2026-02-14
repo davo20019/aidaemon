@@ -197,9 +197,9 @@ impl TaskRegistry {
         // Dedup: skip if an identical message is already in the queue and was queued
         // within the last 30 seconds. This prevents duplicate processing when a client
         // sends the same message multiple times in rapid succession.
-        let is_duplicate = queue.iter().any(|m| {
-            m.text == text && (Utc::now() - m.queued_at).num_seconds() < 30
-        });
+        let is_duplicate = queue
+            .iter()
+            .any(|m| m.text == text && (Utc::now() - m.queued_at).num_seconds() < 30);
         if is_duplicate {
             return None;
         }

@@ -120,6 +120,10 @@ fn parse_owner_ids(config: &AppConfig, platform: &str) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+fn parse_u64_ids(ids: &[String]) -> Vec<u64> {
+    ids.iter().filter_map(|s| s.parse::<u64>().ok()).collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_channels(
     config: &AppConfig,
@@ -132,76 +136,106 @@ pub async fn build_channels(
     watchdog_stale_threshold_secs: u64,
 ) -> ChannelBundle {
     let telegram_owner_ids = parse_owner_ids(config, "telegram");
+    let inbox_dir = PathBuf::from(inbox_dir);
+    let files_enabled = config.files.enabled;
+    let max_file_size_mb = config.files.max_file_size_mb;
+
+    let make_telegram = |bot_token: &str, allowed_user_ids: Vec<u64>| -> Arc<TelegramChannel> {
+        Arc::new(TelegramChannel::new(
+            bot_token,
+            allowed_user_ids,
+            telegram_owner_ids.clone(),
+            Arc::clone(&agent),
+            config_path.clone(),
+            session_map.clone(),
+            task_registry.clone(),
+            files_enabled,
+            inbox_dir.clone(),
+            max_file_size_mb,
+            state.clone(),
+            watchdog_stale_threshold_secs,
+        ))
+    };
 
     let telegram_bots: Vec<Arc<TelegramChannel>> = config
         .all_telegram_bots()
         .into_iter()
         .map(|bot_config| {
             info!("Registering Telegram bot (username will be fetched from API)");
-            Arc::new(TelegramChannel::new(
-                &bot_config.bot_token,
-                bot_config.allowed_user_ids.clone(),
-                telegram_owner_ids.clone(),
-                Arc::clone(&agent),
-                config_path.clone(),
-                session_map.clone(),
-                task_registry.clone(),
-                config.files.enabled,
-                PathBuf::from(inbox_dir),
-                config.files.max_file_size_mb,
-                state.clone(),
-                watchdog_stale_threshold_secs,
-            ))
+            make_telegram(&bot_config.bot_token, bot_config.allowed_user_ids.clone())
         })
         .collect();
 
     #[cfg(feature = "discord")]
     let discord_owner_ids = parse_owner_ids(config, "discord");
     #[cfg(feature = "discord")]
+    let make_discord =
+        |bot_token: &str, allowed_user_ids: Vec<u64>, guild_id: Option<u64>| -> Arc<DiscordChannel> {
+            Arc::new(DiscordChannel::new(
+                bot_token,
+                allowed_user_ids,
+                discord_owner_ids.clone(),
+                guild_id,
+                Arc::clone(&agent),
+                config_path.clone(),
+                session_map.clone(),
+                task_registry.clone(),
+                files_enabled,
+                inbox_dir.clone(),
+                max_file_size_mb,
+                state.clone(),
+                watchdog_stale_threshold_secs,
+            ))
+        };
+    #[cfg(feature = "discord")]
     let discord_bots: Vec<Arc<DiscordChannel>> = config
         .all_discord_bots()
         .into_iter()
         .map(|bot_config| {
             info!("Registering Discord bot (username will be fetched from API)");
-            Arc::new(DiscordChannel::new(
+            make_discord(
                 &bot_config.bot_token,
                 bot_config.allowed_user_ids.clone(),
-                discord_owner_ids.clone(),
                 bot_config.guild_id,
+            )
+        })
+        .collect();
+
+    #[cfg(feature = "slack")]
+    let make_slack =
+        |app_token: &str,
+         bot_token: &str,
+         allowed_user_ids: Vec<String>,
+         use_threads: bool|
+         -> Arc<SlackChannel> {
+            Arc::new(SlackChannel::new(
+                app_token,
+                bot_token,
+                allowed_user_ids,
+                use_threads,
                 Arc::clone(&agent),
                 config_path.clone(),
                 session_map.clone(),
                 task_registry.clone(),
-                config.files.enabled,
-                PathBuf::from(inbox_dir),
-                config.files.max_file_size_mb,
+                files_enabled,
+                inbox_dir.clone(),
+                max_file_size_mb,
                 state.clone(),
                 watchdog_stale_threshold_secs,
             ))
-        })
-        .collect();
-
+        };
     #[cfg(feature = "slack")]
     let slack_bots: Vec<Arc<SlackChannel>> = config
         .all_slack_bots()
         .into_iter()
         .map(|bot_config| {
             info!("Registering Slack bot (bot name will be fetched from API)");
-            Arc::new(SlackChannel::new(
+            make_slack(
                 &bot_config.app_token,
                 &bot_config.bot_token,
                 bot_config.allowed_user_ids.clone(),
                 bot_config.use_threads,
-                Arc::clone(&agent),
-                config_path.clone(),
-                session_map.clone(),
-                task_registry.clone(),
-                config.files.enabled,
-                PathBuf::from(inbox_dir),
-                config.files.max_file_size_mb,
-                state.clone(),
-                watchdog_stale_threshold_secs,
-            ))
+            )
         })
         .collect();
 
@@ -216,53 +250,18 @@ pub async fn build_channels(
             for bot in bots {
                 match bot.channel_type.as_str() {
                     "telegram" => {
-                        let allowed_user_ids: Vec<u64> = bot
-                            .allowed_user_ids
-                            .iter()
-                            .filter_map(|s| s.parse::<u64>().ok())
-                            .collect();
+                        let allowed_user_ids: Vec<u64> = parse_u64_ids(&bot.allowed_user_ids);
                         info!(bot_id = bot.id, "Loading dynamic Telegram bot");
-                        dynamic_telegram_bots.push(Arc::new(TelegramChannel::new(
-                            &bot.bot_token,
-                            allowed_user_ids,
-                            telegram_owner_ids.clone(),
-                            Arc::clone(&agent),
-                            config_path.clone(),
-                            session_map.clone(),
-                            task_registry.clone(),
-                            config.files.enabled,
-                            PathBuf::from(inbox_dir),
-                            config.files.max_file_size_mb,
-                            state.clone(),
-                            watchdog_stale_threshold_secs,
-                        )));
+                        dynamic_telegram_bots.push(make_telegram(&bot.bot_token, allowed_user_ids));
                     }
                     #[cfg(feature = "discord")]
                     "discord" => {
-                        let allowed_user_ids: Vec<u64> = bot
-                            .allowed_user_ids
-                            .iter()
-                            .filter_map(|s| s.parse::<u64>().ok())
-                            .collect();
+                        let allowed_user_ids: Vec<u64> = parse_u64_ids(&bot.allowed_user_ids);
                         let extra: serde_json::Value =
                             serde_json::from_str(&bot.extra_config).unwrap_or_default();
                         let guild_id = extra["guild_id"].as_u64();
                         info!(bot_id = bot.id, "Loading dynamic Discord bot");
-                        dynamic_discord_bots.push(Arc::new(DiscordChannel::new(
-                            &bot.bot_token,
-                            allowed_user_ids,
-                            discord_owner_ids.clone(),
-                            guild_id,
-                            Arc::clone(&agent),
-                            config_path.clone(),
-                            session_map.clone(),
-                            task_registry.clone(),
-                            config.files.enabled,
-                            PathBuf::from(inbox_dir),
-                            config.files.max_file_size_mb,
-                            state.clone(),
-                            watchdog_stale_threshold_secs,
-                        )));
+                        dynamic_discord_bots.push(make_discord(&bot.bot_token, allowed_user_ids, guild_id));
                     }
                     #[cfg(not(feature = "discord"))]
                     "discord" => {
@@ -278,21 +277,12 @@ pub async fn build_channels(
                                 serde_json::from_str(&bot.extra_config).unwrap_or_default();
                             let use_threads = extra["use_threads"].as_bool().unwrap_or(false);
                             info!(bot_id = bot.id, "Loading dynamic Slack bot");
-                            dynamic_slack_bots.push(Arc::new(SlackChannel::new(
+                            dynamic_slack_bots.push(make_slack(
                                 app_token,
                                 &bot.bot_token,
                                 bot.allowed_user_ids.clone(),
                                 use_threads,
-                                Arc::clone(&agent),
-                                config_path.clone(),
-                                session_map.clone(),
-                                task_registry.clone(),
-                                config.files.enabled,
-                                PathBuf::from(inbox_dir),
-                                config.files.max_file_size_mb,
-                                state.clone(),
-                                watchdog_stale_threshold_secs,
-                            )));
+                            ));
                         }
                     }
                     #[cfg(not(feature = "slack"))]

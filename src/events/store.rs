@@ -12,7 +12,7 @@ use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
 
 use super::{Event, EventType, PolicyDecisionData, TaskEndData, TaskStatus};
-use crate::traits::{Message, ToolCall};
+use crate::traits::Message;
 
 /// The event store backed by SQLite.
 pub struct EventStore {
@@ -190,59 +190,7 @@ impl EventStore {
 
     /// Run database migrations for the events table
     async fn migrate(&self) -> anyhow::Result<()> {
-        // Create events table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                data TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                consolidated_at TEXT,
-                task_id TEXT,
-                tool_name TEXT
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Create indexes for efficient queries
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_events_session_time
-             ON events(session_id, created_at DESC)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)")
-            .execute(&self.pool)
-            .await?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_events_task
-             ON events(task_id) WHERE task_id IS NOT NULL",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_events_consolidation
-             ON events(consolidated_at) WHERE consolidated_at IS NULL",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_events_prune
-             ON events(created_at) WHERE consolidated_at IS NOT NULL",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        info!("Events table migration complete");
-        Ok(())
+        crate::db::migrations::migrate_events(&self.pool).await
     }
 
     // =========================================================================
@@ -575,126 +523,22 @@ impl EventStore {
             )
             .await?;
 
-        // Convert events to Message format (for backwards compatibility)
+        // Convert events to Message format (for backwards compatibility).
+        // Reverse to chronological (query returns newest-first).
         let mut messages = Vec::new();
         for event in events.into_iter().rev() {
-            // Reverse to chronological
-            match event.event_type {
-                EventType::UserMessage => {
-                    if let Ok(data) = event.parse_data::<super::UserMessageData>() {
-                        let message_id = data
-                            .message_id
-                            .clone()
-                            .unwrap_or_else(|| event.id.to_string());
-                        messages.push(Message {
-                            id: message_id,
-                            session_id: event.session_id.clone(),
-                            role: "user".to_string(),
-                            content: Some(data.content),
-                            tool_call_id: None,
-                            tool_name: None,
-                            tool_calls_json: None,
-                            created_at: event.created_at,
-                            importance: 0.5,
-                            embedding: None,
-                        });
-                    }
-                }
-                EventType::AssistantResponse => {
-                    if let Ok(data) = event.parse_data::<super::AssistantResponseData>() {
-                        let message_id = data
-                            .message_id
-                            .clone()
-                            .unwrap_or_else(|| event.id.to_string());
-                        let tool_calls_json = data.tool_calls.as_ref().map(|calls| {
-                            let tool_calls: Vec<ToolCall> = calls
-                                .iter()
-                                .map(|tc| ToolCall {
-                                    id: tc.id.clone(),
-                                    name: tc.name.clone(),
-                                    arguments: tc.arguments.to_string(),
-                                    extra_content: tc.extra_content.clone(),
-                                })
-                                .collect();
-                            serde_json::to_string(&tool_calls).unwrap_or_default()
-                        });
-
-                        messages.push(Message {
-                            id: message_id,
-                            session_id: event.session_id.clone(),
-                            role: "assistant".to_string(),
-                            content: data.content,
-                            tool_call_id: None,
-                            tool_name: None,
-                            tool_calls_json,
-                            created_at: event.created_at,
-                            importance: 0.5,
-                            embedding: None,
-                        });
-                    }
-                }
-                EventType::ToolResult => {
-                    if let Ok(data) = event.parse_data::<super::ToolResultData>() {
-                        let message_id = data
-                            .message_id
-                            .clone()
-                            .unwrap_or_else(|| event.id.to_string());
-                        messages.push(Message {
-                            id: message_id,
-                            session_id: event.session_id.clone(),
-                            role: "tool".to_string(),
-                            content: Some(data.result),
-                            tool_call_id: Some(data.tool_call_id),
-                            tool_name: Some(data.name),
-                            tool_calls_json: None,
-                            created_at: event.created_at,
-                            importance: 0.5,
-                            embedding: None,
-                        });
-                    }
-                }
-                _ => {}
+            if let Some(msg) = crate::conversation::message_from_event(
+                event.id,
+                &event.session_id,
+                event.event_type.as_str(),
+                &event.data,
+                event.created_at,
+            ) {
+                messages.push(msg);
             }
         }
 
-        // Apply limit - keep only the last `limit` messages
-        // IMPORTANT: Always preserve the first user message (anchor) to satisfy
-        // provider ordering requirements (Gemini requires assistant+tool calls
-        // to follow a user message)
-        if messages.len() > limit {
-            // Find the first user message (anchor)
-            let anchor_idx = messages.iter().position(|m| m.role == "user");
-
-            if let Some(anchor) = anchor_idx {
-                // Keep the anchor + last (limit - 1) messages
-                let skip_count = messages.len() - limit;
-
-                if skip_count > anchor {
-                    // We would skip past the anchor - preserve it
-                    let anchor_msg = messages[anchor].clone();
-                    let remaining: Vec<_> = messages.into_iter().skip(skip_count).collect();
-
-                    // Only prepend anchor if it's not already in remaining
-                    if remaining.first().map(|m| m.role.as_str()) != Some("user") {
-                        let mut result = vec![anchor_msg];
-                        // Take limit - 1 from remaining to stay within limit
-                        result.extend(remaining.into_iter().take(limit - 1));
-                        messages = result;
-                    } else {
-                        messages = remaining;
-                    }
-                } else {
-                    // Normal case - anchor is within the kept range
-                    messages = messages.into_iter().skip(skip_count).collect();
-                }
-            } else {
-                // No user message found - just truncate normally
-                let skip_count = messages.len() - limit;
-                messages = messages.into_iter().skip(skip_count).collect();
-            }
-        }
-
-        Ok(messages)
+        Ok(crate::conversation::truncate_with_anchor(messages, limit))
     }
 
     // =========================================================================

@@ -308,6 +308,10 @@ pub(super) fn is_short_user_correction(text: &str) -> bool {
         " try again",
         " proceed",
         " go ahead",
+        " check ",
+        " verify ",
+        " look it up",
+        " look this up",
     ];
     if request_phrases.iter().any(|p| lower.contains(p)) {
         return false;

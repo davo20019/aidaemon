@@ -90,17 +90,16 @@ impl Agent {
         let mut user_msg = user_msg;
         user_msg.importance = score;
 
-        self.append_user_message_with_event(&emitter, &user_msg, false)
+        self.append_user_message_with_event(&emitter, &user_msg, &channel_ctx, false)
             .await?;
 
-        // Detect stop/cancel commands and automatically cancel running cli_agents
-        let lower = user_text.to_lowercase();
-        let is_stop_command = lower == "stop"
-            || lower == "cancel"
-            || lower == "abort"
-            || lower.starts_with("stop ")
-            || lower.starts_with("cancel ");
+        // Detect stop/cancel/abort commands and automatically cancel running cli_agents.
+        // Conservative: exact match only (no prefix matching), and only short-circuit
+        // when there is actually something to cancel.
+        let lower_trimmed = user_text.trim().to_ascii_lowercase();
+        let is_stop_command = matches!(lower_trimmed.as_str(), "stop" | "cancel" | "abort");
         if is_stop_command {
+            let early_task_start = Instant::now();
             // Cancel all running cli_agents for this session
             let cancel_result = self
                 .execute_tool_with_watchdog(
@@ -121,6 +120,41 @@ impl Agent {
                         session_id,
                         "Auto-cancelled cli_agents on stop command: {}", msg
                     );
+                    // Short-circuit: user requested cancel/stop and there were active agents.
+                    let reply = msg;
+                    let assistant_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "assistant".to_string(),
+                        content: Some(reply.clone()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.5,
+                        embedding: None,
+                    };
+                    self.append_assistant_message_with_event(
+                        &emitter,
+                        &assistant_msg,
+                        "system",
+                        None,
+                        None,
+                    )
+                    .await?;
+
+                    self.emit_task_end(
+                        &emitter,
+                        &task_id,
+                        TaskStatus::Completed,
+                        early_task_start,
+                        0,
+                        0,
+                        None,
+                        Some(reply.chars().take(200).collect()),
+                    )
+                    .await;
+                    return Ok(reply);
                 }
             }
         }
@@ -267,6 +301,158 @@ impl Agent {
                         let _ = self.state.update_goal_v3(&updated).await;
                     }
                 }
+            }
+        }
+
+        // Cheap local acknowledgment shortcut: avoid an LLM call for trivial turns like
+        // "thanks" or a single emoji reaction. Keep this conservative to avoid eating
+        // genuine requests.
+        if self.depth == 0 {
+            let trimmed = user_text.trim();
+            let normalized = trimmed
+                .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+                .to_ascii_lowercase();
+            let is_thanks = matches!(normalized.as_str(), "thanks" | "thank you" | "thx");
+            let is_ok = matches!(normalized.as_str(), "ok" | "okay");
+            let is_single_emoji_reaction = {
+                let char_count = trimmed.chars().count();
+                char_count > 0
+                    && char_count <= 4
+                    && trimmed.chars().any(|c| !c.is_ascii())
+                    && trimmed
+                        .chars()
+                        .all(|c| !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace())
+            };
+
+            // If the previous assistant turn ended with a question, treat "ok/okay" as non-terminal
+            // and let the LLM re-ask for missing info rather than replying "Got it.".
+            let ok_is_safe_to_short_circuit = if is_ok {
+                let history = self.state.get_history(session_id, 12).await.unwrap_or_default();
+                let last_assistant = history.iter().rev().find(|m| m.role == "assistant");
+                !last_assistant
+                    .and_then(|m| m.content.as_deref())
+                    .is_some_and(|c| c.contains('?'))
+            } else {
+                true
+            };
+
+            let trivial_reply = if is_thanks {
+                Some("You're welcome.".to_string())
+            } else if is_single_emoji_reaction {
+                Some("Got it.".to_string())
+            } else if is_ok && ok_is_safe_to_short_circuit {
+                Some("Got it.".to_string())
+            } else {
+                None
+            };
+
+            if let Some(reply) = trivial_reply {
+                let early_task_start = Instant::now();
+                let assistant_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "assistant".to_string(),
+                    content: Some(reply.clone()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.5,
+                    embedding: None,
+                };
+                self.append_assistant_message_with_event(
+                    &emitter,
+                    &assistant_msg,
+                    "system",
+                    None,
+                    None,
+                )
+                .await?;
+
+                self.emit_task_end(
+                    &emitter,
+                    &task_id,
+                    TaskStatus::Completed,
+                    early_task_start,
+                    0,
+                    0,
+                    None,
+                    Some(reply.chars().take(200).collect()),
+                )
+                .await;
+                return Ok(reply);
+            }
+        }
+
+        // Cheap local time shortcut: avoid an LLM call for "what time is it?" style requests.
+        // Keep this strict (exact-match after normalization) so we don't mis-handle timezone
+        // or location-specific queries (e.g., "what time is it in Tokyo?").
+        if self.depth == 0 {
+            let trimmed = user_text.trim();
+            let normalized = trimmed
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c.is_whitespace() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        ' '
+                    }
+                })
+                .collect::<String>();
+            let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+            let is_time_query = matches!(
+                normalized.as_str(),
+                "what time is it"
+                    | "what time is it now"
+                    | "what time is it right now"
+                    | "what is the time"
+                    | "what s the time"
+                    | "whats the time"
+                    | "current time"
+                    | "time now"
+                    | "time"
+            );
+            if is_time_query {
+                let now = chrono::Local::now();
+                let reply = format!(
+                    "It is {}.",
+                    now.format("%Y-%m-%d %H:%M:%S %Z (UTC%:z)")
+                );
+
+                let early_task_start = Instant::now();
+                let assistant_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "assistant".to_string(),
+                    content: Some(reply.clone()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.5,
+                    embedding: None,
+                };
+                self.append_assistant_message_with_event(
+                    &emitter,
+                    &assistant_msg,
+                    "system",
+                    None,
+                    None,
+                )
+                .await?;
+
+                self.emit_task_end(
+                    &emitter,
+                    &task_id,
+                    TaskStatus::Completed,
+                    early_task_start,
+                    0,
+                    0,
+                    None,
+                    Some(reply.chars().take(200).collect()),
+                )
+                .await;
+                return Ok(reply);
             }
         }
 
@@ -471,7 +657,6 @@ impl Agent {
                 user_text,
                 user_role,
                 &channel_ctx,
-                is_top_level_orchestrator,
                 tool_defs.len(),
                 resume_checkpoint.as_ref(),
             )
@@ -525,6 +710,7 @@ impl Agent {
         let mut task_tokens_used: u64 = 0;
         let mut tool_failure_count: HashMap<String, usize> = HashMap::new();
         let mut tool_call_count: HashMap<String, usize> = HashMap::new();
+        let mut unknown_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut recent_tool_calls: VecDeque<u64> = VecDeque::with_capacity(RECENT_CALLS_WINDOW);
         // Tracks consecutive calls to the same tool name, plus the set of
         // unique argument hashes seen during the streak.  When every call in
@@ -537,6 +723,8 @@ impl Agent {
         // Force-stop flag: when true, strip tools from next LLM call to force
         // a text response. Activated after too many tool calls without settling.
         let mut force_text_response = false;
+        let mut budget_warning_sent = false;
+        let mut pending_system_messages: Vec<String> = Vec::new();
         // Track recent tool names for alternating pattern detection (A-B-A-B cycles)
         let mut recent_tool_names: VecDeque<String> = VecDeque::new();
         // Mid-loop adaptation and fallback expansion controls.
@@ -559,6 +747,35 @@ impl Agent {
                 (Some(HARD_ITERATION_CAP), Some(*threshold), Some(*warn_at))
             }
             IterationLimitConfig::Hard { initial: _, cap } => (Some(*cap), None, None),
+        };
+
+        // Resolve V3 goal_id once for per-goal token budget enforcement.
+        // Executors currently carry only v3_task_id, so we may need to lookup goal_id via task.
+        let resolved_goal_id: Option<String> = if let Some(gid) = self.v3_goal_id.clone() {
+            Some(gid)
+        } else if let Some(ref tid) = self.v3_task_id {
+            match self.state.get_task_v3(tid).await {
+                Ok(Some(task)) => Some(task.goal_id),
+                Ok(None) => {
+                    warn!(
+                        session_id,
+                        task_id = %tid,
+                        "V3 task not found while resolving goal_id; goal budget enforcement disabled for this run"
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!(
+                        session_id,
+                        task_id = %tid,
+                        error = %e,
+                        "Failed to resolve goal_id from V3 task; goal budget enforcement disabled for this run"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
         };
 
         loop {
@@ -756,7 +973,30 @@ impl Agent {
 
             // 3. Task token budget (if configured)
             if let Some(budget) = self.task_token_budget {
-                if task_tokens_used >= budget {
+                // One-time warning at 80% of budget
+                if budget > 0
+                    && !budget_warning_sent
+                    && task_tokens_used >= budget.saturating_mul(80) / 100
+                    && task_tokens_used < budget
+                {
+                    budget_warning_sent = true;
+                    let pct = task_tokens_used.saturating_mul(100) / budget;
+                    warn!(
+                        session_id,
+                        tokens_used = task_tokens_used,
+                        budget,
+                        pct,
+                        "Task token budget at 80%"
+                    );
+                    pending_system_messages.push(format!(
+                        "[SYSTEM] TOKEN BUDGET WARNING: You have used {} of {} tokens ({}%). \
+                         You are approaching the task token limit. Wrap up your work and \
+                         respond to the user immediately.",
+                        task_tokens_used, budget, pct
+                    ));
+                }
+
+                if budget > 0 && task_tokens_used >= budget {
                     warn!(
                         session_id,
                         tokens_used = task_tokens_used,
@@ -820,7 +1060,96 @@ impl Agent {
                 }
             }
 
-            // 4. Daily token budget (existing global limit)
+            // 4. Goal daily token budget (per-goal limit)
+            if let Some(ref goal_id) = resolved_goal_id {
+                match self
+                    .state
+                    .add_goal_tokens_and_get_budget_status(goal_id, 0)
+                    .await
+                {
+                    Ok(Some(status)) => {
+                        if let Some(budget_daily) = status.budget_daily {
+                            if status.tokens_used_today >= budget_daily {
+                                warn!(
+                                    session_id,
+                                    iteration,
+                                    goal_id = %goal_id,
+                                    tokens_used_today = status.tokens_used_today,
+                                    budget_daily,
+                                    "Goal daily token budget exhausted"
+                                );
+                                self.emit_decision_point(
+                                    &emitter,
+                                    &task_id,
+                                    iteration,
+                                    DecisionType::StoppingCondition,
+                                    "Stopping condition fired: goal daily token budget exhausted"
+                                        .to_string(),
+                                    json!({
+                                        "condition":"goal_daily_token_budget",
+                                        "goal_id": goal_id,
+                                        "budget_daily": budget_daily,
+                                        "tokens_used_today": status.tokens_used_today
+                                    }),
+                                )
+                                .await;
+                                let alert_msg = format!(
+                                    "Token alert: goal '{}' hit daily token budget (used {} / limit {}). Execution was stopped to prevent overspending.",
+                                    goal_id, status.tokens_used_today, budget_daily
+                                );
+                                self.fanout_token_alert(
+                                    Some(goal_id.as_str()),
+                                    session_id,
+                                    &alert_msg,
+                                    Some(session_id),
+                                )
+                                .await;
+                                let result = self
+                                    .graceful_goal_daily_budget_response(
+                                        &emitter,
+                                        session_id,
+                                        &learning_ctx,
+                                        status.tokens_used_today,
+                                        budget_daily,
+                                    )
+                                    .await;
+                                let (status, error, summary) = match &result {
+                                    Ok(reply) => (
+                                        TaskStatus::Completed,
+                                        None,
+                                        Some(reply.chars().take(200).collect()),
+                                    ),
+                                    Err(e) => (TaskStatus::Failed, Some(e.to_string()), None),
+                                };
+                                self.emit_task_end(
+                                    &emitter,
+                                    &task_id,
+                                    status,
+                                    task_start,
+                                    iteration,
+                                    learning_ctx.tool_calls.len(),
+                                    error,
+                                    summary,
+                                )
+                                .await;
+                                return result;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            session_id,
+                            iteration,
+                            goal_id = %goal_id,
+                            error = %e,
+                            "Failed to check goal daily token budget"
+                        );
+                    }
+                }
+            }
+
+            // 5. Daily token budget (existing global limit)
             if let Some(daily_budget) = self.daily_token_budget {
                 let today_start = Utc::now().format("%Y-%m-%d 00:00:00").to_string();
                 if let Ok(records) = self.state.get_token_usage_since(&today_start).await {
@@ -875,7 +1204,7 @@ impl Agent {
                 }
             }
 
-            // 5. Stall detection — agent spinning without progress
+            // 6. Stall detection — agent spinning without progress
             if stall_count >= MAX_STALL_ITERATIONS {
                 if !successful_send_file_keys.is_empty() && learning_ctx.errors.is_empty() {
                     let reply = "I already sent the requested file. If you want any changes or another file, tell me exactly what to send.".to_string();
@@ -1167,8 +1496,10 @@ impl Agent {
                     std::collections::HashSet::new()
                 };
 
-            // Collect tool_call_ids that have valid tool responses (role=tool with a name)
-            let valid_tool_call_ids: std::collections::HashSet<&str> = deduped_msgs
+            // Collect tool result ids present in this context window (tool_call_id on tool-role
+            // messages with a non-empty tool name). Used to drop assistant tool_calls that would
+            // otherwise be orphaned.
+            let tool_result_ids: std::collections::HashSet<&str> = deduped_msgs
                 .iter()
                 .filter(|m| m.role == "tool" && m.tool_name.as_ref().is_some_and(|n| !n.is_empty()))
                 .filter_map(|m| m.tool_call_id.as_deref())
@@ -1180,23 +1511,12 @@ impl Agent {
                 .filter(|m| {
                     !(m.role == "tool" && m.tool_name.as_ref().is_none_or(|n| n.is_empty()))
                 })
-                // Skip tool results whose tool_call_id has no matching tool_call in an assistant message
-                .filter(|m| {
-                    if m.role == "tool" {
-                        m.tool_call_id
-                            .as_ref()
-                            .is_some_and(|id| valid_tool_call_ids.contains(id.as_str()))
-                    } else {
-                        true
-                    }
-                })
                 .filter_map(|m| {
                     // Truncate stale assistant content from prior interactions.
                     // We only shorten long messages to save tokens — we do NOT
                     // append marker text (e.g. "[prior turn]") because LLMs tend
                     // to echo such markers, producing empty or garbage replies.
-                    let is_old_assistant =
-                        old_interaction_assistant_ids.contains(m.id.as_str());
+                    let is_old_assistant = old_interaction_assistant_ids.contains(m.id.as_str());
                     let content = if is_old_assistant {
                         m.content.as_ref().map(|c| {
                             if c.len() > MAX_OLD_ASSISTANT_CONTENT_CHARS {
@@ -1210,6 +1530,19 @@ impl Agent {
                     } else {
                         m.content.clone()
                     };
+
+                    // Prevent "empty response" fallbacks from accumulating as prompt context.
+                    // These messages are user-visible (stored in history) but not useful for
+                    // subsequent turns and can contribute to degraded model behavior.
+                    if m.role == "assistant"
+                        && m.tool_calls_json.is_none()
+                        && content
+                            .as_deref()
+                            .is_some_and(|c| c.trim_start().starts_with("I wasn't able to process that request."))
+                    {
+                        return None;
+                    }
+
                     let mut obj = json!({
                         "role": m.role,
                         "content": content,
@@ -1220,7 +1553,7 @@ impl Agent {
                         if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
                             let filtered: Vec<Value> = tcs
                                 .iter()
-                                .filter(|tc| valid_tool_call_ids.contains(tc.id.as_str()))
+                                .filter(|tc| tool_result_ids.contains(tc.id.as_str()))
                                 .map(|tc| {
                                     let mut val = json!({
                                         "id": tc.id,
@@ -1305,6 +1638,19 @@ impl Agent {
                 }
             }
 
+            // Collapse repeated tool errors in the current interaction to reduce
+            // context blow-up during retry loops (keep the latest error details).
+            let collapsed_tool_errors =
+                super::loop_utils::collapse_repeated_tool_errors(&mut messages);
+            if collapsed_tool_errors > 0 {
+                info!(
+                    session_id,
+                    iteration,
+                    collapsed_tool_errors,
+                    "Collapsed repeated tool errors in current interaction"
+                );
+            }
+
             // Context window enforcement: trim messages to fit token budget
             if self.context_window_config.enabled {
                 let model_budget = crate::memory::context_window::compute_available_budget(
@@ -1321,7 +1667,8 @@ impl Agent {
                     );
                 }
                 let effective_budget = if self.policy_config.policy_enforce {
-                    policy_budget
+                    // Never exceed the model's budget; policy config can be mis-set.
+                    policy_budget.min(model_budget)
                 } else {
                     model_budget
                 };
@@ -1332,11 +1679,34 @@ impl Agent {
                 );
             }
 
+            // Empty-response recovery: on retry, clear conversational history to avoid
+            // repeatedly sending a poisoned context to the provider (Gemini in particular
+            // can get "stuck" returning empty candidates for a given session history).
+            if empty_response_retry_pending && !is_trigger_session(session_id) {
+                let before = messages.len();
+                messages.clear();
+                messages.push(json!({
+                    "role": "user",
+                    "content": user_text,
+                }));
+                info!(
+                    session_id,
+                    iteration,
+                    before,
+                    after = messages.len(),
+                    "Empty-response recovery: cleared history context for retry"
+                );
+            }
+
             // For the consultant pass, force text-only behavior and strip
             // tool-heavy docs from the system prompt to reduce hallucinated
             // functionCall output on Gemini thinking models.
             let effective_system_prompt = if iteration == 1 && consultant_pass_active {
-                build_consultant_system_prompt(&system_prompt)
+                let style = match policy_bundle.policy.model_profile {
+                    ModelProfile::Cheap => ConsultantPromptStyle::Lite,
+                    ModelProfile::Balanced | ModelProfile::Strong => ConsultantPromptStyle::Full,
+                };
+                build_consultant_system_prompt(&system_prompt, style)
             } else {
                 system_prompt.clone()
             };
@@ -1348,6 +1718,25 @@ impl Agent {
                     "content": effective_system_prompt,
                 }),
             );
+
+            // System nudges (budget warnings, loop-stop reminders, etc.): inject for a single
+            // LLM call so they influence the model without polluting stored history.
+            for content in pending_system_messages.drain(..) {
+                messages.push(json!({
+                    "role": "system",
+                    "content": content,
+                }));
+            }
+
+            // Empty-response recovery: if the prior iteration produced no text and no tool calls,
+            // inject a system nudge for the next LLM call. (Tool-role nudges are dropped by
+            // message-order fixups because they don't correspond to an assistant tool_call_id.)
+            if empty_response_retry_pending && !is_trigger_session(session_id) {
+                messages.push(json!({
+                    "role": "system",
+                    "content": "[SYSTEM] Your previous reply was empty (no text and no tool calls). This retry is running with reduced conversation history to recover. You MUST either (1) call the required tools, or (2) reply with a concrete blocker and the missing info. Do NOT return an empty response."
+                }));
+            }
 
             // Emit "Thinking" status for iterations after the first
             if iteration > 1 {
@@ -1438,7 +1827,8 @@ impl Agent {
                     // signal completion ("Let me know if…") because the user's message
                     // may also contain legitimate questions or tool requests that the
                     // LLM should continue to address after declining the persona change.
-                    let prefill = "I appreciate the creative request, but I need to stay as myself. \
+                    let prefill =
+                        "I appreciate the creative request, but I need to stay as myself. \
                         I can't adopt a different persona or change who I am.";
                     messages.push(json!({
                         "role": "assistant",
@@ -1534,6 +1924,99 @@ impl Agent {
                 if let Err(e) = self.state.record_token_usage(session_id, usage).await {
                     warn!(session_id, error = %e, "Failed to record token usage");
                 }
+
+                // V3 goal budget accounting: increment tokens_used_today and stop immediately
+                // before tool execution if the goal's daily budget is exhausted.
+                if let Some(ref goal_id) = resolved_goal_id {
+                    let delta_tokens = (usage.input_tokens + usage.output_tokens) as i64;
+                    match self
+                        .state
+                        .add_goal_tokens_and_get_budget_status(goal_id, delta_tokens)
+                        .await
+                    {
+                        Ok(Some(status)) => {
+                            if let Some(budget_daily) = status.budget_daily {
+                                if status.tokens_used_today >= budget_daily {
+                                    warn!(
+                                        session_id,
+                                        iteration,
+                                        goal_id = %goal_id,
+                                        delta_tokens,
+                                        tokens_used_today = status.tokens_used_today,
+                                        budget_daily,
+                                        "Goal daily token budget exhausted after LLM call"
+                                    );
+                                    self.emit_decision_point(
+                                        &emitter,
+                                        &task_id,
+                                        iteration,
+                                        DecisionType::StoppingCondition,
+                                        "Stopping condition fired: goal daily token budget exhausted"
+                                            .to_string(),
+                                        json!({
+                                            "condition":"goal_daily_token_budget",
+                                            "goal_id": goal_id,
+                                            "budget_daily": budget_daily,
+                                            "tokens_used_today": status.tokens_used_today,
+                                            "delta_tokens": delta_tokens
+                                        }),
+                                    )
+                                    .await;
+                                    let alert_msg = format!(
+                                        "Token alert: goal '{}' hit daily token budget (used {} / limit {}). Execution was stopped to prevent overspending.",
+                                        goal_id, status.tokens_used_today, budget_daily
+                                    );
+                                    self.fanout_token_alert(
+                                        Some(goal_id.as_str()),
+                                        session_id,
+                                        &alert_msg,
+                                        Some(session_id),
+                                    )
+                                    .await;
+                                    let result = self
+                                        .graceful_goal_daily_budget_response(
+                                            &emitter,
+                                            session_id,
+                                            &learning_ctx,
+                                            status.tokens_used_today,
+                                            budget_daily,
+                                        )
+                                        .await;
+                                    let (status, error, summary) = match &result {
+                                        Ok(reply) => (
+                                            TaskStatus::Completed,
+                                            None,
+                                            Some(reply.chars().take(200).collect()),
+                                        ),
+                                        Err(e) => (TaskStatus::Failed, Some(e.to_string()), None),
+                                    };
+                                    self.emit_task_end(
+                                        &emitter,
+                                        &task_id,
+                                        status,
+                                        task_start,
+                                        iteration,
+                                        learning_ctx.tool_calls.len(),
+                                        error,
+                                        summary,
+                                    )
+                                    .await;
+                                    return result;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(
+                                session_id,
+                                iteration,
+                                goal_id = %goal_id,
+                                error = %e,
+                                "Failed to update goal token usage"
+                            );
+                        }
+                    }
+                }
             }
 
             // Log V3 LLM call activity for executor agents
@@ -1608,11 +2091,24 @@ impl Agent {
 
                 // Override: if user references a filesystem path, the consultant
                 // (text-only, no tools) can never fulfil the request — force tools.
-                let user_lower_for_path = user_text.trim().to_ascii_lowercase();
-                let user_references_fs_path = user_lower_for_path.contains('/')
-                    || user_lower_for_path.contains('\\')
-                    || user_lower_for_path.contains("~/");
+                let user_references_fs_path = user_text_references_filesystem_path(user_text);
                 let user_is_short_correction = is_short_user_correction(user_text);
+                let user_requests_verification = {
+                    let lower = user_text.trim().to_ascii_lowercase();
+                    contains_keyword_as_words(&lower, "are you sure")
+                        || contains_keyword_as_words(&lower, "actually check")
+                        || contains_keyword_as_words(&lower, "double check")
+                        || contains_keyword_as_words(&lower, "double-check")
+                        || contains_keyword_as_words(&lower, "fact check")
+                        || contains_keyword_as_words(&lower, "fact-check")
+                        || contains_keyword_as_words(&lower, "verify")
+                        || contains_keyword_as_words(&lower, "verify this")
+                        || contains_keyword_as_words(&lower, "look it up")
+                        || contains_keyword_as_words(&lower, "look this up")
+                        || contains_keyword_as_words(&lower, "check online")
+                        || contains_keyword_as_words(&lower, "search the web")
+                        || contains_keyword_as_words(&lower, "use tools")
+                };
                 // Semantic overrides — these detect intent from the LLM's BEHAVIOR,
                 // not from word matching. They override the intent gate when there's
                 // strong evidence the LLM needs tools.
@@ -1621,6 +2117,18 @@ impl Agent {
 
                 let (can_answer_now, needs_tools, needs_clarification) = if user_references_fs_path
                 {
+                    (false, true, false)
+                } else if user_is_short_correction {
+                    info!(
+                        session_id,
+                        "Consultant pass: short user correction detected — forcing no-tools answer mode"
+                    );
+                    (true, false, false)
+                } else if user_requests_verification {
+                    info!(
+                        session_id,
+                        "Consultant pass: user requested verification — forcing tools mode"
+                    );
                     (false, true, false)
                 } else if had_hallucinated_tool_calls {
                     // Strongest signal: the LLM literally tried to call tools
@@ -1631,18 +2139,12 @@ impl Agent {
                         "Consultant pass: LLM attempted tool calls — forcing tools mode"
                     );
                     (false, true, false)
-                } else if user_is_short_correction {
+                } else if analysis_defers_execution && intent_gate.needs_tools.is_none() {
+                    // Fallback: if the model omitted needs_tools but its analysis still promises
+                    // concrete future actions, force tool mode rather than trusting missing fields.
                     info!(
                         session_id,
-                        "Consultant pass: short user correction detected — forcing no-tools answer mode"
-                    );
-                    (true, false, false)
-                } else if analysis_defers_execution && !intent_gate.needs_tools.unwrap_or(false) {
-                    // The consultant text promises/delegates future action, but the
-                    // intent gate does not request tools. Trust the behavioral signal.
-                    info!(
-                        session_id,
-                        "Consultant pass: deferred-action text contradicts needs_tools=false — forcing tools mode"
+                        "Consultant pass: deferred-action text but needs_tools was omitted — forcing tools mode"
                     );
                     (false, true, false)
                 } else {
@@ -2434,6 +2936,17 @@ impl Agent {
                                 session_id,
                                 "V3: Simple intent — continuing to full agent loop"
                             );
+                            // Warm-start iteration 2: keep the consultant analysis as a one-shot
+                            // system nudge so the executor model doesn't have to re-derive intent
+                            // (and we don't pay the consultant cost for nothing).
+                            if !analysis.trim().is_empty() {
+                                let hint = truncate_for_resume(analysis.trim(), 1500);
+                                pending_system_messages.push(format!(
+                                    "[SYSTEM] Prior tool-free consultant analysis (for internal guidance only). \
+                                     Use this as context for the next step; do not claim you already ran tools.\n\n{}",
+                                    hint
+                                ));
+                            }
                             // Skip to next iteration where the full agent loop
                             // runs with all tools and full context.
                             continue;
@@ -2671,6 +3184,8 @@ impl Agent {
                                     self.state.clone(),
                                     user_text.to_string(),
                                     goal_response.clone(),
+                                    channel_ctx.channel_id.clone(),
+                                    channel_ctx.visibility,
                                 );
 
                                 if self.context_window_config.enabled {
@@ -2731,7 +3246,7 @@ impl Agent {
 
             // === NATURAL COMPLETION: No tool calls ===
             if resp.tool_calls.is_empty() {
-                let mut reply = resp.content.filter(|s| !s.is_empty()).unwrap_or_default();
+                let mut reply = resp.content.filter(|s| !s.trim().is_empty()).unwrap_or_default();
 
                 // If we used an identity-attack prefill, prepend it so the user
                 // sees the full decline (the API only returns continuation tokens).
@@ -2815,9 +3330,9 @@ impl Agent {
 
                         return Ok(reply);
                     }
-                    // Top-level agent past the consultant pass but no tools were called
-                    // and no content returned — the LLM failed to act. Tell the user.
-                    if iteration > 1 && self.depth == 0 {
+                    // User-facing empty response: never return silence.
+                    // Retry once; if the model remains empty, return an explicit fallback.
+                    if !is_trigger_session(session_id) {
                         if !empty_response_retry_used {
                             empty_response_retry_used = true;
                             empty_response_retry_pending = true;
@@ -2831,37 +3346,43 @@ impl Agent {
                             stall_count += 1;
                             consecutive_clean_iterations = 0;
 
+                            // Retry once with a stronger model profile to avoid repeated empties,
+                            // unless the user explicitly pinned a model override.
+                            let is_override = *self.model_override.read().await;
+                            if !is_override {
+                                let reason = format!(
+                                    "empty_response(iter={},model={})",
+                                    iteration, model
+                                );
+                                if policy_bundle.policy.escalate(reason.clone()) {
+                                    POLICY_METRICS
+                                        .escalation_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if let Some(ref router) = self.router {
+                                        let next_model = router
+                                            .select_for_profile(policy_bundle.policy.model_profile)
+                                            .to_string();
+                                        if next_model != model {
+                                            info!(
+                                                session_id,
+                                                iteration,
+                                                reason = %reason,
+                                                from_model = %model,
+                                                to_model = %next_model,
+                                                "Empty-response recovery: escalated model for retry"
+                                            );
+                                            model = next_model;
+                                        }
+                                    }
+                                }
+                            }
+
                             info!(
                                 session_id,
                                 iteration,
                                 response_note = ?resp.response_note,
                                 "Empty-response recovery: issuing one retry before fallback"
                             );
-
-                            let retry_nudge = Message {
-                                id: Uuid::new_v4().to_string(),
-                                session_id: session_id.to_string(),
-                                role: "tool".to_string(),
-                                content: Some(
-                                    "[SYSTEM] Your previous reply was empty (no text and no tool calls). Retry once now: call the required tools, or provide a concrete blocker and the missing info."
-                                        .to_string(),
-                                ),
-                                tool_call_id: Some("system-empty-response-retry".to_string()),
-                                tool_name: Some("system".to_string()),
-                                tool_calls_json: None,
-                                created_at: Utc::now(),
-                                importance: 0.1,
-                                embedding: None,
-                            };
-                            self.append_tool_message_with_result_event(
-                                &emitter,
-                                &retry_nudge,
-                                true,
-                                0,
-                                None,
-                                Some(&task_id),
-                            )
-                            .await?;
 
                             continue;
                         }
@@ -2928,7 +3449,10 @@ impl Agent {
                 // produce a better response), but if the guard fires a second time,
                 // accept the reply to avoid "Stuck" loops (e.g., after remember_fact
                 // the LLM says "I'll remember that" — a confirmation, not a real deferral).
-                if self.depth == 0 && !used_identity_prefill && looks_like_deferred_action_response(&reply) {
+                if self.depth == 0
+                    && !used_identity_prefill
+                    && looks_like_deferred_action_response(&reply)
+                {
                     // Post-tool-success: if we've already caught one deferral after tools
                     // succeeded, accept this reply instead of stalling further.
                     if total_successful_tool_calls > 0 && stall_count >= 1 {
@@ -2974,27 +3498,7 @@ impl Agent {
                                 .to_string()
                         };
 
-                        let nudge = Message {
-                            id: Uuid::new_v4().to_string(),
-                            session_id: session_id.to_string(),
-                            role: "tool".to_string(),
-                            content: Some(deferred_nudge),
-                            tool_call_id: Some("system-deferred-action".to_string()),
-                            tool_name: Some("system".to_string()),
-                            tool_calls_json: None,
-                            created_at: Utc::now(),
-                            importance: 0.1,
-                            embedding: None,
-                        };
-                        self.append_tool_message_with_result_event(
-                            &emitter,
-                            &nudge,
-                            true,
-                            0,
-                            None,
-                            Some(&task_id),
-                        )
-                        .await?;
+                        pending_system_messages.push(deferred_nudge);
 
                         // Fallback expansion: widen tool set once after exactly two
                         // no-progress iterations, even in no-tool-call paths.
@@ -3041,31 +3545,10 @@ impl Agent {
                                 deferred_no_tool_model_switches += 1;
                                 // Strategy changed, give the new model a fresh stall budget.
                                 stall_count = 0;
-
-                                let recovery_nudge = Message {
-                                    id: Uuid::new_v4().to_string(),
-                                    session_id: session_id.to_string(),
-                                    role: "tool".to_string(),
-                                    content: Some(
-                                        "[SYSTEM] Recovery mode: a model switch was applied because prior replies kept promising actions without tool calls. Call the required tools now and return concrete results."
-                                            .to_string(),
-                                    ),
-                                    tool_call_id: Some("system-deferred-action-recovery".to_string()),
-                                    tool_name: Some("system".to_string()),
-                                    tool_calls_json: None,
-                                    created_at: Utc::now(),
-                                    importance: 0.1,
-                                    embedding: None,
-                                };
-                                self.append_tool_message_with_result_event(
-                                    &emitter,
-                                    &recovery_nudge,
-                                    true,
-                                    0,
-                                    None,
-                                    Some(&task_id),
-                                )
-                                .await?;
+                                pending_system_messages.push(
+                                    "[SYSTEM] Recovery mode: a model switch was applied because prior replies kept promising actions without tool calls. Call the required tools now and return concrete results."
+                                        .to_string(),
+                                );
                             }
                         }
 
@@ -3143,6 +3626,8 @@ impl Agent {
                         self.state.clone(),
                         user_text.to_string(),
                         reply.clone(),
+                        channel_ctx.channel_id.clone(),
+                        channel_ctx.visibility,
                     );
 
                     // Incremental summarization: update summary if threshold reached
@@ -3606,7 +4091,16 @@ impl Agent {
                 let web_fetch_calls = tool_call_count.get("web_fetch").copied().unwrap_or(0);
                 let combined_web_calls = web_search_calls + web_fetch_calls;
 
-                let blocked = if prior_failures >= 3 {
+                let failure_limit = if tc.name == "cli_agent" { 2 } else { 3 };
+                let blocked = if unknown_tools.contains(&tc.name) {
+                    // Tool doesn't exist — block immediately, no retries.
+                    Some(format!(
+                        "[SYSTEM] '{}' is not a real tool. It does NOT exist. \
+                         You MUST use one of the actual available tools or respond with text. \
+                         Do NOT invent tool names.",
+                        tc.name
+                    ))
+                } else if prior_failures >= failure_limit {
                     Some(format!(
                         "[SYSTEM] Tool '{}' has encountered {} errors. \
                          Do not call it again. Use a different approach or \
@@ -3843,6 +4337,29 @@ impl Agent {
 
                 let tool_exec_start = Instant::now();
                 touch_heartbeat(&heartbeat);
+
+                // For long-running tools (cli_agent, terminal), spawn a background
+                // task that keeps the heartbeat alive so the channel-level stale
+                // watchdog doesn't auto-cancel the task while the tool is still
+                // actively working.
+                let heartbeat_keeper = if matches!(tc.name.as_str(), "cli_agent" | "terminal") {
+                    heartbeat.as_ref().map(|hb| {
+                        let hb = Arc::clone(hb);
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                let now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                hb.store(now, Ordering::Relaxed);
+                            }
+                        })
+                    })
+                } else {
+                    None
+                };
+
                 let result = self
                     .execute_tool_with_watchdog(
                         &tc.name,
@@ -3856,7 +4373,13 @@ impl Agent {
                         user_role,
                     )
                     .await;
+
+                // Stop the heartbeat keeper now that the tool has finished.
+                if let Some(handle) = heartbeat_keeper {
+                    handle.abort();
+                }
                 touch_heartbeat(&heartbeat);
+                let result_is_err = result.is_err();
                 let mut result_text = match result {
                     Ok(text) => {
                         // Sanitize and wrap untrusted tool outputs
@@ -3870,6 +4393,27 @@ impl Agent {
                     }
                     Err(e) => format!("Error: {}", e),
                 };
+
+                // `cli_agent` errors can be extremely large (process output, stack traces).
+                // Truncate aggressively to prevent context blow-up and runaway retries.
+                if tc.name == "cli_agent" && result_is_err {
+                    let char_len = result_text.chars().count();
+                    if char_len > 2000 {
+                        let head: String = result_text.chars().take(500).collect();
+                        let tail: String = result_text
+                            .chars()
+                            .rev()
+                            .take(500)
+                            .collect::<Vec<char>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        result_text = format!(
+                            "{}\n\n[... cli_agent error output truncated ({} chars total) ...]\n\n{}",
+                            head, char_len, tail
+                        );
+                    }
+                }
 
                 // Compress large tool results to save context budget
                 if self.context_window_config.enabled {
@@ -3899,6 +4443,12 @@ impl Agent {
                     || result_text.starts_with("Failed to ");
                 if is_error {
                     iteration_had_tool_failures = true;
+
+                    // Track hallucinated tool names so they're blocked on next attempt
+                    if result_text.contains("Unknown tool '") {
+                        unknown_tools.insert(tc.name.clone());
+                    }
+
                     let count = tool_failure_count.entry(tc.name.clone()).or_insert(0);
                     *count += 1;
 
@@ -4049,42 +4599,35 @@ impl Agent {
             // Escalating early-stop nudges: remind the LLM with increasing urgency
             // to stop exploring and respond. After a hard threshold, strip tools
             // entirely to force a text response on the next iteration.
-            const NUDGE_INTERVAL: usize = 8;
-            const FORCE_TEXT_AT: usize = 100;
+            const NUDGE_INTERVAL: usize = 6;
+            const FORCE_TEXT_AT: usize = 30;
             if total_successful_tool_calls > 0
                 && total_successful_tool_calls.is_multiple_of(NUDGE_INTERVAL)
                 && total_successful_tool_calls < FORCE_TEXT_AT
             {
-                let urgency = if total_successful_tool_calls >= 16 {
-                    "[SYSTEM] IMPORTANT: You have made many tool calls. You MUST stop calling \
-                     tools and respond to the user NOW with what you have found so far. \
-                     Summarize your findings immediately."
+                let urgency = if total_successful_tool_calls >= 24 {
+                    format!(
+                        "[SYSTEM] CRITICAL: You have used {} tokens across {} tool calls. \
+                         Stop immediately and respond to the user with what you have. \
+                         No more exploration.",
+                        task_tokens_used, total_successful_tool_calls
+                    )
+                } else if total_successful_tool_calls >= 12 {
+                    format!(
+                        "[SYSTEM] IMPORTANT: You have used {} tokens in {} tool calls. \
+                         You MUST stop calling tools and respond to the user NOW. \
+                         Summarize your findings immediately.",
+                        task_tokens_used, total_successful_tool_calls
+                    )
                 } else {
-                    "[SYSTEM] You have made several tool calls. If you already have enough \
-                     information to answer the user's question, stop calling tools and \
-                     respond now with your findings."
+                    format!(
+                        "[SYSTEM] You have used {} tokens in {} tool calls. If you have \
+                         enough information to answer the user's question, stop calling \
+                         tools and respond now with your findings.",
+                        task_tokens_used, total_successful_tool_calls
+                    )
                 };
-                let nudge = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "tool".to_string(),
-                    content: Some(urgency.to_string()),
-                    tool_call_id: Some("system-nudge".to_string()),
-                    tool_name: Some("system".to_string()),
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.1,
-                    embedding: None,
-                };
-                self.append_tool_message_with_result_event(
-                    &emitter,
-                    &nudge,
-                    true,
-                    0,
-                    None,
-                    Some(&task_id),
-                )
-                .await?;
+                pending_system_messages.push(urgency);
                 info!(
                     session_id,
                     total_successful_tool_calls, "Early-stop nudge injected (escalating)"
@@ -4094,31 +4637,11 @@ impl Agent {
             // the next LLM call so the model MUST produce a text response.
             if total_successful_tool_calls >= FORCE_TEXT_AT && !force_text_response {
                 force_text_response = true;
-                let force_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "tool".to_string(),
-                    content: Some(
-                        "[SYSTEM] Tool limit reached. You must now respond to the user with \
-                         a summary of everything you found. No more tool calls are available."
-                            .to_string(),
-                    ),
-                    tool_call_id: Some("system-force-stop".to_string()),
-                    tool_name: Some("system".to_string()),
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.1,
-                    embedding: None,
-                };
-                self.append_tool_message_with_result_event(
-                    &emitter,
-                    &force_msg,
-                    true,
-                    0,
-                    None,
-                    Some(&task_id),
-                )
-                .await?;
+                pending_system_messages.push(
+                    "[SYSTEM] Tool limit reached. You must now respond to the user with \
+                     a summary of everything you found. No more tool calls are available."
+                        .to_string(),
+                );
                 warn!(
                     session_id,
                     total_successful_tool_calls, "Force-text response activated — tools stripped"

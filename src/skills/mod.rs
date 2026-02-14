@@ -13,6 +13,7 @@ use crate::traits::{
     BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, ModelProvider, Person,
     PersonFact, Procedure, StateStore, UserProfile,
 };
+use crate::types::{ChannelVisibility, UserRole};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
@@ -380,20 +381,139 @@ fn extract_explicit_skill_refs(user_message: &str) -> Vec<String> {
     refs
 }
 
-/// Match skills only through explicit invocation references.
-pub fn match_skills<'a>(skills: &'a [Skill], user_message: &str) -> Vec<&'a Skill> {
-    let refs = extract_explicit_skill_refs(user_message);
-    if refs.is_empty() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillMatchKind {
+    None,
+    Explicit,
+    Trigger,
+}
+
+pub struct SkillMatches<'a> {
+    pub kind: SkillMatchKind,
+    pub skills: Vec<&'a Skill>,
+}
+
+fn normalize_for_trigger_match(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last_space = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn trigger_matches_message(message_norm_padded: &str, trigger: &str) -> bool {
+    let t = normalize_for_trigger_match(trigger);
+    // Skip extremely short triggers to reduce false positives ("a", "i", etc.).
+    let compact_len = t.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+    if compact_len < 3 {
+        return false;
+    }
+    let needle = format!(" {} ", t);
+    message_norm_padded.contains(&needle)
+}
+
+fn match_skills_by_triggers<'a>(skills: &'a [Skill], user_message: &str) -> Vec<&'a Skill> {
+    // Normalize and pad so we can do cheap word-boundary matching with spaces.
+    let normalized = normalize_for_trigger_match(user_message);
+    if normalized.is_empty() {
         return Vec::new();
     }
+    let padded = format!(" {} ", normalized);
 
-    skills
-        .iter()
-        .filter(|skill| {
-            refs.iter()
-                .any(|r| r == &sanitize_skill_filename(&skill.name))
-        })
-        .collect()
+    let mut scored: Vec<(&Skill, usize)> = Vec::new();
+    for skill in skills {
+        if skill.triggers.is_empty() {
+            continue;
+        }
+        let mut score = 0usize;
+        for trig in &skill.triggers {
+            if trigger_matches_message(&padded, trig) {
+                score += 1;
+            }
+        }
+        if score > 0 {
+            scored.push((skill, score));
+        }
+    }
+
+    // Deterministic order: score desc, then name asc.
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.name.cmp(&b.0.name)));
+
+    let mut out: Vec<&Skill> = scored.into_iter().map(|(s, _)| s).collect();
+    if out.len() > 8 {
+        out.truncate(8);
+    }
+    out
+}
+
+/// Match skills for the given message.
+///
+/// Rules:
+/// - Explicit references always win (`$skill`, `skill:name`, `use skill <name>`).
+/// - Trigger matching is only enabled for the Owner in non-PublicExternal channels.
+/// - Trigger matches are capped to a small number to keep prompts stable.
+pub fn match_skills<'a>(
+    skills: &'a [Skill],
+    user_message: &str,
+    user_role: UserRole,
+    visibility: ChannelVisibility,
+) -> SkillMatches<'a> {
+    let refs = extract_explicit_skill_refs(user_message);
+    if !refs.is_empty() {
+        let matched: Vec<&Skill> = skills
+            .iter()
+            .filter(|skill| {
+                refs.iter()
+                    .any(|r| r == &sanitize_skill_filename(&skill.name))
+            })
+            .collect();
+        if matched.is_empty() {
+            return SkillMatches {
+                kind: SkillMatchKind::None,
+                skills: Vec::new(),
+            };
+        }
+        return SkillMatches {
+            kind: SkillMatchKind::Explicit,
+            skills: matched,
+        };
+    }
+
+    // Never trigger skills for untrusted public platforms.
+    if matches!(visibility, ChannelVisibility::PublicExternal) {
+        return SkillMatches {
+            kind: SkillMatchKind::None,
+            skills: Vec::new(),
+        };
+    }
+
+    // Only allow keyword/trigger-based activation for the Owner.
+    if user_role != UserRole::Owner {
+        return SkillMatches {
+            kind: SkillMatchKind::None,
+            skills: Vec::new(),
+        };
+    }
+
+    let triggered = match_skills_by_triggers(skills, user_message);
+    if triggered.is_empty() {
+        return SkillMatches {
+            kind: SkillMatchKind::None,
+            skills: Vec::new(),
+        };
+    }
+
+    SkillMatches {
+        kind: SkillMatchKind::Trigger,
+        skills: triggered,
+    }
 }
 
 /// Ask a fast LLM to confirm which candidate skills are truly relevant to the user message.
@@ -895,31 +1015,82 @@ mod tests {
             make_skill("web-browsing", &["browse", "website"]),
             make_skill("system-admin", &["disk", "memory", "cpu"]),
         ];
-        let matched = match_skills(&skills, "please run $web-browsing now");
-        assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].name, "web-browsing");
+        let matched = match_skills(
+            &skills,
+            "please run $web-browsing now",
+            crate::types::UserRole::Owner,
+            crate::types::ChannelVisibility::Private,
+        );
+        assert_eq!(matched.kind, SkillMatchKind::Explicit);
+        assert_eq!(matched.skills.len(), 1);
+        assert_eq!(matched.skills[0].name, "web-browsing");
     }
 
     #[test]
     fn match_skills_explicit_skill_prefix() {
         let skills = vec![make_skill("web-browsing", &["browse", "website"])];
-        let matched = match_skills(&skills, "skill:web-browsing");
-        assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].name, "web-browsing");
+        let matched = match_skills(
+            &skills,
+            "skill:web-browsing",
+            crate::types::UserRole::Owner,
+            crate::types::ChannelVisibility::Private,
+        );
+        assert_eq!(matched.kind, SkillMatchKind::Explicit);
+        assert_eq!(matched.skills.len(), 1);
+        assert_eq!(matched.skills[0].name, "web-browsing");
     }
 
     #[test]
     fn match_skills_use_skill_form() {
         let skills = vec![make_skill("web-browsing", &["browse"])];
-        let matched = match_skills(&skills, "Use skill WEB-BROWSING");
-        assert_eq!(matched.len(), 1);
+        let matched = match_skills(
+            &skills,
+            "Use skill WEB-BROWSING",
+            crate::types::UserRole::Guest,
+            crate::types::ChannelVisibility::Public,
+        );
+        assert_eq!(matched.kind, SkillMatchKind::Explicit);
+        assert_eq!(matched.skills.len(), 1);
     }
 
     #[test]
-    fn match_skills_does_not_guess_from_keywords() {
+    fn match_skills_triggers_for_owner_in_private() {
         let skills = vec![make_skill("web-browsing", &["browse", "website"])];
-        let matched = match_skills(&skills, "please browse the site");
-        assert!(matched.is_empty());
+        let matched = match_skills(
+            &skills,
+            "please browse the site",
+            crate::types::UserRole::Owner,
+            crate::types::ChannelVisibility::Private,
+        );
+        assert_eq!(matched.kind, SkillMatchKind::Trigger);
+        assert_eq!(matched.skills.len(), 1);
+        assert_eq!(matched.skills[0].name, "web-browsing");
+    }
+
+    #[test]
+    fn match_skills_does_not_trigger_for_guest() {
+        let skills = vec![make_skill("web-browsing", &["browse", "website"])];
+        let matched = match_skills(
+            &skills,
+            "please browse the site",
+            crate::types::UserRole::Guest,
+            crate::types::ChannelVisibility::Private,
+        );
+        assert_eq!(matched.kind, SkillMatchKind::None);
+        assert!(matched.skills.is_empty());
+    }
+
+    #[test]
+    fn match_skills_does_not_trigger_for_public_external() {
+        let skills = vec![make_skill("web-browsing", &["browse", "website"])];
+        let matched = match_skills(
+            &skills,
+            "please browse the site",
+            crate::types::UserRole::Owner,
+            crate::types::ChannelVisibility::PublicExternal,
+        );
+        assert_eq!(matched.kind, SkillMatchKind::None);
+        assert!(matched.skills.is_empty());
     }
 
     // --- build_system_prompt max_facts tests ---

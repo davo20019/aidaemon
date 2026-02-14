@@ -1085,6 +1085,9 @@ impl CliAgentTool {
         let pid_for_kill = pid;
         let invocation_started_at = started_at_instant;
         let max_output_for_log = max_output;
+        let notify_session_id = session_id.to_string();
+        let notify_async = async_mode;
+        let notify_working_dir = working_dir.map(|s| s.to_string());
         tokio::spawn(async move {
             let mut stdout_reader = BufReader::new(stdout).lines();
             let mut stderr_reader = BufReader::new(stderr).lines();
@@ -1317,6 +1320,44 @@ impl CliAgentTool {
                         duration,
                     )
                     .await;
+
+                // Send proactive notification for async tasks
+                if notify_async {
+                    let duration_secs = duration as u64;
+                    let duration_display = if duration_secs >= 60 {
+                        format!("{}m{}s", duration_secs / 60, duration_secs % 60)
+                    } else {
+                        format!("{}s", duration_secs)
+                    };
+
+                    let status_word = if success { "completed" } else { "failed" };
+                    let diff_section = if let Some(ref dir) = notify_working_dir {
+                        CliAgentTool::capture_git_diff(dir)
+                            .await
+                            .map(|diff| format!("\n\n{}", diff))
+                    } else {
+                        None
+                    };
+
+                    let message = format!(
+                        "Background task {} ({}, {})\nTask: {}\nResult: {}{}",
+                        status_word,
+                        tool_name_owned,
+                        duration_display,
+                        task_context,
+                        output_summary,
+                        diff_section.unwrap_or_default(),
+                    );
+
+                    let notification_type = if success { "completed" } else { "failed" };
+                    let entry = crate::traits::NotificationEntry::new(
+                        "",
+                        &notify_session_id,
+                        notification_type,
+                        &message,
+                    );
+                    let _ = state_for_completion.enqueue_notification(&entry).await;
+                }
             }
             let _ = completion_tx.send((exit_code, loop_detected, loop_pattern_count));
         });

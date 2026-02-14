@@ -6,6 +6,24 @@ const FACT_LEXICAL_MAX_SCORE: f32 = 0.55;
 const FACT_FRESHNESS_MAX_BOOST: f32 = 0.15;
 const FACT_FRESHNESS_DECAY_HOURS: f32 = 168.0; // 7 days
 
+async fn bump_fact_recall(pool: &SqlitePool, facts: &[Fact]) {
+    if facts.is_empty() {
+        return;
+    }
+    let now = Utc::now().to_rfc3339();
+    let ids: Vec<i64> = facts.iter().map(|f| f.id).collect();
+    let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+    let query = format!(
+        "UPDATE facts SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id IN ({})",
+        placeholders.join(",")
+    );
+    let mut q = sqlx::query(&query).bind(&now);
+    for id in ids {
+        q = q.bind(id);
+    }
+    let _ = q.execute(pool).await;
+}
+
 fn canonicalize_fact_key(key: &str) -> String {
     let raw = key.trim();
     if raw.is_empty() {
@@ -414,6 +432,7 @@ impl crate::traits::FactStore for SqliteStateStore {
         if all_facts.is_empty() || query.trim().is_empty() {
             let mut facts = all_facts;
             facts.truncate(max);
+            bump_fact_recall(&self.pool, &facts).await;
             return Ok(facts);
         }
 
@@ -427,6 +446,7 @@ impl crate::traits::FactStore for SqliteStateStore {
                 );
                 let mut facts = all_facts;
                 facts.truncate(max);
+                bump_fact_recall(&self.pool, &facts).await;
                 return Ok(facts);
             }
         };
@@ -512,6 +532,7 @@ impl crate::traits::FactStore for SqliteStateStore {
             }
         }
 
+        bump_fact_recall(&self.pool, &relevant).await;
         Ok(relevant)
     }
 
@@ -530,7 +551,11 @@ impl crate::traits::FactStore for SqliteStateStore {
             return self.get_relevant_facts(query, max).await;
         }
 
-        // PublicExternal: only same-channel facts + sanitized global facts
+        // PublicExternal: do NOT inject any stored facts (treat as untrusted).
+        if matches!(visibility, ChannelVisibility::PublicExternal) {
+            return Ok(vec![]);
+        }
+
         // Public/PrivateGroup: global + same-channel facts (no private, no other-channel)
         let rows = sqlx::query(
             "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding
@@ -570,6 +595,7 @@ impl crate::traits::FactStore for SqliteStateStore {
         if filtered.is_empty() || query.trim().is_empty() {
             let mut facts = filtered;
             facts.truncate(max);
+            bump_fact_recall(&self.pool, &facts).await;
             return Ok(facts);
         }
 
@@ -579,6 +605,7 @@ impl crate::traits::FactStore for SqliteStateStore {
             Err(_) => {
                 let mut facts = filtered;
                 facts.truncate(max);
+                bump_fact_recall(&self.pool, &facts).await;
                 return Ok(facts);
             }
         };
@@ -657,6 +684,7 @@ impl crate::traits::FactStore for SqliteStateStore {
             }
         }
 
+        bump_fact_recall(&self.pool, &relevant).await;
         Ok(relevant)
     }
 
@@ -712,6 +740,7 @@ impl crate::traits::FactStore for SqliteStateStore {
             .map(|(i, _)| facts[i].clone())
             .collect();
 
+        bump_fact_recall(&self.pool, &hints).await;
         Ok(hints)
     }
 

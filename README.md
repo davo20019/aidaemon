@@ -313,6 +313,7 @@ allowed_domains = ["api.stripe.com"]
 Built-in providers (no URL config needed):
 - **twitter** (alias: **x**) — Tweet read/write, user info, offline access
 - **github** — User info, repository access
+- **google** — Gmail, Calendar, Tasks (PKCE flow)
 
 The `manage_oauth` tool handles the full lifecycle:
 - **providers** — list available providers and credential status
@@ -459,6 +460,7 @@ db_path = "aidaemon.db"
 working_memory_cap = 50
 consolidation_interval_hours = 6   # how often to run memory consolidation
 max_facts = 100                    # max facts to include in system prompt
+task_token_budget = 500000         # max tokens per task (default 500k, 0 = unlimited)
 daily_token_budget = 1000000       # optional daily token limit (resets at midnight UTC)
 # encryption_key = "keychain"      # optional override; defaults to AIDAEMON_ENCRYPTION_KEY from .env
 ```

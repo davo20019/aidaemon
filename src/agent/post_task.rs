@@ -124,9 +124,15 @@ pub(super) fn classify_stall(
             "Server Error",
             "The AI provider is experiencing issues. This is usually temporary — try again in a few minutes.",
         )
-    } else if recent_errors.contains("auth")
-        || recent_errors.contains("unauthorized")
+    } else if recent_errors.contains("unknown tool") {
+        (
+            "Unknown Tool",
+            "The model tried to call a tool that doesn't exist. This usually resolves on retry — if it recurs, try a different model or rephrase your request.",
+        )
+    } else if recent_errors.contains("unauthorized")
         || recent_errors.contains("api key")
+        || recent_errors.contains("authentication failed")
+        || recent_errors.contains("invalid auth")
     {
         (
             "Authentication",
@@ -178,6 +184,27 @@ pub(super) fn graceful_budget_response(learning_ctx: &LearningContext, tokens_us
         learning_ctx.errors.len()
     );
     summary
+}
+
+/// Graceful response when a goal hits its daily token budget.
+pub(super) fn graceful_goal_daily_budget_response(
+    learning_ctx: &LearningContext,
+    tokens_used_today: i64,
+    budget_daily: i64,
+) -> String {
+    format!(
+        "This goal has reached its daily token budget (used {} / limit {}). \
+            I'm stopping now to prevent runaway spend.\n\n\
+            Here's what I accomplished:\n\n\
+            - {} tool calls executed\n\
+            - {} errors encountered\n\n\
+            If you want me to continue, you can retry later after the daily budget resets, \
+            or increase the goal's budget.",
+        tokens_used_today,
+        budget_daily,
+        learning_ctx.tool_calls.len(),
+        learning_ctx.errors.len()
+    )
 }
 
 /// Graceful response when agent is stalled (no progress).

@@ -249,9 +249,8 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
     // State store
     let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
 
-    // Event store
-    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
-    let event_store = Arc::new(EventStore::new(pool).await?);
+    // Event store (reuse the same pool/options as the state store)
+    let event_store = Arc::new(EventStore::new(state.pool()).await?);
 
     // Provider
     let provider = Arc::new(provider);
@@ -340,8 +339,7 @@ pub async fn setup_test_agent_with_models(
     let embedding_service = Arc::new(EmbeddingService::new()?);
     let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
 
-    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
-    let event_store = Arc::new(EventStore::new(pool).await?);
+    let event_store = Arc::new(EventStore::new(state.pool()).await?);
 
     let provider = Arc::new(provider);
 
@@ -414,8 +412,7 @@ pub async fn setup_test_agent_v3(provider: MockProvider) -> anyhow::Result<TestH
     let embedding_service = Arc::new(EmbeddingService::new()?);
     let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
 
-    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
-    let event_store = Arc::new(EventStore::new(pool).await?);
+    let event_store = Arc::new(EventStore::new(state.pool()).await?);
 
     let provider = Arc::new(provider);
 
@@ -588,8 +585,8 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
     // State store
     let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
 
-    // Event store
-    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
+    // Reuse the state store pool for all DB-backed components so tests match production.
+    let pool = state.pool();
     let event_store = Arc::new(EventStore::new(pool.clone()).await?);
 
     // Approval channel
@@ -603,7 +600,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
             30,
             8000,
             PermissionMode::Yolo,
-            pool,
+            pool.clone(),
         )
         .await,
     );
