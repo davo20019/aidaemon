@@ -59,7 +59,7 @@ fn strip_latex_inner(text: &str) -> String {
     for func in &[
         "sin", "cos", "tan", "log", "ln", "exp", "lim", "max", "min",
     ] {
-        s = s.replace(&format!("\\{}", func), *func);
+        s = s.replace(&format!("\\{}", func), func);
     }
 
     // \left( and \right) → ( and )
