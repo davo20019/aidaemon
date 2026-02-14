@@ -6312,26 +6312,103 @@ async fn test_old_interaction_assistant_content_truncated() {
     let has_truncated = assistant_msgs.iter().any(|m| {
         m.get("content")
             .and_then(|c| c.as_str())
-            .is_some_and(|s| s.contains("[prior turn, truncated]"))
+            .is_some_and(|s| s.ends_with('…') && s.len() < 500)
     });
     assert!(
         has_truncated,
         "Turn 1's long assistant response should be truncated in Turn 2's context"
     );
 
-    // The truncated content should be <= MAX_OLD_ASSISTANT_CONTENT_CHARS + marker (~25 chars)
+    // The truncated content should be <= MAX_OLD_ASSISTANT_CONTENT_CHARS + ellipsis
     for m in &assistant_msgs {
         if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
-            if content.contains("[prior turn, truncated]") {
+            if content.ends_with('…') {
+                // 200 chars + "…" (3 bytes) = ~203 bytes max
                 assert!(
-                    content.len() <= 330,
-                    "Truncated content should be ~325 chars max, got {} chars: {}...",
+                    content.len() <= 210,
+                    "Truncated content should be ~203 chars max, got {} chars: {}...",
                     content.len(),
                     &content[..50.min(content.len())]
                 );
             }
         }
     }
+}
+
+/// Short assistant responses from old turns should be passed through unmodified
+/// (no marker text appended, since LLMs tend to echo markers back).
+#[tokio::test]
+async fn test_old_short_assistant_response_preserved_unmodified() {
+    let provider = MockProvider::with_responses(vec![
+        // Turn 1: short response about files
+        MockProvider::text_response("Here are 20 .rs files in the tools directory."),
+        // Turn 2: different topic
+        MockProvider::text_response("Rust 1.82.0"),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    // Turn 1
+    let _ = harness
+        .agent
+        .handle_message(
+            "prior_turn_no_marker",
+            "List files in src/tools",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Turn 2: completely different topic
+    let _ = harness
+        .agent
+        .handle_message(
+            "prior_turn_no_marker",
+            "What version of Rust is installed?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Verify: Turn 1's short assistant response is present without marker text
+    let call_log = harness.provider.call_log.lock().await;
+    let turn2_call = call_log.last().unwrap();
+    let old_assistant_msgs: Vec<&serde_json::Value> = turn2_call
+        .messages
+        .iter()
+        .filter(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("files"))
+        })
+        .collect();
+
+    assert!(
+        !old_assistant_msgs.is_empty(),
+        "Turn 1's assistant response should be present in Turn 2's context"
+    );
+    // Content should be exactly what the LLM returned — no marker appended
+    let content = old_assistant_msgs[0]
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap();
+    assert!(
+        !content.contains("[prior turn]"),
+        "Old assistant responses should NOT have [prior turn] marker (causes LLM echoing). Got: {}",
+        content
+    );
+    assert_eq!(
+        content,
+        "Here are 20 .rs files in the tools directory.",
+        "Short old assistant content should be preserved unmodified"
+    );
 }
 
 // ==================== Context Window Management Tests ====================

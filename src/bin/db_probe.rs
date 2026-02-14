@@ -6,6 +6,24 @@ use std::str::FromStr;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    let msg_search = args
+        .windows(2)
+        .find(|w| w[0] == "--search")
+        .map(|w| w[1].clone());
+    let msg_search_limit = args
+        .windows(2)
+        .find(|w| w[0] == "--search-limit")
+        .map(|w| w[1].parse::<i64>())
+        .transpose()?
+        .unwrap_or(10)
+        .clamp(1, 200);
+    let msg_search_context = args
+        .windows(2)
+        .find(|w| w[0] == "--search-context")
+        .map(|w| w[1].parse::<i64>())
+        .transpose()?
+        .unwrap_or(6)
+        .clamp(0, 50);
     let task_filter = args
         .windows(2)
         .find(|w| w[0] == "--task")
@@ -47,6 +65,122 @@ async fn main() -> anyhow::Result<()> {
         .pragma("journal_mode", "WAL");
 
     let pool = SqlitePool::connect_with(opts).await?;
+
+    if let Some(needle) = msg_search.as_ref() {
+        println!("== Message Search ==");
+        println!(
+            "- needle={:?} limit={} context={}",
+            needle, msg_search_limit, msg_search_context
+        );
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_id, role, tool_name, created_at, substr(COALESCE(content, ''), 1, 240) AS content_preview
+            FROM messages
+            WHERE COALESCE(content, '') LIKE '%' || ? || '%'
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(needle)
+        .bind(msg_search_limit)
+        .fetch_all(&pool)
+        .await?;
+
+        if rows.is_empty() {
+            println!("(no matches)");
+        } else {
+            for row in &rows {
+                let msg_id: String = row.get("id");
+                let session_id: String = row.get("session_id");
+                let role: String = row.get("role");
+                let tool_name: Option<String> = row.try_get("tool_name").unwrap_or(None);
+                let created_at: String = row.get("created_at");
+                let preview: String = row.get("content_preview");
+
+                println!(
+                    "- msg_id={} session={} role={} tool={:?} at={}\n  {}",
+                    msg_id,
+                    session_id,
+                    role,
+                    tool_name,
+                    created_at,
+                    preview.replace('\n', " ")
+                );
+
+                if msg_search_context > 0 {
+                    // Surrounding context inside the same session for quick forensics.
+                    let before = sqlx::query(
+                        r#"
+                        SELECT role, tool_name, created_at, substr(COALESCE(content, ''), 1, 140) AS content_preview
+                        FROM messages
+                        WHERE session_id = ?
+                          AND created_at < ?
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                        "#,
+                    )
+                    .bind(&session_id)
+                    .bind(&created_at)
+                    .bind(msg_search_context)
+                    .fetch_all(&pool)
+                    .await?;
+
+                    let after = sqlx::query(
+                        r#"
+                        SELECT role, tool_name, created_at, substr(COALESCE(content, ''), 1, 140) AS content_preview
+                        FROM messages
+                        WHERE session_id = ?
+                          AND created_at > ?
+                        ORDER BY created_at ASC
+                        LIMIT ?
+                        "#,
+                    )
+                    .bind(&session_id)
+                    .bind(&created_at)
+                    .bind(msg_search_context)
+                    .fetch_all(&pool)
+                    .await?;
+
+                    if !before.is_empty() || !after.is_empty() {
+                        println!("  -- context --");
+                        for ctx_row in before.iter().rev() {
+                            println!(
+                                "  - {} tool={:?} at={}  {}",
+                                ctx_row.get::<String, _>("role"),
+                                ctx_row.try_get::<Option<String>, _>("tool_name")
+                                    .unwrap_or(None),
+                                ctx_row.get::<String, _>("created_at"),
+                                ctx_row
+                                    .get::<String, _>("content_preview")
+                                    .replace('\n', " ")
+                            );
+                        }
+                        println!(
+                            "  - {} tool={:?} at={}  {}",
+                            role,
+                            tool_name,
+                            created_at,
+                            preview.replace('\n', " ")
+                        );
+                        for ctx_row in after {
+                            println!(
+                                "  - {} tool={:?} at={}  {}",
+                                ctx_row.get::<String, _>("role"),
+                                ctx_row.try_get::<Option<String>, _>("tool_name")
+                                    .unwrap_or(None),
+                                ctx_row.get::<String, _>("created_at"),
+                                ctx_row
+                                    .get::<String, _>("content_preview")
+                                    .replace('\n', " ")
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        println!();
+    }
 
     if let Some(hours) = repair_stale_cli_hours {
         println!("== Repair Stale CLI Agent Invocations ==");
@@ -356,7 +490,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some(session_id) = session_filter {
+    if let Some(session_id) = session_filter.as_deref() {
         println!("\n== Recent Session {} Events ==", session_id);
         let rows = sqlx::query(
             r#"
@@ -385,6 +519,36 @@ async fn main() -> anyhow::Result<()> {
                     row.try_get::<Option<String>, _>("data_preview")
                         .unwrap_or(None)
                         .unwrap_or_default()
+                        .replace('\n', " ")
+                );
+            }
+        }
+
+        println!("\n== Recent Session {} Messages ==", session_id);
+        let msgs = sqlx::query(
+            r#"
+            SELECT id, role, tool_name, created_at, substr(COALESCE(content, ''), 1, 280) AS content_preview
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY created_at DESC
+            LIMIT 80
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await?;
+        if msgs.is_empty() {
+            println!("(none)");
+        } else {
+            for row in msgs {
+                println!(
+                    "- {} {} tool={:?} at={}\n  {}",
+                    row.get::<String, _>("id"),
+                    row.get::<String, _>("role"),
+                    row.try_get::<Option<String>, _>("tool_name")
+                        .unwrap_or(None),
+                    row.get::<String, _>("created_at"),
+                    row.get::<String, _>("content_preview")
                         .replace('\n', " ")
                 );
             }

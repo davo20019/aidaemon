@@ -1772,15 +1772,27 @@ impl Agent {
         channel_ctx: ChannelContext,
         heartbeat: Option<Arc<AtomicU64>>,
     ) -> anyhow::Result<String> {
-        self.handle_message_impl(
-            session_id,
-            user_text,
-            status_tx,
-            user_role,
-            channel_ctx,
-            heartbeat,
-        )
-        .await
+        let reply = self
+            .handle_message_impl(
+                session_id,
+                user_text,
+                status_tx,
+                user_role,
+                channel_ctx,
+                heartbeat,
+            )
+            .await?;
+
+        // Strip internal context markers that the LLM may echo back.
+        // These markers are injected into old assistant messages to help the
+        // model distinguish prior-turn context, but must never leak to users.
+        let reply = reply
+            .replace(" [prior turn, truncated]", "")
+            .replace(" [prior turn]", "")
+            .replace("[prior turn, truncated]", "")
+            .replace("[prior turn]", "");
+
+        Ok(reply)
     }
 }
 

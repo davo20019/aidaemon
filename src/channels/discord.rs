@@ -611,11 +611,12 @@ impl DiscordChannel {
                 },
             };
             typing_cancel.cancel();
-            let _ = status_task.await;
+            // Abort the status display task to prevent blocking if a background
+            // CLI agent monitoring task still holds a status_tx clone.
+            status_task.abort();
 
             match result {
                 Ok(reply) => {
-                    registry.complete(task_id).await;
                     // Discord supports markdown natively — split at 2000 chars
                     let chunks = split_message(&reply, 2000);
                     for chunk in &chunks {
@@ -623,22 +624,25 @@ impl DiscordChannel {
                             warn!("Failed to send Discord message: {}", e);
                         }
                     }
+                    registry.complete(task_id).await;
                 }
                 Err(e) => {
                     let error_msg = e.to_string();
-                    registry.fail(task_id, &error_msg).await;
                     // Don't notify user about task cancellation - it's expected when they send a new message
                     if error_msg == "Task cancelled" {
+                        registry.fail(task_id, &error_msg).await;
                         info!("Task #{} cancelled (new message received)", task_id);
                         return;
                     }
                     if error_msg.starts_with("Task auto-cancelled due to inactivity") {
                         info!("Task #{} auto-cancelled by stale watchdog", task_id);
                         let _ = channel_id.say(&http, format!("⚠️ {}", error_msg)).await;
+                        registry.fail(task_id, &error_msg).await;
                         return;
                     }
                     warn!("Agent error: {}", e);
                     let _ = channel_id.say(&http, format!("Error: {}", e)).await;
+                    registry.fail(task_id, &error_msg).await;
                 }
             }
         });

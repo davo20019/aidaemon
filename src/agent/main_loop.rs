@@ -1191,7 +1191,10 @@ impl Agent {
                     }
                 })
                 .filter_map(|m| {
-                    // Truncate stale assistant content from prior interactions
+                    // Truncate stale assistant content from prior interactions.
+                    // We only shorten long messages to save tokens — we do NOT
+                    // append marker text (e.g. "[prior turn]") because LLMs tend
+                    // to echo such markers, producing empty or garbage replies.
                     let is_old_assistant =
                         old_interaction_assistant_ids.contains(m.id.as_str());
                     let content = if is_old_assistant {
@@ -1199,7 +1202,7 @@ impl Agent {
                             if c.len() > MAX_OLD_ASSISTANT_CONTENT_CHARS {
                                 let truncated: String =
                                     c.chars().take(MAX_OLD_ASSISTANT_CONTENT_CHARS).collect();
-                                format!("{}… [prior turn, truncated]", truncated)
+                                format!("{}…", truncated)
                             } else {
                                 c.clone()
                             }
@@ -1400,7 +1403,7 @@ impl Agent {
             // Identity manipulation detection: if the user's message contains obvious
             // injection patterns, prepend a strong system reminder to the messages so
             // the LLM is primed to reject the manipulation even under heavy context pressure.
-            if iteration <= 2 && self.depth == 0 {
+            if iteration == 1 && self.depth == 0 {
                 let lower_user = user_text.to_ascii_lowercase();
                 // These are multi-word phrases specific enough that substring matching
                 // is safe (per CLAUDE.md, single-word keywords need word-boundary matching,
@@ -2729,6 +2732,7 @@ impl Agent {
 
                 // If we used an identity-attack prefill, prepend it so the user
                 // sees the full decline (the API only returns continuation tokens).
+                let used_identity_prefill = identity_prefill_text.is_some();
                 if let Some(ref prefill) = identity_prefill_text {
                     if reply.is_empty() {
                         reply = prefill.clone();
@@ -2921,7 +2925,7 @@ impl Agent {
                 // produce a better response), but if the guard fires a second time,
                 // accept the reply to avoid "Stuck" loops (e.g., after remember_fact
                 // the LLM says "I'll remember that" — a confirmation, not a real deferral).
-                if self.depth == 0 && looks_like_deferred_action_response(&reply) {
+                if self.depth == 0 && !used_identity_prefill && looks_like_deferred_action_response(&reply) {
                     // Post-tool-success: if we've already caught one deferral after tools
                     // succeeded, accept this reply instead of stalling further.
                     if total_successful_tool_calls > 0 && stall_count >= 1 {
@@ -3169,7 +3173,14 @@ impl Agent {
                     _ => reply,
                 };
 
-                info!(session_id, iteration, "Agent completed naturally");
+                info!(
+                    session_id,
+                    iteration,
+                    reply_len = reply.len(),
+                    reply_empty = reply.trim().is_empty(),
+                    reply_preview = &reply.chars().take(120).collect::<String>() as &str,
+                    "Agent completed naturally"
+                );
                 return Ok(reply);
             }
 

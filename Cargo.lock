@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "async-imap",

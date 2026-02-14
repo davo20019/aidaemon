@@ -1733,12 +1733,20 @@ impl TelegramChannel {
                     },
                 };
                 current_typing_cancel.cancel();
-                let _ = current_status_task.await;
+                // Abort the status display task to prevent blocking if a background
+                // CLI agent monitoring task still holds a status_tx clone.
+                current_status_task.abort();
+
+                // Track whether this iteration ended in error (for deferred finalization).
+                let mut task_error: Option<String> = None;
 
                 match result {
                     Ok(reply) => {
-                        registry.complete(current_task_id).await;
-                        // Skip sending empty replies (e.g., scheduled tasks with no output)
+                        // NOTE: Task intentionally stays "running" during response
+                        // sending. This prevents a race condition where incoming
+                        // messages see no running task (has_running_task = false),
+                        // skip the queue, and spawn concurrent tasks — silently
+                        // dropping themselves. Finalized below before queue check.
                         if !reply.trim().is_empty() {
                             let html = markdown_to_telegram_html(&reply);
                             // Split long messages (Telegram limit is 4096 chars)
@@ -1767,12 +1775,17 @@ impl TelegramChannel {
                     }
                     Err(e) => {
                         let error_msg = e.to_string();
-                        registry.fail(current_task_id, &error_msg).await;
-                        // Don't notify user about task cancellation
+                        // Cancellation: fail immediately and exit (queue already
+                        // cleared by the /cancel handler).
                         if error_msg == "Task cancelled" {
+                            registry.fail(current_task_id, &error_msg).await;
                             info!("Task #{} cancelled", current_task_id);
                             return; // Exit loop on cancellation
                         }
+                        // Other errors: defer fail() so the task stays "running"
+                        // while we send the error message (same race-prevention
+                        // logic as the Ok path).
+                        task_error = Some(error_msg.clone());
                         if error_msg.starts_with("Task auto-cancelled due to inactivity") {
                             info!("Task #{} auto-cancelled by stale watchdog", current_task_id);
                             let _ = bot.send_message(chat_id, format!("⚠️ {}", error_msg)).await;
@@ -1781,6 +1794,15 @@ impl TelegramChannel {
                             let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
                         }
                     }
+                }
+
+                // Finalize the current task AFTER sending the response/error.
+                // This closes the race window where incoming messages could see
+                // no running task and spawn concurrent handlers.
+                if let Some(ref err) = task_error {
+                    registry.fail(current_task_id, err).await;
+                } else {
+                    registry.complete(current_task_id).await;
                 }
 
                 // Check if there are queued messages to process

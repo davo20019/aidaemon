@@ -102,6 +102,7 @@ pub(super) fn has_action_promise(text: &str) -> bool {
         "be",
         "give",
         "offer",
+        "know",
         "rephrase",
         "restate",
     ];

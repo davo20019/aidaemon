@@ -1117,11 +1117,17 @@ impl SlackChannel {
                     },
                 };
                 current_typing_cancel.cancel();
-                let _ = current_status_task.await;
+                // Abort the status display task to prevent blocking if a background
+                // CLI agent monitoring task still holds a status_tx clone.
+                current_status_task.abort();
+
+                let mut task_error: Option<String> = None;
 
                 match result {
                     Ok(reply) => {
-                        registry.complete(current_task_id).await;
+                        // NOTE: Task intentionally stays "running" during response
+                        // sending to prevent a race where incoming messages skip the
+                        // queue. Finalized below before queue check.
                         let mrkdwn = markdown_to_slack_mrkdwn(&reply);
                         // Restore @DisplayName → <@USERID> for proper Slack mentions
                         let mrkdwn = restore_mentions_from_cache(&mrkdwn, &user_cache_snapshot);
@@ -1139,12 +1145,12 @@ impl SlackChannel {
                     }
                     Err(e) => {
                         let error_msg = e.to_string();
-                        registry.fail(current_task_id, &error_msg).await;
-                        // Don't notify user about task cancellation
                         if error_msg == "Task cancelled" {
+                            registry.fail(current_task_id, &error_msg).await;
                             info!("Task #{} cancelled", current_task_id);
                             return; // Exit loop on cancellation
                         }
+                        task_error = Some(error_msg.clone());
                         if error_msg.starts_with("Task auto-cancelled due to inactivity") {
                             info!("Task #{} auto-cancelled by stale watchdog", current_task_id);
                             let _ = slack_post_message(
@@ -1167,6 +1173,13 @@ impl SlackChannel {
                             .await;
                         }
                     }
+                }
+
+                // Finalize the current task AFTER sending the response/error.
+                if let Some(ref err) = task_error {
+                    registry.fail(current_task_id, err).await;
+                } else {
+                    registry.complete(current_task_id).await;
                 }
 
                 // Check if there are queued messages to process
