@@ -9,6 +9,7 @@ use crate::testing::{
     setup_test_agent_v3, setup_test_agent_v3_task_leads, setup_test_agent_with_models,
     MockProvider, MockTool,
 };
+use crate::traits::store_prelude::*;
 use crate::traits::{
     BehaviorPattern, Episode, ErrorSolution, Goal, GoalV3, Procedure, ProviderResponse, StateStore,
     UserProfile,
@@ -3502,6 +3503,40 @@ async fn test_data_integrity_rule_in_prompts() {
     );
 }
 
+/// System prompt should include a response-focus rule to avoid re-answering older
+/// questions from the conversation history (context bleeding).
+#[tokio::test]
+async fn test_response_focus_rule_in_prompts() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("ok")]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    harness
+        .agent
+        .handle_message(
+            "focus_dm",
+            "hello",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    let sys = call_log[0]
+        .messages
+        .iter()
+        .find(|m| m["role"] == "system")
+        .unwrap();
+    let content = sys["content"].as_str().unwrap_or("");
+    assert!(
+        content.contains("[Response Focus]") && content.contains("latest message"),
+        "System prompt should contain response focus rule. Tail: ...{}",
+        &content[content.len().saturating_sub(800)..]
+    );
+}
+
 /// Soft-delete via delete_fact: fact should be superseded and no longer returned.
 #[tokio::test]
 async fn test_fact_soft_delete() {
@@ -6129,6 +6164,174 @@ async fn test_old_tool_intermediates_collapsed_in_follow_up() {
         "Turn 2 should include user messages from both turns, found {}",
         user_msgs.len()
     );
+}
+
+/// Regression: when the final LLM response is empty after tool calls, a
+/// synthesized "Done" message is returned. Before the fix it was NOT saved
+/// to the DB, causing the next interaction's history to merge the two user
+/// messages (missing assistant in between) and bleeding context.
+#[tokio::test]
+async fn test_synthesized_done_persisted() {
+    // At depth=0 (orchestrator), iteration 1 is the consultant pass (no tools).
+    // The mock tool_call_response triggers hallucinated-tool detection which
+    // forces needs_tools=true → Simple intent → tools loaded → loop continues.
+    let provider = MockProvider::with_responses(vec![
+        // Turn 1, iteration 1 (consultant pass): tool_call forces needs_tools=true
+        MockProvider::tool_call_response("system_info", "{}"),
+        // Turn 1, iteration 2 (tools available): tool call is executed
+        MockProvider::tool_call_response("system_info", "{}"),
+        // Turn 1, iteration 3: empty response → "Done" synthesis at depth=0
+        MockProvider::text_response(""),
+        // Turn 2, iteration 1 (consultant pass): text answer returned directly
+        MockProvider::text_response("Weather is sunny."),
+    ]);
+
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    // Reset to depth=0 so orchestrator mode + "Done" synthesis fires
+    harness.agent.set_test_orchestrator_mode();
+
+    // Turn 1: should trigger "Done" synthesis
+    let r1 = harness
+        .agent
+        .handle_message(
+            "done_persist_test",
+            "Check my system info",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        r1.starts_with("Done"),
+        "Expected Done synthesis, got: {}",
+        r1
+    );
+
+    // Turn 2: different topic
+    let r2 = harness
+        .agent
+        .handle_message(
+            "done_persist_test",
+            "Tell me the weather",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !r2.is_empty(),
+        "Turn 2 should produce a non-empty response"
+    );
+
+    // Verify: Turn 2's first LLM call should have >= 2 separate user messages (not merged)
+    let call_log = harness.provider.call_log.lock().await;
+    // Turn 2 is the 4th call (Turn 1 consumed 3 calls)
+    let turn2_call = &call_log[3];
+    let user_msgs: Vec<&serde_json::Value> = turn2_call
+        .messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .collect();
+    assert!(
+        user_msgs.len() >= 2,
+        "Turn 2 should have at least 2 separate user messages (not merged), found {}",
+        user_msgs.len()
+    );
+
+    // Verify: there should be a "Done" assistant message between the user messages
+    let done_assistant = turn2_call.messages.iter().any(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+            && m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.starts_with("Done"))
+    });
+    assert!(
+        done_assistant,
+        "Turn 2's history should contain the persisted 'Done' assistant message from Turn 1"
+    );
+}
+
+/// Regression: old interaction assistant responses should be truncated so
+/// stale context from long prior turns doesn't pollute subsequent replies.
+#[tokio::test]
+async fn test_old_interaction_assistant_content_truncated() {
+    let long_response = "A".repeat(500);
+    let provider = MockProvider::with_responses(vec![
+        // Turn 1: tool call + long response
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response(&long_response),
+        // Turn 2: direct text response
+        MockProvider::text_response("Short answer."),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    // Turn 1: produces a long assistant response
+    let r1 = harness
+        .agent
+        .handle_message(
+            "truncate_test",
+            "What system info?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1, long_response);
+
+    // Turn 2: different topic
+    let r2 = harness
+        .agent
+        .handle_message(
+            "truncate_test",
+            "What is the weather?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2, "Short answer.");
+
+    // Verify: Turn 1's 500-char assistant response is truncated in Turn 2's context
+    let call_log = harness.provider.call_log.lock().await;
+    let turn2_call = call_log.last().unwrap();
+    let assistant_msgs: Vec<&serde_json::Value> = turn2_call
+        .messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        .collect();
+
+    let has_truncated = assistant_msgs.iter().any(|m| {
+        m.get("content")
+            .and_then(|c| c.as_str())
+            .is_some_and(|s| s.contains("[prior turn, truncated]"))
+    });
+    assert!(
+        has_truncated,
+        "Turn 1's long assistant response should be truncated in Turn 2's context"
+    );
+
+    // The truncated content should be <= MAX_OLD_ASSISTANT_CONTENT_CHARS + marker (~25 chars)
+    for m in &assistant_msgs {
+        if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
+            if content.contains("[prior turn, truncated]") {
+                assert!(
+                    content.len() <= 330,
+                    "Truncated content should be ~325 chars max, got {} chars: {}...",
+                    content.len(),
+                    &content[..50.min(content.len())]
+                );
+            }
+        }
+    }
 }
 
 // ==================== Context Window Management Tests ====================

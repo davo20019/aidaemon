@@ -8,7 +8,8 @@ use crate::config::AppConfig;
 use crate::state::SqliteStateStore;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
-use crate::traits::{StateStore, Tool};
+use crate::traits::store_prelude::*;
+use crate::traits::Tool;
 
 pub async fn register_skills_tools(
     config: &AppConfig,

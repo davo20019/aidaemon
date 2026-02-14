@@ -422,7 +422,7 @@ impl DiscordChannel {
                     continue;
                 }
                 let text = match &update {
-                    StatusUpdate::Thinking(iter) => format!("Thinking... (step {})", iter),
+                    StatusUpdate::Thinking(_) => "Thinking...".to_string(),
                     StatusUpdate::ToolStart { name, summary } => {
                         if summary.is_empty() {
                             format!("Using {}...", name)

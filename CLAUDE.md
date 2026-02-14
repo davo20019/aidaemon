@@ -101,7 +101,9 @@ contains_keyword_as_words("I'll check the report", "i'll check") // true ✓
 "check deployed sites".contains("deploy")  // true ✗ — false positive
 ```
 
-**Exception:** Structural format markers like `[tool_use:`, `[tool_call:`, `[consultation]`, `[INTENT_GATE]` may use substring matching since they are format patterns, not natural language keywords.
+**Exceptions where substring matching (`.contains()`) is appropriate:**
+- Structural format markers like `[tool_use:`, `[tool_call:`, `[consultation]`, `[INTENT_GATE]` — format patterns, not natural language.
+- Multi-word phrases with enough specificity to avoid false positives (e.g., `"you are now"`, `"pretend to be"`, `"ignore previous instructions"`). These are safe because the phrase itself provides sufficient context. For single-word-ish patterns, add a trailing space or extra context to prevent substring overlap (e.g., `"act as a "` not `"act as"`, `"jailbreak mode"` not `"jailbreak"`).
 
 ### Module Map
 

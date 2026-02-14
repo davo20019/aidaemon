@@ -188,14 +188,27 @@ impl TaskRegistry {
     }
 
     /// Queue a message for later processing.
-    pub async fn queue_message(&self, session_id: &str, text: &str) -> usize {
+    /// Returns `Some(position)` if queued, or `None` if deduplicated (identical message
+    /// already exists in the queue within the dedup window).
+    pub async fn queue_message(&self, session_id: &str, text: &str) -> Option<usize> {
         let mut queues = self.queues.write().await;
         let queue = queues.entry(session_id.to_string()).or_default();
+
+        // Dedup: skip if an identical message is already in the queue and was queued
+        // within the last 30 seconds. This prevents duplicate processing when a client
+        // sends the same message multiple times in rapid succession.
+        let is_duplicate = queue.iter().any(|m| {
+            m.text == text && (Utc::now() - m.queued_at).num_seconds() < 30
+        });
+        if is_duplicate {
+            return None;
+        }
+
         queue.push_back(QueuedMessage {
             text: text.to_string(),
             queued_at: Utc::now(),
         });
-        queue.len()
+        Some(queue.len())
     }
 
     /// Pop the next queued message for a session.
@@ -216,5 +229,61 @@ impl TaskRegistry {
         if let Some(queue) = queues.get_mut(session_id) {
             queue.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_queue_deduplicates_identical_messages() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // First message queues normally
+        let result = registry.queue_message(session, "hello world").await;
+        assert_eq!(result, Some(1));
+
+        // Identical message within 30s is deduplicated
+        let result = registry.queue_message(session, "hello world").await;
+        assert_eq!(result, None);
+
+        // Different message queues normally
+        let result = registry.queue_message(session, "different message").await;
+        assert_eq!(result, Some(2));
+
+        // Only 2 messages in queue (not 3)
+        assert_eq!(registry.queue_len(session).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_queue_allows_same_message_different_sessions() {
+        let registry = TaskRegistry::new(10);
+
+        let result = registry.queue_message("session-a", "hello").await;
+        assert_eq!(result, Some(1));
+
+        // Same message but different session — should queue
+        let result = registry.queue_message("session-b", "hello").await;
+        assert_eq!(result, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_queue_allows_requeue_after_pop() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        let result = registry.queue_message(session, "hello").await;
+        assert_eq!(result, Some(1));
+
+        // Pop the message
+        let popped = registry.pop_queued_message(session).await;
+        assert!(popped.is_some());
+        assert_eq!(popped.unwrap().text, "hello");
+
+        // Same message can be queued again after being popped (queue is empty now)
+        let result = registry.queue_message(session, "hello").await;
+        assert_eq!(result, Some(1));
     }
 }

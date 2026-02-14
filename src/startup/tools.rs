@@ -25,8 +25,8 @@ use crate::tools::{
     SearchFilesTool, SendFileTool, ServiceStatusTool, ShareMemoryTool, SpawnAgentTool,
     SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
+use crate::traits::store_prelude::*;
 use crate::traits::ModelProvider;
-use crate::traits::StateStore;
 use crate::traits::Tool;
 use crate::types::MediaMessage;
 

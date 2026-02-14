@@ -843,6 +843,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::traits::store_prelude::*;
 
     async fn setup_tool() -> ManagePeopleTool {
         let db_file = tempfile::NamedTempFile::new().unwrap();

@@ -116,6 +116,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::traits::store_prelude::*;
     use crate::traits::{GoalV3, TaskV3};
 
     async fn setup_test_state() -> (Arc<dyn StateStore>, String, String) {

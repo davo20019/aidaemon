@@ -846,27 +846,34 @@ impl SlackChannel {
 
         // Check if a task is already running for this session - if so, queue this message
         if self.task_registry.has_running_task(&session_id).await {
-            let queue_pos = self
+            let queue_result = self
                 .task_registry
                 .queue_message(&session_id, &agent_text)
                 .await;
-            let current_task = self
-                .task_registry
-                .get_running_task_description(&session_id)
-                .await
-                .unwrap_or_else(|| "processing".to_string());
-            let preview: String = agent_text.chars().take(50).collect();
-            let suffix = if agent_text.len() > 50 { "..." } else { "" };
-            let _ = self
-                .post_message(
-                    &channel_id,
-                    &format!(
-                        "📥 Queued ({}): \"{}{}\" | Currently: {}",
-                        queue_pos, preview, suffix, current_task
-                    ),
-                    reply_thread.as_deref(),
-                )
-                .await;
+            match queue_result {
+                Some(queue_pos) => {
+                    let current_task = self
+                        .task_registry
+                        .get_running_task_description(&session_id)
+                        .await
+                        .unwrap_or_else(|| "processing".to_string());
+                    let preview: String = agent_text.chars().take(50).collect();
+                    let suffix = if agent_text.len() > 50 { "..." } else { "" };
+                    let _ = self
+                        .post_message(
+                            &channel_id,
+                            &format!(
+                                "📥 Queued ({}): \"{}{}\" | Currently: {}",
+                                queue_pos, preview, suffix, current_task
+                            ),
+                            reply_thread.as_deref(),
+                        )
+                        .await;
+                }
+                None => {
+                    debug!(session_id, "Dropped duplicate queued message");
+                }
+            }
             return;
         }
 
@@ -950,7 +957,7 @@ impl SlackChannel {
                     continue;
                 }
                 let text = match &update {
-                    StatusUpdate::Thinking(iter) => format!("_Thinking... (step {})_", iter),
+                    StatusUpdate::Thinking(_) => "_Thinking..._".to_string(),
                     StatusUpdate::ToolStart { name, summary } => {
                         if summary.is_empty() {
                             format!("_Using {}..._", name)
@@ -1214,9 +1221,7 @@ impl SlackChannel {
                                 continue;
                             }
                             let text = match &update {
-                                StatusUpdate::Thinking(iter) => {
-                                    format!("_Thinking... (step {})_", iter)
-                                }
+                                StatusUpdate::Thinking(_) => "_Thinking..._".to_string(),
                                 StatusUpdate::ToolStart { name, summary } => {
                                     if summary.is_empty() {
                                         format!("_Using {}..._", name)

@@ -22,7 +22,8 @@ use crate::startup::{
 };
 use crate::state::SqliteStateStore;
 use crate::tasks::TaskRegistry;
-use crate::traits::{GoalV3, StateStore};
+use crate::traits::store_prelude::*;
+use crate::traits::GoalV3;
 use crate::triggers::{self, TriggerManager};
 
 const LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC: &str =
@@ -259,7 +260,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     agent.set_self_ref(Arc::downgrade(&agent)).await;
 
     // 8. Event bus for triggers
-    let (event_tx, mut event_rx) = triggers::event_bus(queue_policy.trigger_event_capacity);
+    let (event_tx, event_rx) = triggers::event_bus(queue_policy.trigger_event_capacity);
     // 9. Triggers
     let trigger_manager = Arc::new(TriggerManager::new(config.triggers.clone(), event_tx));
     trigger_manager.spawn();
@@ -291,8 +292,166 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 9c. Heartbeat coordinator (replaces individual background task loops)
     let (_wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(16);
+    let HeartbeatSetup {
+        coordinator: heartbeat_opt,
+        telemetry: heartbeat_telemetry,
+    } = init_heartbeat_coordinator(
+        &config,
+        state.clone(),
+        event_store.clone(),
+        pruner.clone(),
+        memory_manager.clone(),
+        wake_rx,
+        inbox_dir.clone(),
+        skills_dir.clone(),
+        provider_for_promotion.clone(),
+        &router,
+        oauth_gateway.clone(),
+        watchdog_stale_threshold_secs,
+        goal_token_registry.clone(),
+    )
+    .await;
+
+    // 10. Session map (shared between hub and channels for routing)
+    // Reload persisted session→channel mappings so scheduled goals can
+    // deliver notifications after a restart.
+    let session_map: SessionMap = restore_session_map(state.clone()).await;
+
+    // 10b. Task registry for tracking background agent work
+    let task_registry = Arc::new(TaskRegistry::new(50));
+
+    // 11. Channels
+    let channel_bundle = startup_channels::build_channels(
+        &config,
+        agent.clone(),
+        config_path.clone(),
+        session_map.clone(),
+        task_registry.clone(),
+        &inbox_dir,
+        state.clone(),
+        watchdog_stale_threshold_secs,
+    )
+    .await;
+
+    // 12. Channel Hub — routes approvals, media, and notifications
+    let hub = Arc::new(
+        ChannelHub::new(channel_bundle.channels.clone(), session_map)
+            .with_queue_telemetry(queue_telemetry.clone())
+            .with_queue_policy(queue_policy.clone()),
+    );
+
+    // Give the spawn tool a reference to the hub for background mode notifications.
+    if let Some(st) = spawn_tool {
+        st.set_hub(Arc::downgrade(&hub));
+    }
+
+    // Give the agent a reference to the hub for V3 background task notifications.
+    agent.set_hub(Arc::downgrade(&hub)).await;
+
+    // Start the heartbeat coordinator now that hub and agent are available.
+    start_heartbeat_coordinator(heartbeat_opt, &hub, &agent);
+
+    // Give all channels a reference to the hub for dynamic bot registration
+    let weak_hub = Arc::downgrade(&hub);
+    channel_bundle.set_channel_hub_for_all(weak_hub);
+
+    // Start approval listener (routes tool approval requests to the right channel)
+    let hub_for_approvals = hub.clone();
+    tokio::spawn(async move {
+        hub_for_approvals.approval_listener(approval_rx).await;
+    });
+
+    // Start media listener (routes screenshots/photos/files to the right channel)
+    let hub_for_media = hub.clone();
+    tokio::spawn(async move {
+        hub_for_media.media_listener(media_rx).await;
+    });
+
+    // Inbox cleanup is now registered with the heartbeat coordinator below.
+
+    let default_alert_sessions = persist_default_alert_sessions(&config, state.clone()).await;
+
+    // 12b. Health Probe Manager (uses health_store created earlier in 1d)
+    init_health_probe_manager(&config, &health_store, hub.clone(), &default_alert_sessions).await;
+
+    // 13. Health / Dashboard server
+    spawn_dashboard_or_health_server(
+        &config,
+        state.clone(),
+        event_store.clone(),
+        health_store.clone(),
+        heartbeat_telemetry.clone(),
+        oauth_gateway.clone(),
+        write_consistency_thresholds,
+        queue_telemetry.clone(),
+    );
+
+    // 14. Event listener: route trigger events to agent -> broadcast via hub
+    let notify_session_ids = collect_notify_session_ids(&config);
+    spawn_trigger_event_listener(
+        event_rx,
+        hub.clone(),
+        agent.clone(),
+        notify_session_ids.clone(),
+        queue_telemetry.clone(),
+        queue_policy.clone(),
+    );
+
+    // 14b. Self-updater
+    if config.updates.mode != crate::config::UpdateMode::Disable {
+        let updater = Arc::new(crate::updater::Updater::new(
+            config.updates.clone(),
+            hub.clone(),
+            notify_session_ids.clone(),
+            approval_tx.clone(),
+        ));
+        updater.spawn();
+        info!(mode = ?config.updates.mode, "Self-updater initialized");
+    }
+
+    // 15. Send startup notification to first Telegram bot's allowed users.
+    channel_bundle.send_startup_notifications(&config).await;
+
+    // 16. Start channels
+    info!("Starting aidaemon v0.1.0");
+    channel_bundle.spawn_all();
+
+    // Wait for shutdown signal (ctrl+c), then gracefully pause plans
+    info!("All subsystems started, waiting for shutdown signal (ctrl+c)");
+    tokio::signal::ctrl_c().await.ok();
+    info!("Shutdown signal received");
+
+    // Shut down all MCP server processes
+    info!("Shutting down MCP servers...");
+    mcp_registry.shutdown_all().await;
+
+    Ok(())
+}
+
+struct HeartbeatSetup {
+    coordinator: Option<crate::heartbeat::HeartbeatCoordinator>,
+    telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn init_heartbeat_coordinator(
+    config: &AppConfig,
+    state: Arc<SqliteStateStore>,
+    event_store: Arc<crate::events::EventStore>,
+    pruner: Arc<crate::events::Pruner>,
+    memory_manager: Arc<crate::memory::manager::MemoryManager>,
+    wake_rx: tokio::sync::mpsc::Receiver<()>,
+    inbox_dir: String,
+    skills_dir: Option<std::path::PathBuf>,
+    provider_for_promotion: Arc<dyn crate::traits::ModelProvider>,
+    router: &crate::router::Router,
+    oauth_gateway: Option<crate::oauth::OAuthGateway>,
+    watchdog_stale_threshold_secs: u64,
+    goal_token_registry: crate::goal_tokens::GoalTokenRegistry,
+) -> HeartbeatSetup {
     let mut heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>> = None;
     let mut heartbeat_opt: Option<crate::heartbeat::HeartbeatCoordinator> = None;
+
     if config.heartbeat.enabled {
         let telemetry = Arc::new(crate::heartbeat::HeartbeatTelemetry::new());
         heartbeat_telemetry = Some(telemetry.clone());
@@ -302,7 +461,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             config.heartbeat.max_concurrent_llm_tasks,
             wake_rx,
             None, // hub set later after creation
-            Some(goal_token_registry.clone()),
+            Some(goal_token_registry),
             Some(telemetry.clone()),
         );
 
@@ -310,7 +469,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         memory_manager.register_heartbeat_jobs(&mut heartbeat);
 
         // Event pruning (daily)
-        let pruner_hb = pruner.clone();
+        let pruner_hb = pruner;
         heartbeat.register_job("event_pruning", Duration::from_secs(24 * 3600), move || {
             let p = pruner_hb.clone();
             async move {
@@ -333,7 +492,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         // Uses a conservative timeout (2x watchdog stale threshold, minimum 5 min)
         // to avoid false positives on legitimately long-running tasks.
         if watchdog_stale_threshold_secs > 0 {
-            let event_store_for_reconcile = event_store.clone();
+            let event_store_for_reconcile = event_store;
             let stale_secs = watchdog_stale_threshold_secs.saturating_mul(2).max(300);
             heartbeat.register_job(
                 "event_task_reconciliation",
@@ -398,12 +557,12 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         );
 
         // Skill promotion (every 12 hours)
-        if let Some(ref sd) = skills_dir {
+        if let Some(sd) = skills_dir {
             let promoter = Arc::new(crate::memory::skill_promotion::SkillPromoter::new(
                 state.clone(),
-                provider_for_promotion.clone(),
+                provider_for_promotion,
                 router.select(Tier::Fast).to_string(),
-                sd.clone(),
+                sd,
                 config.policy.learning_evidence_gate_enforce,
             ));
             heartbeat.register_job(
@@ -447,7 +606,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
         // Inbox cleanup (hourly)
         if config.files.enabled {
-            let cleanup_dir = inbox_dir.clone();
+            let cleanup_dir = inbox_dir;
             let retention = Duration::from_secs(config.files.retention_hours * 3600);
             heartbeat.register_job("inbox_cleanup", Duration::from_secs(3600), move || {
                 let dir = cleanup_dir.clone();
@@ -493,7 +652,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         // Policy auto-tuning hooks (shadow-first).
         if config.policy.autotune_shadow {
             let autotune_enforce = config.policy.autotune_enforce;
-            let autotune_telemetry = telemetry.clone();
+            let autotune_telemetry = telemetry;
             heartbeat.register_job("policy_autotune", Duration::from_secs(30 * 60), move || {
                 let t = autotune_telemetry.clone();
                 async move {
@@ -537,21 +696,37 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         drop(wake_rx);
 
         // OAuth cleanup still needs to run even without heartbeat
-        if let Some(ref gw) = oauth_gateway {
-            let cleanup_gw = gw.clone();
+        if let Some(gw) = oauth_gateway {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(300)).await;
-                    cleanup_gw.cleanup_expired_flows().await;
+                    gw.cleanup_expired_flows().await;
                 }
             });
         }
         info!("Heartbeat coordinator disabled");
     }
 
-    // 10. Session map (shared between hub and channels for routing)
-    // Reload persisted session→channel mappings so scheduled goals can
-    // deliver notifications after a restart.
+    HeartbeatSetup {
+        coordinator: heartbeat_opt,
+        telemetry: heartbeat_telemetry,
+    }
+}
+
+fn start_heartbeat_coordinator(
+    heartbeat_opt: Option<crate::heartbeat::HeartbeatCoordinator>,
+    hub: &Arc<ChannelHub>,
+    agent: &Arc<Agent>,
+) {
+    if let Some(mut heartbeat) = heartbeat_opt {
+        heartbeat.set_hub(Arc::downgrade(hub));
+        heartbeat.set_agent(Arc::downgrade(agent));
+        info!("Heartbeat coordinator starting with hub and agent references");
+        heartbeat.start();
+    }
+}
+
+async fn restore_session_map(state: Arc<SqliteStateStore>) -> SessionMap {
     let persisted_sessions = state.load_session_channels().await.unwrap_or_default();
     let session_count = persisted_sessions.len();
     let session_map: SessionMap = Arc::new(RwLock::new(
@@ -563,65 +738,14 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             "Restored session→channel mappings from DB"
         );
     }
+    session_map
+}
 
-    // 10b. Task registry for tracking background agent work
-    let task_registry = Arc::new(TaskRegistry::new(50));
-
-    // 11. Channels
-    let channel_bundle = startup_channels::build_channels(
-        &config,
-        agent.clone(),
-        config_path.clone(),
-        session_map.clone(),
-        task_registry.clone(),
-        &inbox_dir,
-        state.clone(),
-        watchdog_stale_threshold_secs,
-    )
-    .await;
-
-    // 12. Channel Hub — routes approvals, media, and notifications
-    let hub = Arc::new(
-        ChannelHub::new(channel_bundle.channels.clone(), session_map)
-            .with_queue_telemetry(queue_telemetry.clone())
-            .with_queue_policy(queue_policy.clone()),
-    );
-
-    // Give the spawn tool a reference to the hub for background mode notifications.
-    if let Some(st) = spawn_tool {
-        st.set_hub(Arc::downgrade(&hub));
-    }
-
-    // Give the agent a reference to the hub for V3 background task notifications.
-    agent.set_hub(Arc::downgrade(&hub)).await;
-
-    // Start the heartbeat coordinator now that hub and agent are available.
-    if let Some(mut heartbeat) = heartbeat_opt {
-        heartbeat.set_hub(Arc::downgrade(&hub));
-        heartbeat.set_agent(Arc::downgrade(&agent));
-        info!("Heartbeat coordinator starting with hub and agent references");
-        heartbeat.start();
-    }
-
-    // Give all channels a reference to the hub for dynamic bot registration
-    let weak_hub = Arc::downgrade(&hub);
-    channel_bundle.set_channel_hub_for_all(weak_hub);
-
-    // Start approval listener (routes tool approval requests to the right channel)
-    let hub_for_approvals = hub.clone();
-    tokio::spawn(async move {
-        hub_for_approvals.approval_listener(approval_rx).await;
-    });
-
-    // Start media listener (routes screenshots/photos/files to the right channel)
-    let hub_for_media = hub.clone();
-    tokio::spawn(async move {
-        hub_for_media.media_listener(media_rx).await;
-    });
-
-    // Inbox cleanup is now registered with the heartbeat coordinator below.
-
-    let default_alert_sessions = collect_default_alert_sessions(&config);
+async fn persist_default_alert_sessions(
+    config: &AppConfig,
+    state: Arc<SqliteStateStore>,
+) -> Vec<String> {
+    let default_alert_sessions = collect_default_alert_sessions(config);
     match serde_json::to_string(&default_alert_sessions) {
         Ok(serialized) => {
             if let Err(e) = state
@@ -635,59 +759,78 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             warn!(error = %e, "Failed to serialize default alert sessions");
         }
     }
+    default_alert_sessions
+}
 
-    // 12b. Health Probe Manager (uses health_store created earlier in 1d)
-    if let Some(ref store) = health_store {
-        let health_manager = Arc::new(HealthProbeManager::new(
-            store.clone(),
-            hub.clone(),
-            config.health.tick_interval_secs,
-        ));
+async fn init_health_probe_manager(
+    config: &AppConfig,
+    health_store: &Option<Arc<crate::health::HealthProbeStore>>,
+    hub: Arc<ChannelHub>,
+    default_alert_sessions: &[String],
+) {
+    let Some(store) = health_store else {
+        return;
+    };
 
-        // Seed probes from config
-        health_manager
-            .seed_from_config(&config.health.probes, &default_alert_sessions)
-            .await;
+    let health_manager = Arc::new(HealthProbeManager::new(
+        store.clone(),
+        hub,
+        config.health.tick_interval_secs,
+    ));
 
-        // Spawn tick loop
-        health_manager.clone().spawn();
+    // Seed probes from config
+    health_manager
+        .seed_from_config(&config.health.probes, default_alert_sessions)
+        .await;
 
-        // Spawn cleanup task
-        crate::health::spawn_cleanup_task(health_manager, config.health.result_retention_days);
+    // Spawn tick loop
+    health_manager.clone().spawn();
 
-        info!(
-            probe_count = config.health.probes.len(),
-            tick_interval_secs = config.health.tick_interval_secs,
-            "Health probe manager initialized"
-        );
-    }
+    // Spawn cleanup task
+    crate::health::spawn_cleanup_task(health_manager, config.health.result_retention_days);
 
-    // 13. Health / Dashboard server
+    info!(
+        probe_count = config.health.probes.len(),
+        tick_interval_secs = config.health.tick_interval_secs,
+        "Health probe manager initialized"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_dashboard_or_health_server(
+    config: &AppConfig,
+    state: Arc<SqliteStateStore>,
+    event_store: Arc<crate::events::EventStore>,
+    health_store: Option<Arc<crate::health::HealthProbeStore>>,
+    heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
+    oauth_gateway: Option<crate::oauth::OAuthGateway>,
+    write_consistency_thresholds: crate::events::WriteConsistencyThresholds,
+    queue_telemetry: Arc<QueueTelemetry>,
+) {
     let health_port = config.daemon.health_port;
     let health_bind = config.daemon.health_bind.clone();
+
     if config.daemon.dashboard_enabled {
         match crate::dashboard::get_or_create_dashboard_token() {
             Ok(dashboard_token_info) => {
                 let ds = crate::dashboard::DashboardState {
                     pool: state.pool(),
-                    event_store: Some(event_store.clone()),
+                    event_store: Some(event_store),
                     provider_kind: format!("{:?}", config.provider.kind),
                     models: config.provider.models.clone(),
                     started_at: std::time::Instant::now(),
                     dashboard_token: dashboard_token_info.token,
                     token_created_at: dashboard_token_info.created_at,
                     daily_token_budget: config.state.daily_token_budget,
-                    health_store: health_store.clone(),
-                    heartbeat_telemetry: heartbeat_telemetry.clone(),
-                    oauth_gateway: oauth_gateway.clone(),
+                    health_store,
+                    heartbeat_telemetry,
+                    oauth_gateway,
                     policy_window_days: config.policy.classify_retirement_window_days,
                     policy_max_divergence: config.policy.classify_retirement_max_divergence as f64,
                     policy_uncertainty_threshold: config.policy.uncertainty_clarify_threshold,
                     write_consistency_thresholds,
-                    queue_telemetry: queue_telemetry.clone(),
-                    auth_failures: std::sync::Arc::new(tokio::sync::Mutex::new(
-                        std::collections::HashMap::new(),
-                    )),
+                    queue_telemetry,
+                    auth_failures: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 };
                 let bind = health_bind.clone();
                 tokio::spawn(async move {
@@ -716,14 +859,10 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             }
         });
     }
+}
 
-    // 14. Event listener: route trigger events to agent -> broadcast via hub
-    let hub_for_events = hub.clone();
-    let agent_for_events = Arc::clone(&agent);
-    #[allow(unused_mut)]
+fn collect_notify_session_ids(config: &AppConfig) -> Vec<String> {
     let mut notify_session_ids: Vec<String> = Vec::new();
-    // Clone for the event listener closure (which moves its copy);
-    // the original is used later by the updater.
 
     // Collect notify session IDs from all configured bots.
     // For multi-bot setups, the first bot's users will receive trigger notifications.
@@ -747,18 +886,26 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             notify_session_ids.push(format!("slack:{}", uid));
         }
     }
-    let notify_session_ids_for_events = notify_session_ids.clone();
-    let queue_telemetry_for_events = queue_telemetry.clone();
-    let queue_policy_for_events = queue_policy.clone();
+
+    notify_session_ids
+}
+
+fn spawn_trigger_event_listener(
+    mut event_rx: triggers::EventReceiver,
+    hub: Arc<ChannelHub>,
+    agent: Arc<Agent>,
+    notify_session_ids: Vec<String>,
+    queue_telemetry: Arc<QueueTelemetry>,
+    queue_policy: crate::config::QueuePolicyConfig,
+) {
     tokio::spawn(async move {
-        let notify_session_ids = notify_session_ids_for_events;
         let mut fair_session_budget: SessionFairnessBudget = HashMap::new();
         loop {
             match event_rx.recv().await {
                 Ok(event) => {
                     let trigger_depth = event_rx.len().saturating_add(1);
-                    queue_telemetry_for_events.mark_trigger_received();
-                    let pressure = queue_telemetry_for_events.observe_trigger_depth(trigger_depth);
+                    queue_telemetry.mark_trigger_received();
+                    let pressure = queue_telemetry.observe_trigger_depth(trigger_depth);
                     if pressure.entered_warning {
                         warn!(
                             queue = "trigger_events",
@@ -775,14 +922,14 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                     }
                     let should_shed = !event.trusted
                         && should_shed_due_to_overload(
-                            &queue_policy_for_events.lanes.trigger,
+                            &queue_policy.lanes.trigger,
                             pressure.pressure,
                             &mut fair_session_budget,
                             &event.session_id,
                         );
                     if should_shed {
-                        queue_telemetry_for_events.mark_trigger_dropped(1);
-                        queue_telemetry_for_events.mark_trigger_completed();
+                        queue_telemetry.mark_trigger_dropped(1);
+                        queue_telemetry.mark_trigger_completed();
                         warn!(
                             source = %event.source,
                             session_id = %event.session_id,
@@ -809,7 +956,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                     } else {
                         crate::types::ChannelContext::internal()
                     };
-                    match agent_for_events
+                    match agent
                         .handle_message(
                             &event.session_id,
                             &wrapped_content,
@@ -821,20 +968,18 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
                         .await
                     {
                         Ok(reply) => {
-                            hub_for_events
-                                .broadcast_text(&notify_session_ids, &reply)
-                                .await;
-                            queue_telemetry_for_events.mark_trigger_completed();
+                            hub.broadcast_text(&notify_session_ids, &reply).await;
+                            queue_telemetry.mark_trigger_completed();
                         }
                         Err(e) => {
-                            queue_telemetry_for_events.mark_trigger_failed();
-                            queue_telemetry_for_events.mark_trigger_completed();
+                            queue_telemetry.mark_trigger_failed();
+                            queue_telemetry.mark_trigger_completed();
                             tracing::error!("Agent error handling trigger event: {}", e);
                         }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    queue_telemetry_for_events.mark_trigger_dropped(n);
+                    queue_telemetry.mark_trigger_dropped(n);
                     tracing::warn!("Event listener lagged by {} events", n);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -843,36 +988,6 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             }
         }
     });
-
-    // 14b. Self-updater
-    if config.updates.mode != crate::config::UpdateMode::Disable {
-        let updater = Arc::new(crate::updater::Updater::new(
-            config.updates.clone(),
-            hub.clone(),
-            notify_session_ids.clone(),
-            approval_tx.clone(),
-        ));
-        updater.spawn();
-        info!(mode = ?config.updates.mode, "Self-updater initialized");
-    }
-
-    // 15. Send startup notification to first Telegram bot's allowed users.
-    channel_bundle.send_startup_notifications(&config).await;
-
-    // 16. Start channels
-    info!("Starting aidaemon v0.1.0");
-    channel_bundle.spawn_all();
-
-    // Wait for shutdown signal (ctrl+c), then gracefully pause plans
-    info!("All subsystems started, waiting for shutdown signal (ctrl+c)");
-    tokio::signal::ctrl_c().await.ok();
-    info!("Shutdown signal received");
-
-    // Shut down all MCP server processes
-    info!("Shutting down MCP servers...");
-    mcp_registry.shutdown_all().await;
-
-    Ok(())
 }
 
 fn is_legacy_system_maintenance_goal(goal: &GoalV3) -> bool {
@@ -1105,8 +1220,10 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         - Research requiring multiple searches -> cli_agent\n\
         - Simple quick answers, memory lookups, one-off commands -> handle directly\n\
         - If a cli_agent fails -> retry with different agent or handle directly\n\
-        \n  Parameters: tool (which agent), prompt (the task), working_dir (project path), \
-        system_instruction (specialist role), async_mode (true for parallel dispatch)."
+        \n  Parameters: tool (optional specific agent), prompt (the task), working_dir (project path), \
+        system_instruction (specialist role), async_mode (true for parallel dispatch).\n\
+        If tool is omitted, the runtime auto-selects the first installed agent in this order: \
+        claude, gemini, codex, copilot, aider."
     } else {
         ""
     };
@@ -1472,7 +1589,12 @@ Use this when you specifically need per-tool execution forensics.
 - `self_diagnose`: Diagnose why a task failed. \
 Actions: list_tasks (recent task outcomes), timeline (full task event timeline), \
 diagnose (ranked root causes with evidence), compare (find divergence between two tasks).
-- `web_search`: Search the web. Returns titles, URLs, and snippets for your query. Use to find current information, research topics, check facts.
+- `web_search`: Search the web. Returns titles, URLs, and snippets for your query. \
+Use to find current information, research topics, check facts. \
+Make focused queries — one search is almost always enough. For factual lookups \
+(weather, time, scores, prices, exchange rates, simple questions), a single search \
+suffices — do NOT re-search with rephrased queries. Synthesize results promptly; \
+do not over-research.
 - `web_fetch`: Fetch a URL and extract its readable content. Strips ads/navigation. For login-required sites, use `browser` instead.
 {browser_tool_doc}{send_file_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}{manage_cli_agents_tool_doc}{health_probe_tool_doc}{manage_skills_tool_doc}{use_skill_tool_doc}{skill_resources_tool_doc}{manage_people_tool_doc}{http_request_tool_doc}{manage_oauth_tool_doc}{direct_mode_doc}
 
@@ -1506,6 +1628,7 @@ STOP asking and USE YOUR TOOLS immediately. Never claim you can't access files o
 (category \"preference\") so you remember next time.
 - **Show results.** After using a tool, include the actual output in your response.
 - **Be concise.** Adjust verbosity to user preferences.
+- **Plain text math.** Never use LaTeX ($...$, \\times, \\frac). Use plain symbols: × ÷ √ ≈ ≤ ≥ and a/b for fractions.
 - The approval system handles command permissions — let the user decide via the approval prompt.\
 {social_intelligence_guidelines}{v3_orchestration_section}"
     )

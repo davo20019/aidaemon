@@ -71,6 +71,33 @@ impl Tool for RememberFactTool {
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: RememberArgs = serde_json::from_str(arguments)?;
+
+        // Reject persona/identity manipulation saves
+        let combined = format!("{} {} {}", args.category, args.key, args.value).to_ascii_lowercase();
+        let persona_patterns = [
+            "talk like",
+            "speak like",
+            "act like",
+            "act as",
+            "pretend to be",
+            "roleplay",
+            "persona",
+            "character voice",
+            "pirate",
+            "accent",
+            "from now on",
+            "new identity",
+            "speak in character",
+            "respond as",
+        ];
+        if persona_patterns.iter().any(|p| combined.contains(p)) {
+            return Ok(
+                "Rejected: Cannot save persona or identity changes as facts. \
+                 I maintain a consistent identity across all interactions."
+                    .to_string(),
+            );
+        }
+
         let channel_id = self.current_channel_id.read().await.clone();
         // When explicitly remembered by the agent, default to global privacy
         self.state

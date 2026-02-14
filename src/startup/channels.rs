@@ -12,7 +12,8 @@ use crate::channels::{ChannelHub, SessionMap, TelegramChannel};
 use crate::config::AppConfig;
 use crate::state::SqliteStateStore;
 use crate::tasks::TaskRegistry;
-use crate::traits::{Channel, StateStore};
+use crate::traits::store_prelude::*;
+use crate::traits::Channel;
 
 pub struct ChannelBundle {
     pub channels: Vec<Arc<dyn Channel>>,

@@ -249,12 +249,14 @@ args = ["-p", "--dangerously-skip-permissions", "--output-format", "stream-json"
 
 [cli_agents.tools.gemini]
 command = "gemini"
-args = ["-p", "--sandbox=false", "--yolo"]
+args = ["--sandbox=false", "--yolo", "--output-format", "stream-json"]
 
 [cli_agents.tools.codex]
 command = "codex"
 args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
 ```
+
+When `cli_agent` runs without specifying a `tool`, aidaemon now auto-selects the best installed default in this order: `claude`, `gemini`, `codex`, `copilot`, `aider`.
 
 Conservative profile (primary machine):
 

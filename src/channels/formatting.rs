@@ -1,5 +1,136 @@
+/// Strip LaTeX math notation that Telegram/Slack/Discord can't render.
+/// Protects code blocks (``` fences) from stripping.
+pub(crate) fn strip_latex(text: &str) -> String {
+    // Split text into code-block and non-code-block segments.
+    // Process only non-code segments through strip_latex_inner.
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find("```") {
+        // Strip LaTeX in the text before the code block
+        let before = &remaining[..start];
+        result.push_str(&strip_latex_inner(before));
+
+        // Find the closing ```
+        let after_opening = &remaining[start + 3..];
+        if let Some(end_offset) = after_opening.find("```") {
+            // Include opening ```, content, and closing ```
+            let code_block = &remaining[start..start + 3 + end_offset + 3];
+            result.push_str(code_block);
+            remaining = &remaining[start + 3 + end_offset + 3..];
+        } else {
+            // Unclosed code block — treat rest as code
+            result.push_str(&remaining[start..]);
+            return result;
+        }
+    }
+
+    // Process any remaining text after the last code block
+    result.push_str(&strip_latex_inner(remaining));
+    result
+}
+
+/// Inner LaTeX stripping on non-code text.
+fn strip_latex_inner(text: &str) -> String {
+    use regex::Regex;
+
+    let mut s = text.to_string();
+
+    // Replace common LaTeX commands with Unicode equivalents
+    s = s.replace("\\times", "×");
+    s = s.replace("\\div", "÷");
+    s = s.replace("\\pm", "±");
+    s = s.replace("\\leq", "≤");
+    s = s.replace("\\geq", "≥");
+    s = s.replace("\\neq", "≠");
+    s = s.replace("\\approx", "≈");
+    s = s.replace("\\infty", "∞");
+    s = s.replace("\\cdot", "·");
+    s = s.replace("\\alpha", "α");
+    s = s.replace("\\beta", "β");
+    s = s.replace("\\gamma", "γ");
+    s = s.replace("\\delta", "δ");
+    s = s.replace("\\theta", "θ");
+    s = s.replace("\\lambda", "λ");
+    s = s.replace("\\sigma", "σ");
+    s = s.replace("\\pi", "π");
+
+    // Common trig/log functions: \sin → sin, \cos → cos, etc.
+    for func in &[
+        "sin", "cos", "tan", "log", "ln", "exp", "lim", "max", "min",
+    ] {
+        s = s.replace(&format!("\\{}", func), *func);
+    }
+
+    // \left( and \right) → ( and )
+    s = s.replace("\\left(", "(");
+    s = s.replace("\\right)", ")");
+    s = s.replace("\\left[", "[");
+    s = s.replace("\\right]", "]");
+    s = s.replace("\\left|", "|");
+    s = s.replace("\\right|", "|");
+    s = s.replace("\\left\\{", "{");
+    s = s.replace("\\right\\}", "}");
+
+    // Process \sqrt BEFORE \frac so nested \sqrt{...} inside \frac is resolved first
+    let sqrt_re = Regex::new(r"\\sqrt\{([^}]*)\}").unwrap();
+    // Apply sqrt multiple times to handle nesting
+    for _ in 0..3 {
+        let new = sqrt_re.replace_all(&s, "√($1)").to_string();
+        if new == s {
+            break;
+        }
+        s = new;
+    }
+
+    // \frac with nested-brace-aware matching (one level of nesting)
+    // Matches \frac{...{...}...}{...{...}...}
+    let frac_re =
+        Regex::new(r"\\frac\{((?:[^{}]|\{[^{}]*\})*)\}\{((?:[^{}]|\{[^{}]*\})*)\}").unwrap();
+    // Apply multiple times for nested fracs
+    for _ in 0..3 {
+        let new = frac_re.replace_all(&s, "($1)/($2)").to_string();
+        if new == s {
+            break;
+        }
+        s = new;
+    }
+
+    // Superscript handling: ^2 → ², ^3 → ³, ^n → ⁿ, ^{...} → strip braces
+    s = s.replace("^2", "²");
+    s = s.replace("^3", "³");
+    s = s.replace("^n", "ⁿ");
+    // ^{expr} → ^(expr)
+    let sup_re = Regex::new(r"\^\{([^}]*)\}").unwrap();
+    s = sup_re.replace_all(&s, "^($1)").to_string();
+
+    // Subscript: _{expr} → _(expr)
+    let sub_re = Regex::new(r"_\{([^}]*)\}").unwrap();
+    s = sub_re.replace_all(&s, "_($1)").to_string();
+
+    // Strip remaining \command sequences that weren't caught above
+    // (e.g., \text{...} → content, \mathrm{...} → content)
+    let text_cmd_re = Regex::new(r"\\(?:text|mathrm|mathbf|mathit|textbf)\{([^}]*)\}").unwrap();
+    s = text_cmd_re.replace_all(&s, "$1").to_string();
+
+    // Strip $$ ... $$ display math delimiters (non-greedy)
+    let display_re = Regex::new(r"(?s)\$\$(.+?)\$\$").unwrap();
+    s = display_re.replace_all(&s, "$1").to_string();
+
+    // Strip \[ ... \] display math delimiters
+    let display_bracket_re = Regex::new(r"(?s)\\\[(.+?)\\\]").unwrap();
+    s = display_bracket_re.replace_all(&s, "$1").to_string();
+
+    // Strip $ ... $ inline math delimiters (non-greedy, single-line)
+    let inline_re = Regex::new(r"\$([^$]+?)\$").unwrap();
+    s = inline_re.replace_all(&s, "$1").to_string();
+
+    s
+}
+
 /// Convert common LLM markdown to Telegram-compatible HTML.
 pub(crate) fn markdown_to_telegram_html(md: &str) -> String {
+    let md = strip_latex(md);
     let mut result = String::with_capacity(md.len() + md.len() / 4);
     let lines: Vec<&str> = md.lines().collect();
     let mut i = 0;
@@ -657,6 +788,92 @@ mod tests {
         let result = sanitize_filename(&long);
         assert!(result.len() <= 200);
         assert!(result.ends_with(".txt"));
+    }
+
+    #[test]
+    fn test_strip_latex_inline() {
+        assert_eq!(strip_latex("$247 \\times 38$"), "247 × 38");
+        let frac_result = strip_latex("$\\frac{a}{b}$");
+        assert!(frac_result.contains("a"));
+        assert!(frac_result.contains("b"));
+        assert!(frac_result.contains('/'));
+        assert!(!frac_result.contains("\\frac"));
+        let sqrt_result = strip_latex("$\\sqrt{x}$");
+        assert!(sqrt_result.contains('√'));
+        assert!(sqrt_result.contains('x'));
+        assert!(!sqrt_result.contains("\\sqrt"));
+    }
+
+    #[test]
+    fn test_strip_latex_display() {
+        assert_eq!(strip_latex("$$x + y$$"), "x + y");
+    }
+
+    #[test]
+    fn test_strip_latex_preserves_lone_dollar() {
+        // A single $ without a closing $ should not be stripped
+        assert_eq!(strip_latex("costs $50"), "costs $50");
+    }
+
+    #[test]
+    fn test_strip_latex_in_telegram_html() {
+        let result = markdown_to_telegram_html("The answer is $247 \\times 38 = 9386$.");
+        assert!(result.contains("247 × 38 = 9386"));
+        assert!(!result.contains('$'));
+        assert!(!result.contains("\\times"));
+    }
+
+    #[test]
+    fn test_strip_latex_complex_quadratic() {
+        // The quadratic formula: \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}
+        let input = r"$$x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$";
+        let result = strip_latex(input);
+        // Should not contain any LaTeX commands
+        assert!(!result.contains("\\frac"), "still contains \\frac: {}", result);
+        assert!(!result.contains("\\sqrt"), "still contains \\sqrt: {}", result);
+        assert!(!result.contains("\\pm"), "still contains \\pm: {}", result);
+        assert!(!result.contains("$$"), "still contains $$: {}", result);
+        // Should contain readable math
+        assert!(result.contains('√'), "missing √: {}", result);
+        assert!(result.contains('±'), "missing ±: {}", result);
+        assert!(result.contains('/'), "missing /: {}", result);
+    }
+
+    #[test]
+    fn test_strip_latex_superscripts() {
+        assert_eq!(strip_latex("$x^2$"), "x²");
+        assert_eq!(strip_latex("$x^3$"), "x³");
+        let result = strip_latex("$x^{n+1}$");
+        assert!(result.contains("n+1"));
+        assert!(!result.contains('{'));
+    }
+
+    #[test]
+    fn test_strip_latex_trig_functions() {
+        let result = strip_latex(r"$\sin(x) + \cos(y)$");
+        assert!(result.contains("sin(x)"));
+        assert!(result.contains("cos(y)"));
+        assert!(!result.contains("\\sin"));
+        assert!(!result.contains("\\cos"));
+    }
+
+    #[test]
+    fn test_strip_latex_left_right_delimiters() {
+        let result = strip_latex(r"$\left(\frac{a}{b}\right)$");
+        assert!(!result.contains("\\left"));
+        assert!(!result.contains("\\right"));
+        assert!(result.contains('('));
+        assert!(result.contains(')'));
+    }
+
+    #[test]
+    fn test_strip_latex_preserves_code_blocks() {
+        let input = "Here is math: $x^2$\n```\n$\\frac{a}{b}$\n```\nMore math: $y^3$";
+        let result = strip_latex(input);
+        assert!(result.contains("x²"), "should strip latex outside code: {}", result);
+        assert!(result.contains("y³"), "should strip latex outside code: {}", result);
+        // Inside code block, LaTeX should be preserved
+        assert!(result.contains("\\frac{a}{b}"), "should preserve latex in code: {}", result);
     }
 
     mod proptest_formatting {

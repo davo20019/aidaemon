@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use super::formatting::{
     build_help_text, format_number, html_escape, markdown_to_telegram_html, sanitize_filename,
-    split_message,
+    split_message, strip_latex,
 };
 use crate::agent::Agent;
 #[cfg(feature = "discord")]
@@ -1477,23 +1477,31 @@ impl TelegramChannel {
                     .await;
                 return;
             }
-            let queue_pos = self.task_registry.queue_message(&session_id, &text).await;
-            let current_task = self
-                .task_registry
-                .get_running_task_description(&session_id)
-                .await
-                .unwrap_or_else(|| "processing".to_string());
-            let preview: String = text.chars().take(50).collect();
-            let suffix = if text.len() > 50 { "..." } else { "" };
-            let _ = bot
-                .send_message(
-                    msg.chat.id,
-                    format!(
-                        "📥 Queued ({}): \"{}{}\" | Currently: {}",
-                        queue_pos, preview, suffix, current_task
-                    ),
-                )
-                .await;
+            let queue_result = self.task_registry.queue_message(&session_id, &text).await;
+            match queue_result {
+                Some(queue_pos) => {
+                    let current_task = self
+                        .task_registry
+                        .get_running_task_description(&session_id)
+                        .await
+                        .unwrap_or_else(|| "processing".to_string());
+                    let preview: String = text.chars().take(50).collect();
+                    let suffix = if text.len() > 50 { "..." } else { "" };
+                    let _ = bot
+                        .send_message(
+                            msg.chat.id,
+                            format!(
+                                "📥 Queued ({}): \"{}{}\" | Currently: {}",
+                                queue_pos, preview, suffix, current_task
+                            ),
+                        )
+                        .await;
+                }
+                None => {
+                    // Duplicate message detected — silently ignore
+                    debug!(session_id, "Dropped duplicate queued message");
+                }
+            }
             return;
         }
 
@@ -1569,7 +1577,7 @@ impl TelegramChannel {
                     continue;
                 }
                 let text = match &update {
-                    StatusUpdate::Thinking(iter) => format!("Thinking... (step {})", iter),
+                    StatusUpdate::Thinking(_) => "Thinking...".to_string(),
                     StatusUpdate::ToolStart { name, summary } => {
                         if summary.is_empty() {
                             format!("Using {}...", name)
@@ -1735,7 +1743,7 @@ impl TelegramChannel {
                             let html = markdown_to_telegram_html(&reply);
                             // Split long messages (Telegram limit is 4096 chars)
                             let html_chunks = split_message(&html, 4096);
-                            let plain_chunks = split_message(&reply, 4096);
+                            let plain_chunks = split_message(&strip_latex(&reply), 4096);
                             for (i, html_chunk) in html_chunks.iter().enumerate() {
                                 let plain_chunk = plain_chunks
                                     .get(i)
@@ -1833,9 +1841,7 @@ impl TelegramChannel {
                                 continue;
                             }
                             let text = match &update {
-                                StatusUpdate::Thinking(iter) => {
-                                    format!("Thinking... (step {})", iter)
-                                }
+                                StatusUpdate::Thinking(_) => "Thinking...".to_string(),
                                 StatusUpdate::ToolStart { name, summary } => {
                                     if summary.is_empty() {
                                         format!("Using {}...", name)
@@ -1918,8 +1924,11 @@ impl Channel for TelegramChannel {
                 .unwrap_or(0) as i64
         });
         let html = markdown_to_telegram_html(text);
+        let plain = strip_latex(text);
         for chunk in split_message(&html, 4096) {
-            if let Err(e) = send_html_or_fallback(&self.bot, ChatId(chat_id), &chunk, text).await {
+            if let Err(e) =
+                send_html_or_fallback(&self.bot, ChatId(chat_id), &chunk, &plain).await
+            {
                 warn!("Failed to send message: {}", e);
             }
         }

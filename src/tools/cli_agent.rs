@@ -202,7 +202,12 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
         (
             "gemini",
             "gemini",
-            vec!["-p", "--sandbox=false", "--yolo"],
+            vec![
+                "--sandbox=false",
+                "--yolo",
+                "--output-format",
+                "stream-json",
+            ],
             "Gemini CLI — Google's AI coding agent (auto-approve mode)",
         ),
         (
@@ -230,6 +235,12 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
     ]
 }
 
+/// Preferred fallback order when `action=run` omits `tool`.
+///
+/// Rationale: keep common coding agents at the front so orchestrator calls can
+/// simply provide a prompt and still use a strong default.
+const DEFAULT_TOOL_PRIORITY: &[&str] = &["claude", "gemini", "codex", "copilot", "aider"];
+
 /// Check if a command exists on the system.
 async fn command_exists(command: &str) -> bool {
     tokio::process::Command::new("which")
@@ -241,6 +252,31 @@ async fn command_exists(command: &str) -> bool {
 }
 
 impl CliAgentTool {
+    fn tool_priority(name: &str) -> usize {
+        let lower = name.to_ascii_lowercase();
+        DEFAULT_TOOL_PRIORITY
+            .iter()
+            .position(|known| *known == lower)
+            .unwrap_or(DEFAULT_TOOL_PRIORITY.len())
+    }
+
+    /// Pick a default tool if caller omits `tool`.
+    /// Preference: known coding CLIs first, then lexicographic order.
+    fn default_tool_name(&self) -> Option<String> {
+        let tools = self.tools.read().unwrap();
+        if tools.is_empty() {
+            return None;
+        }
+
+        let mut names: Vec<String> = tools.keys().cloned().collect();
+        names.sort_by(|a, b| {
+            Self::tool_priority(a)
+                .cmp(&Self::tool_priority(b))
+                .then_with(|| a.cmp(b))
+        });
+        names.into_iter().next()
+    }
+
     fn is_owner_role(user_role: Option<&str>) -> bool {
         user_role.is_some_and(|role| role.eq_ignore_ascii_case("owner"))
     }
@@ -862,7 +898,7 @@ impl CliAgentTool {
         }
 
         // Get entry from the tools map (clone what we need, release lock)
-        let (command, args, timeout, max_output) = {
+        let (command, mut args, timeout, max_output) = {
             let tools = self.tools.read().unwrap();
             let entry = tools
                 .get(tool_name)
@@ -874,6 +910,34 @@ impl CliAgentTool {
                 entry.max_output_chars,
             )
         };
+
+        // Claude Code can refuse to start when it detects it's running inside a
+        // parent Claude session. Also, aidaemon has no TTY for interactive mode.
+        // Force non-interactive mode and remove the nesting marker env var.
+        if tool_name.eq_ignore_ascii_case("claude") {
+            // Always run non-interactively.
+            let has_print = args.iter().any(|a| a == "-p" || a == "--print");
+            if !has_print {
+                args.push("--print".to_string());
+            }
+
+            // Prefer stream-json output so we can show progress updates.
+            let has_output_format = args.iter().any(|a| a == "--output-format" || a == "-o");
+            if !has_output_format {
+                args.push("--output-format".to_string());
+                args.push("stream-json".to_string());
+            }
+
+            let has_partial = args.iter().any(|a| a == "--include-partial-messages");
+            if !has_partial {
+                args.push("--include-partial-messages".to_string());
+            }
+
+            let has_verbose = args.iter().any(|a| a == "--verbose");
+            if !has_verbose {
+                args.push("--verbose".to_string());
+            }
+        }
 
         // Re-check that command still exists
         if !command_exists(&command).await {
@@ -930,12 +994,19 @@ impl CliAgentTool {
             .await
             .unwrap_or(0);
 
+        let state_for_completion = self.state.clone();
+
         // Build command
         let mut cmd = tokio::process::Command::new(&command);
         for arg in &args {
             cmd.arg(arg);
         }
         cmd.arg(&final_prompt);
+
+        // Ensure Claude child runs aren't treated as nested Claude sessions.
+        if tool_name.eq_ignore_ascii_case("claude") {
+            cmd.env_remove("CLAUDECODE");
+        }
 
         if let Some(dir) = working_dir {
             cmd.current_dir(dir);
@@ -965,9 +1036,23 @@ impl CliAgentTool {
             });
         }
 
-        let mut child = cmd.spawn()?;
-        let pid = child.id().unwrap_or(0);
         let started_at_instant = Instant::now();
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // Ensure invocations don't stay "running" forever when spawn fails.
+                if invocation_id != 0 {
+                    let duration = started_at_instant.elapsed().as_secs_f64();
+                    let msg = format!("Failed to spawn CLI agent '{}': {}", tool_name, e);
+                    let summary: String = msg.chars().take(200).collect();
+                    let _ = state_for_completion
+                        .log_cli_agent_complete(invocation_id, None, &summary, false, duration)
+                        .await;
+                }
+                return Err(e.into());
+            }
+        };
+        let pid = child.id().unwrap_or(0);
 
         // stdin is null (prompt passed via args), so just drop any handle
         drop(child.stdin.take());
@@ -998,6 +1083,8 @@ impl CliAgentTool {
 
         // Spawn a task to read stdout/stderr, emit progress updates, and signal completion
         let pid_for_kill = pid;
+        let invocation_started_at = started_at_instant;
+        let max_output_for_log = max_output;
         tokio::spawn(async move {
             let mut stdout_reader = BufReader::new(stdout).lines();
             let mut stderr_reader = BufReader::new(stderr).lines();
@@ -1196,6 +1283,41 @@ impl CliAgentTool {
                     Err(_) => None,
                 }
             };
+
+            // Persist completion even if the caller timed out and moved the task to background.
+            if invocation_id != 0 {
+                let duration = invocation_started_at.elapsed().as_secs_f64();
+                let (success, output_summary) = if loop_detected {
+                    (false, "Killed - infinite loop detected".to_string())
+                } else {
+                    // Prefer stdout for success summaries; fall back to display output for failures.
+                    let stdout_text = stdout_buf_writer.lock().await.clone();
+                    let display_text = display_buf_writer.lock().await.clone();
+
+                    if exit_code == Some(0) {
+                        let result_text =
+                            extract_meaningful_output(&stdout_text, max_output_for_log);
+                        let summary: String = result_text.chars().take(200).collect();
+                        (true, summary)
+                    } else {
+                        let auth_msg =
+                            CliAgentTool::detect_auth_error(&display_text, &tool_name_owned);
+                        let summary_src = auth_msg.unwrap_or(display_text);
+                        let summary: String = summary_src.chars().take(200).collect();
+                        (false, summary)
+                    }
+                };
+
+                let _ = state_for_completion
+                    .log_cli_agent_complete(
+                        invocation_id,
+                        exit_code,
+                        &output_summary,
+                        success,
+                        duration,
+                    )
+                    .await;
+            }
             let _ = completion_tx.send((exit_code, loop_detected, loop_pattern_count));
         });
 
@@ -1222,7 +1344,6 @@ impl CliAgentTool {
         }
 
         // Wait for completion with timeout
-        let state = self.state.clone();
         let working_dir_owned = working_dir.map(|s| s.to_string());
         let dir_locks = self.working_dir_locks.clone();
 
@@ -1232,8 +1353,6 @@ impl CliAgentTool {
         if let Some(ref dir) = working_dir_owned {
             dir_locks.lock().await.remove(dir);
         }
-
-        let duration = started_at_instant.elapsed().as_secs_f64();
 
         match result {
             Ok(Ok((exit_code, was_loop_killed, loop_count))) => {
@@ -1257,17 +1376,6 @@ impl CliAgentTool {
                             summary: format!("{} killed - infinite loop detected", tool_name),
                         });
                     }
-
-                    // Log completion
-                    let _ = state
-                        .log_cli_agent_complete(
-                            invocation_id,
-                            None,
-                            "Killed - infinite loop detected",
-                            false,
-                            duration,
-                        )
-                        .await;
 
                     return Ok(format!(
                         "ERROR: CLI agent '{}' was automatically killed - INFINITE LOOP DETECTED.\n\n\
@@ -1326,28 +1434,8 @@ impl CliAgentTool {
 
                     // Check for auth errors
                     if let Some(auth_msg) = Self::detect_auth_error(&display_output, tool_name) {
-                        let _ = state
-                            .log_cli_agent_complete(
-                                invocation_id,
-                                exit_code,
-                                &auth_msg,
-                                false,
-                                duration,
-                            )
-                            .await;
                         return Ok(auth_msg);
                     }
-
-                    let output_summary: String = display_output.chars().take(200).collect();
-                    let _ = state
-                        .log_cli_agent_complete(
-                            invocation_id,
-                            exit_code,
-                            &output_summary,
-                            false,
-                            duration,
-                        )
-                        .await;
 
                     let mut error_msg = format!(
                         "ERROR: CLI agent '{}' failed (exit code {:?}).\n\n## Error Output\n{}",
@@ -1372,17 +1460,6 @@ impl CliAgentTool {
                 }
 
                 // Success path
-                let output_summary: String = result_text.chars().take(200).collect();
-                let _ = state
-                    .log_cli_agent_complete(
-                        invocation_id,
-                        exit_code,
-                        &output_summary,
-                        true,
-                        duration,
-                    )
-                    .await;
-
                 let mut final_result = result_text;
                 if let Some(diff) = diff_section {
                     final_result.push_str(&diff);
@@ -1391,15 +1468,6 @@ impl CliAgentTool {
             }
             Ok(Err(_)) => {
                 // Channel closed unexpectedly
-                let _ = state
-                    .log_cli_agent_complete(
-                        invocation_id,
-                        None,
-                        "Task failed unexpectedly",
-                        false,
-                        duration,
-                    )
-                    .await;
                 Ok(format!(
                     "ERROR: CLI agent '{}' task failed unexpectedly",
                     tool_name
@@ -1870,7 +1938,7 @@ impl Tool for CliAgentTool {
                     "tool": {
                         "type": "string",
                         "enum": names_vec,
-                        "description": "Which CLI agent to use (required for action=run)"
+                        "description": "Which CLI agent to use. Optional for action=run: if omitted, a default installed agent is selected automatically (priority: claude, gemini, codex, copilot, aider)."
                     },
                     "prompt": {
                         "type": "string",
@@ -1931,8 +1999,9 @@ impl Tool for CliAgentTool {
             "run" => {
                 let tool = args
                     .tool
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'tool' parameter for action=run"))?;
+                    .clone()
+                    .or_else(|| self.default_tool_name())
+                    .ok_or_else(|| anyhow::anyhow!("No CLI agents available for action=run"))?;
                 let prompt = args
                     .prompt
                     .as_ref()
@@ -1962,7 +2031,7 @@ impl Tool for CliAgentTool {
                     match self
                         .request_daemonization_approval(
                             session_id.trim(),
-                            tool,
+                            &tool,
                             prompt,
                             &daemon_hits,
                         )
@@ -1985,7 +2054,7 @@ impl Tool for CliAgentTool {
                     }
                 }
                 self.handle_run(
-                    tool,
+                    &tool,
                     prompt,
                     args.working_dir.as_deref(),
                     &session_id,
@@ -2024,6 +2093,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::MockProvider;
+    use crate::traits::store_prelude::*;
     use crate::traits::Tool;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2200,8 +2270,15 @@ mod tests {
     #[tokio::test]
     async fn test_run_missing_tool_param() {
         let (tool, _db) = setup_echo_tool().await;
-        let result = tool.call(r#"{"action":"run","prompt":"test"}"#).await;
-        assert!(result.is_err());
+        let result = tool
+            .call(r#"{"action":"run","prompt":"test"}"#)
+            .await
+            .unwrap();
+        assert!(
+            result.contains("test"),
+            "Expected default tool fallback output, got: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -2884,6 +2961,85 @@ mod tests {
         assert!(invocations[0].duration_secs.is_some());
     }
 
+    #[tokio::test]
+    async fn test_timeout_run_still_logs_completion() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+        let state_clone = state.clone();
+        let provider = Arc::new(MockProvider::new());
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+
+        let mut tools_map = HashMap::new();
+        tools_map.insert(
+            "bash".to_string(),
+            CliToolEntry {
+                command: "bash".to_string(),
+                args: vec!["-c".to_string()],
+                description: "".to_string(),
+                timeout: Duration::from_millis(50),
+                max_output_chars: 10000,
+                is_dynamic: false,
+            },
+        );
+
+        let tool = CliAgentTool {
+            tools: Arc::new(std::sync::RwLock::new(tools_map)),
+            tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
+            running: Arc::new(Mutex::new(HashMap::new())),
+            working_dir_locks: Arc::new(Mutex::new(HashSet::new())),
+            state: state as Arc<dyn StateStore>,
+            provider: provider as Arc<dyn crate::traits::ModelProvider>,
+            default_timeout: Duration::from_secs(10),
+            default_max_output: 10000,
+            max_concurrent: 3,
+            approval_tx,
+        };
+
+        // Run a command that will exceed the short timeout and be moved to background,
+        // but should still eventually be logged as completed in the DB.
+        let resp = tool
+            .call(
+                r#"{"action":"run","tool":"bash","prompt":"sleep 0.2; echo done","_session_id":"sess1"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.contains("Moved to background") || resp.contains("still running"),
+            "expected background/timeout response, got: {}",
+            resp
+        );
+
+        // Allow the child to finish and the completion logger to flush to SQLite.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let invocations = state_clone.get_cli_agent_invocations(10).await.unwrap();
+        assert!(!invocations.is_empty(), "Expected invocation logged");
+        assert_eq!(invocations[0].agent_name, "bash");
+        assert_eq!(
+            invocations[0].success,
+            Some(true),
+            "Expected background invocation to be marked successful"
+        );
+        assert!(
+            invocations[0].completed_at.is_some(),
+            "Expected completed_at to be set"
+        );
+        assert!(
+            invocations[0].duration_secs.unwrap_or(0.0) > 0.0,
+            "Expected a positive duration"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Git diff capture test
     // -----------------------------------------------------------------------
@@ -2971,6 +3127,22 @@ mod tests {
         // Clear all tools
         tool.tools.write().unwrap().clear();
         assert!(!tool.has_tools());
+    }
+
+    #[tokio::test]
+    async fn test_run_without_tool_and_no_agents_errors() {
+        let (tool, _db) = setup_echo_tool().await;
+        tool.tools.write().unwrap().clear();
+        tool.tool_names.write().unwrap().clear();
+
+        let result = tool.call(r#"{"action":"run","prompt":"test"}"#).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("No CLI agents available"),
+            "Expected no-agents error, got: {}",
+            err
+        );
     }
 
     // -----------------------------------------------------------------------
