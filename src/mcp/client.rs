@@ -39,6 +39,16 @@ const SAFE_ENV_KEYS: &[&str] = &[
     "NODE_PATH",
     "NPM_CONFIG_PREFIX",
     "NVM_DIR",
+    // Windows-specific environment variables
+    "USERPROFILE",
+    "USERNAME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "COMSPEC",
+    "SYSTEMROOT",
+    "WINDIR",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
 ];
 
 /// JSON-RPC client over stdio for MCP protocol.

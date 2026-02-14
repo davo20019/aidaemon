@@ -2129,6 +2129,7 @@ impl Channel for TelegramChannel {
 }
 
 /// Replace the current process with a fresh instance of itself.
+#[cfg(unix)]
 fn restart_process() {
     use std::os::unix::process::CommandExt;
 
@@ -2146,6 +2147,26 @@ fn restart_process() {
     // This replaces the current process — does not return on success
     let err = std::process::Command::new(&exe).args(&args).exec();
     tracing::error!("exec failed: {}", err);
+}
+
+/// Restart on Windows: spawn a new process then exit the current one.
+#[cfg(windows)]
+fn restart_process() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("Failed to get current exe path: {}", e);
+            return;
+        }
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    tracing::info!(exe = %exe.display(), "Spawning new process and exiting");
+
+    match std::process::Command::new(&exe).args(&args).spawn() {
+        Ok(_) => std::process::exit(0),
+        Err(e) => tracing::error!("Failed to spawn new process: {}", e),
+    }
 }
 
 /// Send a message with HTML parse mode, falling back to plain text on failure.

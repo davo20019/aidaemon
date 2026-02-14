@@ -357,8 +357,16 @@ impl ProbeExecutor {
         let start = Instant::now();
 
         // Parse command (simple shell execution)
+        #[cfg(unix)]
         let output = Command::new("sh")
             .arg("-c")
+            .arg(&probe.target)
+            .output()
+            .await;
+
+        #[cfg(windows)]
+        let output = Command::new("cmd.exe")
+            .arg("/C")
             .arg(&probe.target)
             .output()
             .await;

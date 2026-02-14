@@ -125,7 +125,7 @@ impl OAuthGateway {
     fn generate_code_verifier() -> String {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+        let bytes: Vec<u8> = (0..32).map(|_| rng.gen::<u8>()).collect();
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
     }
 

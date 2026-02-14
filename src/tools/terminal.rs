@@ -451,9 +451,19 @@ impl TerminalTool {
 
     /// Run a command: spawn, wait up to initial_timeout, return output or move to background.
     async fn handle_run(&self, command: &str) -> anyhow::Result<String> {
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(command)
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c");
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new("cmd.exe");
+            c.arg("/C");
+            c
+        };
+        cmd.arg(command)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         configure_command_for_process_group(&mut cmd);

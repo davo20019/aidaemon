@@ -1,20 +1,34 @@
+#[cfg(feature = "encryption")]
 use std::collections::HashMap;
+#[cfg(feature = "encryption")]
 use std::fs::File;
+#[cfg(feature = "encryption")]
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "encryption")]
+use std::path::PathBuf;
 
+#[cfg(feature = "encryption")]
 use chrono::Utc;
+#[cfg(feature = "encryption")]
 use rand::RngCore;
+#[cfg(feature = "encryption")]
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+#[cfg(feature = "encryption")]
 use sqlx::{Row, SqlitePool};
-use tracing::{info, warn};
+use tracing::{warn};
+#[cfg(feature = "encryption")]
+use tracing::info;
 
 use crate::config::AppConfig;
 
+#[cfg(feature = "encryption")]
 const DB_ENCRYPTION_ENV_KEY: &str = "AIDAEMON_ENCRYPTION_KEY";
 const DB_ALLOW_PLAINTEXT_ENV_KEY: &str = "AIDAEMON_ALLOW_PLAINTEXT_DB";
+#[cfg(feature = "encryption")]
 const DB_ENV_FILE_ENV_KEY: &str = "AIDAEMON_ENV_FILE";
 
+#[cfg(feature = "encryption")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DbMode {
     Missing,
@@ -30,8 +44,10 @@ enum DbMode {
 /// - Verifies encrypted DB accessibility with the resolved key.
 /// - Supports emergency bypass via `AIDAEMON_ALLOW_PLAINTEXT_DB=1|true`.
 pub async fn enforce_database_encryption(
-    config: &mut AppConfig,
-    config_path: &Path,
+    #[cfg(feature = "encryption")] config: &mut AppConfig,
+    #[cfg(not(feature = "encryption"))] _config: &mut AppConfig,
+    #[cfg(feature = "encryption")] config_path: &Path,
+    #[cfg(not(feature = "encryption"))] _config_path: &Path,
 ) -> anyhow::Result<()> {
     if truthy_env(DB_ALLOW_PLAINTEXT_ENV_KEY) {
         warn!(
@@ -43,12 +59,11 @@ pub async fn enforce_database_encryption(
 
     #[cfg(not(feature = "encryption"))]
     {
-        anyhow::bail!(
-            "Database encryption is required by default, but aidaemon was built without the \
-             'encryption' feature. Rebuild without --no-default-features or set \
-             {}=1 temporarily.",
-            DB_ALLOW_PLAINTEXT_ENV_KEY
+        warn!(
+            "Built without the 'encryption' feature; database will not be encrypted at rest. \
+             Rebuild with --features encryption for encrypted storage."
         );
+        return Ok(());
     }
 
     #[cfg(feature = "encryption")]
@@ -330,6 +345,7 @@ async fn collect_table_counts(pool: &SqlitePool) -> anyhow::Result<HashMap<Strin
     Ok(counts)
 }
 
+#[cfg(feature = "encryption")]
 fn resolve_db_path(config_path: &Path, db_path: &str) -> PathBuf {
     let p = PathBuf::from(db_path);
     if p.is_absolute() {
@@ -342,6 +358,7 @@ fn resolve_db_path(config_path: &Path, db_path: &str) -> PathBuf {
     }
 }
 
+#[cfg(feature = "encryption")]
 fn detect_db_mode(db_path: &Path) -> anyhow::Result<DbMode> {
     if !db_path.exists() {
         return Ok(DbMode::Missing);
@@ -474,11 +491,12 @@ fn remove_if_exists(path: PathBuf) {
     }
 }
 
-fn set_file_mode_0600(path: &Path) -> anyhow::Result<()> {
+#[cfg(feature = "encryption")]
+fn set_file_mode_0600(_path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }
