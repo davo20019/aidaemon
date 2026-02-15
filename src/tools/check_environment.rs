@@ -153,7 +153,11 @@ fn pad_right(s: &str, width: usize) -> String {
 
 async fn check_tool(name: &str, flag: &str) -> Option<String> {
     // First check if tool exists
-    let which_result = tokio::process::Command::new("which")
+    #[cfg(unix)]
+    let which_cmd = "which";
+    #[cfg(windows)]
+    let which_cmd = "where";
+    let which_result = tokio::process::Command::new(which_cmd)
         .arg(name)
         .output()
         .await

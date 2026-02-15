@@ -35,19 +35,46 @@ fn send_signal_to_process_group_or_pid(pid: u32, signal: i32) -> bool {
     unsafe { libc::kill(raw_pid, signal) == 0 }
 }
 
-#[cfg(not(unix))]
-fn send_signal_to_process_group_or_pid(_pid: u32, _signal: i32) -> bool {
-    false
-}
-
 /// Send SIGTERM to a process group (or fallback process pid).
+#[cfg(unix)]
 pub fn send_sigterm(pid: u32) -> bool {
     send_signal_to_process_group_or_pid(pid, libc::SIGTERM)
 }
 
 /// Send SIGKILL to a process group (or fallback process pid).
+#[cfg(unix)]
 pub fn send_sigkill(pid: u32) -> bool {
     send_signal_to_process_group_or_pid(pid, libc::SIGKILL)
+}
+
+/// Send graceful termination to a process via taskkill.
+#[cfg(windows)]
+pub fn send_sigterm(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Force-kill a process via taskkill /F.
+#[cfg(windows)]
+pub fn send_sigkill(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Best-effort process tree termination with TERM->KILL escalation.
@@ -65,10 +92,17 @@ pub async fn terminate_process_tree(pid: u32, child: &mut tokio::process::Child,
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = pid;
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(grace, child.wait()).await;
+        // Try graceful taskkill first, then force-kill if needed
+        if !send_sigterm(pid) {
+            let _ = child.start_kill();
+        }
+
+        let exited = tokio::time::timeout(grace, child.wait()).await;
+        if exited.is_err() {
+            let _ = send_sigkill(pid);
+            let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+        }
     }
 }

@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::process_control::{configure_command_for_process_group, send_sigkill, send_sigterm};
+use super::process_control::configure_command_for_process_group;
 use super::{
     command_risk::{PermissionMode, RiskLevel},
     daemon_guard::detect_daemonization_primitives,
@@ -110,9 +110,22 @@ fn is_process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    use std::process::Command;
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+        .output()
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            !out.contains("No tasks") && out.contains(&pid.to_string())
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn is_process_alive(_pid: u32) -> bool {
-    // On non-Unix platforms, assume process is alive
+    // On other platforms, assume process is alive
     true
 }
 
@@ -135,9 +148,28 @@ async fn kill_process(pid: u32) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+async fn kill_process(pid: u32) {
+    use std::process::Command;
+    // Graceful termination
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string()])
+        .status();
+
+    // Wait a bit
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Force-kill if still alive
+    if is_process_alive(pid) {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 async fn kill_process(_pid: u32) {
-    // On non-Unix platforms, we can't easily kill by PID
+    // On other platforms, we can't easily kill by PID
     // The process will be orphaned but should eventually terminate
 }
 
@@ -243,7 +275,12 @@ const DEFAULT_TOOL_PRIORITY: &[&str] = &["claude", "gemini", "codex", "copilot",
 
 /// Check if a command exists on the system.
 async fn command_exists(command: &str) -> bool {
-    tokio::process::Command::new("which")
+    #[cfg(unix)]
+    let which_cmd = "which";
+    #[cfg(windows)]
+    let which_cmd = "where";
+
+    tokio::process::Command::new(which_cmd)
         .arg(command)
         .output()
         .await
