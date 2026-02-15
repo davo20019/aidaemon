@@ -54,4 +54,3 @@ pub trait Channel: Send + Sync {
         permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse>;
 }
-

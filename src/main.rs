@@ -1,12 +1,12 @@
 mod agent;
 mod channels;
 mod config;
+mod conversation;
 mod core;
 mod cron_utils;
-mod db;
 mod daemon;
 mod dashboard;
-mod conversation;
+mod db;
 #[allow(dead_code)]
 mod events;
 mod execution_policy;
@@ -24,11 +24,11 @@ mod providers;
 mod queue_policy;
 mod queue_telemetry;
 mod router;
+mod session;
 mod skills;
 mod startup;
 mod state;
 mod tasks;
-mod session;
 mod token_alerts;
 mod tools;
 mod traits;

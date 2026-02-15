@@ -86,21 +86,10 @@ mod tests {
         let p = get_builtin_provider("google").unwrap();
         assert_eq!(p.name, "google");
         assert_eq!(p.auth_type, OAuthType::OAuth2Pkce);
-        assert!(p
-            .scopes
-            .iter()
-            .any(|s| s.contains("gmail")));
-        assert!(p
-            .scopes
-            .iter()
-            .any(|s| s.contains("calendar")));
-        assert!(p
-            .scopes
-            .iter()
-            .any(|s| s.contains("tasks")));
-        assert!(p
-            .allowed_domains
-            .contains(&"googleapis.com".to_string()));
+        assert!(p.scopes.iter().any(|s| s.contains("gmail")));
+        assert!(p.scopes.iter().any(|s| s.contains("calendar")));
+        assert!(p.scopes.iter().any(|s| s.contains("tasks")));
+        assert!(p.allowed_domains.contains(&"googleapis.com".to_string()));
     }
 
     #[test]

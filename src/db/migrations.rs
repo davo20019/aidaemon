@@ -5,7 +5,6 @@ use tracing::info;
 ///
 /// Each migration is designed to be safe to call multiple times (idempotent) by
 /// using `IF NOT EXISTS` where possible and best-effort `ALTER TABLE`s where not.
-
 pub(crate) async fn migrate_events(pool: &SqlitePool) -> anyhow::Result<()> {
     // Create events table
     sqlx::query(
@@ -54,6 +53,16 @@ pub(crate) async fn migrate_events(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_events_prune
          ON events(created_at) WHERE consolidated_at IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+
+    // Tool-result stats: efficient per-tool lookups in time windows.
+    // Partial index keeps it small (most events have tool_name = NULL and/or aren't tool_results).
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_events_tool_result_name_time
+         ON events(tool_name, created_at DESC)
+         WHERE event_type = 'tool_result' AND tool_name IS NOT NULL",
     )
     .execute(pool)
     .await?;

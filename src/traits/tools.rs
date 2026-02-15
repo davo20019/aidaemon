@@ -83,4 +83,3 @@ pub trait Tool: Send + Sync {
         ToolCapabilities::default()
     }
 }
-

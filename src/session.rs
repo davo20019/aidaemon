@@ -7,7 +7,7 @@
 /// Returns the first well-known platform marker found inside `session_id`.
 ///
 /// For multi-bot formats like "{bot}:slack:C123", this finds "slack:".
-fn find_platform_substring<'a>(session_id: &'a str) -> Option<(&'static str, &'a str)> {
+fn find_platform_substring(session_id: &str) -> Option<(&'static str, &str)> {
     // Keep this list small and explicit: only markers that are actually used
     // in session IDs today.
     for marker in ["slack:", "discord:", "telegram:"].into_iter() {
@@ -140,13 +140,19 @@ mod tests {
     #[test]
     fn telegram_chat_id_parses_multi_bot() {
         assert_eq!(telegram_chat_id_from_session("mybot:12345"), Some(12345));
-        assert_eq!(telegram_chat_id_from_session("mybot:-10012345"), Some(-10012345));
+        assert_eq!(
+            telegram_chat_id_from_session("mybot:-10012345"),
+            Some(-10012345)
+        );
     }
 
     #[test]
     fn telegram_chat_id_parses_explicit_marker() {
         assert_eq!(telegram_chat_id_from_session("telegram:12345"), Some(12345));
-        assert_eq!(telegram_chat_id_from_session("bot:telegram:12345"), Some(12345));
+        assert_eq!(
+            telegram_chat_id_from_session("bot:telegram:12345"),
+            Some(12345)
+        );
     }
 
     #[test]
@@ -181,4 +187,3 @@ mod tests {
         assert!(!is_group_session("mybot:12345"));
     }
 }
-

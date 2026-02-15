@@ -45,4 +45,3 @@ pub struct ConversationSummary {
     pub last_message_id: String,
     pub updated_at: DateTime<Utc>,
 }
-

@@ -153,4 +153,3 @@ pub fn truncate_with_anchor(messages: Vec<Message>, limit: usize) -> Vec<Message
     // Normal case - just take last N
     messages.into_iter().skip(skip).collect()
 }
-

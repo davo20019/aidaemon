@@ -17,10 +17,12 @@ mod v3;
 pub use channels::{Channel, ChannelCapabilities};
 pub use conversation::{ConversationSummary, Message, ToolCall};
 pub use dynamic::{
-    CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill, OAuthConnection,
-    SkillDraft,
+    CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
+    OAuthConnection, SkillDraft,
 };
-pub use memory::{BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, Procedure, UserProfile};
+pub use memory::{
+    BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, Procedure, UserProfile,
+};
 pub use people::{Person, PersonFact};
 pub use provider::{ModelProvider, ProviderResponse, TokenUsage, TokenUsageRecord};
 pub use tools::{AgentRole, Tool, ToolCapabilities, ToolRole};
@@ -58,4 +60,3 @@ mod tests {
         assert!(!caps.high_impact_write);
     }
 }
-

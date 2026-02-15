@@ -1525,6 +1525,9 @@ impl TelegramChannel {
         let heartbeat_for_typing = heartbeat.clone();
         let stale_threshold_secs = self.watchdog_stale_threshold_secs;
         tokio::spawn(async move {
+            // Hard maximum: stop typing after 30 minutes regardless of heartbeat/cancel.
+            // Prevents infinite typing loops from leaked heartbeat keepers.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
             loop {
                 let _ = typing_bot
                     .send_chat_action(typing_chat_id, ChatAction::Typing)
@@ -1538,6 +1541,10 @@ impl TelegramChannel {
                             if now.saturating_sub(last_hb) > stale_threshold_secs {
                                 break; // Stop typing indicator
                             }
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            tracing::warn!(chat_id = %typing_chat_id, "Typing indicator reached 30-minute hard limit");
+                            break;
                         }
                     }
                     _ = typing_token.cancelled() => break,
@@ -1893,6 +1900,7 @@ impl TelegramChannel {
                     current_typing_cancel = new_typing_cancel.clone();
                     let heartbeat_for_queued = new_heartbeat;
                     tokio::spawn(async move {
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
                         loop {
                             let _ = typing_bot
                                 .send_chat_action(chat_id, ChatAction::Typing)
@@ -1906,6 +1914,10 @@ impl TelegramChannel {
                                         if now.saturating_sub(last_hb) > stale_threshold_secs {
                                             break;
                                         }
+                                    }
+                                    if tokio::time::Instant::now() >= deadline {
+                                        tracing::warn!(chat_id = %chat_id, "Queued typing indicator reached 30-minute hard limit");
+                                        break;
                                     }
                                 }
                                 _ = new_typing_cancel.cancelled() => break,
@@ -1939,12 +1951,12 @@ impl Channel for TelegramChannel {
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
         let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
             .unwrap_or_else(|| {
-            self.allowed_user_ids
-                .read()
-                .unwrap()
-                .first()
-                .copied()
-                .unwrap_or(0) as i64
+                self.allowed_user_ids
+                    .read()
+                    .unwrap()
+                    .first()
+                    .copied()
+                    .unwrap_or(0) as i64
             });
         let html = markdown_to_telegram_html(text);
         let plain = strip_latex(text);
@@ -1960,12 +1972,12 @@ impl Channel for TelegramChannel {
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
         let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
             .unwrap_or_else(|| {
-            self.allowed_user_ids
-                .read()
-                .unwrap()
-                .first()
-                .copied()
-                .unwrap_or(0) as i64
+                self.allowed_user_ids
+                    .read()
+                    .unwrap()
+                    .first()
+                    .copied()
+                    .unwrap_or(0) as i64
             });
         match &media.kind {
             MediaKind::Photo { data } => {
@@ -2002,12 +2014,12 @@ impl Channel for TelegramChannel {
     ) -> anyhow::Result<ApprovalResponse> {
         let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
             .unwrap_or_else(|| {
-            self.allowed_user_ids
-                .read()
-                .unwrap()
-                .first()
-                .copied()
-                .unwrap_or(0) as i64
+                self.allowed_user_ids
+                    .read()
+                    .unwrap()
+                    .first()
+                    .copied()
+                    .unwrap_or(0) as i64
             });
 
         info!(session_id, command, chat_id, risk = %risk_level, mode = %permission_mode, "Approval requested");

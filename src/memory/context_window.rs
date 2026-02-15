@@ -285,9 +285,13 @@ pub async fn summarize_messages(
             .get("content")
             .and_then(|c| c.as_str())
             .unwrap_or("[no content]");
-        // Truncate very long messages in the summary input
+        // Truncate very long messages in the summary input (char-boundary safe)
         let truncated = if content.len() > 500 {
-            &content[..500]
+            let mut end = 500;
+            while !content.is_char_boundary(end) && end > 0 {
+                end -= 1;
+            }
+            &content[..end]
         } else {
             content
         };
@@ -474,7 +478,11 @@ fn truncate_for_extraction(text: &str, max_len: usize) -> &str {
     if text.len() <= max_len {
         text
     } else {
-        &text[..max_len]
+        let mut end = max_len;
+        while !text.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        &text[..end]
     }
 }
 

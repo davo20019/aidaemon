@@ -294,7 +294,7 @@ fn tool_content_is_error_prefix(s: &str) -> bool {
 /// Strategy: for each tool name, keep only the most recent error details and
 /// replace earlier errors with a short note. A successful (non-error) tool
 /// result resets the error streak for that tool.
-pub(super) fn collapse_repeated_tool_errors(messages: &mut Vec<Value>) -> usize {
+pub(super) fn collapse_repeated_tool_errors(messages: &mut [Value]) -> usize {
     let Some(boundary) = messages
         .iter()
         .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))

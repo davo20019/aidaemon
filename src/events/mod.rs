@@ -18,7 +18,7 @@ pub use payloads::*;
 #[allow(unused_imports)]
 pub use store::{
     EventEmitter, EventStore, PolicyGraduationReport, SessionWriteDrift, TaskWindowStats,
-    WriteConsistencyGateStatus, WriteConsistencyReport, WriteConsistencyThresholds,
+    ToolStats, WriteConsistencyGateStatus, WriteConsistencyReport, WriteConsistencyThresholds,
 };
 
 use chrono::{DateTime, Utc};

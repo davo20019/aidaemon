@@ -169,24 +169,26 @@ pub async fn build_channels(
     #[cfg(feature = "discord")]
     let discord_owner_ids = parse_owner_ids(config, "discord");
     #[cfg(feature = "discord")]
-    let make_discord =
-        |bot_token: &str, allowed_user_ids: Vec<u64>, guild_id: Option<u64>| -> Arc<DiscordChannel> {
-            Arc::new(DiscordChannel::new(
-                bot_token,
-                allowed_user_ids,
-                discord_owner_ids.clone(),
-                guild_id,
-                Arc::clone(&agent),
-                config_path.clone(),
-                session_map.clone(),
-                task_registry.clone(),
-                files_enabled,
-                inbox_dir.clone(),
-                max_file_size_mb,
-                state.clone(),
-                watchdog_stale_threshold_secs,
-            ))
-        };
+    let make_discord = |bot_token: &str,
+                        allowed_user_ids: Vec<u64>,
+                        guild_id: Option<u64>|
+     -> Arc<DiscordChannel> {
+        Arc::new(DiscordChannel::new(
+            bot_token,
+            allowed_user_ids,
+            discord_owner_ids.clone(),
+            guild_id,
+            Arc::clone(&agent),
+            config_path.clone(),
+            session_map.clone(),
+            task_registry.clone(),
+            files_enabled,
+            inbox_dir.clone(),
+            max_file_size_mb,
+            state.clone(),
+            watchdog_stale_threshold_secs,
+        ))
+    };
     #[cfg(feature = "discord")]
     let discord_bots: Vec<Arc<DiscordChannel>> = config
         .all_discord_bots()
@@ -202,28 +204,27 @@ pub async fn build_channels(
         .collect();
 
     #[cfg(feature = "slack")]
-    let make_slack =
-        |app_token: &str,
-         bot_token: &str,
-         allowed_user_ids: Vec<String>,
-         use_threads: bool|
-         -> Arc<SlackChannel> {
-            Arc::new(SlackChannel::new(
-                app_token,
-                bot_token,
-                allowed_user_ids,
-                use_threads,
-                Arc::clone(&agent),
-                config_path.clone(),
-                session_map.clone(),
-                task_registry.clone(),
-                files_enabled,
-                inbox_dir.clone(),
-                max_file_size_mb,
-                state.clone(),
-                watchdog_stale_threshold_secs,
-            ))
-        };
+    let make_slack = |app_token: &str,
+                      bot_token: &str,
+                      allowed_user_ids: Vec<String>,
+                      use_threads: bool|
+     -> Arc<SlackChannel> {
+        Arc::new(SlackChannel::new(
+            app_token,
+            bot_token,
+            allowed_user_ids,
+            use_threads,
+            Arc::clone(&agent),
+            config_path.clone(),
+            session_map.clone(),
+            task_registry.clone(),
+            files_enabled,
+            inbox_dir.clone(),
+            max_file_size_mb,
+            state.clone(),
+            watchdog_stale_threshold_secs,
+        ))
+    };
     #[cfg(feature = "slack")]
     let slack_bots: Vec<Arc<SlackChannel>> = config
         .all_slack_bots()
@@ -261,7 +262,11 @@ pub async fn build_channels(
                             serde_json::from_str(&bot.extra_config).unwrap_or_default();
                         let guild_id = extra["guild_id"].as_u64();
                         info!(bot_id = bot.id, "Loading dynamic Discord bot");
-                        dynamic_discord_bots.push(make_discord(&bot.bot_token, allowed_user_ids, guild_id));
+                        dynamic_discord_bots.push(make_discord(
+                            &bot.bot_token,
+                            allowed_user_ids,
+                            guild_id,
+                        ));
                     }
                     #[cfg(not(feature = "discord"))]
                     "discord" => {

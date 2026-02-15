@@ -44,7 +44,8 @@ pub(super) fn build_consultant_system_prompt(
     let without_tool_selection = strip_markdown_section(system_prompt, "## Tool Selection Guide");
     let without_tools = strip_markdown_section(&without_tool_selection, "## Tools");
     let instructions = match style {
-        ConsultantPromptStyle::Full => r#"[IMPORTANT: CONSULTATION MODE]
+        ConsultantPromptStyle::Full => {
+            r#"[IMPORTANT: CONSULTATION MODE]
 - TEXT ONLY. No function calls, tool_use blocks, or functionCall output.
 - You have no tools in this step. Tools are available in the next step. If tools are needed, do NOT guess; briefly say what you'd check/do next and set "needs_tools":true and "can_answer_now":false in the [INTENT_GATE] JSON.
 - If clarification is required, set "needs_clarification":true, ask exactly ONE concrete question (ending with '?'), and fill "missing_info".
@@ -55,13 +56,16 @@ End your response with ONE LINE:
 Guidelines:
 - complexity: "knowledge" = fully answerable now without tools; "simple" = needs tools but doable now; "complex" = multi-session project.
 - Only include schedule fields if the user explicitly asks for deferred/recurring execution.
-- domains is optional; if set, use: rust, python, javascript, go, docker, kubernetes, infrastructure, web-frontend, web-backend, databases, git, system-admin, general."#,
-        ConsultantPromptStyle::Lite => r#"[IMPORTANT: CONSULTATION MODE]
+- domains is optional; if set, use: rust, python, javascript, go, docker, kubernetes, infrastructure, web-frontend, web-backend, databases, git, system-admin, general."#
+        }
+        ConsultantPromptStyle::Lite => {
+            r#"[IMPORTANT: CONSULTATION MODE]
 TEXT ONLY. No tools in this step. If tools are needed, don't guess: say what you'd check and set needs_tools=true, can_answer_now=false.
 If you need clarification, set needs_clarification=true and ask exactly one question.
 
 End with ONE LINE:
-[INTENT_GATE] {"can_answer_now":false,"needs_tools":true,"needs_clarification":false,"clarifying_question":"","missing_info":[],"complexity":"simple","cancel_intent":false,"cancel_scope":"","is_acknowledgment":false,"schedule":"","schedule_type":"","schedule_cron":""}"#,
+[INTENT_GATE] {"can_answer_now":false,"needs_tools":true,"needs_clarification":false,"clarifying_question":"","missing_info":[],"complexity":"simple","cancel_intent":false,"cancel_scope":"","is_acknowledgment":false,"schedule":"","schedule_type":"","schedule_cron":""}"#
+        }
     };
 
     format!(

@@ -6,9 +6,9 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
+use crate::llm_markers::CONSULTANT_TEXT_ONLY_MARKER;
 use crate::providers::ProviderError;
 use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
-use crate::llm_markers::CONSULTANT_TEXT_ONLY_MARKER;
 
 /// Recursively strip fields unsupported by Gemini API from a JSON value.
 /// Google Gemini rejects `$schema` and `additionalProperties` in function parameter schemas.
@@ -544,8 +544,9 @@ impl GoogleGenAiProvider {
         // Diagnostics: Some Gemini models occasionally return a candidate with
         // empty content parts and no tool calls. Surface this so the agent can
         // produce a meaningful fallback and logs capture the cause.
-        let is_empty_response =
-            final_text.trim().is_empty() && thinking_text.trim().is_empty() && tool_calls.is_empty();
+        let is_empty_response = final_text.trim().is_empty()
+            && thinking_text.trim().is_empty()
+            && tool_calls.is_empty();
         if is_empty_response {
             let extra = format!(
                 "empty response (finishReason={}, parts={})",

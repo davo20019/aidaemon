@@ -897,6 +897,20 @@ impl CliAgentTool {
             }
         }
 
+        // Announce which agent is being dispatched and what it's working on
+        if let Some(ref tx) = status_tx {
+            let task_preview: String = prompt.chars().take(60).collect();
+            let task_desc = if prompt.len() > 60 {
+                format!("{}...", task_preview)
+            } else {
+                task_preview
+            };
+            let _ = tx.try_send(StatusUpdate::ToolProgress {
+                name: tool_name.to_string(),
+                chunk: format!("🚀 Delegating to {}: {}", tool_name, task_desc),
+            });
+        }
+
         // Get entry from the tools map (clone what we need, release lock)
         let (command, mut args, timeout, max_output) = {
             let tools = self.tools.read().unwrap();
@@ -1031,7 +1045,7 @@ impl CliAgentTool {
         // Notify user this task can be cancelled
         if let Some(ref tx) = status_tx {
             let _ = tx.try_send(StatusUpdate::ToolCancellable {
-                name: "cli_agent".to_string(),
+                name: tool_name.to_string(),
                 task_id: task_id.clone(),
             });
         }
@@ -1413,8 +1427,8 @@ impl CliAgentTool {
                     // Emit error status
                     if let Some(ref tx) = status_tx {
                         let _ = tx.try_send(StatusUpdate::ToolComplete {
-                            name: "cli_agent".to_string(),
-                            summary: format!("{} killed - infinite loop detected", tool_name),
+                            name: tool_name.to_string(),
+                            summary: "killed - infinite loop detected".to_string(),
                         });
                     }
 
@@ -1459,12 +1473,12 @@ impl CliAgentTool {
                 // Emit completion status
                 if let Some(ref tx) = status_tx {
                     let summary = if exit_code == Some(0) {
-                        format!("{} completed successfully", tool_name)
+                        "completed successfully".to_string()
                     } else {
-                        format!("{} exited with code {:?}", tool_name, exit_code)
+                        format!("exited with code {:?}", exit_code)
                     };
                     let _ = tx.try_send(StatusUpdate::ToolComplete {
-                        name: "cli_agent".to_string(),
+                        name: tool_name.to_string(),
                         summary,
                     });
                 }

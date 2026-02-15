@@ -156,33 +156,44 @@ pub(super) fn graceful_timeout_response(
     learning_ctx: &LearningContext,
     elapsed: Duration,
 ) -> String {
-    // Plan pausing removed (plans deprecated in favor of goals/tasks).
-    let summary = format!(
+    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let mut summary = format!(
         "I've been working on this task for {} minutes and reached the time limit. \
             Here's what I accomplished:\n\n\
             - {} tool calls executed\n\
-            - {} errors encountered\n\n\
+            - {} errors encountered\n\n{}\
             The task may be incomplete. You can continue where I left off or try breaking it into smaller parts.",
         elapsed.as_secs() / 60,
         learning_ctx.tool_calls.len(),
-        learning_ctx.errors.len()
+        learning_ctx.errors.len(),
+        activity,
     );
+    if summary.len() > 1500 {
+        summary.truncate(1500);
+        summary.push('…');
+    }
     summary
 }
 
 /// Graceful response when task token budget is exhausted.
 pub(super) fn graceful_budget_response(learning_ctx: &LearningContext, tokens_used: u64) -> String {
-    // Plan pausing removed (plans deprecated in favor of goals/tasks).
-    let summary = format!(
+    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let mut summary = format!(
         "I've used {} tokens on this task and reached the budget limit. \
             Here's what I accomplished:\n\n\
             - {} tool calls executed\n\
-            - {} errors encountered\n\n\
+            - {} errors encountered\n\n{}\
             The task may be incomplete. You can continue where I left off.",
         tokens_used,
         learning_ctx.tool_calls.len(),
-        learning_ctx.errors.len()
+        learning_ctx.errors.len(),
+        activity,
     );
+    // Cap to avoid bloating conversation history while preserving key context.
+    if summary.len() > 1500 {
+        summary.truncate(1500);
+        summary.push('…');
+    }
     summary
 }
 
@@ -275,16 +286,194 @@ pub(super) fn graceful_repetitive_response(
 
 /// Graceful response when hard iteration cap is reached (legacy mode).
 pub(super) fn graceful_cap_response(learning_ctx: &LearningContext, iterations: usize) -> String {
-    // Plan pausing removed (plans deprecated in favor of goals/tasks).
-    let summary = format!(
+    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let mut summary = format!(
         "I've reached the maximum iteration limit ({} iterations). \
             Here's what I accomplished:\n\n\
             - {} tool calls executed\n\
-            - {} errors encountered\n\n\
+            - {} errors encountered\n\n{}\
             The task may be incomplete. Consider increasing the iteration limit in config or using unlimited mode.",
         iterations,
         learning_ctx.tool_calls.len(),
-        learning_ctx.errors.len()
+        learning_ctx.errors.len(),
+        activity,
     );
+    if summary.len() > 1500 {
+        summary.truncate(1500);
+        summary.push('…');
+    }
     summary
+}
+
+/// Categorize tool calls into a human-readable activity summary.
+///
+/// Parses entries like `"read_file(Hero.jsx)"` and `"terminal(\`pip install fpdf\`)"` into
+/// grouped categories so the next interaction can understand what was already done.
+fn categorize_tool_calls(tool_calls: &[String]) -> String {
+    let mut files_read: Vec<&str> = Vec::new();
+    let mut files_written: Vec<&str> = Vec::new();
+    let mut commands_run: Vec<&str> = Vec::new();
+    let mut files_sent: Vec<&str> = Vec::new();
+    let mut searches: Vec<&str> = Vec::new();
+    let mut other: Vec<&str> = Vec::new();
+
+    for entry in tool_calls {
+        // Parse "tool_name(summary)" format
+        let (name, args) = match entry.find('(') {
+            Some(idx) => {
+                let name = &entry[..idx];
+                let args = entry[idx + 1..].trim_end_matches(')');
+                (name, args)
+            }
+            None => (entry.as_str(), ""),
+        };
+        match name {
+            "read_file" => files_read.push(args),
+            "write_file" | "edit_file" => files_written.push(args),
+            "terminal" | "run_command" => commands_run.push(args),
+            "send_file" | "send_media" => files_sent.push(args),
+            "web_search" | "search_files" => searches.push(args),
+            "project_inspect" => files_read.push(args),
+            _ => {
+                if !args.is_empty() {
+                    other.push(args);
+                }
+            }
+        }
+    }
+
+    let mut sections = Vec::new();
+
+    if !files_read.is_empty() {
+        let items: Vec<&str> = files_read.iter().copied().take(15).collect();
+        sections.push(format!("Files read: {}", items.join(", ")));
+    }
+    if !files_written.is_empty() {
+        let items: Vec<&str> = files_written.iter().copied().take(10).collect();
+        sections.push(format!("Files written: {}", items.join(", ")));
+    }
+    if !commands_run.is_empty() {
+        let items: Vec<&str> = commands_run.iter().copied().take(10).collect();
+        sections.push(format!("Commands run: {}", items.join(", ")));
+    }
+    if !files_sent.is_empty() {
+        let items: Vec<&str> = files_sent.iter().copied().take(5).collect();
+        sections.push(format!("Files sent: {}", items.join(", ")));
+    }
+    if !searches.is_empty() {
+        let items: Vec<&str> = searches.iter().copied().take(5).collect();
+        sections.push(format!("Searches: {}", items.join(", ")));
+    }
+
+    if sections.is_empty() {
+        return String::new();
+    }
+
+    let mut result = String::from("Activity summary:\n");
+    for section in &sections {
+        result.push_str("- ");
+        result.push_str(section);
+        result.push('\n');
+    }
+    result.push('\n');
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_categorize_tool_calls_groups_correctly() {
+        let calls = vec![
+            "read_file(Hero.jsx)".to_string(),
+            "read_file(App.jsx)".to_string(),
+            "terminal(`pip install fpdf`)".to_string(),
+            "write_file(generate_pdf.py)".to_string(),
+            "terminal(`python3 generate_pdf.py`)".to_string(),
+            "send_file(Guide.pdf)".to_string(),
+            "web_search(top things Chantilly VA)".to_string(),
+            "project_inspect(chantilly-va-site)".to_string(),
+        ];
+        let result = categorize_tool_calls(&calls);
+        assert!(result.contains("Files read:"));
+        assert!(result.contains("Hero.jsx"));
+        assert!(result.contains("chantilly-va-site"));
+        assert!(result.contains("Files written:"));
+        assert!(result.contains("generate_pdf.py"));
+        assert!(result.contains("Commands run:"));
+        assert!(result.contains("Files sent:"));
+        assert!(result.contains("Guide.pdf"));
+        assert!(result.contains("Searches:"));
+    }
+
+    #[test]
+    fn test_categorize_tool_calls_empty() {
+        let result = categorize_tool_calls(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_categorize_tool_calls_limits_items() {
+        let calls: Vec<String> = (0..20)
+            .map(|i| format!("read_file(file_{}.rs)", i))
+            .collect();
+        let result = categorize_tool_calls(&calls);
+        // Should include max 15 files
+        assert!(result.contains("file_14.rs"));
+        assert!(!result.contains("file_15.rs"));
+    }
+
+    #[test]
+    fn test_graceful_budget_response_includes_activity() {
+        let ctx = LearningContext {
+            user_text: "Create a PDF".to_string(),
+            intent_domains: vec![],
+            tool_calls: vec![
+                "read_file(App.jsx)".to_string(),
+                "terminal(`pip install fpdf`)".to_string(),
+                "write_file(gen.py)".to_string(),
+                "send_file(out.pdf)".to_string(),
+            ],
+            errors: vec![],
+            first_error: None,
+            recovery_actions: vec![],
+            start_time: Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+        };
+        let result = graceful_budget_response(&ctx, 500_000);
+        assert!(result.contains("500000 tokens"));
+        assert!(result.contains("4 tool calls"));
+        assert!(result.contains("Activity summary:"));
+        assert!(result.contains("Files read: App.jsx"));
+        assert!(result.contains("Files sent: out.pdf"));
+    }
+
+    #[test]
+    fn test_graceful_budget_response_caps_length() {
+        let calls: Vec<String> = (0..100)
+            .map(|i| {
+                format!(
+                    "terminal(`very long command number {} that does things`)",
+                    i
+                )
+            })
+            .collect();
+        let ctx = LearningContext {
+            user_text: "big task".to_string(),
+            intent_domains: vec![],
+            tool_calls: calls,
+            errors: vec![],
+            first_error: None,
+            recovery_actions: vec![],
+            start_time: Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+        };
+        let result = graceful_budget_response(&ctx, 500_000);
+        assert!(result.len() <= 1502); // 1500 + "…"
+    }
 }

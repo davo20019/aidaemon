@@ -385,12 +385,10 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     // Migration: add resources_json column if missing
-    sqlx::query(
-        "ALTER TABLE dynamic_skills ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]'",
-    )
-    .execute(pool)
-    .await
-    .ok();
+    sqlx::query("ALTER TABLE dynamic_skills ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]'")
+        .execute(pool)
+        .await
+        .ok();
 
     // Skill drafts table - stores auto-promoted skill drafts pending user review
     sqlx::query(
@@ -500,16 +498,12 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_people_name ON people(name)")
         .execute(pool)
         .await?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_person_facts_person ON person_facts(person_id)",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_person_facts_category ON person_facts(category)",
-    )
-    .execute(pool)
-    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_person_facts_person ON person_facts(person_id)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_person_facts_category ON person_facts(category)")
+        .execute(pool)
+        .await?;
 
     // --- OAuth connections table ---
     sqlx::query(
@@ -617,11 +611,10 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .await;
 
     // Migration: add dispatch_failures column for progress-based circuit breaker
-    let _ = sqlx::query(
-        "ALTER TABLE goals_v3 ADD COLUMN dispatch_failures INTEGER NOT NULL DEFAULT 0",
-    )
-    .execute(pool)
-    .await;
+    let _ =
+        sqlx::query("ALTER TABLE goals_v3 ADD COLUMN dispatch_failures INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS tasks_v3 (
@@ -753,7 +746,6 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await;
-
 
     Ok(())
 }

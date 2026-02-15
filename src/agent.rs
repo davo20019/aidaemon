@@ -23,6 +23,7 @@ use crate::events::{
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
+use crate::llm_markers::{CONSULTANT_TEXT_ONLY_MARKER, INTENT_GATE_MARKER};
 use crate::mcp::McpRegistry;
 use crate::providers::{ProviderError, ProviderErrorKind};
 use crate::router::{self, Router};
@@ -34,7 +35,6 @@ use crate::traits::{
     ToolCapabilities, ToolRole,
 };
 use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
-use crate::llm_markers::{CONSULTANT_TEXT_ONLY_MARKER, INTENT_GATE_MARKER};
 // Re-export StatusUpdate from types for backwards compatibility
 pub use crate::types::StatusUpdate;
 
@@ -291,58 +291,208 @@ pub fn touch_heartbeat(hb: &Option<Arc<AtomicU64>>) {
 }
 
 /// Extract a brief human-readable summary from tool arguments JSON.
+/// Helper to truncate a string and append "..." if it exceeds `max` chars.
+fn truncate_summary(s: &str, max: usize) -> String {
+    let truncated: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        format!("{}...", truncated)
+    } else {
+        truncated
+    }
+}
+
+/// Helper to extract the last path component (file/dir name) for compact display.
+fn short_path(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 fn summarize_tool_args(name: &str, arguments: &str) -> String {
     let val: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(_) => return String::new(),
     };
 
+    // Helper closure to get a string field from the JSON args.
+    let get_str = |key: &str| val.get(key).and_then(|v| v.as_str());
+
     match name {
-        "terminal" => val
-            .get("command")
-            .and_then(|v| v.as_str())
-            .map(|cmd| {
-                let truncated: String = cmd.chars().take(60).collect();
-                if cmd.len() > 60 {
-                    format!("`{}...`", truncated)
-                } else {
-                    format!("`{}`", truncated)
-                }
-            })
+        // --- Command execution ---
+        "terminal" | "run_command" => get_str("command")
+            .map(|cmd| format!("`{}`", truncate_summary(cmd, 60)))
             .unwrap_or_default(),
+
+        // --- File operations ---
+        "read_file" => get_str("path")
+            .map(|p| short_path(p).to_string())
+            .unwrap_or_default(),
+        "write_file" => get_str("path")
+            .map(|p| short_path(p).to_string())
+            .unwrap_or_default(),
+        "edit_file" => get_str("path")
+            .map(|p| short_path(p).to_string())
+            .unwrap_or_default(),
+        "search_files" => {
+            let pattern = get_str("pattern").or_else(|| get_str("glob")).unwrap_or("");
+            if pattern.is_empty() {
+                String::new()
+            } else {
+                truncate_summary(pattern, 40)
+            }
+        }
+        "list_files" => get_str("path")
+            .map(|p| short_path(p).to_string())
+            .unwrap_or_default(),
+
+        // --- Web & network ---
+        "web_search" => get_str("query")
+            .map(|q| truncate_summary(q, 50))
+            .unwrap_or_default(),
+        "web_fetch" => get_str("url")
+            .map(|u| truncate_summary(u, 60))
+            .unwrap_or_default(),
+        "http_request" => {
+            let method = get_str("method").unwrap_or("GET");
+            let url = get_str("url").unwrap_or("");
+            if url.is_empty() {
+                method.to_string()
+            } else {
+                format!("{} {}", method, truncate_summary(url, 50))
+            }
+        }
+
+        // --- Browser ---
         "browser" => {
-            let action = val.get("action").and_then(|v| v.as_str()).unwrap_or("");
-            let url = val.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let action = get_str("action").unwrap_or("");
+            let url = get_str("url").unwrap_or("");
             if !url.is_empty() {
-                format!("{} {}", action, url)
+                format!("{} {}", action, truncate_summary(url, 50))
             } else {
                 action.to_string()
             }
         }
-        "spawn_agent" => val
-            .get("mission")
-            .and_then(|v| v.as_str())
-            .map(|m| {
-                let truncated: String = m.chars().take(50).collect();
-                if m.len() > 50 {
-                    format!("{}...", truncated)
-                } else {
-                    truncated
-                }
-            })
+
+        // --- Git ---
+        "git_info" => {
+            let include = val.get("include").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            include.unwrap_or_default()
+        }
+        "git_commit" => get_str("message")
+            .map(|m| truncate_summary(m, 40))
             .unwrap_or_default(),
-        "remember_fact" => val
-            .get("fact")
-            .and_then(|v| v.as_str())
-            .map(|f| {
-                let truncated: String = f.chars().take(40).collect();
-                if f.len() > 40 {
-                    format!("{}...", truncated)
-                } else {
-                    truncated
-                }
-            })
-            .unwrap_or_else(|| "saving to memory".to_string()),
+
+        // --- Memory ---
+        "remember_fact" => {
+            let fact = get_str("fact").or_else(|| get_str("value")).unwrap_or("");
+            if fact.is_empty() {
+                "saving to memory".to_string()
+            } else {
+                truncate_summary(fact, 40)
+            }
+        }
+        "manage_memories" => get_str("action").unwrap_or("").to_string(),
+
+        // --- Skills ---
+        "use_skill" => get_str("skill_name").unwrap_or("").to_string(),
+        "manage_skills" => {
+            let action = get_str("action").unwrap_or("");
+            let name_val = get_str("name").unwrap_or("");
+            if name_val.is_empty() {
+                action.to_string()
+            } else {
+                format!("{} {}", action, name_val)
+            }
+        }
+
+        // --- People ---
+        "manage_people" => {
+            let action = get_str("action").unwrap_or("");
+            let name_val = get_str("name").unwrap_or("");
+            if name_val.is_empty() {
+                action.to_string()
+            } else {
+                format!("{} {}", action, name_val)
+            }
+        }
+
+        // --- Agents ---
+        "spawn_agent" => get_str("mission")
+            .map(|m| truncate_summary(m, 50))
+            .unwrap_or_default(),
+        "cli_agent" => {
+            let action = get_str("action").unwrap_or("run");
+            if action != "run" {
+                return format!("action={}", action);
+            }
+            let tool = get_str("tool").unwrap_or("auto");
+            let prompt = get_str("prompt").unwrap_or("");
+            let task_desc = truncate_summary(prompt, 50);
+            if task_desc.is_empty() {
+                format!("→ {}", tool)
+            } else {
+                format!("→ {}: {}", tool, task_desc)
+            }
+        }
+        "manage_cli_agents" => get_str("action").unwrap_or("").to_string(),
+
+        // --- Config / diagnostic ---
+        "manage_config" => get_str("action").unwrap_or("").to_string(),
+        "manage_mcp" => {
+            let action = get_str("action").unwrap_or("");
+            let name_val = get_str("name").unwrap_or("");
+            if name_val.is_empty() {
+                action.to_string()
+            } else {
+                format!("{} {}", action, name_val)
+            }
+        }
+        "project_inspect" => get_str("path")
+            .map(|p| short_path(p).to_string())
+            .unwrap_or_default(),
+
+        // --- Channel operations ---
+        "read_channel_history" => {
+            let channel = get_str("channel_id").unwrap_or("");
+            if channel.is_empty() {
+                String::new()
+            } else {
+                truncate_summary(channel, 30)
+            }
+        }
+        "send_file" => get_str("path")
+            .map(|p| short_path(p).to_string())
+            .unwrap_or_default(),
+
+        // --- MCP tools: extract a human-readable name from the prefix ---
+        _ if name.starts_with("mcp__") => {
+            // mcp__chrome-devtools__take_screenshot → chrome-devtools: take_screenshot
+            let without_prefix = &name[5..]; // skip "mcp__"
+            if let Some(idx) = without_prefix.find("__") {
+                let server = &without_prefix[..idx];
+                let tool = &without_prefix[idx + 2..];
+                // For common tools, add key arg info
+                let arg_info = match tool {
+                    "navigate_page" => get_str("url")
+                        .map(|u| format!(" {}", truncate_summary(u, 40)))
+                        .unwrap_or_default(),
+                    "click" | "hover" | "fill" => get_str("uid")
+                        .map(|u| format!(" #{}", u))
+                        .unwrap_or_default(),
+                    "evaluate_script" => get_str("function")
+                        .map(|f| format!(" {}", truncate_summary(f, 30)))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                format!("{}: {}{}", server, tool.replace('_', " "), arg_info)
+            } else {
+                without_prefix.replace('_', " ")
+            }
+        }
+
         _ => String::new(),
     }
 }
@@ -578,7 +728,10 @@ fn user_text_references_filesystem_path(user_text: &str) -> bool {
         }
         let is_simple_fraction_or_date = {
             let parts: Vec<&str> = lower.split('/').collect();
-            (parts.len() == 2 || parts.len() == 3) && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            (parts.len() == 2 || parts.len() == 3)
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
         };
         if is_simple_fraction_or_date {
             continue;

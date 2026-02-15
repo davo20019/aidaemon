@@ -1,5 +1,16 @@
 use super::*;
 
+/// A JoinHandle wrapper that aborts the task when dropped.
+/// Standard `JoinHandle::drop()` detaches the task (it keeps running);
+/// this ensures background tasks like the heartbeat keeper are cleaned up
+/// if the parent future is cancelled by an outer `select!`.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl Agent {
     /// Run the agentic loop for a user message in the given session.
     /// Returns the final assistant text response.
@@ -318,7 +329,7 @@ impl Agent {
                 let char_count = trimmed.chars().count();
                 char_count > 0
                     && char_count <= 4
-                    && trimmed.chars().any(|c| !c.is_ascii())
+                    && !trimmed.is_ascii()
                     && trimmed
                         .chars()
                         .all(|c| !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace())
@@ -327,7 +338,11 @@ impl Agent {
             // If the previous assistant turn ended with a question, treat "ok/okay" as non-terminal
             // and let the LLM re-ask for missing info rather than replying "Got it.".
             let ok_is_safe_to_short_circuit = if is_ok {
-                let history = self.state.get_history(session_id, 12).await.unwrap_or_default();
+                let history = self
+                    .state
+                    .get_history(session_id, 12)
+                    .await
+                    .unwrap_or_default();
                 let last_assistant = history.iter().rev().find(|m| m.role == "assistant");
                 !last_assistant
                     .and_then(|m| m.content.as_deref())
@@ -338,9 +353,7 @@ impl Agent {
 
             let trivial_reply = if is_thanks {
                 Some("You're welcome.".to_string())
-            } else if is_single_emoji_reaction {
-                Some("Got it.".to_string())
-            } else if is_ok && ok_is_safe_to_short_circuit {
+            } else if is_single_emoji_reaction || (is_ok && ok_is_safe_to_short_circuit) {
                 Some("Got it.".to_string())
             } else {
                 None
@@ -414,10 +427,7 @@ impl Agent {
             );
             if is_time_query {
                 let now = chrono::Local::now();
-                let reply = format!(
-                    "It is {}.",
-                    now.format("%Y-%m-%d %H:%M:%S %Z (UTC%:z)")
-                );
+                let reply = format!("It is {}.", now.format("%Y-%m-%d %H:%M:%S %Z (UTC%:z)"));
 
                 let early_task_start = Instant::now();
                 let assistant_msg = Message {
@@ -1340,12 +1350,30 @@ impl Agent {
             // 7. Progress summary for long-running tasks (every 5 minutes)
             if last_progress_summary.elapsed() >= PROGRESS_SUMMARY_INTERVAL {
                 let elapsed_mins = task_start.elapsed().as_secs() / 60;
-                let summary = format!(
-                    "Working... {} iterations, {} tool calls, {} mins elapsed",
-                    iteration,
-                    learning_ctx.tool_calls.len(),
-                    elapsed_mins
-                );
+                let last_tool_info = learning_ctx
+                    .tool_calls
+                    .last()
+                    .map(|tc| {
+                        // Extract tool name from "tool_name(args)" format
+                        tc.split('(').next().unwrap_or(tc).to_string()
+                    })
+                    .unwrap_or_default();
+                let summary = if last_tool_info.is_empty() {
+                    format!(
+                        "Working... {} iterations, {} tool calls, {} mins elapsed",
+                        iteration,
+                        learning_ctx.tool_calls.len(),
+                        elapsed_mins
+                    )
+                } else {
+                    format!(
+                        "Working... {} iterations, {} tool calls, {} mins elapsed (last: {})",
+                        iteration,
+                        learning_ctx.tool_calls.len(),
+                        elapsed_mins,
+                        last_tool_info
+                    )
+                };
                 send_status(
                     &status_tx,
                     StatusUpdate::ProgressSummary {
@@ -1452,6 +1480,11 @@ impl Agent {
             // Without this, old tool call chains (e.g., manage_people calls from a prior question)
             // overwhelm the current question's context and confuse the LLM.
             // Only the current interaction (after the last user message) keeps full tool chains.
+            //
+            // We drop tool-role messages (results) but keep assistant messages even if they
+            // have tool_calls — the JSON conversion below strips orphaned tool_calls and drops
+            // content-less assistant messages automatically. This preserves the assistant's
+            // reasoning text and budget/timeout summaries as context for the next interaction.
             let last_user_pos = deduped_msgs.iter().rposition(|m| m.role == "user");
             let pre_collapse_len = deduped_msgs.len();
             let deduped_msgs: Vec<&Message> = if let Some(boundary) = last_user_pos {
@@ -1462,9 +1495,9 @@ impl Agent {
                         if *i >= boundary {
                             true // current interaction: keep everything
                         } else {
-                            // old interactions: drop tool intermediates, keep user + final assistant
+                            // old interactions: drop tool results only; assistant messages
+                            // survive (orphan stripping handles their tool_calls in JSON conversion)
                             m.role != "tool"
-                                && !(m.role == "assistant" && m.tool_calls_json.is_some())
                         }
                     })
                     .map(|(_, m)| m)
@@ -1476,20 +1509,34 @@ impl Agent {
             if collapsed > 0 {
                 info!(
                     session_id,
-                    collapsed, "Collapsed tool intermediates from previous interactions"
+                    collapsed, "Collapsed tool results from previous interactions"
                 );
             }
 
             // Identify old-interaction assistant messages for content truncation.
             // After collapse, recompute the last-user boundary and collect IDs of
             // assistant messages before it — their full text is stale context.
+            // Exception: the assistant message immediately before the boundary is exempt
+            // from truncation — it typically contains the budget/timeout response with
+            // handoff context (activity summary, files read, commands run) that the next
+            // interaction needs to avoid re-exploring from scratch.
             let collapse_boundary = deduped_msgs.iter().rposition(|m| m.role == "user");
             let old_interaction_assistant_ids: std::collections::HashSet<&str> =
                 if let Some(boundary) = collapse_boundary {
+                    // Find the immediately-prior assistant message (right before boundary).
+                    let prior_assistant_id: Option<&str> = (0..boundary)
+                        .rev()
+                        .find(|&i| deduped_msgs[i].role == "assistant")
+                        .map(|i| deduped_msgs[i].id.as_str());
+
                     deduped_msgs
                         .iter()
                         .enumerate()
-                        .filter(|(i, m)| *i < boundary && m.role == "assistant")
+                        .filter(|(i, m)| {
+                            *i < boundary
+                                && m.role == "assistant"
+                                && Some(m.id.as_str()) != prior_assistant_id
+                        })
                         .map(|(_, m)| m.id.as_str())
                         .collect()
                 } else {
@@ -1536,9 +1583,10 @@ impl Agent {
                     // subsequent turns and can contribute to degraded model behavior.
                     if m.role == "assistant"
                         && m.tool_calls_json.is_none()
-                        && content
-                            .as_deref()
-                            .is_some_and(|c| c.trim_start().starts_with("I wasn't able to process that request."))
+                        && content.as_deref().is_some_and(|c| {
+                            c.trim_start()
+                                .starts_with("I wasn't able to process that request.")
+                        })
                     {
                         return None;
                     }
@@ -3246,7 +3294,10 @@ impl Agent {
 
             // === NATURAL COMPLETION: No tool calls ===
             if resp.tool_calls.is_empty() {
-                let mut reply = resp.content.filter(|s| !s.trim().is_empty()).unwrap_or_default();
+                let mut reply = resp
+                    .content
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_default();
 
                 // If we used an identity-attack prefill, prepend it so the user
                 // sees the full decline (the API only returns continuation tokens).
@@ -3350,10 +3401,8 @@ impl Agent {
                             // unless the user explicitly pinned a model override.
                             let is_override = *self.model_override.read().await;
                             if !is_override {
-                                let reason = format!(
-                                    "empty_response(iter={},model={})",
-                                    iteration, model
-                                );
+                                let reason =
+                                    format!("empty_response(iter={},model={})", iteration, model);
                                 if policy_bundle.policy.escalate(reason.clone()) {
                                     POLICY_METRICS
                                         .escalation_total
@@ -4342,10 +4391,14 @@ impl Agent {
                 // task that keeps the heartbeat alive so the channel-level stale
                 // watchdog doesn't auto-cancel the task while the tool is still
                 // actively working.
-                let heartbeat_keeper = if matches!(tc.name.as_str(), "cli_agent" | "terminal") {
+                // Wrap in AbortOnDrop so the keeper is automatically cancelled if
+                // handle_message is dropped by an outer select! (e.g. stale watchdog).
+                // Without this, a detached keeper loop continues touching the heartbeat
+                // forever, preventing the typing indicator's stale check from firing.
+                let _heartbeat_keeper = if matches!(tc.name.as_str(), "cli_agent" | "terminal") {
                     heartbeat.as_ref().map(|hb| {
                         let hb = Arc::clone(hb);
-                        tokio::spawn(async move {
+                        AbortOnDrop(tokio::spawn(async move {
                             loop {
                                 tokio::time::sleep(Duration::from_secs(30)).await;
                                 let now = SystemTime::now()
@@ -4354,7 +4407,7 @@ impl Agent {
                                     .as_secs();
                                 hb.store(now, Ordering::Relaxed);
                             }
-                        })
+                        }))
                     })
                 } else {
                     None
@@ -4374,10 +4427,9 @@ impl Agent {
                     )
                     .await;
 
-                // Stop the heartbeat keeper now that the tool has finished.
-                if let Some(handle) = heartbeat_keeper {
-                    handle.abort();
-                }
+                // _heartbeat_keeper is dropped here (or when the scope ends),
+                // which triggers AbortOnDrop to cancel the background task.
+                drop(_heartbeat_keeper);
                 touch_heartbeat(&heartbeat);
                 let result_is_err = result.is_err();
                 let mut result_text = match result {
@@ -4484,6 +4536,42 @@ impl Agent {
                                     solutions_found = solutions.len(),
                                     "Diagnostic loop: injected error solutions"
                                 );
+                            }
+                        }
+
+                        // Inline tool failure stats to help the model decide whether to retry or pivot.
+                        // Bounded query (LIMIT 500) and guarded for graceful degradation.
+                        let since = Utc::now() - chrono::Duration::hours(24);
+                        if let Ok(stats) = self.event_store.get_tool_stats(&tc.name, since).await {
+                            if stats.total_calls >= 3 {
+                                let failure_pct = if stats.total_calls == 0 {
+                                    0u64
+                                } else {
+                                    ((stats.failed as f64 / stats.total_calls as f64) * 100.0)
+                                        .round()
+                                        .clamp(0.0, 100.0)
+                                        as u64
+                                };
+                                let mut lines = Vec::new();
+                                lines.push(format!(
+                                    "[TOOL STATS] {} (24h): {} calls, {} failed ({}%), avg {}ms",
+                                    tc.name,
+                                    stats.total_calls,
+                                    stats.failed,
+                                    failure_pct,
+                                    stats.avg_duration_ms
+                                ));
+                                for (pattern, count) in stats.common_errors.into_iter().take(2) {
+                                    let limit = 100usize;
+                                    let head: String = pattern.chars().take(limit).collect();
+                                    let preview = if pattern.chars().count() > limit {
+                                        format!("{}...", head)
+                                    } else {
+                                        head
+                                    };
+                                    lines.push(format!("  - {}x: {}", count, preview));
+                                }
+                                result_text = format!("{}\n\n{}", result_text, lines.join("\n"));
                             }
                         }
                     }

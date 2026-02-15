@@ -161,4 +161,3 @@ pub struct ErrorSolution {
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
-

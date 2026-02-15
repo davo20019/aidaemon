@@ -103,4 +103,3 @@ pub struct CliAgentInvocation {
     pub success: Option<bool>,
     pub duration_secs: Option<f64>,
 }
-

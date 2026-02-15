@@ -6348,14 +6348,18 @@ async fn test_synthesized_done_persisted() {
 
 /// Regression: old interaction assistant responses should be truncated so
 /// stale context from long prior turns doesn't pollute subsequent replies.
+/// Exception: the immediately-prior assistant message (e.g., budget/timeout response)
+/// is preserved untruncated to provide handoff context.
 #[tokio::test]
 async fn test_old_interaction_assistant_content_truncated() {
-    let long_response = "A".repeat(500);
+    let long_response_1 = "B".repeat(500);
+    let long_response_2 = "A".repeat(500);
     let provider = MockProvider::with_responses(vec![
-        // Turn 1: tool call + long response
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::text_response(&long_response),
-        // Turn 2: direct text response
+        // Turn 1: long response
+        MockProvider::text_response(&long_response_1),
+        // Turn 2: another long response
+        MockProvider::text_response(&long_response_2),
+        // Turn 3: direct text response
         MockProvider::text_response("Short answer."),
     ]);
 
@@ -6366,7 +6370,7 @@ async fn test_old_interaction_assistant_content_truncated() {
         .agent
         .handle_message(
             "truncate_test",
-            "What system info?",
+            "First question?",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -6374,14 +6378,14 @@ async fn test_old_interaction_assistant_content_truncated() {
         )
         .await
         .unwrap();
-    assert_eq!(r1, long_response);
+    assert_eq!(r1, long_response_1);
 
-    // Turn 2: different topic
+    // Turn 2: another long response
     let r2 = harness
         .agent
         .handle_message(
             "truncate_test",
-            "What is the weather?",
+            "Second question?",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -6389,31 +6393,59 @@ async fn test_old_interaction_assistant_content_truncated() {
         )
         .await
         .unwrap();
-    assert_eq!(r2, "Short answer.");
+    assert_eq!(r2, long_response_2);
 
-    // Verify: Turn 1's 500-char assistant response is truncated in Turn 2's context
+    // Turn 3: different topic
+    let r3 = harness
+        .agent
+        .handle_message(
+            "truncate_test",
+            "Third question?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3, "Short answer.");
+
+    // Verify: Turn 1's 500-char response (2+ turns back) is truncated in Turn 3,
+    // but Turn 2's response (immediately prior) is preserved untruncated.
     let call_log = harness.provider.call_log.lock().await;
-    let turn2_call = call_log.last().unwrap();
-    let assistant_msgs: Vec<&serde_json::Value> = turn2_call
+    let turn3_call = call_log.last().unwrap();
+    let assistant_msgs: Vec<&serde_json::Value> = turn3_call
         .messages
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
         .collect();
 
+    // Turn 1's response (BBB...) should be truncated (it's NOT the immediately-prior)
     let has_truncated = assistant_msgs.iter().any(|m| {
         m.get("content")
             .and_then(|c| c.as_str())
-            .is_some_and(|s| s.ends_with('…') && s.len() < 500)
+            .is_some_and(|s| s.starts_with('B') && s.ends_with('…') && s.len() < 500)
     });
     assert!(
         has_truncated,
-        "Turn 1's long assistant response should be truncated in Turn 2's context"
+        "Turn 1's long assistant response should be truncated in Turn 3's context"
     );
 
-    // The truncated content should be <= MAX_OLD_ASSISTANT_CONTENT_CHARS + ellipsis
+    // Turn 2's response (AAA...) should be preserved untruncated (immediately-prior)
+    let has_preserved = assistant_msgs.iter().any(|m| {
+        m.get("content")
+            .and_then(|c| c.as_str())
+            .is_some_and(|s| s.starts_with('A') && s.len() == 500)
+    });
+    assert!(
+        has_preserved,
+        "Turn 2's assistant response (immediately prior) should be preserved untruncated"
+    );
+
+    // Truncated content should be <= MAX_OLD_ASSISTANT_CONTENT_CHARS + ellipsis
     for m in &assistant_msgs {
         if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
-            if content.ends_with('…') {
+            if content.starts_with('B') && content.ends_with('…') {
                 // 200 chars + "…" (3 bytes) = ~203 bytes max
                 assert!(
                     content.len() <= 210,

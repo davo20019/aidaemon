@@ -8,4 +8,3 @@ pub struct TriggerEvent {
     /// (e.g., a scheduled task marked `trusted = true` in config).
     pub trusted: bool,
 }
-

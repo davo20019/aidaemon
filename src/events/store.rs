@@ -11,7 +11,7 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
 
-use super::{Event, EventType, PolicyDecisionData, TaskEndData, TaskStatus};
+use super::{Event, EventType, PolicyDecisionData, TaskEndData, TaskStatus, ToolResultData};
 use crate::traits::Message;
 
 /// The event store backed by SQLite.
@@ -30,6 +30,16 @@ pub struct TaskWindowStats {
     pub completion_rate: f64,
     pub error_rate: f64,
     pub stall_rate: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolStats {
+    pub total_calls: u64,
+    pub successful: u64,
+    pub failed: u64,
+    pub avg_duration_ms: u64,
+    /// (error pattern, count), top 3.
+    pub common_errors: Vec<(String, u64)>,
 }
 
 impl Default for TaskWindowStats {
@@ -722,6 +732,81 @@ impl EventStore {
         .await
     }
 
+    pub async fn get_tool_stats(
+        &self,
+        tool_name: &str,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<ToolStats> {
+        let since_str = since.to_rfc3339();
+        let rows = sqlx::query(
+            r#"
+            SELECT data
+            FROM events
+            WHERE event_type = 'tool_result'
+              AND tool_name = ?
+              AND created_at >= ?
+            ORDER BY created_at DESC
+            LIMIT 500
+            "#,
+        )
+        .bind(tool_name)
+        .bind(&since_str)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut total_calls = 0u64;
+        let mut successful = 0u64;
+        let mut failed = 0u64;
+        let mut duration_sum_ms: u128 = 0;
+        let mut error_counts: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+
+        for row in rows {
+            let data_str: String = row.get("data");
+            let tr: ToolResultData = match serde_json::from_str(&data_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if is_synthetic_tool_result(&tr) {
+                continue;
+            }
+
+            total_calls += 1;
+            duration_sum_ms += tr.duration_ms as u128;
+            if tr.success {
+                successful += 1;
+                continue;
+            }
+            failed += 1;
+
+            let raw_error = tr.error.as_deref().unwrap_or(&tr.result);
+            let normalized = normalize_tool_error_text(raw_error);
+            let pattern = crate::memory::procedures::extract_error_pattern(normalized);
+            if !pattern.trim().is_empty() {
+                *error_counts.entry(pattern).or_insert(0) += 1;
+            }
+        }
+
+        let avg_duration_ms = if total_calls == 0 {
+            0
+        } else {
+            (duration_sum_ms / total_calls as u128) as u64
+        };
+
+        let mut common_errors: Vec<(String, u64)> = error_counts.into_iter().collect();
+        common_errors.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        common_errors.truncate(3);
+
+        Ok(ToolStats {
+            total_calls,
+            successful,
+            failed,
+            avg_duration_ms,
+            common_errors,
+        })
+    }
+
     /// Get the last completed task for a session
     pub async fn get_last_completed_task(&self, session_id: &str) -> anyhow::Result<Option<Event>> {
         let rows = sqlx::query(
@@ -1026,6 +1111,29 @@ fn to_u64(value: i64) -> u64 {
     }
 }
 
+fn normalize_tool_error_text(raw: &str) -> &str {
+    let diag = raw.find("\n\n[DIAGNOSTIC]");
+    let sys = raw.find("\n\n[SYSTEM]");
+    let cut_at = match (diag, sys) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    let trimmed = match cut_at {
+        Some(idx) => &raw[..idx],
+        None => raw,
+    };
+    trimmed.trim()
+}
+
+fn is_synthetic_tool_result(tr: &ToolResultData) -> bool {
+    tr.success
+        && tr.duration_ms == 0
+        && tr.error.is_none()
+        && tr.result.trim_start().starts_with("[SYSTEM]")
+}
+
 /// Builder for emitting events with a consistent session context
 pub struct EventEmitter {
     store: Arc<EventStore>,
@@ -1201,6 +1309,36 @@ mod tests {
                 "metadata":{"needs_tools":true},
                 "summary":"intent gate forced tool mode"
             }),
+            created_at,
+        )
+        .await;
+    }
+
+    async fn append_tool_result(
+        store: &EventStore,
+        session_id: &str,
+        tool: &str,
+        success: bool,
+        duration_ms: u64,
+        result: &str,
+        error: Option<&str>,
+        created_at: DateTime<Utc>,
+    ) {
+        let mut payload = json!({
+            "tool_call_id": format!("tc-{}-{}", tool, created_at.timestamp_nanos_opt().unwrap_or(0)),
+            "name": tool,
+            "result": result,
+            "success": success,
+            "duration_ms": duration_ms,
+        });
+        if let Some(err) = error {
+            payload["error"] = json!(err);
+        }
+        append_event_at(
+            store,
+            session_id,
+            EventType::ToolResult,
+            payload,
             created_at,
         )
         .await;
@@ -1655,6 +1793,135 @@ mod tests {
             !report.evaluate_gate().passed,
             "default gate should fail when event payloads are missing message_id"
         );
+    }
+
+    #[tokio::test]
+    async fn get_tool_stats_aggregates_and_groups_errors() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+        let session = "s-tool-stats-1";
+
+        append_tool_result(
+            &store,
+            session,
+            "terminal",
+            true,
+            100,
+            "ok",
+            None,
+            now - Duration::minutes(50),
+        )
+        .await;
+        append_tool_result(
+            &store,
+            session,
+            "terminal",
+            true,
+            300,
+            "ok",
+            None,
+            now - Duration::minutes(40),
+        )
+        .await;
+        append_tool_result(
+            &store,
+            session,
+            "terminal",
+            false,
+            200,
+            "Error: Connection timed out at /tmp/foo.rs:12:3",
+            Some("Error: Connection timed out at /tmp/foo.rs:12:3"),
+            now - Duration::minutes(30),
+        )
+        .await;
+        append_tool_result(
+            &store,
+            session,
+            "terminal",
+            false,
+            400,
+            "Error: Connection timed out at /tmp/bar.rs:99:1",
+            Some("Error: Connection timed out at /tmp/bar.rs:99:1"),
+            now - Duration::minutes(20),
+        )
+        .await;
+
+        let stats = store
+            .get_tool_stats("terminal", now - Duration::hours(24))
+            .await
+            .expect("tool stats");
+
+        assert_eq!(stats.total_calls, 4);
+        assert_eq!(stats.successful, 2);
+        assert_eq!(stats.failed, 2);
+        assert_eq!(stats.avg_duration_ms, 250);
+        assert_eq!(stats.common_errors.len(), 1);
+        assert_eq!(stats.common_errors[0].1, 2);
+    }
+
+    #[tokio::test]
+    async fn get_tool_stats_excludes_synthetic_system_results() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+        let session = "s-tool-stats-2";
+
+        // Synthetic: success + duration 0 + no error + [SYSTEM] prefix.
+        append_tool_result(
+            &store,
+            session,
+            "web_search",
+            true,
+            0,
+            "[SYSTEM] You have already called web_search 3 times.",
+            None,
+            now - Duration::minutes(10),
+        )
+        .await;
+        append_tool_result(
+            &store,
+            session,
+            "web_search",
+            true,
+            0,
+            "[SYSTEM] BLOCKED: repetitive tool call",
+            None,
+            now - Duration::minutes(9),
+        )
+        .await;
+        append_tool_result(
+            &store,
+            session,
+            "web_search",
+            true,
+            0,
+            "[SYSTEM] Before executing tools, briefly state what you understand...",
+            None,
+            now - Duration::minutes(8),
+        )
+        .await;
+
+        // Real execution result
+        append_tool_result(
+            &store,
+            session,
+            "web_search",
+            true,
+            120,
+            "some results",
+            None,
+            now - Duration::minutes(7),
+        )
+        .await;
+
+        let stats = store
+            .get_tool_stats("web_search", now - Duration::hours(24))
+            .await
+            .expect("tool stats");
+
+        assert_eq!(stats.total_calls, 1);
+        assert_eq!(stats.successful, 1);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.avg_duration_ms, 120);
     }
 
     #[test]

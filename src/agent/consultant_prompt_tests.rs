@@ -86,11 +86,17 @@ fn test_user_text_references_filesystem_path_ignores_fractions_and_shorthand() {
 
 #[test]
 fn test_user_text_references_filesystem_path_detects_common_paths_and_files() {
-    assert!(user_text_references_filesystem_path("/Users/alice/project/file.txt"));
+    assert!(user_text_references_filesystem_path(
+        "/Users/alice/project/file.txt"
+    ));
     assert!(user_text_references_filesystem_path("~/project/file.txt"));
-    assert!(user_text_references_filesystem_path("src/agent/main_loop.rs"));
+    assert!(user_text_references_filesystem_path(
+        "src/agent/main_loop.rs"
+    ));
     assert!(user_text_references_filesystem_path("Cargo.toml"));
-    assert!(user_text_references_filesystem_path(r"C:\\Users\\alice\\file.txt"));
+    assert!(user_text_references_filesystem_path(
+        r"C:\\Users\\alice\\file.txt"
+    ));
 }
 
 #[test]
