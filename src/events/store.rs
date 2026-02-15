@@ -1113,13 +1113,9 @@ fn to_u64(value: i64) -> u64 {
 
 fn normalize_tool_error_text(raw: &str) -> &str {
     let diag = raw.find("\n\n[DIAGNOSTIC]");
+    let stats = raw.find("\n\n[TOOL STATS]");
     let sys = raw.find("\n\n[SYSTEM]");
-    let cut_at = match (diag, sys) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
+    let cut_at = [diag, stats, sys].into_iter().flatten().min();
     let trimmed = match cut_at {
         Some(idx) => &raw[..idx],
         None => raw,

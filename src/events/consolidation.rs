@@ -430,7 +430,9 @@ impl Consolidator {
                     if let (Some(tool), Some(summary)) = (recovery_tool, recovery_summary) {
                         let solution = ErrorSolution {
                             id: 0,
-                            error_pattern: error_data.message.clone(),
+                            error_pattern: crate::memory::procedures::extract_error_pattern(
+                                &error_data.message,
+                            ),
                             domain: error_data.tool_name.clone(),
                             solution_summary: format!("Used {} to resolve", tool),
                             solution_steps: Some(vec![summary]),
@@ -811,6 +813,7 @@ impl Consolidator {
             .solution_steps
             .as_ref()
             .map(|s| serde_json::to_string(s).unwrap_or_default());
+        let domain = es.domain.clone().unwrap_or_default();
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
@@ -818,10 +821,15 @@ impl Consolidator {
             INSERT INTO error_solutions (error_pattern, domain, solution_summary, solution_steps,
                                          success_count, failure_count, last_used_at, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(error_pattern, domain, solution_summary) DO UPDATE SET
+                solution_steps = COALESCE(excluded.solution_steps, error_solutions.solution_steps),
+                success_count = error_solutions.success_count + excluded.success_count,
+                failure_count = error_solutions.failure_count + excluded.failure_count,
+                last_used_at = excluded.last_used_at
             "#,
         )
         .bind(&es.error_pattern)
-        .bind(&es.domain)
+        .bind(&domain)
         .bind(&es.solution_summary)
         .bind(&steps_json)
         .bind(es.success_count)

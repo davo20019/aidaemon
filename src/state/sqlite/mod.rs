@@ -1324,6 +1324,10 @@ impl SqliteStateStore {
 
     /// Insert a new error solution.
     pub async fn insert_error_solution(&self, solution: &ErrorSolution) -> anyhow::Result<i64> {
+        // Normalize so duplicates conflict and retrieval similarity is stable.
+        let error_pattern =
+            crate::memory::procedures::extract_error_pattern(&solution.error_pattern);
+        let domain = solution.domain.clone().unwrap_or_default();
         let steps_json = solution
             .solution_steps
             .as_ref()
@@ -1331,26 +1335,39 @@ impl SqliteStateStore {
         // Best-effort embedding for semantic retrieval. Backfilled by MemoryManager if missing.
         let error_embedding = self
             .embedding_service
-            .embed(solution.error_pattern.clone())
+            .embed(error_pattern.clone())
             .await
             .ok()
             .map(|v| encode_embedding(&v));
-        let result = sqlx::query(
-            "INSERT INTO error_solutions (error_pattern, error_embedding, domain, solution_summary, solution_steps, success_count, failure_count, last_used_at, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        let now = Utc::now();
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            INSERT INTO error_solutions (
+                error_pattern, error_embedding, domain, solution_summary, solution_steps,
+                success_count, failure_count, last_used_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(error_pattern, domain, solution_summary) DO UPDATE SET
+                error_embedding = COALESCE(error_solutions.error_embedding, excluded.error_embedding),
+                solution_steps = COALESCE(excluded.solution_steps, error_solutions.solution_steps),
+                success_count = error_solutions.success_count + excluded.success_count,
+                failure_count = error_solutions.failure_count + excluded.failure_count,
+                last_used_at = excluded.last_used_at
+            RETURNING id
+            "#,
         )
-        .bind(&solution.error_pattern)
+        .bind(&error_pattern)
         .bind(&error_embedding)
-        .bind(&solution.domain)
+        .bind(&domain)
         .bind(&solution.solution_summary)
         .bind(&steps_json)
         .bind(solution.success_count)
         .bind(solution.failure_count)
-        .bind(solution.last_used_at.map(|t| t.to_rfc3339()))
+        .bind(solution.last_used_at.unwrap_or(now).to_rfc3339())
         .bind(solution.created_at.to_rfc3339())
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(result.last_insert_rowid())
+        Ok(row.0)
     }
 
     /// Get error solutions relevant to an error message.
@@ -1361,7 +1378,10 @@ impl SqliteStateStore {
     ) -> anyhow::Result<Vec<ErrorSolution>> {
         let rows = sqlx::query(
             "SELECT id, error_pattern, domain, solution_summary, solution_steps, success_count, failure_count, last_used_at, created_at, error_embedding
-             FROM error_solutions WHERE success_count > failure_count ORDER BY success_count DESC LIMIT 100"
+             FROM error_solutions
+             WHERE success_count > failure_count
+             ORDER BY (success_count - failure_count) DESC, COALESCE(last_used_at, created_at) DESC
+             LIMIT 1000",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1450,11 +1470,20 @@ impl SqliteStateStore {
         let solution_steps = steps_json.and_then(|j| serde_json::from_str(&j).ok());
         let created_str: String = row.get("created_at");
         let last_used_str: Option<String> = row.get("last_used_at");
+        let domain_raw: Option<String> = row.get("domain");
+        let domain = domain_raw.and_then(|d| {
+            let t = d.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        });
 
         Ok(ErrorSolution {
             id: row.get("id"),
             error_pattern: row.get("error_pattern"),
-            domain: row.get("domain"),
+            domain,
             solution_summary: row.get("solution_summary"),
             solution_steps,
             success_count: row.get("success_count"),

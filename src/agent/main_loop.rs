@@ -11,6 +11,23 @@ impl Drop for AbortOnDrop {
     }
 }
 
+fn strip_appended_diagnostics(raw: &str) -> &str {
+    // Keep only the "core" tool output so pattern extraction and retrieval don't
+    // get polluted by injected meta blocks.
+    const MARKERS: [&str; 3] = ["\n\n[DIAGNOSTIC]", "\n\n[TOOL STATS]", "\n\n[SYSTEM]"];
+    let mut cut_at: Option<usize> = None;
+    for m in MARKERS {
+        if let Some(idx) = raw.find(m) {
+            cut_at = Some(cut_at.map(|c| c.min(idx)).unwrap_or(idx));
+        }
+    }
+    let trimmed = match cut_at {
+        Some(idx) => &raw[..idx],
+        None => raw,
+    };
+    trimmed.trim()
+}
+
 impl Agent {
     /// Run the agentic loop for a user message in the given session.
     /// Returns the final assistant text response.
@@ -720,6 +737,12 @@ impl Agent {
         let mut task_tokens_used: u64 = 0;
         let mut tool_failure_count: HashMap<String, usize> = HashMap::new();
         let mut tool_call_count: HashMap<String, usize> = HashMap::new();
+        // Track which error solutions were injected so we can credit them on recovery.
+        let mut pending_error_solution_ids: Vec<i64> = Vec::new();
+        // In-session error learning: track repeated failures by (tool, normalized error pattern).
+        let mut tool_failure_patterns: HashMap<(String, String), usize> = HashMap::new();
+        let mut last_tool_failure: Option<(String, String)> = None;
+        let mut in_session_learned: HashSet<(String, String)> = HashSet::new();
         let mut unknown_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut recent_tool_calls: VecDeque<u64> = VecDeque::with_capacity(RECENT_CALLS_WINDOW);
         // Tracks consecutive calls to the same tool name, plus the set of
@@ -4504,14 +4527,25 @@ impl Agent {
                     let count = tool_failure_count.entry(tc.name.clone()).or_insert(0);
                     *count += 1;
 
+                    let base_error = strip_appended_diagnostics(&result_text).to_string();
+                    let err_pattern = crate::memory::procedures::extract_error_pattern(&base_error);
+                    if !err_pattern.trim().is_empty() {
+                        let key = (tc.name.clone(), err_pattern);
+                        *tool_failure_patterns.entry(key.clone()).or_insert(0) += 1;
+                        last_tool_failure = Some(key);
+                    }
+
                     // DIAGNOSTIC LOOP: On first failure, query memory for similar errors
                     if *count == 1 {
+                        pending_error_solution_ids.clear();
                         if let Ok(solutions) = self
                             .state
-                            .get_relevant_error_solutions(&result_text, 3)
+                            .get_relevant_error_solutions(&base_error, 3)
                             .await
                         {
                             if !solutions.is_empty() {
+                                pending_error_solution_ids =
+                                    solutions.iter().map(|s| s.id).collect();
                                 let diagnostic_hints: Vec<String> = solutions
                                     .iter()
                                     .map(|s| {
@@ -4542,20 +4576,15 @@ impl Agent {
                         // Inline tool failure stats to help the model decide whether to retry or pivot.
                         // Bounded query (LIMIT 500) and guarded for graceful degradation.
                         let since = Utc::now() - chrono::Duration::hours(24);
-                        if let Ok(stats) = self.event_store.get_tool_stats(&tc.name, since).await {
-                            if stats.total_calls >= 3 {
-                                let failure_pct = if stats.total_calls == 0 {
-                                    0u64
-                                } else {
-                                    ((stats.failed as f64 / stats.total_calls as f64) * 100.0)
-                                        .round()
-                                        .clamp(0.0, 100.0)
-                                        as u64
-                                };
-                                let mut lines = Vec::new();
-                                lines.push(format!(
-                                    "[TOOL STATS] {} (24h): {} calls, {} failed ({}%), avg {}ms",
-                                    tc.name,
+	                        if let Ok(stats) = self.event_store.get_tool_stats(&tc.name, since).await {
+	                            if stats.total_calls >= 3 {
+	                                // total_calls is bounded by the underlying LIMIT and guarded above.
+	                                let failure_pct = ((stats.failed * 100) + (stats.total_calls / 2))
+	                                    / stats.total_calls;
+	                                let mut lines = Vec::new();
+	                                lines.push(format!(
+	                                    "[TOOL STATS] {} (24h): {} calls, {} failed ({}%), avg {}ms",
+	                                    tc.name,
                                     stats.total_calls,
                                     stats.failed,
                                     failure_pct,
@@ -4586,7 +4615,7 @@ impl Agent {
 
                     // Track error for learning
                     if learning_ctx.first_error.is_none() {
-                        learning_ctx.first_error = Some(result_text.clone());
+                        learning_ctx.first_error = Some(base_error);
                     }
                     learning_ctx.errors.push((result_text.clone(), false));
                 } else {
@@ -4616,8 +4645,65 @@ impl Agent {
                     }
 
                     if !learning_ctx.errors.is_empty() {
+                        // Credit any injected diagnostic hints if we recovered after they were shown.
+                        if !pending_error_solution_ids.is_empty() {
+                            let ids = std::mem::take(&mut pending_error_solution_ids);
+                            let state = self.state.clone();
+                            tokio::spawn(async move {
+                                for id in ids {
+                                    if let Err(e) =
+                                        state.update_error_solution_outcome(id, true).await
+                                    {
+                                        warn!(
+                                            solution_id = id,
+                                            error = %e,
+                                            "Failed to record error solution success"
+                                        );
+                                    }
+                                }
+                            });
+                        }
+
+                        // In-session mini learning: if we saw repeated failures for a tool+pattern
+                        // and then recovered via a different tool, persist the workaround now.
+	                        if let Some((failed_tool, failed_pattern)) = last_tool_failure.take() {
+	                            let key = (failed_tool.clone(), failed_pattern.clone());
+	                            let failures = tool_failure_patterns.get(&key).copied().unwrap_or(0);
+	                            if failures >= 3
+	                                && tc.name != failed_tool
+	                                && in_session_learned.insert(key)
+	                            {
+	                                let recovery_tool = tc.name.clone();
+                                let solution = crate::memory::procedures::create_error_solution(
+                                    failed_pattern,
+                                    Some(failed_tool.clone()),
+                                    format!(
+                                        "After {} errors, recovered via {}",
+                                        failed_tool, recovery_tool
+                                    ),
+                                    Some(vec![tool_summary.clone()]),
+                                );
+                                let state = self.state.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = state.insert_error_solution(&solution).await {
+                                        warn!(
+                                            error_pattern = %solution.error_pattern,
+                                            error = %e,
+                                            "Failed to save in-session error solution"
+                                        );
+                                    }
+                                });
+                                info!(
+                                    failed_tool = %failed_tool,
+                                    recovery_tool = %recovery_tool,
+                                    failures,
+                                    "In-session error solution learned"
+                                );
+                            }
+                        }
+
                         // Successful action after an error - this is recovery
-                        learning_ctx.recovery_actions.push(tool_summary);
+                        learning_ctx.recovery_actions.push(tool_summary.clone());
                         // Mark the last error as recovered
                         if let Some((_, recovered)) = learning_ctx.errors.last_mut() {
                             *recovered = true;

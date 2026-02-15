@@ -29,6 +29,19 @@ cargo fmt                            # auto-format
 
 No `rustfmt.toml` — uses default Rust formatting conventions.
 
+## Releasing & Publishing
+
+1. Bump version in `Cargo.toml`
+2. Commit all changes and push to `master`
+3. Tag with `git tag vX.Y.Z` and push the tag
+4. Create a GitHub release via `gh release create`
+5. Publish to crates.io via `cargo publish`
+
+**IMPORTANT**: `cargo publish` packages only git-tracked files. Before publishing:
+- Ensure all changes are committed and pushed — do NOT use `--allow-dirty`
+- Ensure `.gitignore` excludes non-Rust artifacts (`node_modules/`, temp files, etc.)
+- The crate has a 10MB upload limit — if it fails with "Payload Too Large", check what's being packaged with `cargo package --list`
+
 ## Architecture
 
 **aidaemon** is a personal AI agent daemon (single Rust binary) accessible via Telegram/Slack/Discord with agentic tool use, MCP integration, and persistent memory.

@@ -218,6 +218,42 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Normalize historical NULL domains to empty string so dedupe/unique keys are stable.
+    sqlx::query("UPDATE error_solutions SET domain = '' WHERE domain IS NULL")
+        .execute(pool)
+        .await?;
+
+    // Dedupe: allow multiple solutions per error pattern, but avoid identical repeats.
+    // Only do the (potentially expensive) cleanup once, before we install the unique index.
+    let has_unique: Option<i64> = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_error_solutions_unique' LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if has_unique.is_none() {
+        // Remove exact duplicates before adding the unique index.
+        // Keep the smallest id (oldest row) for each (error_pattern, domain, solution_summary) triple.
+        sqlx::query(
+            r#"
+            DELETE FROM error_solutions
+            WHERE id NOT IN (
+                SELECT MIN(id)
+                FROM error_solutions
+                GROUP BY error_pattern, domain, solution_summary
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_error_solutions_unique
+             ON error_solutions(error_pattern, domain, solution_summary)",
+        )
+        .execute(pool)
+        .await?;
+    }
+
     // Terminal allowed prefixes (persisted "Allow Always" approvals)
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS terminal_allowed_prefixes (

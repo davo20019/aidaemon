@@ -1335,6 +1335,34 @@ async fn test_insert_and_get_error_solutions() {
 }
 
 #[tokio::test]
+async fn test_insert_error_solution_upserts_and_increments_success_count() {
+    let (store, _db) = setup_test_store().await;
+
+    let solution = ErrorSolution {
+        id: 0,
+        error_pattern: "permission denied: /tmp/foo.txt:12:3".to_string(),
+        domain: None,
+        solution_summary: "Fix permissions".to_string(),
+        solution_steps: Some(vec!["chmod +w <path>".to_string()]),
+        success_count: 1,
+        failure_count: 0,
+        last_used_at: None,
+        created_at: Utc::now(),
+    };
+
+    let id1 = store.insert_error_solution(&solution).await.unwrap();
+    let id2 = store.insert_error_solution(&solution).await.unwrap();
+    assert_eq!(id1, id2, "expected upsert to return the same row id");
+
+    let solutions = store
+        .get_relevant_error_solutions("permission denied", 10)
+        .await
+        .unwrap();
+    assert_eq!(solutions.len(), 1);
+    assert_eq!(solutions[0].success_count, 2);
+}
+
+#[tokio::test]
 async fn test_update_error_solution_outcome() {
     let (store, _db) = setup_test_store().await;
 
