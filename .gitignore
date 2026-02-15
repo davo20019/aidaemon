@@ -24,11 +24,15 @@ proptest-regressions/
 # User-generated skills (auto-promoted, dynamic, etc.)
 skills/
 
+node_modules/
+claude-code-landing/
+render_pdf.mjs
+telegram-autobot.js
+
 # Personal/temp files — not part of aidaemon
 *.py
 __pycache__/
 *.json
-!package.json
 *.png
 *.txt
 *.pdf
