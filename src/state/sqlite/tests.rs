@@ -3,7 +3,7 @@ use crate::memory::embeddings::EmbeddingService;
 use crate::traits::store_prelude::*;
 use crate::traits::{
     BehaviorPattern, DynamicBot, DynamicMcpServer, DynamicSkill, Episode, ErrorSolution, Goal,
-    Message, Procedure, TokenUsage,
+    GoalSchedule, Message, Procedure, TokenUsage,
 };
 use crate::types::FactPrivacy;
 use std::sync::Arc;
@@ -1040,92 +1040,62 @@ async fn test_backfill_episode_embeddings() {
 // ==================== Goal Tests ====================
 
 #[tokio::test]
-async fn test_insert_and_get_active_goals() {
+async fn test_create_and_get_active_personal_goals() {
     let (store, _db) = setup_test_store().await;
 
-    let goal = Goal {
-        id: 0,
-        description: "Learn Rust generics".to_string(),
-        status: "active".to_string(),
-        priority: "high".to_string(),
-        progress_notes: None,
-        source_episode_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        completed_at: None,
-    };
+    let mut goal = Goal::new_finite("Learn Rust generics", "test-session");
+    goal.domain = "personal".to_string();
+    goal.priority = "high".to_string();
+    store.create_goal(&goal).await.unwrap();
 
-    let goal_id = store.insert_goal(&goal).await.unwrap();
-    assert!(goal_id > 0);
-
-    let active = store.get_active_goals().await.unwrap();
+    let active = store.get_active_personal_goals(10).await.unwrap();
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].description, "Learn Rust generics");
     assert_eq!(active[0].status, "active");
     assert_eq!(active[0].priority, "high");
+    assert_eq!(active[0].domain, "personal");
 }
 
 #[tokio::test]
-async fn test_update_goal_status() {
+async fn test_update_personal_goal_status() {
     let (store, _db) = setup_test_store().await;
 
-    let goal = Goal {
-        id: 0,
-        description: "Finish project".to_string(),
-        status: "active".to_string(),
-        priority: "medium".to_string(),
-        progress_notes: None,
-        source_episode_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        completed_at: None,
-    };
-
-    let goal_id = store.insert_goal(&goal).await.unwrap();
+    let mut goal = Goal::new_finite("Finish project", "test-session");
+    goal.domain = "personal".to_string();
+    store.create_goal(&goal).await.unwrap();
 
     store
-        .update_goal(goal_id, Some("completed"), None)
+        .update_personal_goal(&goal.id, Some("completed"), None)
         .await
         .unwrap();
 
-    let active = store.get_active_goals().await.unwrap();
+    let active = store.get_active_personal_goals(10).await.unwrap();
     assert_eq!(
         active.len(),
         0,
-        "Completed goal should not appear in active goals"
+        "Completed personal goal should not appear in active personal goals"
     );
 }
 
 #[tokio::test]
-async fn test_update_goal_progress_note() {
+async fn test_update_personal_goal_progress_note() {
     let (store, _db) = setup_test_store().await;
 
-    let goal = Goal {
-        id: 0,
-        description: "Write tests".to_string(),
-        status: "active".to_string(),
-        priority: "low".to_string(),
-        progress_notes: None,
-        source_episode_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        completed_at: None,
-    };
-
-    let goal_id = store.insert_goal(&goal).await.unwrap();
+    let mut goal = Goal::new_finite("Write tests", "test-session");
+    goal.domain = "personal".to_string();
+    store.create_goal(&goal).await.unwrap();
 
     store
-        .update_goal(goal_id, None, Some("Added 5 unit tests"))
+        .update_personal_goal(&goal.id, None, Some("Added 5 unit tests"))
         .await
         .unwrap();
     store
-        .update_goal(goal_id, None, Some("Added 10 more tests"))
+        .update_personal_goal(&goal.id, None, Some("Added 10 more tests"))
         .await
         .unwrap();
 
-    let goals = store.get_active_goals().await.unwrap();
-    assert_eq!(goals.len(), 1);
-    let notes = goals[0].progress_notes.as_ref().unwrap();
+    let stored = store.get_goal(&goal.id).await.unwrap().unwrap();
+    let notes = stored.progress_notes.as_ref().unwrap();
     assert_eq!(notes.len(), 2);
     assert_eq!(notes[0], "Added 5 unit tests");
     assert_eq!(notes[1], "Added 10 more tests");
@@ -1898,18 +1868,18 @@ async fn test_cli_agent_invocation_cleanup_stale() {
     assert_eq!(count2, 0);
 }
 
-// ==================== V3 Orchestration Tests ====================
+// ==================== Orchestration Tests ====================
 
 #[tokio::test]
-async fn test_goals_v3_crud() {
+async fn test_goals_crud() {
     let (store, _file) = setup_test_store().await;
 
     // Create
-    let goal = crate::traits::GoalV3::new_finite("Build a website", "session_1");
-    store.create_goal_v3(&goal).await.unwrap();
+    let goal = crate::traits::Goal::new_finite("Build a website", "session_1");
+    store.create_goal(&goal).await.unwrap();
 
     // Get
-    let fetched = store.get_goal_v3(&goal.id).await.unwrap().unwrap();
+    let fetched = store.get_goal(&goal.id).await.unwrap().unwrap();
     assert_eq!(fetched.description, "Build a website");
     assert_eq!(fetched.status, "active");
     assert_eq!(fetched.goal_type, "finite");
@@ -1919,47 +1889,47 @@ async fn test_goals_v3_crud() {
     let mut updated = fetched;
     updated.status = "completed".to_string();
     updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
-    store.update_goal_v3(&updated).await.unwrap();
+    store.update_goal(&updated).await.unwrap();
 
-    let fetched2 = store.get_goal_v3(&goal.id).await.unwrap().unwrap();
+    let fetched2 = store.get_goal(&goal.id).await.unwrap().unwrap();
     assert_eq!(fetched2.status, "completed");
     assert!(fetched2.completed_at.is_some());
 
     // Active goals should not include completed
-    let active = store.get_active_goals_v3().await.unwrap();
+    let active = store.get_active_goals().await.unwrap();
     assert!(active.is_empty());
 }
 
 #[tokio::test]
-async fn test_goals_v3_session_filter() {
+async fn test_goals_session_filter() {
     let (store, _file) = setup_test_store().await;
 
-    let goal1 = crate::traits::GoalV3::new_finite("Task A", "session_1");
-    let goal2 = crate::traits::GoalV3::new_finite("Task B", "session_2");
-    let goal3 = crate::traits::GoalV3::new_finite("Task C", "session_1");
+    let goal1 = crate::traits::Goal::new_finite("Task A", "session_1");
+    let goal2 = crate::traits::Goal::new_finite("Task B", "session_2");
+    let goal3 = crate::traits::Goal::new_finite("Task C", "session_1");
 
-    store.create_goal_v3(&goal1).await.unwrap();
-    store.create_goal_v3(&goal2).await.unwrap();
-    store.create_goal_v3(&goal3).await.unwrap();
+    store.create_goal(&goal1).await.unwrap();
+    store.create_goal(&goal2).await.unwrap();
+    store.create_goal(&goal3).await.unwrap();
 
-    let session1_goals = store.get_goals_for_session_v3("session_1").await.unwrap();
+    let session1_goals = store.get_goals_for_session("session_1").await.unwrap();
     assert_eq!(session1_goals.len(), 2);
     assert!(session1_goals.iter().all(|g| g.session_id == "session_1"));
 
-    let session2_goals = store.get_goals_for_session_v3("session_2").await.unwrap();
+    let session2_goals = store.get_goals_for_session("session_2").await.unwrap();
     assert_eq!(session2_goals.len(), 1);
 }
 
 #[tokio::test]
-async fn test_tasks_v3_crud() {
+async fn test_tasks_crud() {
     let (store, _file) = setup_test_store().await;
 
     // Create parent goal first (FK)
-    let goal = crate::traits::GoalV3::new_finite("Parent goal", "session_1");
-    store.create_goal_v3(&goal).await.unwrap();
+    let goal = crate::traits::Goal::new_finite("Parent goal", "session_1");
+    store.create_goal(&goal).await.unwrap();
 
     let now = chrono::Utc::now().to_rfc3339();
-    let task = crate::traits::TaskV3 {
+    let task = crate::traits::Task {
         id: uuid::Uuid::new_v4().to_string(),
         goal_id: goal.id.clone(),
         description: "Step 1: create files".to_string(),
@@ -1980,10 +1950,10 @@ async fn test_tasks_v3_crud() {
         started_at: None,
         completed_at: None,
     };
-    store.create_task_v3(&task).await.unwrap();
+    store.create_task(&task).await.unwrap();
 
     // Get
-    let fetched = store.get_task_v3(&task.id).await.unwrap().unwrap();
+    let fetched = store.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(fetched.description, "Step 1: create files");
     assert_eq!(fetched.status, "pending");
     assert!(fetched.idempotent);
@@ -1993,26 +1963,26 @@ async fn test_tasks_v3_crud() {
     updated.status = "completed".to_string();
     updated.result = Some("Files created successfully".to_string());
     updated.completed_at = Some(now.clone());
-    store.update_task_v3(&updated).await.unwrap();
+    store.update_task(&updated).await.unwrap();
 
-    let fetched2 = store.get_task_v3(&task.id).await.unwrap().unwrap();
+    let fetched2 = store.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(fetched2.status, "completed");
     assert!(fetched2.result.is_some());
 
     // List for goal
-    let tasks = store.get_tasks_for_goal_v3(&goal.id).await.unwrap();
+    let tasks = store.get_tasks_for_goal(&goal.id).await.unwrap();
     assert_eq!(tasks.len(), 1);
 }
 
 #[tokio::test]
-async fn test_claim_task_v3() {
+async fn test_claim_task() {
     let (store, _file) = setup_test_store().await;
 
-    let goal = crate::traits::GoalV3::new_finite("Goal", "session_1");
-    store.create_goal_v3(&goal).await.unwrap();
+    let goal = crate::traits::Goal::new_finite("Goal", "session_1");
+    store.create_goal(&goal).await.unwrap();
 
     let now = chrono::Utc::now().to_rfc3339();
-    let task = crate::traits::TaskV3 {
+    let task = crate::traits::Task {
         id: uuid::Uuid::new_v4().to_string(),
         goal_id: goal.id.clone(),
         description: "Claimable task".to_string(),
@@ -2033,31 +2003,31 @@ async fn test_claim_task_v3() {
         started_at: None,
         completed_at: None,
     };
-    store.create_task_v3(&task).await.unwrap();
+    store.create_task(&task).await.unwrap();
 
     // First claim succeeds
-    let claimed = store.claim_task_v3(&task.id, "agent-1").await.unwrap();
+    let claimed = store.claim_task(&task.id, "agent-1").await.unwrap();
     assert!(claimed);
 
     // Second claim fails (already claimed)
-    let claimed2 = store.claim_task_v3(&task.id, "agent-2").await.unwrap();
+    let claimed2 = store.claim_task(&task.id, "agent-2").await.unwrap();
     assert!(!claimed2);
 
     // Verify agent_id was set
-    let fetched = store.get_task_v3(&task.id).await.unwrap().unwrap();
+    let fetched = store.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(fetched.agent_id, Some("agent-1".to_string()));
     assert_eq!(fetched.status, "claimed");
 }
 
 #[tokio::test]
-async fn test_task_activity_v3_log() {
+async fn test_task_activity_log() {
     let (store, _file) = setup_test_store().await;
 
-    let goal = crate::traits::GoalV3::new_finite("Goal", "session_1");
-    store.create_goal_v3(&goal).await.unwrap();
+    let goal = crate::traits::Goal::new_finite("Goal", "session_1");
+    store.create_goal(&goal).await.unwrap();
 
     let now = chrono::Utc::now().to_rfc3339();
-    let task = crate::traits::TaskV3 {
+    let task = crate::traits::Task {
         id: uuid::Uuid::new_v4().to_string(),
         goal_id: goal.id.clone(),
         description: "Task".to_string(),
@@ -2078,10 +2048,10 @@ async fn test_task_activity_v3_log() {
         started_at: Some(now.clone()),
         completed_at: None,
     };
-    store.create_task_v3(&task).await.unwrap();
+    store.create_task(&task).await.unwrap();
 
     // Log activity
-    let activity = crate::traits::TaskActivityV3 {
+    let activity = crate::traits::TaskActivity {
         id: 0,
         task_id: task.id.clone(),
         activity_type: "tool_call".to_string(),
@@ -2092,9 +2062,9 @@ async fn test_task_activity_v3_log() {
         tokens_used: Some(42),
         created_at: now,
     };
-    store.log_task_activity_v3(&activity).await.unwrap();
+    store.log_task_activity(&activity).await.unwrap();
 
-    let activities = store.get_task_activities_v3(&task.id).await.unwrap();
+    let activities = store.get_task_activities(&task.id).await.unwrap();
     assert_eq!(activities.len(), 1);
     assert_eq!(activities[0].activity_type, "tool_call");
     assert_eq!(activities[0].tool_name, Some("terminal".to_string()));
@@ -2238,229 +2208,456 @@ async fn test_cleanup_stale_goals() {
     let now = chrono::Utc::now().to_rfc3339();
     let three_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
 
-    // Legacy goals: one stale active, one recent active, one completed
-    sqlx::query::<sqlx::Sqlite>(
-        "INSERT INTO goals (description, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
-    )
-    .bind("stale legacy goal")
-    .bind("active")
-    .bind(&three_hours_ago)
-    .bind(&three_hours_ago)
-    .execute(&store.pool)
-    .await
-    .unwrap();
+    // Finite orchestration goals without schedules: stale active/pending -> failed.
+    let mut stale_finite = Goal::new_finite("stale finite goal", "test");
+    stale_finite.id = "stale-finite".to_string();
+    stale_finite.created_at = three_hours_ago.clone();
+    stale_finite.updated_at = three_hours_ago.clone();
+    store.create_goal(&stale_finite).await.unwrap();
 
-    sqlx::query::<sqlx::Sqlite>(
-        "INSERT INTO goals (description, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
-    )
-    .bind("recent legacy goal")
-    .bind("active")
-    .bind(&now)
-    .bind(&now)
-    .execute(&store.pool)
-    .await
-    .unwrap();
+    // Recent finite stays active.
+    let mut recent_finite = Goal::new_finite("recent finite goal", "test");
+    recent_finite.id = "recent-finite".to_string();
+    recent_finite.created_at = now.clone();
+    recent_finite.updated_at = now.clone();
+    store.create_goal(&recent_finite).await.unwrap();
 
-    sqlx::query::<sqlx::Sqlite>(
-        "INSERT INTO goals (description, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
-    )
-    .bind("completed goal")
-    .bind("completed")
-    .bind(&three_hours_ago)
-    .bind(&three_hours_ago)
-    .execute(&store.pool)
-    .await
-    .unwrap();
+    // Scheduled finite goals should not be failed by stale cleanup.
+    let mut stale_scheduled = Goal::new_finite("stale scheduled finite goal", "test");
+    stale_scheduled.id = "stale-scheduled-finite".to_string();
+    stale_scheduled.created_at = three_hours_ago.clone();
+    stale_scheduled.updated_at = three_hours_ago.clone();
+    store.create_goal(&stale_scheduled).await.unwrap();
+    let schedule = GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: stale_scheduled.id.clone(),
+        cron_expr: "0 9 12 2 *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("0 9 12 2 *".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: true,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    store.create_goal_schedule(&schedule).await.unwrap();
 
-    // V3 goals: one stale finite, one recent finite, one stale evergreen
-    fn make_goal_v3(id: &str, desc: &str, goal_type: &str, ts: &str) -> GoalV3 {
-        GoalV3 {
-            id: id.to_string(),
-            description: desc.to_string(),
-            goal_type: goal_type.to_string(),
-            status: "active".to_string(),
-            priority: "medium".to_string(),
-            conditions: None,
-            schedule: None,
-            context: None,
-            resources: None,
-            budget_per_check: None,
-            budget_daily: None,
-            tokens_used_today: 0,
-            last_useful_action: None,
-            created_at: ts.to_string(),
-            updated_at: ts.to_string(),
-            completed_at: None,
-            parent_goal_id: None,
-            session_id: "test".to_string(),
-            notified_at: None,
-            notification_attempts: 0,
-            dispatch_failures: 0,
-        }
-    }
-
-    store
-        .create_goal_v3(&make_goal_v3(
-            "stale-finite",
-            "stale finite goal",
-            "finite",
-            &three_hours_ago,
-        ))
-        .await
-        .unwrap();
-
-    let mut stale_scheduled_finite = make_goal_v3(
-        "stale-scheduled-finite",
-        "stale scheduled finite goal",
-        "finite",
-        &three_hours_ago,
-    );
-    stale_scheduled_finite.schedule = Some("0 9 12 2 *".to_string());
-    store.create_goal_v3(&stale_scheduled_finite).await.unwrap();
-
-    store
-        .create_goal_v3(&make_goal_v3(
-            "recent-finite",
-            "recent finite goal",
-            "finite",
-            &now,
-        ))
-        .await
-        .unwrap();
-
-    store
-        .create_goal_v3(&make_goal_v3(
-            "stale-evergreen",
-            "stale evergreen goal",
-            "evergreen",
-            &three_hours_ago,
-        ))
-        .await
-        .unwrap();
+    // Continuous goals are not cleaned up by this path.
+    let mut stale_continuous = Goal::new_continuous("stale continuous goal", "test", None, None);
+    stale_continuous.id = "stale-continuous".to_string();
+    stale_continuous.created_at = three_hours_ago.clone();
+    stale_continuous.updated_at = three_hours_ago.clone();
+    store.create_goal(&stale_continuous).await.unwrap();
 
     // Run cleanup with 2-hour threshold
-    let (legacy, v3) = store.cleanup_stale_goals(2).await.unwrap();
-    assert_eq!(legacy, 1, "should abandon 1 stale legacy goal");
-    assert_eq!(v3, 1, "should fail 1 stale finite v3 goal");
+    let count = store.cleanup_stale_goals(2).await.unwrap();
+    assert_eq!(count, 1);
 
-    // Verify legacy: stale → abandoned, recent stays active
-    let row: (String,) = sqlx::query_as::<sqlx::Sqlite, _>(
-        "SELECT status FROM goals WHERE description = 'stale legacy goal'",
-    )
-    .fetch_one(&store.pool)
-    .await
-    .unwrap();
-    assert_eq!(row.0, "abandoned");
-
-    let row: (String,) = sqlx::query_as::<sqlx::Sqlite, _>(
-        "SELECT status FROM goals WHERE description = 'recent legacy goal'",
-    )
-    .fetch_one(&store.pool)
-    .await
-    .unwrap();
-    assert_eq!(row.0, "active");
-
-    // Verify V3: stale finite → failed, recent finite stays active, evergreen untouched
-    let g = store.get_goal_v3("stale-finite").await.unwrap().unwrap();
+    let g = store.get_goal("stale-finite").await.unwrap().unwrap();
     assert_eq!(g.status, "failed");
     assert!(g.completed_at.is_some());
 
-    let g = store.get_goal_v3("recent-finite").await.unwrap().unwrap();
+    let g = store.get_goal("recent-finite").await.unwrap().unwrap();
     assert_eq!(g.status, "active");
 
     let g = store
-        .get_goal_v3("stale-scheduled-finite")
+        .get_goal("stale-scheduled-finite")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        g.status, "active",
-        "scheduled finite goals should not be failed by stale cleanup"
-    );
+    assert_eq!(g.status, "active");
 
-    let g = store.get_goal_v3("stale-evergreen").await.unwrap().unwrap();
-    assert_eq!(
-        g.status, "active",
-        "evergreen goals should not be cleaned up"
-    );
+    let g = store.get_goal("stale-continuous").await.unwrap().unwrap();
+    assert_eq!(g.status, "active");
 }
 
 #[tokio::test]
-async fn test_migrate_legacy_scheduled_tasks_to_v3() {
-    let (store, _db) = setup_test_store().await;
+async fn test_migrate_legacy_scheduled_tasks_to_goals_and_schedules() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_path = db_file.path().to_str().unwrap();
     let now = chrono::Utc::now();
     let next_hour = (now + chrono::Duration::hours(1)).to_rfc3339();
 
-    // Recurring active legacy task
-    sqlx::query::<sqlx::Sqlite>(
-            "INSERT INTO scheduled_tasks
-             (id, name, cron_expr, original_schedule, prompt, source, is_oneshot, is_paused, is_trusted, last_run_at, next_run_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    // Create a legacy scheduled_tasks table and rows BEFORE opening SqliteStateStore (migrations run on open).
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(db_path)
+                .create_if_missing(true),
         )
-        .bind("legacy-recurring-1")
-        .bind("legacy recurring")
-        .bind("0 */6 * * *")
-        .bind("every 6h")
-        .bind("monitor API health")
-        .bind("tool")
-        .bind(0i64)
-        .bind(0i64)
-        .bind(0i64)
-        .bind::<Option<String>>(None)
-        .bind(&next_hour)
-        .bind(now.to_rfc3339())
-        .bind(now.to_rfc3339())
-        .execute(&store.pool)
         .await
         .unwrap();
+    sqlx::query(
+        "CREATE TABLE scheduled_tasks (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            cron_expr TEXT NOT NULL,
+            original_schedule TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            source TEXT NOT NULL,
+            is_oneshot INTEGER NOT NULL DEFAULT 0,
+            is_paused INTEGER NOT NULL DEFAULT 0,
+            is_trusted INTEGER NOT NULL DEFAULT 0,
+            last_run_at TEXT,
+            next_run_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Recurring active legacy task
+    sqlx::query(
+        "INSERT INTO scheduled_tasks
+         (id, name, cron_expr, original_schedule, prompt, source, is_oneshot, is_paused, is_trusted, last_run_at, next_run_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("legacy-recurring-1")
+    .bind("legacy recurring")
+    .bind("0 */6 * * *")
+    .bind("every 6h")
+    .bind("monitor API health")
+    .bind("tool")
+    .bind(0i64)
+    .bind(0i64)
+    .bind(0i64)
+    .bind::<Option<String>>(None)
+    .bind(&next_hour)
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // One-shot paused legacy task
-    sqlx::query::<sqlx::Sqlite>(
-            "INSERT INTO scheduled_tasks
-             (id, name, cron_expr, original_schedule, prompt, source, is_oneshot, is_paused, is_trusted, last_run_at, next_run_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind("legacy-oneshot-1")
-        .bind("legacy oneshot")
-        .bind("0 9 * * *")
-        .bind("tomorrow at 9am")
-        .bind("check deployment")
-        .bind("tool")
-        .bind(1i64)
-        .bind(1i64)
-        .bind(0i64)
-        .bind::<Option<String>>(None)
-        .bind(&next_hour)
-        .bind(now.to_rfc3339())
-        .bind(now.to_rfc3339())
-        .execute(&store.pool)
+    sqlx::query(
+        "INSERT INTO scheduled_tasks
+         (id, name, cron_expr, original_schedule, prompt, source, is_oneshot, is_paused, is_trusted, last_run_at, next_run_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("legacy-oneshot-1")
+    .bind("legacy oneshot")
+    .bind("0 9 * * *")
+    .bind("tomorrow at 9am")
+    .bind("check deployment")
+    .bind("tool")
+    .bind(1i64)
+    .bind(1i64)
+    .bind(0i64)
+    .bind::<Option<String>>(None)
+    .bind(&next_hour)
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    pool.close().await;
+
+    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let store = SqliteStateStore::new(db_path, 100, None, embedding_service)
         .await
         .unwrap();
 
-    let migrated = store.migrate_legacy_scheduled_tasks_to_v3().await.unwrap();
-    assert_eq!(migrated, 2);
-
-    // Idempotent rerun should not duplicate.
-    let migrated_again = store.migrate_legacy_scheduled_tasks_to_v3().await.unwrap();
-    assert_eq!(migrated_again, 0);
+    // scheduled_tasks table should be dropped after migration.
+    let has_scheduled_tasks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='scheduled_tasks'",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(has_scheduled_tasks, 0);
 
     let g1 = store
-        .get_goal_v3("legacy-sched-legacy-recurring-1")
+        .get_goal("legacy-sched-legacy-recurring-1")
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(g1.domain, "orchestration");
     assert_eq!(g1.goal_type, "continuous");
     assert_eq!(g1.status, "active");
     assert_eq!(g1.session_id, "system");
-    assert_eq!(g1.schedule.as_deref(), Some("0 */6 * * *"));
+    let sched1 = store.get_schedules_for_goal(&g1.id).await.unwrap();
+    assert_eq!(sched1.len(), 1);
+    assert_eq!(sched1[0].id, "sched-legacy-legacy-recurring-1");
+    assert_eq!(sched1[0].cron_expr, "0 */6 * * *");
+    assert_eq!(sched1[0].tz, "local");
+    assert_eq!(sched1[0].original_schedule.as_deref(), Some("every 6h"));
+    assert!(!sched1[0].is_one_shot);
+    assert!(!sched1[0].is_paused);
+    let expected_next = chrono::DateTime::parse_from_rfc3339(&next_hour)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let got_next = chrono::DateTime::parse_from_rfc3339(&sched1[0].next_run_at)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert_eq!(got_next, expected_next);
 
     let g2 = store
-        .get_goal_v3("legacy-sched-legacy-oneshot-1")
+        .get_goal("legacy-sched-legacy-oneshot-1")
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(g2.domain, "orchestration");
     assert_eq!(g2.goal_type, "finite");
     assert_eq!(g2.status, "paused");
     assert_eq!(g2.session_id, "system");
-    assert!(g2.schedule.is_some());
+    let sched2 = store.get_schedules_for_goal(&g2.id).await.unwrap();
+    assert_eq!(sched2.len(), 1);
+    assert_eq!(sched2[0].id, "sched-legacy-legacy-oneshot-1");
+    assert_eq!(sched2[0].tz, "local");
+    assert_eq!(
+        sched2[0].original_schedule.as_deref(),
+        Some("tomorrow at 9am")
+    );
+    assert!(sched2[0].is_one_shot);
+    assert!(sched2[0].is_paused);
+    assert!(!sched2[0].cron_expr.trim().is_empty());
+}
+
+#[tokio::test]
+async fn test_migrate_fixup_scheduled_goal_budgets() {
+    let (store, _db_file) = setup_test_store().await;
+
+    let goal = Goal::new_continuous(
+        "Legacy scheduled budget bug",
+        "system",
+        Some(5000),
+        Some(20000),
+    );
+    store.create_goal(&goal).await.unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 */6 * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("every 6h".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    store.create_goal_schedule(&schedule).await.unwrap();
+
+    let before = store.get_goal(&goal.id).await.unwrap().unwrap();
+    assert_eq!(before.budget_per_check, Some(5000));
+    assert_eq!(before.budget_daily, Some(20000));
+
+    migrations::migrate_state(&store.pool()).await.unwrap();
+
+    let after = store.get_goal(&goal.id).await.unwrap().unwrap();
+    assert_eq!(after.budget_per_check, Some(50_000));
+    assert_eq!(after.budget_daily, Some(200_000));
+}
+
+#[tokio::test]
+async fn test_migrate_v3_tables_renamed_and_schedule_migrated() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_path = db_file.path().to_str().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Create goals_v3/tasks_v3/task_activity_v3 BEFORE opening SqliteStateStore (migrations run on open).
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(db_path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "CREATE TABLE goals_v3 (
+            id TEXT PRIMARY KEY,
+            description TEXT NOT NULL,
+            goal_type TEXT NOT NULL DEFAULT 'finite',
+            status TEXT NOT NULL DEFAULT 'active',
+            priority TEXT NOT NULL DEFAULT 'medium',
+            conditions TEXT,
+            context TEXT,
+            resources TEXT,
+            schedule TEXT,
+            budget_per_check INTEGER,
+            budget_daily INTEGER,
+            tokens_used_today INTEGER NOT NULL DEFAULT 0,
+            last_useful_action TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            parent_goal_id TEXT,
+            session_id TEXT NOT NULL,
+            notified_at TEXT
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "CREATE TABLE tasks_v3 (
+            id TEXT PRIMARY KEY,
+            goal_id TEXT NOT NULL REFERENCES goals_v3(id) ON DELETE CASCADE,
+            description TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            priority TEXT NOT NULL DEFAULT 'medium',
+            task_order INTEGER NOT NULL DEFAULT 0,
+            parallel_group TEXT,
+            depends_on TEXT,
+            agent_id TEXT,
+            context TEXT,
+            result TEXT,
+            error TEXT,
+            blocker TEXT,
+            idempotent INTEGER NOT NULL DEFAULT 0,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 3,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "CREATE TABLE task_activity_v3 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks_v3(id) ON DELETE CASCADE,
+            activity_type TEXT NOT NULL,
+            tool_name TEXT,
+            tool_args TEXT,
+            result TEXT,
+            success INTEGER,
+            tokens_used INTEGER,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO goals_v3
+         (id, description, goal_type, status, priority, schedule, created_at, updated_at, session_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("g-v3-1")
+    .bind("v3 goal")
+    .bind("continuous")
+    .bind("active")
+    .bind("medium")
+    .bind("0 6,12,18 * * *")
+    .bind(&now)
+    .bind(&now)
+    .bind("test")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO tasks_v3
+         (id, goal_id, description, status, priority, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("t-v3-1")
+    .bind("g-v3-1")
+    .bind("do the thing")
+    .bind("pending")
+    .bind("medium")
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO task_activity_v3
+         (task_id, activity_type, tool_name, tool_args, result, success, tokens_used, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("t-v3-1")
+    .bind("tool_call")
+    .bind("terminal")
+    .bind("{\"cmd\":\"echo hi\"}")
+    .bind("ok")
+    .bind(1i64)
+    .bind(10i64)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    pool.close().await;
+
+    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let store = SqliteStateStore::new(db_path, 100, None, embedding_service)
+        .await
+        .unwrap();
+
+    // v3 tables should be gone.
+    let has_goals_v3: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='goals_v3'",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    let has_tasks_v3: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tasks_v3'",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    let has_task_activity_v3: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_activity_v3'",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(has_goals_v3, 0);
+    assert_eq!(has_tasks_v3, 0);
+    assert_eq!(has_task_activity_v3, 0);
+
+    // Data should be preserved under clean names.
+    let g = store.get_goal("g-v3-1").await.unwrap().unwrap();
+    assert_eq!(g.description, "v3 goal");
+    assert_eq!(g.domain, "orchestration");
+
+    let schedules = store.get_schedules_for_goal(&g.id).await.unwrap();
+    assert_eq!(schedules.len(), 1);
+    assert_eq!(schedules[0].id, "sched-migrated-g-v3-1");
+    assert_eq!(schedules[0].cron_expr, "0 6,12,18 * * *");
+    assert_eq!(schedules[0].tz, "local");
+    assert!(!schedules[0].next_run_at.trim().is_empty());
+
+    let tasks = store.get_tasks_for_goal(&g.id).await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, "t-v3-1");
+
+    let act = store.get_task_activities(&tasks[0].id).await.unwrap();
+    assert_eq!(act.len(), 1);
+    assert_eq!(act[0].tool_name.as_deref(), Some("terminal"));
+
+    // Idempotency: re-opening should not duplicate migrated schedules.
+    drop(store);
+    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let store2 = SqliteStateStore::new(db_path, 100, None, embedding_service)
+        .await
+        .unwrap();
+    let schedules2 = store2.get_schedules_for_goal("g-v3-1").await.unwrap();
+    assert_eq!(schedules2.len(), 1);
 }

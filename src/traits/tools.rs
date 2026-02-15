@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::types::StatusUpdate;
 
-/// V3 role assigned to an agent for role-based tool scoping.
+/// Role assigned to an agent for role-based tool scoping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRole {
     /// Root agent — routes, classifies, full tool access (legacy behavior).
@@ -16,7 +16,7 @@ pub enum AgentRole {
     Executor,
 }
 
-/// Categorization of a tool for V3 role-based scoping.
+/// Categorization of a tool for role-based scoping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRole {
     /// Terminal, web_search, web_fetch, browser, etc.
@@ -71,7 +71,7 @@ pub trait Tool: Send + Sync {
         self.call(arguments).await
     }
 
-    /// Categorize this tool for V3 role-based scoping.
+    /// Categorize this tool for role-based scoping.
     /// Default: Action (most tools are action tools).
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action

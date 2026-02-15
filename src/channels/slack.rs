@@ -35,7 +35,7 @@ pub struct SlackChannel {
     bot_name: std::sync::RwLock<String>,
     app_token: String,
     bot_token: String,
-    allowed_user_ids: Vec<String>,
+    allowed_user_ids: std::sync::RwLock<Vec<String>>,
     use_threads: bool,
     agent: Arc<Agent>,
     config_path: PathBuf,
@@ -83,7 +83,7 @@ impl SlackChannel {
             bot_name: std::sync::RwLock::new("slack".to_string()),
             app_token: app_token.to_string(),
             bot_token: bot_token.to_string(),
-            allowed_user_ids,
+            allowed_user_ids: std::sync::RwLock::new(allowed_user_ids),
             use_threads,
             agent,
             config_path,
@@ -109,6 +109,40 @@ impl SlackChannel {
         if let Ok(mut guard) = self.channel_hub.write() {
             *guard = Some(hub);
         }
+    }
+
+    /// Persist the current allowed_user_ids list to config.toml.
+    /// Handles both `[slack]` and `[[slack_bots]]` config formats.
+    async fn persist_allowed_user_ids(&self, ids: &[String]) -> anyhow::Result<()> {
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let mut doc: toml::Table = content.parse()?;
+
+        let ids_toml = toml::Value::Array(
+            ids.iter()
+                .map(|id| toml::Value::String(id.clone()))
+                .collect(),
+        );
+
+        let mut updated = false;
+        if let Some(slack) = doc.get_mut("slack").and_then(|v| v.as_table_mut()) {
+            slack.insert("allowed_user_ids".to_string(), ids_toml.clone());
+            updated = true;
+        }
+        if let Some(bots) = doc.get_mut("slack_bots").and_then(|v| v.as_array_mut()) {
+            if let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut()) {
+                first.insert("allowed_user_ids".to_string(), ids_toml);
+                updated = true;
+            }
+        }
+
+        if !updated {
+            anyhow::bail!("No [slack] or [[slack_bots]] section found in config");
+        }
+
+        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
+        tokio::fs::write(&self.config_path, &new_content).await?;
+        info!("Persisted Slack allowed_user_ids to config.toml");
+        Ok(())
     }
 
     /// Get the bot's name (cached after first connection).
@@ -621,10 +655,6 @@ impl SlackChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Determine user role: Owner if whitelisted, Public if @mention/DM, otherwise ignore
-        let is_whitelisted =
-            !self.allowed_user_ids.is_empty() && self.allowed_user_ids.contains(&user);
-
         // Check if the message mentions the bot
         let bot_mentioned = {
             let bot_id_guard = self.bot_user_id.lock().await;
@@ -636,6 +666,47 @@ impl SlackChannel {
         };
         let is_dm = channel_type == "im";
 
+        // Auto-claim: if no allowed_user_ids and this is a DM, claim the sender as owner
+        let auto_claimed;
+        let is_whitelisted = {
+            let allowed = self.allowed_user_ids.read().unwrap();
+            if allowed.is_empty() {
+                if is_dm {
+                    drop(allowed);
+                    warn!(
+                        user = %user,
+                        "No allowed_user_ids configured — auto-claiming first DM user as owner."
+                    );
+                    {
+                        let mut allowed = self.allowed_user_ids.write().unwrap();
+                        allowed.push(user.clone());
+                    }
+                    auto_claimed = true;
+                    true
+                } else {
+                    auto_claimed = false;
+                    false
+                }
+            } else {
+                auto_claimed = false;
+                allowed.contains(&user)
+            }
+        };
+
+        if auto_claimed {
+            // Persist to config.toml (must be outside RwLock scope to avoid Send issues)
+            let ids = self.allowed_user_ids.read().unwrap().clone();
+            if let Err(e) = self.persist_allowed_user_ids(&ids).await {
+                warn!(user = %user, "Failed to persist auto-claimed user ID to config: {}", e);
+            }
+            let _ = self.post_message(
+                &channel_id,
+                "Hey! You're now set as the owner. Ask me anything, give me tasks, or just chat.",
+                None,
+            ).await;
+        }
+
+        // Determine user role: Owner if whitelisted, Public if @mention/DM, otherwise ignore
         let user_role = if is_whitelisted {
             // Owner in a non-DM channel who didn't mention the bot and is mentioning
             // someone else — they're talking to that person, not the bot. Stay silent.
@@ -1288,10 +1359,12 @@ impl SlackChannel {
             .unwrap_or("");
 
         // Authorization check: fail-closed - deny if no users configured or user not in list
-        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id.to_string())
         {
-            warn!(user_id, "Unauthorized Slack interactive action");
-            return;
+            let allowed = self.allowed_user_ids.read().unwrap();
+            if allowed.is_empty() || !allowed.contains(&user_id.to_string()) {
+                warn!(user_id, "Unauthorized Slack interactive action");
+                return;
+            }
         }
 
         let actions = match payload.get("actions").and_then(|v| v.as_array()) {
@@ -1396,10 +1469,12 @@ impl SlackChannel {
         let text_arg = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
         // Authorization check: fail-closed - deny if no users configured or user not in list
-        if self.allowed_user_ids.is_empty() || !self.allowed_user_ids.contains(&user_id.to_string())
         {
-            warn!(user_id, "Unauthorized Slack slash command");
-            return;
+            let allowed = self.allowed_user_ids.read().unwrap();
+            if allowed.is_empty() || !allowed.contains(&user_id.to_string()) {
+                warn!(user_id, "Unauthorized Slack slash command");
+                return;
+            }
         }
 
         let cmd_text = if text_arg.is_empty() {

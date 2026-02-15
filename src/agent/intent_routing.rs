@@ -2,14 +2,14 @@ use regex::Regex;
 
 use super::{IntentGateDecision, ENABLE_SCHEDULE_HEURISTICS};
 
-/// Complexity classification for V3 orchestration routing.
+/// Complexity classification for orchestration routing.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum IntentComplexity {
     /// Answer from memory/knowledge, no executor needed.
     Knowledge,
     /// Simple task — falls through to full agent loop.
     Simple,
-    /// Multi-step complex task, create a V3 goal and fall through to current agent loop.
+    /// Multi-step complex task, create a goal and fall through to current agent loop.
     Complex,
     /// User asks for recurring/ongoing behavior but did not provide timing.
     ScheduledMissingTiming,
@@ -90,34 +90,24 @@ pub(super) fn detect_schedule_heuristic(user_text: &str) -> Option<(String, bool
     if is_schedule_reference_query(text) {
         return None;
     }
-    let lower = text.to_ascii_lowercase();
 
-    // One-shot relative time, e.g. "in 2h", "in 30 minutes"
-    let re_in_time =
-        Regex::new(r"(?i)\bin\s+\d+\s*(?:m|min|mins|minutes?|h|hrs?|hours?)\b").ok()?;
+    // One-shot relative time, e.g. "in 2h", "after 90 minutes"
+    // Keep it strict to avoid misclassifying general "in ..." prose as scheduling.
+    let re_in_time = Regex::new(
+        r"(?i)\b(?:in|after)\s+\d+\s*(?:w|weeks?|d|days?|h|hrs?|hours?|m|min|mins|minutes?)\b",
+    )
+    .ok()?;
     if let Some(m) = re_in_time.find(text) {
         return Some((m.as_str().trim().to_string(), true));
     }
 
-    // One-shot absolute tomorrow time, e.g. "tomorrow at 9am"
-    let re_tomorrow_at =
-        Regex::new(r"(?i)\btomorrow\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b").ok()?;
-    if let Some(m) = re_tomorrow_at.find(text) {
-        return Some((m.as_str().trim().to_string(), true));
-    }
-
-    // One-shot today/tonight absolute time, optional timezone token.
-    let re_today_tonight_at = Regex::new(
-        r"(?i)\b(?:today|tonight)\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?(?:\s+[A-Za-z]{1,8}|[+-]\d{2}:?\d{2}|Z)?\b",
+    // One-shot day+time, optional timezone token.
+    let re_day_at = Regex::new(
+        r"(?i)\b(?:today|tonight|tomorrow)\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?(?:\s+(?:[A-Za-z]{1,8}|[+-]\d{2}:?\d{2}|Z))?\b",
     )
     .ok()?;
-    if let Some(m) = re_today_tonight_at.find(text) {
+    if let Some(m) = re_day_at.find(text) {
         return Some((m.as_str().trim().to_string(), true));
-    }
-
-    // One-shot tomorrow without explicit time (will likely require clarification later).
-    if contains_keyword_as_words(&lower, "tomorrow") {
-        return Some(("tomorrow".to_string(), true));
     }
 
     // Recurring intervals: "every 6h", "every 30m", "each 5 minutes"
@@ -127,21 +117,48 @@ pub(super) fn detect_schedule_heuristic(user_text: &str) -> Option<(String, bool
         return Some((m.as_str().trim().to_string(), false));
     }
 
-    // Recurring named schedules
-    let recurring_patterns = [
-        r"(?i)\bdaily\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
-        r"(?i)\bweekdays?\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
-        r"(?i)\bweekends?\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
-    ];
-    for pattern in recurring_patterns {
-        let re = Regex::new(pattern).ok()?;
-        if let Some(m) = re.find(text) {
-            return Some((m.as_str().trim().to_string(), false));
-        }
+    // Recurring "at" schedules (support multi-time variants; minutes must match).
+    // We normalize to canonical strings so cron parsing is consistent.
+    let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
+    let time_list = format!(
+        r"(?P<times>{time}(?:\s*(?:,|\band\b|&)\s*{time})*)",
+        time = time
+    );
+    let re_daily_at = Regex::new(&format!(
+        r"(?i)\b(?P<kind>daily|every\s+day|everyday|each\s+day)\s+at\s+{}",
+        time_list
+    ))
+    .ok()?;
+    if let Some(caps) = re_daily_at.captures(text) {
+        let times = caps.name("times")?.as_str().trim();
+        return Some((format!("every day at {}", times), false));
+    }
+    let re_weekdays_at = Regex::new(&format!(
+        r"(?i)\b(?P<kind>weekdays?|every\s+weekdays?|every\s+weekday|each\s+weekday)\s+at\s+{}",
+        time_list
+    ))
+    .ok()?;
+    if let Some(caps) = re_weekdays_at.captures(text) {
+        let times = caps.name("times")?.as_str().trim();
+        return Some((format!("weekdays at {}", times), false));
+    }
+    let re_weekends_at = Regex::new(&format!(
+        r"(?i)\b(?P<kind>weekends?|every\s+weekends?|every\s+weekend|each\s+weekend)\s+at\s+{}",
+        time_list
+    ))
+    .ok()?;
+    if let Some(caps) = re_weekends_at.captures(text) {
+        let times = caps.name("times")?.as_str().trim();
+        return Some((format!("weekends at {}", times), false));
     }
 
+    // Standalone keywords ("daily", etc.) are only treated as schedules when
+    // the user's entire message is the keyword. This is commonly used as a
+    // follow-up answer to "how often?" and avoids false positives like
+    // "what is my daily budget?".
+    let trimmed_lower = text.trim().to_ascii_lowercase();
     for kw in ["hourly", "daily", "weekly", "monthly"] {
-        if contains_keyword_as_words(&lower, kw) {
+        if trimmed_lower == kw {
             return Some((kw.to_string(), false));
         }
     }
@@ -306,7 +323,7 @@ mod intent_routing_path_override_tests {
     }
 }
 
-/// Classify user intent complexity for V3 routing.
+/// Classify user intent complexity for orchestration routing.
 ///
 /// Uses the LLM-provided `complexity` field from the `[INTENT_GATE]` JSON.
 /// Falls back to `Simple` when the field is absent or unrecognized.
@@ -318,6 +335,26 @@ pub(super) fn classify_intent_complexity(
     user_text: &str,
     intent_gate: &IntentGateDecision,
 ) -> (IntentComplexity, Vec<String>) {
+    // Heuristic schedule extraction: if the model omitted schedule fields but the
+    // user message contains a concrete schedule phrase, treat it as scheduled
+    // rather than falling back into the tool loop (which can spiral).
+    if ENABLE_SCHEDULE_HEURISTICS
+        && intent_gate.schedule.is_none()
+        && intent_gate.schedule_cron.is_none()
+    {
+        if let Some((schedule_raw, is_one_shot)) = detect_schedule_heuristic(user_text) {
+            return (
+                IntentComplexity::Scheduled {
+                    schedule_raw,
+                    schedule_cron: None,
+                    is_one_shot,
+                    schedule_type_explicit: false,
+                },
+                vec![],
+            );
+        }
+    }
+
     // If user clearly wants recurring behavior but no timing could be extracted,
     // ask for schedule details instead of silently creating a non-recurring goal.
     if ENABLE_SCHEDULE_HEURISTICS

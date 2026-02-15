@@ -21,7 +21,7 @@ pub struct Suggestion {
 #[allow(dead_code)] // IDs reserved for feedback/analytics
 pub enum SuggestionSource {
     Pattern(i64),   // Behavior pattern ID
-    Goal(i64),      // Goal ID
+    Goal(String),   // Goal ID
     Procedure(i64), // Procedure ID
     Episode(i64),   // Episode ID
 }
@@ -35,7 +35,7 @@ pub struct SuggestionContext {
     /// Explicitly selected behavior pattern IDs relevant to the current turn.
     pub relevant_pattern_ids: Vec<i64>,
     /// Explicitly selected goal IDs relevant to the current turn.
-    pub relevant_goal_ids: Vec<i64>,
+    pub relevant_goal_ids: Vec<String>,
     /// Explicitly selected procedure IDs relevant to the current turn.
     pub relevant_procedure_ids: Vec<i64>,
     /// Explicitly selected episode IDs relevant to the current turn.
@@ -174,7 +174,7 @@ impl ProactiveEngine {
 
                 suggestions.push(Suggestion {
                     text: format!("This relates to your goal: {}", goal.description),
-                    source: SuggestionSource::Goal(goal.id),
+                    source: SuggestionSource::Goal(goal.id.clone()),
                     confidence,
                 });
             }
@@ -280,17 +280,9 @@ mod tests {
 
     #[test]
     fn test_goal_suggestion() {
-        let goal = Goal {
-            id: 1,
-            description: "Complete the Rust migration".to_string(),
-            status: "active".to_string(),
-            priority: "high".to_string(),
-            progress_notes: None,
-            source_episode_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            completed_at: None,
-        };
+        let mut goal = Goal::new_finite("Complete the Rust migration", "test-session");
+        goal.priority = "high".to_string();
+        let goal_id = goal.id.clone();
 
         let engine = ProactiveEngine::new(vec![], vec![goal], vec![], vec![], make_profile(true));
 
@@ -298,7 +290,7 @@ mod tests {
             last_action: None,
             current_topic: None,
             relevant_pattern_ids: vec![],
-            relevant_goal_ids: vec![1],
+            relevant_goal_ids: vec![goal_id],
             relevant_procedure_ids: vec![],
             relevant_episode_ids: vec![],
             session_duration_mins: 5,
@@ -313,17 +305,8 @@ mod tests {
 
     #[test]
     fn test_goal_suggestion_does_not_use_keyword_guessing() {
-        let goal = Goal {
-            id: 1,
-            description: "Complete the Rust migration".to_string(),
-            status: "active".to_string(),
-            priority: "high".to_string(),
-            progress_notes: None,
-            source_episode_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            completed_at: None,
-        };
+        let mut goal = Goal::new_finite("Complete the Rust migration", "test-session");
+        goal.priority = "high".to_string();
 
         let engine = ProactiveEngine::new(vec![], vec![goal], vec![], vec![], make_profile(true));
         let context = SuggestionContext {

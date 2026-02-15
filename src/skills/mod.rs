@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use tracing::{info, warn};
 
 pub mod resources;
@@ -334,6 +335,58 @@ pub fn load_skills(dir: &Path) -> Vec<Skill> {
     }
 
     skills
+}
+
+/// Cached skill loader that avoids re-reading files on every message.
+/// Checks directory modification time and only reloads when files change.
+#[derive(Clone)]
+pub struct SkillCache {
+    dir: PathBuf,
+    inner: Arc<Mutex<SkillCacheInner>>,
+}
+
+struct SkillCacheInner {
+    skills: Vec<Skill>,
+    last_checked: SystemTime,
+    dir_mtime: Option<SystemTime>,
+}
+
+impl SkillCache {
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            inner: Arc::new(Mutex::new(SkillCacheInner {
+                skills: Vec::new(),
+                last_checked: SystemTime::UNIX_EPOCH,
+                dir_mtime: None,
+            })),
+        }
+    }
+
+    /// Returns cached skills, reloading only if the directory has been modified.
+    pub fn get(&self) -> Vec<Skill> {
+        let current_mtime = std::fs::metadata(&self.dir)
+            .and_then(|m| m.modified())
+            .ok();
+
+        let mut inner = self.inner.lock().unwrap();
+
+        // Reload if directory mtime changed or cache is empty
+        if inner.dir_mtime != current_mtime || inner.skills.is_empty() {
+            inner.skills = load_skills(&self.dir);
+            inner.dir_mtime = current_mtime;
+            inner.last_checked = SystemTime::now();
+        }
+
+        inner.skills.clone()
+    }
+
+    /// Force a reload on next access (e.g., after adding/removing a skill).
+    #[allow(dead_code)]
+    pub fn invalidate(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.dir_mtime = None;
+    }
 }
 
 /// Normalize a potential skill reference token into canonical filename form.

@@ -22,8 +22,8 @@ impl ToolTraceTool {
 
 #[derive(Deserialize)]
 struct ToolTraceArgs {
-    #[serde(default)]
-    goal_id_v3: Option<String>,
+    #[serde(default, alias = "goal_id_v3")]
+    goal_id: Option<String>,
     #[serde(default)]
     task_id: Option<String>,
     #[serde(default)]
@@ -49,7 +49,7 @@ impl Tool for ToolTraceTool {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "goal_id_v3": {
+                    "goal_id": {
                         "type": "string",
                         "description": "Goal ID (full or unique prefix). Required when task_id is not provided."
                     },
@@ -86,7 +86,7 @@ impl Tool for ToolTraceTool {
 
         let delegated = json!({
             "action": "tool_trace",
-            "goal_id_v3": args.goal_id_v3,
+            "goal_id": args.goal_id,
             "task_id": args.task_id,
             "tool_name": args.tool_name,
             "limit": args.limit
@@ -100,7 +100,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::{GoalV3, TaskActivityV3, TaskV3};
+    use crate::traits::{Goal, Task, TaskActivity};
 
     async fn setup_state() -> Arc<dyn StateStore> {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -120,11 +120,11 @@ mod tests {
         let state = setup_state().await;
         let tool = ToolTraceTool::new(state.clone());
 
-        let goal = GoalV3::new_finite("Alias trace goal", "user-session");
-        state.create_goal_v3(&goal).await.unwrap();
+        let goal = Goal::new_finite("Alias trace goal", "user-session");
+        state.create_goal(&goal).await.unwrap();
 
         let now = chrono::Utc::now().to_rfc3339();
-        let task = TaskV3 {
+        let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
             description: "Run task".to_string(),
@@ -145,9 +145,9 @@ mod tests {
             started_at: Some(now.clone()),
             completed_at: Some(now.clone()),
         };
-        state.create_task_v3(&task).await.unwrap();
+        state.create_task(&task).await.unwrap();
         state
-            .log_task_activity_v3(&TaskActivityV3 {
+            .log_task_activity(&TaskActivity {
                 id: 0,
                 task_id: task.id.clone(),
                 activity_type: "tool_result".to_string(),
@@ -164,7 +164,7 @@ mod tests {
         let result = tool
             .call(
                 &json!({
-                    "goal_id_v3": goal.id,
+                    "goal_id": goal.id,
                     "tool_name": "web_fetch"
                 })
                 .to_string(),

@@ -54,3 +54,6 @@ telegram-modern-site/
 
 # Documentation (local only)
 docs/
+
+# Local git worktrees (dev helper)
+.worktrees/

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::execution_policy::{
-    score_risk_from_capabilities, score_uncertainty_v1, PolicyBundle, UncertaintySignals,
+    score_risk_from_capabilities, score_uncertainty, PolicyBundle, UncertaintySignals,
 };
 use crate::traits::ToolCapabilities;
 
@@ -162,7 +162,7 @@ fn infer_uncertainty_signals(user_text: &str, prior_immediate_failure: bool) -> 
     }
 }
 
-pub(super) fn build_policy_bundle_v1(
+pub(super) fn build_policy_bundle(
     user_text: &str,
     available_capabilities: &HashMap<String, ToolCapabilities>,
     prior_immediate_failure: bool,
@@ -171,7 +171,7 @@ pub(super) fn build_policy_bundle_v1(
     let cap_risk =
         score_risk_from_capabilities(&available_capabilities.values().copied().collect::<Vec<_>>());
     let risk_score = ((text_risk * 0.7) + (cap_risk * 0.3)).clamp(0.0, 1.0);
-    let uncertainty_score = score_uncertainty_v1(infer_uncertainty_signals(
+    let uncertainty_score = score_uncertainty(infer_uncertainty_signals(
         user_text,
         prior_immediate_failure,
     ));

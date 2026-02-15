@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 use crate::agent::{is_group_session, Agent};
 use crate::channels::ChannelHub;
 use crate::goal_tokens::GoalTokenRegistry;
-use crate::traits::{GoalV3, StateStore};
+use crate::traits::{GoalSchedule, StateStore};
 use crate::types::{ChannelContext, UserRole};
 
 /// Runtime snapshot of a heartbeat background job.
@@ -222,20 +222,6 @@ impl HeartbeatCoordinator {
     async fn startup_recovery(&self) {
         info!("Running startup recovery");
 
-        // One-time migration path for legacy scheduler rows.
-        match self.state.migrate_legacy_scheduled_tasks_to_v3().await {
-            Ok(count) if count > 0 => {
-                info!(
-                    migrated = count,
-                    "Migrated legacy scheduled tasks into V3 goals"
-                );
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to migrate legacy scheduled tasks");
-            }
-            _ => {}
-        }
-
         // Mark any tasks stuck in running/claimed as interrupted,
         // then auto-retry idempotent ones ONLY if their parent goal is still active.
         // We do NOT aggressively fail goals here — the progress-based circuit breaker
@@ -252,7 +238,7 @@ impl HeartbeatCoordinator {
                     interrupted += 1;
 
                     // Check if the parent goal is still active/non-stalled before retrying
-                    let goal_active = match self.state.get_goal_v3(&task.goal_id).await {
+                    let goal_active = match self.state.get_goal(&task.goal_id).await {
                         Ok(Some(g)) => g.status == "active",
                         _ => false,
                     };
@@ -268,7 +254,7 @@ impl HeartbeatCoordinator {
                         retry_task.status = "pending".to_string();
                         retry_task.retry_count += 1;
                         retry_task.started_at = None;
-                        if let Err(e) = self.state.update_task_v3(&retry_task).await {
+                        if let Err(e) = self.state.update_task(&retry_task).await {
                             error!(task_id = %task.id, error = %e, "Failed to auto-retry task");
                         } else {
                             auto_retried += 1;
@@ -294,23 +280,18 @@ impl HeartbeatCoordinator {
         // Mark stale active goals as abandoned/failed.
         // Finite goals stuck active for >2 hours are clearly orphaned.
         match self.state.cleanup_stale_goals(2).await {
-            Ok((legacy, v3)) => {
-                if legacy > 0 || v3 > 0 {
-                    info!(
-                        legacy_abandoned = legacy,
-                        v3_failed = v3,
-                        "Startup recovery: cleaned up stale goals"
-                    );
-                }
+            Ok(count) if count > 0 => {
+                info!(count, "Startup recovery: cleaned up stale goals");
             }
             Err(e) => {
                 error!(error = %e, "Failed to cleanup stale goals during recovery");
             }
+            _ => {}
         }
 
         // Rebuild goal token registry from active goals
         if let Some(ref registry) = self.goal_token_registry {
-            match self.state.get_active_goals_v3().await {
+            match self.state.get_active_goals().await {
                 Ok(goals) => {
                     registry.rebuild_from_goals(&goals).await;
                     info!(
@@ -442,11 +423,8 @@ impl HeartbeatCoordinator {
             }
         }
 
-        // Phase 2: Check evergreen goals
-        self.check_evergreen_goals().await;
-
-        // Phase 2b: Check deferred one-shot finite goals
-        self.check_deferred_finite_goals().await;
+        // Phase 2: Fire due schedules (recurring + one-shot)
+        self.check_due_goal_schedules().await;
 
         // Phase 3: Detect stuck tasks
         self.detect_stuck_tasks().await;
@@ -474,18 +452,13 @@ impl HeartbeatCoordinator {
         if should_cleanup_goals {
             self.last_stale_goal_cleanup = Some(now);
             match self.state.cleanup_stale_goals(2).await {
-                Ok((legacy, v3)) => {
-                    if legacy > 0 || v3 > 0 {
-                        info!(
-                            legacy_abandoned = legacy,
-                            v3_failed = v3,
-                            "Periodic cleanup: marked stale goals"
-                        );
-                    }
+                Ok(count) if count > 0 => {
+                    info!(count, "Periodic cleanup: marked stale goals");
                 }
                 Err(e) => {
                     error!(error = %e, "Failed to cleanup stale goals");
                 }
+                _ => {}
             }
         }
 
@@ -521,7 +494,7 @@ impl HeartbeatCoordinator {
     /// Auto-retry failed idempotent tasks that haven't exceeded their max retries.
     /// Resets them to "pending" so they get picked up by dispatch_pending_tasks.
     async fn auto_retry_failed_tasks(&self) {
-        let goals = match self.state.get_active_goals_v3().await {
+        let goals = match self.state.get_active_goals().await {
             Ok(g) => g,
             Err(e) => {
                 error!(error = %e, "Failed to get active goals for auto-retry");
@@ -531,7 +504,12 @@ impl HeartbeatCoordinator {
 
         let mut retried = 0;
         for goal in &goals {
-            let tasks = match self.state.get_tasks_for_goal_v3(&goal.id).await {
+            // Only retry within active orchestration goals.
+            if goal.status != "active" {
+                continue;
+            }
+
+            let tasks = match self.state.get_tasks_for_goal(&goal.id).await {
                 Ok(t) => t,
                 Err(_) => continue,
             };
@@ -547,7 +525,7 @@ impl HeartbeatCoordinator {
                     retry_task.started_at = None;
                     retry_task.completed_at = None;
 
-                    if let Err(e) = self.state.update_task_v3(&retry_task).await {
+                    if let Err(e) = self.state.update_task(&retry_task).await {
                         error!(task_id = %task.id, error = %e, "Failed to auto-retry failed task");
                     } else {
                         retried += 1;
@@ -586,7 +564,7 @@ impl HeartbeatCoordinator {
     /// Dispatch orphaned pending tasks by atomically claiming them and spawning task leads.
     ///
     /// For each active goal with pending tasks but no running agent:
-    /// 1. Atomically claim a task via `claim_task_v3` (prevents duplicate dispatch)
+    /// 1. Atomically claim a task via `claim_task` (prevents duplicate dispatch)
     /// 2. Spawn a background task lead gated by the semaphore
     /// 3. The task lead picks up all pending tasks for the goal
     ///
@@ -604,7 +582,7 @@ impl HeartbeatCoordinator {
         }
 
         // Group pending tasks by goal_id
-        let mut goals_with_pending: std::collections::HashMap<String, Vec<&crate::traits::TaskV3>> =
+        let mut goals_with_pending: std::collections::HashMap<String, Vec<&crate::traits::Task>> =
             std::collections::HashMap::new();
         for task in &pending {
             goals_with_pending
@@ -614,7 +592,7 @@ impl HeartbeatCoordinator {
         }
 
         for (goal_id, tasks) in &goals_with_pending {
-            let goal = match self.state.get_goal_v3(goal_id).await {
+            let goal = match self.state.get_goal(goal_id).await {
                 Ok(Some(g)) => g,
                 _ => continue,
             };
@@ -638,7 +616,7 @@ impl HeartbeatCoordinator {
             }
 
             // Check if any tasks are still running (task lead is alive)
-            let all_tasks = match self.state.get_tasks_for_goal_v3(goal_id).await {
+            let all_tasks = match self.state.get_tasks_for_goal(goal_id).await {
                 Ok(t) => t,
                 Err(_) => continue,
             };
@@ -685,7 +663,7 @@ impl HeartbeatCoordinator {
             let first_task = tasks[0];
             let agent_id = format!("heartbeat-dispatch-{}", uuid::Uuid::new_v4());
 
-            let claimed = match self.state.claim_task_v3(&first_task.id, &agent_id).await {
+            let claimed = match self.state.claim_task(&first_task.id, &agent_id).await {
                 Ok(c) => c,
                 Err(e) => {
                     error!(task_id = %first_task.id, error = %e, "Failed to claim task for dispatch");
@@ -758,7 +736,7 @@ impl HeartbeatCoordinator {
             reverted.status = "pending".to_string();
             reverted.agent_id = None;
             reverted.started_at = None;
-            let _ = self.state.update_task_v3(&reverted).await;
+            let _ = self.state.update_task(&reverted).await;
 
             let msg = format!(
                 "Goal stalled: \"{}\" has {} pending task(s) but no active agent. \
@@ -809,7 +787,7 @@ impl HeartbeatCoordinator {
                     // Build notification from actual task results, not goal description
                     let completed_tasks = self
                         .state
-                        .get_tasks_for_goal_v3(&goal.id)
+                        .get_tasks_for_goal(&goal.id)
                         .await
                         .unwrap_or_default();
 
@@ -945,159 +923,142 @@ impl HeartbeatCoordinator {
         }
     }
 
-    /// Check for continuous goals whose schedule is due and create tasks for them.
-    async fn check_evergreen_goals(&self) {
-        match self.state.get_due_evergreen_goals().await {
-            Ok(goals) if !goals.is_empty() => {
-                info!(count = goals.len(), "Found due evergreen goals");
-                for goal in goals {
-                    // Auto-retirement suggestion: log warning if idle > 30 days
-                    if let Some(ref last_action) = goal.last_useful_action {
-                        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_action) {
-                            let days_idle =
-                                (chrono::Utc::now() - ts.with_timezone(&chrono::Utc)).num_days();
-                            if days_idle > 30 {
-                                warn!(
-                                    goal_id = %goal.id,
-                                    description = %goal.description,
-                                    days_idle,
-                                    "Evergreen goal has been idle for >30 days, consider pausing"
-                                );
-                                continue; // Skip firing stale goals
-                            }
-                        }
-                    }
-
-                    if let Err(e) = self.fire_evergreen_goal(&goal).await {
-                        error!(goal_id = %goal.id, error = %e, "Failed to fire evergreen goal");
-                    }
-                }
-            }
+    /// Check for due schedules across active orchestration goals and enqueue tasks.
+    ///
+    /// Scheduling is per-schedule (`goal_schedules`) rather than a goal column.
+    async fn check_due_goal_schedules(&self) {
+        let due = match self.state.get_due_goal_schedules(50).await {
+            Ok(s) => s,
             Err(e) => {
-                error!(error = %e, "Failed to check evergreen goals");
+                error!(error = %e, "Failed to get due goal schedules");
+                return;
             }
-            _ => {}
+        };
+
+        if due.is_empty() {
+            return;
+        }
+
+        info!(count = due.len(), "Found due goal schedules");
+        for schedule in due {
+            let schedule_id = schedule.id.clone();
+            let goal_id = schedule.goal_id.clone();
+            if let Err(e) = self.fire_due_schedule(schedule).await {
+                error!(
+                    schedule_id = %schedule_id,
+                    goal_id = %goal_id,
+                    error = %e,
+                    "Failed to fire due schedule"
+                );
+            }
         }
     }
 
-    /// Check deferred finite goals whose schedule is due and create execution tasks.
-    async fn check_deferred_finite_goals(&self) {
-        match self.state.get_due_scheduled_finite_goals().await {
-            Ok(goals) if !goals.is_empty() => {
-                info!(count = goals.len(), "Found due deferred finite goals");
-                for goal in goals {
-                    if let Err(e) = self.fire_deferred_finite_goal(&goal).await {
-                        error!(goal_id = %goal.id, error = %e, "Failed to fire deferred finite goal");
-                    }
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to check deferred finite goals");
-            }
-            _ => {}
-        }
-    }
-
-    /// Fire a single evergreen goal: check budget, create a check task, update timestamp.
-    async fn fire_evergreen_goal(&self, goal: &GoalV3) -> anyhow::Result<()> {
-        // No-overlap/backpressure policy:
-        // if this goal already has pending/claimed/running work, skip creating
-        // another scheduled task to prevent queue buildup on high-frequency goals.
-        let has_open_work = self
-            .state
-            .get_tasks_for_goal_v3(&goal.id)
-            .await?
-            .iter()
-            .any(|t| matches!(t.status.as_str(), "pending" | "claimed" | "running"));
-        if has_open_work {
-            tracing::debug!(
-                goal_id = %goal.id,
-                description = %goal.description,
-                "Skipping evergreen fire due to existing open task (coalesced)"
+    async fn fire_due_schedule(&self, mut schedule: GoalSchedule) -> anyhow::Result<()> {
+        // Guardrails (unknown policy/tz -> treat as coalesce/local-only).
+        if schedule.tz != "local" {
+            tracing::warn!(
+                schedule_id = %schedule.id,
+                goal_id = %schedule.goal_id,
+                tz = %schedule.tz,
+                "Skipping schedule with unsupported tz"
             );
             return Ok(());
         }
 
-        // Budget check: skip if daily budget exhausted
-        if let Some(budget_daily) = goal.budget_daily {
-            if goal.tokens_used_today >= budget_daily {
-                info!(
-                    goal_id = %goal.id,
-                    tokens_used = goal.tokens_used_today,
-                    budget = budget_daily,
-                    "Skipping evergreen goal — daily budget exhausted"
-                );
-                return Ok(());
-            }
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+
+        let Some(goal) = self.state.get_goal(&schedule.goal_id).await? else {
+            return Ok(());
+        };
+
+        // Safety: only active orchestration goals should fire.
+        if goal.domain != "orchestration" || goal.status != "active" {
+            return Ok(());
         }
 
-        // Create a check task for this evergreen goal
-        let now = chrono::Utc::now().to_rfc3339();
-        let task = crate::traits::TaskV3 {
-            id: uuid::Uuid::new_v4().to_string(),
-            goal_id: goal.id.clone(),
-            description: format!("Scheduled check: {}", goal.description),
-            status: "pending".to_string(),
-            priority: "low".to_string(),
-            task_order: 0,
-            parallel_group: None,
-            depends_on: None,
-            agent_id: None,
-            context: goal.context.clone(),
-            result: None,
-            error: None,
-            blocker: None,
-            idempotent: true,
-            retry_count: 0,
-            max_retries: 1,
-            created_at: now.clone(),
-            started_at: None,
-            completed_at: None,
-        };
-        self.state.create_task_v3(&task).await?;
-
-        // Update timestamp
-        let mut updated = goal.clone();
-        updated.last_useful_action = Some(now);
-        updated.updated_at = chrono::Utc::now().to_rfc3339();
-        self.state.update_goal_v3(&updated).await?;
-
-        info!(
-            goal_id = %goal.id,
-            task_id = %task.id,
-            description = %goal.description,
-            "Fired evergreen goal — created check task"
-        );
-
-        // Notify user that the scheduled goal is executing (DMs only —
-        // group channels just get the results without progress noise).
-        if !is_group_session(&goal.session_id) {
-            if let Some(hub_weak) = &self.hub {
-                if let Some(hub_arc) = hub_weak.upgrade() {
-                    let short_desc: String = goal.description.chars().take(200).collect();
-                    let _ = hub_arc
-                        .send_text(
-                            &goal.session_id,
-                            &format!("Running scheduled task: {}", short_desc),
-                        )
-                        .await;
+        // Auto-retirement suggestion: skip stale continuous goals (>30d idle).
+        if goal.goal_type == "continuous" {
+            if let Some(ref last_action) = goal.last_useful_action {
+                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_action) {
+                    let days_idle =
+                        (chrono::Utc::now() - ts.with_timezone(&chrono::Utc)).num_days();
+                    if days_idle > 30 {
+                        warn!(
+                            goal_id = %goal.id,
+                            description = %goal.description,
+                            days_idle,
+                            "Continuous goal has been idle for >30 days, skipping scheduled fire"
+                        );
+                        // Advance recurring schedules so we don't hot-loop. One-shots stay due.
+                        if !schedule.is_one_shot {
+                            if let Ok(next) =
+                                crate::cron_utils::compute_next_run(&schedule.cron_expr)
+                            {
+                                schedule.next_run_at = next.to_rfc3339();
+                                schedule.updated_at = now_ts.clone();
+                                let _ = self.state.update_goal_schedule(&schedule).await;
+                            }
+                        }
+                        return Ok(());
+                    }
                 }
             }
         }
 
-        // The pending task will be picked up by dispatch_pending_tasks on next tick
-        Ok(())
-    }
+        let tasks = self
+            .state
+            .get_tasks_for_goal(&goal.id)
+            .await
+            .unwrap_or_default();
+        let open_count = tasks
+            .iter()
+            .filter(|t| matches!(t.status.as_str(), "pending" | "claimed" | "running"))
+            .count();
 
-    /// Fire a deferred one-shot finite goal by creating one pending task and clearing schedule.
-    async fn fire_deferred_finite_goal(&self, goal: &GoalV3) -> anyhow::Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let task = crate::traits::TaskV3 {
+        let fire_policy = schedule.fire_policy.as_str();
+        let coalesce = fire_policy != "always_fire";
+        const ALWAYS_FIRE_OPEN_TASK_CAP: usize = 3;
+
+        // Backpressure: coalesce by default; always_fire only up to a cap.
+        if (coalesce && open_count > 0) || (!coalesce && open_count >= ALWAYS_FIRE_OPEN_TASK_CAP) {
+            if schedule.is_one_shot {
+                // Keep the one-shot due, but avoid hot-looping while open work exists.
+                schedule.next_run_at = (now + chrono::Duration::minutes(5)).to_rfc3339();
+            } else if let Ok(next) = crate::cron_utils::compute_next_run(&schedule.cron_expr) {
+                schedule.next_run_at = next.to_rfc3339();
+            }
+            schedule.updated_at = now_ts.clone();
+            let _ = self.state.update_goal_schedule(&schedule).await;
+            return Ok(());
+        }
+
+        // Budget check: skip if daily budget exhausted, but back off schedule to avoid hot-loop.
+        if let Some(budget_daily) = goal.budget_daily {
+            if goal.tokens_used_today >= budget_daily {
+                schedule.next_run_at = (now + chrono::Duration::minutes(15)).to_rfc3339();
+                schedule.updated_at = now_ts.clone();
+                let _ = self.state.update_goal_schedule(&schedule).await;
+                return Ok(());
+            }
+        }
+
+        // Create a pending task for this scheduled run.
+        let task = crate::traits::Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
-            description: format!("Execute deferred goal: {}", goal.description),
+            description: if schedule.is_one_shot || goal.goal_type == "finite" {
+                format!("Execute scheduled goal: {}", goal.description)
+            } else {
+                format!("Scheduled check: {}", goal.description)
+            },
             status: "pending".to_string(),
-            priority: "medium".to_string(),
+            priority: if goal.goal_type == "continuous" {
+                "low".to_string()
+            } else {
+                "medium".to_string()
+            },
             task_order: 0,
             parallel_group: None,
             depends_on: None,
@@ -1106,25 +1067,43 @@ impl HeartbeatCoordinator {
             result: None,
             error: None,
             blocker: None,
-            idempotent: false,
+            idempotent: goal.goal_type == "continuous",
             retry_count: 0,
             max_retries: 1,
-            created_at: now.clone(),
+            created_at: now_ts.clone(),
             started_at: None,
             completed_at: None,
         };
-        self.state.create_task_v3(&task).await?;
 
-        let mut updated = goal.clone();
-        updated.schedule = None; // one-shot semantics
-        updated.last_useful_action = Some(now);
-        updated.updated_at = chrono::Utc::now().to_rfc3339();
-        self.state.update_goal_v3(&updated).await?;
+        if let Err(e) = self.state.create_task(&task).await {
+            // Avoid hot-looping on persistent DB errors.
+            schedule.next_run_at = (now + chrono::Duration::minutes(5)).to_rfc3339();
+            schedule.updated_at = now_ts.clone();
+            let _ = self.state.update_goal_schedule(&schedule).await;
+            return Err(e);
+        }
+
+        // Update goal timestamp.
+        let mut updated_goal = goal.clone();
+        updated_goal.last_useful_action = Some(now_ts.clone());
+        updated_goal.updated_at = now_ts.clone();
+        let _ = self.state.update_goal(&updated_goal).await;
+
+        // Advance schedule state.
+        if schedule.is_one_shot {
+            let _ = self.state.delete_goal_schedule(&schedule.id).await;
+        } else if let Ok(next) = crate::cron_utils::compute_next_run(&schedule.cron_expr) {
+            schedule.last_run_at = Some(now_ts.clone());
+            schedule.next_run_at = next.to_rfc3339();
+            schedule.updated_at = now_ts.clone();
+            let _ = self.state.update_goal_schedule(&schedule).await;
+        }
 
         info!(
             goal_id = %goal.id,
+            schedule_id = %schedule.id,
             task_id = %task.id,
-            "Fired deferred finite goal — created execution task"
+            "Enqueued scheduled task"
         );
 
         // Notify user that the scheduled goal is executing (DMs only —
@@ -1152,21 +1131,16 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::traits::{Goal, Task};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn test_new_continuous_goal() {
-        let goal = GoalV3::new_continuous(
-            "Test continuous goal",
-            "system",
-            "0 */6 * * *",
-            Some(5000),
-            Some(20000),
-        );
+        let goal = Goal::new_continuous("Test continuous goal", "system", Some(5000), Some(20000));
+        assert_eq!(goal.domain, "orchestration");
         assert_eq!(goal.goal_type, "continuous");
         assert_eq!(goal.status, "active");
         assert_eq!(goal.priority, "low");
-        assert_eq!(goal.schedule, Some("0 */6 * * *".to_string()));
         assert_eq!(goal.budget_per_check, Some(5000));
         assert_eq!(goal.budget_daily, Some(20000));
         assert_eq!(goal.tokens_used_today, 0);
@@ -1318,7 +1292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_evergreen_goal_creation() {
+    async fn test_due_one_shot_schedule_creates_task_and_deletes_schedule() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let embedding_service = Arc::new(EmbeddingService::new().unwrap());
         let state: Arc<dyn StateStore> = Arc::new(
@@ -1332,30 +1306,50 @@ mod tests {
             .unwrap(),
         );
 
-        // Create a continuous goal with a schedule that's already past due
-        let mut goal = GoalV3::new_continuous(
-            "Test evergreen goal",
-            "system",
-            "* * * * *", // every minute
-            Some(5000),
-            Some(20000),
-        );
-        // Set last_useful_action to 2 hours ago so the schedule is past due
-        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
-        goal.last_useful_action = Some(two_hours_ago.to_rfc3339());
+        let goal = Goal::new_finite("Send deployment reminder", "session-1");
+        state.create_goal(&goal).await.unwrap();
 
-        state.create_goal_v3(&goal).await.unwrap();
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+        let due_ts = (now - chrono::Duration::minutes(2)).to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "* * * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("* * * * *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: true,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: due_ts,
+            created_at: now_ts.clone(),
+            updated_at: now_ts,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
 
-        let due = state.get_due_evergreen_goals().await.unwrap();
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let mut coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.tick().await.unwrap();
+
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(tasks.len(), 1, "One execution task should be created");
+        assert_eq!(tasks[0].status, "pending");
         assert!(
-            !due.is_empty(),
-            "Goal with every-minute schedule should be due"
+            tasks[0].description.starts_with("Execute scheduled goal:"),
+            "Task description should indicate scheduled execution"
         );
-        assert_eq!(due[0].id, goal.id);
+
+        let sched = state.get_goal_schedule(&schedule.id).await.unwrap();
+        assert!(
+            sched.is_none(),
+            "One-shot schedules should be deleted after firing"
+        );
     }
 
     #[tokio::test]
-    async fn test_evergreen_goal_no_overlap_when_open_task_exists() {
+    async fn test_coalesce_policy_one_shot_backs_off_when_open_task_exists() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let embedding_service = Arc::new(EmbeddingService::new().unwrap());
         let state: Arc<dyn StateStore> = Arc::new(
@@ -1369,22 +1363,14 @@ mod tests {
             .unwrap(),
         );
 
-        let mut goal = GoalV3::new_continuous(
-            "High-frequency monitor",
-            "system",
-            "* * * * *",
-            Some(5000),
-            Some(20000),
-        );
-        goal.last_useful_action =
-            Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
-        state.create_goal_v3(&goal).await.unwrap();
+        let goal = Goal::new_finite("Coalesce test", "session-1");
+        state.create_goal(&goal).await.unwrap();
 
-        // Existing open task should trigger no-overlap behavior.
-        let existing_task = crate::traits::TaskV3 {
+        // Existing open task should block coalesced firing.
+        let existing_task = Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
-            description: "Scheduled check: High-frequency monitor".to_string(),
+            description: "Existing work".to_string(),
             status: "running".to_string(),
             priority: "low".to_string(),
             task_order: 0,
@@ -1402,20 +1388,104 @@ mod tests {
             started_at: Some(chrono::Utc::now().to_rfc3339()),
             completed_at: None,
         };
-        state.create_task_v3(&existing_task).await.unwrap();
+        state.create_task(&existing_task).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+        let due_ts = (now - chrono::Duration::minutes(2)).to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "* * * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("* * * * *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: true,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: due_ts,
+            created_at: now_ts.clone(),
+            updated_at: now_ts,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
 
         let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
-        let coordinator =
+        let mut coordinator =
             HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
-        coordinator.check_evergreen_goals().await;
+        coordinator.tick().await.unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal.id).await.unwrap();
+        // No new tasks should be created when coalescing and open work exists.
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, existing_task.id);
+
+        // One-shot schedules should back off instead of hot-looping.
+        let updated_sched = state
+            .get_goal_schedule(&schedule.id)
+            .await
+            .unwrap()
+            .expect("schedule should still exist");
+        let next = chrono::DateTime::parse_from_rfc3339(&updated_sched.next_run_at).unwrap();
+        assert!(next.with_timezone(&chrono::Utc) > now);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_due_schedules_always_fire_enqueues_multiple_tasks() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state: Arc<dyn StateStore> = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let goal = Goal::new_continuous("Take medicine", "session-1", Some(5000), Some(20000));
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+        let due_ts = (now - chrono::Duration::minutes(2)).to_rfc3339();
+
+        for _ in 0..3 {
+            let schedule = GoalSchedule {
+                id: uuid::Uuid::new_v4().to_string(),
+                goal_id: goal.id.clone(),
+                cron_expr: "* * * * *".to_string(),
+                tz: "local".to_string(),
+                original_schedule: Some("* * * * *".to_string()),
+                fire_policy: "always_fire".to_string(),
+                is_one_shot: true,
+                is_paused: false,
+                last_run_at: None,
+                next_run_at: due_ts.clone(),
+                created_at: now_ts.clone(),
+                updated_at: now_ts.clone(),
+            };
+            state.create_goal_schedule(&schedule).await.unwrap();
+        }
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let mut coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.tick().await.unwrap();
+
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
         assert_eq!(
             tasks.len(),
-            1,
-            "No-overlap policy should avoid creating additional scheduled tasks when open work exists"
+            3,
+            "always_fire should enqueue multiple due runs"
         );
-        assert_eq!(tasks[0].id, existing_task.id);
+
+        let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
+        assert!(
+            schedules.is_empty(),
+            "one-shot schedules should be deleted after firing"
+        );
     }
 
     #[tokio::test]
@@ -1435,17 +1505,11 @@ mod tests {
         let state: Arc<dyn StateStore> = sqlite_state.clone();
 
         // Create a continuous goal with some tokens used
-        let goal = GoalV3::new_continuous(
-            "Test budget goal",
-            "system",
-            "0 */6 * * *",
-            Some(5000),
-            Some(20000),
-        );
-        state.create_goal_v3(&goal).await.unwrap();
+        let goal = Goal::new_continuous("Test budget goal", "system", Some(5000), Some(20000));
+        state.create_goal(&goal).await.unwrap();
 
         // Manually set tokens_used_today > 0 via the concrete pool
-        sqlx::query("UPDATE goals_v3 SET tokens_used_today = 1500 WHERE id = ?")
+        sqlx::query("UPDATE goals SET tokens_used_today = 1500 WHERE id = ?")
             .bind(&goal.id)
             .execute(&sqlite_state.pool())
             .await
@@ -1456,8 +1520,7 @@ mod tests {
         assert!(count >= 1, "Should have reset at least one goal");
 
         // Verify it's 0 now
-        let goals = state.get_active_goals_v3().await.unwrap();
-        let updated = goals.iter().find(|g| g.id == goal.id).unwrap();
+        let updated = state.get_goal(&goal.id).await.unwrap().unwrap();
         assert_eq!(
             updated.tokens_used_today, 0,
             "tokens_used_today should be reset to 0"
@@ -1480,10 +1543,10 @@ mod tests {
         );
 
         // Create an active goal with a pending task (no running tasks = orphaned)
-        let goal = GoalV3::new_finite("Build website", "session-1");
-        state.create_goal_v3(&goal).await.unwrap();
+        let goal = Goal::new_finite("Build website", "session-1");
+        state.create_goal(&goal).await.unwrap();
 
-        let task = crate::traits::TaskV3 {
+        let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
             description: "Deploy to production".to_string(),
@@ -1504,7 +1567,7 @@ mod tests {
             started_at: None,
             completed_at: None,
         };
-        state.create_task_v3(&task).await.unwrap();
+        state.create_task(&task).await.unwrap();
 
         // Create coordinator with NO agent reference
         let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
@@ -1522,7 +1585,7 @@ mod tests {
         coordinator.dispatch_pending_tasks().await;
 
         // Task must be back to "pending", NOT stranded in "claimed"
-        let tasks = state.get_tasks_for_goal_v3(&goal.id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(
             tasks[0].status, "pending",
@@ -1546,48 +1609,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_deferred_finite_goal_fires() {
-        let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let state: Arc<dyn StateStore> = Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
-        );
-
-        let mut goal = GoalV3::new_finite("Send deployment reminder", "session-1");
-        goal.status = "active".to_string();
-        goal.schedule = Some("* * * * *".to_string());
-        goal.created_at = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
-        goal.updated_at = goal.created_at.clone();
-        state.create_goal_v3(&goal).await.unwrap();
-
-        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
-        let coordinator =
-            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
-        coordinator.check_deferred_finite_goals().await;
-
-        let updated = state
-            .get_goal_v3(&goal.id)
-            .await
-            .unwrap()
-            .expect("goal should exist");
-        assert!(
-            updated.schedule.is_none(),
-            "Deferred finite goal schedule should be cleared after firing"
-        );
-
-        let tasks = state.get_tasks_for_goal_v3(&goal.id).await.unwrap();
-        assert_eq!(tasks.len(), 1, "One execution task should be created");
-        assert_eq!(tasks[0].status, "pending");
-        assert!(
-            tasks[0].description.starts_with("Execute deferred goal:"),
-            "Task description should indicate deferred execution"
-        );
+        // Deprecated: deferred finite goals are now represented as one-shot goal_schedules.
+        // This behavior is covered by test_due_one_shot_schedule_creates_task_and_deletes_schedule().
     }
 
     #[tokio::test]
@@ -1605,10 +1628,25 @@ mod tests {
             .unwrap(),
         );
 
-        let mut goal = GoalV3::new_deferred_finite("Remind me tomorrow", "session-1", "0 9 12 2 *");
+        let mut goal = Goal::new_deferred_finite("Remind me tomorrow", "session-1");
         goal.created_at = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         goal.updated_at = goal.created_at.clone();
-        state.create_goal_v3(&goal).await.unwrap();
+        state.create_goal(&goal).await.unwrap();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 9 12 2 *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("0 9 12 2 *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: true,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339(),
+            created_at: goal.created_at.clone(),
+            updated_at: goal.updated_at.clone(),
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
 
         let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
         let mut coordinator =
@@ -1616,7 +1654,7 @@ mod tests {
         coordinator.tick().await.unwrap();
 
         let updated = state
-            .get_goal_v3(&goal.id)
+            .get_goal(&goal.id)
             .await
             .unwrap()
             .expect("goal should exist");
@@ -1624,5 +1662,9 @@ mod tests {
             updated.status, "cancelled",
             "Stale pending_confirmation goal should be auto-cancelled"
         );
+
+        // Stale pending-confirmation cleanup should also remove schedules.
+        let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
+        assert!(schedules.is_empty());
     }
 }

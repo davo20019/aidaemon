@@ -389,10 +389,23 @@ struct SessionRow {
 }
 
 async fn api_tasks(State(state): State<DashboardState>) -> Json<serde_json::Value> {
-    let rows = sqlx::query_as::<_, TaskRow>(
-        "SELECT id, name, original_schedule, cron_expr, prompt, source, \
-         is_oneshot, is_paused, is_trusted, last_run_at, next_run_at \
-         FROM scheduled_tasks ORDER BY next_run_at ASC",
+    let rows = sqlx::query_as::<_, ScheduleRow>(
+        "SELECT
+            s.id AS schedule_id,
+            s.goal_id AS goal_id,
+            g.description AS goal_description,
+            g.status AS goal_status,
+            g.domain AS goal_domain,
+            s.original_schedule AS original_schedule,
+            s.cron_expr AS cron_expr,
+            s.fire_policy AS fire_policy,
+            s.is_one_shot AS is_one_shot,
+            s.is_paused AS is_paused,
+            s.last_run_at AS last_run_at,
+            s.next_run_at AS next_run_at
+         FROM goal_schedules s
+         JOIN goals g ON g.id = s.goal_id
+         ORDER BY s.next_run_at ASC",
     )
     .fetch_all(&state.pool)
     .await
@@ -401,23 +414,17 @@ async fn api_tasks(State(state): State<DashboardState>) -> Json<serde_json::Valu
     let vals: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| {
-            // Truncate prompt to prevent leaking sensitive task instructions
-            // through the dashboard API. Full prompt visible via direct DB only.
-            let truncated_prompt = if r.prompt.len() > 100 {
-                format!("{}...", &r.prompt[..100])
-            } else {
-                r.prompt.clone()
-            };
             json!({
-                "id": r.id,
-                "name": r.name,
+                "schedule_id": r.schedule_id,
+                "goal_id": r.goal_id,
+                "goal_description": r.goal_description,
+                "goal_status": r.goal_status,
+                "goal_domain": r.goal_domain,
                 "original_schedule": r.original_schedule,
                 "cron_expr": r.cron_expr,
-                "prompt": truncated_prompt,
-                "source": r.source,
-                "is_oneshot": r.is_oneshot != 0,
+                "fire_policy": r.fire_policy,
+                "is_one_shot": r.is_one_shot != 0,
                 "is_paused": r.is_paused != 0,
-                "is_trusted": r.is_trusted != 0,
                 "last_run_at": r.last_run_at,
                 "next_run_at": r.next_run_at,
             })
@@ -428,16 +435,17 @@ async fn api_tasks(State(state): State<DashboardState>) -> Json<serde_json::Valu
 }
 
 #[derive(sqlx::FromRow)]
-struct TaskRow {
-    id: String,
-    name: String,
-    original_schedule: String,
+struct ScheduleRow {
+    schedule_id: String,
+    goal_id: String,
+    goal_description: String,
+    goal_status: String,
+    goal_domain: String,
+    original_schedule: Option<String>,
     cron_expr: String,
-    prompt: String,
-    source: String,
-    is_oneshot: i64,
+    fire_policy: String,
+    is_one_shot: i64,
     is_paused: i64,
-    is_trusted: i64,
     last_run_at: Option<String>,
     next_run_at: String,
 }

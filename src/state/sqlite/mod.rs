@@ -2,14 +2,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock;
 
 use crate::traits::{
     BehaviorPattern, ConversationSummary, Episode, ErrorSolution, Expertise, Fact, Goal,
-    GoalTokenBudgetStatus, GoalV3, Message, Procedure, TaskActivityV3, TaskV3, TokenUsage,
+    GoalSchedule, GoalTokenBudgetStatus, Message, Procedure, Task, TaskActivity, TokenUsage,
     TokenUsageRecord, UserProfile,
 };
 use crate::types::{ChannelVisibility, FactPrivacy};
@@ -141,21 +141,6 @@ pub struct SqliteStateStore {
     working_memory: Arc<RwLock<HashMap<String, VecDeque<Message>>>>,
     cap: usize,
     embedding_service: Arc<EmbeddingService>,
-}
-
-fn parse_legacy_datetime_to_local(raw: &str) -> Option<chrono::DateTime<chrono::Local>> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Local))
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
-                .ok()
-                .and_then(|naive| match chrono::Local.from_local_datetime(&naive) {
-                    chrono::LocalResult::Single(dt) => Some(dt),
-                    chrono::LocalResult::Ambiguous(early, _) => Some(early),
-                    chrono::LocalResult::None => None,
-                })
-        })
 }
 
 impl SqliteStateStore {
@@ -647,154 +632,6 @@ impl SqliteStateStore {
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()),
             channel_id,
-        })
-    }
-
-    // ==================== Goal Methods ====================
-
-    /// Insert a new goal.
-    #[allow(dead_code)]
-    pub async fn insert_goal(&self, goal: &Goal) -> anyhow::Result<i64> {
-        let progress_notes_json = goal
-            .progress_notes
-            .as_ref()
-            .map(|p| serde_json::to_string(p).unwrap_or_default());
-        let result = sqlx::query(
-            "INSERT INTO goals (description, status, priority, progress_notes, source_episode_id, created_at, updated_at, completed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&goal.description)
-        .bind(&goal.status)
-        .bind(&goal.priority)
-        .bind(&progress_notes_json)
-        .bind(goal.source_episode_id)
-        .bind(goal.created_at.to_rfc3339())
-        .bind(goal.updated_at.to_rfc3339())
-        .bind(goal.completed_at.map(|t| t.to_rfc3339()))
-        .execute(&self.pool)
-        .await?;
-        Ok(result.last_insert_rowid())
-    }
-
-    /// Get active goals.
-    pub async fn get_active_goals(&self) -> anyhow::Result<Vec<Goal>> {
-        let rows = sqlx::query(
-            "SELECT id, description, status, priority, progress_notes, source_episode_id, created_at, updated_at, completed_at
-             FROM goals WHERE status = 'active' ORDER BY
-             CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at DESC
-             LIMIT 10"
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut goals = Vec::with_capacity(rows.len());
-        for row in rows {
-            goals.push(self.row_to_goal(&row)?);
-        }
-        Ok(goals)
-    }
-
-    /// Update goal status and optionally add a progress note.
-    pub async fn update_goal(
-        &self,
-        goal_id: i64,
-        status: Option<&str>,
-        progress_note: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let now = Utc::now().to_rfc3339();
-
-        if let Some(note) = progress_note {
-            // Append progress note to existing notes
-            let row = sqlx::query("SELECT progress_notes FROM goals WHERE id = ?")
-                .bind(goal_id)
-                .fetch_optional(&self.pool)
-                .await?;
-
-            let mut notes: Vec<String> = row
-                .and_then(|r| r.get::<Option<String>, _>("progress_notes"))
-                .and_then(|j| serde_json::from_str(&j).ok())
-                .unwrap_or_default();
-            notes.push(note.to_string());
-            let notes_json = serde_json::to_string(&notes)?;
-
-            sqlx::query("UPDATE goals SET progress_notes = ?, updated_at = ? WHERE id = ?")
-                .bind(&notes_json)
-                .bind(&now)
-                .bind(goal_id)
-                .execute(&self.pool)
-                .await?;
-        }
-
-        if let Some(s) = status {
-            let completed_at = if s == "completed" {
-                Some(now.clone())
-            } else {
-                None
-            };
-            sqlx::query("UPDATE goals SET status = ?, updated_at = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?")
-                .bind(s)
-                .bind(&now)
-                .bind(&completed_at)
-                .bind(goal_id)
-                .execute(&self.pool)
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    /// Find a goal similar to the given description using embeddings.
-    #[allow(dead_code)]
-    pub async fn find_similar_goal(&self, description: &str) -> anyhow::Result<Option<Goal>> {
-        let goals = self.get_active_goals().await?;
-        if goals.is_empty() {
-            return Ok(None);
-        }
-
-        let query_vec = self
-            .embedding_service
-            .embed(description.to_string())
-            .await?;
-        let goal_texts: Vec<String> = goals.iter().map(|g| g.description.clone()).collect();
-        let goal_embeddings = self.embedding_service.embed_batch(goal_texts).await?;
-
-        let mut best_match: Option<(usize, f32)> = None;
-        for (i, emb) in goal_embeddings.iter().enumerate() {
-            let score = crate::memory::math::cosine_similarity(&query_vec, emb);
-            if score > 0.75 && (best_match.is_none() || score > best_match.unwrap().1) {
-                best_match = Some((i, score));
-            }
-        }
-
-        Ok(best_match.map(|(i, _)| goals[i].clone()))
-    }
-
-    fn row_to_goal(&self, row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Goal> {
-        let progress_notes_json: Option<String> = row.get("progress_notes");
-        let progress_notes = progress_notes_json.and_then(|j| serde_json::from_str(&j).ok());
-
-        let created_str: String = row.get("created_at");
-        let updated_str: String = row.get("updated_at");
-        let completed_str: Option<String> = row.get("completed_at");
-
-        Ok(Goal {
-            id: row.get("id"),
-            description: row.get("description"),
-            status: row.get("status"),
-            priority: row.get("priority"),
-            progress_notes,
-            source_episode_id: row.get("source_episode_id"),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
-            completed_at: completed_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            }),
         })
     }
 
@@ -1673,9 +1510,9 @@ mod dynamic_cli_agents;
 mod dynamic_mcp;
 mod episodes;
 mod facts;
+mod goals;
 mod health_checks;
 mod learning;
-mod legacy_goals;
 mod messages;
 pub(crate) mod migrations;
 mod notifications;
@@ -1685,7 +1522,6 @@ mod session_channels;
 mod settings;
 mod skills;
 mod token_usage;
-mod v3;
 
 #[cfg(test)]
 mod tests;

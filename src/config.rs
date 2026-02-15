@@ -877,8 +877,13 @@ pub struct BrowserConfig {
     pub screenshot_width: u32,
     #[serde(default = "default_screenshot_height")]
     pub screenshot_height: u32,
-    /// Path to Chrome user data directory to reuse an existing profile's sessions/cookies.
-    /// e.g. "~/Library/Application Support/Google/Chrome"
+    /// Connect to an existing Chrome instance on this debugging port instead of launching a new one.
+    /// Start Chrome with: --remote-debugging-port=9222
+    /// This shares your existing login sessions, cookies, and tabs.
+    pub remote_debugging_port: Option<u16>,
+    /// Path to Chrome user data directory for persistent sessions/cookies.
+    /// Defaults to "~/.aidaemon/chrome-profile" so logins survive restarts.
+    #[serde(default = "default_browser_user_data_dir")]
     pub user_data_dir: Option<String>,
     /// Chrome profile directory name within user_data_dir (default: "Default").
     /// Other profiles are typically "Profile 1", "Profile 2", etc.
@@ -892,10 +897,20 @@ impl Default for BrowserConfig {
             headless: default_headless(),
             screenshot_width: default_screenshot_width(),
             screenshot_height: default_screenshot_height(),
-            user_data_dir: None,
+            remote_debugging_port: None,
+            user_data_dir: default_browser_user_data_dir(),
             profile: None,
         }
     }
+}
+
+fn default_browser_user_data_dir() -> Option<String> {
+    dirs::home_dir().map(|h| {
+        h.join(".aidaemon")
+            .join("chrome-profile")
+            .to_string_lossy()
+            .into_owned()
+    })
 }
 
 fn default_headless() -> bool {

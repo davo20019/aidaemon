@@ -31,7 +31,7 @@ use crate::skills::{self, MemoryContext};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::VerificationTracker;
 use crate::traits::{
-    AgentRole, GoalV3, Message, ModelProvider, StateStore, TaskActivityV3, Tool, ToolCall,
+    AgentRole, Goal, Message, ModelProvider, StateStore, TaskActivity, Tool, ToolCall,
     ToolCapabilities, ToolRole,
 };
 use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
@@ -86,7 +86,7 @@ use intent_routing::{
 use intent_routing::{detect_schedule_heuristic, looks_like_recurring_intent_without_timing};
 mod policy_signals;
 use policy_signals::{
-    build_policy_bundle_v1, default_clarifying_question, detect_explicit_outcome_signal,
+    build_policy_bundle, default_clarifying_question, detect_explicit_outcome_signal,
     is_short_user_correction, tool_is_side_effecting,
 };
 mod loop_utils;
@@ -798,6 +798,7 @@ pub struct Agent {
     system_prompt: String,
     config_path: PathBuf,
     skills_dir: PathBuf,
+    skill_cache: skills::SkillCache,
     /// Current recursion depth (0 = root agent).
     depth: usize,
     /// Maximum allowed recursion depth for sub-agent spawning.
@@ -834,12 +835,12 @@ pub struct Agent {
     verification_tracker: Option<Arc<VerificationTracker>>,
     /// Optional MCP server registry for dynamic, context-aware MCP tool injection.
     mcp_registry: Option<McpRegistry>,
-    /// V3 role for this agent instance.
+    /// Role for this agent instance.
     role: AgentRole,
-    /// V3 task ID for executor agents — enables activity logging.
-    v3_task_id: Option<String>,
-    /// V3 goal ID for task lead agents — enables context injection into spawn calls.
-    v3_goal_id: Option<String>,
+    /// Task ID for executor agents — enables activity logging.
+    task_id: Option<String>,
+    /// Goal ID for task lead agents — enables context injection into spawn calls.
+    goal_id: Option<String>,
     /// Cancellation token — checked each iteration; cancelled by parent or user.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     /// Goal cancellation token registry — shared across agent hierarchy.
@@ -953,13 +954,13 @@ pub fn is_group_session(session_id: &str) -> bool {
     crate::session::is_group_session(session_id)
 }
 
-/// Spawn a V3 task lead in the background (free function to satisfy Send requirements).
+/// Spawn a task lead in the background (free function to satisfy Send requirements).
 /// This runs `spawn_child` on the given agent with TaskLead role, then updates
 /// the goal and notifies the user when complete.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_background_task_lead(
     agent: Arc<Agent>,
-    goal: crate::traits::GoalV3,
+    goal: crate::traits::Goal,
     user_text: String,
     session_id: String,
     channel_ctx: ChannelContext,
@@ -981,7 +982,7 @@ pub fn spawn_background_task_lead(
         // lead. Mark that trigger task complete immediately so it does not remain
         // stuck in claimed/interrupted state while real subtasks execute.
         if let Some(trigger_task_id) = dispatch_trigger_task_id {
-            match state.get_task_v3(&trigger_task_id).await {
+            match state.get_task(&trigger_task_id).await {
                 Ok(Some(task)) if task.status == "claimed" || task.status == "running" => {
                     let mut updated = task.clone();
                     updated.status = "completed".to_string();
@@ -989,7 +990,7 @@ pub fn spawn_background_task_lead(
                         Some("Task lead dispatched for deferred goal execution.".to_string());
                     updated.error = None;
                     updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                    if let Err(e) = state.update_task_v3(&updated).await {
+                    if let Err(e) = state.update_task(&updated).await {
                         warn!(
                             task_id = %trigger_task_id,
                             goal_id = %goal_id,
@@ -1040,7 +1041,7 @@ pub fn spawn_background_task_lead(
 
                 // Build progress message from task statuses
                 let tasks = heartbeat_state
-                    .get_tasks_for_goal_v3(&heartbeat_goal_id)
+                    .get_tasks_for_goal(&heartbeat_goal_id)
                     .await
                     .unwrap_or_default();
                 if tasks.is_empty() {
@@ -1127,10 +1128,8 @@ pub fn spawn_background_task_lead(
             let max_dispatch_rounds = 10; // safety limit
             let mut budget_exhausted = false;
             for _round in 0..max_dispatch_rounds {
-                let all_tasks: Vec<crate::traits::TaskV3> = state
-                    .get_tasks_for_goal_v3(&goal_id)
-                    .await
-                    .unwrap_or_default();
+                let all_tasks: Vec<crate::traits::Task> =
+                    state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
 
                 // Build set of completed task IDs for dependency checking
                 let completed_ids: std::collections::HashSet<String> = all_tasks
@@ -1140,7 +1139,7 @@ pub fn spawn_background_task_lead(
                     .collect();
 
                 // Filter to pending tasks whose dependencies are all met
-                let dispatchable: Vec<crate::traits::TaskV3> = all_tasks
+                let dispatchable: Vec<crate::traits::Task> = all_tasks
                     .iter()
                     .filter(|t| t.status == "pending")
                     .filter(|t| match &t.depends_on {
@@ -1161,7 +1160,7 @@ pub fn spawn_background_task_lead(
                 // task_order in each round. This preserves intended sequencing
                 // when a task lead created ordered tasks but omitted depends_on.
                 let min_task_order = dispatchable.iter().map(|t| t.task_order).min().unwrap_or(0);
-                let dispatch_batch: Vec<crate::traits::TaskV3> = dispatchable
+                let dispatch_batch: Vec<crate::traits::Task> = dispatchable
                     .into_iter()
                     .filter(|t| t.task_order == min_task_order)
                     .collect();
@@ -1176,7 +1175,7 @@ pub fn spawn_background_task_lead(
 
                 for task in &dispatch_batch {
                     // Stop dispatching as soon as the goal hits its daily token budget.
-                    if let Ok(Some(g)) = state.get_goal_v3(&goal_id).await {
+                    if let Ok(Some(g)) = state.get_goal(&goal_id).await {
                         if let Some(budget_daily) = g.budget_daily {
                             if g.tokens_used_today >= budget_daily {
                                 budget_exhausted = true;
@@ -1193,7 +1192,7 @@ pub fn spawn_background_task_lead(
 
                     // Claim the task
                     let claimed = match state
-                        .claim_task_v3(&task.id, &format!("auto-dispatch-{}", goal_id))
+                        .claim_task(&task.id, &format!("auto-dispatch-{}", goal_id))
                         .await
                     {
                         Ok(c) => c,
@@ -1221,23 +1220,21 @@ pub fn spawn_background_task_lead(
                             tokio::time::sleep(Duration::from_secs(step)).await;
                             remaining = remaining.saturating_sub(step);
                             if remaining > 0 {
-                                if let Ok(Some(mut claimed_task)) =
-                                    state.get_task_v3(&task.id).await
-                                {
+                                if let Ok(Some(mut claimed_task)) = state.get_task(&task.id).await {
                                     claimed_task.started_at = Some(chrono::Utc::now().to_rfc3339());
                                     claimed_task.status = "claimed".to_string();
-                                    let _ = state.update_task_v3(&claimed_task).await;
+                                    let _ = state.update_task(&claimed_task).await;
                                 }
                             }
                         }
 
-                        if let Ok(Some(mut completed_task)) = state.get_task_v3(&task.id).await {
+                        if let Ok(Some(mut completed_task)) = state.get_task(&task.id).await {
                             completed_task.status = "completed".to_string();
                             completed_task.result =
                                 Some(format!("Waited for {} second(s).", wait_secs));
                             completed_task.error = None;
                             completed_task.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                            let _ = state.update_task_v3(&completed_task).await;
+                            let _ = state.update_task(&completed_task).await;
                         }
                         continue;
                     }
@@ -1277,7 +1274,7 @@ pub fn spawn_background_task_lead(
                             updated.error = Some(e.to_string());
                         }
                     }
-                    let _ = state.update_task_v3(&updated).await;
+                    let _ = state.update_task(&updated).await;
                 }
 
                 if budget_exhausted {
@@ -1292,7 +1289,7 @@ pub fn spawn_background_task_lead(
 
         // Check the actual goal status from DB — the task lead may have already
         // set it via complete_goal/fail_goal. Only update if still "active".
-        let current_goal = state.get_goal_v3(&goal.id).await;
+        let current_goal = state.get_goal(&goal.id).await;
         let needs_status_update = match &current_goal {
             Ok(Some(g)) => g.status == "active" || g.status == "pending",
             _ => true, // fallback: update if we can't read
@@ -1307,16 +1304,13 @@ pub fn spawn_background_task_lead(
                 .await
                 .unwrap_or(0);
 
-            let tasks = state
-                .get_tasks_for_goal_v3(&goal_id)
-                .await
-                .unwrap_or_default();
+            let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
             let all_done = !tasks.is_empty()
                 && tasks
                     .iter()
                     .all(|t| t.status == "completed" || t.status == "skipped");
 
-            let mut updated_goal = match state.get_goal_v3(&goal_id).await {
+            let mut updated_goal = match state.get_goal(&goal_id).await {
                 Ok(Some(g)) => g,
                 _ => goal,
             };
@@ -1473,7 +1467,7 @@ pub fn spawn_background_task_lead(
             }
 
             updated_goal.updated_at = chrono::Utc::now().to_rfc3339();
-            let _ = state.update_goal_v3(&updated_goal).await;
+            let _ = state.update_goal(&updated_goal).await;
 
             // If goal is stalled or failed, cancel remaining pending tasks
             if updated_goal.status == "stalled" || updated_goal.status == "failed" {
@@ -1487,7 +1481,7 @@ pub fn spawn_background_task_lead(
                                 .to_string(),
                         );
                         t.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                        let _ = state.update_task_v3(&t).await;
+                        let _ = state.update_task(&t).await;
                         cancelled += 1;
                     }
                 }
@@ -1499,7 +1493,7 @@ pub fn spawn_background_task_lead(
 
         // Enqueue notification for delivery (persisted in SQLite).
         // Then attempt immediate delivery via hub if available.
-        let final_goal = state.get_goal_v3(&goal_id).await;
+        let final_goal = state.get_goal(&goal_id).await;
         let status = final_goal
             .as_ref()
             .ok()
@@ -1575,11 +1569,11 @@ pub fn spawn_background_task_lead(
             match fallback_result {
                 Ok(response) if !response.trim().is_empty() => {
                     // Direct handling succeeded — update goal to completed
-                    if let Ok(Some(mut g)) = state.get_goal_v3(&goal_id).await {
+                    if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
                         g.status = "completed".to_string();
                         g.completed_at = Some(chrono::Utc::now().to_rfc3339());
                         g.updated_at = chrono::Utc::now().to_rfc3339();
-                        let _ = state.update_goal_v3(&g).await;
+                        let _ = state.update_goal(&g).await;
                     }
                     info!(goal_id = %goal_id, "Direct fallback succeeded");
                     (
@@ -1592,10 +1586,7 @@ pub fn spawn_background_task_lead(
                 }
                 _ => {
                     // Direct handling also failed — give detailed info
-                    let tasks = state
-                        .get_tasks_for_goal_v3(&goal_id)
-                        .await
-                        .unwrap_or_default();
+                    let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
                     let task_summary: String = tasks
                         .iter()
                         .take(5)
@@ -1625,10 +1616,8 @@ pub fn spawn_background_task_lead(
                     // Build notification from actual task results, not the task lead's
                     // planning message. The task lead response is just a plan outline;
                     // the real outputs come from the executor tasks.
-                    let completed_tasks = state
-                        .get_tasks_for_goal_v3(&goal_id)
-                        .await
-                        .unwrap_or_default();
+                    let completed_tasks =
+                        state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
 
                     // Build a result summary from completed tasks (skip the echo/setup tasks
                     // and focus on tasks that produced meaningful output)
@@ -1862,6 +1851,7 @@ impl Agent {
             fallback_model: RwLock::new(fallback),
             system_prompt,
             config_path,
+            skill_cache: skills::SkillCache::new(skills_dir.clone()),
             skills_dir,
             depth: 0,
             max_depth,
@@ -1880,8 +1870,8 @@ impl Agent {
             verification_tracker: Some(Arc::new(VerificationTracker::new())),
             mcp_registry,
             role: AgentRole::Orchestrator,
-            v3_task_id: None,
-            v3_goal_id: None,
+            task_id: None,
+            goal_id: None,
             cancel_token: None,
             goal_token_registry,
             hub: RwLock::new(hub),
@@ -1937,8 +1927,8 @@ impl Agent {
         mcp_registry: Option<McpRegistry>,
         verification_tracker: Option<Arc<VerificationTracker>>,
         role: AgentRole,
-        v3_task_id: Option<String>,
-        v3_goal_id: Option<String>,
+        task_id: Option<String>,
+        goal_id: Option<String>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         goal_token_registry: Option<GoalTokenRegistry>,
         hub: Option<Weak<ChannelHub>>,
@@ -1957,6 +1947,7 @@ impl Agent {
             fallback_model: RwLock::new(fallback),
             system_prompt,
             config_path,
+            skill_cache: skills::SkillCache::new(skills_dir.clone()),
             skills_dir,
             depth,
             max_depth,
@@ -1975,8 +1966,8 @@ impl Agent {
             verification_tracker,
             mcp_registry,
             role,
-            v3_task_id,
-            v3_goal_id,
+            task_id,
+            goal_id,
             cancel_token,
             goal_token_registry,
             hub: RwLock::new(hub),
@@ -2011,7 +2002,7 @@ impl Agent {
         self.max_depth
     }
 
-    /// V3 role for this agent instance.
+    /// Role for this agent instance.
     pub fn role(&self) -> AgentRole {
         self.role
     }
@@ -2027,7 +2018,7 @@ impl Agent {
     /// Base delay for exponential backoff on transient errors (seconds).
     const RETRY_BASE_DELAY_SECS: u64 = 2;
 
-    // ==================== V3 Orchestration Methods ====================
+    // ==================== Orchestration Methods ====================
 
     /// Run the agentic loop for a user message in the given session.
     /// Returns the final assistant text response.
@@ -2086,10 +2077,10 @@ mod consultant_prompt_tests;
 mod resume_checkpoint_tests;
 
 #[cfg(test)]
-mod v3_intent_tests;
+mod intent_tests;
 
 #[cfg(test)]
-mod v3_tool_scoping_tests;
+mod tool_scoping_tests;
 
 #[cfg(test)]
 mod file_path_extraction_tests;

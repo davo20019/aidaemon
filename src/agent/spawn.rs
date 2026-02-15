@@ -105,15 +105,15 @@ impl Agent {
                             channel_ctx,
                             user_role,
                             role,
-                            false,                          // no spawn tool
-                            task_id.map(|s| s.to_string()), // v3_task_id
-                            None,                           // v3_goal_id
+                            false, // no spawn tool
+                            task_id.map(|s| s.to_string()),
+                            None,
                             None, // root_tools (executors don't spawn children)
                         )
                         .await;
                 }
                 AgentRole::Orchestrator => {
-                    // Orchestrator: legacy behavior
+                    // Orchestrator: full loop with spawn available (unless at max depth)
                     let at_max_depth = child_depth >= self.max_depth;
                     let depth_note = if at_max_depth {
                         "\nYou are at the maximum sub-agent depth. You CANNOT spawn further sub-agents; \
@@ -155,8 +155,8 @@ impl Agent {
         let effective_role = child_role.unwrap_or(AgentRole::Orchestrator);
         let can_spawn = child_depth < self.max_depth && effective_role != AgentRole::Executor;
 
-        // For TaskLead, pass goal_id; for Orchestrator/legacy, pass None
-        let v3_goal_for_child = if effective_role == AgentRole::TaskLead {
+        // For TaskLead, pass goal_id; other roles get no goal context injection.
+        let goal_for_child = if effective_role == AgentRole::TaskLead {
             goal_id.map(|s| s.to_string())
         } else {
             None
@@ -174,9 +174,9 @@ impl Agent {
             user_role,
             effective_role,
             can_spawn,
-            None,              // v3_task_id
-            v3_goal_for_child, // v3_goal_id
-            child_root_tools,  // root_tools for TaskLead → Executor inheritance
+            None,             // task_id (executor activity tracking)
+            goal_for_child,   // goal_id (task lead context injection)
+            child_root_tools, // root_tools for TaskLead → Executor inheritance
         )
         .await
     }
@@ -196,8 +196,8 @@ impl Agent {
         user_role: UserRole,
         role: AgentRole,
         add_spawn_tool: bool,
-        v3_task_id: Option<String>,
-        v3_goal_id: Option<String>,
+        task_id: Option<String>,
+        goal_id: Option<String>,
         root_tools: Option<Vec<Arc<dyn Tool>>>,
     ) -> anyhow::Result<String> {
         let child_session = format!("sub-{}-{}", child_depth, Uuid::new_v4());
@@ -231,7 +231,7 @@ impl Agent {
 
         let start = std::time::Instant::now();
         // Save task_id for post-completion knowledge extraction (Phase 4)
-        let saved_v3_task_id = v3_task_id.clone();
+        let saved_task_id = task_id.clone();
 
         let result = if add_spawn_tool {
             let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(
@@ -268,8 +268,8 @@ impl Agent {
                 self.mcp_registry.clone(),
                 self.verification_tracker.clone(),
                 role,
-                v3_task_id,
-                v3_goal_id,
+                task_id,
+                goal_id,
                 child_cancel,
                 self.goal_token_registry.clone(),
                 self.hub.read().await.clone(),
@@ -319,8 +319,8 @@ impl Agent {
                 self.mcp_registry.clone(),
                 self.verification_tracker.clone(),
                 role,
-                v3_task_id,
-                v3_goal_id,
+                task_id,
+                goal_id,
                 child_cancel,
                 self.goal_token_registry.clone(),
                 self.hub.read().await.clone(),
@@ -366,10 +366,10 @@ impl Agent {
                 .await;
         }
 
-        // V3 Phase 4: Spawn background knowledge extraction for completed executor tasks
-        if let Some(ref task_id) = saved_v3_task_id {
+        // Spawn background knowledge extraction for completed executor tasks.
+        if let Some(ref task_id) = saved_task_id {
             if result.is_ok() {
-                if let Ok(Some(completed_task)) = self.state.get_task_v3(task_id).await {
+                if let Ok(Some(completed_task)) = self.state.get_task(task_id).await {
                     if completed_task.status == "completed" {
                         let state = self.state.clone();
                         let provider = self.provider.clone();
@@ -387,7 +387,7 @@ impl Agent {
                                 warn!(
                                     task_id = %tid,
                                     error = %e,
-                                    "V3 task knowledge extraction failed"
+                                    "Task knowledge extraction failed"
                                 );
                             }
                         });
@@ -399,7 +399,7 @@ impl Agent {
         result
     }
 
-    /// Spawn a task lead for a V3 goal. Called from handle_message (&self context).
+    /// Spawn a task lead for a goal. Called from handle_message (&self context).
     ///
     /// This is a simplified version of spawn_child that doesn't require &Arc<Self>,
     /// since handle_message takes &self. The task lead gets management + universal tools
@@ -450,7 +450,7 @@ impl Agent {
             // Read goal context for feed-forward (Phase 4)
             let goal_context = self
                 .state
-                .get_goal_v3(goal_id)
+                .get_goal(goal_id)
                 .await
                 .ok()
                 .flatten()
@@ -479,7 +479,7 @@ impl Agent {
                 child_depth,
                 child_session = %child_session,
                 goal_id,
-                "Spawning V3 task lead"
+                "Spawning task lead"
             );
 
             // Emit SubAgentSpawn event
@@ -552,8 +552,8 @@ impl Agent {
                 self.mcp_registry.clone(),
                 self.verification_tracker.clone(),
                 AgentRole::TaskLead,
-                None,                             // v3_task_id
-                Some(goal_id.to_string()),        // v3_goal_id
+                None,                             // task_id (task leads aren't executors)
+                Some(goal_id.to_string()),        // goal_id (context injection for child)
                 child_cancel_token,               // cancel_token (derived from goal token)
                 self.goal_token_registry.clone(), // goal_token_registry
                 self.hub.read().await.clone(),    // hub
@@ -621,6 +621,8 @@ impl Agent {
              Your job is to plan and delegate work. You MUST NOT execute tasks yourself.\n\n\
              ## Workflow\n\
              1. Analyze the goal and break it into concrete tasks using manage_goal_tasks(create_task)\n\
+                - Start with 2-5 tasks for the NEXT PHASE (not the entire project)\n\
+                - After those tasks complete, reassess and create more tasks if the goal isn't done\n\
                 - Set `depends_on` (array of task IDs) for tasks that require prior tasks to complete\n\
                 - Set `parallel_group` for tasks that belong to the same logical phase\n\
                 - Set `idempotent: true` for tasks safe to retry on failure\n\
@@ -635,7 +637,7 @@ impl Agent {
                 - If not idempotent or max retries exceeded: create alternative task or fail the goal\n\
              6. When all tasks complete: manage_goal_tasks(complete_goal, summary)\n\n\
              ## Rules\n\
-             - Create 2-5 tasks (keep scope focused)\n\
+             - Keep each planning step small: 2-5 tasks at a time, then iterate\n\
              - Spawn executors one at a time (sequential execution)\n\
              - Each executor gets a single, focused task\n\
              - Always check list_tasks before spawning the next executor\n\

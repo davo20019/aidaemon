@@ -4,8 +4,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::cron_utils::is_one_shot_schedule;
-use crate::traits::{GoalV3, StateStore, TaskActivityV3, TaskV3, Tool};
+use crate::traits::{Goal, StateStore, Task, TaskActivity, Tool};
 
 pub struct ScheduledGoalRunsTool {
     state: Arc<dyn StateStore>,
@@ -16,19 +15,99 @@ impl ScheduledGoalRunsTool {
         Self { state }
     }
 
-    async fn resolve_goal_id_v3(&self, input_id: &str) -> anyhow::Result<String> {
+    async fn set_budget(
+        &self,
+        goal_id_input: &str,
+        budget_per_check: Option<i64>,
+        budget_daily: Option<i64>,
+    ) -> anyhow::Result<String> {
+        const MAX_BUDGET: i64 = 2_000_000;
+
+        if budget_per_check.is_none() && budget_daily.is_none() {
+            return Ok("Provide budget_per_check and/or budget_daily.".to_string());
+        }
+        if let Some(v) = budget_per_check {
+            if v < 0 {
+                return Ok("budget_per_check must be >= 0.".to_string());
+            }
+            if v > MAX_BUDGET {
+                return Ok(format!(
+                    "budget_per_check is too large (max {}).",
+                    MAX_BUDGET
+                ));
+            }
+        }
+        if let Some(v) = budget_daily {
+            if v < 0 {
+                return Ok("budget_daily must be >= 0.".to_string());
+            }
+            if v > MAX_BUDGET {
+                return Ok(format!("budget_daily is too large (max {}).", MAX_BUDGET));
+            }
+        }
+
+        let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
+            Ok(id) => id,
+            Err(e) => return Ok(e.to_string()),
+        };
+        let Some(mut goal) = self.state.get_goal(&resolved_goal_id).await? else {
+            return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
+        };
+
+        let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
+        if schedules.is_empty() {
+            return Ok("Only scheduled goals can be updated with scheduled_goal_runs."
+                .to_string());
+        }
+
+        let old_per_check = goal.budget_per_check;
+        let old_daily = goal.budget_daily;
+
+        if let Some(v) = budget_per_check {
+            goal.budget_per_check = Some(v);
+        }
+        if let Some(v) = budget_daily {
+            goal.budget_daily = Some(v);
+        }
+
+        if let (Some(per_check), Some(daily)) = (goal.budget_per_check, goal.budget_daily) {
+            if per_check > daily {
+                return Ok(format!(
+                    "Invalid budgets: budget_per_check ({}) cannot exceed budget_daily ({}).",
+                    per_check, daily
+                ));
+            }
+        }
+
+        self.state.update_goal(&goal).await?;
+
+        let mut out = format!(
+            "Updated budget for scheduled goal {}.\n- budget_per_check: {:?} -> {:?}\n- budget_daily: {:?} -> {:?}",
+            goal.id, old_per_check, goal.budget_per_check, old_daily, goal.budget_daily
+        );
+        if let Some(budget_daily) = goal.budget_daily {
+            if goal.tokens_used_today >= budget_daily {
+                out.push_str(&format!(
+                    "\nNote: tokens_used_today={} already exceeds the new budget_daily={}, so runs may stop until the daily reset.",
+                    goal.tokens_used_today, budget_daily
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn resolve_goal_id(&self, input_id: &str) -> anyhow::Result<String> {
         let trimmed = input_id.trim();
         if trimmed.is_empty() {
             anyhow::bail!("Empty goal ID");
         }
 
-        if self.state.get_goal_v3(trimmed).await?.is_some() {
+        if self.state.get_goal(trimmed).await?.is_some() {
             return Ok(trimmed.to_string());
         }
 
-        let goals = self.state.get_scheduled_goals_v3().await?;
-        let mut matches: Vec<&GoalV3> =
-            goals.iter().filter(|g| g.id.starts_with(trimmed)).collect();
+        let goals = self.state.get_scheduled_goals().await?;
+        let mut matches: Vec<&Goal> = goals.iter().filter(|g| g.id.starts_with(trimmed)).collect();
 
         if matches.is_empty() {
             anyhow::bail!("Scheduled goal not found: {}", trimmed);
@@ -62,7 +141,7 @@ impl ScheduledGoalRunsTool {
             .collect::<Vec<_>>()
             .join("; ");
         anyhow::bail!(
-            "Goal ID prefix '{}' is ambiguous ({} matches): {}. Use full goal_id_v3.",
+            "Goal ID prefix '{}' is ambiguous ({} matches): {}. Use full goal_id.",
             trimmed,
             matches.len(),
             preview
@@ -109,7 +188,7 @@ impl ScheduledGoalRunsTool {
         }
     }
 
-    fn latest_problem_task(tasks: &[TaskV3]) -> Option<&TaskV3> {
+    fn latest_problem_task(tasks: &[Task]) -> Option<&Task> {
         let latest_failed = tasks
             .iter()
             .filter(|t| t.status == "failed")
@@ -201,16 +280,22 @@ impl ScheduledGoalRunsTool {
         hints
     }
 
-    async fn run_now(&self, goal_id_input: &str) -> anyhow::Result<String> {
-        let resolved_goal_id = match self.resolve_goal_id_v3(goal_id_input).await {
+    async fn run_now(
+        &self,
+        goal_id_input: &str,
+        schedule_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
             Ok(id) => id,
             Err(e) => return Ok(e.to_string()),
         };
 
-        let Some(mut goal) = self.state.get_goal_v3(&resolved_goal_id).await? else {
+        let Some(mut goal) = self.state.get_goal(&resolved_goal_id).await? else {
             return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
         };
-        if goal.schedule.is_none() {
+
+        let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
+        if schedules.is_empty() {
             return Ok("Only scheduled goals can be run with scheduled_goal_runs.".to_string());
         }
 
@@ -230,8 +315,8 @@ impl ScheduledGoalRunsTool {
             _ => {}
         }
 
-        let existing_tasks = self.state.get_tasks_for_goal_v3(&goal.id).await?;
-        let open: Vec<&TaskV3> = existing_tasks
+        let existing_tasks = self.state.get_tasks_for_goal(&goal.id).await?;
+        let open: Vec<&Task> = existing_tasks
             .iter()
             .filter(|t| matches!(t.status.as_str(), "pending" | "claimed" | "running"))
             .collect();
@@ -251,7 +336,7 @@ impl ScheduledGoalRunsTool {
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        let task = TaskV3 {
+        let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
             description: format!("Manual scheduled run: {}", goal.description),
@@ -281,45 +366,52 @@ impl ScheduledGoalRunsTool {
             goal.status = "active".to_string();
             goal.completed_at = None;
         }
-        let schedule_was_cleared = if goal.goal_type == "finite"
-            && goal
-                .schedule
-                .as_ref()
-                .is_some_and(|s| is_one_shot_schedule(s))
-        {
-            goal.schedule = None;
-            true
-        } else {
-            false
-        };
+
+        let mut schedule_consumed = false;
+        if let Some(sid) = schedule_id {
+            let Some(s) = self.state.get_goal_schedule(sid).await? else {
+                return Ok(format!("Schedule not found: {}", sid));
+            };
+            if s.goal_id != goal.id {
+                return Ok(format!(
+                    "Schedule {} does not belong to goal {}.",
+                    sid, goal.id
+                ));
+            }
+            if s.is_one_shot {
+                let _ = self.state.delete_goal_schedule(&s.id).await;
+                schedule_consumed = true;
+            }
+        } else if schedules.len() == 1 && schedules[0].is_one_shot {
+            let _ = self.state.delete_goal_schedule(&schedules[0].id).await;
+            schedule_consumed = true;
+        }
+
         goal.last_useful_action = Some(now.clone());
         goal.updated_at = now;
-        self.state.update_goal_v3(&goal).await?;
-        self.state.create_task_v3(&task).await?;
+        self.state.update_goal(&goal).await?;
+        self.state.create_task(&task).await?;
 
         let mut out = format!(
             "Triggered manual run for scheduled goal {}.\n- Created task: {}\n- Goal status: {}",
             resolved_goal_id, task.id, goal.status
         );
-        if schedule_was_cleared {
-            out.push_str("\n- One-shot schedule consumed: schedule cleared.");
+        if schedule_consumed {
+            out.push_str("\n- One-shot schedule consumed: schedule deleted.");
         }
         Ok(out)
     }
 
     async fn run_history(&self, goal_id_input: &str, limit: usize) -> anyhow::Result<String> {
-        let resolved_goal_id = match self.resolve_goal_id_v3(goal_id_input).await {
+        let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
             Ok(id) => id,
             Err(e) => return Ok(e.to_string()),
         };
-        let Some(goal) = self.state.get_goal_v3(&resolved_goal_id).await? else {
+        let Some(goal) = self.state.get_goal(&resolved_goal_id).await? else {
             return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
         };
-        if goal.schedule.is_none() {
-            return Ok("Only scheduled goals support run history in this tool.".to_string());
-        }
 
-        let mut tasks = self.state.get_tasks_for_goal_v3(&goal.id).await?;
+        let mut tasks = self.state.get_tasks_for_goal(&goal.id).await?;
         if tasks.is_empty() {
             return Ok(format!("No runs found yet for scheduled goal {}.", goal.id));
         }
@@ -358,7 +450,7 @@ impl ScheduledGoalRunsTool {
         for t in &tasks {
             let activities = self
                 .state
-                .get_task_activities_v3(&t.id)
+                .get_task_activities(&t.id)
                 .await
                 .unwrap_or_default();
             let last_activity = activities.last();
@@ -395,14 +487,14 @@ impl ScheduledGoalRunsTool {
     }
 
     async fn last_failure(&self, goal_id_input: &str) -> anyhow::Result<String> {
-        let resolved_goal_id = match self.resolve_goal_id_v3(goal_id_input).await {
+        let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
             Ok(id) => id,
             Err(e) => return Ok(e.to_string()),
         };
-        let Some(goal) = self.state.get_goal_v3(&resolved_goal_id).await? else {
+        let Some(goal) = self.state.get_goal(&resolved_goal_id).await? else {
             return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
         };
-        let tasks = self.state.get_tasks_for_goal_v3(&goal.id).await?;
+        let tasks = self.state.get_tasks_for_goal(&goal.id).await?;
         let Some(task) = Self::latest_problem_task(&tasks) else {
             return Ok(format!(
                 "No failed/blocked runs found for scheduled goal {}.",
@@ -410,7 +502,7 @@ impl ScheduledGoalRunsTool {
             ));
         };
 
-        let activities = self.state.get_task_activities_v3(&task.id).await?;
+        let activities = self.state.get_task_activities(&task.id).await?;
         let mut out = format!(
             "**Last Failure**\n\n- Goal: {}\n- Goal ID: {}\n- Task ID: {}\n- Task status: {}\n- Retry: {}/{}\n- Created: {}\n- Duration: {}",
             goal.description,
@@ -461,14 +553,14 @@ impl ScheduledGoalRunsTool {
     }
 
     async fn unblock_hints(&self, goal_id_input: &str) -> anyhow::Result<String> {
-        let resolved_goal_id = match self.resolve_goal_id_v3(goal_id_input).await {
+        let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
             Ok(id) => id,
             Err(e) => return Ok(e.to_string()),
         };
-        let Some(goal) = self.state.get_goal_v3(&resolved_goal_id).await? else {
+        let Some(goal) = self.state.get_goal(&resolved_goal_id).await? else {
             return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
         };
-        let tasks = self.state.get_tasks_for_goal_v3(&goal.id).await?;
+        let tasks = self.state.get_tasks_for_goal(&goal.id).await?;
         let Some(problem_task) = Self::latest_problem_task(&tasks) else {
             return Ok(format!(
                 "No failed/blocked runs found for {}. No unblock hints needed.",
@@ -476,9 +568,9 @@ impl ScheduledGoalRunsTool {
             ));
         };
 
-        let activities: Vec<TaskActivityV3> = self
+        let activities: Vec<TaskActivity> = self
             .state
-            .get_task_activities_v3(&problem_task.id)
+            .get_task_activities(&problem_task.id)
             .await
             .unwrap_or_default();
         let has_blocked = tasks.iter().any(|t| t.status == "blocked");
@@ -520,11 +612,11 @@ impl ScheduledGoalRunsTool {
         }
         out.push_str("\nNext actions:\n");
         out.push_str(&format!(
-            "- Retry immediately: scheduled_goal_runs(action='run_now', goal_id_v3='{}')\n",
+            "- Retry immediately: scheduled_goal_runs(action='run_now', goal_id='{}')\n",
             goal.id
         ));
         out.push_str(&format!(
-            "- Inspect full timeline: goal_trace(action='goal_trace', goal_id_v3='{}')\n",
+            "- Inspect full timeline: goal_trace(action='goal_trace', goal_id='{}')\n",
             goal.id
         ));
         Ok(out)
@@ -535,9 +627,17 @@ impl ScheduledGoalRunsTool {
 struct ScheduledGoalRunsArgs {
     action: String,
     #[serde(default)]
-    goal_id_v3: Option<String>,
+    goal_id: Option<String>,
+    #[serde(default)]
+    schedule_id: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    budget_per_check: Option<i64>,
+    #[serde(default)]
+    budget_daily: Option<i64>,
+    #[serde(default)]
+    _user_role: Option<String>,
 }
 
 #[async_trait]
@@ -550,79 +650,106 @@ impl Tool for ScheduledGoalRunsTool {
         "Run scheduled goals now and inspect run history/failures without terminal/sqlite access"
     }
 
-    fn schema(&self) -> Value {
-        json!({
-            "name": "scheduled_goal_runs",
-            "description": "Run scheduled goals now and inspect execution diagnostics. Use this instead of terminal/sqlite for scheduled-goal run forensics.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["run_now", "run_history", "last_failure", "unblock_hints"],
-                        "description": "Action to perform"
-                    },
-                    "goal_id_v3": {
-                        "type": "string",
-                        "description": "Scheduled goal ID (full or unique prefix)"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max runs to show for run_history (default 10, max 50)"
-                    }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }
-        })
+	    fn schema(&self) -> Value {
+	        json!({
+	            "name": "scheduled_goal_runs",
+	            "description": "Run scheduled goals now and inspect execution diagnostics. Use this instead of terminal/sqlite for scheduled-goal run forensics.",
+	            "parameters": {
+	                "type": "object",
+	                "properties": {
+	                    "action": {
+	                        "type": "string",
+	                        "enum": ["run_now", "run_history", "last_failure", "unblock_hints", "set_budget"],
+	                        "description": "Action to perform"
+	                    },
+	                    "goal_id": {
+	                        "type": "string",
+	                        "description": "Scheduled goal ID (full or unique prefix)"
+	                    },
+	                    "schedule_id": {
+	                        "type": "string",
+	                        "description": "Optional schedule ID. For one-shot schedules, run_now can consume a specific schedule when provided."
+	                    },
+	                    "limit": {
+	                        "type": "integer",
+	                        "description": "Max runs to show for run_history (default 10, max 50)"
+	                    },
+	                    "budget_per_check": {
+	                        "type": "integer",
+	                        "description": "New per-check budget (tokens). Only used for set_budget."
+	                    },
+	                    "budget_daily": {
+	                        "type": "integer",
+	                        "description": "New daily budget (tokens). Only used for set_budget."
+	                    }
+	                },
+	                "required": ["action"],
+	                "additionalProperties": false
+	            }
+	        })
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
 
-        match args.action.as_str() {
-            "run_now" => {
-                let goal_id = args
-                    .goal_id_v3
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id_v3' is required for run_now"))?;
-                self.run_now(goal_id).await
-            }
-            "run_history" => {
-                let goal_id = args
-                    .goal_id_v3
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id_v3' is required for run_history"))?;
-                self.run_history(goal_id, args.limit.unwrap_or(10)).await
-            }
-            "last_failure" => {
-                let goal_id = args
-                    .goal_id_v3
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id_v3' is required for last_failure"))?;
-                self.last_failure(goal_id).await
-            }
-            "unblock_hints" => {
-                let goal_id = args
-                    .goal_id_v3
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id_v3' is required for unblock_hints"))?;
-                self.unblock_hints(goal_id).await
-            }
-            other => Ok(format!(
-                "Unknown action: '{}'. Use run_now, run_history, last_failure, or unblock_hints.",
-                other
-            )),
-        }
-    }
-}
+	        match args.action.as_str() {
+	            "run_now" => {
+	                let goal_id = args
+	                    .goal_id
+	                    .as_deref()
+	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for run_now"))?;
+	                self.run_now(goal_id, args.schedule_id.as_deref()).await
+	            }
+	            "run_history" => {
+	                let goal_id = args
+	                    .goal_id
+	                    .as_deref()
+	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for run_history"))?;
+	                self.run_history(goal_id, args.limit.unwrap_or(10)).await
+	            }
+	            "last_failure" => {
+	                let goal_id = args
+	                    .goal_id
+	                    .as_deref()
+	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for last_failure"))?;
+	                self.last_failure(goal_id).await
+	            }
+	            "unblock_hints" => {
+	                let goal_id = args
+	                    .goal_id
+	                    .as_deref()
+	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for unblock_hints"))?;
+	                self.unblock_hints(goal_id).await
+	            }
+	            "set_budget" => {
+	                let is_owner = args
+	                    ._user_role
+	                    .as_deref()
+	                    .is_some_and(|r| r.eq_ignore_ascii_case("owner"));
+	                if !is_owner {
+	                    return Ok("Only owners can change scheduled goal budgets.".to_string());
+	                }
+	                let goal_id = args
+	                    .goal_id
+	                    .as_deref()
+	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for set_budget"))?;
+	                self.set_budget(goal_id, args.budget_per_check, args.budget_daily)
+	                    .await
+	            }
+	            other => Ok(format!(
+	                "Unknown action: '{}'. Use run_now, run_history, last_failure, unblock_hints, or set_budget.",
+	                other
+	            )),
+	        }
+	    }
+	}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::GoalV3;
+    use crate::traits::{Goal, GoalSchedule, Task};
 
     async fn setup_state() -> Arc<dyn StateStore> {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -642,21 +769,40 @@ mod tests {
         let state = setup_state().await;
         let tool = ScheduledGoalRunsTool::new(state.clone());
 
-        let goal = GoalV3::new_continuous(
+        let goal = Goal::new_continuous(
             "Run diagnostics job",
             "user-session",
-            "0 */6 * * *",
             Some(1000),
             Some(5000),
         );
         let goal_id = goal.id.clone();
-        state.create_goal_v3(&goal).await.unwrap();
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let next_run = crate::cron_utils::compute_next_run("0 */6 * * *")
+            .unwrap()
+            .to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 */6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("every 6h".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: next_run,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
 
         let result = tool
             .call(
                 &json!({
                     "action": "run_now",
-                    "goal_id_v3": goal_id
+                    "goal_id": goal_id
                 })
                 .to_string(),
             )
@@ -664,7 +810,7 @@ mod tests {
             .unwrap();
         assert!(result.contains("Triggered manual run"));
 
-        let tasks = state.get_tasks_for_goal_v3(&goal.id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, "pending");
     }
@@ -674,18 +820,36 @@ mod tests {
         let state = setup_state().await;
         let tool = ScheduledGoalRunsTool::new(state.clone());
 
-        let goal = GoalV3::new_continuous(
+        let goal = Goal::new_continuous(
             "Knowledge base maintenance",
             "system",
-            "0 */6 * * *",
             Some(1000),
             Some(5000),
         );
         let goal_id = goal.id.clone();
-        state.create_goal_v3(&goal).await.unwrap();
+        state.create_goal(&goal).await.unwrap();
 
         let now = chrono::Utc::now().to_rfc3339();
-        let task = TaskV3 {
+        let next_run = crate::cron_utils::compute_next_run("0 */6 * * *")
+            .unwrap()
+            .to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 */6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("every 6h".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: next_run,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
             description: "Run scheduled check".to_string(),
@@ -706,13 +870,13 @@ mod tests {
             started_at: Some(now.clone()),
             completed_at: Some(now),
         };
-        state.create_task_v3(&task).await.unwrap();
+        state.create_task(&task).await.unwrap();
 
         let result = tool
             .call(
                 &json!({
                     "action": "unblock_hints",
-                    "goal_id_v3": goal_id
+                    "goal_id": goal_id
                 })
                 .to_string(),
             )
@@ -720,5 +884,186 @@ mod tests {
             .unwrap();
         assert!(result.contains("Unblock Hints"));
         assert!(result.contains("transient service/network"));
+    }
+
+    #[tokio::test]
+    async fn set_budget_updates_scheduled_goal() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+
+        let goal = Goal::new_continuous(
+            "Run diagnostics job",
+            "user-session",
+            Some(1000),
+            Some(5000),
+        );
+        let goal_id = goal.id.clone();
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let next_run = crate::cron_utils::compute_next_run("0 */6 * * *")
+            .unwrap()
+            .to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 */6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("every 6h".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: next_run,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "set_budget",
+                    "goal_id": goal_id,
+                    "budget_per_check": 1234,
+                    "budget_daily": 5678,
+                    "_user_role": "Owner"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Updated budget"));
+
+        let updated = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert_eq!(updated.budget_per_check, Some(1234));
+        assert_eq!(updated.budget_daily, Some(5678));
+    }
+
+    #[tokio::test]
+    async fn set_budget_rejects_non_owner() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+
+        let goal = Goal::new_continuous(
+            "Run diagnostics job",
+            "user-session",
+            Some(1000),
+            Some(5000),
+        );
+        let goal_id = goal.id.clone();
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let next_run = crate::cron_utils::compute_next_run("0 */6 * * *")
+            .unwrap()
+            .to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 */6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("every 6h".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: next_run,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "set_budget",
+                    "goal_id": goal_id,
+                    "budget_daily": 9999,
+                    "_user_role": "Guest"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Only owners"));
+    }
+
+    #[tokio::test]
+    async fn set_budget_validates_values() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+
+        let goal = Goal::new_continuous(
+            "Run diagnostics job",
+            "user-session",
+            Some(1000),
+            Some(5000),
+        );
+        let goal_id = goal.id.clone();
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let next_run = crate::cron_utils::compute_next_run("0 */6 * * *")
+            .unwrap()
+            .to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 */6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("every 6h".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: next_run,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let negative = tool
+            .call(
+                &json!({
+                    "action": "set_budget",
+                    "goal_id": goal_id,
+                    "budget_daily": -1,
+                    "_user_role": "Owner"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(negative.contains("budget_daily must be >="));
+
+        let too_large = tool
+            .call(
+                &json!({
+                    "action": "set_budget",
+                    "goal_id": goal_id,
+                    "budget_daily": 2000001,
+                    "_user_role": "Owner"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(too_large.contains("max"));
+
+        let invalid_relation = tool
+            .call(
+                &json!({
+                    "action": "set_budget",
+                    "goal_id": goal_id,
+                    "budget_per_check": 200,
+                    "budget_daily": 100,
+                    "_user_role": "Owner"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(invalid_relation.contains("cannot exceed"));
     }
 }

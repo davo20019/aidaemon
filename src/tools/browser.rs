@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,15 +17,22 @@ use crate::types::{MediaKind, MediaMessage};
 pub struct BrowserTool {
     browser: Arc<Mutex<Option<Browser>>>,
     browser_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// True when connected to an existing Chrome (don't close it on "close" action)
+    connected_to_existing: Arc<Mutex<bool>>,
+    /// Runtime-mutable headless mode (togglable via set_mode action)
+    headless: AtomicBool,
     config: BrowserConfig,
     media_tx: mpsc::Sender<MediaMessage>,
 }
 
 impl BrowserTool {
     pub fn new(config: BrowserConfig, media_tx: mpsc::Sender<MediaMessage>) -> Self {
+        let headless = AtomicBool::new(config.headless);
         Self {
             browser: Arc::new(Mutex::new(None)),
             browser_handle: Arc::new(Mutex::new(None)),
+            connected_to_existing: Arc::new(Mutex::new(false)),
+            headless,
             config,
             media_tx,
         }
@@ -36,8 +44,45 @@ impl BrowserTool {
             return Ok(());
         }
 
+        // If remote_debugging_port is set, connect to existing Chrome instead of launching
+        if let Some(port) = self.config.remote_debugging_port {
+            let url = format!("http://127.0.0.1:{}", port);
+            info!(port, "Connecting to existing Chrome instance");
+
+            let (browser, mut handler) = Browser::connect(&url).await.map_err(|e| {
+                format!(
+                    "Failed to connect to Chrome on port {}. \
+                         Make sure Chrome is running with: --remote-debugging-port={}\n\
+                         Error: {}",
+                    port, port, e
+                )
+            })?;
+
+            let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+            info!(
+                port,
+                "Connected to existing Chrome — sharing login sessions"
+            );
+            *guard = Some(browser);
+            *self.connected_to_existing.lock().await = true;
+
+            let mut handle_guard = self.browser_handle.lock().await;
+            *handle_guard = Some(handle);
+
+            return Ok(());
+        }
+
+        // Otherwise, launch a new Chrome instance
         let mut builder = ChromeBrowserConfig::builder();
-        if self.config.headless {
+        let want_headless = self.headless.load(Ordering::Relaxed);
+        let use_headless = if !want_headless && !Self::has_display() {
+            warn!("No display available — falling back to headless mode");
+            true
+        } else {
+            want_headless
+        };
+        if use_headless {
             builder = builder.arg("--headless=new");
         }
         // Use existing Chrome profile if configured (inherits cookies/sessions)
@@ -61,7 +106,10 @@ impl BrowserTool {
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg("--disable-gpu")
-            .arg("--disable-dev-shm-usage");
+            .arg("--disable-dev-shm-usage")
+            // Anti-detection: prevent sites from identifying headless Chrome
+            .arg("--disable-blink-features=AutomationControlled")
+            .arg("--disable-features=AutomationControlled");
 
         let browser_config = builder.build().map_err(|e| {
             format!(
@@ -335,17 +383,89 @@ impl BrowserTool {
         }
     }
 
+    /// Check if a display is available for non-headless Chrome.
+    fn has_display() -> bool {
+        if cfg!(target_os = "macos") {
+            // macOS always has display capability (Quartz)
+            true
+        } else if cfg!(target_os = "windows") {
+            true
+        } else {
+            // Linux: check for X11 or Wayland display
+            std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok()
+        }
+    }
+
+    async fn action_set_mode(&self, args: &Value) -> Result<String, String> {
+        let mode = args.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
+            "Missing required parameter: value (\"visible\" or \"headless\")".to_string()
+        })?;
+
+        let new_headless = match mode {
+            "visible" | "headed" => false,
+            "headless" => true,
+            _ => {
+                return Err(format!(
+                    "Invalid mode '{}'. Use 'visible' or 'headless'.",
+                    mode
+                ))
+            }
+        };
+
+        let old_headless = self.headless.load(Ordering::Relaxed);
+        if old_headless == new_headless {
+            return Ok(format!("Browser is already in {} mode.", mode));
+        }
+
+        // Warn if requesting visible mode on a headless server
+        if !new_headless && !Self::has_display() {
+            return Ok(
+                "No display available on this system. Visible mode requires a monitor, \
+                 VNC, or X forwarding (ssh -X). Staying in headless mode."
+                    .to_string(),
+            );
+        }
+
+        self.headless.store(new_headless, Ordering::Relaxed);
+
+        // Close existing browser so next call launches with the new mode
+        let mut guard = self.browser.lock().await;
+        if guard.is_some() {
+            *guard = None;
+            let mut handle_guard = self.browser_handle.lock().await;
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+            *self.connected_to_existing.lock().await = false;
+            info!(mode, "Browser mode changed, restarting on next use");
+            Ok(format!(
+                "Switched to {} mode. Browser will restart on next action.",
+                mode
+            ))
+        } else {
+            info!(mode, "Browser mode changed");
+            Ok(format!("Switched to {} mode.", mode))
+        }
+    }
+
     async fn action_close(&self) -> Result<String, String> {
         let mut guard = self.browser.lock().await;
         if guard.is_some() {
+            let was_connected = *self.connected_to_existing.lock().await;
             *guard = None;
             // Abort the handler task
             let mut handle_guard = self.browser_handle.lock().await;
             if let Some(handle) = handle_guard.take() {
                 handle.abort();
             }
-            info!("Browser session closed");
-            Ok("Browser session closed.".to_string())
+            *self.connected_to_existing.lock().await = false;
+            if was_connected {
+                info!("Disconnected from existing Chrome (browser still running)");
+                Ok("Disconnected from Chrome (your browser is still running).".to_string())
+            } else {
+                info!("Browser session closed");
+                Ok("Browser session closed.".to_string())
+            }
         } else {
             Ok("No browser session was active.".to_string())
         }
@@ -359,19 +479,19 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Control a headless browser to navigate pages, click elements, fill forms, take screenshots, extract text, and execute JavaScript."
+        "Control a browser to navigate pages, click elements, fill forms, take screenshots, extract text, and execute JavaScript. Supports headless and visible modes."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "browser",
-            "description": "Control a headless browser for web interactions. Actions: navigate (go to URL), screenshot (capture page as photo), click (click element), fill (type into input), get_text (extract text), execute_js (run JavaScript), wait (wait for element), close (end session). The browser persists across calls for multi-step workflows.",
+            "description": "Control a browser for web interactions. Actions: navigate (go to URL), screenshot (capture page as photo), click (click element), fill (type into input), get_text (extract text), execute_js (run JavaScript), wait (wait for element), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["navigate", "screenshot", "click", "fill", "get_text", "execute_js", "wait", "close"],
+                        "enum": ["navigate", "screenshot", "click", "fill", "get_text", "execute_js", "wait", "set_mode", "close"],
                         "description": "The browser action to perform"
                     },
                     "url": {
@@ -384,7 +504,7 @@ impl Tool for BrowserTool {
                     },
                     "value": {
                         "type": "string",
-                        "description": "Text to type into the element (for 'fill' action)"
+                        "description": "Text to type (for 'fill') or mode to set (for 'set_mode': 'visible' or 'headless')"
                     },
                     "script": {
                         "type": "string",
@@ -418,9 +538,10 @@ impl Tool for BrowserTool {
             "get_text" => self.action_get_text(&args).await,
             "execute_js" => self.action_execute_js(&args).await,
             "wait" => self.action_wait(&args).await,
+            "set_mode" => self.action_set_mode(&args).await,
             "close" => self.action_close().await,
             _ => Err(format!(
-                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, execute_js, wait, close",
+                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, execute_js, wait, set_mode, close",
                 action
             )),
         };

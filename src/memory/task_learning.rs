@@ -1,4 +1,4 @@
-//! V3 Phase 4: Knowledge extraction from completed tasks.
+//! Knowledge extraction from completed tasks.
 //!
 //! After an executor completes a task, this module reads activity logs and uses
 //! an LLM to extract durable knowledge (facts, procedures, error solutions) that
@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::traits::{ModelProvider, StateStore, TaskV3};
+use crate::traits::{ModelProvider, StateStore, Task};
 use crate::types::FactPrivacy;
 
 /// Maximum size of activity log text sent to the extraction prompt.
@@ -24,18 +24,18 @@ pub async fn extract_task_knowledge(
     state: Arc<dyn StateStore>,
     provider: Arc<dyn ModelProvider>,
     model: String,
-    task: TaskV3,
+    task: Task,
 ) -> anyhow::Result<()> {
     // Derive channel provenance from the parent goal (tasks do not carry session_id).
     let derived_channel_id: Option<String> = state
-        .get_goal_v3(&task.goal_id)
+        .get_goal(&task.goal_id)
         .await
         .ok()
         .flatten()
         .and_then(|g| crate::memory::derive_channel_id_from_session(&g.session_id));
 
     // Fetch activity log for this task
-    let activities = state.get_task_activities_v3(&task.id).await?;
+    let activities = state.get_task_activities(&task.id).await?;
     if activities.is_empty() {
         info!(task_id = %task.id, "No activities to extract knowledge from");
         return Ok(());
@@ -136,7 +136,7 @@ pub async fn extract_task_knowledge(
                 &fact.category,
                 &fact.key,
                 &fact.value,
-                "v3_task_learning",
+                "task_learning",
                 derived_channel_id.as_deref(),
                 FactPrivacy::Channel,
             )
@@ -203,7 +203,7 @@ pub async fn extract_task_knowledge(
         procedures = extraction.procedures.len(),
         error_solutions = extraction.error_solutions.len(),
         stored,
-        "V3 task knowledge extraction complete"
+        "Task knowledge extraction complete"
     );
 
     Ok(())

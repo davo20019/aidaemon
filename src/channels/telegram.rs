@@ -1291,21 +1291,27 @@ impl TelegramChannel {
     async fn handle_message(&self, msg: teloxide::types::Message, bot: Bot) {
         let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
 
-        // Authorization check with first-user auto-claim.
-        // WARNING: When allowed_user_ids is empty, the FIRST user to message
-        // the bot becomes the owner. This is a convenience for initial setup
-        // but means the bot is open to anyone until that first message.
+        // Authorization check with first-user auto-claim (DM only).
+        // When allowed_user_ids is empty, the FIRST user to send a private
+        // message becomes the owner. Group messages are rejected until an
+        // owner is established, preventing someone from claiming ownership
+        // by adding the bot to a group.
+        let is_private = matches!(msg.chat.kind, teloxide::types::ChatKind::Private(_));
         let auth_result = {
             let allowed = self.allowed_user_ids.read().unwrap();
             if allowed.is_empty() {
-                warn!(
-                    user_id,
-                    "No allowed_user_ids configured — auto-claiming first user as owner. \
-                     Set allowed_user_ids in config.toml to prevent this."
-                );
-                drop(allowed);
-                let mut allowed = self.allowed_user_ids.write().unwrap();
-                check_auth(&mut allowed, user_id)
+                if is_private {
+                    warn!(
+                        user_id,
+                        "No allowed_user_ids configured — auto-claiming first DM user as owner."
+                    );
+                    drop(allowed);
+                    let mut allowed = self.allowed_user_ids.write().unwrap();
+                    check_auth(&mut allowed, user_id)
+                } else {
+                    // Group message before any owner is set — reject
+                    AuthResult::Unauthorized
+                }
             } else if allowed.contains(&user_id) {
                 AuthResult::Authorized
             } else {
@@ -1326,13 +1332,8 @@ impl TelegramChannel {
                 let _ = bot
                     .send_message(
                         msg.chat.id,
-                        format!(
-                            "Welcome! You're the first user — your Telegram ID \
-                             (<code>{}</code>) has been saved as owner.",
-                            user_id
-                        ),
+                        "Hey! You're now set as the owner. Ask me anything, give me tasks, or just chat.",
                     )
-                    .parse_mode(ParseMode::Html)
                     .await;
                 // Fall through to process the message normally
             }

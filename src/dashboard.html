@@ -192,11 +192,18 @@ async function fetchSessions() {
 async function fetchTasks() {
   try {
     const rows = await api('/api/tasks');
-    if (!rows.length) { document.getElementById('tasks-body').innerHTML = '<p class="empty">No scheduled tasks</p>'; return; }
-    let html = '<table><tr><th>Name</th><th>Schedule</th><th>Status</th><th>Next Run</th></tr>';
+    if (!rows.length) { document.getElementById('tasks-body').innerHTML = '<p class="empty">No schedules</p>'; return; }
+    let html = '<table><tr><th>Goal</th><th>Schedule</th><th>Goal Status</th><th>Schedule</th><th>Next Run</th></tr>';
     for (const r of rows) {
-      const badge = r.is_paused ? '<span class="badge badge-paused">paused</span>' : '<span class="badge badge-ok">active</span>';
-      html += '<tr><td>' + esc(r.name) + '</td><td class="mono">' + esc(r.original_schedule) + '</td><td>' + badge + '</td><td class="mono">' + esc((r.next_run_at||'-').slice(0,16)) + '</td></tr>';
+      const scheduleText = r.original_schedule || r.cron_expr || '';
+      const schedBadge = r.is_paused ? '<span class="badge badge-paused">paused</span>' : '<span class="badge badge-ok">active</span>';
+      html += '<tr>'
+        + '<td class="truncate">' + esc(r.goal_description || r.goal_id || '-') + '</td>'
+        + '<td class="mono truncate">' + esc(scheduleText) + '</td>'
+        + '<td class="mono">' + esc(r.goal_status || '-') + '</td>'
+        + '<td>' + schedBadge + '</td>'
+        + '<td class="mono">' + esc((r.next_run_at||'-').slice(0,16)) + '</td>'
+        + '</tr>';
     }
     html += '</table>';
     document.getElementById('tasks-body').innerHTML = html;

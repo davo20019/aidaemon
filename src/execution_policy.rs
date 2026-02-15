@@ -139,7 +139,7 @@ pub struct UncertaintySignals {
     pub prior_immediate_failure: bool,
 }
 
-pub fn score_uncertainty_v1(signals: UncertaintySignals) -> f32 {
+pub fn score_uncertainty(signals: UncertaintySignals) -> f32 {
     let mut score = 0.0f32;
     if signals.missing_required_slot {
         score += 0.35;
@@ -226,8 +226,8 @@ mod tests {
     }
 
     #[test]
-    fn uncertainty_v1_weights() {
-        let score = score_uncertainty_v1(UncertaintySignals {
+    fn uncertainty_weights() {
+        let score = score_uncertainty(UncertaintySignals {
             missing_required_slot: true,
             conflicting_constraints: true,
             ambiguous_wording: false,

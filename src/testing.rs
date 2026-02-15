@@ -302,7 +302,7 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         crate::config::PolicyConfig::default(),
     );
 
-    // V3: Set executor mode so integration tests exercise the execution loop directly,
+    // Set executor mode so integration tests exercise the execution loop directly,
     // bypassing orchestrator routing (consultant pass, intent classification).
     agent.set_test_executor_mode();
 
@@ -402,10 +402,12 @@ pub async fn setup_test_agent_with_models(
     })
 }
 
-/// Build a test agent with non-uniform model tiers (enables the smart router
-/// and consultant pass, which activates V3 routing — now always-on).
+/// Build a test agent in orchestrator mode with non-uniform model tiers.
+///
+/// This enables the smart router + consultant pass so integration tests can
+/// exercise orchestration routing (intent gate + confirmation gate + full loop).
 #[allow(dead_code)]
-pub async fn setup_test_agent_v3(provider: MockProvider) -> anyhow::Result<TestHarness> {
+pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Result<TestHarness> {
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();
     let skills_dir = tempfile::TempDir::new()?;
@@ -474,11 +476,15 @@ pub async fn setup_test_agent_v3(provider: MockProvider) -> anyhow::Result<TestH
     })
 }
 
-/// Build a test agent with V3 orchestration + task leads enabled (same as setup_test_agent_v3
-/// since V3 is now always-on — kept for backward compatibility with existing tests).
+/// Build a test agent in orchestrator mode with task leads enabled.
+///
+/// Currently identical to `setup_test_agent_orchestrator()` (task leads are always-on),
+/// but kept as a convenience wrapper for integration tests.
 #[allow(dead_code)]
-pub async fn setup_test_agent_v3_task_leads(provider: MockProvider) -> anyhow::Result<TestHarness> {
-    setup_test_agent_v3(provider).await
+pub async fn setup_test_agent_orchestrator_task_leads(
+    provider: MockProvider,
+) -> anyhow::Result<TestHarness> {
+    setup_test_agent_orchestrator(provider).await
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +663,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         crate::config::PolicyConfig::default(),
     );
 
-    // V3: Set executor mode so tests exercise the execution loop directly
+    // Set executor mode so tests exercise the execution loop directly
     agent.set_test_executor_mode();
 
     // Channel

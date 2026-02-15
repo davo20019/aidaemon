@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::traits::{GoalV3, StateStore, TaskActivityV3, Tool, ToolCapabilities};
+use crate::traits::{Goal, StateStore, TaskActivity, Tool, ToolCapabilities};
 
 pub struct GoalTraceTool {
     state: Arc<dyn StateStore>,
@@ -16,23 +16,23 @@ impl GoalTraceTool {
         Self { state }
     }
 
-    async fn resolve_goal_id_v3(&self, input_id: &str) -> anyhow::Result<String> {
+    async fn resolve_goal_id(&self, input_id: &str) -> anyhow::Result<String> {
         let trimmed = input_id.trim();
         if trimmed.is_empty() {
             anyhow::bail!("Empty goal ID");
         }
-        if self.state.get_goal_v3(trimmed).await?.is_some() {
+        if self.state.get_goal(trimmed).await?.is_some() {
             return Ok(trimmed.to_string());
         }
 
-        let mut candidates = self.state.get_active_goals_v3().await?;
-        for g in self.state.get_scheduled_goals_v3().await? {
+        let mut candidates = self.state.get_active_goals().await?;
+        for g in self.state.get_scheduled_goals().await? {
             if !candidates.iter().any(|x| x.id == g.id) {
                 candidates.push(g);
             }
         }
 
-        let mut matches: Vec<&GoalV3> = candidates
+        let mut matches: Vec<&Goal> = candidates
             .iter()
             .filter(|g| g.id.starts_with(trimmed))
             .collect();
@@ -58,7 +58,7 @@ impl GoalTraceTool {
             .collect::<Vec<_>>()
             .join(", ");
         anyhow::bail!(
-            "Goal ID prefix '{}' is ambiguous ({} matches): {}. Use full goal_id_v3.",
+            "Goal ID prefix '{}' is ambiguous ({} matches): {}. Use full goal_id.",
             trimmed,
             matches.len(),
             preview
@@ -107,11 +107,11 @@ impl GoalTraceTool {
     async fn gather_goal_activities(
         &self,
         goal_id: &str,
-    ) -> anyhow::Result<Vec<(String, TaskActivityV3)>> {
+    ) -> anyhow::Result<Vec<(String, TaskActivity)>> {
         let mut rows = Vec::new();
-        let tasks = self.state.get_tasks_for_goal_v3(goal_id).await?;
+        let tasks = self.state.get_tasks_for_goal(goal_id).await?;
         for t in &tasks {
-            let activities = self.state.get_task_activities_v3(&t.id).await?;
+            let activities = self.state.get_task_activities(&t.id).await?;
             for a in activities {
                 rows.push((t.id.clone(), a));
             }
@@ -126,15 +126,15 @@ impl GoalTraceTool {
         max_tasks: usize,
         max_activities_per_task: usize,
     ) -> anyhow::Result<String> {
-        let resolved_goal_id = match self.resolve_goal_id_v3(goal_id_input).await {
+        let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
             Ok(id) => id,
             Err(e) => return Ok(e.to_string()),
         };
-        let Some(goal) = self.state.get_goal_v3(&resolved_goal_id).await? else {
+        let Some(goal) = self.state.get_goal(&resolved_goal_id).await? else {
             return Ok(format!("Goal not found: {}", resolved_goal_id));
         };
 
-        let mut tasks = self.state.get_tasks_for_goal_v3(&goal.id).await?;
+        let mut tasks = self.state.get_tasks_for_goal(&goal.id).await?;
         tasks.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
         let mut status_counts: HashMap<String, usize> = HashMap::new();
@@ -143,7 +143,7 @@ impl GoalTraceTool {
         for t in &tasks {
             *status_counts.entry(t.status.clone()).or_insert(0) += 1;
             retries_total += t.retry_count;
-            let activities = self.state.get_task_activities_v3(&t.id).await?;
+            let activities = self.state.get_task_activities(&t.id).await?;
             tokens_total += activities.iter().filter_map(|a| a.tokens_used).sum::<i64>();
         }
 
@@ -173,7 +173,7 @@ impl GoalTraceTool {
 
         out.push_str("\n**Task Timeline**");
         for t in tasks.iter().take(max_tasks.clamp(1, 100)) {
-            let activities = self.state.get_task_activities_v3(&t.id).await?;
+            let activities = self.state.get_task_activities(&t.id).await?;
             let mut tool_chain = Vec::new();
             for a in activities.iter().take(max_activities_per_task.clamp(1, 20)) {
                 if let Some(tool) = &a.tool_name {
@@ -226,16 +226,16 @@ impl GoalTraceTool {
         tool_name: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<String> {
-        let mut rows: Vec<(String, TaskActivityV3)> = if let Some(task_id) = task_id {
-            let activities = self.state.get_task_activities_v3(task_id).await?;
+        let mut rows: Vec<(String, TaskActivity)> = if let Some(task_id) = task_id {
+            let activities = self.state.get_task_activities(task_id).await?;
             activities
                 .into_iter()
                 .map(|a| (task_id.to_string(), a))
                 .collect::<Vec<_>>()
         } else {
             let goal_input = goal_id_input
-                .ok_or_else(|| anyhow::anyhow!("'goal_id_v3' or 'task_id' is required"))?;
-            let resolved_goal_id = match self.resolve_goal_id_v3(goal_input).await {
+                .ok_or_else(|| anyhow::anyhow!("'goal_id' or 'task_id' is required"))?;
+            let resolved_goal_id = match self.resolve_goal_id(goal_input).await {
                 Ok(id) => id,
                 Err(e) => return Ok(e.to_string()),
             };
@@ -331,8 +331,8 @@ impl GoalTraceTool {
 #[derive(Deserialize)]
 struct GoalTraceArgs {
     action: String,
-    #[serde(default)]
-    goal_id_v3: Option<String>,
+    #[serde(default, alias = "goal_id_v3")]
+    goal_id: Option<String>,
     #[serde(default)]
     task_id: Option<String>,
     #[serde(default)]
@@ -367,7 +367,7 @@ impl Tool for GoalTraceTool {
                         "enum": ["goal_trace", "tool_trace"],
                         "description": "Trace view type"
                     },
-                    "goal_id_v3": {
+                    "goal_id": {
                         "type": "string",
                         "description": "Goal ID (full or unique prefix). Required for goal_trace, optional for tool_trace when task_id is provided."
                     },
@@ -413,9 +413,9 @@ impl Tool for GoalTraceTool {
         match args.action.as_str() {
             "goal_trace" => {
                 let goal_id = args
-                    .goal_id_v3
+                    .goal_id
                     .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id_v3' is required for goal_trace"))?;
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for goal_trace"))?;
                 self.goal_trace(
                     goal_id,
                     args.max_tasks.unwrap_or(20),
@@ -425,7 +425,7 @@ impl Tool for GoalTraceTool {
             }
             "tool_trace" => {
                 self.tool_trace(
-                    args.goal_id_v3.as_deref(),
+                    args.goal_id.as_deref(),
                     args.task_id.as_deref(),
                     args.tool_name.as_deref(),
                     args.limit.unwrap_or(30),
@@ -445,7 +445,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::{GoalV3, TaskV3};
+    use crate::traits::{Goal, Task, TaskActivity};
 
     async fn setup_state() -> Arc<dyn StateStore> {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -465,12 +465,12 @@ mod tests {
         let state = setup_state().await;
         let tool = GoalTraceTool::new(state.clone());
 
-        let goal = GoalV3::new_finite("Trace this goal", "user-session");
+        let goal = Goal::new_finite("Trace this goal", "user-session");
         let goal_id = goal.id.clone();
-        state.create_goal_v3(&goal).await.unwrap();
+        state.create_goal(&goal).await.unwrap();
 
         let now = chrono::Utc::now().to_rfc3339();
-        let task = TaskV3 {
+        let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal_id.clone(),
             description: "Inspect state".to_string(),
@@ -491,10 +491,10 @@ mod tests {
             started_at: Some(now.clone()),
             completed_at: Some(now.clone()),
         };
-        state.create_task_v3(&task).await.unwrap();
+        state.create_task(&task).await.unwrap();
 
         state
-            .log_task_activity_v3(&TaskActivityV3 {
+            .log_task_activity(&TaskActivity {
                 id: 0,
                 task_id: task.id.clone(),
                 activity_type: "tool_call".to_string(),
@@ -508,7 +508,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .log_task_activity_v3(&TaskActivityV3 {
+            .log_task_activity(&TaskActivity {
                 id: 0,
                 task_id: task.id.clone(),
                 activity_type: "tool_result".to_string(),
@@ -526,7 +526,7 @@ mod tests {
             .call(
                 &json!({
                     "action": "goal_trace",
-                    "goal_id_v3": goal_id
+                    "goal_id": goal_id
                 })
                 .to_string(),
             )
@@ -543,11 +543,11 @@ mod tests {
         let state = setup_state().await;
         let tool = GoalTraceTool::new(state.clone());
 
-        let goal = GoalV3::new_finite("Trace tool filter", "user-session");
-        state.create_goal_v3(&goal).await.unwrap();
+        let goal = Goal::new_finite("Trace tool filter", "user-session");
+        state.create_goal(&goal).await.unwrap();
 
         let now = chrono::Utc::now().to_rfc3339();
-        let task = TaskV3 {
+        let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
             description: "Do work".to_string(),
@@ -568,10 +568,10 @@ mod tests {
             started_at: Some(now.clone()),
             completed_at: Some(now.clone()),
         };
-        state.create_task_v3(&task).await.unwrap();
+        state.create_task(&task).await.unwrap();
 
         state
-            .log_task_activity_v3(&TaskActivityV3 {
+            .log_task_activity(&TaskActivity {
                 id: 0,
                 task_id: task.id.clone(),
                 activity_type: "tool_result".to_string(),
@@ -585,7 +585,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .log_task_activity_v3(&TaskActivityV3 {
+            .log_task_activity(&TaskActivity {
                 id: 0,
                 task_id: task.id.clone(),
                 activity_type: "tool_result".to_string(),
@@ -603,7 +603,7 @@ mod tests {
             .call(
                 &json!({
                     "action": "tool_trace",
-                    "goal_id_v3": goal.id,
+                    "goal_id": goal.id,
                     "tool_name": "web_fetch"
                 })
                 .to_string(),

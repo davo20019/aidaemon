@@ -124,25 +124,6 @@ pub trait EpisodeStore: Send + Sync {
     }
 }
 
-/// Legacy goal tracking (pre-V3).
-#[async_trait]
-pub trait LegacyGoalStore: Send + Sync {
-    /// Get active goals.
-    async fn get_active_goals(&self) -> anyhow::Result<Vec<super::Goal>> {
-        Ok(vec![])
-    }
-
-    /// Update a goal's status and/or add a progress note.
-    async fn update_goal(
-        &self,
-        _goal_id: i64,
-        _status: Option<&str>,
-        _progress_note: Option<&str>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
 /// Token usage persistence.
 #[async_trait]
 pub trait TokenUsageStore: Send + Sync {
@@ -631,82 +612,88 @@ pub trait OAuthStore: Send + Sync {
     }
 }
 
-/// V3 orchestration persistence (goals/tasks, scheduling, and dispatch bookkeeping).
+/// Goal persistence (goals/tasks, schedules, and dispatch bookkeeping).
 #[async_trait]
-pub trait V3Store: Send + Sync {
-    /// Create a new V3 goal.
-    async fn create_goal_v3(&self, _goal: &super::GoalV3) -> anyhow::Result<()> {
+pub trait GoalStore: Send + Sync {
+    /// Create a new goal.
+    async fn create_goal(&self, _goal: &super::Goal) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// Get a V3 goal by ID.
+    /// Get a goal by ID.
     #[allow(dead_code)] // Used in Phase 2
-    async fn get_goal_v3(&self, _id: &str) -> anyhow::Result<Option<super::GoalV3>> {
+    async fn get_goal(&self, _id: &str) -> anyhow::Result<Option<super::Goal>> {
         Ok(None)
     }
 
-    /// Update a V3 goal (full replacement).
+    /// Update a goal (full replacement).
     #[allow(dead_code)] // Used in Phase 2
-    async fn update_goal_v3(&self, _goal: &super::GoalV3) -> anyhow::Result<()> {
+    async fn update_goal(&self, _goal: &super::Goal) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// Get all active V3 goals (status = "active" or "pending").
+    /// Get all active orchestration goals (status = "active" or "pending").
     #[allow(dead_code)] // Used in Phase 2
-    async fn get_active_goals_v3(&self) -> anyhow::Result<Vec<super::GoalV3>> {
+    async fn get_active_goals(&self) -> anyhow::Result<Vec<super::Goal>> {
         Ok(vec![])
     }
 
-    /// Get V3 goals for a specific session.
-    #[allow(dead_code)] // Used in Phase 2
-    async fn get_goals_for_session_v3(
+    /// Get active personal goals (tracked, never dispatched).
+    async fn get_active_personal_goals(&self, _limit: i64) -> anyhow::Result<Vec<super::Goal>> {
+        Ok(vec![])
+    }
+
+    /// Update a personal goal's status and/or append a progress note.
+    async fn update_personal_goal(
         &self,
-        _session_id: &str,
-    ) -> anyhow::Result<Vec<super::GoalV3>> {
-        Ok(vec![])
+        _goal_id: &str,
+        _status: Option<&str>,
+        _progress_note: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
-    /// Migrate legacy scheduler rows (`scheduled_tasks`) into V3 goals.
-    /// Returns the number of migrated rows.
-    async fn migrate_legacy_scheduled_tasks_to_v3(&self) -> anyhow::Result<u64> {
-        Ok(0)
+    /// Get orchestration goals for a specific session.
+    #[allow(dead_code)] // Used in Phase 2
+    async fn get_goals_for_session(&self, _session_id: &str) -> anyhow::Result<Vec<super::Goal>> {
+        Ok(vec![])
     }
 
     /// Get scheduled goals awaiting confirmation in a session.
     async fn get_pending_confirmation_goals(
         &self,
         _session_id: &str,
-    ) -> anyhow::Result<Vec<super::GoalV3>> {
+    ) -> anyhow::Result<Vec<super::Goal>> {
         Ok(vec![])
     }
 
     /// Activate a pending-confirmation goal.
     /// Returns true when the status transition was applied.
-    async fn activate_goal_v3(&self, _goal_id: &str) -> anyhow::Result<bool> {
+    async fn activate_goal(&self, _goal_id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
 
-    /// Create a new V3 task within a goal.
+    /// Create a new task within a goal.
     #[allow(dead_code)] // Used in Phase 2
-    async fn create_task_v3(&self, _task: &super::TaskV3) -> anyhow::Result<()> {
+    async fn create_task(&self, _task: &super::Task) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// Get a V3 task by ID.
+    /// Get a task by ID.
     #[allow(dead_code)] // Used in Phase 2
-    async fn get_task_v3(&self, _id: &str) -> anyhow::Result<Option<super::TaskV3>> {
+    async fn get_task(&self, _id: &str) -> anyhow::Result<Option<super::Task>> {
         Ok(None)
     }
 
-    /// Update a V3 task (full replacement).
+    /// Update a task (full replacement).
     #[allow(dead_code)] // Used in Phase 2
-    async fn update_task_v3(&self, _task: &super::TaskV3) -> anyhow::Result<()> {
+    async fn update_task(&self, _task: &super::Task) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// Get all V3 tasks for a goal.
+    /// Get all tasks for a goal.
     #[allow(dead_code)] // Used in Phase 2
-    async fn get_tasks_for_goal_v3(&self, _goal_id: &str) -> anyhow::Result<Vec<super::TaskV3>> {
+    async fn get_tasks_for_goal(&self, _goal_id: &str) -> anyhow::Result<Vec<super::Task>> {
         Ok(vec![])
     }
 
@@ -717,33 +704,62 @@ pub trait V3Store: Send + Sync {
 
     /// Atomically claim a pending task for an executor.
     #[allow(dead_code)] // Used in Phase 2
-    async fn claim_task_v3(&self, _task_id: &str, _agent_id: &str) -> anyhow::Result<bool> {
+    async fn claim_task(&self, _task_id: &str, _agent_id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
 
-    /// Log an activity entry for a V3 task.
+    /// Log an activity entry for a task.
     #[allow(dead_code)] // Used in Phase 2
-    async fn log_task_activity_v3(&self, _activity: &super::TaskActivityV3) -> anyhow::Result<()> {
+    async fn log_task_activity(&self, _activity: &super::TaskActivity) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// Get activity log for a V3 task.
+    /// Get activity log for a task.
     #[allow(dead_code)] // Used in Phase 2
-    async fn get_task_activities_v3(
+    async fn get_task_activities(
         &self,
         _task_id: &str,
-    ) -> anyhow::Result<Vec<super::TaskActivityV3>> {
+    ) -> anyhow::Result<Vec<super::TaskActivity>> {
         Ok(vec![])
     }
 
-    /// Get continuous goals whose schedule is due (last_useful_action + interval < now).
-    async fn get_due_evergreen_goals(&self) -> anyhow::Result<Vec<super::GoalV3>> {
+    /// Create a new schedule for a goal.
+    async fn create_goal_schedule(&self, _schedule: &super::GoalSchedule) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Get a schedule by ID.
+    async fn get_goal_schedule(
+        &self,
+        _schedule_id: &str,
+    ) -> anyhow::Result<Option<super::GoalSchedule>> {
+        Ok(None)
+    }
+
+    /// List schedules for a goal.
+    async fn get_schedules_for_goal(
+        &self,
+        _goal_id: &str,
+    ) -> anyhow::Result<Vec<super::GoalSchedule>> {
         Ok(vec![])
     }
 
-    /// Get deferred finite goals whose scheduled run is due.
-    async fn get_due_scheduled_finite_goals(&self) -> anyhow::Result<Vec<super::GoalV3>> {
+    /// Get due schedules for active orchestration goals.
+    async fn get_due_goal_schedules(
+        &self,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<super::GoalSchedule>> {
         Ok(vec![])
+    }
+
+    /// Update a schedule (full replacement).
+    async fn update_goal_schedule(&self, _schedule: &super::GoalSchedule) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Delete a schedule by ID. Returns true if a row was deleted.
+    async fn delete_goal_schedule(&self, _schedule_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     /// Cancel pending-confirmation goals older than max_age_secs.
@@ -754,8 +770,8 @@ pub trait V3Store: Send + Sync {
         Ok(0)
     }
 
-    /// Get all V3 goals that are scheduled or awaiting confirmation.
-    async fn get_scheduled_goals_v3(&self) -> anyhow::Result<Vec<super::GoalV3>> {
+    /// Get all orchestration goals that have schedules or are awaiting confirmation.
+    async fn get_scheduled_goals(&self) -> anyhow::Result<Vec<super::Goal>> {
         Ok(vec![])
     }
 
@@ -776,24 +792,18 @@ pub trait V3Store: Send + Sync {
     }
 
     /// Get pending tasks ordered by priority, filtering out those with unmet dependencies.
-    async fn get_pending_tasks_by_priority(
-        &self,
-        _limit: i64,
-    ) -> anyhow::Result<Vec<super::TaskV3>> {
+    async fn get_pending_tasks_by_priority(&self, _limit: i64) -> anyhow::Result<Vec<super::Task>> {
         Ok(vec![])
     }
 
     /// Get tasks stuck in running/claimed state longer than timeout_secs.
-    async fn get_stuck_tasks(&self, _timeout_secs: i64) -> anyhow::Result<Vec<super::TaskV3>> {
+    async fn get_stuck_tasks(&self, _timeout_secs: i64) -> anyhow::Result<Vec<super::Task>> {
         Ok(vec![])
     }
 
     /// Get tasks completed after a given timestamp.
     #[allow(dead_code)]
-    async fn get_recently_completed_tasks(
-        &self,
-        _since: &str,
-    ) -> anyhow::Result<Vec<super::TaskV3>> {
+    async fn get_recently_completed_tasks(&self, _since: &str) -> anyhow::Result<Vec<super::Task>> {
         Ok(vec![])
     }
 
@@ -808,7 +818,7 @@ pub trait V3Store: Send + Sync {
     }
 
     /// Get goals that completed/failed but haven't been notified to the user yet.
-    async fn get_goals_needing_notification(&self) -> anyhow::Result<Vec<super::GoalV3>> {
+    async fn get_goals_needing_notification(&self) -> anyhow::Result<Vec<super::Goal>> {
         Ok(vec![])
     }
 
@@ -819,13 +829,13 @@ pub trait V3Store: Send + Sync {
 
     /// Mark stale active goals as abandoned/failed.
     ///
-    /// - Legacy `goals` table: active goals with no update in `stale_hours` → abandoned
-    /// - V3 finite goals: active goals with no update in `stale_hours` → failed
-    /// - V3 evergreen goals: skipped (they have their own idle detection)
+    /// - Finite orchestration goals: active goals with no update in `stale_hours` → failed
+    /// - Continuous orchestration goals: skipped (they have their own idle detection)
+    /// - Personal goals: skipped
     ///
-    /// Returns (legacy_count, v3_count) of goals cleaned up.
-    async fn cleanup_stale_goals(&self, _stale_hours: i64) -> anyhow::Result<(u64, u64)> {
-        Ok((0, 0))
+    /// Returns the number of goals cleaned up.
+    async fn cleanup_stale_goals(&self, _stale_hours: i64) -> anyhow::Result<u64> {
+        Ok(0)
     }
 }
 
@@ -899,7 +909,6 @@ pub trait StateStore:
     + MessageStore
     + FactStore
     + EpisodeStore
-    + LegacyGoalStore
     + TokenUsageStore
     + LearningStore
     + SkillStore
@@ -910,7 +919,7 @@ pub trait StateStore:
     + SettingsStore
     + PeopleStore
     + OAuthStore
-    + V3Store
+    + GoalStore
     + ConversationSummaryStore
     + HealthCheckStore
     + NotificationStore
@@ -923,7 +932,6 @@ impl<T> StateStore for T where
         + MessageStore
         + FactStore
         + EpisodeStore
-        + LegacyGoalStore
         + TokenUsageStore
         + LearningStore
         + SkillStore
@@ -934,7 +942,7 @@ impl<T> StateStore for T where
         + SettingsStore
         + PeopleStore
         + OAuthStore
-        + V3Store
+        + GoalStore
         + ConversationSummaryStore
         + HealthCheckStore
         + NotificationStore

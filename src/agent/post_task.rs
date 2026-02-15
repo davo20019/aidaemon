@@ -210,7 +210,7 @@ pub(super) fn graceful_goal_daily_budget_response(
             - {} tool calls executed\n\
             - {} errors encountered\n\n\
             If you want me to continue, you can retry later after the daily budget resets, \
-            or increase the goal's budget.",
+            or (for scheduled goals) increase the budget via scheduled_goal_runs(action='set_budget', goal_id='…', budget_daily=…).",
         tokens_used_today,
         budget_daily,
         learning_ctx.tool_calls.len(),

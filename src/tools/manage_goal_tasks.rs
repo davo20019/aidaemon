@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
 
-use crate::traits::{StateStore, TaskV3, Tool, ToolRole};
+use crate::traits::{StateStore, Task, Tool, ToolRole};
 
 /// Tool for task leads to manage tasks within their assigned goal.
 pub struct ManageGoalTasksTool {
@@ -152,11 +152,11 @@ impl Tool for ManageGoalTasksTool {
 
 /// Check if all dependencies for a task are completed. Returns Ok(()) if all are met,
 /// or an error message string describing which dependencies are unmet.
-async fn check_dependencies_met(state: &dyn StateStore, task: &TaskV3) -> Result<(), String> {
+async fn check_dependencies_met(state: &dyn StateStore, task: &Task) -> Result<(), String> {
     if let Some(ref deps_json) = task.depends_on {
         if let Ok(dep_ids) = serde_json::from_str::<Vec<String>>(deps_json) {
             for dep_id in &dep_ids {
-                if let Ok(Some(dep_task)) = state.get_task_v3(dep_id).await {
+                if let Ok(Some(dep_task)) = state.get_task(dep_id).await {
                     if dep_task.status != "completed" {
                         return Err(format!(
                             "dependency {} not completed (status: {})",
@@ -193,7 +193,7 @@ fn compress_old_entries(entries: &mut [Value]) {
 /// Validate that adding a new task with the given dependencies won't create a cycle.
 /// Uses Kahn's algorithm (topological sort) on the task dependency graph.
 fn validate_no_cycles(
-    existing: &[TaskV3],
+    existing: &[Task],
     new_task_id: &str,
     new_deps: &[String],
 ) -> Result<(), String> {
@@ -279,14 +279,14 @@ impl ManageGoalTasksTool {
         // Validate dependencies don't create cycles
         if let Some(ref dep_ids) = args.depends_on {
             if !dep_ids.is_empty() {
-                let existing = self.state.get_tasks_for_goal_v3(&self.goal_id).await?;
+                let existing = self.state.get_tasks_for_goal(&self.goal_id).await?;
                 if let Err(reason) = validate_no_cycles(&existing, &task_id, dep_ids) {
                     return Ok(format!("Cannot create task: {}", reason));
                 }
             }
         }
 
-        let task = TaskV3 {
+        let task = Task {
             id: task_id,
             goal_id: self.goal_id.clone(),
             description: description.to_string(),
@@ -314,8 +314,8 @@ impl ManageGoalTasksTool {
             completed_at: None,
         };
 
-        self.state.create_task_v3(&task).await?;
-        info!(goal_id = %self.goal_id, task_id = %task.id, "V3: created task");
+        self.state.create_task(&task).await?;
+        info!(goal_id = %self.goal_id, task_id = %task.id, "Created task");
 
         Ok(format!(
             "Created task {} (order: {}, priority: {}): {}",
@@ -324,7 +324,7 @@ impl ManageGoalTasksTool {
     }
 
     async fn list_tasks(&self) -> anyhow::Result<String> {
-        let tasks = self.state.get_tasks_for_goal_v3(&self.goal_id).await?;
+        let tasks = self.state.get_tasks_for_goal(&self.goal_id).await?;
 
         if tasks.is_empty() {
             return Ok(format!("No tasks for goal {}", self.goal_id));
@@ -389,7 +389,7 @@ impl ManageGoalTasksTool {
 
         let mut task = self
             .state
-            .get_task_v3(task_id)
+            .get_task(task_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?;
 
@@ -425,8 +425,8 @@ impl ManageGoalTasksTool {
             task.error = Some(error.clone());
         }
 
-        self.state.update_task_v3(&task).await?;
-        info!(goal_id = %self.goal_id, task_id, status = %task.status, "V3: updated task");
+        self.state.update_task(&task).await?;
+        info!(goal_id = %self.goal_id, task_id, status = %task.status, "Updated task");
 
         // Accumulate context when a task completes with a result
         if task.status == "completed" && task.result.is_some() {
@@ -449,7 +449,7 @@ impl ManageGoalTasksTool {
 
         let task = self
             .state
-            .get_task_v3(task_id)
+            .get_task(task_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?;
 
@@ -463,9 +463,9 @@ impl ManageGoalTasksTool {
         }
 
         let agent_id = args.agent_id.as_deref().unwrap_or("executor");
-        let claimed = self.state.claim_task_v3(task_id, agent_id).await?;
+        let claimed = self.state.claim_task(task_id, agent_id).await?;
         if claimed {
-            info!(goal_id = %self.goal_id, task_id, agent_id, "V3: claimed task");
+            info!(goal_id = %self.goal_id, task_id, agent_id, "Claimed task");
             Ok(format!("Claimed task {} for agent {}", task_id, agent_id))
         } else {
             Ok(format!(
@@ -483,7 +483,7 @@ impl ManageGoalTasksTool {
 
         let mut task = self
             .state
-            .get_task_v3(task_id)
+            .get_task(task_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?;
 
@@ -516,14 +516,14 @@ impl ManageGoalTasksTool {
         task.agent_id = None;
         task.started_at = None;
         task.completed_at = None;
-        self.state.update_task_v3(&task).await?;
+        self.state.update_task(&task).await?;
 
         info!(
             goal_id = %self.goal_id,
             task_id,
             retry_count = task.retry_count,
             max_retries = task.max_retries,
-            "V3: retried task"
+            "Retried task"
         );
 
         Ok(format!(
@@ -535,7 +535,7 @@ impl ManageGoalTasksTool {
     async fn complete_goal(&self, args: &ManageGoalTasksArgs) -> anyhow::Result<String> {
         let mut goal = self
             .state
-            .get_goal_v3(&self.goal_id)
+            .get_goal(&self.goal_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Goal not found: {}", self.goal_id))?;
 
@@ -543,8 +543,8 @@ impl ManageGoalTasksTool {
         goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
         goal.updated_at = chrono::Utc::now().to_rfc3339();
 
-        self.state.update_goal_v3(&goal).await?;
-        info!(goal_id = %self.goal_id, "V3: goal completed");
+        self.state.update_goal(&goal).await?;
+        info!(goal_id = %self.goal_id, "Goal completed");
 
         let summary = args
             .summary
@@ -555,10 +555,10 @@ impl ManageGoalTasksTool {
 
     /// Append a completed task's summary to the goal's context JSON,
     /// so later executors and the task lead can see what was accomplished.
-    async fn accumulate_goal_context(&self, task: &TaskV3) -> anyhow::Result<()> {
+    async fn accumulate_goal_context(&self, task: &Task) -> anyhow::Result<()> {
         let mut goal = self
             .state
-            .get_goal_v3(&self.goal_id)
+            .get_goal(&self.goal_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Goal not found"))?;
 
@@ -596,7 +596,7 @@ impl ManageGoalTasksTool {
 
         goal.context = Some(serde_json::to_string(&ctx)?);
         goal.updated_at = chrono::Utc::now().to_rfc3339();
-        self.state.update_goal_v3(&goal).await?;
+        self.state.update_goal(&goal).await?;
         Ok(())
     }
 
@@ -608,7 +608,7 @@ impl ManageGoalTasksTool {
 
         let mut task = self
             .state
-            .get_task_v3(task_id)
+            .get_task(task_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?;
 
@@ -634,8 +634,8 @@ impl ManageGoalTasksTool {
             ));
         }
 
-        self.state.update_task_v3(&task).await?;
-        info!(goal_id = %self.goal_id, task_id, "V3: blocker resolved, task reset to pending");
+        self.state.update_task(&task).await?;
+        info!(goal_id = %self.goal_id, task_id, "Blocker resolved; task reset to pending");
 
         Ok(format!(
             "Blocker resolved for task {}. Task reset to pending.",
@@ -646,20 +646,20 @@ impl ManageGoalTasksTool {
     async fn fail_goal(&self, args: &ManageGoalTasksArgs) -> anyhow::Result<String> {
         let mut goal = self
             .state
-            .get_goal_v3(&self.goal_id)
+            .get_goal(&self.goal_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Goal not found: {}", self.goal_id))?;
 
         goal.status = "failed".to_string();
         goal.updated_at = chrono::Utc::now().to_rfc3339();
 
-        self.state.update_goal_v3(&goal).await?;
-        info!(goal_id = %self.goal_id, "V3: goal failed");
+        self.state.update_goal(&goal).await?;
+        info!(goal_id = %self.goal_id, "Goal failed");
 
         // Cancel remaining pending/claimed tasks so they don't get re-dispatched
         let tasks = self
             .state
-            .get_tasks_for_goal_v3(&self.goal_id)
+            .get_tasks_for_goal(&self.goal_id)
             .await
             .unwrap_or_default();
         let mut cancelled = 0;
@@ -669,7 +669,7 @@ impl ManageGoalTasksTool {
                 t.status = "completed".to_string();
                 t.error = Some("Cancelled: parent goal explicitly failed".to_string());
                 t.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                let _ = self.state.update_task_v3(&t).await;
+                let _ = self.state.update_task(&t).await;
                 cancelled += 1;
             }
         }
@@ -691,7 +691,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::traits::store_prelude::*;
-    use crate::traits::GoalV3;
+    use crate::traits::Goal;
 
     async fn setup_test_state() -> (Arc<dyn StateStore>, String) {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -704,8 +704,8 @@ mod tests {
         );
 
         // Create a goal
-        let goal = GoalV3::new_finite("Test goal", "test-session");
-        state.create_goal_v3(&goal).await.unwrap();
+        let goal = Goal::new_finite("Test goal", "test-session");
+        state.create_goal(&goal).await.unwrap();
 
         // We need to keep db_file alive, but for tests we'll leak it
         std::mem::forget(db_file);
@@ -733,7 +733,7 @@ mod tests {
         assert!(result.contains("Created task"));
         assert!(result.contains("Write the code"));
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, "Write the code");
         assert_eq!(tasks[0].priority, "high");
@@ -794,7 +794,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_id = &tasks[0].id;
 
         // Update it
@@ -813,7 +813,7 @@ mod tests {
 
         assert!(result.contains("completed"));
 
-        let updated = state.get_task_v3(task_id).await.unwrap().unwrap();
+        let updated = state.get_task(task_id).await.unwrap().unwrap();
         assert_eq!(updated.status, "completed");
         assert_eq!(updated.result.as_deref(), Some("Done successfully"));
         assert!(updated.completed_at.is_some());
@@ -838,7 +838,7 @@ mod tests {
         assert!(result.contains("completed"));
         assert!(result.contains("All tasks done"));
 
-        let goal = state.get_goal_v3(&goal_id).await.unwrap().unwrap();
+        let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
         assert_eq!(goal.status, "completed");
         assert!(goal.completed_at.is_some());
     }
@@ -862,7 +862,7 @@ mod tests {
         assert!(result.contains("failed"));
         assert!(result.contains("Could not complete"));
 
-        let goal = state.get_goal_v3(&goal_id).await.unwrap().unwrap();
+        let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
         assert_eq!(goal.status, "failed");
     }
 
@@ -882,7 +882,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_id = tasks[0].id.clone();
 
         // First claim should succeed
@@ -932,7 +932,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_a_id = tasks[0].id.clone();
 
         // Create task B that depends on A
@@ -948,7 +948,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_b_id = tasks
             .iter()
             .find(|t| t.description == "Task B")
@@ -1014,7 +1014,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_id = tasks[0].id.clone();
 
         // Fail the task
@@ -1045,7 +1045,7 @@ mod tests {
         assert!(result.contains("1/3"));
 
         // Verify the task was reset
-        let task = state.get_task_v3(&task_id).await.unwrap().unwrap();
+        let task = state.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "pending");
         assert_eq!(task.retry_count, 1);
         assert!(task.error.is_none());
@@ -1068,7 +1068,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_id = tasks[0].id.clone();
 
         // Fail it
@@ -1115,7 +1115,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_id = tasks[0].id.clone();
 
         // Exhaust all retries (max_retries = 3)
@@ -1188,7 +1188,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_a_id = tasks[0].id.clone();
 
         // Create task B that depends on A
@@ -1203,7 +1203,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_b_id = tasks
             .iter()
             .find(|t| t.description == "Task B")
@@ -1271,7 +1271,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_a_id = tasks[0].id.clone();
 
         // Create task B with depends_on and idempotent
@@ -1314,7 +1314,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_id = &tasks[0].id;
 
         // Complete with a result
@@ -1331,7 +1331,7 @@ mod tests {
         .unwrap();
 
         // Check goal context has the task result
-        let goal = state.get_goal_v3(&goal_id).await.unwrap().unwrap();
+        let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
         assert!(
             goal.context.is_some(),
             "Goal should have context after task completion"
@@ -1372,7 +1372,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
 
         // Complete both
         for task in &tasks {
@@ -1389,7 +1389,7 @@ mod tests {
             .unwrap();
         }
 
-        let goal = state.get_goal_v3(&goal_id).await.unwrap().unwrap();
+        let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
         let ctx: serde_json::Value =
             serde_json::from_str(goal.context.as_deref().unwrap()).unwrap();
         let results = ctx["task_results"].as_array().unwrap();
@@ -1412,7 +1412,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_id = tasks[0].id.clone();
 
         // Set it to blocked
@@ -1443,7 +1443,7 @@ mod tests {
         assert!(result.contains("pending"));
 
         // Verify task is pending with resolution context
-        let task = state.get_task_v3(&task_id).await.unwrap().unwrap();
+        let task = state.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "pending");
         assert!(task.blocker.is_none());
         assert!(task.context.unwrap().contains("Found alternative approach"));
@@ -1464,7 +1464,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
         let task_id = tasks[0].id.clone();
 
         let result = tool
@@ -1482,7 +1482,7 @@ mod tests {
 
     #[test]
     fn test_validate_no_cycles_simple() {
-        let task_a = TaskV3 {
+        let task_a = Task {
             id: "a".to_string(),
             goal_id: "g".to_string(),
             description: "A".to_string(),
@@ -1517,7 +1517,7 @@ mod tests {
     #[test]
     fn test_validate_no_cycles_circular() {
         // A depends on B, B (new) depends on A → cycle
-        let task_a = TaskV3 {
+        let task_a = Task {
             id: "a".to_string(),
             goal_id: "g".to_string(),
             description: "A".to_string(),
@@ -1539,7 +1539,7 @@ mod tests {
             completed_at: None,
         };
 
-        let task_b = TaskV3 {
+        let task_b = Task {
             id: "b".to_string(),
             goal_id: "g".to_string(),
             description: "B".to_string(),
@@ -1572,7 +1572,7 @@ mod tests {
         // New task "b2" depends on A, but A depends on B, and B already exists → no cycle
         // But if we create a NEW "b" that depends on "a" when "a" depends on "b" → cycle
         // Let's test: existing has A depends on C, C exists. New task C depends on A → cycle
-        let task_a_dep_c = TaskV3 {
+        let task_a_dep_c = Task {
             id: "a".to_string(),
             depends_on: Some(serde_json::to_string(&vec!["c"]).unwrap()),
             ..task_a.clone()

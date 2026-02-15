@@ -276,8 +276,8 @@ fn build_goal_alert_message(spike: &GoalSpike) -> String {
 
     msg.push_str(&format!(
         "Suggested action: cancel/pause this schedule if unexpected.\n\
-         - manage_memories(action='cancel_scheduled', goal_id_v3='{}')\n\
-         - manage_memories(action='pause_scheduled', goal_id_v3='{}')",
+         - manage_memories(action='cancel_scheduled', goal_id='{}')\n\
+         - manage_memories(action='pause_scheduled', goal_id='{}')",
         spike.goal_id, spike.goal_id
     ));
 
@@ -381,10 +381,11 @@ async fn detect_goal_spikes(pool: &SqlitePool) -> anyhow::Result<Vec<GoalSpike>>
                 WHEN julianday(a.created_at) >= julianday('now', '-10 minutes') THEN 1
                 ELSE 0
             END), 0) AS calls_10m
-         FROM goals_v3 g
-         JOIN tasks_v3 t ON t.goal_id = g.id
-         JOIN task_activity_v3 a ON a.task_id = t.id
-         WHERE g.status = 'active'
+         FROM goals g
+         JOIN tasks t ON t.goal_id = g.id
+         JOIN task_activity a ON a.task_id = t.id
+         WHERE g.domain = 'orchestration'
+           AND g.status = 'active'
            AND a.activity_type = 'llm_call'
            AND a.tokens_used IS NOT NULL
            AND julianday(a.created_at) >= julianday('now', '-15 minutes')
@@ -422,10 +423,11 @@ async fn detect_goal_spikes(pool: &SqlitePool) -> anyhow::Result<Vec<GoalSpike>>
             t.description AS task_description,
             COALESCE(SUM(a.tokens_used), 0) AS tokens_10m,
             COUNT(*) AS calls_10m
-         FROM goals_v3 g
-         JOIN tasks_v3 t ON t.goal_id = g.id
-         JOIN task_activity_v3 a ON a.task_id = t.id
-         WHERE g.status = 'active'
+         FROM goals g
+         JOIN tasks t ON t.goal_id = g.id
+         JOIN task_activity a ON a.task_id = t.id
+         WHERE g.domain = 'orchestration'
+           AND g.status = 'active'
            AND a.activity_type = 'llm_call'
            AND a.tokens_used IS NOT NULL
            AND julianday(a.created_at) >= julianday('now', '-10 minutes')

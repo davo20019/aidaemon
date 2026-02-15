@@ -714,6 +714,8 @@ impl CliAgentTool {
         parts.push(
             "## Instructions\n\
              - Focus exclusively on the task above\n\
+             - Do NOT attempt to directly inspect or modify aidaemon's state database (SQLite/SQLCipher). Do not run sqlite3/sqlcipher, do not install sqlcipher, and do not look for encryption keys. Use aidaemon tools/APIs instead.\n\
+             - Do NOT install system packages (brew/apt/dnf/pacman/pip) unless the user explicitly asked\n\
              - Report what you did and what changed when done"
                 .to_string(),
         );
@@ -1140,6 +1142,38 @@ impl CliAgentTool {
                                 last_output_time = Instant::now();
                                 if !text.trim().is_empty() {
                                     last_non_empty_line = text.clone();
+                                }
+
+                                // Guardrail: kill external coding agents if they attempt to
+                                // manipulate aidaemon's state DB (E2E rabbit-hole).
+                                if looks_like_json(&text) {
+                                    let mut blocked: Option<(String, &'static str)> = None;
+                                    for cmd in extract_terminal_commands_from_json(&text) {
+                                        if let Some(reason) = prohibited_cli_agent_command_reason(&cmd) {
+                                            blocked = Some((cmd, reason));
+                                            break;
+                                        }
+                                    }
+
+                                    if let Some((cmd, reason)) = blocked {
+                                        info!(
+                                            pid = pid_for_kill,
+                                            cmd = %cmd,
+                                            "Prohibited CLI agent command detected; killing process"
+                                        );
+                                        {
+                                            let mut buf = display_buf_writer.lock().await;
+                                            if buf.len() < BUFFER_CAP {
+                                                buf.push_str(&format!(
+                                                    "[killed] Prohibited CLI agent command: {}\nReason: {}\n",
+                                                    cmd,
+                                                    reason
+                                                ));
+                                            }
+                                        }
+                                        kill_process(pid_for_kill).await;
+                                        break;
+                                    }
                                 }
 
                                 // Check for infinite loop pattern
@@ -1875,6 +1909,95 @@ fn extract_progress_from_json(line: &str) -> Option<String> {
     None
 }
 
+fn prohibited_cli_agent_command_reason(command: &str) -> Option<&'static str> {
+    let lower = command.trim().to_ascii_lowercase();
+
+    // E2E incidents: external coding agents tried to "fix scheduling" by hacking the
+    // SQLCipher DB directly (sqlite/sqlcipher + key hunting). This tool runs in an
+    // auto-approve mode, so we must block obvious state-store manipulation.
+    if lower.contains("aidaemon.db")
+        || lower.contains("sqlite3")
+        || lower.contains("sqlcipher")
+        || lower.contains("pragma key")
+        || lower.contains("pragma cipher")
+    {
+        return Some("Direct manipulation of aidaemon's state database is prohibited. Use manage_memories / built-in tools instead of terminal SQL.");
+    }
+
+    // Narrow install block for sqlcipher specifically (common rabbit-hole).
+    if lower.contains("install") && lower.contains("sqlcipher") {
+        return Some(
+            "Installing sqlcipher is prohibited in cli_agent runs. Use aidaemon tools instead.",
+        );
+    }
+
+    None
+}
+
+fn extract_terminal_commands_from_json(line: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+        return vec![];
+    };
+
+    let mut out = Vec::new();
+
+    // Claude Code stream-json tool_use: { "name": "Bash", "input": {"command": "..."} }
+    if let Some(tool_name) = v.get("name").and_then(|n| n.as_str()) {
+        if matches!(tool_name, "Bash" | "bash" | "terminal") {
+            if let Some(cmd) = v
+                .get("input")
+                .and_then(|i| i.get("command"))
+                .and_then(|c| c.as_str())
+            {
+                out.push(cmd.to_string());
+            }
+        }
+    }
+
+    // Claude Code assistant wrapper:
+    // { "type": "assistant", "message": {"content":[{"type":"tool_use","name":"Bash","input":{"command":"..."}}]}}
+    if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+        if let Some(items) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        {
+            for item in items {
+                if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                    continue;
+                }
+                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                if !matches!(name, "Bash" | "bash" | "terminal") {
+                    continue;
+                }
+                if let Some(cmd) = item
+                    .get("input")
+                    .and_then(|i| i.get("command"))
+                    .and_then(|c| c.as_str())
+                {
+                    out.push(cmd.to_string());
+                }
+            }
+        }
+    }
+
+    // Generic tool_use format: { "type": "tool_use", "tool": "bash", "command": "..." }
+    if v.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+        let tool = v
+            .get("tool")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if tool == "bash" || tool == "terminal" {
+            if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                out.push(cmd.to_string());
+            }
+        }
+    }
+
+    out
+}
+
 /// Try to extract meaningful content from CLI output.
 fn extract_meaningful_output(raw: &str, max_chars: usize) -> String {
     // Try JSON extraction first
@@ -1979,7 +2102,7 @@ impl Tool for CliAgentTool {
                 "Delegate a task to a CLI-based AI coding agent. Available agents: {}. \
                  These are full AI agents that can read/write files, run commands, and solve complex coding tasks. \
                  Use this for substantial coding work, refactoring, debugging, or any task that benefits from a \
-                 specialized AI coding tool. Long-running tasks move to background and can be checked/cancelled.",
+                 specialized AI coding tool. Do NOT use this for scheduling goals or manipulating aidaemon's internal SQLite/SQLCipher database; use the manage_memories tool instead. Long-running tasks move to background and can be checked/cancelled.",
                 tools_help
             ),
             "parameters": {

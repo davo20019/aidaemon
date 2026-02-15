@@ -1,10 +1,5 @@
 use std::path::Path;
-#[cfg(feature = "browser")]
-use std::path::PathBuf;
 
-#[cfg(feature = "browser")]
-use dialoguer::{Confirm, Input, MultiSelect, Select};
-#[cfg(not(feature = "browser"))]
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 
 struct ProviderPreset {
@@ -130,7 +125,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     println!();
 
     // ── Step 1: Provider ────────────────────────────────────────────────
-    println!("  STEP 1 of 3 — Choose your AI provider");
+    println!("  STEP 1 of 2 — Choose your AI provider");
     println!("  ──────────────────────────────────────");
     println!();
 
@@ -225,7 +220,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
 
     // ── Step 2: Channels ────────────────────────────────────────────────
     println!();
-    println!("  STEP 2 of 3 — Connect channels");
+    println!("  STEP 2 of 2 — Connect channels");
     println!("  ───────────────────────────────");
     println!();
     println!("  Select one or more channels to set up now.");
@@ -278,12 +273,9 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     let mut selected_channel_names: Vec<String> = Vec::new();
 
     let mut telegram_bot_token: Option<String> = None;
-    let mut telegram_user_id: Option<u64> = None;
 
     #[cfg(feature = "discord")]
     let mut discord_bot_token: Option<String> = None;
-    #[cfg(feature = "discord")]
-    let mut discord_user_id: Option<u64> = None;
     #[cfg(feature = "discord")]
     let mut discord_guild_id: Option<u64> = None;
 
@@ -292,120 +284,67 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     #[cfg(feature = "slack")]
     let mut slack_bot_token: Option<String> = None;
     #[cfg(feature = "slack")]
-    let mut slack_user_id: Option<String> = None;
-    #[cfg(feature = "slack")]
     let mut slack_use_threads: Option<bool> = None;
 
     for idx in selected_indices {
         match channel_choices[idx].1 {
             ChannelSetupChoice::Telegram => {
-                let (bot_token, user_id) = prompt_telegram_setup()?;
+                let bot_token = prompt_telegram_setup()?;
                 telegram_bot_token = Some(bot_token);
-                telegram_user_id = Some(user_id);
                 selected_channel_names.push("Telegram".to_string());
             }
             #[cfg(feature = "discord")]
             ChannelSetupChoice::Discord => {
-                let (bot_token, user_id, guild_id) = prompt_discord_setup()?;
+                let (bot_token, guild_id) = prompt_discord_setup()?;
                 discord_bot_token = Some(bot_token);
-                discord_user_id = Some(user_id);
                 discord_guild_id = guild_id;
                 selected_channel_names.push("Discord".to_string());
             }
             #[cfg(feature = "slack")]
             ChannelSetupChoice::Slack => {
-                let (app_token, bot_token, user_id, use_threads) = prompt_slack_setup()?;
+                let (app_token, bot_token, use_threads) = prompt_slack_setup()?;
                 slack_app_token = Some(app_token);
                 slack_bot_token = Some(bot_token);
-                slack_user_id = Some(user_id);
                 slack_use_threads = Some(use_threads);
                 selected_channel_names.push("Slack".to_string());
             }
         }
     }
 
-    // ── Step 3: Browser (optional) ──────────────────────────────────────
-    println!();
-    println!("  STEP 3 of 3 — Optional features");
-    println!("  ────────────────────────────────");
+    // ── Browser setup (optional) ──────────────────────────────────────
+    #[allow(unused_mut)]
+    let mut browser_enabled = false;
+    #[allow(unused_mut)]
+    let mut browser_headless = true;
 
-    let browser_section;
     #[cfg(feature = "browser")]
     {
         println!();
-        let browser_enabled = Confirm::new()
-            .with_prompt("Enable browser tool? (lets the agent browse the web, fill forms, take screenshots)")
+        println!("  Optional: Browser automation");
+        println!("  The browser tool lets the agent navigate websites, fill forms,");
+        println!("  take screenshots, and interact with authenticated services.");
+        println!();
+
+        let enable = Confirm::new()
+            .with_prompt("  Enable the browser tool?")
             .default(false)
             .interact()?;
 
-        browser_section = if browser_enabled {
-            let mut user_data_dir = String::new();
-            let mut profile_name = String::new();
+        if enable {
+            browser_enabled = true;
 
-            // Try to detect Chrome profiles
-            let profiles = discover_chrome_profiles();
-            if !profiles.is_empty() {
-                let use_profile = Confirm::new()
-                    .with_prompt("Chrome detected! Use an existing Chrome profile? (inherits your login sessions)")
-                    .default(true)
-                    .interact()?;
-
-                if use_profile {
-                    let display_names: Vec<String> = profiles
-                        .iter()
-                        .map(|p| {
-                            if p.display_name.is_empty() {
-                                p.dir_name.clone()
-                            } else {
-                                format!("{} ({})", p.display_name, p.dir_name)
-                            }
-                        })
-                        .collect();
-
-                    let profile_selection = Select::new()
-                        .with_prompt("Select Chrome profile")
-                        .items(&display_names)
-                        .default(0)
-                        .interact()?;
-
-                    let selected = &profiles[profile_selection];
-                    user_data_dir = selected.user_data_dir.clone();
-                    profile_name = selected.dir_name.clone();
-
-                    println!();
-                    println!("  NOTE: Chrome locks its profile while running.");
-                    println!(
-                        "  The agent will only be able to use the browser when Chrome is closed,"
-                    );
-                    println!("  or you can copy the profile to a separate directory.");
-                }
-            } else {
-                println!(
-                    "  No Chrome installation detected. The browser will use a fresh profile."
-                );
-                println!("  You can set user_data_dir in config.toml later to reuse an existing profile.");
-            }
-
-            let headless = Confirm::new()
-                .with_prompt("Run browser in headless mode? (no visible window)")
-                .default(true)
+            let mode_choices = vec!["Visible (recommended for personal computers)", "Headless (recommended for servers)"];
+            let mode_idx = Select::new()
+                .with_prompt("  Browser mode")
+                .items(&mode_choices)
+                .default(0)
                 .interact()?;
+            browser_headless = mode_idx == 1;
 
-            let mut section = format!("\n[browser]\nenabled = true\nheadless = {headless}\n");
-            if !user_data_dir.is_empty() {
-                section.push_str(&format!("user_data_dir = \"{user_data_dir}\"\n"));
-                section.push_str(&format!("profile = \"{profile_name}\"\n"));
-            }
-            section
-        } else {
-            String::new()
-        };
-    }
-    #[cfg(not(feature = "browser"))]
-    {
-        println!();
-        println!("  TIP: Browser tool available with `cargo install aidaemon --features browser`");
-        browser_section = String::new();
+            println!();
+            println!("  Browser tool enabled ({} mode).", if browser_headless { "headless" } else { "visible" });
+            println!("  Run `aidaemon browser login` after setup to log into your services.");
+        }
     }
 
     // ── Store secrets in OS keychain if available ───────────────────────
@@ -470,49 +409,34 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     }
 
     let mut channel_sections = String::new();
-    let mut owner_ids: Vec<(String, String)> = Vec::new();
 
-    if let (Some(bot_token), Some(user_id)) = (telegram_bot_token_config, telegram_user_id) {
+    if let Some(bot_token) = telegram_bot_token_config {
         channel_sections.push_str("\n[telegram]\n");
         channel_sections.push_str(&format!("bot_token = {bot_token}\n"));
-        channel_sections.push_str(&format!("allowed_user_ids = [{user_id}]\n"));
-        owner_ids.push(("telegram".to_string(), user_id.to_string()));
+        channel_sections.push_str("allowed_user_ids = []\n");
     }
 
     #[cfg(feature = "discord")]
-    if let (Some(bot_token), Some(user_id)) = (discord_bot_token_config, discord_user_id) {
+    if let Some(bot_token) = discord_bot_token_config {
         channel_sections.push_str("\n[discord]\n");
         channel_sections.push_str(&format!("bot_token = {bot_token}\n"));
-        channel_sections.push_str(&format!("allowed_user_ids = [{user_id}]\n"));
+        channel_sections.push_str("allowed_user_ids = []\n");
         if let Some(guild_id) = discord_guild_id {
             channel_sections.push_str(&format!("guild_id = {guild_id}\n"));
         }
-        owner_ids.push(("discord".to_string(), user_id.to_string()));
     }
 
     #[cfg(feature = "slack")]
-    if let (Some(app_token), Some(bot_token), Some(user_id), Some(use_threads)) = (
+    if let (Some(app_token), Some(bot_token), Some(use_threads)) = (
         slack_app_token_config,
         slack_bot_token_config,
-        slack_user_id,
         slack_use_threads,
     ) {
         channel_sections.push_str("\n[slack]\n");
         channel_sections.push_str(&format!("app_token = {app_token}\n"));
         channel_sections.push_str(&format!("bot_token = {bot_token}\n"));
-        channel_sections.push_str(&format!(
-            "allowed_user_ids = [{}]\n",
-            quote_toml_string(&user_id)
-        ));
+        channel_sections.push_str("allowed_user_ids = []\n");
         channel_sections.push_str(&format!("use_threads = {use_threads}\n"));
-        owner_ids.push(("slack".to_string(), user_id));
-    }
-
-    if !owner_ids.is_empty() {
-        channel_sections.push_str("\n[users.owner_ids]\n");
-        for (platform, user_id) in owner_ids {
-            channel_sections.push_str(&format!("{platform} = [{}]\n", quote_toml_string(&user_id)));
-        }
     }
 
     // ── Write config ────────────────────────────────────────────────────
@@ -521,6 +445,14 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     } else {
         format!("base_url = \"{base_url}\"\n")
     };
+    let browser_section = if browser_enabled {
+        format!(
+            "\n[browser]\nenabled = true\nheadless = {browser_headless}\n",
+        )
+    } else {
+        "\n# Uncomment to enable browser tool:\n# [browser]\n# enabled = true\n".to_string()
+    };
+
     let config = format!(
         r#"[provider]
 kind = "{}"
@@ -571,31 +503,20 @@ health_port = 8080
         config_path.display()
     );
     println!("  Run `aidaemon install-service` to start on boot (systemd/launchd).");
+    if browser_enabled {
+        println!("  Run `aidaemon browser login` to log into services for the agent.");
+    }
+    println!();
+    println!(
+        "  Starting... Send a message on {} to get started!",
+        human_list(&selected_channel_names)
+    );
     println!();
 
-    // Ask whether to start now
-    let start_now = Confirm::new()
-        .with_prompt("Start aidaemon now?")
-        .default(true)
-        .interact()?;
-
-    if start_now {
-        println!();
-        println!(
-            "  Starting... Send a message on {} to begin!",
-            human_list(&selected_channel_names)
-        );
-        println!();
-    } else {
-        println!();
-        println!("  Run `aidaemon` whenever you're ready to start.");
-        println!();
-    }
-
-    Ok(start_now)
+    Ok(true)
 }
 
-fn prompt_telegram_setup() -> anyhow::Result<(String, u64)> {
+fn prompt_telegram_setup() -> anyhow::Result<String> {
     println!();
     println!("  Telegram setup");
     println!("  1. Open Telegram and search for @BotFather");
@@ -612,6 +533,8 @@ fn prompt_telegram_setup() -> anyhow::Result<(String, u64)> {
     match validate_bot_token(&bot_token) {
         Ok(bot_name) => {
             println!("  Connected to Telegram bot @{}", bot_name);
+            println!();
+            println!("  Send a DM to @{} to get started!", bot_name);
         }
         Err(e) => {
             println!("  Warning: Could not verify Telegram token ({})", e);
@@ -619,29 +542,11 @@ fn prompt_telegram_setup() -> anyhow::Result<(String, u64)> {
         }
     }
 
-    println!();
-    println!("  Find your Telegram user ID via @userinfobot or @RawDataBot.");
-    println!();
-
-    let user_id: u64 = Input::new()
-        .with_prompt("Your Telegram user ID (numeric)")
-        .validate_with(|input: &String| -> Result<(), &str> {
-            input
-                .trim()
-                .parse::<u64>()
-                .map(|_| ())
-                .map_err(|_| "Please enter a valid numeric user ID")
-        })
-        .interact_text()?
-        .trim()
-        .parse()
-        .expect("already validated");
-
-    Ok((bot_token, user_id))
+    Ok(bot_token)
 }
 
 #[cfg(feature = "discord")]
-fn prompt_discord_setup() -> anyhow::Result<(String, u64, Option<u64>)> {
+fn prompt_discord_setup() -> anyhow::Result<(String, Option<u64>)> {
     println!();
     println!("  Discord setup");
     println!("  1. Create an app at https://discord.com/developers/applications");
@@ -656,29 +561,16 @@ fn prompt_discord_setup() -> anyhow::Result<(String, u64, Option<u64>)> {
     println!();
     println!("  Checking Discord token...");
     match validate_discord_bot_token(&bot_token) {
-        Ok(bot_name) => println!("  Connected to Discord bot {}", bot_name),
+        Ok(bot_name) => {
+            println!("  Connected to Discord bot {}", bot_name);
+            println!();
+            println!("  Send a DM to {} to get started!", bot_name);
+        }
         Err(e) => {
             println!("  Warning: Could not verify Discord token ({})", e);
             println!("  The token has been saved — you can fix it later in config.toml.");
         }
     }
-
-    println!();
-    println!("  Turn on Developer Mode in Discord to copy your numeric user ID.");
-    println!();
-    let user_id: u64 = Input::new()
-        .with_prompt("Your Discord user ID (numeric)")
-        .validate_with(|input: &String| -> Result<(), &str> {
-            input
-                .trim()
-                .parse::<u64>()
-                .map(|_| ())
-                .map_err(|_| "Please enter a valid numeric user ID")
-        })
-        .interact_text()?
-        .trim()
-        .parse()
-        .expect("already validated");
 
     let guild_input: String = Input::new()
         .with_prompt("Optional Discord server (guild) ID (leave blank for any)")
@@ -697,11 +589,11 @@ fn prompt_discord_setup() -> anyhow::Result<(String, u64, Option<u64>)> {
         Some(guild_input.trim().parse().expect("already validated"))
     };
 
-    Ok((bot_token, user_id, guild_id))
+    Ok((bot_token, guild_id))
 }
 
 #[cfg(feature = "slack")]
-fn prompt_slack_setup() -> anyhow::Result<(String, String, String, bool)> {
+fn prompt_slack_setup() -> anyhow::Result<(String, String, bool)> {
     println!();
     println!("  Slack setup");
     println!("  1. Create a Slack app at https://api.slack.com/apps");
@@ -720,7 +612,12 @@ fn prompt_slack_setup() -> anyhow::Result<(String, String, String, bool)> {
     println!("  Checking Slack bot token...");
     match validate_slack_bot_token(&bot_token) {
         Ok((bot_name, team_name)) => {
-            println!("  Connected to Slack bot {} in {}", bot_name, team_name)
+            println!("  Connected to Slack bot {} in {}", bot_name, team_name);
+            println!();
+            println!(
+                "  Send a DM to @{} in {} to get started!",
+                bot_name, team_name
+            );
         }
         Err(e) => {
             println!("  Warning: Could not verify Slack bot token ({})", e);
@@ -737,30 +634,15 @@ fn prompt_slack_setup() -> anyhow::Result<(String, String, String, bool)> {
         }
     }
 
-    println!();
-    println!("  Find your Slack user ID in your Slack profile (or use /whoami app tools).");
-    println!();
-    let user_id: String = Input::new()
-        .with_prompt("Your Slack user ID (e.g., U12345678)")
-        .validate_with(|input: &String| -> Result<(), &str> {
-            if input.trim().is_empty() {
-                Err("Please enter a Slack user ID")
-            } else {
-                Ok(())
-            }
-        })
-        .interact_text()?;
-    let use_threads = Confirm::new()
-        .with_prompt("Reply in Slack threads?")
-        .default(true)
-        .interact()?;
+    let use_threads: bool = {
+        use dialoguer::Confirm;
+        Confirm::new()
+            .with_prompt("Reply in Slack threads?")
+            .default(true)
+            .interact()?
+    };
 
-    Ok((
-        app_token,
-        bot_token,
-        user_id.trim().to_string(),
-        use_threads,
-    ))
+    Ok((app_token, bot_token, use_threads))
 }
 
 fn quote_toml_string(value: &str) -> String {
@@ -930,91 +812,6 @@ fn validate_slack_app_token(token: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-#[cfg(feature = "browser")]
-struct ChromeProfile {
-    user_data_dir: String,
-    dir_name: String,
-    display_name: String,
-}
-
-/// Auto-detect Chrome profiles on the system.
-#[cfg(feature = "browser")]
-fn discover_chrome_profiles() -> Vec<ChromeProfile> {
-    let mut profiles = Vec::new();
-
-    // Known Chrome user data directories per platform
-    let candidates: Vec<PathBuf> = if cfg!(target_os = "macos") {
-        vec![
-            dirs::home_dir()
-                .map(|h| h.join("Library/Application Support/Google/Chrome"))
-                .unwrap_or_default(),
-            dirs::home_dir()
-                .map(|h| h.join("Library/Application Support/Chromium"))
-                .unwrap_or_default(),
-        ]
-    } else if cfg!(target_os = "linux") {
-        vec![
-            dirs::config_dir()
-                .map(|c| c.join("google-chrome"))
-                .unwrap_or_default(),
-            dirs::config_dir()
-                .map(|c| c.join("chromium"))
-                .unwrap_or_default(),
-        ]
-    } else {
-        // Windows or other
-        vec![dirs::data_local_dir()
-            .map(|d| d.join("Google/Chrome/User Data"))
-            .unwrap_or_default()]
-    };
-
-    for user_data_dir in candidates {
-        if !user_data_dir.exists() {
-            continue;
-        }
-
-        // Look for profile directories (Default, Profile 1, Profile 2, ...)
-        let entries = match std::fs::read_dir(&user_data_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        for entry in entries.flatten() {
-            let dir_name = entry.file_name().to_string_lossy().to_string();
-            if dir_name == "Default" || dir_name.starts_with("Profile ") {
-                let prefs_path = entry.path().join("Preferences");
-                let display_name = read_chrome_profile_name(&prefs_path);
-
-                profiles.push(ChromeProfile {
-                    user_data_dir: user_data_dir.to_string_lossy().to_string(),
-                    dir_name,
-                    display_name,
-                });
-            }
-        }
-    }
-
-    profiles
-}
-
-/// Read the human-readable profile name from Chrome's Preferences JSON.
-#[cfg(feature = "browser")]
-fn read_chrome_profile_name(prefs_path: &Path) -> String {
-    let content = match std::fs::read_to_string(prefs_path) {
-        Ok(c) => c,
-        Err(_) => return String::new(),
-    };
-    let json: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return String::new(),
-    };
-    json.get("profile")
-        .and_then(|p| p.get("name"))
-        .and_then(|n| n.as_str())
-        .unwrap_or("")
-        .to_string()
 }
 
 fn discover_ollama_models() -> anyhow::Result<Vec<String>> {

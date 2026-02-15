@@ -9,23 +9,27 @@ pub struct GoalTokenBudgetStatus {
     pub tokens_used_today: i64,
 }
 
-// ==================== V3 Orchestration Data Model ====================
+// ==================== Goals + Tasks Data Model ====================
 
-/// A V3 goal — a tracked, potentially long-running objective.
+/// A goal — a tracked, potentially long-running objective.
+///
+/// Goals are stored in a single `goals` table with a `domain` that gates behavior:
+/// - `orchestration`: can be scheduled/continuous, can have tasks, can be dispatched
+/// - `personal`: tracked/injected/listed, never dispatched, usually no tasks
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GoalV3 {
+pub struct Goal {
     pub id: String,
     pub description: String,
+    /// "orchestration" (default) or "personal"
+    pub domain: String,
     /// "finite" (one-shot) or "continuous" (monitoring/recurring)
     pub goal_type: String,
-    /// "pending", "pending_confirmation", "active", "paused", "completed", "failed", "cancelled"
+    /// "pending", "pending_confirmation", "active", "paused", "completed", "failed", "cancelled", "abandoned"
     pub status: String,
     /// "low", "medium", "high", "critical"
     pub priority: String,
     /// Success/completion conditions (human-readable)
     pub conditions: Option<String>,
-    /// Cron schedule for scheduled goals (continuous or deferred finite)
-    pub schedule: Option<String>,
     /// JSON context blob (original request, constraints, etc.)
     pub context: Option<String>,
     /// JSON array of resource references (files, URLs, etc.)
@@ -34,8 +38,10 @@ pub struct GoalV3 {
     pub budget_per_check: Option<i64>,
     /// Max tokens per day for this goal
     pub budget_daily: Option<i64>,
-    /// Tokens used today (reset daily)
+    /// Tokens used for the UTC day in `tokens_used_day` (reset daily).
     pub tokens_used_today: i64,
+    /// UTC day anchor for `tokens_used_today` (YYYY-MM-DD).
+    pub tokens_used_day: String,
     /// Timestamp of last meaningful action
     pub last_useful_action: Option<String>,
     pub created_at: String,
@@ -53,20 +59,30 @@ pub struct GoalV3 {
     /// Consecutive dispatch cycles with no progress (circuit breaker: stalls at 3)
     #[serde(default)]
     pub dispatch_failures: i32,
+    /// Personal-goal progress notes (append-only) stored as JSON array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_notes: Option<Vec<String>>,
+    /// Optional episodic-memory provenance (personal goals).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_episode_id: Option<i64>,
+    /// Optional legacy integer ID (for migrated pre-unification personal goals).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_int_id: Option<i64>,
 }
 
-impl GoalV3 {
+impl Goal {
     /// Create a new finite (one-shot) goal from a user request.
     pub fn new_finite(description: &str, session_id: &str) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
+        let day = chrono::Utc::now().date_naive().to_string();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             description: description.to_string(),
+            domain: "orchestration".to_string(),
             goal_type: "finite".to_string(),
             status: "active".to_string(),
             priority: "medium".to_string(),
             conditions: None,
-            schedule: None,
             context: None,
             resources: None,
             // Safety defaults: generous enough for normal usage, but prevents
@@ -74,6 +90,7 @@ impl GoalV3 {
             budget_per_check: Some(100_000),
             budget_daily: Some(500_000),
             tokens_used_today: 0,
+            tokens_used_day: day,
             last_useful_action: None,
             created_at: now.clone(),
             updated_at: now,
@@ -83,40 +100,81 @@ impl GoalV3 {
             notified_at: None,
             notification_attempts: 0,
             dispatch_failures: 0,
+            progress_notes: None,
+            source_episode_id: None,
+            legacy_int_id: None,
+        }
+    }
+
+    /// Create a new personal goal.
+    ///
+    /// Personal goals are tracked and injected (DM-only) but never dispatched
+    /// as background work. Budgets are unset because they do not execute.
+    pub fn new_personal(description: &str, session_id: &str) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        let day = chrono::Utc::now().date_naive().to_string();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            description: description.to_string(),
+            domain: "personal".to_string(),
+            goal_type: "finite".to_string(),
+            status: "active".to_string(),
+            priority: "medium".to_string(),
+            conditions: None,
+            context: None,
+            resources: None,
+            budget_per_check: None,
+            budget_daily: None,
+            tokens_used_today: 0,
+            tokens_used_day: day,
+            last_useful_action: None,
+            created_at: now.clone(),
+            updated_at: now,
+            completed_at: None,
+            parent_goal_id: None,
+            session_id: session_id.to_string(),
+            notified_at: None,
+            notification_attempts: 0,
+            dispatch_failures: 0,
+            progress_notes: Some(Vec::new()),
+            source_episode_id: None,
+            legacy_int_id: None,
         }
     }
 
     /// Create a deferred one-shot finite goal pending user confirmation.
-    pub fn new_deferred_finite(description: &str, session_id: &str, schedule: &str) -> Self {
+    ///
+    /// Scheduling is managed via `GoalSchedule` rows, not a goal column.
+    pub fn new_deferred_finite(description: &str, session_id: &str) -> Self {
         let mut goal = Self::new_finite(description, session_id);
         goal.status = "pending_confirmation".to_string();
-        goal.schedule = Some(schedule.to_string());
         goal
     }
 
-    /// Create a new continuous (evergreen) goal with a cron schedule.
+    /// Create a new continuous (evergreen) goal.
     pub fn new_continuous(
         description: &str,
         session_id: &str,
-        schedule: &str,
         budget_per_check: Option<i64>,
         budget_daily: Option<i64>,
     ) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
+        let day = chrono::Utc::now().date_naive().to_string();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             description: description.to_string(),
+            domain: "orchestration".to_string(),
             goal_type: "continuous".to_string(),
             status: "active".to_string(),
             priority: "low".to_string(),
             conditions: None,
-            schedule: Some(schedule.to_string()),
             context: None,
             resources: None,
             // Apply defaults if caller omitted budgets.
             budget_per_check: budget_per_check.or(Some(50_000)),
             budget_daily: budget_daily.or(Some(200_000)),
             tokens_used_today: 0,
+            tokens_used_day: day,
             last_useful_action: None,
             created_at: now.clone(),
             updated_at: now,
@@ -126,6 +184,9 @@ impl GoalV3 {
             notified_at: None,
             notification_attempts: 0,
             dispatch_failures: 0,
+            progress_notes: None,
+            source_episode_id: None,
+            legacy_int_id: None,
         }
     }
 
@@ -133,26 +194,41 @@ impl GoalV3 {
     pub fn new_continuous_pending(
         description: &str,
         session_id: &str,
-        schedule: &str,
         budget_per_check: Option<i64>,
         budget_daily: Option<i64>,
     ) -> Self {
-        let mut goal = Self::new_continuous(
-            description,
-            session_id,
-            schedule,
-            budget_per_check,
-            budget_daily,
-        );
+        let mut goal =
+            Self::new_continuous(description, session_id, budget_per_check, budget_daily);
         goal.status = "pending_confirmation".to_string();
         goal
     }
 }
 
-/// A V3 task — a discrete unit of work within a goal.
+/// Goal schedule row — per-schedule state for a goal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalSchedule {
+    pub id: String,
+    pub goal_id: String,
+    /// 5-field cron expression.
+    pub cron_expr: String,
+    /// Timezone label. Currently only `local` is supported.
+    pub tz: String,
+    /// User-provided schedule string (optional; for display/audit).
+    pub original_schedule: Option<String>,
+    /// "coalesce" (default) or "always_fire"
+    pub fire_policy: String,
+    pub is_one_shot: bool,
+    pub is_paused: bool,
+    pub last_run_at: Option<String>,
+    pub next_run_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A task — a discrete unit of work within a goal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // Used in Phase 2; StateStore methods and SQLite impl ready
-pub struct TaskV3 {
+pub struct Task {
     pub id: String,
     pub goal_id: String,
     pub description: String,
@@ -185,10 +261,10 @@ pub struct TaskV3 {
     pub completed_at: Option<String>,
 }
 
-/// A V3 task activity log entry — records tool calls and results within a task.
+/// A task activity log entry — records tool calls and results within a task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // Used in Phase 2; StateStore methods and SQLite impl ready
-pub struct TaskActivityV3 {
+pub struct TaskActivity {
     pub id: i64,
     pub task_id: String,
     /// "tool_call", "tool_result", "llm_call", "status_change"

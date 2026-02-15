@@ -7,12 +7,12 @@
 mod channels;
 mod conversation;
 mod dynamic;
+mod goals;
 mod memory;
 mod people;
 mod provider;
 mod tools;
 mod trigger_event;
-mod v3;
 
 pub use channels::{Channel, ChannelCapabilities};
 pub use conversation::{ConversationSummary, Message, ToolCall};
@@ -20,14 +20,14 @@ pub use dynamic::{
     CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
     OAuthConnection, SkillDraft,
 };
+pub use goals::{Goal, GoalSchedule, GoalTokenBudgetStatus, NotificationEntry, Task, TaskActivity};
 pub use memory::{
-    BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Goal, Procedure, UserProfile,
+    BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Procedure, UserProfile,
 };
 pub use people::{Person, PersonFact};
 pub use provider::{ModelProvider, ProviderResponse, TokenUsage, TokenUsageRecord};
 pub use tools::{AgentRole, Tool, ToolCapabilities, ToolRole};
 pub use trigger_event::TriggerEvent;
-pub use v3::{GoalTokenBudgetStatus, GoalV3, NotificationEntry, TaskActivityV3, TaskV3};
 
 mod state_store;
 pub use state_store::*;
@@ -40,9 +40,9 @@ pub mod store_prelude {
     #![allow(unused_imports)]
     pub use super::{
         ConversationSummaryStore, DynamicBotStore, DynamicCliAgentStore, DynamicMcpServerStore,
-        EpisodeStore, FactStore, HealthCheckStore, LearningStore, LegacyGoalStore, MessageStore,
+        EpisodeStore, FactStore, GoalStore, HealthCheckStore, LearningStore, MessageStore,
         NotificationStore, OAuthStore, PeopleStore, SessionChannelStore, SettingsStore, SkillStore,
-        StateStore, TokenUsageStore, V3Store,
+        StateStore, TokenUsageStore,
     };
 }
 

@@ -46,25 +46,40 @@ pub fn parse_schedule(input: &str) -> anyhow::Result<String> {
         return Ok(format!("0 */{} * * *", n));
     }
 
-    // "daily at 9am" / "daily at 14:30" / "daily at 2pm" / "daily at 2:30pm"
-    let re_daily = Regex::new(r"(?i)^daily\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$")?;
-    if let Some(caps) = re_daily.captures(input) {
-        let (hour, minute) = parse_time_captures(&caps)?;
-        return Ok(format!("{} {} * * *", minute, hour));
+    // Multi-time variants (minutes must match):
+    // - "daily at 6am, 12pm, 6pm"
+    // - "every day at 6am, 12pm, 6pm"
+    // - "weekdays at 9am and 5pm"
+    // - "weekends at noon"
+    let re_daily_at = Regex::new(r"(?i)^daily\s+at\s+(.+)$")?;
+    if let Some(caps) = re_daily_at.captures(input) {
+        let times = parse_time_list(caps.get(1).unwrap().as_str())?;
+        return cron_for_recurring_times(times, "*");
     }
-
-    // "weekdays at 8:30" / "weekdays at 9am"
-    let re_weekdays = Regex::new(r"(?i)^weekdays?\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$")?;
-    if let Some(caps) = re_weekdays.captures(input) {
-        let (hour, minute) = parse_time_captures(&caps)?;
-        return Ok(format!("{} {} * * 1-5", minute, hour));
+    let re_every_day_at = Regex::new(r"(?i)^(?:every\s+day|everyday)\s+at\s+(.+)$")?;
+    if let Some(caps) = re_every_day_at.captures(input) {
+        let times = parse_time_list(caps.get(1).unwrap().as_str())?;
+        return cron_for_recurring_times(times, "*");
     }
-
-    // "weekends at 10am"
-    let re_weekends = Regex::new(r"(?i)^weekends?\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$")?;
-    if let Some(caps) = re_weekends.captures(input) {
-        let (hour, minute) = parse_time_captures(&caps)?;
-        return Ok(format!("{} {} * * 0,6", minute, hour));
+    let re_weekdays_at = Regex::new(r"(?i)^weekdays?\s+at\s+(.+)$")?;
+    if let Some(caps) = re_weekdays_at.captures(input) {
+        let times = parse_time_list(caps.get(1).unwrap().as_str())?;
+        return cron_for_recurring_times(times, "1-5");
+    }
+    let re_every_weekdays_at = Regex::new(r"(?i)^every\s+weekdays?\s+at\s+(.+)$")?;
+    if let Some(caps) = re_every_weekdays_at.captures(input) {
+        let times = parse_time_list(caps.get(1).unwrap().as_str())?;
+        return cron_for_recurring_times(times, "1-5");
+    }
+    let re_weekends_at = Regex::new(r"(?i)^weekends?\s+at\s+(.+)$")?;
+    if let Some(caps) = re_weekends_at.captures(input) {
+        let times = parse_time_list(caps.get(1).unwrap().as_str())?;
+        return cron_for_recurring_times(times, "0,6");
+    }
+    let re_every_weekends_at = Regex::new(r"(?i)^every\s+weekends?\s+at\s+(.+)$")?;
+    if let Some(caps) = re_every_weekends_at.captures(input) {
+        let times = parse_time_list(caps.get(1).unwrap().as_str())?;
+        return cron_for_recurring_times(times, "0,6");
     }
 
     // Dynamic relative one-shot parser:
@@ -314,18 +329,60 @@ fn parse_time_with_offset_captures(
     Some((hour, minute))
 }
 
-/// Extract hour and minute from regex captures with optional AM/PM.
-fn parse_time_captures(caps: &regex::Captures) -> anyhow::Result<(u32, u32)> {
-    let mut hour: u32 = caps[1].parse()?;
+fn parse_time_list(raw: &str) -> anyhow::Result<Vec<(u32, u32)>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("Missing time after 'at'");
+    }
+
+    // Split on commas + "and" (case-insensitive); keep it permissive for LLM text.
+    let and_re = Regex::new(r"(?i)\s+and\s+")?;
+    let normalized = and_re.replace_all(raw, ",").replace('&', ",");
+    let parts: Vec<&str> = normalized
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.is_empty() {
+        anyhow::bail!("Missing time after 'at'");
+    }
+
+    let mut out = Vec::new();
+    for p in parts {
+        out.push(parse_time_token(p)?);
+    }
+    Ok(out)
+}
+
+fn parse_time_token(token: &str) -> anyhow::Result<(u32, u32)> {
+    let token = token.trim();
+    if token.is_empty() {
+        anyhow::bail!("Empty time token");
+    }
+    let lower = token.to_ascii_lowercase();
+    if lower == "noon" {
+        return Ok((12, 0));
+    }
+    if lower == "midnight" {
+        return Ok((0, 0));
+    }
+
+    let re = Regex::new(r"(?i)^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$")?;
+    let Some(caps) = re.captures(token) else {
+        anyhow::bail!("Unrecognized time token '{}'", token);
+    };
+
+    let mut hour: u32 = caps.get(1).unwrap().as_str().parse()?;
     let minute: u32 = caps.get(2).map_or(Ok(0), |m| m.as_str().parse())?;
     if let Some(ampm) = caps.get(3) {
-        let ampm = ampm.as_str().to_lowercase();
+        let ampm = ampm.as_str().to_ascii_lowercase();
         if ampm == "pm" && hour < 12 {
             hour += 12;
         } else if ampm == "am" && hour == 12 {
             hour = 0;
         }
     }
+
     if hour > 23 {
         anyhow::bail!("Hour must be between 0 and 23");
     }
@@ -333,6 +390,27 @@ fn parse_time_captures(caps: &regex::Captures) -> anyhow::Result<(u32, u32)> {
         anyhow::bail!("Minute must be between 0 and 59");
     }
     Ok((hour, minute))
+}
+
+fn cron_for_recurring_times(times: Vec<(u32, u32)>, dow: &str) -> anyhow::Result<String> {
+    if times.is_empty() {
+        anyhow::bail!("Missing time after 'at'");
+    }
+    let minute = times[0].1;
+    if times.iter().any(|(_, m)| *m != minute) {
+        anyhow::bail!(
+            "Multiple times must share the same minute (e.g. 'daily at 6am, 12pm, 6pm'). For different minutes, create multiple schedules."
+        );
+    }
+    let mut hours: Vec<u32> = times.iter().map(|(h, _)| *h).collect();
+    hours.sort_unstable();
+    hours.dedup();
+    let hour_field = hours
+        .into_iter()
+        .map(|h| h.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!("{} {} * * {}", minute, hour_field, dow))
 }
 
 /// Compute the next occurrence from a cron expression using croner.
@@ -406,17 +484,49 @@ mod tests {
         assert_eq!(parse_schedule("daily at 2pm").unwrap(), "0 14 * * *");
         assert_eq!(parse_schedule("daily at 2:30pm").unwrap(), "30 14 * * *");
         assert_eq!(parse_schedule("daily at 12am").unwrap(), "0 0 * * *");
+        assert_eq!(
+            parse_schedule("daily at 6am, 12pm, 6pm").unwrap(),
+            "0 6,12,18 * * *"
+        );
+        assert_eq!(
+            parse_schedule("daily at 6, 12 and 6 pm").unwrap(),
+            "0 6,12,18 * * *"
+        );
+        assert_eq!(
+            parse_schedule("every day at 6, 12 and 6 pm").unwrap(),
+            "0 6,12,18 * * *"
+        );
+        assert_eq!(
+            parse_schedule("everyday at 6am, 12pm, 6pm").unwrap(),
+            "0 6,12,18 * * *"
+        );
     }
 
     #[test]
     fn test_parse_schedule_weekdays() {
         assert_eq!(parse_schedule("weekdays at 8:30").unwrap(), "30 8 * * 1-5");
         assert_eq!(parse_schedule("weekdays at 9am").unwrap(), "0 9 * * 1-5");
+        assert_eq!(
+            parse_schedule("weekdays at 9am and 5pm").unwrap(),
+            "0 9,17 * * 1-5"
+        );
+        assert_eq!(
+            parse_schedule("every weekday at 9am and 5pm").unwrap(),
+            "0 9,17 * * 1-5"
+        );
     }
 
     #[test]
     fn test_parse_schedule_weekends() {
         assert_eq!(parse_schedule("weekends at 10am").unwrap(), "0 10 * * 0,6");
+        assert_eq!(
+            parse_schedule("weekends at noon, 6pm").unwrap(),
+            "0 12,18 * * 0,6"
+        );
+        assert_eq!(
+            parse_schedule("every weekend at noon, 6pm").unwrap(),
+            "0 12,18 * * 0,6"
+        );
     }
 
     #[test]

@@ -210,16 +210,27 @@ impl Agent {
                     let tz_label = crate::cron_utils::system_timezone_display();
 
                     for goal in &pending_goals {
-                        match self.state.activate_goal_v3(&goal.id).await {
+                        match self.state.activate_goal(&goal.id).await {
                             Ok(true) => {
                                 if let Some(ref registry) = self.goal_token_registry {
                                     registry.register(&goal.id).await;
                                 }
-                                let next_run = goal
-                                    .schedule
-                                    .as_deref()
-                                    .and_then(|s| crate::cron_utils::compute_next_run_local(s).ok())
-                                    .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
+                                let schedules = self
+                                    .state
+                                    .get_schedules_for_goal(&goal.id)
+                                    .await
+                                    .unwrap_or_default();
+                                let next_run = schedules
+                                    .iter()
+                                    .filter_map(|s| {
+                                        chrono::DateTime::parse_from_rfc3339(&s.next_run_at).ok()
+                                    })
+                                    .min_by_key(|dt| dt.timestamp())
+                                    .map(|dt| {
+                                        dt.with_timezone(&chrono::Local)
+                                            .format("%Y-%m-%d %H:%M %Z")
+                                            .to_string()
+                                    })
                                     .unwrap_or_else(|| "unscheduled".to_string());
                                 activated
                                     .push(format!("{} (next: {})", goal.description, next_run));
@@ -286,8 +297,16 @@ impl Agent {
                         updated.status = "cancelled".to_string();
                         updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
                         updated.updated_at = chrono::Utc::now().to_rfc3339();
-                        if self.state.update_goal_v3(&updated).await.is_ok() {
+                        if self.state.update_goal(&updated).await.is_ok() {
                             cancelled += 1;
+                        }
+                        // Best-effort cleanup: schedules were created before confirmation.
+                        // Cancelled goals should not retain schedules.
+                        if let Ok(schedules) = self.state.get_schedules_for_goal(&updated.id).await
+                        {
+                            for s in &schedules {
+                                let _ = self.state.delete_goal_schedule(&s.id).await;
+                            }
                         }
                     }
 
@@ -326,7 +345,14 @@ impl Agent {
                         updated.status = "cancelled".to_string();
                         updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
                         updated.updated_at = chrono::Utc::now().to_rfc3339();
-                        let _ = self.state.update_goal_v3(&updated).await;
+                        let _ = self.state.update_goal(&updated).await;
+                        // Best-effort cleanup: remove any schedules created pre-confirmation.
+                        if let Ok(schedules) = self.state.get_schedules_for_goal(&updated.id).await
+                        {
+                            for s in &schedules {
+                                let _ = self.state.delete_goal_schedule(&s.id).await;
+                            }
+                        }
                     }
                 }
             }
@@ -512,7 +538,7 @@ impl Agent {
             );
         }
 
-        // V3: Top-level orchestrator (depth 0) gets NO action tools.
+        // Orchestrator (depth 0) gets NO action tools.
         // It classifies intent and delegates to task leads or falls through to the full agent loop.
         // Sub-agents (depth > 0) get tools based on their role (set in spawn_child).
         let is_top_level_orchestrator = self.depth == 0 && self.role == AgentRole::Orchestrator;
@@ -537,7 +563,7 @@ impl Agent {
             tool_defs = defs;
         }
 
-        let mut policy_bundle = build_policy_bundle_v1(user_text, &available_capabilities, false);
+        let mut policy_bundle = build_policy_bundle(user_text, &available_capabilities, false);
 
         if self.depth == 0 {
             self.maybe_retire_classify_query(session_id).await;
@@ -782,18 +808,18 @@ impl Agent {
             IterationLimitConfig::Hard { initial: _, cap } => (Some(*cap), None, None),
         };
 
-        // Resolve V3 goal_id once for per-goal token budget enforcement.
-        // Executors currently carry only v3_task_id, so we may need to lookup goal_id via task.
-        let resolved_goal_id: Option<String> = if let Some(gid) = self.v3_goal_id.clone() {
+        // Resolve goal_id once for per-goal token budget enforcement.
+        // Executors currently carry only task_id, so we may need to lookup goal_id via task.
+        let resolved_goal_id: Option<String> = if let Some(gid) = self.goal_id.clone() {
             Some(gid)
-        } else if let Some(ref tid) = self.v3_task_id {
-            match self.state.get_task_v3(tid).await {
+        } else if let Some(ref tid) = self.task_id {
+            match self.state.get_task(tid).await {
                 Ok(Some(task)) => Some(task.goal_id),
                 Ok(None) => {
                     warn!(
                         session_id,
                         task_id = %tid,
-                        "V3 task not found while resolving goal_id; goal budget enforcement disabled for this run"
+                        "Task not found while resolving goal_id; goal budget enforcement disabled for this run"
                     );
                     None
                 }
@@ -802,7 +828,7 @@ impl Agent {
                         session_id,
                         task_id = %tid,
                         error = %e,
-                        "Failed to resolve goal_id from V3 task; goal budget enforcement disabled for this run"
+                        "Failed to resolve goal_id from task; goal budget enforcement disabled for this run"
                     );
                     None
                 }
@@ -815,7 +841,7 @@ impl Agent {
             iteration += 1;
             touch_heartbeat(&heartbeat);
 
-            // Check for cancellation (V3 goal cancellation cascades via token hierarchy)
+            // Check for cancellation (cascades via token hierarchy)
             if let Some(ref ct) = self.cancel_token {
                 if ct.is_cancelled() {
                     info!(session_id, iteration, "Task cancelled by parent");
@@ -829,9 +855,9 @@ impl Agent {
                     )
                     .await;
 
-                    // Mark remaining tasks as cancelled (V3 requirement)
-                    if let Some(ref gid) = self.v3_goal_id {
-                        if let Ok(tasks) = self.state.get_tasks_for_goal_v3(gid).await {
+                    // Mark remaining tasks as cancelled.
+                    if let Some(ref gid) = self.goal_id {
+                        if let Ok(tasks) = self.state.get_tasks_for_goal(gid).await {
                             for task in &tasks {
                                 if task.status != "completed"
                                     && task.status != "failed"
@@ -839,7 +865,7 @@ impl Agent {
                                 {
                                     let mut ct = task.clone();
                                     ct.status = "cancelled".to_string();
-                                    let _ = self.state.update_task_v3(&ct).await;
+                                    let _ = self.state.update_task(&ct).await;
                                 }
                             }
                         }
@@ -1056,7 +1082,7 @@ impl Agent {
                         budget
                     );
                     self.fanout_token_alert(
-                        self.v3_goal_id.as_deref(),
+                        self.goal_id.as_deref(),
                         session_id,
                         &alert_msg,
                         Some(session_id),
@@ -1211,7 +1237,7 @@ impl Agent {
                             session_id
                         );
                         self.fanout_token_alert(
-                            self.v3_goal_id.as_deref(),
+                            self.goal_id.as_deref(),
                             session_id,
                             &alert_msg,
                             None,
@@ -1427,8 +1453,7 @@ impl Agent {
                             .ok()
                             .flatten();
                     }
-                    policy_bundle =
-                        build_policy_bundle_v1(user_text, &available_capabilities, true);
+                    policy_bundle = build_policy_bundle(user_text, &available_capabilities, true);
 
                     let can_escalate = last_escalation_iteration
                         .is_none_or(|last| iteration >= last.saturating_add(2));
@@ -1996,7 +2021,7 @@ impl Agent {
                     warn!(session_id, error = %e, "Failed to record token usage");
                 }
 
-                // V3 goal budget accounting: increment tokens_used_today and stop immediately
+                // Goal budget accounting: increment tokens_used_today and stop immediately
                 // before tool execution if the goal's daily budget is exhausted.
                 if let Some(ref goal_id) = resolved_goal_id {
                     let delta_tokens = (usage.input_tokens + usage.output_tokens) as i64;
@@ -2090,15 +2115,15 @@ impl Agent {
                 }
             }
 
-            // Log V3 LLM call activity for executor agents
-            if let Some(ref v3_tid) = self.v3_task_id {
+            // Log LLM call activity for executor agents
+            if let Some(ref tid) = self.task_id {
                 let tokens = resp
                     .usage
                     .as_ref()
                     .map(|u| (u.input_tokens + u.output_tokens) as i64);
-                let activity = TaskActivityV3 {
+                let activity = TaskActivity {
                     id: 0,
-                    task_id: v3_tid.clone(),
+                    task_id: tid.clone(),
                     activity_type: "llm_call".to_string(),
                     tool_name: None,
                     tool_args: None,
@@ -2107,8 +2132,8 @@ impl Agent {
                     tokens_used: tokens,
                     created_at: chrono::Utc::now().to_rfc3339(),
                 };
-                if let Err(e) = self.state.log_task_activity_v3(&activity).await {
-                    warn!(task_id = %v3_tid, error = %e, "Failed to log V3 LLM activity");
+                if let Err(e) = self.state.log_task_activity(&activity).await {
+                    warn!(task_id = %tid, error = %e, "Failed to log LLM activity");
                 }
             }
 
@@ -2451,7 +2476,7 @@ impl Agent {
                     return Ok(reply);
                 }
 
-                // V3: Check for cancel/stop intent before routing
+                // Check for cancel/stop intent before routing
                 {
                     let lower_trimmed = user_text.trim().to_lowercase();
                     let explicit_cancel_command =
@@ -2467,10 +2492,10 @@ impl Agent {
                     if generic_cancel_request {
                         let active_goals = self
                             .state
-                            .get_goals_for_session_v3(session_id)
+                            .get_goals_for_session(session_id)
                             .await
                             .unwrap_or_default();
-                        let active: Vec<&GoalV3> = active_goals
+                        let active: Vec<&Goal> = active_goals
                             .iter()
                             .filter(|g| {
                                 g.status == "active"
@@ -2490,11 +2515,18 @@ impl Agent {
                                 let mut updated = (*goal).clone();
                                 updated.status = "cancelled".to_string();
                                 updated.updated_at = chrono::Utc::now().to_rfc3339();
-                                let _ = self.state.update_goal_v3(&updated).await;
+                                let _ = self.state.update_goal(&updated).await;
+                                // Best-effort cleanup: cancelled goals should not retain schedules.
+                                if let Ok(schedules) =
+                                    self.state.get_schedules_for_goal(&updated.id).await
+                                {
+                                    for s in &schedules {
+                                        let _ = self.state.delete_goal_schedule(&s.id).await;
+                                    }
+                                }
 
                                 // Cancel all remaining tasks for this goal
-                                if let Ok(tasks) = self.state.get_tasks_for_goal_v3(&goal.id).await
-                                {
+                                if let Ok(tasks) = self.state.get_tasks_for_goal(&goal.id).await {
                                     for task in &tasks {
                                         if task.status != "completed"
                                             && task.status != "failed"
@@ -2502,8 +2534,7 @@ impl Agent {
                                         {
                                             let mut cancelled_task = task.clone();
                                             cancelled_task.status = "cancelled".to_string();
-                                            let _ =
-                                                self.state.update_task_v3(&cancelled_task).await;
+                                            let _ = self.state.update_task(&cancelled_task).await;
                                         }
                                     }
                                 }
@@ -2514,7 +2545,7 @@ impl Agent {
                             info!(
                                 session_id,
                                 count = cancelled.len(),
-                                "V3: cancelled active goals"
+                                "Cancelled active goals"
                             );
 
                             let msg = if cancelled.len() == 1 {
@@ -2546,7 +2577,7 @@ impl Agent {
                     }
                 }
 
-                // V3 orchestration routing (always-on)
+                // Orchestration routing (always-on)
                 {
                     let (complexity, _) = classify_intent_complexity(user_text, &intent_gate);
                     match complexity {
@@ -2556,7 +2587,7 @@ impl Agent {
                             // or infer it from context.
                             info!(
                                 session_id,
-                                "V3: ScheduledMissingTiming — falling through to agent loop"
+                                "ScheduledMissingTiming — falling through to agent loop"
                             );
                             if tool_defs.is_empty() {
                                 let (defs, base_defs, caps) = self
@@ -2574,13 +2605,15 @@ impl Agent {
                             }
                             continue;
                         }
-                        IntentComplexity::Scheduled {
-                            schedule_raw,
-                            schedule_cron,
-                            is_one_shot,
-                            schedule_type_explicit,
-                        } => {
-                            let cron_expr = schedule_cron
+	                        IntentComplexity::Scheduled {
+	                            schedule_raw,
+	                            schedule_cron,
+	                            is_one_shot,
+	                            schedule_type_explicit: _,
+	                        } => {
+                            let mut schedule_raw = schedule_raw;
+
+                            let mut cron_expr = schedule_cron
                                 .as_ref()
                                 .filter(|candidate| {
                                     let parts: Vec<&str> =
@@ -2601,6 +2634,29 @@ impl Agent {
                                     }
                                     crate::cron_utils::parse_schedule(&schedule_raw).ok()
                                 });
+
+                            // E2E guardrail: if the model provided a malformed schedule string
+                            // (e.g. "2 minutes" instead of "in 2 minutes"), retry parsing using
+                            // heuristic extraction from the user text.
+                            if cron_expr.is_none() && ENABLE_SCHEDULE_HEURISTICS {
+                                if let Some((heuristic_raw, _)) =
+                                    intent_routing::detect_schedule_heuristic(user_text)
+                                {
+                                    if heuristic_raw != schedule_raw {
+                                        cron_expr =
+                                            crate::cron_utils::parse_schedule(&heuristic_raw).ok();
+                                        if cron_expr.is_some() {
+                                            warn!(
+                                                session_id,
+                                                schedule_raw = %schedule_raw,
+                                                heuristic_raw = %heuristic_raw,
+                                                "Schedule parse failed; recovered using heuristic schedule"
+                                            );
+                                            schedule_raw = heuristic_raw;
+                                        }
+                                    }
+                                }
+                            }
 
                             let cron_expr = match cron_expr {
                                 Some(expr) => expr,
@@ -2631,18 +2687,12 @@ impl Agent {
                                 }
                             };
 
-                            // Use explicit schedule_type when present. Fallback cron-shape
-                            // heuristic is only trusted for obvious relative one-shots.
-                            let allow_one_shot_fallback = !schedule_type_explicit
-                                && (contains_keyword_as_words(&schedule_raw, "in")
-                                    || contains_keyword_as_words(&schedule_raw, "tomorrow"));
-                            let actually_one_shot = if schedule_type_explicit {
-                                is_one_shot
-                            } else if allow_one_shot_fallback {
-                                is_one_shot || crate::cron_utils::is_one_shot_schedule(&cron_expr)
-                            } else {
-                                is_one_shot
-                            };
+	                            // Cron-shape heuristic override: if the cron pins a specific
+	                            // day+month it is clearly one-shot regardless of what the LLM
+	                            // classified (LLMs often return "recurring" for "in 2 minutes").
+	                            let cron_looks_one_shot =
+	                                crate::cron_utils::is_one_shot_schedule(&cron_expr);
+	                            let actually_one_shot = cron_looks_one_shot || is_one_shot;
 
                             if is_internal_maintenance_intent(user_text) {
                                 let msg = "Memory maintenance already runs via built-in background jobs (embeddings, consolidation, decay, retention). I won't create a scheduled goal for that.".to_string();
@@ -2680,17 +2730,16 @@ impl Agent {
                                 return Ok(msg);
                             }
 
-                            let mut goal = if actually_one_shot {
-                                GoalV3::new_deferred_finite(user_text, session_id, &cron_expr)
-                            } else {
-                                GoalV3::new_continuous_pending(
-                                    user_text,
-                                    session_id,
-                                    &cron_expr,
-                                    Some(5000),
-                                    Some(20000),
-                                )
-                            };
+	                            let mut goal = if actually_one_shot {
+	                                Goal::new_deferred_finite(user_text, session_id)
+	                            } else {
+	                                Goal::new_continuous_pending(
+	                                    user_text,
+	                                    session_id,
+	                                    None,
+	                                    None,
+	                                )
+	                            };
 
                             let relevant_facts = self
                                 .state
@@ -2717,18 +2766,35 @@ impl Agent {
                                     Some(serde_json::to_string(&ctx).unwrap_or_default());
                             }
 
-                            self.state.create_goal_v3(&goal).await?;
+                            self.state.create_goal(&goal).await?;
+
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let next_run_local =
+                                crate::cron_utils::compute_next_run_local(&cron_expr)?;
+                            let schedule = crate::traits::GoalSchedule {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                goal_id: goal.id.clone(),
+                                cron_expr: cron_expr.clone(),
+                                tz: "local".to_string(),
+                                original_schedule: Some(schedule_raw.clone()),
+                                fire_policy: "coalesce".to_string(),
+                                is_one_shot: actually_one_shot,
+                                is_paused: false,
+                                last_run_at: None,
+                                next_run_at: next_run_local
+                                    .with_timezone(&chrono::Utc)
+                                    .to_rfc3339(),
+                                created_at: now.clone(),
+                                updated_at: now.clone(),
+                            };
+                            self.state.create_goal_schedule(&schedule).await?;
 
                             let tz_label = crate::cron_utils::system_timezone_display();
                             let schedule_desc = if actually_one_shot {
-                                crate::cron_utils::compute_next_run_local(&cron_expr)
-                                    .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
-                                    .unwrap_or_else(|_| schedule_raw.clone())
+                                next_run_local.format("%Y-%m-%d %H:%M %Z").to_string()
                             } else {
                                 let next_local =
-                                    crate::cron_utils::compute_next_run_local(&cron_expr)
-                                        .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
-                                        .unwrap_or_else(|_| "n/a".to_string());
+                                    next_run_local.format("%Y-%m-%d %H:%M %Z").to_string();
                                 format!("{} (next: {})", schedule_raw, next_local)
                             };
                             let schedule_kind = if actually_one_shot {
@@ -2777,16 +2843,15 @@ impl Agent {
                                     Ok(ApprovalResponse::AllowOnce)
                                     | Ok(ApprovalResponse::AllowSession)
                                     | Ok(ApprovalResponse::AllowAlways) => {
-                                        let activation_msg = match self.state.activate_goal_v3(&goal.id).await {
+                                        let activation_msg =
+                                            match self.state.activate_goal(&goal.id).await {
                                             Ok(true) => {
                                                 if let Some(ref registry) = self.goal_token_registry {
                                                     registry.register(&goal.id).await;
                                                 }
-                                                let next_run = goal
-                                                    .schedule
-                                                    .as_deref()
-                                                    .and_then(|s| crate::cron_utils::compute_next_run_local(s).ok())
-                                                    .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
+                                                let next_run = chrono::DateTime::parse_from_rfc3339(&schedule.next_run_at)
+                                                    .ok()
+                                                    .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z").to_string())
                                                     .unwrap_or_else(|| "n/a".to_string());
                                                 format!(
                                                     "Scheduled: {} (next: {}). I'll execute it when the time comes. System timezone: {}.",
@@ -2842,7 +2907,16 @@ impl Agent {
                                         goal.status = "cancelled".to_string();
                                         goal.completed_at = Some(now.clone());
                                         goal.updated_at = now;
-                                        let _ = self.state.update_goal_v3(&goal).await;
+                                        let _ = self.state.update_goal(&goal).await;
+                                        // Best-effort cleanup: schedules were created pre-confirmation.
+                                        if let Ok(schedules) =
+                                            self.state.get_schedules_for_goal(&goal.id).await
+                                        {
+                                            for s in &schedules {
+                                                let _ =
+                                                    self.state.delete_goal_schedule(&s.id).await;
+                                            }
+                                        }
 
                                         let cancel_msg =
                                             "OK, cancelled the scheduled goal.".to_string();
@@ -2943,7 +3017,7 @@ impl Agent {
                             info!(
                                 session_id,
                                 answer_len = answer.len(),
-                                "V3: Knowledge intent — returning consultant analysis"
+                                "Knowledge intent — returning consultant analysis"
                             );
                             let assistant_msg = Message {
                                 id: Uuid::new_v4().to_string(),
@@ -3000,13 +3074,10 @@ impl Agent {
                                 info!(
                                     session_id,
                                     tool_count = tool_defs.len(),
-                                    "V3: Simple intent — loaded tools for orchestrator"
+                                    "Simple intent — loaded tools for orchestrator"
                                 );
                             }
-                            info!(
-                                session_id,
-                                "V3: Simple intent — continuing to full agent loop"
-                            );
+                            info!(session_id, "Simple intent — continuing to full agent loop");
                             // Warm-start iteration 2: keep the consultant analysis as a one-shot
                             // system nudge so the executor model doesn't have to re-derive intent
                             // (and we don't pay the consultant cost for nothing).
@@ -3059,8 +3130,8 @@ impl Agent {
                                 return Ok(msg);
                             }
 
-                            // Create V3 goal
-                            let mut goal = GoalV3::new_finite(user_text, session_id);
+                            // Create goal
+                            let mut goal = Goal::new_finite(user_text, session_id);
 
                             // Phase 4: Feed-forward relevant knowledge into goal context
                             let relevant_facts = self
@@ -3088,7 +3159,7 @@ impl Agent {
                                     Some(serde_json::to_string(&ctx).unwrap_or_default());
                             }
 
-                            self.state.create_goal_v3(&goal).await?;
+                            self.state.create_goal(&goal).await?;
 
                             // Register cancellation token for this goal
                             if let Some(ref registry) = self.goal_token_registry {
@@ -3098,7 +3169,7 @@ impl Agent {
                             info!(
                                 session_id,
                                 goal_id = %goal.id,
-                                "V3: created goal for complex request, spawning task lead in background"
+                                "Created goal for complex request, spawning task lead in background"
                             );
 
                             // Upgrade weak self-reference to Arc for background spawning
@@ -3124,7 +3195,7 @@ impl Agent {
                                 );
                             } else {
                                 // No self_ref available (sub-agent or test) — fall back to sync
-                                warn!("V3: No self_ref available, running task lead synchronously");
+                                warn!("No self_ref available, running task lead synchronously");
                                 let result = self
                                     .spawn_task_lead(
                                         &goal.id,
@@ -3142,7 +3213,7 @@ impl Agent {
                                         updated_goal.status = "completed".to_string();
                                         updated_goal.completed_at =
                                             Some(chrono::Utc::now().to_rfc3339());
-                                        let _ = self.state.update_goal_v3(&updated_goal).await;
+                                        let _ = self.state.update_goal(&updated_goal).await;
 
                                         let assistant_msg = Message {
                                             id: Uuid::new_v4().to_string(),
@@ -3183,7 +3254,7 @@ impl Agent {
                                     Err(e) => {
                                         let mut updated_goal = goal.clone();
                                         updated_goal.status = "failed".to_string();
-                                        let _ = self.state.update_goal_v3(&updated_goal).await;
+                                        let _ = self.state.update_goal(&updated_goal).await;
                                         let err_reply = format!(
                                             "I encountered an issue while working on your request: {}",
                                             e
@@ -3311,7 +3382,7 @@ impl Agent {
                     }
                 }
 
-                // V3: Knowledge and Complex return above. Simple falls through
+                // Knowledge and Complex return above. Simple falls through
                 // to the full agent loop below (iteration 2+).
             }
 
@@ -4361,10 +4432,10 @@ impl Agent {
                     )
                     .await?;
 
-                    if let Some(ref v3_tid) = self.v3_task_id {
-                        let activity = TaskActivityV3 {
+                    if let Some(ref tid) = self.task_id {
+                        let activity = TaskActivity {
                             id: 0,
-                            task_id: v3_tid.clone(),
+                            task_id: tid.clone(),
                             activity_type: "tool_call".to_string(),
                             tool_name: Some(tc.name.clone()),
                             tool_args: Some(tc.arguments.chars().take(1000).collect()),
@@ -4373,8 +4444,8 @@ impl Agent {
                             tokens_used: None,
                             created_at: chrono::Utc::now().to_rfc3339(),
                         };
-                        if let Err(e) = self.state.log_task_activity_v3(&activity).await {
-                            warn!(task_id = %v3_tid, error = %e, "Failed to log V3 task activity");
+                        if let Err(e) = self.state.log_task_activity(&activity).await {
+                            warn!(task_id = %tid, error = %e, "Failed to log task activity");
                         }
                     }
 
@@ -4576,15 +4647,15 @@ impl Agent {
                         // Inline tool failure stats to help the model decide whether to retry or pivot.
                         // Bounded query (LIMIT 500) and guarded for graceful degradation.
                         let since = Utc::now() - chrono::Duration::hours(24);
-	                        if let Ok(stats) = self.event_store.get_tool_stats(&tc.name, since).await {
-	                            if stats.total_calls >= 3 {
-	                                // total_calls is bounded by the underlying LIMIT and guarded above.
-	                                let failure_pct = ((stats.failed * 100) + (stats.total_calls / 2))
-	                                    / stats.total_calls;
-	                                let mut lines = Vec::new();
-	                                lines.push(format!(
-	                                    "[TOOL STATS] {} (24h): {} calls, {} failed ({}%), avg {}ms",
-	                                    tc.name,
+                        if let Ok(stats) = self.event_store.get_tool_stats(&tc.name, since).await {
+                            if stats.total_calls >= 3 {
+                                // total_calls is bounded by the underlying LIMIT and guarded above.
+                                let failure_pct = ((stats.failed * 100) + (stats.total_calls / 2))
+                                    / stats.total_calls;
+                                let mut lines = Vec::new();
+                                lines.push(format!(
+                                    "[TOOL STATS] {} (24h): {} calls, {} failed ({}%), avg {}ms",
+                                    tc.name,
                                     stats.total_calls,
                                     stats.failed,
                                     failure_pct,
@@ -4666,14 +4737,14 @@ impl Agent {
 
                         // In-session mini learning: if we saw repeated failures for a tool+pattern
                         // and then recovered via a different tool, persist the workaround now.
-	                        if let Some((failed_tool, failed_pattern)) = last_tool_failure.take() {
-	                            let key = (failed_tool.clone(), failed_pattern.clone());
-	                            let failures = tool_failure_patterns.get(&key).copied().unwrap_or(0);
-	                            if failures >= 3
-	                                && tc.name != failed_tool
-	                                && in_session_learned.insert(key)
-	                            {
-	                                let recovery_tool = tc.name.clone();
+                        if let Some((failed_tool, failed_pattern)) = last_tool_failure.take() {
+                            let key = (failed_tool.clone(), failed_pattern.clone());
+                            let failures = tool_failure_patterns.get(&key).copied().unwrap_or(0);
+                            if failures >= 3
+                                && tc.name != failed_tool
+                                && in_session_learned.insert(key)
+                            {
+                                let recovery_tool = tc.name.clone();
                                 let solution = crate::memory::procedures::create_error_solution(
                                     failed_pattern,
                                     Some(failed_tool.clone()),
@@ -4751,11 +4822,11 @@ impl Agent {
                         .await;
                 }
 
-                // Log V3 task activity for executor agents
-                if let Some(ref v3_tid) = self.v3_task_id {
-                    let activity = TaskActivityV3 {
+                // Log tool activity for executor agents
+                if let Some(ref tid) = self.task_id {
+                    let activity = TaskActivity {
                         id: 0,
-                        task_id: v3_tid.clone(),
+                        task_id: tid.clone(),
                         activity_type: "tool_call".to_string(),
                         tool_name: Some(tc.name.clone()),
                         tool_args: Some(tc.arguments.chars().take(1000).collect()),
@@ -4764,8 +4835,8 @@ impl Agent {
                         tokens_used: None,
                         created_at: chrono::Utc::now().to_rfc3339(),
                     };
-                    if let Err(e) = self.state.log_task_activity_v3(&activity).await {
-                        warn!(task_id = %v3_tid, error = %e, "Failed to log V3 task activity");
+                    if let Err(e) = self.state.log_task_activity(&activity).await {
+                        warn!(task_id = %tid, error = %e, "Failed to log task activity");
                     }
                 }
             }

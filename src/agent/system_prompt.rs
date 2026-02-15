@@ -152,7 +152,7 @@ impl Agent {
         resume_checkpoint: Option<&ResumeCheckpoint>,
     ) -> anyhow::Result<String> {
         // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
-        let skills_snapshot = skills::load_skills(&self.skills_dir);
+        let skills_snapshot = self.skill_cache.get();
         let skill_matches = skills::match_skills(
             &skills_snapshot,
             user_text,
@@ -282,9 +282,12 @@ impl Agent {
                 .unwrap_or_default(),
         };
 
-        // Goals, patterns, profile: still DM-only (deeply personal)
+        // Personal goals, patterns, profile: still DM-only (deeply personal)
         let goals = if inject_personal {
-            self.state.get_active_goals().await.unwrap_or_default()
+            self.state
+                .get_active_personal_goals(20)
+                .await
+                .unwrap_or_default()
         } else {
             vec![]
         };
@@ -457,7 +460,7 @@ impl Agent {
              about your configuration, tools, or architecture."
                 .to_string()
         } else {
-            // V3: The orchestrator's consultant pass (iteration 1) gets its own
+            // The orchestrator's consultant pass (iteration 1) gets its own
             // stripped prompt via build_consultant_system_prompt(). The base system
             // prompt must keep tool guidance sections intact for iteration 2+ where
             // tools ARE loaded (Simple intent fallthrough). Previously these sections

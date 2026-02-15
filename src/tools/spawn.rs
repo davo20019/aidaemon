@@ -105,7 +105,7 @@ struct SpawnArgs {
     /// When true, spawn the sub-agent in the background and return immediately.
     #[serde(default)]
     background: bool,
-    /// V3 task ID — when provided by a task lead, the executor tracks activity against this task.
+    /// Task ID — when provided by a task lead, the executor tracks activity against this task.
     #[serde(default)]
     task_id: Option<String>,
     /// Session ID injected by execute_tool — used for background completion notifications.
@@ -165,7 +165,7 @@ impl Tool for SpawnAgentTool {
                     },
                     "task_id": {
                         "type": "string",
-                        "description": "V3 task ID to associate with this executor (used by task leads to connect executor work to task tracking)"
+                        "description": "Task ID to associate with this executor (used by task leads to connect executor work to task tracking)"
                     }
                 },
                 "required": ["mission", "task"]

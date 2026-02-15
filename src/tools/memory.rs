@@ -37,13 +37,13 @@ impl Tool for RememberFactTool {
     }
 
     fn description(&self) -> &str {
-        "Store a fact about the user or environment for long-term memory"
+        "Store a long-lived fact (not goals or schedules) for long-term memory"
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "remember_fact",
-            "description": "Store a fact about the user or environment for long-term memory. Facts are injected into your system prompt on every request.",
+            "description": "Store a fact about the user or environment for long-term memory. Facts are injected into your system prompt on every request. Do NOT use this for personal goals or scheduled work; use the manage_memories tool (create_personal_goal / create_scheduled_goal) for goals.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -95,6 +95,27 @@ impl Tool for RememberFactTool {
             return Ok(
                 "Rejected: Cannot save persona or identity changes as facts. \
                  I maintain a consistent identity across all interactions."
+                    .to_string(),
+            );
+        }
+
+        // Reject personal goal tracking in facts. The goal registry is the source of truth.
+        let category_lower = args.category.trim().to_ascii_lowercase();
+        let key_lower = args.key.trim().to_ascii_lowercase();
+        let value_lower = args.value.trim().to_ascii_lowercase();
+        let looks_like_personal_goal_key =
+            key_lower.starts_with("personal_goal") || key_lower.contains("personal_goal");
+        let looks_like_user_goal_key = key_lower.starts_with("goal_")
+            && matches!(category_lower.as_str(), "user" | "preference");
+        let looks_like_goal_value = matches!(category_lower.as_str(), "user" | "preference")
+            && (value_lower.contains("my goal")
+                || value_lower.contains("personal goal")
+                || value_lower.contains("goal is to")
+                || value_lower.starts_with("goal:"));
+        if looks_like_personal_goal_key || looks_like_user_goal_key || looks_like_goal_value {
+            return Ok(
+                "Rejected: Personal goals should be tracked in the goal registry (not facts). \
+                 Use manage_memories(action='create_personal_goal', goal='...') instead."
                     .to_string(),
             );
         }

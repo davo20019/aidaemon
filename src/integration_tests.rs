@@ -6,12 +6,12 @@
 
 use crate::testing::{
     setup_full_stack_test_agent, setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
-    setup_test_agent_v3, setup_test_agent_v3_task_leads, setup_test_agent_with_models,
-    MockProvider, MockTool,
+    setup_test_agent_orchestrator, setup_test_agent_orchestrator_task_leads,
+    setup_test_agent_with_models, MockProvider, MockTool,
 };
 use crate::traits::store_prelude::*;
 use crate::traits::{
-    BehaviorPattern, Episode, ErrorSolution, Goal, GoalV3, Procedure, ProviderResponse, StateStore,
+    BehaviorPattern, Episode, ErrorSolution, Goal, Procedure, ProviderResponse, StateStore,
     UserProfile,
 };
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
@@ -2084,18 +2084,14 @@ async fn test_memory_episodes_injected_into_prompt() {
 async fn test_memory_goals_injected_into_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
-    let goal = Goal {
-        id: 0,
-        description: "Migrate the database from PostgreSQL to SQLite".to_string(),
-        status: "active".to_string(),
-        priority: "high".to_string(),
-        progress_notes: Some(vec!["Schema drafted".to_string()]),
-        source_episode_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        completed_at: None,
-    };
-    harness.state.insert_goal(&goal).await.unwrap();
+    let mut goal = Goal::new_finite(
+        "Migrate the database from PostgreSQL to SQLite",
+        "goal_session",
+    );
+    goal.domain = "personal".to_string();
+    goal.priority = "high".to_string();
+    goal.progress_notes = Some(vec!["Schema drafted".to_string()]);
+    harness.state.create_goal(&goal).await.unwrap();
 
     harness
         .agent
@@ -2414,19 +2410,12 @@ async fn test_full_memory_stack_in_system_prompt() {
     };
     harness.state.insert_episode(&episode).await.unwrap();
 
-    // 3. Goals
-    let goal = Goal {
-        id: 0,
-        description: "Ship v3.0 with WebSocket support".to_string(),
-        status: "active".to_string(),
-        priority: "high".to_string(),
-        progress_notes: Some(vec!["Design complete".to_string()]),
-        source_episode_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        completed_at: None,
-    };
-    harness.state.insert_goal(&goal).await.unwrap();
+    // 3. Goals (personal goals are injected in DM prompts)
+    let mut goal = Goal::new_finite("Ship next release with WebSocket support", "full_memory");
+    goal.domain = "personal".to_string();
+    goal.priority = "high".to_string();
+    goal.progress_notes = Some(vec!["Design complete".to_string()]);
+    harness.state.create_goal(&goal).await.unwrap();
 
     // 4. Procedures
     let proc = Procedure {
@@ -2604,19 +2593,10 @@ async fn test_public_channel_hides_personal_memory() {
         .await
         .unwrap();
 
-    // Goal — DM-only, should NOT appear in public channels
-    let goal = Goal {
-        id: 0,
-        description: "Learn Japanese".to_string(),
-        status: "active".to_string(),
-        priority: "medium".to_string(),
-        progress_notes: None,
-        source_episode_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        completed_at: None,
-    };
-    harness.state.insert_goal(&goal).await.unwrap();
+    // Personal goal — DM-only, should NOT appear in public channels
+    let mut goal = Goal::new_finite("Learn Japanese", "public_chan");
+    goal.domain = "personal".to_string();
+    harness.state.create_goal(&goal).await.unwrap();
 
     // Seed operational memory
     let proc = Procedure {
@@ -3283,18 +3263,10 @@ async fn test_public_external_no_memory() {
         .await
         .unwrap();
 
-    let goal = Goal {
-        id: 0,
-        description: "Ship v3".to_string(),
-        status: "active".to_string(),
-        priority: "high".to_string(),
-        progress_notes: None,
-        source_episode_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        completed_at: None,
-    };
-    harness.state.insert_goal(&goal).await.unwrap();
+    let mut goal = Goal::new_finite("Ship next release", "pubext_session");
+    goal.domain = "personal".to_string();
+    goal.priority = "high".to_string();
+    harness.state.create_goal(&goal).await.unwrap();
 
     harness
         .agent
@@ -3337,7 +3309,7 @@ async fn test_public_external_no_memory() {
         "PublicExternal should NOT have any stored facts injected"
     );
     assert!(
-        !content.contains("Ship v3"),
+        !content.contains("Ship next release"),
         "PublicExternal should NOT have goals"
     );
     // Should have the hardened security prompt
@@ -4468,7 +4440,7 @@ async fn test_consultant_pass_continues_for_actions() {
     //   1. Consultant (no tools) → analysis of the action
     //   2. Full agent loop → tool call (system_info)
     //   3. Full agent loop → final text with tool result
-    // V3 routes "show me system info" as Simple → falls through to full agent loop.
+    // Orchestration routes "show me system info" as Simple → falls through to full agent loop.
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("I'll check the system information for you."),
         MockProvider::tool_call_response("system_info", "{}"),
@@ -4972,12 +4944,12 @@ async fn test_consultant_pass_drops_hallucinated_tool_calls() {
     );
 }
 
-// ==================== V3 Orchestration Integration Tests ====================
+// ==================== Orchestration Integration Tests ====================
 
 #[tokio::test]
-async fn test_v3_uniform_models_no_routing() {
+async fn test_orchestration_uniform_models_no_routing() {
     // With uniform models (no router), consultant pass doesn't activate,
-    // so V3 routing doesn't happen — simple messages get direct responses.
+    // so orchestration routing doesn't happen — simple messages get direct responses.
     let provider = MockProvider::new(); // Returns "Mock response"
     let harness = setup_test_agent(provider).await.unwrap();
 
@@ -4996,14 +4968,14 @@ async fn test_v3_uniform_models_no_routing() {
 
     assert_eq!(response, "Mock response");
 
-    // No V3 goals — uniform models bypass consultant pass / V3 routing
-    let goals = harness.state.get_active_goals_v3().await.unwrap();
-    assert!(goals.is_empty(), "No V3 goals with uniform models");
+    // No goals — uniform models bypass consultant pass / routing
+    let goals = harness.state.get_active_goals().await.unwrap();
+    assert!(goals.is_empty(), "No goals with uniform models");
 }
 
 #[tokio::test]
-async fn test_v3_simple_falls_through_to_full_loop() {
-    // V3 enabled, non-uniform models → consultant pass activates → V3 routing
+async fn test_orchestration_simple_falls_through_to_full_loop() {
+    // Orchestration enabled, non-uniform models → consultant pass activates → routing
     // Consultant says "needs tools" (not can_answer_now), simple task → full agent loop
     let provider = MockProvider::with_responses(vec![
         // 1st call: consultant pass — analysis that triggers needs_tools
@@ -5015,7 +4987,7 @@ async fn test_v3_simple_falls_through_to_full_loop() {
         // 3rd call: full agent loop — final response
         MockProvider::text_response("Your system is running macOS."),
     ]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
         .agent
@@ -5033,24 +5005,24 @@ async fn test_v3_simple_falls_through_to_full_loop() {
     // Should get the full agent loop's response
     assert_eq!(response, "Your system is running macOS.");
 
-    // No V3 goals should be created (simple tasks don't create goals)
-    let goals = harness.state.get_active_goals_v3().await.unwrap();
-    assert!(goals.is_empty(), "Simple tasks should not create V3 goals");
+    // No goals should be created (simple tasks don't create goals)
+    let goals = harness.state.get_active_goals().await.unwrap();
+    assert!(goals.is_empty(), "Simple tasks should not create goals");
 }
 
 #[tokio::test]
-async fn test_v3_complex_creates_goal() {
-    // V3 always-on, complex request → goal created, task lead spawned.
+async fn test_orchestration_complex_creates_goal() {
+    // Orchestration always-on, complex request → goal created, task lead spawned.
     // No plan generation pre-loop call (removed).
     let provider = MockProvider::with_responses(vec![
         // 1st call: consultant pass — analysis (complex request detected)
         MockProvider::text_response(
             "This is a complex multi-step task requiring setup and deployment.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
         ),
-        // 2nd+ calls: task lead (after V3 creates goal and spawns task lead)
+        // 2nd+ calls: task lead (after orchestration creates goal and spawns task lead)
         MockProvider::text_response("I'll start working on building your website."),
     ]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
         .agent
@@ -5068,13 +5040,13 @@ async fn test_v3_complex_creates_goal() {
     // Should get a response (the exact text depends on how many LLM calls the agent loop makes)
     assert!(!response.is_empty(), "Should return a non-empty response");
 
-    // The key assertion: a V3 goal should have been created
+    // The key assertion: a goal should have been created
     let goals = harness
         .state
-        .get_goals_for_session_v3("test_session")
+        .get_goals_for_session("test_session")
         .await
         .unwrap();
-    assert_eq!(goals.len(), 1, "Complex request should create a V3 goal");
+    assert_eq!(goals.len(), 1, "Complex request should create a goal");
     // Task leads are always-on, so the goal is completed after the task lead succeeds
     assert_eq!(goals[0].status, "completed");
     assert!(goals[0]
@@ -5083,13 +5055,13 @@ async fn test_v3_complex_creates_goal() {
 }
 
 #[tokio::test]
-async fn test_v3_complex_internal_maintenance_does_not_create_goal() {
+async fn test_orchestration_complex_internal_maintenance_does_not_create_goal() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "This is a complex maintenance request.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
         ),
     ]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
         .agent
@@ -5111,17 +5083,17 @@ async fn test_v3_complex_internal_maintenance_does_not_create_goal() {
 
     let goals = harness
         .state
-        .get_goals_for_session_v3("test_session")
+        .get_goals_for_session("test_session")
         .await
         .unwrap();
     assert!(
         goals.is_empty(),
-        "Internal maintenance intent should not create a V3 goal"
+        "Internal maintenance intent should not create a goal"
     );
 }
 
 #[tokio::test]
-async fn test_v3_simple_stall_detection_in_full_loop() {
+async fn test_orchestration_simple_stall_detection_in_full_loop() {
     // Simple tasks now go through full agent loop which has its own stall detection.
     // After the consultant pass, repeated identical tool calls should be detected.
     let provider = MockProvider::with_responses(vec![
@@ -5140,7 +5112,7 @@ async fn test_v3_simple_stall_detection_in_full_loop() {
         // Enough repetitions to trigger stall detection
         MockProvider::text_response("Should not reach here"),
     ]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
         .agent
@@ -5163,7 +5135,7 @@ async fn test_v3_simple_stall_detection_in_full_loop() {
 }
 
 #[tokio::test]
-async fn test_v3_simple_uses_full_loop_with_all_tools() {
+async fn test_orchestration_simple_uses_full_loop_with_all_tools() {
     // Simple tasks now use the full agent loop with all tools available.
     // Verify the agent can complete a simple task through the full loop.
     let provider = MockProvider::with_responses(vec![
@@ -5176,7 +5148,7 @@ async fn test_v3_simple_uses_full_loop_with_all_tools() {
         // 3rd call: full agent loop returns final response
         MockProvider::text_response("Diagnostics complete. All systems normal."),
     ]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
         .agent
@@ -5195,11 +5167,11 @@ async fn test_v3_simple_uses_full_loop_with_all_tools() {
 }
 
 #[tokio::test]
-async fn test_v3_scheduled_one_shot_creates_pending_confirmation() {
+async fn test_orchestration_scheduled_one_shot_creates_pending_confirmation() {
     let provider = MockProvider::with_responses(vec![MockProvider::text_response(
         "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
     )]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
         .agent
@@ -5221,21 +5193,70 @@ async fn test_v3_scheduled_one_shot_creates_pending_confirmation() {
 
     let goals = harness
         .state
-        .get_goals_for_session_v3("test_session")
+        .get_goals_for_session("test_session")
         .await
         .unwrap();
     assert_eq!(goals.len(), 1);
     assert_eq!(goals[0].goal_type, "finite");
     assert_eq!(goals[0].status, "pending_confirmation");
-    assert!(goals[0].schedule.is_some());
+    let schedules = harness
+        .state
+        .get_schedules_for_goal(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(schedules.len(), 1);
+    assert!(schedules[0].is_one_shot);
 }
 
 #[tokio::test]
-async fn test_v3_scheduled_recurring_creates_pending_confirmation() {
+async fn test_orchestration_scheduled_malformed_schedule_recovers_from_user_text() {
+    // E2E regression: LLM sometimes emits schedule="2 minutes" while the user
+    // said "in 2 minutes". The scheduler path should still be taken.
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "Sure.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"2 minutes\",\"schedule_type\":\"one_shot\"}",
+    )]);
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "check disk space in 2 minutes",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("Reply **confirm**"),
+        "Expected confirmation prompt for scheduled goal"
+    );
+
+    let goals = harness
+        .state
+        .get_goals_for_session("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].status, "pending_confirmation");
+    let schedules = harness
+        .state
+        .get_schedules_for_goal(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(schedules.len(), 1);
+    assert!(schedules[0].is_one_shot);
+}
+
+#[tokio::test]
+async fn test_orchestration_scheduled_recurring_creates_pending_confirmation() {
     let provider = MockProvider::with_responses(vec![MockProvider::text_response(
         "I'll schedule recurring monitoring.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"every 6h\",\"schedule_type\":\"recurring\"}",
     )]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
         .agent
@@ -5257,21 +5278,29 @@ async fn test_v3_scheduled_recurring_creates_pending_confirmation() {
 
     let goals = harness
         .state
-        .get_goals_for_session_v3("test_session")
+        .get_goals_for_session("test_session")
         .await
         .unwrap();
     assert_eq!(goals.len(), 1);
     assert_eq!(goals[0].goal_type, "continuous");
     assert_eq!(goals[0].status, "pending_confirmation");
-    assert!(goals[0].schedule.is_some());
+    assert_eq!(goals[0].budget_per_check, Some(50_000));
+    assert_eq!(goals[0].budget_daily, Some(200_000));
+    let schedules = harness
+        .state
+        .get_schedules_for_goal(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(schedules.len(), 1);
+    assert!(!schedules[0].is_one_shot);
 }
 
 #[tokio::test]
-async fn test_v3_schedule_confirm_activates_goal() {
+async fn test_orchestration_schedule_confirm_activates_goal() {
     let provider = MockProvider::with_responses(vec![MockProvider::text_response(
         "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
     )]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let _ = harness
         .agent
@@ -5302,7 +5331,7 @@ async fn test_v3_schedule_confirm_activates_goal() {
 
     let goals = harness
         .state
-        .get_goals_for_session_v3("test_session")
+        .get_goals_for_session("test_session")
         .await
         .unwrap();
     assert_eq!(goals.len(), 1);
@@ -5315,11 +5344,11 @@ async fn test_v3_schedule_confirm_activates_goal() {
 }
 
 #[tokio::test]
-async fn test_v3_schedule_cancel_removes_goal() {
+async fn test_orchestration_schedule_cancel_removes_goal() {
     let provider = MockProvider::with_responses(vec![MockProvider::text_response(
         "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
     )]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let _ = harness
         .agent
@@ -5350,7 +5379,7 @@ async fn test_v3_schedule_cancel_removes_goal() {
 
     let goals = harness
         .state
-        .get_goals_for_session_v3("test_session")
+        .get_goals_for_session("test_session")
         .await
         .unwrap();
     assert_eq!(goals.len(), 1);
@@ -5358,32 +5387,30 @@ async fn test_v3_schedule_cancel_removes_goal() {
 }
 
 #[tokio::test]
-async fn test_v3_targeted_cancel_text_does_not_auto_cancel_session_goal() {
+async fn test_orchestration_targeted_cancel_text_does_not_auto_cancel_session_goal() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "Understood.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"cancel_intent\":true,\"cancel_scope\":\"targeted\",\"complexity\":\"simple\"}",
         ),
         MockProvider::text_response("Please share the goal ID to cancel that specific goal."),
     ]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
-    let morning_goal = GoalV3::new_continuous(
+    let morning_goal = Goal::new_continuous(
         "Send me a slack message at 7:00 am EST tomorrow with a positive message",
         "test_session",
-        "0 7 * * *",
         Some(2000),
         Some(20000),
     );
-    harness.state.create_goal_v3(&morning_goal).await.unwrap();
+    harness.state.create_goal(&morning_goal).await.unwrap();
 
-    let english_goal = GoalV3::new_continuous(
+    let english_goal = Goal::new_continuous(
         "English Research: Researching English pronunciation/phonetics for Spanish speakers",
         "other_session",
-        "0 5,12,19 * * *",
         Some(2000),
         Some(20000),
     );
-    harness.state.create_goal_v3(&english_goal).await.unwrap();
+    harness.state.create_goal(&english_goal).await.unwrap();
 
     let response = harness
         .agent
@@ -5410,13 +5437,13 @@ async fn test_v3_targeted_cancel_text_does_not_auto_cancel_session_goal() {
 
     let morning_after = harness
         .state
-        .get_goal_v3(&morning_goal.id)
+        .get_goal(&morning_goal.id)
         .await
         .unwrap()
         .unwrap();
     let english_after = harness
         .state
-        .get_goal_v3(&english_goal.id)
+        .get_goal(&english_goal.id)
         .await
         .unwrap()
         .unwrap();
@@ -5425,7 +5452,7 @@ async fn test_v3_targeted_cancel_text_does_not_auto_cancel_session_goal() {
 }
 
 #[tokio::test]
-async fn test_v3_schedule_new_message_cancels_pending() {
+async fn test_orchestration_schedule_new_message_cancels_pending() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
@@ -5434,7 +5461,7 @@ async fn test_v3_schedule_new_message_cancels_pending() {
             "Rust is a systems programming language.\n[INTENT_GATE] {\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"knowledge\"}",
         ),
     ]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let _ = harness
         .agent
@@ -5464,7 +5491,7 @@ async fn test_v3_schedule_new_message_cancels_pending() {
 
     let goals = harness
         .state
-        .get_goals_for_session_v3("test_session")
+        .get_goals_for_session("test_session")
         .await
         .unwrap();
     assert_eq!(goals.len(), 1);
@@ -5472,12 +5499,12 @@ async fn test_v3_schedule_new_message_cancels_pending() {
 }
 
 // ============================================================================
-// V3 Phase 2: Task Lead + Executor tests
+// Task Lead + Executor tests
 // ============================================================================
 
 #[tokio::test]
-async fn test_v3_task_lead_flag_off_uses_agent_loop() {
-    // V3 is always-on with task leads always-on. Complex request → goal created,
+async fn test_orchestration_task_lead_flag_off_uses_agent_loop() {
+    // Orchestration is always-on with task leads always-on. Complex request → goal created,
     // task lead spawned. No plan generation pre-loop call (removed).
     let provider = MockProvider::with_responses(vec![
         // 1st call: consultant pass
@@ -5487,7 +5514,7 @@ async fn test_v3_task_lead_flag_off_uses_agent_loop() {
         // 2nd call: task lead response
         MockProvider::text_response("I'll start building the website."),
     ]);
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
         .agent
@@ -5508,17 +5535,17 @@ async fn test_v3_task_lead_flag_off_uses_agent_loop() {
     // Goal should be created
     let goals = harness
         .state
-        .get_goals_for_session_v3("test_session")
+        .get_goals_for_session("test_session")
         .await
         .unwrap();
-    assert_eq!(goals.len(), 1, "Complex request should create a V3 goal");
+    assert_eq!(goals.len(), 1, "Complex request should create a goal");
     // Goal should be completed (task lead always-on, succeeds)
     assert_eq!(goals[0].status, "completed");
 }
 
 #[tokio::test]
-async fn test_v3_task_lead_spawns_for_complex() {
-    // V3 always-on, complex request → task lead spawned, goal updated.
+async fn test_orchestration_task_lead_spawns_for_complex() {
+    // Orchestration always-on, complex request → task lead spawned, goal updated.
     // No plan generation pre-loop call (removed).
     let provider = MockProvider::with_responses(vec![
         // 1st call: consultant pass (orchestrator)
@@ -5529,7 +5556,9 @@ async fn test_v3_task_lead_spawns_for_complex() {
         // (In a real scenario it would use manage_goal_tasks, but here we test the flow)
         MockProvider::text_response("I've planned and completed all the tasks for your website."),
     ]);
-    let harness = setup_test_agent_v3_task_leads(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator_task_leads(provider)
+        .await
+        .unwrap();
 
     let response = harness
         .agent
@@ -5554,10 +5583,10 @@ async fn test_v3_task_lead_spawns_for_complex() {
     // Goal should be created and completed (task lead succeeded)
     let goals = harness
         .state
-        .get_goals_for_session_v3("test_session")
+        .get_goals_for_session("test_session")
         .await
         .unwrap();
-    assert_eq!(goals.len(), 1, "Complex request should create a V3 goal");
+    assert_eq!(goals.len(), 1, "Complex request should create a goal");
     assert_eq!(
         goals[0].status, "completed",
         "Goal should be completed after task lead succeeds"
@@ -5565,8 +5594,8 @@ async fn test_v3_task_lead_spawns_for_complex() {
 }
 
 #[tokio::test]
-async fn test_v3_task_lead_creates_tasks_via_tool() {
-    // V3 always-on, task lead uses manage_goal_tasks to create tasks.
+async fn test_orchestration_task_lead_creates_tasks_via_tool() {
+    // Orchestration always-on, task lead uses manage_goal_tasks to create tasks.
     // No plan generation pre-loop call (removed).
     let provider = MockProvider::with_responses(vec![
         // 1st: consultant pass
@@ -5586,7 +5615,9 @@ async fn test_v3_task_lead_creates_tasks_via_tool() {
         // 4th: task lead's final text response
         MockProvider::text_response("All tasks have been created and the goal is complete."),
     ]);
-    let harness = setup_test_agent_v3_task_leads(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator_task_leads(provider)
+        .await
+        .unwrap();
 
     let response = harness
         .agent
@@ -5606,13 +5637,13 @@ async fn test_v3_task_lead_creates_tasks_via_tool() {
     // Check that a task was created in the DB
     let goals = harness
         .state
-        .get_goals_for_session_v3("test_session")
+        .get_goals_for_session("test_session")
         .await
         .unwrap();
     assert_eq!(goals.len(), 1);
     let goal_id = &goals[0].id;
 
-    let tasks = harness.state.get_tasks_for_goal_v3(goal_id).await.unwrap();
+    let tasks = harness.state.get_tasks_for_goal(goal_id).await.unwrap();
     assert_eq!(
         tasks.len(),
         1,
@@ -5623,8 +5654,8 @@ async fn test_v3_task_lead_creates_tasks_via_tool() {
 }
 
 #[tokio::test]
-async fn test_v3_task_lead_claims_before_dispatch() {
-    // V3 always-on, task lead creates tasks with idempotent and dependency features.
+async fn test_orchestration_task_lead_claims_before_dispatch() {
+    // Orchestration always-on, task lead creates tasks with idempotent and dependency features.
     // No plan generation pre-loop call (removed).
     let provider = MockProvider::with_responses(vec![
         // 1st: consultant pass
@@ -5649,7 +5680,9 @@ async fn test_v3_task_lead_claims_before_dispatch() {
         // 5th: task lead final text
         MockProvider::text_response("Goal complete. Research task has been created."),
     ]);
-    let harness = setup_test_agent_v3_task_leads(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator_task_leads(provider)
+        .await
+        .unwrap();
 
     let response = harness
         .agent
@@ -5669,14 +5702,14 @@ async fn test_v3_task_lead_claims_before_dispatch() {
     // Verify task was created with idempotent flag
     let goals = harness
         .state
-        .get_goals_for_session_v3("test_session")
+        .get_goals_for_session("test_session")
         .await
         .unwrap();
     assert_eq!(goals.len(), 1);
 
     let tasks = harness
         .state
-        .get_tasks_for_goal_v3(&goals[0].id)
+        .get_tasks_for_goal(&goals[0].id)
         .await
         .unwrap();
     assert_eq!(tasks.len(), 1);
@@ -5685,8 +5718,8 @@ async fn test_v3_task_lead_claims_before_dispatch() {
 }
 
 #[tokio::test]
-async fn test_v3_executor_activity_logging() {
-    // Test that executor agents with v3_task_id log TaskActivityV3 records.
+async fn test_executor_activity_logging() {
+    // Test that executor agents with task_id log TaskActivity records.
     // This tests the activity logging indirectly through manage_goal_tasks.
     let state = {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -5701,11 +5734,11 @@ async fn test_v3_executor_activity_logging() {
         let state: Arc<dyn crate::traits::StateStore> = state;
 
         // Create a goal
-        let goal = crate::traits::GoalV3::new_finite("Test activity logging", "test-session");
-        state.create_goal_v3(&goal).await.unwrap();
+        let goal = crate::traits::Goal::new_finite("Test activity logging", "test-session");
+        state.create_goal(&goal).await.unwrap();
 
         // Create a task
-        let task = crate::traits::TaskV3 {
+        let task = crate::traits::Task {
             id: "test-task-001".to_string(),
             goal_id: goal.id.clone(),
             description: "Test task for activity logging".to_string(),
@@ -5726,14 +5759,14 @@ async fn test_v3_executor_activity_logging() {
             started_at: None,
             completed_at: None,
         };
-        state.create_task_v3(&task).await.unwrap();
+        state.create_task(&task).await.unwrap();
 
         std::mem::forget(db_file);
         state
     };
 
     // Log a tool_call activity
-    let activity = crate::traits::TaskActivityV3 {
+    let activity = crate::traits::TaskActivity {
         id: 0,
         task_id: "test-task-001".to_string(),
         activity_type: "tool_call".to_string(),
@@ -5744,10 +5777,10 @@ async fn test_v3_executor_activity_logging() {
         tokens_used: None,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    state.log_task_activity_v3(&activity).await.unwrap();
+    state.log_task_activity(&activity).await.unwrap();
 
     // Log an llm_call activity
-    let activity2 = crate::traits::TaskActivityV3 {
+    let activity2 = crate::traits::TaskActivity {
         id: 0,
         task_id: "test-task-001".to_string(),
         activity_type: "llm_call".to_string(),
@@ -5758,10 +5791,10 @@ async fn test_v3_executor_activity_logging() {
         tokens_used: Some(150),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    state.log_task_activity_v3(&activity2).await.unwrap();
+    state.log_task_activity(&activity2).await.unwrap();
 
     // Verify activities were logged
-    let activities = state.get_task_activities_v3("test-task-001").await.unwrap();
+    let activities = state.get_task_activities("test-task-001").await.unwrap();
     assert_eq!(activities.len(), 2, "Should have 2 activity records");
 
     let tool_activity = activities
@@ -5780,7 +5813,7 @@ async fn test_v3_executor_activity_logging() {
 }
 
 #[tokio::test]
-async fn test_v3_task_id_passed_to_executor() {
+async fn test_task_id_passed_to_executor() {
     // Verify spawn_agent schema accepts task_id parameter
     let json_args = serde_json::json!({
         "mission": "Test executor",
@@ -5809,8 +5842,8 @@ async fn test_v3_task_id_passed_to_executor() {
 // ======================== Phase 4: Learning Integration Tests ========================
 
 #[tokio::test]
-async fn test_v3_goal_context_feed_forward() {
-    // Verify that when facts exist in the state, a V3 goal created for a complex
+async fn test_orchestration_goal_context_feed_forward() {
+    // Verify that when facts exist in the state, a goal created for a complex
     // request gets relevant knowledge injected into its context field.
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
@@ -5850,7 +5883,7 @@ async fn test_v3_goal_context_feed_forward() {
         .unwrap();
 
     // Create a goal and simulate what the agent does: query facts and inject into context
-    let mut goal = GoalV3::new_finite(
+    let mut goal = Goal::new_finite(
         "Build a full-stack website and deploy to AWS",
         "test-session",
     );
@@ -5878,10 +5911,10 @@ async fn test_v3_goal_context_feed_forward() {
         goal.context = Some(serde_json::to_string(&ctx).unwrap_or_default());
     }
 
-    state.create_goal_v3(&goal).await.unwrap();
+    state.create_goal(&goal).await.unwrap();
 
     // Verify goal was created with context
-    let stored_goal = state.get_goal_v3(&goal.id).await.unwrap().unwrap();
+    let stored_goal = state.get_goal(&goal.id).await.unwrap().unwrap();
     assert!(
         stored_goal.context.is_some(),
         "Goal should have context with relevant facts"
@@ -5910,7 +5943,7 @@ async fn test_v3_goal_context_feed_forward() {
 }
 
 #[tokio::test]
-async fn test_v3_context_accumulation_end_to_end() {
+async fn test_orchestration_context_accumulation_end_to_end() {
     // Create a goal and tasks, complete tasks, verify context accumulation
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
@@ -5927,9 +5960,9 @@ async fn test_v3_context_accumulation_end_to_end() {
     );
 
     // Create a goal
-    let goal = GoalV3::new_finite("Build and deploy website", "test-session");
+    let goal = Goal::new_finite("Build and deploy website", "test-session");
     let goal_id = goal.id.clone();
-    state.create_goal_v3(&goal).await.unwrap();
+    state.create_goal(&goal).await.unwrap();
 
     let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
 
@@ -5956,7 +5989,7 @@ async fn test_v3_context_accumulation_end_to_end() {
     .await
     .unwrap();
 
-    let tasks = state.get_tasks_for_goal_v3(&goal_id).await.unwrap();
+    let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
     assert_eq!(tasks.len(), 2);
 
     // Complete first task
@@ -5973,7 +6006,7 @@ async fn test_v3_context_accumulation_end_to_end() {
     .unwrap();
 
     // Verify context after first task
-    let goal = state.get_goal_v3(&goal_id).await.unwrap().unwrap();
+    let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
     let ctx: serde_json::Value = serde_json::from_str(goal.context.as_deref().unwrap()).unwrap();
     let results = ctx["task_results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
@@ -5996,7 +6029,7 @@ async fn test_v3_context_accumulation_end_to_end() {
     .unwrap();
 
     // Verify both results in context
-    let goal = state.get_goal_v3(&goal_id).await.unwrap().unwrap();
+    let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
     let ctx: serde_json::Value = serde_json::from_str(goal.context.as_deref().unwrap()).unwrap();
     let results = ctx["task_results"].as_array().unwrap();
     assert_eq!(results.len(), 2, "Both task results should be accumulated");
@@ -6020,7 +6053,7 @@ async fn test_orchestrator_consultant_pass_has_no_tools() {
         MockProvider::text_response("System is running macOS."),
     ]);
 
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let _response = harness
         .agent
@@ -6076,7 +6109,7 @@ async fn test_orchestrator_drops_tool_calls_for_action_requests() {
         MockProvider::text_response("System is running macOS."),
     ]);
 
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
         .agent
@@ -6111,7 +6144,7 @@ async fn test_orchestrator_knowledge_no_tool_execution() {
         "The capital of France is Paris.\n\n[INTENT_GATE]\n{\"complexity\": \"knowledge\", \"can_answer_now\": true, \"needs_tools\": false}",
     )]);
 
-    let harness = setup_test_agent_v3(provider).await.unwrap();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
         .agent

@@ -14,6 +14,7 @@ aidaemon runs 24/7 as a background daemon. It needs to be small, fast, and run o
 - **Single binary, zero runtime** - one binary, copy it to any machine and run it. Install with `curl -sSfL https://get.aidaemon.ai | bash` or `cargo install aidaemon`.
 - **Startup in milliseconds** - restarts after a crash are near-instant, which matters for the auto-recovery retry loop.
 - **No garbage collector** - predictable latency. No GC pauses between receiving the LLM response and sending the reply.
+- **jemalloc allocator** - uses jemalloc on Linux and macOS for reduced memory fragmentation under long-running workloads.
 
 If you don't care about resource usage and want more channels (WhatsApp, Signal, iMessage) or a web canvas, check out [OpenClaw](https://openclaw.ai) which does similar things in TypeScript.
 
@@ -34,12 +35,13 @@ If you don't care about resource usage and want more channels (WhatsApp, Signal,
 ### Tools & Agents
 - **40+ tools** - file operations (read, write, edit, search), git info/commit, terminal, system info, web research, browser, HTTP requests, and more
 - **Dynamic MCP management** - add, remove, and configure MCP servers at runtime via the `manage_mcp` tool
-- **Browser tool** - headless Chrome with screenshot, click, fill, and JS execution
+- **Browser tool** - headless Chrome with screenshot, click, fill, JS execution, remote debugging connection, and runtime headless/visible toggle
 - **Web research** - search (DuckDuckGo/Brave) and fetch tools for internet access
 - **HTTP requests** - authenticated API calls with OAuth 1.0a, Bearer, Header, and Basic auth profiles
 - **Sub-agent spawning** - recursive agents with configurable depth, iteration limit, and dynamic budget extension
 - **CLI agent delegation** - delegate tasks to claude, gemini, codex, aider, copilot (auto-discovered via `which`)
-- **Goal tracking** - long-running goals with task breakdown, scheduled runs, blockers, and diagnostic tracing
+- **Goal tracking** - long-running orchestration goals with task breakdown, multi-schedule support, blockers, and diagnostic tracing
+- **Personal goals** - lightweight goal tracking for habits and personal objectives (tracked in DMs, never dispatched as background work)
 - **Channel history** - read recent Slack channel messages with time filtering and user resolution
 - **Skills system** - trigger-based markdown instructions with dynamic management, remote registries, and auto-promotion from successful procedures
 - **Tool capability registry** - each tool declares read_only, external_side_effect, needs_approval, idempotent, high_impact_write for risk-based filtering
@@ -115,9 +117,8 @@ cargo build --release
 ```
 
 The wizard will guide you through:
-1. Selecting your LLM provider (OpenAI, OpenRouter, Ollama, Google AI Studio, Anthropic, etc.)
-2. Entering your API key
-3. Selecting and setting up one or more channels (Telegram, Slack, Discord)
+1. Selecting your LLM provider and entering your API key
+2. Selecting and setting up one or more channels (Telegram, Slack, Discord)
 
 ## Configuration
 
@@ -209,10 +210,20 @@ enabled = true
 headless = true
 screenshot_width = 1280
 screenshot_height = 720
-# Use an existing Chrome profile to inherit cookies/sessions
-# user_data_dir = "~/Library/Application Support/Google/Chrome"
+# Connect to an existing Chrome instance (shares your login sessions)
+# remote_debugging_port = 9222
+# Persistent profile directory (defaults to ~/.aidaemon/chrome-profile)
+# user_data_dir = "~/.aidaemon/chrome-profile"
 # profile = "Default"
 ```
+
+Pre-authenticate services for the agent:
+
+```bash
+aidaemon browser login    # launches Chrome with the agent's profile for manual login
+```
+
+Sessions are saved to the profile directory and reused automatically by the browser tool.
 
 ### Sub-agents
 
@@ -429,6 +440,8 @@ prompt = "Summarize my unread emails"
 oneshot = false                # if true, runs once then deletes
 trusted = false                # if true, skips terminal approval
 ```
+
+Goals support multi-schedule via natural language: `"daily at 6am, 12pm, 6pm"`, `"weekdays at 9am and 5pm"`, `"every monday at noon"`.
 
 ### File Transfer
 

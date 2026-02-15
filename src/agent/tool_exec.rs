@@ -119,9 +119,9 @@ impl Agent {
                 }
                 // Inject user role so tools can enforce role-based access control
                 map.insert("_user_role".to_string(), json!(format!("{:?}", user_role)));
-                // Inject V3 context for task lead → executor spawning
+                // Inject goal context for task lead → executor spawning
                 if name == "spawn_agent" {
-                    if let Some(ref gid) = self.v3_goal_id {
+                    if let Some(ref gid) = self.goal_id {
                         map.insert("_goal_id".to_string(), json!(gid));
                     }
                 }

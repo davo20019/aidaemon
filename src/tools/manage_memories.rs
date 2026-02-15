@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::cron_utils::{compute_next_run_local, is_one_shot_schedule};
 use crate::traits::{StateStore, Tool};
 use crate::types::FactPrivacy;
 
@@ -19,23 +18,23 @@ impl ManageMemoriesTool {
 
     /// Resolve a goal identifier provided by the model/user.
     /// Accepts:
-    /// - exact full V3 goal ID
+    /// - exact full goal ID
     /// - unique prefix (e.g., the 8-char short ID shown in list output)
-    async fn resolve_goal_id_v3(&self, input_id: &str) -> anyhow::Result<String> {
+    async fn resolve_goal_id(&self, input_id: &str) -> anyhow::Result<String> {
         let trimmed = input_id.trim();
         if trimmed.is_empty() {
             anyhow::bail!("Empty goal ID");
         }
 
         // Fast path: exact ID match.
-        if self.state.get_goal_v3(trimmed).await?.is_some() {
+        if self.state.get_goal(trimmed).await?.is_some() {
             return Ok(trimmed.to_string());
         }
 
         // Prefix fallback: match against scheduled goals because this tool's
         // schedule operations operate on scheduled goals.
-        let goals = self.state.get_scheduled_goals_v3().await?;
-        let mut matches: Vec<&crate::traits::GoalV3> =
+        let goals = self.state.get_scheduled_goals().await?;
+        let mut matches: Vec<&crate::traits::Goal> =
             goals.iter().filter(|g| g.id.starts_with(trimmed)).collect();
 
         if matches.is_empty() {
@@ -67,14 +66,59 @@ impl ManageMemoriesTool {
             .collect::<Vec<_>>()
             .join("; ");
         anyhow::bail!(
-            "Goal ID prefix '{}' is ambiguous ({} matches): {}. Use full goal_id_v3.",
+            "Goal ID prefix '{}' is ambiguous ({} matches): {}. Use full goal_id.",
             trimmed,
             matches.len(),
             preview
         );
     }
 
-    fn is_protected_system_maintenance_goal(goal: &crate::traits::GoalV3) -> bool {
+    /// Resolve a personal goal identifier (domain = "personal") by exact ID or unique prefix.
+    async fn resolve_personal_goal_id(&self, input_id: &str) -> anyhow::Result<String> {
+        let trimmed = input_id.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("Empty goal ID");
+        }
+
+        // Fast path: exact match + domain check.
+        if let Some(g) = self.state.get_goal(trimmed).await? {
+            if g.domain == "personal" {
+                return Ok(trimmed.to_string());
+            }
+        }
+
+        let goals = self.state.get_active_personal_goals(100).await?;
+        let mut matches: Vec<&crate::traits::Goal> =
+            goals.iter().filter(|g| g.id.starts_with(trimmed)).collect();
+
+        if matches.is_empty() {
+            anyhow::bail!("Personal goal not found: {}", trimmed);
+        }
+        if matches.len() == 1 {
+            return Ok(matches.remove(0).id.clone());
+        }
+
+        // Prefer most recently created in ambiguous cases.
+        matches.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        let preview = matches
+            .iter()
+            .take(5)
+            .map(|g| {
+                let short: String = g.id.chars().take(8).collect();
+                format!("{} ({}, {})", short, g.status, g.description)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "Goal ID prefix '{}' is ambiguous ({} matches): {}. Use full goal_id.",
+            trimmed,
+            matches.len(),
+            preview
+        );
+    }
+
+    fn is_protected_system_maintenance_goal(goal: &crate::traits::Goal) -> bool {
         const KNOWLEDGE_GOAL_DESC: &str =
             "Maintain knowledge base: process embeddings, consolidate memories, decay old facts";
         const HEALTH_GOAL_DESC: &str =
@@ -95,7 +139,7 @@ impl ManageMemoriesTool {
         false
     }
 
-    fn goal_matches_query(goal: &crate::traits::GoalV3, query: &str) -> bool {
+    fn goal_matches_query(goal: &crate::traits::Goal, query: &str) -> bool {
         let q = query.trim().to_ascii_lowercase();
         if q.is_empty() {
             return false;
@@ -107,6 +151,39 @@ impl ManageMemoriesTool {
     fn truncate_chars(s: &str, max: usize) -> String {
         s.chars().take(max).collect()
     }
+
+    fn parse_ts(ts: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Utc))
+    }
+
+    fn format_age(ts: &str) -> String {
+        let Some(dt) = Self::parse_ts(ts) else {
+            return "n/a".to_string();
+        };
+        let age = chrono::Utc::now() - dt;
+        if age.num_days() > 0 {
+            format!("{}d ago", age.num_days())
+        } else if age.num_hours() > 0 {
+            format!("{}h ago", age.num_hours())
+        } else if age.num_minutes() > 0 {
+            format!("{}m ago", age.num_minutes())
+        } else {
+            "just now".to_string()
+        }
+    }
+
+    fn format_local(ts: &str) -> String {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .ok()
+            .map(|dt| {
+                dt.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M %Z")
+                    .to_string()
+            })
+            .unwrap_or_else(|| ts.to_string())
+    }
 }
 
 #[derive(Deserialize)]
@@ -116,8 +193,19 @@ struct ManageArgs {
     key: Option<String>,
     privacy: Option<String>,
     query: Option<String>,
-    goal_id: Option<i64>,
-    goal_id_v3: Option<String>,
+    goal: Option<String>,
+    priority: Option<String>,
+    goal_id: Option<String>,
+    schedule_id: Option<String>,
+    schedule: Option<String>,
+    schedules: Option<Vec<String>>,
+    fire_policy: Option<String>,
+    is_one_shot: Option<bool>,
+    is_paused: Option<bool>,
+    #[serde(default)]
+    _session_id: Option<String>,
+    #[serde(default)]
+    _user_role: Option<String>,
 }
 
 #[async_trait]
@@ -127,20 +215,20 @@ impl Tool for ManageMemoriesTool {
     }
 
     fn description(&self) -> &str {
-        "List/search/forget memories, and list/cancel/pause/resume/retry/diagnose scheduled goals (accepts full or unique prefix goal_id_v3; includes bulk retry for failed schedules)"
+        "List/search/forget memories, and list/add/cancel/pause/resume/retry/diagnose scheduled goals (accepts full or unique prefix goal_id; includes bulk retry for failed schedules)"
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "manage_memories",
-            "description": "List, search, forget, or change privacy of stored memories and goals. Also list/cancel/pause/resume/retry/diagnose scheduled goals. IMPORTANT for scheduled-goal management: first call action='list_scheduled' or 'list_scheduled_matching' to get exact goal IDs, then call cancel_scheduled/pause_scheduled/resume_scheduled/retry_scheduled/diagnose_scheduled with goal_id_v3. Use retry_failed_scheduled for one-shot recovery of failed goals (optionally filtered by query). Do not use terminal/sqlite for scheduled-goal management when this tool can do it. Protected system maintenance goals cannot be cancelled.",
+            "description": "List, search, forget, or change privacy of stored memories and goals. Also create/list/manage personal goals, and list/create/add/cancel/pause/resume/retry/diagnose scheduled goals. IMPORTANT for scheduled-goal management: first call action='list_scheduled' or 'list_scheduled_matching' to get exact goal IDs (and schedule IDs), then call add_schedule/cancel_scheduled/pause_scheduled/resume_scheduled/retry_scheduled/diagnose_scheduled with goal_id (and optionally schedule_id). Use create_scheduled_goal to create a new scheduled goal from scratch. Use retry_failed_scheduled for one-shot recovery of failed goals (optionally filtered by query). Do not use terminal/sqlite for scheduled-goal management when this tool can do it. Protected system maintenance goals cannot be cancelled.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "forget", "set_privacy", "search", "list_goals", "complete_goal", "abandon_goal", "list_scheduled", "list_scheduled_matching", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled"],
-                        "description": "Action to perform. For schedule operations: use list_scheduled or list_scheduled_matching first, then cancel_scheduled/pause_scheduled/resume_scheduled/retry_scheduled/diagnose_scheduled with exact goal_id_v3. For bulk operations, use retry_failed_scheduled (all failed, optionally filtered), cancel_scheduled_matching, or retry_scheduled_matching with query."
+                        "enum": ["list", "forget", "set_privacy", "search", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled"],
+                        "description": "Action to perform. For schedule operations: use list_scheduled or list_scheduled_matching first, then add_schedule/cancel_scheduled/pause_scheduled/resume_scheduled/retry_scheduled/diagnose_scheduled with exact goal_id (and optionally schedule_id). For bulk operations, use retry_failed_scheduled (all failed, optionally filtered), cancel_scheduled_matching, or retry_scheduled_matching with query."
                     },
                     "category": {
                         "type": "string",
@@ -159,13 +247,44 @@ impl Tool for ManageMemoriesTool {
                         "type": "string",
                         "description": "Search term (for search action). For scheduled bulk operations, this matches goal ID prefix or description text."
                     },
-                    "goal_id": {
-                        "type": "integer",
-                        "description": "Goal ID (for complete_goal/abandon_goal)"
-                    },
-                    "goal_id_v3": {
+                    "goal": {
                         "type": "string",
-                        "description": "Exact V3 goal ID for cancel_scheduled, pause_scheduled, resume_scheduled, retry_scheduled, or diagnose_scheduled. Retrieve via list_scheduled first."
+                        "description": "Goal description for create_personal_goal or create_scheduled_goal."
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high", "critical"],
+                        "description": "Optional priority for create_personal_goal (default medium)."
+                    },
+                    "goal_id": {
+                        "type": "string",
+                        "description": "Goal ID for goal/schedule actions. Retrieve via list_goals/list_scheduled first."
+                    },
+                    "schedule_id": {
+                        "type": "string",
+                        "description": "Optional schedule ID for schedule-specific pause/resume/cancel operations. Retrieve via list_scheduled first."
+                    },
+                    "schedule": {
+                        "type": "string",
+                        "description": "Schedule string for add_schedule or create_scheduled_goal. Accepts natural text (e.g. 'daily at 9am', 'every day at 6am, 12pm, 6pm', 'every 6h') or a 5-field cron expression."
+                    },
+                    "schedules": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of schedules for create_scheduled_goal. Use when the user needs multiple schedules with different minutes (e.g. 8:05, 13:10, 21:30)."
+                    },
+                    "fire_policy": {
+                        "type": "string",
+                        "enum": ["coalesce", "always_fire"],
+                        "description": "Optional schedule fire policy (default 'coalesce'). coalesce: skip if open tasks exist; always_fire: enqueue even if open tasks exist (capped)."
+                    },
+                    "is_one_shot": {
+                        "type": "boolean",
+                        "description": "Optional. When true, the schedule is deleted after it fires once."
+                    },
+                    "is_paused": {
+                        "type": "boolean",
+                        "description": "Optional. When true, the new schedule starts paused."
                     }
                 },
                 "required": ["action"]
@@ -278,22 +397,16 @@ impl Tool for ManageMemoriesTool {
                 Ok(output)
             }
             "list_goals" => {
-                let goals = self.state.get_active_goals().await?;
+                let goals = self.state.get_active_personal_goals(50).await?;
                 if goals.is_empty() {
-                    return Ok("No active goals.".to_string());
+                    return Ok("No active personal goals.".to_string());
                 }
 
-                let mut output = format!("**Active Goals** ({} goals)\n\n", goals.len());
+                let mut output =
+                    format!("**Active Personal Goals** ({} goals)\n\n", goals.len());
                 for g in &goals {
-                    let age = chrono::Utc::now().signed_duration_since(g.created_at);
-                    let age_str = if age.num_days() > 0 {
-                        format!("{}d ago", age.num_days())
-                    } else if age.num_hours() > 0 {
-                        format!("{}h ago", age.num_hours())
-                    } else {
-                        "just now".to_string()
-                    };
                     let notes_count = g.progress_notes.as_ref().map_or(0, |n| n.len());
+                    let age_str = Self::format_age(&g.created_at);
                     output.push_str(&format!(
                         "- **[ID: {}]** {} (priority: {}, created: {}, {} progress notes)\n",
                         g.id, g.description, g.priority, age_str, notes_count
@@ -301,18 +414,199 @@ impl Tool for ManageMemoriesTool {
                 }
                 Ok(output)
             }
+            "create_personal_goal" => {
+                let desc = args
+                    .goal
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("'goal' is required for create_personal_goal action"))?;
+
+                let mut goal = crate::traits::Goal::new_personal(desc, "_global");
+                if let Some(p) = args.priority.as_deref() {
+                    let p = p.trim().to_ascii_lowercase();
+                    if matches!(p.as_str(), "low" | "medium" | "high" | "critical") {
+                        goal.priority = p;
+                    } else {
+                        return Ok(format!(
+                            "Invalid priority '{}'. Use low, medium, high, or critical.",
+                            p
+                        ));
+                    }
+                }
+
+                self.state.create_goal(&goal).await?;
+                Ok(format!(
+                    "Created personal goal {}: {}",
+                    goal.id, goal.description
+                ))
+            }
             "complete_goal" => {
-                let goal_id = args.goal_id.ok_or_else(|| anyhow::anyhow!("'goal_id' is required for complete_goal action"))?;
-                self.state.update_goal(goal_id, Some("completed"), None).await?;
-                Ok(format!("Goal {} marked as completed.", goal_id))
+                let goal_id = args
+                    .goal_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for complete_goal action"))?;
+                let resolved_goal_id = match self.resolve_personal_goal_id(goal_id).await {
+                    Ok(id) => id,
+                    Err(e) => return Ok(e.to_string()),
+                };
+                self.state
+                    .update_personal_goal(&resolved_goal_id, Some("completed"), None)
+                    .await?;
+                Ok(format!("Goal {} marked as completed.", resolved_goal_id))
             }
             "abandon_goal" => {
-                let goal_id = args.goal_id.ok_or_else(|| anyhow::anyhow!("'goal_id' is required for abandon_goal action"))?;
-                self.state.update_goal(goal_id, Some("abandoned"), None).await?;
-                Ok(format!("Goal {} marked as abandoned. It will not be re-created by automatic analysis.", goal_id))
+                let goal_id = args
+                    .goal_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for abandon_goal action"))?;
+                let resolved_goal_id = match self.resolve_personal_goal_id(goal_id).await {
+                    Ok(id) => id,
+                    Err(e) => return Ok(e.to_string()),
+                };
+                self.state
+                    .update_personal_goal(&resolved_goal_id, Some("abandoned"), None)
+                    .await?;
+                Ok(format!("Goal {} marked as abandoned. It will not be re-created by automatic analysis.", resolved_goal_id))
+            }
+            "create_scheduled_goal" => {
+                let is_owner = args
+                    ._user_role
+                    .as_deref()
+                    .is_some_and(|r| r.eq_ignore_ascii_case("owner"));
+                if !is_owner {
+                    return Ok("Only owners can create scheduled goals.".to_string());
+                }
+
+                let session_id = args._session_id.as_deref().unwrap_or("");
+                if session_id.trim().is_empty() {
+                    return Ok("Internal error: create_scheduled_goal requires _session_id.".to_string());
+                }
+
+                let desc = args
+                    .goal
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("'goal' is required for create_scheduled_goal action"))?;
+
+                let schedule_inputs: Vec<String> = if let Some(list) = args.schedules.as_ref() {
+                    list.iter()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                } else {
+                    let schedule_raw = args
+                        .schedule
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("'schedule' is required for create_scheduled_goal action"))?;
+                    vec![schedule_raw.to_string()]
+                };
+                if schedule_inputs.is_empty() {
+                    return Ok("At least one schedule is required.".to_string());
+                }
+
+                // Parse schedules first so we don't create partial goals on failure.
+                struct ParsedSchedule {
+                    original: String,
+                    cron: String,
+                    is_one_shot: bool,
+                    next_local: chrono::DateTime<chrono::Local>,
+                }
+                let mut parsed = Vec::new();
+                for schedule_raw in &schedule_inputs {
+                    let cron_expr = match crate::cron_utils::parse_schedule(schedule_raw) {
+                        Ok(expr) => expr,
+                        Err(e) => {
+                            return Ok(format!(
+                                "Couldn't parse schedule '{}': {}",
+                                schedule_raw, e
+                            ))
+                        }
+                    };
+                    let next_local = match crate::cron_utils::compute_next_run_local(&cron_expr) {
+                        Ok(dt) => dt,
+                        Err(e) => {
+                            return Ok(format!(
+                                "Couldn't compute next run for '{}': {}",
+                                cron_expr, e
+                            ))
+                        }
+                    };
+                    let is_one_shot = args
+                        .is_one_shot
+                        .unwrap_or_else(|| crate::cron_utils::is_one_shot_schedule(&cron_expr));
+                    parsed.push(ParsedSchedule {
+                        original: schedule_raw.to_string(),
+                        cron: cron_expr,
+                        is_one_shot,
+                        next_local,
+                    });
+                }
+
+	                let has_recurring = parsed.iter().any(|p| !p.is_one_shot);
+	                let mut goal = if has_recurring {
+	                    crate::traits::Goal::new_continuous_pending(desc, session_id, None, None)
+	                } else {
+	                    crate::traits::Goal::new_deferred_finite(desc, session_id)
+	                };
+                goal.domain = "orchestration".to_string();
+
+                self.state.create_goal(&goal).await?;
+
+                let fire_policy = match args.fire_policy.as_deref() {
+                    Some("always_fire") => "always_fire".to_string(),
+                    Some("coalesce") | None => "coalesce".to_string(),
+                    Some(other) => {
+                        return Ok(format!(
+                            "Invalid fire_policy '{}'. Use 'coalesce' or 'always_fire'.",
+                            other
+                        ))
+                    }
+                };
+                let paused = args.is_paused.unwrap_or(false);
+                let now = chrono::Utc::now().to_rfc3339();
+
+                for p in &parsed {
+                    let schedule = crate::traits::GoalSchedule {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        goal_id: goal.id.clone(),
+                        cron_expr: p.cron.clone(),
+                        tz: "local".to_string(),
+                        original_schedule: Some(p.original.clone()),
+                        fire_policy: fire_policy.clone(),
+                        is_one_shot: p.is_one_shot,
+                        is_paused: paused,
+                        last_run_at: None,
+                        next_run_at: p.next_local
+                            .with_timezone(&chrono::Utc)
+                            .to_rfc3339(),
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    };
+                    self.state.create_goal_schedule(&schedule).await?;
+                }
+
+                let tz_label = crate::cron_utils::system_timezone_display();
+                let next_run = parsed
+                    .iter()
+                    .map(|p| p.next_local)
+                    .min_by_key(|dt| dt.timestamp())
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
+                    .unwrap_or_else(|| "n/a".to_string());
+
+                Ok(format!(
+                    "Created scheduled goal {} (pending confirmation) with {} schedule(s). Next: {}. System timezone: {}. Reply **confirm** to activate or **cancel** to discard.",
+                    goal.id,
+                    parsed.len(),
+                    next_run,
+                    tz_label
+                ))
             }
             "list_scheduled" => {
-                let goals = self.state.get_scheduled_goals_v3().await?;
+                let goals = self.state.get_scheduled_goals().await?;
                 if goals.is_empty() {
                     return Ok("No scheduled goals.".to_string());
                 }
@@ -343,48 +637,67 @@ impl Tool for ManageMemoriesTool {
                     output.push_str("No active scheduled tasks.\n\n");
                 }
 
-                let mut append_group = |title: &str, items: &[&crate::traits::GoalV3]| {
+                output.push_str(&format!(
+                    "System timezone: {}.\nTip: use `schedule_id` for schedule-specific pause/resume/cancel.\n\n",
+                    crate::cron_utils::system_timezone_display()
+                ));
+
+                let groups: [(&str, &Vec<&crate::traits::Goal>); 7] = [
+                    ("Active", &active),
+                    ("Paused", &paused),
+                    ("Pending Confirmation", &pending_confirmation),
+                    ("Failed", &failed),
+                    ("Cancelled", &cancelled),
+                    ("Completed", &completed),
+                    ("Other", &other),
+                ];
+
+                for (title, items) in groups {
                     if items.is_empty() {
-                        return;
+                        continue;
                     }
                     output.push_str(&format!("**{}** ({})\n", title, items.len()));
-                    for g in items {
+                    for g in items.iter() {
                         let desc: String = g.description.chars().take(80).collect();
-                        let schedule = g
-                            .schedule
-                            .clone()
-                            .unwrap_or_else(|| "(none)".to_string());
-                        let goal_type = if g.goal_type == "finite"
-                            || g
-                                .schedule
-                                .as_ref()
-                                .is_some_and(|s| is_one_shot_schedule(s))
-                        {
-                            "one-time"
-                        } else {
+                        let schedules = self
+                            .state
+                            .get_schedules_for_goal(&g.id)
+                            .await
+                            .unwrap_or_default();
+                        let has_recurring = schedules.iter().any(|s| !s.is_one_shot);
+                        let has_one_shot = schedules.iter().any(|s| s.is_one_shot);
+                        let goal_type = if has_recurring {
                             "recurring"
+                        } else if has_one_shot {
+                            "one-time"
+                        } else if g.goal_type == "continuous" {
+                            "recurring"
+                        } else {
+                            "one-time"
                         };
-                        let next_run = g
-                            .schedule
-                            .as_deref()
-                            .and_then(|s| compute_next_run_local(s).ok())
-                            .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
-                            .unwrap_or_else(|| "n/a".to_string());
                         output.push_str(&format!(
-                            "- **{}** {} (type: {}, status: {}, schedule: {}, next: {})\n",
-                            g.id, desc, goal_type, g.status, schedule, next_run
+                            "- **{}** {} (type: {}, status: {}, schedules: {})\n",
+                            g.id,
+                            desc,
+                            goal_type,
+                            g.status,
+                            schedules.len()
                         ));
+                        for s in &schedules {
+                            let next_local = Self::format_local(&s.next_run_at);
+                            output.push_str(&format!(
+                                "  schedule {}: next {}, paused {}, policy {}, one_shot {}, cron {}\n",
+                                s.id,
+                                next_local,
+                                s.is_paused,
+                                s.fire_policy,
+                                s.is_one_shot,
+                                s.cron_expr
+                            ));
+                        }
                     }
                     output.push('\n');
-                };
-
-                append_group("Active", &active);
-                append_group("Paused", &paused);
-                append_group("Pending Confirmation", &pending_confirmation);
-                append_group("Failed", &failed);
-                append_group("Cancelled", &cancelled);
-                append_group("Completed", &completed);
-                append_group("Other", &other);
+                }
                 Ok(output)
             }
             "list_scheduled_matching" => {
@@ -394,8 +707,8 @@ impl Tool for ManageMemoriesTool {
                     .map(str::trim)
                     .filter(|q| !q.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("'query' is required for list_scheduled_matching action"))?;
-                let goals = self.state.get_scheduled_goals_v3().await?;
-                let mut matched: Vec<&crate::traits::GoalV3> = goals
+                let goals = self.state.get_scheduled_goals().await?;
+                let mut matched: Vec<&crate::traits::Goal> = goals
                     .iter()
                     .filter(|g| Self::goal_matches_query(g, query))
                     .collect();
@@ -411,72 +724,205 @@ impl Tool for ManageMemoriesTool {
                 );
                 for g in matched {
                     let desc: String = g.description.chars().take(80).collect();
-                    let schedule = g
-                        .schedule
-                        .clone()
-                        .unwrap_or_else(|| "(none)".to_string());
-                    let goal_type = if g.goal_type == "finite"
-                        || g
-                            .schedule
-                            .as_ref()
-                            .is_some_and(|s| is_one_shot_schedule(s))
-                    {
-                        "one-time"
-                    } else {
+                    let schedules = self
+                        .state
+                        .get_schedules_for_goal(&g.id)
+                        .await
+                        .unwrap_or_default();
+                    let has_recurring = schedules.iter().any(|s| !s.is_one_shot);
+                    let has_one_shot = schedules.iter().any(|s| s.is_one_shot);
+                    let goal_type = if has_recurring {
                         "recurring"
+                    } else if has_one_shot {
+                        "one-time"
+                    } else if g.goal_type == "continuous" {
+                        "recurring"
+                    } else {
+                        "one-time"
                     };
-                    let next_run = g
-                        .schedule
-                        .as_deref()
-                        .and_then(|s| compute_next_run_local(s).ok())
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
+                    let next_run = schedules
+                        .iter()
+                        .filter_map(|s| chrono::DateTime::parse_from_rfc3339(&s.next_run_at).ok())
+                        .min_by_key(|dt| dt.timestamp())
+                        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z").to_string())
                         .unwrap_or_else(|| "n/a".to_string());
                     output.push_str(&format!(
-                        "- **{}** {} (type: {}, status: {}, schedule: {}, next: {})\n",
-                        g.id, desc, goal_type, g.status, schedule, next_run
+                        "- **{}** {} (type: {}, status: {}, schedules: {}, next: {})\n",
+                        g.id, desc, goal_type, g.status, schedules.len(), next_run
                     ));
                 }
                 Ok(output)
             }
-            "cancel_scheduled" => {
+            "add_schedule" => {
                 let goal_id = args
-                    .goal_id_v3
+                    .goal_id
                     .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id_v3' is required for cancel_scheduled action"))?;
-                let resolved_goal_id = match self.resolve_goal_id_v3(goal_id).await {
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "'goal_id' is required for add_schedule action. Call action='list_scheduled' first to get the goal_id, or use action='create_scheduled_goal' to create a new scheduled goal."
+                        )
+                    })?;
+                let schedule_raw = args
+                    .schedule
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("'schedule' is required for add_schedule action"))?;
+                let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
                 };
-                let Some(mut goal) = self.state.get_goal_v3(&resolved_goal_id).await? else {
+
+                let Some(goal) = self.state.get_goal(&resolved_goal_id).await? else {
                     return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
                 };
+                if goal.domain != "orchestration" {
+                    return Ok(format!(
+                        "Personal goals cannot be scheduled. Goal {} has domain '{}'.",
+                        goal.id, goal.domain
+                    ));
+                }
+
+                let cron_expr = match crate::cron_utils::parse_schedule(schedule_raw) {
+                    Ok(expr) => expr,
+                    Err(e) => {
+                        return Ok(format!(
+                            "Couldn't parse schedule '{}': {}",
+                            schedule_raw, e
+                        ))
+                    }
+                };
+                let next_local = match crate::cron_utils::compute_next_run_local(&cron_expr) {
+                    Ok(dt) => dt,
+                    Err(e) => {
+                        return Ok(format!(
+                            "Couldn't compute next run for '{}': {}",
+                            cron_expr, e
+                        ))
+                    }
+                };
+
+                let now = chrono::Utc::now().to_rfc3339();
+                let schedule = crate::traits::GoalSchedule {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    goal_id: goal.id.clone(),
+                    cron_expr: cron_expr.clone(),
+                    tz: "local".to_string(),
+                    original_schedule: Some(schedule_raw.to_string()),
+                    fire_policy: match args.fire_policy.as_deref() {
+                        Some("always_fire") => "always_fire".to_string(),
+                        Some("coalesce") | None => "coalesce".to_string(),
+                        Some(other) => {
+                            return Ok(format!(
+                                "Invalid fire_policy '{}'. Use 'coalesce' or 'always_fire'.",
+                                other
+                            ))
+                        }
+                    },
+                    is_one_shot: args
+                        .is_one_shot
+                        .unwrap_or_else(|| crate::cron_utils::is_one_shot_schedule(&cron_expr)),
+                    is_paused: args.is_paused.unwrap_or(false),
+                    last_run_at: None,
+                    next_run_at: next_local.with_timezone(&chrono::Utc).to_rfc3339(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                self.state.create_goal_schedule(&schedule).await?;
+
+                Ok(format!(
+                    "Added schedule {} to goal {} (next: {}).",
+                    schedule.id,
+                    goal.id,
+                    next_local.format("%Y-%m-%d %H:%M %Z")
+                ))
+            }
+            "cancel_scheduled" => {
+                let goal_id = args
+                    .goal_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for cancel_scheduled action"))?;
+                let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
+                    Ok(id) => id,
+                    Err(e) => return Ok(e.to_string()),
+                };
+                let Some(mut goal) = self.state.get_goal(&resolved_goal_id).await? else {
+                    return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
+                };
+                if let Some(schedule_id) = args.schedule_id.as_deref() {
+                    let Some(sched) = self.state.get_goal_schedule(schedule_id).await? else {
+                        return Ok(format!("Schedule not found: {}", schedule_id));
+                    };
+                    if sched.goal_id != goal.id {
+                        return Ok(format!(
+                            "Schedule {} does not belong to goal {}.",
+                            sched.id, goal.id
+                        ));
+                    }
+                    let deleted = self.state.delete_goal_schedule(&sched.id).await?;
+                    if deleted {
+                        return Ok(format!(
+                            "Cancelled schedule {} for goal {}.",
+                            sched.id, goal.id
+                        ));
+                    }
+                    return Ok(format!("Schedule {} was already removed.", sched.id));
+                }
+
                 if Self::is_protected_system_maintenance_goal(&goal) {
                     return Ok(format!(
                         "Cannot cancel protected system maintenance goal {}.",
                         resolved_goal_id
                     ));
                 }
+
+                // Capture schedules before transitioning status; state.update_goal now
+                // purges schedules for terminal goals as a safety net.
+                let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
                 goal.status = "cancelled".to_string();
                 goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
                 goal.updated_at = chrono::Utc::now().to_rfc3339();
-                self.state.update_goal_v3(&goal).await?;
-                Ok(format!("Cancelled scheduled goal {}.", resolved_goal_id))
+                self.state.update_goal(&goal).await?;
+
+                // Clean up schedules so they no longer appear in listings.
+                for s in &schedules {
+                    let _ = self.state.delete_goal_schedule(&s.id).await;
+                }
+
+                Ok(format!(
+                    "Cancelled scheduled goal {} (deleted {} schedule(s)).",
+                    resolved_goal_id,
+                    schedules.len()
+                ))
             }
             "pause_scheduled" => {
                 let goal_id = args
-                    .goal_id_v3
+                    .goal_id
                     .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id_v3' is required for pause_scheduled action"))?;
-                let resolved_goal_id = match self.resolve_goal_id_v3(goal_id).await {
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for pause_scheduled action"))?;
+                let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
                 };
-                let Some(mut goal) = self.state.get_goal_v3(&resolved_goal_id).await? else {
+                if let Some(schedule_id) = args.schedule_id.as_deref() {
+                    let Some(mut sched) = self.state.get_goal_schedule(schedule_id).await? else {
+                        return Ok(format!("Schedule not found: {}", schedule_id));
+                    };
+                    if sched.goal_id != resolved_goal_id {
+                        return Ok(format!(
+                            "Schedule {} does not belong to goal {}.",
+                            sched.id, resolved_goal_id
+                        ));
+                    }
+                    sched.is_paused = true;
+                    sched.updated_at = chrono::Utc::now().to_rfc3339();
+                    self.state.update_goal_schedule(&sched).await?;
+                    return Ok(format!("Paused schedule {}.", sched.id));
+                }
+
+                let Some(mut goal) = self.state.get_goal(&resolved_goal_id).await? else {
                     return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
                 };
-                if goal.schedule.is_none() {
-                    return Ok("Only scheduled goals can be paused.".to_string());
-                }
                 if goal.status != "active" {
                     return Ok(format!(
                         "Only active scheduled goals can be paused (current status: {}).",
@@ -485,24 +931,37 @@ impl Tool for ManageMemoriesTool {
                 }
                 goal.status = "paused".to_string();
                 goal.updated_at = chrono::Utc::now().to_rfc3339();
-                self.state.update_goal_v3(&goal).await?;
+                self.state.update_goal(&goal).await?;
                 Ok(format!("Paused scheduled goal {}.", resolved_goal_id))
             }
             "resume_scheduled" => {
                 let goal_id = args
-                    .goal_id_v3
+                    .goal_id
                     .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id_v3' is required for resume_scheduled action"))?;
-                let resolved_goal_id = match self.resolve_goal_id_v3(goal_id).await {
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for resume_scheduled action"))?;
+                let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
                 };
-                let Some(mut goal) = self.state.get_goal_v3(&resolved_goal_id).await? else {
+                if let Some(schedule_id) = args.schedule_id.as_deref() {
+                    let Some(mut sched) = self.state.get_goal_schedule(schedule_id).await? else {
+                        return Ok(format!("Schedule not found: {}", schedule_id));
+                    };
+                    if sched.goal_id != resolved_goal_id {
+                        return Ok(format!(
+                            "Schedule {} does not belong to goal {}.",
+                            sched.id, resolved_goal_id
+                        ));
+                    }
+                    sched.is_paused = false;
+                    sched.updated_at = chrono::Utc::now().to_rfc3339();
+                    self.state.update_goal_schedule(&sched).await?;
+                    return Ok(format!("Resumed schedule {}.", sched.id));
+                }
+
+                let Some(mut goal) = self.state.get_goal(&resolved_goal_id).await? else {
                     return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
                 };
-                if goal.schedule.is_none() {
-                    return Ok("Only scheduled goals can be resumed.".to_string());
-                }
                 if goal.status != "paused" {
                     return Ok(format!(
                         "Only paused scheduled goals can be resumed (current status: {}).",
@@ -520,24 +979,21 @@ impl Tool for ManageMemoriesTool {
                 }
                 goal.status = "active".to_string();
                 goal.updated_at = chrono::Utc::now().to_rfc3339();
-                self.state.update_goal_v3(&goal).await?;
+                self.state.update_goal(&goal).await?;
                 Ok(format!("Resumed scheduled goal {}.", resolved_goal_id))
             }
             "retry_scheduled" => {
                 let goal_id = args
-                    .goal_id_v3
+                    .goal_id
                     .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id_v3' is required for retry_scheduled action"))?;
-                let resolved_goal_id = match self.resolve_goal_id_v3(goal_id).await {
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for retry_scheduled action"))?;
+                let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
                 };
-                let Some(mut goal) = self.state.get_goal_v3(&resolved_goal_id).await? else {
+                let Some(mut goal) = self.state.get_goal(&resolved_goal_id).await? else {
                     return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
                 };
-                if goal.schedule.is_none() {
-                    return Ok("Only scheduled goals can be retried.".to_string());
-                }
                 if goal.status != "failed" {
                     return Ok(format!(
                         "Only failed scheduled goals can be retried (current status: {}).",
@@ -556,7 +1012,7 @@ impl Tool for ManageMemoriesTool {
                 goal.status = "active".to_string();
                 goal.completed_at = None;
                 goal.updated_at = chrono::Utc::now().to_rfc3339();
-                self.state.update_goal_v3(&goal).await?;
+                self.state.update_goal(&goal).await?;
                 Ok(format!(
                     "Retried scheduled goal {}. It is active again.",
                     resolved_goal_id
@@ -564,8 +1020,8 @@ impl Tool for ManageMemoriesTool {
             }
             "retry_failed_scheduled" => {
                 let query = args.query.as_deref().map(str::trim).unwrap_or("");
-                let goals = self.state.get_scheduled_goals_v3().await?;
-                let mut matched: Vec<&crate::traits::GoalV3> = goals
+                let goals = self.state.get_scheduled_goals().await?;
+                let mut matched: Vec<&crate::traits::Goal> = goals
                     .iter()
                     .filter(|g| {
                         g.status == "failed"
@@ -597,7 +1053,7 @@ impl Tool for ManageMemoriesTool {
                     updated.status = "active".to_string();
                     updated.completed_at = None;
                     updated.updated_at = chrono::Utc::now().to_rfc3339();
-                    match self.state.update_goal_v3(&updated).await {
+                    match self.state.update_goal(&updated).await {
                         Ok(()) => {
                             if updated.goal_type == "continuous" {
                                 active_evergreen += 1;
@@ -641,8 +1097,8 @@ impl Tool for ManageMemoriesTool {
                     .map(str::trim)
                     .filter(|q| !q.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("'query' is required for cancel_scheduled_matching action"))?;
-                let goals = self.state.get_scheduled_goals_v3().await?;
-                let mut matched: Vec<&crate::traits::GoalV3> = goals
+                let goals = self.state.get_scheduled_goals().await?;
+                let mut matched: Vec<&crate::traits::Goal> = goals
                     .iter()
                     .filter(|g| Self::goal_matches_query(g, query))
                     .collect();
@@ -669,7 +1125,7 @@ impl Tool for ManageMemoriesTool {
                     updated.status = "cancelled".to_string();
                     updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
                     updated.updated_at = chrono::Utc::now().to_rfc3339();
-                    match self.state.update_goal_v3(&updated).await {
+                    match self.state.update_goal(&updated).await {
                         Ok(()) => cancelled.push(updated.id),
                         Err(e) => errors.push(format!("{} ({})", g.id, e)),
                     }
@@ -707,8 +1163,8 @@ impl Tool for ManageMemoriesTool {
                     .map(str::trim)
                     .filter(|q| !q.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("'query' is required for retry_scheduled_matching action"))?;
-                let goals = self.state.get_scheduled_goals_v3().await?;
-                let mut matched: Vec<&crate::traits::GoalV3> = goals
+                let goals = self.state.get_scheduled_goals().await?;
+                let mut matched: Vec<&crate::traits::Goal> = goals
                     .iter()
                     .filter(|g| Self::goal_matches_query(g, query))
                     .collect();
@@ -736,7 +1192,7 @@ impl Tool for ManageMemoriesTool {
                     updated.status = "active".to_string();
                     updated.completed_at = None;
                     updated.updated_at = chrono::Utc::now().to_rfc3339();
-                    match self.state.update_goal_v3(&updated).await {
+                    match self.state.update_goal(&updated).await {
                         Ok(()) => {
                             if updated.goal_type == "continuous" {
                                 active_evergreen += 1;
@@ -774,42 +1230,37 @@ impl Tool for ManageMemoriesTool {
             }
             "diagnose_scheduled" => {
                 let goal_id = args
-                    .goal_id_v3
+                    .goal_id
                     .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id_v3' is required for diagnose_scheduled action"))?;
-                let resolved_goal_id = match self.resolve_goal_id_v3(goal_id).await {
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for diagnose_scheduled action"))?;
+                let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
                 };
-                let Some(goal) = self.state.get_goal_v3(&resolved_goal_id).await? else {
+                let Some(goal) = self.state.get_goal(&resolved_goal_id).await? else {
                     return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
                 };
-                if goal.schedule.is_none() {
-                    return Ok("Only scheduled goals can be diagnosed with this action.".to_string());
-                }
 
-                let schedule = goal
-                    .schedule
-                    .clone()
-                    .unwrap_or_else(|| "(none)".to_string());
-                let next_run = goal
-                    .schedule
-                    .as_deref()
-                    .and_then(|s| compute_next_run_local(s).ok())
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
-                    .unwrap_or_else(|| "n/a".to_string());
-                let goal_type = if goal.goal_type == "finite"
-                    || goal
-                        .schedule
-                        .as_ref()
-                        .is_some_and(|s| is_one_shot_schedule(s))
-                {
-                    "one-time"
-                } else {
+                let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
+                let has_recurring = schedules.iter().any(|s| !s.is_one_shot);
+                let has_one_shot = schedules.iter().any(|s| s.is_one_shot);
+                let goal_type = if has_recurring {
                     "recurring"
+                } else if has_one_shot {
+                    "one-time"
+                } else if goal.goal_type == "continuous" {
+                    "recurring"
+                } else {
+                    "one-time"
                 };
+                let next_run = schedules
+                    .iter()
+                    .filter_map(|s| chrono::DateTime::parse_from_rfc3339(&s.next_run_at).ok())
+                    .min_by_key(|dt| dt.timestamp())
+                    .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z").to_string())
+                    .unwrap_or_else(|| "n/a".to_string());
 
-                let tasks = self.state.get_tasks_for_goal_v3(&goal.id).await?;
+                let tasks = self.state.get_tasks_for_goal(&goal.id).await?;
                 let mut task_total = 0usize;
                 let mut task_failed = 0usize;
                 let mut task_completed = 0usize;
@@ -827,19 +1278,36 @@ impl Tool for ManageMemoriesTool {
                 }
 
                 let mut out = format!(
-                    "**Scheduled Goal Diagnosis**\n\n- ID: {}\n- Description: {}\n- Type: {}\n- Status: {}\n- Schedule: {}\n- Next: {}\n- Tasks: total {}, failed {}, running {}, pending {}, completed {}",
+                    "**Scheduled Goal Diagnosis**\n\n- ID: {}\n- Description: {}\n- Type: {}\n- Status: {}\n- Next: {}\n- Schedules: {}\n- Tasks: total {}, failed {}, running {}, pending {}, completed {}",
                     goal.id,
                     goal.description,
                     goal_type,
                     goal.status,
-                    schedule,
                     next_run,
+                    schedules.len(),
                     task_total,
                     task_failed,
                     task_running,
                     task_pending,
                     task_completed
                 );
+
+                if schedules.is_empty() {
+                    out.push_str("\n\nNo schedules found for this goal.");
+                } else {
+                    out.push_str("\n\n**Schedules**");
+                    for s in &schedules {
+                        out.push_str(&format!(
+                            "\n- {} next={} paused={} one_shot={} policy={} cron={}",
+                            s.id,
+                            Self::format_local(&s.next_run_at),
+                            s.is_paused,
+                            s.is_one_shot,
+                            s.fire_policy,
+                            s.cron_expr
+                        ));
+                    }
+                }
 
                 if let Some(last_failed_task) = tasks.iter().filter(|t| t.status == "failed").max_by(
                     |a, b| {
@@ -869,7 +1337,7 @@ impl Tool for ManageMemoriesTool {
 
                     let activities = self
                         .state
-                        .get_task_activities_v3(&last_failed_task.id)
+                        .get_task_activities(&last_failed_task.id)
                         .await
                         .unwrap_or_default();
                     if !activities.is_empty() {
@@ -899,7 +1367,7 @@ impl Tool for ManageMemoriesTool {
 
                 Ok(out)
             }
-            other => Ok(format!("Unknown action: '{}'. Use list, forget, set_privacy, search, list_goals, complete_goal, abandon_goal, list_scheduled, list_scheduled_matching, cancel_scheduled, pause_scheduled, resume_scheduled, retry_scheduled, retry_failed_scheduled, cancel_scheduled_matching, retry_scheduled_matching, or diagnose_scheduled.", other)),
+            other => Ok(format!("Unknown action: '{}'. Use list, forget, set_privacy, search, create_personal_goal, list_goals, complete_goal, abandon_goal, create_scheduled_goal, list_scheduled, list_scheduled_matching, add_schedule, cancel_scheduled, pause_scheduled, resume_scheduled, retry_scheduled, retry_failed_scheduled, cancel_scheduled_matching, retry_scheduled_matching, or diagnose_scheduled.", other)),
         }
     }
 }
@@ -909,7 +1377,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::GoalV3;
+    use crate::traits::{Goal, GoalSchedule, Task, TaskActivity};
 
     async fn setup_state() -> Arc<dyn StateStore> {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -924,26 +1392,107 @@ mod tests {
         state as Arc<dyn StateStore>
     }
 
+    async fn add_schedule(state: &Arc<dyn StateStore>, goal_id: &str, cron_expr: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let next_run = crate::cron_utils::compute_next_run(cron_expr)
+            .unwrap()
+            .to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal_id.to_string(),
+            cron_expr: cron_expr.to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some(cron_expr.to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: next_run,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_schedule_creates_schedule_row() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let goal = Goal::new_continuous(
+            "English research for pronunciation",
+            "user-session",
+            Some(2000),
+            Some(20000),
+        );
+        let goal_id = goal.id.clone();
+        state.create_goal(&goal).await.unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "add_schedule",
+                    "goal_id": goal_id,
+                    "schedule": "daily at 9am"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Added schedule"));
+
+        let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].cron_expr, "0 9 * * *");
+        assert!(!schedules[0].is_paused);
+    }
+
+    #[tokio::test]
+    async fn add_schedule_rejects_personal_goal() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let mut goal = Goal::new_finite("Personal goal", "user-session");
+        goal.domain = "personal".to_string();
+        state.create_goal(&goal).await.unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "add_schedule",
+                    "goal_id": goal.id,
+                    "schedule": "daily at 9am"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Personal goals cannot be scheduled"));
+        let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
+        assert!(schedules.is_empty());
+    }
+
     #[tokio::test]
     async fn cancel_scheduled_blocks_protected_system_maintenance_goal() {
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state.clone());
 
-        let goal = GoalV3::new_continuous(
+        let goal = Goal::new_continuous(
             "Maintain memory health: prune old events, clean up retention, remove stale data",
             "system",
-            "30 3 * * *",
             Some(1000),
             Some(5000),
         );
         let goal_id = goal.id.clone();
-        state.create_goal_v3(&goal).await.unwrap();
+        state.create_goal(&goal).await.unwrap();
+        add_schedule(&state, &goal.id, "30 3 * * *").await;
 
         let result = tool
             .call(
                 &json!({
                     "action": "cancel_scheduled",
-                    "goal_id_v3": goal_id
+                    "goal_id": goal_id
                 })
                 .to_string(),
             )
@@ -951,7 +1500,7 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("Cannot cancel protected system maintenance goal"));
-        let fetched = state.get_goal_v3(&goal.id).await.unwrap().unwrap();
+        let fetched = state.get_goal(&goal.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, "active");
     }
 
@@ -960,21 +1509,21 @@ mod tests {
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state.clone());
 
-        let goal = GoalV3::new_continuous(
+        let goal = Goal::new_continuous(
             "English research for pronunciation",
             "user-session",
-            "0 5,12,19 * * *",
             Some(2000),
             Some(20000),
         );
         let goal_id = goal.id.clone();
-        state.create_goal_v3(&goal).await.unwrap();
+        state.create_goal(&goal).await.unwrap();
+        add_schedule(&state, &goal.id, "0 5,12,19 * * *").await;
 
         let result = tool
             .call(
                 &json!({
                     "action": "cancel_scheduled",
-                    "goal_id_v3": goal_id
+                    "goal_id": goal_id
                 })
                 .to_string(),
             )
@@ -982,7 +1531,7 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("Cancelled scheduled goal"));
-        let fetched = state.get_goal_v3(&goal.id).await.unwrap().unwrap();
+        let fetched = state.get_goal(&goal.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, "cancelled");
     }
 
@@ -991,23 +1540,23 @@ mod tests {
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state.clone());
 
-        let mut goal = GoalV3::new_continuous(
+        let mut goal = Goal::new_continuous(
             "Retryable scheduled goal",
             "user-session",
-            "0 */6 * * *",
             Some(2000),
             Some(20000),
         );
         goal.status = "failed".to_string();
         goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
         let goal_id = goal.id.clone();
-        state.create_goal_v3(&goal).await.unwrap();
+        state.create_goal(&goal).await.unwrap();
+        add_schedule(&state, &goal.id, "0 */6 * * *").await;
 
         let result = tool
             .call(
                 &json!({
                     "action": "retry_scheduled",
-                    "goal_id_v3": goal_id
+                    "goal_id": goal_id
                 })
                 .to_string(),
             )
@@ -1015,7 +1564,7 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("Retried scheduled goal"));
-        let fetched = state.get_goal_v3(&goal.id).await.unwrap().unwrap();
+        let fetched = state.get_goal(&goal.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, "active");
         assert!(fetched.completed_at.is_none());
     }
@@ -1025,21 +1574,21 @@ mod tests {
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state.clone());
 
-        let goal = GoalV3::new_continuous(
+        let goal = Goal::new_continuous(
             "Already active scheduled goal",
             "user-session",
-            "0 */6 * * *",
             Some(2000),
             Some(20000),
         );
         let goal_id = goal.id.clone();
-        state.create_goal_v3(&goal).await.unwrap();
+        state.create_goal(&goal).await.unwrap();
+        add_schedule(&state, &goal.id, "0 */6 * * *").await;
 
         let result = tool
             .call(
                 &json!({
                     "action": "retry_scheduled",
-                    "goal_id_v3": goal_id
+                    "goal_id": goal_id
                 })
                 .to_string(),
             )
@@ -1047,7 +1596,7 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("Only failed scheduled goals can be retried"));
-        let fetched = state.get_goal_v3(&goal.id).await.unwrap().unwrap();
+        let fetched = state.get_goal(&goal.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, "active");
     }
 
@@ -1056,27 +1605,27 @@ mod tests {
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state.clone());
 
-        let mut failed_one = GoalV3::new_continuous(
+        let mut failed_one = Goal::new_continuous(
             "Maintain knowledge base: process embeddings, consolidate memories, decay old facts",
             "system",
-            "0 */6 * * *",
             Some(1000),
             Some(5000),
         );
         failed_one.status = "failed".to_string();
         let failed_one_id = failed_one.id.clone();
-        state.create_goal_v3(&failed_one).await.unwrap();
+        state.create_goal(&failed_one).await.unwrap();
+        add_schedule(&state, &failed_one.id, "0 */6 * * *").await;
 
-        let mut failed_two = GoalV3::new_continuous(
+        let mut failed_two = Goal::new_continuous(
             "English pronunciation slot A",
             "user-session",
-            "0 5 * * *",
             Some(1000),
             Some(5000),
         );
         failed_two.status = "failed".to_string();
         let failed_two_id = failed_two.id.clone();
-        state.create_goal_v3(&failed_two).await.unwrap();
+        state.create_goal(&failed_two).await.unwrap();
+        add_schedule(&state, &failed_two.id, "0 5 * * *").await;
 
         let result = tool
             .call(
@@ -1089,8 +1638,8 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("retried 2"));
-        let fetched_one = state.get_goal_v3(&failed_one_id).await.unwrap().unwrap();
-        let fetched_two = state.get_goal_v3(&failed_two_id).await.unwrap().unwrap();
+        let fetched_one = state.get_goal(&failed_one_id).await.unwrap().unwrap();
+        let fetched_two = state.get_goal(&failed_two_id).await.unwrap().unwrap();
         assert_eq!(fetched_one.status, "active");
         assert_eq!(fetched_two.status, "active");
     }
@@ -1100,30 +1649,30 @@ mod tests {
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state.clone());
 
-        let g1 = GoalV3::new_continuous(
+        let g1 = Goal::new_continuous(
             "English pronunciation slot A",
             "user-session",
-            "0 5 * * *",
             Some(2000),
             Some(20000),
         );
-        let g2 = GoalV3::new_continuous(
+        let g2 = Goal::new_continuous(
             "English pronunciation slot B",
             "user-session",
-            "0 12 * * *",
             Some(2000),
             Some(20000),
         );
-        let g3 = GoalV3::new_continuous(
+        let g3 = Goal::new_continuous(
             "Unrelated recurring task",
             "user-session",
-            "0 19 * * *",
             Some(2000),
             Some(20000),
         );
-        state.create_goal_v3(&g1).await.unwrap();
-        state.create_goal_v3(&g2).await.unwrap();
-        state.create_goal_v3(&g3).await.unwrap();
+        state.create_goal(&g1).await.unwrap();
+        state.create_goal(&g2).await.unwrap();
+        state.create_goal(&g3).await.unwrap();
+        add_schedule(&state, &g1.id, "0 5 * * *").await;
+        add_schedule(&state, &g2.id, "0 12 * * *").await;
+        add_schedule(&state, &g3.id, "0 19 * * *").await;
 
         let result = tool
             .call(
@@ -1137,32 +1686,30 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("cancelled 2"));
-        let g1_after = state.get_goal_v3(&g1.id).await.unwrap().unwrap();
-        let g2_after = state.get_goal_v3(&g2.id).await.unwrap().unwrap();
-        let g3_after = state.get_goal_v3(&g3.id).await.unwrap().unwrap();
+        let g1_after = state.get_goal(&g1.id).await.unwrap().unwrap();
+        let g2_after = state.get_goal(&g2.id).await.unwrap().unwrap();
+        let g3_after = state.get_goal(&g3.id).await.unwrap().unwrap();
         assert_eq!(g1_after.status, "cancelled");
         assert_eq!(g2_after.status, "cancelled");
         assert_eq!(g3_after.status, "active");
+
+        // Schedules for cancelled goals should be purged.
+        assert_eq!(state.get_schedules_for_goal(&g1.id).await.unwrap().len(), 0);
+        assert_eq!(state.get_schedules_for_goal(&g2.id).await.unwrap().len(), 0);
+        assert_eq!(state.get_schedules_for_goal(&g3.id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn diagnose_scheduled_reports_latest_failed_task() {
-        use crate::traits::{TaskActivityV3, TaskV3};
-
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state.clone());
 
-        let mut goal = GoalV3::new_continuous(
-            "Diagnose me",
-            "user-session",
-            "0 */6 * * *",
-            Some(2000),
-            Some(20000),
-        );
+        let mut goal = Goal::new_continuous("Diagnose me", "user-session", Some(2000), Some(20000));
         goal.status = "failed".to_string();
-        state.create_goal_v3(&goal).await.unwrap();
+        state.create_goal(&goal).await.unwrap();
+        add_schedule(&state, &goal.id, "0 */6 * * *").await;
 
-        let task = TaskV3 {
+        let task = Task {
             id: "diag-task-1".to_string(),
             goal_id: goal.id.clone(),
             description: "Run maintenance".to_string(),
@@ -1183,9 +1730,9 @@ mod tests {
             started_at: None,
             completed_at: Some(chrono::Utc::now().to_rfc3339()),
         };
-        state.create_task_v3(&task).await.unwrap();
+        state.create_task(&task).await.unwrap();
 
-        let activity = TaskActivityV3 {
+        let activity = TaskActivity {
             id: 0,
             task_id: task.id.clone(),
             activity_type: "tool_result".to_string(),
@@ -1196,13 +1743,13 @@ mod tests {
             tokens_used: None,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
-        state.log_task_activity_v3(&activity).await.unwrap();
+        state.log_task_activity(&activity).await.unwrap();
 
         let result = tool
             .call(
                 &json!({
                     "action": "diagnose_scheduled",
-                    "goal_id_v3": goal.id
+                    "goal_id": goal.id
                 })
                 .to_string(),
             )
@@ -1213,5 +1760,359 @@ mod tests {
         assert!(result.contains("Latest Failed Task"));
         assert!(result.contains("Connection timeout to embedding backend"));
         assert!(result.contains("Recent Activity"));
+    }
+
+    // ==================== create_personal_goal tests ====================
+
+    #[tokio::test]
+    async fn create_personal_goal_creates_goal_in_registry() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_personal_goal",
+                    "goal": "Learn conversational Spanish"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Created personal goal"));
+        assert!(result.contains("Learn conversational Spanish"));
+
+        let goals = state.get_active_personal_goals(50).await.unwrap();
+        assert_eq!(goals.len(), 1);
+        assert_eq!(goals[0].description, "Learn conversational Spanish");
+        assert_eq!(goals[0].domain, "personal");
+        assert_eq!(goals[0].priority, "medium");
+        assert_eq!(goals[0].status, "active");
+    }
+
+    #[tokio::test]
+    async fn create_personal_goal_with_priority() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_personal_goal",
+                    "goal": "Exercise daily",
+                    "priority": "high"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Created personal goal"));
+        let goals = state.get_active_personal_goals(50).await.unwrap();
+        assert_eq!(goals[0].priority, "high");
+    }
+
+    #[tokio::test]
+    async fn create_personal_goal_rejects_invalid_priority() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_personal_goal",
+                    "goal": "Some goal",
+                    "priority": "ultra"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Invalid priority"));
+        let goals = state.get_active_personal_goals(50).await.unwrap();
+        assert!(goals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_personal_goal_rejects_empty_description() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_personal_goal",
+                    "goal": "   "
+                })
+                .to_string(),
+            )
+            .await;
+
+        assert!(result.is_err() || result.unwrap().contains("required"));
+    }
+
+    // ==================== create_scheduled_goal tests ====================
+
+    #[tokio::test]
+    async fn create_scheduled_goal_success_recurring() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Check API health",
+                    "schedule": "every 6h",
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Created scheduled goal"));
+        assert!(result.contains("pending confirmation"));
+        assert!(result.contains("1 schedule(s)"));
+        assert!(result.contains("confirm"));
+
+        let goals = state.get_scheduled_goals().await.unwrap();
+        let goal = goals
+            .iter()
+            .find(|g| g.description == "Check API health")
+            .unwrap();
+        assert_eq!(goal.status, "pending_confirmation");
+        assert_eq!(goal.domain, "orchestration");
+        assert_eq!(goal.goal_type, "continuous");
+        assert_eq!(goal.budget_per_check, Some(50_000));
+        assert_eq!(goal.budget_daily, Some(200_000));
+
+        let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
+        assert_eq!(schedules.len(), 1);
+        assert!(!schedules[0].is_one_shot);
+        assert_eq!(schedules[0].cron_expr, "0 */6 * * *");
+    }
+
+    #[tokio::test]
+    async fn create_scheduled_goal_success_one_shot() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Deploy release",
+                    "schedule": "in 2h",
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Created scheduled goal"));
+
+        let goals = state.get_scheduled_goals().await.unwrap();
+        let goal = goals
+            .iter()
+            .find(|g| g.description == "Deploy release")
+            .unwrap();
+        assert_eq!(goal.goal_type, "finite");
+
+        let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
+        assert_eq!(schedules.len(), 1);
+        assert!(schedules[0].is_one_shot);
+    }
+
+    #[tokio::test]
+    async fn create_scheduled_goal_rejects_non_owner() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Steal data",
+                    "schedule": "every 1h",
+                    "_user_role": "guest",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Only owners"));
+        let goals = state.get_scheduled_goals().await.unwrap();
+        assert!(goals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_scheduled_goal_rejects_missing_session_id() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Do something",
+                    "schedule": "daily at 9am",
+                    "_user_role": "owner"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("requires _session_id"));
+        let goals = state.get_scheduled_goals().await.unwrap();
+        assert!(goals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_scheduled_goal_rejects_bad_schedule() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Do something",
+                    "schedule": "whenever the moon is full",
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Couldn't parse schedule"));
+        let goals = state.get_scheduled_goals().await.unwrap();
+        assert!(goals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_scheduled_goal_rejects_missing_schedule() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Do something",
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await;
+
+        assert!(result.is_err() || result.unwrap().contains("required"));
+    }
+
+    #[tokio::test]
+    async fn create_scheduled_goal_multiple_schedules() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Multi-slot monitoring",
+                    "schedules": ["daily at 8am", "daily at 2pm", "daily at 9pm"],
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Created scheduled goal"));
+        assert!(result.contains("3 schedule(s)"));
+
+        let goals = state.get_scheduled_goals().await.unwrap();
+        let goal = goals
+            .iter()
+            .find(|g| g.description == "Multi-slot monitoring")
+            .unwrap();
+        assert_eq!(goal.goal_type, "continuous");
+
+        let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
+        assert_eq!(schedules.len(), 3);
+        let crons: Vec<&str> = schedules.iter().map(|s| s.cron_expr.as_str()).collect();
+        assert!(crons.contains(&"0 8 * * *"));
+        assert!(crons.contains(&"0 14 * * *"));
+        assert!(crons.contains(&"0 21 * * *"));
+    }
+
+    #[tokio::test]
+    async fn create_scheduled_goal_starts_paused() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Paused from start",
+                    "schedule": "daily at 9am",
+                    "is_paused": true,
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Created scheduled goal"));
+
+        let goals = state.get_scheduled_goals().await.unwrap();
+        let goal = goals
+            .iter()
+            .find(|g| g.description == "Paused from start")
+            .unwrap();
+        let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
+        assert!(schedules[0].is_paused);
+    }
+
+    #[tokio::test]
+    async fn create_scheduled_goal_bad_schedule_in_multi_does_not_create_goal() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Partial failure",
+                    "schedules": ["daily at 8am", "whenever I feel like it"],
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Couldn't parse schedule"));
+        // No goal should be created — fail-fast before DB writes
+        let goals = state.get_scheduled_goals().await.unwrap();
+        assert!(
+            goals.iter().all(|g| g.description != "Partial failure"),
+            "No goal should be created when any schedule fails to parse"
+        );
     }
 }

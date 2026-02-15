@@ -60,10 +60,12 @@ impl ChannelBundle {
     pub async fn send_startup_notifications(&self, config: &AppConfig) {
         if let Some(first_tg) = self.telegram_bots.first() {
             if let Some(first_config) = config.all_telegram_bots().first() {
-                for user_id in &first_config.allowed_user_ids {
-                    let _ = first_tg
-                        .send_text(&user_id.to_string(), "aidaemon is online.")
-                        .await;
+                if !first_config.allowed_user_ids.is_empty() {
+                    for user_id in &first_config.allowed_user_ids {
+                        let _ = first_tg
+                            .send_text(&user_id.to_string(), "aidaemon is online.")
+                            .await;
+                    }
                 }
             }
         }

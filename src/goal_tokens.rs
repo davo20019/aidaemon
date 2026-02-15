@@ -1,4 +1,4 @@
-//! GoalTokenRegistry — cancellation token hierarchy for V3 goals.
+//! GoalTokenRegistry — cancellation token hierarchy for goal orchestration.
 //!
 //! Each active goal gets a `CancellationToken`. Task leads and executors
 //! derive child tokens so cancelling a goal cascades to all its agents.
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::traits::GoalV3;
+use crate::traits::Goal;
 
 /// Registry of cancellation tokens keyed by goal ID.
 ///
@@ -61,7 +61,7 @@ impl GoalTokenRegistry {
     }
 
     /// Rebuild registry from a list of active goals (for startup recovery).
-    pub async fn rebuild_from_goals(&self, goals: &[GoalV3]) {
+    pub async fn rebuild_from_goals(&self, goals: &[Goal]) {
         let mut tokens = self.tokens.write().await;
         for goal in goals {
             if !tokens.contains_key(&goal.id) {
@@ -123,8 +123,8 @@ mod tests {
     async fn test_rebuild_from_goals() {
         let registry = GoalTokenRegistry::new();
         let goals = vec![
-            GoalV3::new_finite("Goal A", "session-1"),
-            GoalV3::new_finite("Goal B", "session-2"),
+            Goal::new_finite("Goal A", "session-1"),
+            Goal::new_finite("Goal B", "session-2"),
         ];
         registry.rebuild_from_goals(&goals).await;
 

@@ -1,3 +1,7 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod agent;
 mod channels;
 mod config;
@@ -45,7 +49,7 @@ mod live_e2e_tests;
 #[cfg(test)]
 mod testing;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tracing_subscriber::EnvFilter;
 
@@ -96,6 +100,9 @@ fn main() -> anyhow::Result<()> {
                 println!("Commands:");
                 println!("  install-service       Install as a system service (launchd/systemd)");
                 println!("  check-update          Check for available updates");
+                println!(
+                    "  browser login          Launch Chrome to log into services for the agent"
+                );
                 println!("  keychain set <key>    Store a secret in the OS keychain");
                 println!("  keychain get <key>    Retrieve a secret from the OS keychain");
                 println!("  keychain delete <key> Remove a secret from the OS keychain");
@@ -126,6 +133,9 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 return Ok(());
+            }
+            "browser" => {
+                return crate::handle_browser_command(&args[2..], config_path.as_path());
             }
             "keychain" => {
                 return handle_keychain_command(&args[2..]);
@@ -185,6 +195,133 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?
         .block_on(crate::core::run(config, config_path))
+}
+
+#[allow(unreachable_code)]
+fn handle_browser_command(
+    args: &[String],
+    #[allow(unused)] config_path: &Path,
+) -> anyhow::Result<()> {
+    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+    match action {
+        "login" => {
+            #[cfg(not(feature = "browser"))]
+            {
+                eprintln!("Browser support is not compiled in.");
+                eprintln!("Rebuild with: cargo build --features browser");
+                std::process::exit(1);
+            }
+
+            #[cfg(feature = "browser")]
+            {
+                let config = config::AppConfig::load(config_path)?;
+                let profile_dir = config.browser.user_data_dir.unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from(".").to_path_buf())
+                        .join(".aidaemon")
+                        .join("chrome-profile")
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                let expanded = shellexpand::tilde(&profile_dir).into_owned();
+
+                // Ensure profile directory exists
+                std::fs::create_dir_all(&expanded)?;
+
+                println!("Launching Chrome for login...");
+                println!("Profile: {}", expanded);
+                println!();
+                println!("Log into the services you want the agent to access,");
+                println!("then close Chrome when you're done.");
+                println!();
+
+                // Find Chrome binary
+                let chrome_bin = find_chrome_binary().ok_or_else(|| {
+                    anyhow::anyhow!("Chrome not found. Install Chrome or Chromium and try again.")
+                })?;
+
+                let profile = config.browser.profile.as_deref().unwrap_or("Default");
+
+                let status = std::process::Command::new(&chrome_bin)
+                    .arg(format!("--user-data-dir={}", expanded))
+                    .arg(format!("--profile-directory={}", profile))
+                    .arg("--no-first-run")
+                    .arg("--no-default-browser-check")
+                    .status()?;
+
+                if status.success() {
+                    println!();
+                    println!("Chrome closed. Your login sessions are saved.");
+                    println!(
+                        "The agent will use them automatically when the browser tool is enabled."
+                    );
+                } else {
+                    eprintln!("Chrome exited with status: {}", status);
+                }
+            }
+        }
+        _ => {
+            eprintln!("Usage: aidaemon browser login");
+            eprintln!();
+            eprintln!("Launch Chrome to log into services for the agent.");
+            eprintln!("Sessions are saved and reused by the browser tool.");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "browser")]
+fn find_chrome_binary() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ];
+        for path in &candidates {
+            if std::path::Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let candidates = [
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+        ];
+        for name in &candidates {
+            if std::process::Command::new("which")
+                .arg(name)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ];
+        for path in &candidates {
+            if std::path::Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 fn handle_keychain_command(args: &[String]) -> anyhow::Result<()> {

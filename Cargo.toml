@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon"
-version = "0.7.7"
+version = "0.8.0"
 edition = "2021"
 description = "A personal AI agent that runs as a background daemon, accessible via Telegram, Slack, or Discord, with tool use, MCP integration, and persistent memory"
 license = "MIT"
@@ -60,19 +60,26 @@ rand = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
+tikv-jemallocator = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+tikv-jemallocator = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 
 [features]
-default = ["discord", "slack", "encryption"]
+default = ["discord", "slack", "encryption", "browser"]
 browser = ["dep:chromiumoxide"]
 discord = ["dep:serenity"]
 slack = ["dep:tokio-tungstenite"]
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
 
 [dev-dependencies]
 tempfile = "3"

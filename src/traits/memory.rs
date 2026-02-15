@@ -56,23 +56,6 @@ pub struct Episode {
     pub channel_id: Option<String>,
 }
 
-/// A goal being tracked over time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Goal {
-    pub id: i64,
-    pub description: String,
-    pub status: String,   // "active", "completed", "abandoned"
-    pub priority: String, // "low", "medium", "high"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub progress_notes: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_episode_id: Option<i64>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<DateTime<Utc>>,
-}
-
 /// User communication style preferences.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserProfile {

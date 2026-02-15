@@ -87,7 +87,7 @@ impl Tool for ReportBlockerTool {
         }
 
         // Update the task in the database
-        if let Ok(Some(mut task)) = self.state.get_task_v3(&self.task_id).await {
+        if let Ok(Some(mut task)) = self.state.get_task(&self.task_id).await {
             task.status = "blocked".to_string();
             task.blocker = Some(blocker.clone());
             if let Some(partial) = &args.partial_work {
@@ -99,8 +99,8 @@ impl Tool for ReportBlockerTool {
                     Some(format!("{}\n{}", existing, partial))
                 };
             }
-            let _ = self.state.update_task_v3(&task).await;
-            info!(task_id = %self.task_id, reason = %args.reason, "V3: executor reported blocker");
+            let _ = self.state.update_task(&task).await;
+            info!(task_id = %self.task_id, reason = %args.reason, "Executor reported blocker");
         }
 
         Ok(format!(
@@ -117,7 +117,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::traits::store_prelude::*;
-    use crate::traits::{GoalV3, TaskV3};
+    use crate::traits::{Goal, Task};
 
     async fn setup_test_state() -> (Arc<dyn StateStore>, String, String) {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -129,11 +129,11 @@ mod tests {
                 .unwrap(),
         );
 
-        let goal = GoalV3::new_finite("Test goal", "test-session");
-        state.create_goal_v3(&goal).await.unwrap();
+        let goal = Goal::new_finite("Test goal", "test-session");
+        state.create_goal(&goal).await.unwrap();
 
         let now = chrono::Utc::now().to_rfc3339();
-        let task = TaskV3 {
+        let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
             description: "Test task".to_string(),
@@ -154,7 +154,7 @@ mod tests {
             started_at: None,
             completed_at: None,
         };
-        state.create_task_v3(&task).await.unwrap();
+        state.create_task(&task).await.unwrap();
 
         std::mem::forget(db_file);
         (state as Arc<dyn StateStore>, goal.id, task.id)
@@ -178,7 +178,7 @@ mod tests {
         assert!(result.contains("Blocker reported"));
         assert!(result.contains("Stop working"));
 
-        let task = state.get_task_v3(&task_id).await.unwrap().unwrap();
+        let task = state.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "blocked");
         assert!(task
             .blocker
@@ -206,7 +206,7 @@ mod tests {
 
         assert!(result.contains("Blocker reported"));
 
-        let task = state.get_task_v3(&task_id).await.unwrap().unwrap();
+        let task = state.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "blocked");
         assert!(task
             .blocker

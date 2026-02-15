@@ -23,7 +23,7 @@ use crate::startup::{
 use crate::state::SqliteStateStore;
 use crate::tasks::TaskRegistry;
 use crate::traits::store_prelude::*;
-use crate::traits::GoalV3;
+use crate::traits::Goal;
 use crate::triggers::{self, TriggerManager};
 
 const LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC: &str =
@@ -219,7 +219,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         0
     };
 
-    // Goal token registry for V3 cancellation hierarchy
+    // Goal token registry for cancellation hierarchy
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
     let agent = Arc::new(Agent::new(
@@ -256,7 +256,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         st.set_agent(Arc::downgrade(&agent));
     }
 
-    // Give the agent a weak self-reference for background V3 task spawning.
+    // Give the agent a weak self-reference for background task spawning.
     agent.set_self_ref(Arc::downgrade(&agent)).await;
 
     // 8. Event bus for triggers
@@ -345,7 +345,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         st.set_hub(Arc::downgrade(&hub));
     }
 
-    // Give the agent a reference to the hub for V3 background task notifications.
+    // Give the agent a reference to the hub for background task notifications.
     agent.set_hub(Arc::downgrade(&hub)).await;
 
     // Start the heartbeat coordinator now that hub and agent are available.
@@ -1010,7 +1010,7 @@ fn spawn_trigger_event_listener(
     });
 }
 
-fn is_legacy_system_maintenance_goal(goal: &GoalV3) -> bool {
+fn is_legacy_system_maintenance_goal(goal: &Goal) -> bool {
     if goal.session_id != LEGACY_SYSTEM_SESSION_ID {
         return false;
     }
@@ -1035,8 +1035,8 @@ async fn retire_legacy_system_maintenance_goals(
     state: Arc<SqliteStateStore>,
 ) -> anyhow::Result<LegacyMaintenanceMigrationStats> {
     let mut stats = LegacyMaintenanceMigrationStats::default();
-    let scheduled_goals = state.get_scheduled_goals_v3().await?;
-    let legacy_goals: Vec<GoalV3> = scheduled_goals
+    let scheduled_goals = state.get_scheduled_goals().await?;
+    let legacy_goals: Vec<Goal> = scheduled_goals
         .into_iter()
         .filter(is_legacy_system_maintenance_goal)
         .collect();
@@ -1055,11 +1055,11 @@ async fn retire_legacy_system_maintenance_goals(
             updated_goal.status = "cancelled".to_string();
             updated_goal.completed_at = Some(now.clone());
             updated_goal.updated_at = now.clone();
-            state.update_goal_v3(&updated_goal).await?;
+            state.update_goal(&updated_goal).await?;
             stats.goals_retired += 1;
         }
 
-        let tasks = state.get_tasks_for_goal_v3(&goal.id).await?;
+        let tasks = state.get_tasks_for_goal(&goal.id).await?;
         for mut task in tasks {
             if !is_open_goal_task_status(&task.status) {
                 continue;
@@ -1074,7 +1074,7 @@ async fn retire_legacy_system_maintenance_goals(
             if !has_result {
                 task.result = Some(retirement_note.to_string());
             }
-            state.update_task_v3(&task).await?;
+            state.update_task(&task).await?;
             stats.tasks_closed += 1;
         }
 
@@ -1468,7 +1468,7 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         - Gently point out patterns the owner might miss\n\
         - Be a thoughtful friend, not a relationship therapist";
 
-    let v3_orchestration_section = "\n\n## Orchestrator Mode\n\
+    let orchestration_section = "\n\n## Orchestrator Mode\n\
          You are a ROUTER, not an executor. You have NO tools — do not reference or attempt tool use.\n\
          Classify the user's intent and respond conversationally. The system handles delegation \
          automatically based on your classification.\n\n\
@@ -1527,7 +1527,9 @@ episodic memory (past session summaries), procedural memory (learned workflows),
 goals, expertise levels, and behavior patterns.
 
 Reference memories conversationally: \"Since you mentioned X last time...\" \
-When you learn something important, store it with `remember_fact`. \
+When you learn something important, store it with `remember_fact` (stable facts/preferences). \
+For personal goals/habits the user wants tracked over time, use `manage_memories` (create_personal_goal/list_goals/complete_goal/abandon_goal). \
+Do NOT store goals as facts. \
 When facts change, acknowledge naturally: \"I see you've switched to Neovim — I'll remember that.\"
 
 ## Planning
@@ -1650,7 +1652,7 @@ STOP asking and USE YOUR TOOLS immediately. Never claim you can't access files o
 - **Be concise.** Adjust verbosity to user preferences.
 - **Plain text math.** Never use LaTeX ($...$, \\times, \\frac). Use plain symbols: × ÷ √ ≈ ≤ ≥ and a/b for fractions.
 - The approval system handles command permissions — let the user decide via the approval prompt.\
-{social_intelligence_guidelines}{v3_orchestration_section}"
+{social_intelligence_guidelines}{orchestration_section}"
     )
 }
 
@@ -1658,7 +1660,7 @@ STOP asking and USE YOUR TOOLS immediately. Never claim you can't access files o
 mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
-    use crate::traits::{NotificationEntry, TaskV3};
+    use crate::traits::{Goal, GoalSchedule, NotificationEntry, Task};
 
     async fn setup_state() -> Arc<SqliteStateStore> {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -1673,11 +1675,10 @@ mod tests {
         state
     }
 
-    fn legacy_goal_with_context(system_goal: &str, description: &str) -> GoalV3 {
-        let mut goal = GoalV3::new_continuous(
+    fn legacy_goal_with_context(system_goal: &str, description: &str) -> Goal {
+        let mut goal = Goal::new_continuous(
             description,
             LEGACY_SYSTEM_SESSION_ID,
-            "0 */6 * * *",
             Some(5000),
             Some(20000),
         );
@@ -1691,9 +1692,9 @@ mod tests {
         goal
     }
 
-    fn task_for_goal(goal_id: &str, status: &str) -> TaskV3 {
+    fn task_for_goal(goal_id: &str, status: &str) -> Task {
         let now = chrono::Utc::now().to_rfc3339();
-        TaskV3 {
+        Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal_id.to_string(),
             description: format!("legacy task ({})", status),
@@ -1716,6 +1717,30 @@ mod tests {
         }
     }
 
+    async fn attach_schedule(
+        state: &Arc<SqliteStateStore>,
+        goal_id: &str,
+        cron_expr: &str,
+    ) -> anyhow::Result<GoalSchedule> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal_id.to_string(),
+            cron_expr: cron_expr.to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some(cron_expr.to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        state.create_goal_schedule(&schedule).await?;
+        Ok(schedule)
+    }
+
     #[tokio::test]
     async fn migrate_legacy_maintenance_goals_retires_goals_and_cleans_work() {
         let state = setup_state().await;
@@ -1724,22 +1749,27 @@ mod tests {
             "knowledge_maintenance",
             LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC,
         );
-        let user_goal = GoalV3::new_continuous(
+        let user_goal = Goal::new_continuous(
             "User recurring goal",
             "user-session",
-            "0 9 * * *",
             Some(1000),
             Some(5000),
         );
-        state.create_goal_v3(&legacy_goal).await.unwrap();
-        state.create_goal_v3(&user_goal).await.unwrap();
+        state.create_goal(&legacy_goal).await.unwrap();
+        state.create_goal(&user_goal).await.unwrap();
+        attach_schedule(&state, &legacy_goal.id, "0 */6 * * *")
+            .await
+            .unwrap();
+        attach_schedule(&state, &user_goal.id, "0 9 * * *")
+            .await
+            .unwrap();
 
         let pending_task = task_for_goal(&legacy_goal.id, "pending");
         let running_task = task_for_goal(&legacy_goal.id, "running");
         let completed_task = task_for_goal(&legacy_goal.id, "completed");
-        state.create_task_v3(&pending_task).await.unwrap();
-        state.create_task_v3(&running_task).await.unwrap();
-        state.create_task_v3(&completed_task).await.unwrap();
+        state.create_task(&pending_task).await.unwrap();
+        state.create_task(&running_task).await.unwrap();
+        state.create_task(&completed_task).await.unwrap();
 
         let legacy_notification = NotificationEntry::new(
             &legacy_goal.id,
@@ -1767,11 +1797,11 @@ mod tests {
         assert_eq!(stats.tasks_closed, 2);
         assert_eq!(stats.notifications_deleted, 1);
 
-        let updated_goal = state.get_goal_v3(&legacy_goal.id).await.unwrap().unwrap();
+        let updated_goal = state.get_goal(&legacy_goal.id).await.unwrap().unwrap();
         assert_eq!(updated_goal.status, "cancelled");
         assert!(updated_goal.completed_at.is_some());
 
-        let tasks = state.get_tasks_for_goal_v3(&legacy_goal.id).await.unwrap();
+        let tasks = state.get_tasks_for_goal(&legacy_goal.id).await.unwrap();
         let closed_count = tasks
             .iter()
             .filter(|t| t.description.contains("legacy task (pending)"))
@@ -1814,14 +1844,16 @@ mod tests {
     async fn migrate_legacy_maintenance_goals_uses_description_fallback() {
         let state = setup_state().await;
 
-        let legacy_goal = GoalV3::new_continuous(
+        let legacy_goal = Goal::new_continuous(
             LEGACY_MEMORY_HEALTH_GOAL_DESC,
             LEGACY_SYSTEM_SESSION_ID,
-            "30 3 * * *",
             Some(1000),
             Some(5000),
         );
-        state.create_goal_v3(&legacy_goal).await.unwrap();
+        state.create_goal(&legacy_goal).await.unwrap();
+        attach_schedule(&state, &legacy_goal.id, "30 3 * * *")
+            .await
+            .unwrap();
 
         let stats = retire_legacy_system_maintenance_goals(state.clone())
             .await
@@ -1829,7 +1861,7 @@ mod tests {
         assert_eq!(stats.goals_matched, 1);
         assert_eq!(stats.goals_retired, 1);
 
-        let updated = state.get_goal_v3(&legacy_goal.id).await.unwrap().unwrap();
+        let updated = state.get_goal(&legacy_goal.id).await.unwrap().unwrap();
         assert_eq!(updated.status, "cancelled");
     }
 
@@ -1838,9 +1870,12 @@ mod tests {
         let state = setup_state().await;
 
         let legacy_goal = legacy_goal_with_context("memory_health", LEGACY_MEMORY_HEALTH_GOAL_DESC);
-        state.create_goal_v3(&legacy_goal).await.unwrap();
+        state.create_goal(&legacy_goal).await.unwrap();
+        attach_schedule(&state, &legacy_goal.id, "30 3 * * *")
+            .await
+            .unwrap();
         let pending_task = task_for_goal(&legacy_goal.id, "pending");
-        state.create_task_v3(&pending_task).await.unwrap();
+        state.create_task(&pending_task).await.unwrap();
         let notification = NotificationEntry::new(
             &legacy_goal.id,
             &legacy_goal.session_id,
@@ -1869,10 +1904,9 @@ mod tests {
     async fn migrate_legacy_maintenance_goals_does_not_touch_user_goals() {
         let state = setup_state().await;
 
-        let mut user_goal = GoalV3::new_continuous(
+        let mut user_goal = Goal::new_continuous(
             LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC,
             "user-session",
-            "0 */6 * * *",
             Some(5000),
             Some(20000),
         );
@@ -1882,7 +1916,10 @@ mod tests {
             })
             .to_string(),
         );
-        state.create_goal_v3(&user_goal).await.unwrap();
+        state.create_goal(&user_goal).await.unwrap();
+        attach_schedule(&state, &user_goal.id, "0 */6 * * *")
+            .await
+            .unwrap();
 
         let stats = retire_legacy_system_maintenance_goals(state.clone())
             .await
@@ -1890,7 +1927,7 @@ mod tests {
         assert_eq!(stats.goals_matched, 0);
         assert_eq!(stats.goals_retired, 0);
 
-        let unchanged = state.get_goal_v3(&user_goal.id).await.unwrap().unwrap();
+        let unchanged = state.get_goal(&user_goal.id).await.unwrap().unwrap();
         assert_eq!(unchanged.status, "active");
     }
 }
