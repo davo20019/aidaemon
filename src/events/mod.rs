@@ -3,17 +3,20 @@
 //! This module provides a pure event-sourcing system where all agent activity
 //! is captured as immutable events. Events serve multiple purposes:
 //! - **Working context**: Answer "what are you doing?" and "what was the error?"
-//! - **Conversation history**: Replace the messages table
+//! - **Conversation history**: Canonical chat/task timeline
 //! - **Learning input**: Feed the consolidation system for long-term memory
 //! - **Audit trail**: Full debugging and reconstruction capability
 
 mod consolidation;
 mod context;
+mod conversation_turn;
 mod payloads;
 mod store;
 
 pub use consolidation::{Consolidator, Pruner};
 pub use context::SessionContextCompiler;
+#[allow(unused_imports)]
+pub use conversation_turn::{turn_from_event, ConversationTurn, ConversationTurnRole};
 pub use payloads::*;
 #[allow(unused_imports)]
 pub use store::{
@@ -83,7 +86,7 @@ pub enum EventType {
     /// Session ended (explicit or timeout)
     SessionEnd,
 
-    // === Conversation (replaces messages table) ===
+    // === Conversation ===
     /// User sent a message
     UserMessage,
     /// Assistant generated a response

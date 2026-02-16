@@ -254,7 +254,7 @@ async fn test_get_history_hydrates_from_events_when_available() {
 }
 
 #[tokio::test]
-async fn test_get_context_falls_back_to_history_when_messages_table_missing() {
+async fn test_get_context_uses_event_history() {
     let (store, _db) = setup_test_store().await;
     let session = "sess-context-fallback";
     let now = Utc::now();
@@ -273,16 +273,188 @@ async fn test_get_context_falls_back_to_history_when_messages_table_missing() {
     )
     .await;
 
-    sqlx::query("DROP TABLE messages")
-        .execute(&store.pool())
-        .await
-        .unwrap();
-
     let context = store.get_context(session, "context", 10).await.unwrap();
     assert_eq!(context.len(), 1);
     assert_eq!(context[0].id, "msg-context-1");
     assert_eq!(context[0].role, "user");
     assert_eq!(context[0].content.as_deref(), Some("Context from events"));
+}
+
+#[tokio::test]
+async fn test_open_store_migrates_legacy_messages_to_events() {
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_url = format!("sqlite:{}", db_file.path().display());
+    let pool = sqlx::SqlitePool::connect(&db_url).await.unwrap();
+
+    sqlx::query(
+        "CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_call_id TEXT,
+            tool_name TEXT,
+            tool_calls_json TEXT,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO messages (id, session_id, role, content, created_at)
+         VALUES ('legacy-u-1', 'sess-migrate', 'user', 'hello from legacy', ?)",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO messages (id, session_id, role, content, created_at)
+         VALUES ('legacy-a-1', 'sess-migrate', 'assistant', 'legacy reply', ?)",
+    )
+    .bind((Utc::now() + chrono::Duration::seconds(1)).to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    pool.close().await;
+
+    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let store = SqliteStateStore::new(
+        db_file.path().to_str().unwrap(),
+        100,
+        None,
+        embedding_service,
+    )
+    .await
+    .unwrap();
+
+    let has_messages_table: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages' LIMIT 1",
+    )
+    .fetch_optional(&store.pool())
+    .await
+    .unwrap();
+    assert!(has_messages_table.is_none());
+
+    let history = store.get_history("sess-migrate", 10).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].id, "legacy-u-1");
+    assert_eq!(history[0].role, "user");
+    assert_eq!(history[1].id, "legacy-a-1");
+    assert_eq!(history[1].role, "assistant");
+
+    let event_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM events
+         WHERE session_id = 'sess-migrate'
+           AND event_type IN ('user_message', 'assistant_response', 'tool_result')",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(event_rows, 2);
+}
+
+#[tokio::test]
+async fn test_open_store_migration_skips_preexisting_event_rows() {
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_url = format!("sqlite:{}", db_file.path().display());
+    let pool = sqlx::SqlitePool::connect(&db_url).await.unwrap();
+
+    crate::db::migrations::migrate_events(&pool).await.unwrap();
+
+    sqlx::query(
+        "CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_call_id TEXT,
+            tool_name TEXT,
+            tool_calls_json TEXT,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let t0 = Utc::now();
+    sqlx::query(
+        "INSERT INTO messages (id, session_id, role, content, created_at)
+         VALUES ('legacy-u-dup-1', 'sess-migrate-dedupe', 'user', 'hello', ?)",
+    )
+    .bind(t0.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO messages (id, session_id, role, content, created_at)
+         VALUES ('legacy-a-dup-1', 'sess-migrate-dedupe', 'assistant', 'reply', ?)",
+    )
+    .bind((t0 + chrono::Duration::seconds(1)).to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Simulate a partial prior migration run: first row already exists in events.
+    sqlx::query(
+        "INSERT INTO events (session_id, event_type, data, created_at)
+         VALUES (?, 'user_message', ?, ?)",
+    )
+    .bind("sess-migrate-dedupe")
+    .bind(
+        serde_json::json!({
+            "message_id": "legacy-u-dup-1",
+            "content": "hello",
+            "has_attachments": false
+        })
+        .to_string(),
+    )
+    .bind(t0.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    pool.close().await;
+
+    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let store = SqliteStateStore::new(
+        db_file.path().to_str().unwrap(),
+        100,
+        None,
+        embedding_service,
+    )
+    .await
+    .unwrap();
+
+    let duplicate_user_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM events
+         WHERE session_id = 'sess-migrate-dedupe'
+           AND event_type = 'user_message'
+           AND json_extract(data, '$.message_id') = 'legacy-u-dup-1'",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(duplicate_user_events, 1);
+
+    let total_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM events
+         WHERE session_id = 'sess-migrate-dedupe'
+           AND event_type IN ('user_message', 'assistant_response', 'tool_result')",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(total_events, 2);
 }
 
 // ==================== Fact Tests ====================
@@ -739,6 +911,97 @@ async fn test_get_relevant_facts_freshness_boost_does_not_override_threshold() {
     assert!(
         facts.iter().any(|f| f.key == "above_threshold"),
         "Above-threshold semantic match should be returned"
+    );
+}
+
+#[tokio::test]
+async fn test_get_relevant_facts_does_not_pad_with_unrelated_recent_facts() {
+    let (store, _db) = setup_test_store().await;
+
+    let query = "rust deployment strategy";
+    let q = store
+        .embedding_service
+        .embed(query.to_string())
+        .await
+        .unwrap();
+    let q_norm = (q.iter().map(|x| x * x).sum::<f32>()).sqrt();
+    assert!(q_norm > 0.0);
+    let uq: Vec<f32> = q.iter().map(|x| x / q_norm).collect();
+
+    let mut r = vec![0.0f32; uq.len()];
+    r[0] = 1.0;
+    let proj = r.iter().zip(uq.iter()).map(|(a, b)| a * b).sum::<f32>();
+    let mut o: Vec<f32> = r.iter().zip(uq.iter()).map(|(a, b)| a - proj * b).collect();
+    let o_norm = (o.iter().map(|x| x * x).sum::<f32>()).sqrt();
+    assert!(o_norm > 1e-6);
+    for v in o.iter_mut() {
+        *v /= o_norm;
+    }
+    let uo = o;
+
+    let mk = |cos: f32| -> Vec<f32> {
+        let sin = (1.0 - cos * cos).sqrt();
+        uq.iter()
+            .zip(uo.iter())
+            .map(|(a, b)| cos * a + sin * b)
+            .collect()
+    };
+
+    store
+        .upsert_fact(
+            "project",
+            "deploy_notes",
+            "Use canary rollout for Rust API",
+            "user",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_fact(
+            "travel",
+            "vacation_city",
+            "Barcelona",
+            "user",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let old_ts = (now - chrono::Duration::days(8)).to_rfc3339();
+    let fresh_ts = now.to_rfc3339();
+
+    let emb_relevant = encode_embedding(&mk(0.52));
+    let emb_unrelated = encode_embedding(&mk(0.20));
+
+    sqlx::query("UPDATE facts SET embedding = ?, updated_at = ? WHERE category = ? AND key = ?")
+        .bind(&emb_relevant)
+        .bind(&old_ts)
+        .bind("project")
+        .bind("deploy_notes")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE facts SET embedding = ?, updated_at = ? WHERE category = ? AND key = ?")
+        .bind(&emb_unrelated)
+        .bind(&fresh_ts)
+        .bind("travel")
+        .bind("vacation_city")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+    let facts = store.get_relevant_facts(query, 6).await.unwrap();
+    assert!(
+        facts.iter().any(|f| f.key == "deploy_notes"),
+        "Above-threshold fact should be returned"
+    );
+    assert!(
+        facts.iter().all(|f| f.key != "vacation_city"),
+        "Unrelated recent fact should not be padded into relevant results"
     );
 }
 
@@ -1204,6 +1467,41 @@ async fn test_update_behavior_pattern_confidence() {
     assert!(patterns[0].last_seen_at.is_some());
 }
 
+#[tokio::test]
+async fn test_record_behavior_pattern_upserts_by_logical_key() {
+    let (store, _db) = setup_test_store().await;
+
+    store
+        .record_behavior_pattern(
+            "failure",
+            "Tool terminal repeatedly fails on permission denied; pivot sooner.",
+            Some("terminal"),
+            Some("pivot"),
+            0.7,
+            1,
+        )
+        .await
+        .unwrap();
+
+    store
+        .record_behavior_pattern(
+            "failure",
+            "Tool terminal repeatedly fails on permission denied; pivot sooner.",
+            Some("terminal"),
+            Some("pivot"),
+            0.8,
+            2,
+        )
+        .await
+        .unwrap();
+
+    let patterns = store.get_behavior_patterns(0.0).await.unwrap();
+    assert_eq!(patterns.len(), 1);
+    assert_eq!(patterns[0].pattern_type, "failure");
+    assert_eq!(patterns[0].occurrence_count, 3);
+    assert!(patterns[0].confidence >= 0.7);
+}
+
 // ==================== Procedure Tests ====================
 
 #[tokio::test]
@@ -1266,6 +1564,57 @@ async fn test_procedure_success_count_increments() {
         "Expected success_count >= 2 after upsert conflict, got {}",
         procs[0].success_count
     );
+}
+
+#[tokio::test]
+async fn test_procedure_upsert_accumulates_failure_and_updates_trigger() {
+    let (store, _db) = setup_test_store().await;
+
+    let procedure = Procedure {
+        id: 0,
+        name: "run-tests-1234abcd".to_string(),
+        trigger_pattern: "run test suite".to_string(),
+        steps: vec!["cargo test".to_string()],
+        success_count: 1,
+        failure_count: 0,
+        avg_duration_secs: Some(20.0),
+        last_used_at: Some(Utc::now()),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    store.upsert_procedure(&procedure).await.unwrap();
+
+    let failure_update = Procedure {
+        id: 0,
+        name: "run-tests-1234abcd".to_string(),
+        trigger_pattern: "run complete test suite in ci".to_string(),
+        steps: vec!["cargo test --workspace".to_string()],
+        success_count: 0,
+        failure_count: 1,
+        avg_duration_secs: None,
+        last_used_at: Some(Utc::now()),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    store.upsert_procedure(&failure_update).await.unwrap();
+
+    let row = sqlx::query(
+        "SELECT success_count, failure_count, trigger_pattern
+         FROM procedures WHERE name = ?",
+    )
+    .bind("run-tests-1234abcd")
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+
+    let success_count: i32 = row.get("success_count");
+    let failure_count: i32 = row.get("failure_count");
+    let trigger_pattern: String = row.get("trigger_pattern");
+
+    assert_eq!(success_count, 1);
+    assert_eq!(failure_count, 1);
+    assert_eq!(trigger_pattern, "run complete test suite in ci");
 }
 
 // ==================== Error Solution Tests ====================

@@ -9,8 +9,8 @@ use tracing::info;
 use crate::config::AppConfig;
 use crate::events::EventStore;
 use crate::health::HealthProbeStore;
+use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
-use crate::router::{Router, Tier};
 use crate::state::SqliteStateStore;
 use crate::tools::terminal::ApprovalRequest;
 #[cfg(feature = "browser")]
@@ -21,12 +21,12 @@ use crate::tools::{
     CheckEnvironmentTool, CliAgentTool, ConfigManagerTool, DiagnoseTool, EditFileTool,
     GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool,
     ManageCliAgentsTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool,
-    ProjectInspectTool, ReadFileTool, RememberFactTool, RunCommandTool, ScheduledGoalRunsTool,
-    SearchFilesTool, SendFileTool, ServiceStatusTool, ShareMemoryTool, SpawnAgentTool,
-    SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    PolicyMetricsTool, ProjectInspectTool, ReadFileTool, RememberFactTool, RunCommandTool,
+    ScheduledGoalRunsTool, SearchFilesTool, SendFileTool, ServiceStatusTool, ShareMemoryTool,
+    SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 use crate::traits::store_prelude::*;
-use crate::traits::ModelProvider;
 use crate::traits::Tool;
 use crate::types::MediaMessage;
 
@@ -58,6 +58,7 @@ enum BaseToolId {
     ScheduledGoalRuns,
     GoalTrace,
     ToolTrace,
+    PolicyMetrics,
     ConfigManager,
     WebFetch,
     WebSearch,
@@ -84,6 +85,7 @@ impl BaseToolId {
             BaseToolId::ScheduledGoalRuns => "scheduled_goal_runs",
             BaseToolId::GoalTrace => "goal_trace",
             BaseToolId::ToolTrace => "tool_trace",
+            BaseToolId::PolicyMetrics => "policy_metrics",
             BaseToolId::ConfigManager => "manage_config",
             BaseToolId::WebFetch => "web_fetch",
             BaseToolId::WebSearch => "web_search",
@@ -110,6 +112,7 @@ const BASE_TOOL_MANIFEST: &[BaseToolId] = &[
     BaseToolId::ScheduledGoalRuns,
     BaseToolId::GoalTrace,
     BaseToolId::ToolTrace,
+    BaseToolId::PolicyMetrics,
     BaseToolId::ConfigManager,
     BaseToolId::WebFetch,
     BaseToolId::WebSearch,
@@ -324,8 +327,7 @@ pub async fn register_optional_tools(
     config: &AppConfig,
     state: Arc<SqliteStateStore>,
     event_store: Arc<EventStore>,
-    provider: Arc<dyn ModelProvider>,
-    router: &Router,
+    llm_runtime: SharedLlmRuntime,
     health_store: Option<Arc<HealthProbeStore>>,
     approval_tx: mpsc::Sender<ApprovalRequest>,
     media_tx: mpsc::Sender<MediaMessage>,
@@ -342,8 +344,7 @@ pub async fn register_optional_tools(
                 tools.push(Arc::new(DiagnoseTool::new(
                     event_store.clone(),
                     state.clone(),
-                    provider.clone(),
-                    router.select(Tier::Fast).to_string(),
+                    llm_runtime.clone(),
                     config.diagnostics.max_events,
                     config.diagnostics.include_raw_tool_args,
                 )));
@@ -376,7 +377,7 @@ pub async fn register_optional_tools(
                 let cli_tool = CliAgentTool::discover(
                     config.cli_agents.clone(),
                     state.clone(),
-                    provider.clone(),
+                    llm_runtime.clone(),
                     approval_tx.clone(),
                 )
                 .await;
@@ -602,6 +603,7 @@ async fn build_base_tool(
         BaseToolId::ScheduledGoalRuns => Arc::new(ScheduledGoalRunsTool::new(state)),
         BaseToolId::GoalTrace => Arc::new(GoalTraceTool::new(state)),
         BaseToolId::ToolTrace => Arc::new(ToolTraceTool::new(state)),
+        BaseToolId::PolicyMetrics => Arc::new(PolicyMetricsTool),
         BaseToolId::ConfigManager => Arc::new(ConfigManagerTool::new(
             config_path.to_path_buf(),
             approval_tx,

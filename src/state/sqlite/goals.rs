@@ -959,6 +959,26 @@ impl crate::traits::GoalStore for SqliteStateStore {
         Ok(result.rows_affected())
     }
 
+    async fn set_goal_budgets(
+        &self,
+        goal_id: &str,
+        budget_per_check: Option<i64>,
+        budget_daily: Option<i64>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE goals SET budget_per_check = COALESCE(?, budget_per_check),
+                              budget_daily = COALESCE(?, budget_daily),
+                              updated_at = ? WHERE id = ?",
+        )
+        .bind(budget_per_check)
+        .bind(budget_daily)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(goal_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn add_goal_tokens_and_get_budget_status(
         &self,
         goal_id: &str,

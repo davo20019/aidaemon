@@ -153,7 +153,7 @@ mod tests {
         let tool = ReadFileTool;
         let schema = tool.schema();
         assert_eq!(schema["name"], "read_file");
-        assert!(schema["description"].as_str().unwrap().len() > 0);
+        assert!(!schema["description"].as_str().unwrap().is_empty());
         assert!(schema["parameters"]["properties"]["path"].is_object());
     }
 

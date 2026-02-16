@@ -208,6 +208,38 @@ cargo test test_tool_execution        # run a single integration test
 
 First run downloads the fastembed model (~25MB, cached in `~/.cache/`).
 
+## Debugging with db_probe
+
+The database is encrypted with SQLCipher. To inspect it, use `src/bin/db_probe.rs` — a CLI tool that connects with the encryption key and dumps diagnostic data.
+
+**Prerequisites:** Requires `AIDAEMON_ENCRYPTION_KEY` env var (or in `.env` file). Optionally set `AIDAEMON_DB_PATH` (defaults to `aidaemon.db`).
+
+```bash
+# Build and run (encryption feature required)
+cargo run --bin db_probe --features encryption
+
+# Search message history for a keyword (with surrounding context)
+cargo run --bin db_probe --features encryption -- --search "dogs-project"
+cargo run --bin db_probe --features encryption -- --search "error" --search-limit 20 --search-context 10
+
+# Inspect a specific session's events and messages
+cargo run --bin db_probe --features encryption -- --session "telegram:12345"
+
+# Inspect a specific task's full event stream
+cargo run --bin db_probe --features encryption -- --task "task-uuid-here"
+
+# Inspect a specific CLI agent invocation
+cargo run --bin db_probe --features encryption -- --invocation 42
+
+# Repair stale CLI agent invocations (no completion recorded, older than N hours)
+cargo run --bin db_probe --features encryption -- --repair-stale-cli 24
+
+# Change token usage lookback window (default: 7 hours, max: 720)
+cargo run --bin db_probe --features encryption -- --token-hours 24
+```
+
+**Default output includes:** recent CLI agent invocations, open (incomplete) invocations, token usage stats (totals, per-session, hourly), recent task events, recent `cli_agent` tool events, recent messages, and dynamic CLI agent config.
+
 ## MCP Tools
 
 - When using chrome-devtools, prefer `take_screenshot` over `take_snapshot` to save tokens. Only use `take_snapshot` when you specifically need element UIDs for interaction (clicking, filling, etc.).

@@ -43,7 +43,7 @@ impl Tool for RememberFactTool {
     fn schema(&self) -> Value {
         json!({
             "name": "remember_fact",
-            "description": "Store a fact about the user or environment for long-term memory. Facts are injected into your system prompt on every request. Do NOT use this for personal goals or scheduled work; use the manage_memories tool (create_personal_goal / create_scheduled_goal) for goals.",
+            "description": "Store a stable, long-term fact about the user or their environment. Facts are injected into your system prompt on every request, so only store things that are persistently useful — user preferences, personal info, environment details, communication patterns. Do NOT store task-scoped research, reference data gathered for a specific project, or content being built (e.g., product prices, API docs, website copy). Do NOT use this for personal goals or scheduled work; use the manage_memories tool (create_personal_goal / create_scheduled_goal) for goals.",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -1,24 +1,211 @@
 use chrono::{Datelike, TimeZone, Timelike};
 use sqlx::Row;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 
-pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
-    // Create tables
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS messages (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT,
-            tool_call_id TEXT,
-            tool_name TEXT,
-            tool_calls_json TEXT,
-            created_at TEXT NOT NULL
-        )",
+async fn migrate_legacy_messages_to_events(pool: &SqlitePool) -> anyhow::Result<()> {
+    let has_messages = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages' LIMIT 1",
     )
-    .execute(pool)
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+
+    if !has_messages {
+        return Ok(());
+    }
+
+    let rows = sqlx::query(
+        "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at
+         FROM messages
+         ORDER BY created_at ASC, id ASC",
+    )
+    .fetch_all(pool)
     .await?;
 
+    let existing_rows = sqlx::query(
+        "SELECT e.session_id AS session_id,
+                e.event_type AS event_type,
+                CAST(json_extract(e.data, '$.message_id') AS TEXT) AS message_id
+         FROM events e
+         INNER JOIN (SELECT DISTINCT session_id FROM messages) m
+           ON m.session_id = e.session_id
+         WHERE e.event_type IN ('user_message', 'assistant_response', 'tool_result')
+           AND json_extract(e.data, '$.message_id') IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut existing_keys: HashSet<(String, String, String)> = existing_rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("session_id"),
+                row.get("event_type"),
+                row.get("message_id"),
+            )
+        })
+        .collect();
+
+    let mut tx = pool.begin().await?;
+    let mut scanned: u64 = 0;
+    let mut migrated: u64 = 0;
+
+    for row in rows {
+        scanned += 1;
+
+        let message_id: String = row.get("id");
+        let message_id_key = message_id.clone();
+        let session_id: String = row.get("session_id");
+        let role: String = row.get("role");
+        let content: Option<String> = row.get("content");
+        let tool_call_id: Option<String> = row.get("tool_call_id");
+        let tool_name: Option<String> = row.get("tool_name");
+        let tool_calls_json: Option<String> = row.get("tool_calls_json");
+        let created_at: String = row.get("created_at");
+
+        let (event_type, payload, event_tool_name): (&str, serde_json::Value, Option<String>) =
+            match role.as_str() {
+                "user" => (
+                    "user_message",
+                    serde_json::json!({
+                        "content": content.unwrap_or_default(),
+                        "message_id": message_id,
+                        "has_attachments": false
+                    }),
+                    None,
+                ),
+                "tool" => (
+                    "tool_result",
+                    {
+                        let fallback_tool_call_id = format!("legacy-tool-{}", message_id);
+                        serde_json::json!({
+                            "message_id": message_id,
+                            "tool_call_id": tool_call_id.unwrap_or(fallback_tool_call_id),
+                            "name": tool_name.clone().unwrap_or_else(|| "system".to_string()),
+                            "result": content.unwrap_or_default(),
+                            "success": true,
+                            "duration_ms": 0,
+                            "error": serde_json::Value::Null,
+                            "task_id": serde_json::Value::Null
+                        })
+                    },
+                    tool_name,
+                ),
+                _ => {
+                    let parsed_tool_calls = tool_calls_json
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
+                        .map(|calls| {
+                            calls
+                                .into_iter()
+                                .filter_map(|tc| {
+                                    let id = tc.get("id")?.as_str()?;
+                                    let name = tc.get("name")?.as_str()?;
+                                    let arguments = tc
+                                        .get("arguments")
+                                        .cloned()
+                                        .and_then(|args| match args {
+                                            serde_json::Value::String(raw) => {
+                                                serde_json::from_str::<serde_json::Value>(&raw).ok()
+                                            }
+                                            other => Some(other),
+                                        })
+                                        .unwrap_or_else(|| serde_json::json!({}));
+                                    let extra_content = tc.get("extra_content").cloned();
+
+                                    let mut obj = serde_json::Map::new();
+                                    obj.insert("id".to_string(), serde_json::json!(id));
+                                    obj.insert("name".to_string(), serde_json::json!(name));
+                                    obj.insert("arguments".to_string(), arguments);
+                                    if let Some(extra) = extra_content {
+                                        obj.insert("extra_content".to_string(), extra);
+                                    }
+                                    Some(serde_json::Value::Object(obj))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|v| !v.is_empty());
+
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("message_id".to_string(), serde_json::json!(message_id));
+                    payload.insert("content".to_string(), serde_json::json!(content));
+                    payload.insert(
+                        "model".to_string(),
+                        serde_json::json!("legacy-messages-migration"),
+                    );
+                    if let Some(tool_calls) = parsed_tool_calls {
+                        payload.insert("tool_calls".to_string(), serde_json::json!(tool_calls));
+                    }
+
+                    (
+                        "assistant_response",
+                        serde_json::Value::Object(payload),
+                        None,
+                    )
+                }
+            };
+
+        let dedupe_key = (
+            session_id.clone(),
+            event_type.to_string(),
+            message_id_key.clone(),
+        );
+        if existing_keys.contains(&dedupe_key) {
+            continue;
+        }
+
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at, task_id, tool_name)
+             VALUES (?, ?, ?, ?, NULL, ?)",
+        )
+        .bind(&session_id)
+        .bind(event_type)
+        .bind(payload.to_string())
+        .bind(&created_at)
+        .bind(event_tool_name.as_deref())
+        .execute(&mut *tx)
+        .await?;
+
+        existing_keys.insert(dedupe_key);
+        migrated += 1;
+        if scanned.is_multiple_of(5_000) {
+            tracing::info!(
+                scanned_rows = scanned,
+                migrated_rows = migrated,
+                "Migrating legacy messages table into events"
+            );
+        }
+    }
+
+    // Legacy conversation rows are now represented in the canonical event log.
+    sqlx::query("DROP TABLE IF EXISTS messages")
+        .execute(&mut *tx)
+        .await?;
+
+    // Clean obsolete projection toggles from runtime settings.
+    let _ = sqlx::query(
+        "DELETE FROM settings WHERE key IN ('enable_event_to_messages_projection', 'event_projection_last_id')",
+    )
+    .execute(&mut *tx)
+    .await;
+
+    tx.commit().await?;
+
+    tracing::info!(
+        scanned_rows = scanned,
+        migrated_rows = migrated,
+        "Migrated legacy messages table into events and removed legacy table"
+    );
+
+    Ok(())
+}
+
+pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
+    // Ensure canonical events schema exists even when only SqliteStateStore is
+    // initialized (without EventStore bootstrap).
+    crate::db::migrations::migrate_events(pool).await?;
+
+    // Create tables
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,33 +219,6 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)",
-    )
-    .execute(pool)
-    .await?;
-
-    // --- Migrations for Advanced Memory ---
-    // 1. Add importance column
-    let _ = sqlx::query("ALTER TABLE messages ADD COLUMN importance REAL DEFAULT 0.5")
-        .execute(pool)
-        .await; // Ignore error if exists
-
-    // 2. Add embedding column
-    let _ = sqlx::query("ALTER TABLE messages ADD COLUMN embedding BLOB")
-        .execute(pool)
-        .await; // Ignore error if exists
-
-    // Add embedding_error column if it doesn't exist
-    let _ = sqlx::query("ALTER TABLE messages ADD COLUMN embedding_error TEXT")
-        .execute(pool)
-        .await;
-
-    // 4. Add consolidated_at column for memory consolidation (Layer 6)
-    let _ = sqlx::query("ALTER TABLE messages ADD COLUMN consolidated_at TEXT")
-        .execute(pool)
-        .await;
 
     // --- Human-Like Memory System Migrations ---
     // 5. Add new columns to facts table for supersession and recall tracking
@@ -513,6 +673,9 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Migrate legacy message rows into canonical events and remove the table.
+    migrate_legacy_messages_to_events(pool).await?;
+
     // --- Channel-Scoped Memory Migrations ---
     // Add channel_id and privacy columns to facts table
     let _ = sqlx::query("ALTER TABLE facts ADD COLUMN channel_id TEXT")
@@ -594,15 +757,25 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?
     .is_some();
 
-    let goals_has_goal_type = if has_goals {
+    let (goals_has_goal_type, goals_has_legacy_int_id) = if has_goals {
         let cols = sqlx::query("PRAGMA table_info(goals)")
             .fetch_all(pool)
             .await?;
-        cols.iter()
+        let mut has_goal_type = false;
+        let mut has_legacy_int_id = false;
+        for name in cols
+            .iter()
             .filter_map(|r| r.try_get::<String, _>("name").ok())
-            .any(|n| n == "goal_type")
+        {
+            if name == "goal_type" {
+                has_goal_type = true;
+            } else if name == "legacy_int_id" {
+                has_legacy_int_id = true;
+            }
+        }
+        (has_goal_type, has_legacy_int_id)
     } else {
-        false
+        (false, false)
     };
     let has_legacy_goals = has_goals && !goals_has_goal_type;
 
@@ -613,12 +786,37 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?
     .is_some();
 
+    // Keep the deprecated table for recovery, but only re-run heavy goal schema
+    // unification when it still contains rows that are not represented in unified goals.
+    let legacy_goals_deprecated_needs_migration = if has_legacy_goals_deprecated {
+        if !has_goals || !goals_has_goal_type || !goals_has_legacy_int_id {
+            true
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT 1
+                 FROM _goals_legacy_deprecated lg
+                 WHERE NOT EXISTS (
+                     SELECT 1
+                     FROM goals g
+                     WHERE g.domain = 'personal'
+                       AND g.legacy_int_id = lg.id
+                 )
+                 LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await?
+            .is_some()
+        }
+    } else {
+        false
+    };
+
     let should_unify_goal_schema = has_goals_v3
         || has_tasks_v3
         || has_task_activity_v3
         || has_scheduled_tasks
         || has_legacy_goals
-        || has_legacy_goals_deprecated;
+        || legacy_goals_deprecated_needs_migration;
 
     if should_unify_goal_schema {
         tracing::info!(
@@ -1052,12 +1250,12 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
                         .is_some();
 
                 if !goal_exists {
-	                    let (goal_type, priority, budget_per_check, budget_daily) = if legacy_is_oneshot
-	                    {
-	                        ("finite", "medium", Some(100_000i64), Some(500_000i64))
-	                    } else {
-	                        ("continuous", "low", Some(50_000i64), Some(200_000i64))
-	                    };
+                    let (goal_type, priority, budget_per_check, budget_daily) = if legacy_is_oneshot
+                    {
+                        ("finite", "medium", Some(100_000i64), Some(500_000i64))
+                    } else {
+                        ("continuous", "low", Some(50_000i64), Some(200_000i64))
+                    };
 
                     let status = if legacy_is_paused { "paused" } else { "active" };
 
@@ -1401,6 +1599,20 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
          WHERE goal_id IN (
             SELECT id FROM goals WHERE status IN ('cancelled', 'completed')
          )",
+    )
+    .execute(pool)
+    .await;
+
+    // Fix: reset inflated goal budgets caused by the auto-extension bug that
+    // persisted doubled budgets to DB. Any budget_daily above 500K was almost
+    // certainly ratcheted up by the auto-extension logic (standard defaults are
+    // 200K for continuous goals). Cap them back to 500K.
+    // Safe + idempotent — only touches goals with unreasonably high budgets.
+    let _ = sqlx::query(
+        "UPDATE goals
+         SET budget_daily = 500000
+         WHERE budget_daily > 500000
+           AND status IN ('active', 'pending', 'pending_confirmation')",
     )
     .execute(pool)
     .await;

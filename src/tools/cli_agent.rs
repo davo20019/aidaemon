@@ -1,6 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -18,6 +19,7 @@ use super::{
     daemon_guard::detect_daemonization_primitives,
 };
 use crate::config::CliAgentsConfig;
+use crate::llm_runtime::SharedLlmRuntime;
 use crate::tools::terminal::ApprovalRequest;
 use crate::traits::{DynamicCliAgent, ModelProvider, StateStore, Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
@@ -168,18 +170,70 @@ struct RunningCliAgent {
     working_dir: Option<String>,
 }
 
+/// A working directory claim with enough metadata to explain conflicts.
+struct WorkingDirClaim {
+    task_id: String,
+    tool_name: String,
+    prompt_summary: String,
+    dedup_prompt: String,
+}
+
+/// Jaccard similarity between two strings based on word-level bigrams.
+/// Returns a value in [0.0, 1.0].
+fn prompt_similarity(a: &str, b: &str) -> f64 {
+    fn bigrams(s: &str) -> HashSet<(String, String)> {
+        let words: Vec<&str> = s.split_whitespace().collect();
+        if words.len() < 2 {
+            // For single-word prompts, fall back to unigram set
+            return words
+                .into_iter()
+                .map(|w| (w.to_string(), String::new()))
+                .collect();
+        }
+        words
+            .windows(2)
+            .map(|w| (w[0].to_string(), w[1].to_string()))
+            .collect()
+    }
+
+    let set_a = bigrams(&a.to_lowercase());
+    let set_b = bigrams(&b.to_lowercase());
+
+    if set_a.is_empty() && set_b.is_empty() {
+        return 1.0; // Both empty → identical
+    }
+    if set_a.is_empty() || set_b.is_empty() {
+        return 0.0;
+    }
+
+    let intersection = set_a.intersection(&set_b).count();
+    let union = set_a.union(&set_b).count();
+
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+/// Build a dedup key from a prompt: first 200 chars, lowercased.
+fn make_dedup_prompt(prompt: &str) -> String {
+    prompt.chars().take(200).collect::<String>().to_lowercase()
+}
+
 pub struct CliAgentTool {
     // MUST be std::sync::RwLock because schema() is sync
     tools: Arc<std::sync::RwLock<HashMap<String, CliToolEntry>>>,
     tool_names: Arc<std::sync::RwLock<Vec<String>>>,
     running: Arc<Mutex<HashMap<String, RunningCliAgent>>>, // task_id -> RunningCliAgent
-    working_dir_locks: Arc<Mutex<HashSet<String>>>,
+    working_dir_claims: Arc<Mutex<HashMap<String, WorkingDirClaim>>>, // normalized dir -> claim
     state: Arc<dyn StateStore>,
     #[allow(dead_code)] // Reserved for future interactive feedback
-    provider: Arc<dyn ModelProvider>,
+    llm_runtime: SharedLlmRuntime,
     default_timeout: Duration,
     default_max_output: usize,
     max_concurrent: usize,
+    concurrency_limiter: Arc<Semaphore>,
     approval_tx: mpsc::Sender<ApprovalRequest>,
 }
 
@@ -281,6 +335,28 @@ impl CliAgentTool {
         user_role.is_some_and(|role| role.eq_ignore_ascii_case("owner"))
     }
 
+    /// Normalize a working directory for lock/key comparisons.
+    /// Uses canonical paths when possible so aliases like `/repo` and `/repo/`
+    /// map to the same lock key.
+    fn normalize_working_dir(dir: &str) -> String {
+        let expanded = shellexpand::tilde(dir).to_string();
+        std::fs::canonicalize(&expanded)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or(expanded)
+    }
+
+    /// Release a working-directory claim if it belongs to the given task.
+    async fn release_working_dir_claim(&self, dir: &str, task_id: &str) {
+        let mut claims = self.working_dir_claims.lock().await;
+        let should_remove = claims
+            .get(dir)
+            .map(|claim| claim.task_id == task_id)
+            .unwrap_or(false);
+        if should_remove {
+            claims.remove(dir);
+        }
+    }
+
     async fn request_daemonization_approval(
         &self,
         session_id: &str,
@@ -324,7 +400,7 @@ impl CliAgentTool {
     pub async fn discover(
         config: CliAgentsConfig,
         state: Arc<dyn StateStore>,
-        provider: Arc<dyn ModelProvider>,
+        llm_runtime: SharedLlmRuntime,
         approval_tx: mpsc::Sender<ApprovalRequest>,
     ) -> Self {
         let default_timeout = Duration::from_secs(config.timeout_secs);
@@ -403,12 +479,13 @@ impl CliAgentTool {
             tools: Arc::new(std::sync::RwLock::new(tools)),
             tool_names: Arc::new(std::sync::RwLock::new(tool_names)),
             running: Arc::new(Mutex::new(HashMap::new())),
-            working_dir_locks: Arc::new(Mutex::new(HashSet::new())),
+            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
             state,
-            provider,
+            llm_runtime,
             default_timeout,
             default_max_output,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
+            concurrency_limiter: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
             approval_tx,
         };
 
@@ -624,12 +701,19 @@ impl CliAgentTool {
             .map(|(id, _)| id.clone())
             .collect();
 
-        // Also release working dir locks for finished tasks
-        let mut dir_locks = self.working_dir_locks.lock().await;
+        // Also release working-dir claims for finished tasks.
+        // Lock ordering: running -> working_dir_claims.
+        let mut claims = self.working_dir_claims.lock().await;
         for task_id in finished {
             if let Some(agent) = running.remove(&task_id) {
                 if let Some(ref dir) = agent.working_dir {
-                    dir_locks.remove(dir);
+                    let should_remove = claims
+                        .get(dir)
+                        .map(|claim| claim.task_id == task_id)
+                        .unwrap_or(false);
+                    if should_remove {
+                        claims.remove(dir);
+                    }
                 }
                 info!(task_id, tool = %agent.tool_name, "Reaped finished CLI agent");
             }
@@ -884,21 +968,11 @@ impl CliAgentTool {
         prompt: &str,
         working_dir: Option<&str>,
         session_id: &str,
+        goal_id: Option<&str>,
         system_instruction: Option<&str>,
         async_mode: bool,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
-        // Check concurrent limit
-        {
-            let running = self.running.lock().await;
-            if running.len() >= self.max_concurrent {
-                return Ok(format!(
-                    "Maximum {} CLI agents already running. Use action='list' to see running tasks, or action='cancel' to stop one.",
-                    self.max_concurrent
-                ));
-            }
-        }
-
         // Announce which agent is being dispatched and what it's working on
         if let Some(ref tx) = status_tx {
             let task_preview: String = prompt.chars().take(60).collect();
@@ -971,18 +1045,48 @@ impl CliAgentTool {
             ));
         }
 
-        // Check working directory conflicts
-        if let Some(dir) = working_dir {
-            let mut dir_locks = self.working_dir_locks.lock().await;
-            if dir_locks.contains(dir) {
+        let canonical_working_dir = working_dir.map(Self::normalize_working_dir);
+        let dedup_prompt = make_dedup_prompt(prompt);
+        let task_id = Uuid::new_v4().to_string()[..8].to_string();
+        let short_summary: String = prompt.chars().take(50).collect();
+
+        // Claim the working directory and perform conflict checks.
+        // Lock ordering when both locks are needed: running -> working_dir_claims.
+        if let Some(ref dir) = canonical_working_dir {
+            let _running_guard = self.running.lock().await;
+            let mut claims = self.working_dir_claims.lock().await;
+
+            if let Some(claim) = claims.get(dir) {
+                let sim = prompt_similarity(&dedup_prompt, &claim.dedup_prompt);
+                if sim > 0.5 {
+                    return Ok(format!(
+                        "BLOCKED: A very similar task is already running in {} \
+                         (task_id={}, agent={}, similarity={:.0}%). \
+                         You MUST wait for it to finish or cancel it.",
+                        dir,
+                        claim.task_id,
+                        claim.tool_name,
+                        sim * 100.0
+                    ));
+                }
                 return Ok(format!(
-                    "WARNING: Another CLI agent is already working in {}. \
-                     Running in parallel may cause file conflicts. Consider waiting for \
-                     the first task to complete.",
-                    dir
+                    "BLOCKED: Another CLI agent is already working in {} \
+                     (task_id={}, agent={}, prompt=\"{}\"). \
+                     You MUST wait for it to finish or cancel it before dispatching \
+                     another task to the same directory.",
+                    dir, claim.task_id, claim.tool_name, claim.prompt_summary
                 ));
             }
-            dir_locks.insert(dir.to_string());
+
+            claims.insert(
+                dir.clone(),
+                WorkingDirClaim {
+                    task_id: task_id.clone(),
+                    tool_name: tool_name.to_string(),
+                    prompt_summary: short_summary.clone(),
+                    dedup_prompt: dedup_prompt.clone(),
+                },
+            );
         }
 
         // Build the enriched prompt if system_instruction is provided
@@ -993,11 +1097,24 @@ impl CliAgentTool {
             prompt.to_string()
         };
 
+        let slot_permit = match self.concurrency_limiter.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                if let Some(ref dir) = canonical_working_dir {
+                    self.release_working_dir_claim(dir, &task_id).await;
+                }
+                return Ok(format!(
+                    "Maximum {} CLI agents already running. Use action='list' to see running tasks, or action='cancel' to stop one.",
+                    self.max_concurrent
+                ));
+            }
+        };
+
         info!(
             tool = tool_name,
             session = session_id,
             prompt_len = final_prompt.len(),
-            working_dir = working_dir.unwrap_or("(default)"),
+            working_dir = canonical_working_dir.as_deref().unwrap_or("(default)"),
             async_mode,
             "CLI agent invocation — runs with auto-approve flags"
         );
@@ -1006,7 +1123,12 @@ impl CliAgentTool {
         let prompt_summary: String = prompt.chars().take(100).collect();
         let invocation_id = self
             .state
-            .log_cli_agent_start(session_id, tool_name, &prompt_summary, working_dir)
+            .log_cli_agent_start(
+                session_id,
+                tool_name,
+                &prompt_summary,
+                canonical_working_dir.as_deref(),
+            )
             .await
             .unwrap_or(0);
 
@@ -1024,7 +1146,7 @@ impl CliAgentTool {
             cmd.env_remove("CLAUDECODE");
         }
 
-        if let Some(dir) = working_dir {
+        if let Some(ref dir) = canonical_working_dir {
             cmd.current_dir(dir);
         }
 
@@ -1033,14 +1155,11 @@ impl CliAgentTool {
         cmd.stderr(std::process::Stdio::piped());
         configure_command_for_process_group(&mut cmd);
 
-        let task_id = Uuid::new_v4().to_string()[..8].to_string();
-        let short_summary: String = prompt.chars().take(50).collect();
-
         info!(
             task_id,
             tool = %tool_name,
             command = %command,
-            working_dir = ?working_dir,
+            working_dir = ?canonical_working_dir,
             "Starting CLI agent"
         );
 
@@ -1056,6 +1175,9 @@ impl CliAgentTool {
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
+                if let Some(ref dir) = canonical_working_dir {
+                    self.release_working_dir_claim(dir, &task_id).await;
+                }
                 // Ensure invocations don't stay "running" forever when spawn fails.
                 if invocation_id != 0 {
                     let duration = started_at_instant.elapsed().as_secs_f64();
@@ -1097,14 +1219,22 @@ impl CliAgentTool {
         let (completion_tx, completion_rx) =
             tokio::sync::oneshot::channel::<(Option<i32>, bool, Option<usize>)>();
 
-        // Spawn a task to read stdout/stderr, emit progress updates, and signal completion
+        // Spawn a task to read stdout/stderr, emit progress updates, and signal completion.
+        //
+        // `should_notify` defaults to async_mode. If a sync run later times out and moves to
+        // background, we flip it to true so completion is still delivered to the user.
+        let should_notify = Arc::new(AtomicBool::new(async_mode));
         let pid_for_kill = pid;
         let invocation_started_at = started_at_instant;
         let max_output_for_log = max_output;
         let notify_session_id = session_id.to_string();
         let notify_async = async_mode;
-        let notify_working_dir = working_dir.map(|s| s.to_string());
+        let notify_goal_id = goal_id.map(|s| s.to_string()).unwrap_or_default();
+        let notify_working_dir = canonical_working_dir.clone();
+        let should_notify_for_task = Arc::clone(&should_notify);
+        let slot_permit_for_task = slot_permit;
         tokio::spawn(async move {
+            let _slot_permit = slot_permit_for_task;
             let mut stdout_reader = BufReader::new(stdout).lines();
             let mut stderr_reader = BufReader::new(stderr).lines();
             let mut last_progress = Instant::now();
@@ -1369,8 +1499,9 @@ impl CliAgentTool {
                     )
                     .await;
 
-                // Send proactive notification for async tasks
-                if notify_async {
+                // Send proactive notification when the caller won't necessarily be waiting
+                // for completion (async_mode or sync->timeout moved to background).
+                if notify_async || should_notify_for_task.load(Ordering::Relaxed) {
                     let duration_secs = duration as u64;
                     let duration_display = if duration_secs >= 60 {
                         format!("{}m{}s", duration_secs / 60, duration_secs % 60)
@@ -1399,7 +1530,7 @@ impl CliAgentTool {
 
                     let notification_type = if success { "completed" } else { "failed" };
                     let entry = crate::traits::NotificationEntry::new(
-                        "",
+                        &notify_goal_id,
                         &notify_session_id,
                         notification_type,
                         &message,
@@ -1412,7 +1543,7 @@ impl CliAgentTool {
 
         // For async_mode, return immediately with task_id
         if async_mode {
-            let working_dir_owned = working_dir.map(|s| s.to_string());
+            let working_dir_owned = canonical_working_dir.clone();
             let agent = RunningCliAgent {
                 tool_name: tool_name.to_string(),
                 prompt_summary: short_summary.clone(),
@@ -1433,18 +1564,16 @@ impl CliAgentTool {
         }
 
         // Wait for completion with timeout
-        let working_dir_owned = working_dir.map(|s| s.to_string());
-        let dir_locks = self.working_dir_locks.clone();
-
+        let working_dir_owned = canonical_working_dir;
         let result = tokio::time::timeout(timeout, completion_rx).await;
-
-        // Release working directory lock
-        if let Some(ref dir) = working_dir_owned {
-            dir_locks.lock().await.remove(dir);
-        }
 
         match result {
             Ok(Ok((exit_code, was_loop_killed, loop_count))) => {
+                // Sync completion path: release the claim.
+                if let Some(ref dir) = working_dir_owned {
+                    self.release_working_dir_claim(dir, &task_id).await;
+                }
+
                 // Check if killed due to infinite loop
                 if was_loop_killed {
                     let display_output = display_buf.lock().await.clone();
@@ -1556,6 +1685,9 @@ impl CliAgentTool {
                 Ok(final_result)
             }
             Ok(Err(_)) => {
+                if let Some(ref dir) = working_dir_owned {
+                    self.release_working_dir_claim(dir, &task_id).await;
+                }
                 // Channel closed unexpectedly
                 Ok(format!(
                     "ERROR: CLI agent '{}' task failed unexpectedly",
@@ -1570,6 +1702,9 @@ impl CliAgentTool {
                     let buf = display_buf.lock().await;
                     truncate_with_note(&buf, 1000)
                 };
+
+                // The caller got an early return; ensure we notify on completion.
+                should_notify.store(true, Ordering::Relaxed);
 
                 // Store the running agent for later checking/cancellation
                 let agent = RunningCliAgent {
@@ -1647,18 +1782,20 @@ impl CliAgentTool {
 
     /// Cancel a background CLI agent task.
     async fn handle_cancel(&self, task_id: &str) -> anyhow::Result<String> {
-        let mut running = self.running.lock().await;
-
-        let Some(agent) = running.remove(task_id) else {
-            return Ok(format!("No running CLI agent with task_id '{}'", task_id));
+        let agent = {
+            let mut running = self.running.lock().await;
+            let Some(agent) = running.remove(task_id) else {
+                return Ok(format!("No running CLI agent with task_id '{}'", task_id));
+            };
+            agent
         };
 
         let display_output = agent.display_buf.lock().await.clone();
         let elapsed = agent.started_at.elapsed().as_secs();
 
-        // Release working dir lock
+        // Release working-dir claim owned by this task.
         if let Some(ref dir) = agent.working_dir {
-            self.working_dir_locks.lock().await.remove(dir);
+            self.release_working_dir_claim(dir, task_id).await;
         }
 
         // Try to kill the process
@@ -1674,28 +1811,35 @@ impl CliAgentTool {
 
     /// Cancel all CLI agent tasks for a specific session.
     async fn handle_cancel_all(&self, session_id: &str) -> anyhow::Result<String> {
-        let mut running = self.running.lock().await;
+        // Find all tasks matching this session and remove them from tracking first.
+        let to_cancel: Vec<(String, RunningCliAgent)> = {
+            let mut running = self.running.lock().await;
+            let task_ids: Vec<String> = running
+                .iter()
+                .filter(|(_, agent)| agent.session_id == session_id)
+                .map(|(task_id, _)| task_id.clone())
+                .collect();
 
-        // Find all tasks matching this session
-        let to_cancel: Vec<String> = running
-            .iter()
-            .filter(|(_, agent)| agent.session_id == session_id)
-            .map(|(task_id, _)| task_id.clone())
-            .collect();
+            let mut removed = Vec::new();
+            for task_id in task_ids {
+                if let Some(agent) = running.remove(&task_id) {
+                    removed.push((task_id, agent));
+                }
+            }
+            removed
+        };
 
         if to_cancel.is_empty() {
             return Ok("No running CLI agents for this session.".to_string());
         }
 
         let mut cancelled = Vec::new();
-        for task_id in to_cancel {
-            if let Some(agent) = running.remove(&task_id) {
-                if let Some(ref dir) = agent.working_dir {
-                    self.working_dir_locks.lock().await.remove(dir);
-                }
-                kill_process(agent.child_id).await;
-                cancelled.push(format!("{} ({})", agent.tool_name, task_id));
+        for (task_id, agent) in to_cancel {
+            if let Some(ref dir) = agent.working_dir {
+                self.release_working_dir_claim(dir, &task_id).await;
             }
+            kill_process(agent.child_id).await;
+            cancelled.push(format!("{} ({})", agent.tool_name, task_id));
         }
 
         Ok(format!(
@@ -1747,6 +1891,9 @@ struct CliAgentArgs {
     /// Injected by agent - session ID for cancel_all filtering
     #[serde(default)]
     _session_id: Option<String>,
+    /// Injected by agent - goal context for routing async/timeout notifications.
+    #[serde(default)]
+    _goal_id: Option<String>,
     /// Injected by agent for role-aware safeguards.
     #[serde(default)]
     _user_role: Option<String>,
@@ -2124,7 +2271,7 @@ impl Tool for CliAgentTool {
                     },
                     "working_dir": {
                         "type": "string",
-                        "description": "Working directory for the CLI agent (absolute path). If not specified, uses the current directory."
+                        "description": "Working directory for the CLI agent (absolute path). IMPORTANT: Always specify this — omitting it disables directory conflict detection and task deduplication, risking two agents clobbering the same files."
                     },
                     "task_id": {
                         "type": "string",
@@ -2171,7 +2318,18 @@ impl Tool for CliAgentTool {
 
         let action = args.action.as_deref().unwrap_or("run");
 
-        let session_id = args._session_id.clone().unwrap_or_default();
+        // Default to the caller session (often a sub-agent session like "sub-...").
+        // If this CLI agent is running in the context of an orchestration goal,
+        // route background notifications and cancel_all scoping to the *origin*
+        // session_id (goal.session_id), which is routable via the ChannelHub.
+        let mut session_id = args._session_id.clone().unwrap_or_default();
+        if let Some(ref goal_id) = args._goal_id {
+            if let Ok(Some(goal)) = self.state.get_goal(goal_id).await {
+                if !goal.session_id.trim().is_empty() {
+                    session_id = goal.session_id;
+                }
+            }
+        }
 
         match action {
             "run" => {
@@ -2231,13 +2389,23 @@ impl Tool for CliAgentTool {
                         }
                     }
                 }
+                // Goal-scoped cli_agent runs should not detach immediately:
+                // the goal/task lead is already running in the background, and
+                // returning early makes results easy to drop.
+                let async_mode = if args._goal_id.is_some() {
+                    false
+                } else {
+                    args.async_mode.unwrap_or(false)
+                };
+
                 self.handle_run(
                     &tool,
                     prompt,
                     args.working_dir.as_deref(),
                     &session_id,
+                    args._goal_id.as_deref(),
                     args.system_instruction.as_deref(),
-                    args.async_mode.unwrap_or(false),
+                    async_mode,
                     status_tx,
                 )
                 .await
@@ -2311,12 +2479,18 @@ mod tests {
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
-            working_dir_locks: Arc::new(Mutex::new(HashSet::new())),
+            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
-            provider: provider as Arc<dyn crate::traits::ModelProvider>,
+            llm_runtime: SharedLlmRuntime::new(
+                provider as Arc<dyn crate::traits::ModelProvider>,
+                None,
+                crate::config::ProviderKind::OpenaiCompatible,
+                "mock".to_string(),
+            ),
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
+            concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
         };
 
@@ -2357,12 +2531,18 @@ mod tests {
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash-agent".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
-            working_dir_locks: Arc::new(Mutex::new(HashSet::new())),
+            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
-            provider: provider as Arc<dyn crate::traits::ModelProvider>,
+            llm_runtime: SharedLlmRuntime::new(
+                provider as Arc<dyn crate::traits::ModelProvider>,
+                None,
+                crate::config::ProviderKind::OpenaiCompatible,
+                "mock".to_string(),
+            ),
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
+            concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
         };
 
@@ -2556,18 +2736,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Working directory lock test
+    // Working directory claim tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_working_dir_conflict_detection() {
         let (tool, _db) = setup_bash_tool().await;
 
-        // Lock a working directory
-        tool.working_dir_locks
-            .lock()
-            .await
-            .insert("/tmp/project".to_string());
+        // Seed a claim as if another task already owns this directory.
+        tool.working_dir_claims.lock().await.insert(
+            "/tmp/project".to_string(),
+            WorkingDirClaim {
+                task_id: "abc12345".to_string(),
+                tool_name: "bash-agent".to_string(),
+                prompt_summary: "sleep 60".to_string(),
+                dedup_prompt: make_dedup_prompt("sleep 60"),
+            },
+        );
 
         let result = tool
             .call(
@@ -2576,8 +2761,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            result.contains("WARNING") && result.contains("Another CLI agent"),
-            "Expected working dir conflict warning, got: {}",
+            result.contains("BLOCKED") && result.contains("Another CLI agent"),
+            "Expected working dir conflict BLOCKED message, got: {}",
             result
         );
     }
@@ -2595,11 +2780,196 @@ mod tests {
         let result = tool.call(&args).await.unwrap();
         assert!(result.contains("done"));
 
-        // Working dir lock should be released after completion
-        let locks = tool.working_dir_locks.lock().await;
+        // Working-dir claim should be released after completion.
+        let claims = tool.working_dir_claims.lock().await;
         assert!(
-            !locks.contains(dir_path),
-            "Working dir lock not released after completion"
+            !claims.contains_key(dir_path),
+            "Working-dir claim not released after completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_working_dir_aliases_conflict_after_normalization() {
+        let (tool, _db) = setup_bash_tool().await;
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_string_lossy().to_string();
+        let dir_with_slash = format!("{}/", dir.trim_end_matches('/'));
+
+        let first_args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 5","working_dir":"{}","async_mode":true}}"#,
+            dir
+        );
+        let first = tool.call(&first_args).await.unwrap();
+        assert!(
+            first.contains("started in background"),
+            "Expected first task to start in background, got: {}",
+            first
+        );
+
+        let second_args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"echo test","working_dir":"{}"}}"#,
+            dir_with_slash
+        );
+        let second = tool.call(&second_args).await.unwrap();
+        assert!(
+            second.contains("BLOCKED") && second.contains("Another CLI agent"),
+            "Expected normalized path conflict BLOCKED message, got: {}",
+            second
+        );
+
+        tool.handle_cancel_all("").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_working_dir_lock_released_on_spawn_failure() {
+        let (tool, _db) = setup_bash_tool().await;
+        let missing_dir = "/tmp/aidaemon-cli-agent-missing-dir-lock-test";
+        let _ = std::fs::remove_dir_all(missing_dir);
+        let normalized = CliAgentTool::normalize_working_dir(missing_dir);
+
+        let args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"echo should-fail","working_dir":"{}"}}"#,
+            missing_dir
+        );
+        let result = tool.call(&args).await;
+        assert!(
+            result.is_err(),
+            "Expected spawn failure for missing current_dir, got: {:?}",
+            result
+        );
+
+        let claims = tool.working_dir_claims.lock().await;
+        assert!(
+            !claims.contains_key(&normalized),
+            "Working-dir claim should be released after spawn failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_limit_includes_sync_runs() {
+        let (mut tool, _db) = setup_bash_tool().await;
+        tool.max_concurrent = 1;
+        tool.concurrency_limiter = Arc::new(Semaphore::new(1));
+        let tool = Arc::new(tool);
+
+        let tool_for_first = Arc::clone(&tool);
+        let first = tokio::spawn(async move {
+            tool_for_first
+                .call(r#"{"action":"run","tool":"bash-agent","prompt":"sleep 2; echo first"}"#)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let second = tool
+            .call(r#"{"action":"run","tool":"bash-agent","prompt":"echo second"}"#)
+            .await
+            .unwrap();
+        assert!(
+            second.contains("Maximum 1 CLI agents already running"),
+            "Expected concurrency rejection while sync run is active, got: {}",
+            second
+        );
+
+        let first_result = first.await.unwrap().unwrap();
+        assert!(
+            first_result.contains("first"),
+            "Expected first sync run output, got: {}",
+            first_result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_inflight_conflict_reports_claim_metadata() {
+        let (tool, _db) = setup_bash_tool().await;
+        let tool = Arc::new(tool);
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_string_lossy().to_string();
+
+        let first_args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 2; echo first","working_dir":"{}"}}"#,
+            dir
+        );
+        let tool_for_first = Arc::clone(&tool);
+        let first = tokio::spawn(async move { tool_for_first.call(&first_args).await.unwrap() });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let second_args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"echo second","working_dir":"{}"}}"#,
+            dir
+        );
+        let second = tool.call(&second_args).await.unwrap();
+        assert!(
+            second.contains("BLOCKED")
+                && second.contains("task_id=")
+                && second.contains("agent=bash-agent"),
+            "Expected conflict response with claim metadata, got: {}",
+            second
+        );
+
+        let first_result = first.await.unwrap();
+        assert!(
+            first_result.contains("first"),
+            "Expected first sync run output, got: {}",
+            first_result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_inflight_duplicate_prompt_blocked() {
+        let (tool, _db) = setup_bash_tool().await;
+        let tool = Arc::new(tool);
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_string_lossy().to_string();
+
+        let first_args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"echo refactor the auth module to use OAuth tokens; sleep 2","working_dir":"{}"}}"#,
+            dir
+        );
+        let tool_for_first = Arc::clone(&tool);
+        let first = tokio::spawn(async move { tool_for_first.call(&first_args).await.unwrap() });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let second_args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"echo refactor the auth module to use OAuth tokens","working_dir":"{}"}}"#,
+            dir
+        );
+        let second = tool.call(&second_args).await.unwrap();
+        assert!(
+            second.contains("BLOCKED") && second.contains("similar task"),
+            "Expected duplicate-task block for sync in-flight run, got: {}",
+            second
+        );
+
+        let _ = first.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_working_dir_claim_released_on_semaphore_reject() {
+        let (mut tool, _db) = setup_bash_tool().await;
+        tool.max_concurrent = 0;
+        tool.concurrency_limiter = Arc::new(Semaphore::new(0));
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let dir_path = tmp_dir.path().to_str().unwrap();
+        let normalized = CliAgentTool::normalize_working_dir(dir_path);
+        let args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"echo blocked","working_dir":"{}"}}"#,
+            dir_path
+        );
+        let result = tool.call(&args).await.unwrap();
+        assert!(
+            result.contains("Maximum 0 CLI agents already running"),
+            "Expected semaphore rejection, got: {}",
+            result
+        );
+
+        let claims = tool.working_dir_claims.lock().await;
+        assert!(
+            !claims.contains_key(&normalized),
+            "Working-dir claim should be released after semaphore rejection"
         );
     }
 
@@ -3019,7 +3389,12 @@ mod tests {
         let tool = CliAgentTool::discover(
             config,
             state as Arc<dyn StateStore>,
-            provider as Arc<dyn crate::traits::ModelProvider>,
+            SharedLlmRuntime::new(
+                provider as Arc<dyn crate::traits::ModelProvider>,
+                None,
+                crate::config::ProviderKind::OpenaiCompatible,
+                "mock".to_string(),
+            ),
             approval_tx,
         )
         .await;
@@ -3067,7 +3442,12 @@ mod tests {
         let tool = CliAgentTool::discover(
             config,
             state as Arc<dyn StateStore>,
-            provider as Arc<dyn crate::traits::ModelProvider>,
+            SharedLlmRuntime::new(
+                provider as Arc<dyn crate::traits::ModelProvider>,
+                None,
+                crate::config::ProviderKind::OpenaiCompatible,
+                "mock".to_string(),
+            ),
             approval_tx,
         )
         .await;
@@ -3113,12 +3493,18 @@ mod tests {
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
-            working_dir_locks: Arc::new(Mutex::new(HashSet::new())),
+            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
-            provider: provider as Arc<dyn crate::traits::ModelProvider>,
+            llm_runtime: SharedLlmRuntime::new(
+                provider as Arc<dyn crate::traits::ModelProvider>,
+                None,
+                crate::config::ProviderKind::OpenaiCompatible,
+                "mock".to_string(),
+            ),
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
+            concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
         };
 
@@ -3174,12 +3560,18 @@ mod tests {
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
-            working_dir_locks: Arc::new(Mutex::new(HashSet::new())),
+            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
-            provider: provider as Arc<dyn crate::traits::ModelProvider>,
+            llm_runtime: SharedLlmRuntime::new(
+                provider as Arc<dyn crate::traits::ModelProvider>,
+                None,
+                crate::config::ProviderKind::OpenaiCompatible,
+                "mock".to_string(),
+            ),
             default_timeout: Duration::from_secs(10),
             default_max_output: 10000,
             max_concurrent: 3,
+            concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
         };
 
@@ -3368,7 +3760,7 @@ mod tests {
         // The fix: stdin is now Stdio::null() so processes get EOF immediately.
         let (tool, _db) = setup_bash_tool().await;
 
-        let user_prompt = "I need to create a new website about cars. We should push it to cars.davidloor.com. make it modern.";
+        let user_prompt = "I need to create a new website about cars. We should push it to cars.example.com. make it modern.";
 
         let start = Instant::now();
         let args = serde_json::json!({
@@ -3513,5 +3905,82 @@ echo '{"type":"result","result":"Website created successfully with index.html, s
             "CLI agent should run in specified working dir, got: {}",
             result
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Prompt similarity tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prompt_similarity_scores() {
+        // Identical prompts → 1.0
+        assert!(
+            (prompt_similarity("refactor the auth module", "refactor the auth module") - 1.0).abs()
+                < f64::EPSILON
+        );
+
+        // Very similar prompts → high similarity
+        let sim = prompt_similarity(
+            "refactor the auth module to use JWT",
+            "refactor the auth module to use OAuth",
+        );
+        assert!(
+            sim > 0.5,
+            "Similar prompts should score > 0.5, got: {:.3}",
+            sim
+        );
+
+        // Completely different prompts → low similarity
+        let sim = prompt_similarity("refactor the auth module", "deploy to production server");
+        assert!(
+            sim < 0.3,
+            "Different prompts should score < 0.3, got: {:.3}",
+            sim
+        );
+
+        // Empty prompts
+        assert!((prompt_similarity("", "") - 1.0).abs() < f64::EPSILON);
+        assert!((prompt_similarity("hello", "") - 0.0).abs() < f64::EPSILON);
+
+        // Single-word prompts (unigram fallback)
+        assert!((prompt_similarity("deploy", "deploy") - 1.0).abs() < f64::EPSILON);
+        assert!((prompt_similarity("deploy", "refactor") - 0.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task deduplication test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_duplicate_task_detection() {
+        let (tool, _db) = setup_bash_tool().await;
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_string_lossy().to_string();
+
+        // Start a background task
+        let first_args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"refactor the auth module to use JWT tokens","working_dir":"{}","async_mode":true}}"#,
+            dir
+        );
+        let first = tool.call(&first_args).await.unwrap();
+        assert!(
+            first.contains("started in background"),
+            "Expected first task to start, got: {}",
+            first
+        );
+
+        // Try a very similar prompt to the same dir → should be blocked
+        let second_args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"refactor the auth module to use OAuth tokens","working_dir":"{}"}}"#,
+            dir
+        );
+        let second = tool.call(&second_args).await.unwrap();
+        assert!(
+            second.contains("BLOCKED") && second.contains("similar task"),
+            "Expected duplicate task BLOCKED message, got: {}",
+            second
+        );
+
+        tool.handle_cancel_all("").await.unwrap();
     }
 }

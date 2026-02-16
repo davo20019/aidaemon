@@ -45,6 +45,9 @@ pub struct TaskEntry {
 struct TaskHandle {
     entry: TaskEntry,
     cancel_token: CancellationToken,
+    /// Optional token to cancel the channel's typing indicator for this task.
+    /// Set by the channel after task registration; cancelled alongside the task.
+    typing_cancel: Option<CancellationToken>,
 }
 
 pub struct TaskRegistry {
@@ -79,6 +82,7 @@ impl TaskRegistry {
                 finished_at: None,
             },
             cancel_token: cancel_token.clone(),
+            typing_cancel: None,
         };
         let mut tasks = self.tasks.write().await;
         tasks.insert(id, handle);
@@ -105,12 +109,24 @@ impl TaskRegistry {
         Self::cleanup_locked(&mut tasks, self.max_completed);
     }
 
+    /// Associate a typing indicator cancel token with a running task.
+    /// When the task is cancelled, the typing indicator will also be stopped.
+    pub async fn set_typing_cancel(&self, task_id: u64, token: CancellationToken) {
+        let mut tasks = self.tasks.write().await;
+        if let Some(handle) = tasks.get_mut(&task_id) {
+            handle.typing_cancel = Some(token);
+        }
+    }
+
     /// Cancel a running task. Returns true if the task was found and cancelled.
     pub async fn cancel(&self, task_id: u64) -> bool {
         let mut tasks = self.tasks.write().await;
         if let Some(handle) = tasks.get_mut(&task_id) {
             if matches!(handle.entry.status, TaskStatus::Running) {
                 handle.cancel_token.cancel();
+                if let Some(ref typing) = handle.typing_cancel {
+                    typing.cancel();
+                }
                 handle.entry.status = TaskStatus::Cancelled;
                 handle.entry.finished_at = Some(Utc::now());
                 return true;
@@ -128,6 +144,9 @@ impl TaskRegistry {
                 && matches!(handle.entry.status, TaskStatus::Running)
             {
                 handle.cancel_token.cancel();
+                if let Some(ref typing) = handle.typing_cancel {
+                    typing.cancel();
+                }
                 handle.entry.status = TaskStatus::Cancelled;
                 handle.entry.finished_at = Some(Utc::now());
                 cancelled.push((*id, handle.entry.description.clone()));

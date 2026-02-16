@@ -256,6 +256,13 @@ pub enum StatusUpdate {
         reason: String,
         new_total_steps: usize,
     },
+    /// Token budget was auto-extended due to productive progress.
+    BudgetExtended {
+        old_budget: i64,
+        new_budget: i64,
+        extension: usize,
+        max_extensions: usize,
+    },
 }
 
 /// The kind of media being sent.

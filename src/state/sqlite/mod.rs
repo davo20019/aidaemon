@@ -239,13 +239,15 @@ impl SqliteStateStore {
                 }
             };
 
-            if let Some(message) = crate::conversation::message_from_event(
+            if let Some(message) = crate::events::turn_from_event(
                 event_id,
                 &row_session_id,
                 &event_type,
                 &data,
                 created_at,
-            ) {
+            )
+            .map(|turn| turn.into_message())
+            {
                 deque.push_back(message);
             }
         }
@@ -253,77 +255,15 @@ impl SqliteStateStore {
         Ok(deque)
     }
 
-    async fn hydrate_from_messages(
-        &self,
-        session_id: &str,
-        limit: usize,
-    ) -> anyhow::Result<VecDeque<Message>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at
-            FROM messages
-            WHERE session_id = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(session_id)
-        .bind(limit.max(1) as i64)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut deque = VecDeque::with_capacity(rows.len());
-        for row in rows.into_iter().rev() {
-            let created_str: String = row.get("created_at");
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            deque.push_back(Message {
-                id: row.get("id"),
-                session_id: row.get("session_id"),
-                role: row.get("role"),
-                content: row.get("content"),
-                tool_call_id: row.get("tool_call_id"),
-                tool_name: row.get("tool_name"),
-                tool_calls_json: row.get("tool_calls_json"),
-                created_at,
-                importance: row.try_get("importance").unwrap_or(0.5),
-                embedding: None,
-            });
-        }
-
-        Ok(deque)
-    }
-
     /// Hydrate working memory for a session from the database.
     async fn hydrate(&self, session_id: &str) -> anyhow::Result<VecDeque<Message>> {
-        match self.hydrate_from_events(session_id, self.cap).await {
-            Ok(deque) => {
-                tracing::debug!(
-                    session_id,
-                    hydrated_count = deque.len(),
-                    "hydrate: loaded conversation from canonical event stream"
-                );
-                Ok(deque)
-            }
-            Err(e) => {
-                if e.to_string().contains("no such table: events") {
-                    tracing::warn!(
-                        session_id,
-                        "hydrate: events table missing, falling back to legacy messages table"
-                    );
-                    let deque = self.hydrate_from_messages(session_id, self.cap).await?;
-                    tracing::debug!(
-                        session_id,
-                        hydrated_count = deque.len(),
-                        "hydrate: loaded conversation from legacy messages table"
-                    );
-                    Ok(deque)
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        let deque = self.hydrate_from_events(session_id, self.cap).await?;
+        tracing::debug!(
+            session_id,
+            hydrated_count = deque.len(),
+            "hydrate: loaded conversation from canonical event stream"
+        );
+        Ok(deque)
     }
     pub fn pool(&self) -> SqlitePool {
         self.pool.clone()
@@ -786,6 +726,72 @@ impl SqliteStateStore {
         Ok(patterns)
     }
 
+    /// Insert or update a behavior pattern by logical key
+    /// (pattern_type + trigger_context + action).
+    pub async fn record_behavior_pattern(
+        &self,
+        pattern_type: &str,
+        description: &str,
+        trigger_context: Option<&str>,
+        action: Option<&str>,
+        confidence_hint: f32,
+        occurrence_delta: i32,
+    ) -> anyhow::Result<()> {
+        let now = Utc::now().to_rfc3339();
+
+        let existing = sqlx::query(
+            "SELECT id FROM behavior_patterns
+             WHERE pattern_type = ?
+               AND COALESCE(trigger_context, '') = COALESCE(?, '')
+               AND COALESCE(action, '') = COALESCE(?, '')
+             LIMIT 1",
+        )
+        .bind(pattern_type)
+        .bind(trigger_context)
+        .bind(action)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let delta = occurrence_delta.max(1);
+        let confidence_hint = confidence_hint.clamp(0.1, 0.98);
+
+        if let Some(row) = existing {
+            let id: i64 = row.get("id");
+            sqlx::query(
+                "UPDATE behavior_patterns
+                 SET description = ?,
+                     occurrence_count = occurrence_count + ?,
+                     confidence = MIN(0.98, MAX(confidence, ?) + 0.02),
+                     last_seen_at = ?
+                 WHERE id = ?",
+            )
+            .bind(description)
+            .bind(delta)
+            .bind(confidence_hint)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO behavior_patterns (pattern_type, description, trigger_context, action, confidence, occurrence_count, last_seen_at, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(pattern_type)
+            .bind(description)
+            .bind(trigger_context)
+            .bind(action)
+            .bind(confidence_hint)
+            .bind(delta)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
     /// Update pattern occurrence and confidence.
     #[allow(dead_code)]
     pub async fn update_behavior_pattern(
@@ -822,8 +828,12 @@ impl SqliteStateStore {
             "INSERT INTO procedures (name, trigger_pattern, trigger_embedding, steps, success_count, failure_count, avg_duration_secs, last_used_at, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(name) DO UPDATE SET
+                trigger_pattern = excluded.trigger_pattern,
                 steps = excluded.steps,
-                success_count = success_count + 1,
+                success_count = procedures.success_count + excluded.success_count,
+                failure_count = procedures.failure_count + excluded.failure_count,
+                avg_duration_secs = COALESCE(excluded.avg_duration_secs, procedures.avg_duration_secs),
+                last_used_at = COALESCE(excluded.last_used_at, procedures.last_used_at),
                 updated_at = excluded.updated_at,
                 trigger_embedding = COALESCE(trigger_embedding, excluded.trigger_embedding)"
         )

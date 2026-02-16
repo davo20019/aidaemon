@@ -51,6 +51,10 @@ pub async fn register_skills_tools(
                         description: ds.description.clone(),
                         triggers,
                         body: ds.body.clone(),
+                        origin: Some(
+                            crate::skills::infer_skill_origin(None, Some(ds.source.as_str()))
+                                .to_string(),
+                        ),
                         source: Some(ds.source.clone()),
                         source_url: ds.source_url.clone(),
                         dir_path: None,

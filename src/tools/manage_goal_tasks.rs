@@ -17,6 +17,19 @@ impl ManageGoalTasksTool {
     pub fn new(goal_id: String, state: Arc<dyn StateStore>) -> Self {
         Self { goal_id, state }
     }
+
+    async fn task_not_found_message(&self, task_id: &str) -> String {
+        let list = self
+            .list_tasks()
+            .await
+            .unwrap_or_else(|_| "(failed to list tasks)".to_string());
+        format!(
+            "Task not found: {}.\n\n\
+             Use manage_goal_tasks(action=\"list_tasks\") to see valid task IDs, then retry with an existing task_id.\n\n\
+             {}",
+            task_id, list
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -387,11 +400,9 @@ impl ManageGoalTasksTool {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("update_task requires 'task_id'"))?;
 
-        let mut task = self
-            .state
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?;
+        let Some(mut task) = self.state.get_task(task_id).await? else {
+            return Ok(self.task_not_found_message(task_id).await);
+        };
 
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
@@ -447,11 +458,9 @@ impl ManageGoalTasksTool {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("claim_task requires 'task_id'"))?;
 
-        let task = self
-            .state
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?;
+        let Some(task) = self.state.get_task(task_id).await? else {
+            return Ok(self.task_not_found_message(task_id).await);
+        };
 
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
@@ -481,11 +490,9 @@ impl ManageGoalTasksTool {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("retry_task requires 'task_id'"))?;
 
-        let mut task = self
-            .state
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?;
+        let Some(mut task) = self.state.get_task(task_id).await? else {
+            return Ok(self.task_not_found_message(task_id).await);
+        };
 
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
@@ -606,11 +613,9 @@ impl ManageGoalTasksTool {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("resolve_blocker requires 'task_id'"))?;
 
-        let mut task = self
-            .state
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Task not found: {}", task_id))?;
+        let Some(mut task) = self.state.get_task(task_id).await? else {
+            return Ok(self.task_not_found_message(task_id).await);
+        };
 
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
@@ -1505,7 +1510,10 @@ mod tests {
         };
 
         // B depends on A — no cycle
-        assert!(super::validate_no_cycles(&[task_a.clone()], "b", &["a".to_string()]).is_ok());
+        assert!(
+            super::validate_no_cycles(std::slice::from_ref(&task_a), "b", &["a".to_string()])
+                .is_ok()
+        );
     }
 
     #[test]

@@ -13,10 +13,11 @@ use tracing::{info, warn};
 
 use super::{ErrorData, TaskEndData, TaskStartData, ToolCallData, ToolResultData};
 use super::{Event, EventStore, EventType, TaskStatus};
+use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
 use crate::plans::{PlanStore, StepStatus};
-use crate::traits::{Episode, ErrorSolution, ModelProvider, Procedure};
+use crate::traits::{Episode, ErrorSolution, Procedure};
 
 /// Statistics from a consolidation run
 #[derive(Debug, Default)]
@@ -57,8 +58,7 @@ pub struct Consolidator {
     event_store: Arc<EventStore>,
     plan_store: Arc<PlanStore>,
     pool: sqlx::SqlitePool,
-    provider: Option<Arc<dyn ModelProvider>>,
-    fast_model: String,
+    llm_runtime: Option<SharedLlmRuntime>,
     embedding_service: Option<Arc<EmbeddingService>>,
     state: Option<Arc<dyn crate::traits::StateStore>>,
     learning_evidence_gate_enforce: bool,
@@ -69,16 +69,14 @@ impl Consolidator {
         event_store: Arc<EventStore>,
         plan_store: Arc<PlanStore>,
         pool: sqlx::SqlitePool,
-        provider: Option<Arc<dyn ModelProvider>>,
-        fast_model: String,
+        llm_runtime: Option<SharedLlmRuntime>,
         embedding_service: Option<Arc<EmbeddingService>>,
     ) -> Self {
         Self {
             event_store,
             plan_store,
             pool,
-            provider,
-            fast_model,
+            llm_runtime,
             embedding_service,
             state: None,
             learning_evidence_gate_enforce: false,
@@ -629,7 +627,10 @@ impl Consolidator {
         task_description: &str,
         tool_sequence: &str,
     ) -> Option<Procedure> {
-        let provider = self.provider.as_ref()?;
+        let runtime = self.llm_runtime.as_ref()?;
+        let runtime_snapshot = runtime.snapshot();
+        let provider = runtime_snapshot.provider();
+        let fast_model = runtime_snapshot.fast_model();
 
         let step_count = proc.steps.len();
         let duration_str = proc
@@ -664,7 +665,7 @@ impl Consolidator {
             serde_json::json!({"role": "user", "content": user_prompt}),
         ];
 
-        let response = match provider.chat(&self.fast_model, &llm_messages, &[]).await {
+        let response = match provider.chat(&fast_model, &llm_messages, &[]).await {
             Ok(r) => r,
             Err(e) => {
                 warn!("LLM enhancement failed for procedure: {}", e);
@@ -1002,7 +1003,14 @@ fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        let target = max_len.saturating_sub(3);
+        let safe_end = s
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= target)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &s[..safe_end])
     }
 }
 

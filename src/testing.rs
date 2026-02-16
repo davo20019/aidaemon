@@ -13,8 +13,9 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::agent::Agent;
 use crate::channels::{ChannelHub, SessionMap};
-use crate::config::{IterationLimitConfig, ModelsConfig};
+use crate::config::{IterationLimitConfig, ModelsConfig, ProviderKind};
 use crate::events::EventStore;
+use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
 use crate::memory::embeddings::EmbeddingService;
 use crate::state::SqliteStateStore;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
@@ -269,9 +270,15 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         fast: "mock-model".to_string(),
         smart: "mock-model".to_string(),
     };
+    let llm_runtime = SharedLlmRuntime::new(
+        provider.clone() as Arc<dyn ModelProvider>,
+        router_from_models(models_config.clone()),
+        ProviderKind::OpenaiCompatible,
+        models_config.primary.clone(),
+    );
 
     let mut agent = Agent::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        llm_runtime,
         state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
@@ -284,9 +291,8 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         100,                                             // max_iterations_cap
         8000,                                            // max_response_chars
         30,                                              // timeout_secs
-        models_config,
-        20,   // max_facts
-        None, // daily_token_budget
+        20,                                              // max_facts
+        None,                                            // daily_token_budget
         IterationLimitConfig::Unlimited,
         None, // task_timeout_secs
         None, // task_token_budget
@@ -356,9 +362,15 @@ pub async fn setup_test_agent_with_models(
         fast: smart_model.to_string(),
         smart: smart_model.to_string(),
     };
+    let llm_runtime = SharedLlmRuntime::new(
+        provider.clone() as Arc<dyn ModelProvider>,
+        router_from_models(models_config.clone()),
+        ProviderKind::OpenaiCompatible,
+        models_config.primary.clone(),
+    );
 
     let agent = Agent::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        llm_runtime,
         state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
@@ -371,7 +383,6 @@ pub async fn setup_test_agent_with_models(
         100,  // max_iterations_cap
         8000, // max_response_chars
         30,   // timeout_secs
-        models_config,
         20,   // max_facts
         None, // daily_token_budget
         IterationLimitConfig::Unlimited,
@@ -431,9 +442,15 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         fast: "fast-model".to_string(),
         smart: "smart-model".to_string(),
     };
+    let llm_runtime = SharedLlmRuntime::new(
+        provider.clone() as Arc<dyn ModelProvider>,
+        router_from_models(models_config.clone()),
+        ProviderKind::OpenaiCompatible,
+        models_config.primary.clone(),
+    );
 
     let agent = Agent::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        llm_runtime,
         state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
@@ -446,7 +463,6 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         100,  // max_iterations_cap
         8000, // max_response_chars
         30,   // timeout_secs
-        models_config,
         20,   // max_facts
         None, // daily_token_budget
         IterationLimitConfig::Unlimited,
@@ -630,9 +646,15 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         fast: "mock-model".to_string(),
         smart: "mock-model".to_string(),
     };
+    let llm_runtime = SharedLlmRuntime::new(
+        provider.clone() as Arc<dyn ModelProvider>,
+        router_from_models(models_config.clone()),
+        ProviderKind::OpenaiCompatible,
+        models_config.primary.clone(),
+    );
 
     let mut agent = Agent::new(
-        provider.clone() as Arc<dyn ModelProvider>,
+        llm_runtime,
         state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
@@ -645,7 +667,6 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         100,  // max_iterations_cap
         8000, // max_response_chars
         30,   // timeout_secs
-        models_config,
         20,   // max_facts
         None, // daily_token_budget
         IterationLimitConfig::Unlimited,

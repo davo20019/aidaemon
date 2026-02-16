@@ -78,10 +78,19 @@ pub fn calculate_episode_importance(
 
 /// Calculate importance score (0.0 - 1.0) based on heuristics.
 pub fn score_message(msg: &Message) -> f32 {
+    score_role_and_content(&msg.role, msg.content.as_deref())
+}
+
+/// Calculate importance score for event-native conversation turns.
+pub fn score_turn(turn: &crate::events::ConversationTurn) -> f32 {
+    score_role_and_content(turn.role.as_str(), turn.content.as_deref())
+}
+
+fn score_role_and_content(role: &str, content: Option<&str>) -> f32 {
     let mut score: f32 = 0.5;
 
     // 1. Role-based baseline
-    match msg.role.as_str() {
+    match role {
         "system" => return 0.0, // System prompts are not "memories"
         "tool" => score = 0.3,  // Tool outputs are less important unless they are results
         "assistant" => score = 0.5,
@@ -89,7 +98,7 @@ pub fn score_message(msg: &Message) -> f32 {
         _ => {}
     }
 
-    if let Some(content) = &msg.content {
+    if let Some(content) = content {
         let text = content.to_lowercase();
         let len = content.len();
 

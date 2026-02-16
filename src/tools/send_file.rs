@@ -305,7 +305,7 @@ mod tests {
             tmp.path().join("inbox").to_string_lossy().to_string(),
         );
 
-        let requested = Path::new("/Users/davidloor/report.pdf");
+        let requested = Path::new("/tmp/testuser/report.pdf");
         let resolved = tool
             .resolve_missing_path_by_filename(requested)
             .expect("resolver should not error")
@@ -334,7 +334,7 @@ mod tests {
             tmp.path().join("inbox").to_string_lossy().to_string(),
         );
 
-        let requested = Path::new("/Users/davidloor/report.pdf");
+        let requested = Path::new("/tmp/testuser/report.pdf");
         let err = tool
             .resolve_missing_path_by_filename(requested)
             .expect_err("expected ambiguity error");
@@ -352,7 +352,7 @@ mod tests {
             tmp.path().join("inbox").to_string_lossy().to_string(),
         );
 
-        let requested = Path::new("/Users/davidloor/report.pdf");
+        let requested = Path::new("/tmp/testuser/report.pdf");
         let resolved = tool
             .resolve_missing_path_by_filename(requested)
             .expect("resolver should not error");

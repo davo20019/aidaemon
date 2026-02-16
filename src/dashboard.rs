@@ -50,8 +50,6 @@ pub struct DashboardState {
     pub health_store: Option<Arc<HealthProbeStore>>,
     pub heartbeat_telemetry: Option<Arc<HeartbeatTelemetry>>,
     pub oauth_gateway: Option<OAuthGateway>,
-    pub policy_window_days: u32,
-    pub policy_max_divergence: f64,
     pub policy_uncertainty_threshold: f32,
     pub write_consistency_thresholds: WriteConsistencyThresholds,
     pub queue_telemetry: Arc<QueueTelemetry>,
@@ -497,8 +495,6 @@ async fn api_writes_consistency(State(state): State<DashboardState>) -> Json<ser
             let gate = report.evaluate_gate_with(state.write_consistency_thresholds);
             Json(json!({
                 "generated_at": report.generated_at,
-                "messages_table_present": report.messages_table_present,
-                "conversation_message_rows": report.conversation_message_rows,
                 "conversation_event_rows": report.conversation_event_rows,
                 "missing_message_id_events": report.missing_message_id_events,
                 "global_delta": report.global_delta,
@@ -520,11 +516,6 @@ async fn api_writes_consistency(State(state): State<DashboardState>) -> Json<ser
 async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_json::Value> {
     let metrics = agent::policy_metrics_snapshot();
     let autotune = agent::policy_autotune_snapshot(state.policy_uncertainty_threshold);
-    let divergence_rate = if metrics.router_shadow_total > 0 {
-        metrics.router_shadow_diverged as f64 / metrics.router_shadow_total as f64
-    } else {
-        0.0
-    };
     let avg_tools_before = if metrics.tool_exposure_samples > 0 {
         metrics.tool_exposure_before_sum as f64 / metrics.tool_exposure_samples as f64
     } else {
@@ -535,39 +526,7 @@ async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_j
     } else {
         0.0
     };
-    let mut graduation = serde_json::json!({
-        "window_days": state.policy_window_days,
-        "observed_days": 0.0,
-        "total_decisions": 0,
-        "diverged_decisions": 0,
-        "divergence_rate": 0.0,
-        "gate_passed": false,
-    });
-    if let Some(store) = &state.event_store {
-        match store
-            .policy_graduation_report(state.policy_window_days)
-            .await
-        {
-            Ok(report) => {
-                graduation = serde_json::json!({
-                    "window_days": report.window_days,
-                    "observed_days": report.observed_days,
-                    "total_decisions": report.total_decisions,
-                    "diverged_decisions": report.diverged_decisions,
-                    "divergence_rate": report.divergence_rate,
-                    "gate_passed": report.gate_passes(state.policy_max_divergence),
-                    "max_divergence": state.policy_max_divergence
-                });
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to load policy graduation report");
-            }
-        }
-    }
     Json(json!({
-        "router_shadow_total": metrics.router_shadow_total,
-        "router_shadow_diverged": metrics.router_shadow_diverged,
-        "router_divergence_rate": divergence_rate,
         "tool_exposure_samples": metrics.tool_exposure_samples,
         "avg_tools_before_filter": avg_tools_before,
         "avg_tools_after_filter": avg_tools_after,
@@ -577,7 +536,15 @@ async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_j
         "context_refresh_total": metrics.context_refresh_total,
         "escalation_total": metrics.escalation_total,
         "fallback_expansion_total": metrics.fallback_expansion_total,
-        "graduation": graduation
+        "consultant_direct_return_total": metrics.consultant_direct_return_total,
+        "consultant_fallthrough_total": metrics.consultant_fallthrough_total,
+        "consultant_route_clarification_required_total": metrics.consultant_route_clarification_required_total,
+        "consultant_route_tools_required_total": metrics.consultant_route_tools_required_total,
+        "consultant_route_short_correction_direct_reply_total": metrics.consultant_route_short_correction_direct_reply_total,
+        "consultant_route_acknowledgment_direct_reply_total": metrics.consultant_route_acknowledgment_direct_reply_total,
+        "consultant_route_default_continue_total": metrics.consultant_route_default_continue_total,
+        "tokens_failed_tasks_total": metrics.tokens_failed_tasks_total,
+        "no_progress_iterations_total": metrics.no_progress_iterations_total
     }))
 }
 

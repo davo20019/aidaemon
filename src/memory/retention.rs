@@ -1,7 +1,7 @@
 //! Retention policies for automatic cleanup of old data.
 //!
 //! Each table has configurable retention with safe guards:
-//! - Messages: only deletes consolidated messages
+//! - Conversation events: only deletes consolidated conversation events
 //! - Facts: only deletes superseded versions
 //! - Token usage: aggregates before deleting
 //! - Episodes: only deletes unreferenced (recall_count=0)
@@ -103,17 +103,19 @@ impl RetentionManager {
         Ok(stats)
     }
 
-    /// Delete consolidated messages older than cutoff.
-    /// Safety: never deletes unconsolidated messages.
+    /// Delete consolidated conversation events older than cutoff.
+    /// Safety: never deletes unconsolidated events.
     async fn cleanup_messages(&self) -> anyhow::Result<u64> {
         if self.config.messages_days == 0 {
             return Ok(0);
         }
         let cutoff = (Utc::now() - Duration::days(self.config.messages_days as i64)).to_rfc3339();
         let result = sqlx::query(
-            "DELETE FROM messages WHERE id IN (
-                SELECT id FROM messages
-                WHERE consolidated_at IS NOT NULL AND created_at < ?
+            "DELETE FROM events WHERE id IN (
+                SELECT id FROM events
+                WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+                  AND consolidated_at IS NOT NULL
+                  AND created_at < ?
                 LIMIT 500
             )",
         )
@@ -299,13 +301,15 @@ mod tests {
 
         // Create minimal tables for testing
         sqlx::query(
-            "CREATE TABLE messages (
-                id TEXT PRIMARY KEY,
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT,
+                event_type TEXT NOT NULL,
+                data TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                consolidated_at TEXT
+                consolidated_at TEXT,
+                task_id TEXT,
+                tool_name TEXT
             )",
         )
         .execute(&pool)
@@ -436,23 +440,41 @@ mod tests {
         let pool = setup_test_db().await;
         let old_date = "2020-01-01T00:00:00+00:00";
 
-        // Insert unconsolidated old message (should survive)
-        sqlx::query("INSERT INTO messages (id, session_id, role, content, created_at) VALUES ('m1', 's1', 'user', 'hello', ?)")
-            .bind(old_date).execute(&pool).await.unwrap();
+        // Insert unconsolidated old conversation event (should survive)
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at)
+             VALUES ('s1', 'user_message', '{\"content\":\"hello\"}', ?)",
+        )
+        .bind(old_date)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        // Insert consolidated old message (should be deleted)
-        sqlx::query("INSERT INTO messages (id, session_id, role, content, created_at, consolidated_at) VALUES ('m2', 's1', 'user', 'world', ?, ?)")
-            .bind(old_date).bind(old_date).execute(&pool).await.unwrap();
+        // Insert consolidated old conversation event (should be deleted)
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at, consolidated_at)
+             VALUES ('s1', 'assistant_response', '{\"content\":\"world\"}', ?, ?)",
+        )
+        .bind(old_date)
+        .bind(old_date)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let mgr = RetentionManager::new(pool.clone(), RetentionConfig::default());
         let deleted = mgr.cleanup_messages().await.unwrap();
         assert_eq!(deleted, 1);
 
-        // Verify unconsolidated message survived
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages WHERE id = 'm1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        // Verify unconsolidated event survived
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM events
+             WHERE session_id = 's1'
+               AND event_type = 'user_message'
+               AND consolidated_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count.0, 1);
     }
 

@@ -3,12 +3,11 @@ use std::time::Duration;
 
 use crate::config::AppConfig;
 use crate::events::{Consolidator, EventStore, Pruner};
+use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::manager::MemoryManager;
 use crate::plans::PlanStore;
-use crate::router::{Router, Tier};
 use crate::state::SqliteStateStore;
-use crate::traits::ModelProvider;
 
 pub struct MemoryPipelineBundle {
     pub consolidator: Arc<Consolidator>,
@@ -21,8 +20,7 @@ pub fn build_memory_pipeline(
     state: Arc<SqliteStateStore>,
     event_store: Arc<EventStore>,
     plan_store: Arc<PlanStore>,
-    provider: Arc<dyn ModelProvider>,
-    router: &Router,
+    llm_runtime: SharedLlmRuntime,
     embedding_service: Arc<EmbeddingService>,
 ) -> MemoryPipelineBundle {
     let consolidator = Arc::new(
@@ -30,8 +28,7 @@ pub fn build_memory_pipeline(
             event_store.clone(),
             plan_store,
             state.pool(),
-            Some(provider.clone()),
-            router.select(Tier::Fast).to_string(),
+            Some(llm_runtime.clone()),
             Some(embedding_service.clone()),
         )
         .with_state(state.clone())
@@ -50,8 +47,7 @@ pub fn build_memory_pipeline(
         MemoryManager::new(
             state.pool(),
             embedding_service,
-            provider,
-            router.select(Tier::Fast).to_string(),
+            llm_runtime,
             consolidation_interval,
             Some(consolidator.clone()),
         )

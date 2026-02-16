@@ -16,7 +16,7 @@ use super::formatting::{
     build_help_text, format_number, markdown_to_slack_mrkdwn, sanitize_filename, split_message,
 };
 use crate::agent::Agent;
-use crate::channels::{ChannelHub, SessionMap};
+use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
@@ -60,6 +60,8 @@ pub struct SlackChannel {
     channel_name_cache: RwLock<HashMap<String, String>>,
     /// Cache of channel ID → (member display names, fetched_at). TTL: 10 minutes.
     channel_members_cache: RwLock<HashMap<String, (Vec<String>, Instant)>>,
+    /// Daemon start time used for post-restart UX guardrails.
+    started_at: Instant,
 }
 
 impl SlackChannel {
@@ -101,6 +103,7 @@ impl SlackChannel {
             user_cache: RwLock::new(HashMap::new()),
             channel_name_cache: RwLock::new(HashMap::new()),
             channel_members_cache: RwLock::new(HashMap::new()),
+            started_at: Instant::now(),
         }
     }
 
@@ -147,7 +150,10 @@ impl SlackChannel {
 
     /// Get the bot's name (cached after first connection).
     fn get_bot_name(&self) -> String {
-        self.bot_name.read().unwrap().clone()
+        self.bot_name
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Set the bot's name (called during start() after fetching from API).
@@ -669,7 +675,10 @@ impl SlackChannel {
         // Auto-claim: if no allowed_user_ids and this is a DM, claim the sender as owner
         let auto_claimed;
         let is_whitelisted = {
-            let allowed = self.allowed_user_ids.read().unwrap();
+            let allowed = self
+                .allowed_user_ids
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if allowed.is_empty() {
                 if is_dm {
                     drop(allowed);
@@ -678,7 +687,10 @@ impl SlackChannel {
                         "No allowed_user_ids configured — auto-claiming first DM user as owner."
                     );
                     {
-                        let mut allowed = self.allowed_user_ids.write().unwrap();
+                        let mut allowed = self
+                            .allowed_user_ids
+                            .write()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         allowed.push(user.clone());
                     }
                     auto_claimed = true;
@@ -695,7 +707,11 @@ impl SlackChannel {
 
         if auto_claimed {
             // Persist to config.toml (must be outside RwLock scope to avoid Send issues)
-            let ids = self.allowed_user_ids.read().unwrap().clone();
+            let ids = self
+                .allowed_user_ids
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
             if let Err(e) = self.persist_allowed_user_ids(&ids).await {
                 warn!(user = %user, "Failed to persist auto-claimed user ID to config: {}", e);
             }
@@ -845,25 +861,62 @@ impl SlackChannel {
         // Handle cancel/stop commands - these bypass the queue
         let text_lower = agent_text.to_lowercase();
         if text_lower == "cancel" || text_lower == "stop" || text_lower == "abort" {
+            if user_role != UserRole::Owner {
+                let _ = self
+                    .post_message(
+                        &channel_id,
+                        "Only the owner can cancel running work in this session.",
+                        reply_thread.as_deref(),
+                    )
+                    .await;
+                return;
+            }
             let cancelled = self
                 .task_registry
                 .cancel_running_for_session(&session_id)
                 .await;
             self.task_registry.clear_queue(&session_id).await;
+            let cancelled_goals = self
+                .agent
+                .cancel_active_goals_for_session(&session_id)
+                .await;
             if cancelled.is_empty() {
-                let _ = self
-                    .post_message(
-                        &channel_id,
-                        "No running task to cancel.",
-                        reply_thread.as_deref(),
-                    )
-                    .await;
+                if cancelled_goals.is_empty() {
+                    let _ = self
+                        .post_message(
+                            &channel_id,
+                            "No running task to cancel.",
+                            reply_thread.as_deref(),
+                        )
+                        .await;
+                } else if cancelled_goals.len() == 1 {
+                    let response = format!("⏹️ Cancelled goal: {}", cancelled_goals[0]);
+                    let _ = self
+                        .post_message(&channel_id, &response, reply_thread.as_deref())
+                        .await;
+                } else {
+                    let response = format!(
+                        "⏹️ Cancelled {} goals:\n{}",
+                        cancelled_goals.len(),
+                        cancelled_goals
+                            .iter()
+                            .map(|d| format!("- {}", d))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                    let _ = self
+                        .post_message(&channel_id, &response, reply_thread.as_deref())
+                        .await;
+                }
             } else {
                 let desc = cancelled
                     .first()
                     .map(|(_, d)| d.as_str())
                     .unwrap_or("unknown");
-                let response = format!("⏹️ Cancelled: {}", desc);
+                let mut response = format!("⏹️ Cancelled: {}", desc);
+                if !cancelled_goals.is_empty() {
+                    response.push_str(&format!(" (+{} goal(s) cancelled)", cancelled_goals.len()));
+                }
                 let _ = self
                     .post_message(&channel_id, &response, reply_thread.as_deref())
                     .await;
@@ -917,6 +970,26 @@ impl SlackChannel {
 
         // Check if a task is already running for this session - if so, queue this message
         if self.task_registry.has_running_task(&session_id).await {
+            let daemon_uptime = self.started_at.elapsed();
+            if should_ignore_lightweight_interjection(&agent_text, daemon_uptime) {
+                let current_task = self
+                    .task_registry
+                    .get_running_task_description(&session_id)
+                    .await
+                    .unwrap_or_else(|| "processing".to_string());
+                let _ = self
+                    .post_message(
+                        &channel_id,
+                        &format!(
+                            "⏳ Still working on: {}. I ignored that short check-in. \
+                             Send `cancel` to stop the current task.",
+                            current_task
+                        ),
+                        reply_thread.as_deref(),
+                    )
+                    .await;
+                return;
+            }
             let queue_result = self
                 .task_registry
                 .queue_message(&session_id, &agent_text)
@@ -1017,14 +1090,17 @@ impl SlackChannel {
             let min_interval = Duration::from_secs(3);
             while let Some(update) = status_rx.recv().await {
                 // In non-DM channels: hourglass reaction is sufficient, skip status messages
-                if !is_dm {
+                // (except BudgetExtended which must always reach the user)
+                if !is_dm && !matches!(&update, StatusUpdate::BudgetExtended { .. }) {
                     continue;
                 }
                 let now = tokio::time::Instant::now();
                 // Skip rate limiting for ToolProgress with URLs (e.g., OAuth authorize links)
+                // and for BudgetExtended (cost notifications should always be delivered)
                 let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
                     if chunk.contains("https://") || chunk.contains("http://"));
-                if !has_url && now.duration_since(last_sent) < min_interval {
+                let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
+                if !has_url && !is_budget_ext && now.duration_since(last_sent) < min_interval {
                     continue;
                 }
                 let text = match &update {
@@ -1146,6 +1222,17 @@ impl SlackChannel {
                             description, new_total_steps, reason
                         )
                     }
+                    StatusUpdate::BudgetExtended {
+                        old_budget,
+                        new_budget,
+                        extension,
+                        max_extensions,
+                    } => {
+                        format!(
+                            "_💰 Auto-extended token budget {} → {} ({}/{}) — continuing._",
+                            old_budget, new_budget, extension, max_extensions
+                        )
+                    }
                 };
                 let _ = status_self
                     .post_message(&status_channel, &text, status_thread.as_deref())
@@ -1157,6 +1244,11 @@ impl SlackChannel {
         // Register task for tracking
         let description: String = agent_text.chars().take(80).collect();
         let (task_id, cancel_token) = self.task_registry.register(&session_id, &description).await;
+        // Associate the typing indicator with this task so cancel_running_for_session
+        // also stops the typing/reaction indicator.
+        self.task_registry
+            .set_typing_cancel(task_id, typing_cancel.clone())
+            .await;
         let registry = Arc::clone(&self.task_registry);
 
         let agent = Arc::clone(&self.agent);
@@ -1167,6 +1259,18 @@ impl SlackChannel {
         // Snapshot user_cache for restoring @mentions in the reply
         let user_cache_snapshot = self.user_cache.read().await.clone();
         tokio::spawn(async move {
+            // Drop guard: if this task panics, ensure the typing indicator stops.
+            let typing_guard_token = Arc::new(std::sync::Mutex::new(typing_cancel.clone()));
+            struct TypingGuard(Arc<std::sync::Mutex<tokio_util::sync::CancellationToken>>);
+            impl Drop for TypingGuard {
+                fn drop(&mut self) {
+                    if let Ok(token) = self.0.lock() {
+                        token.cancel();
+                    }
+                }
+            }
+            let _typing_guard = TypingGuard(typing_guard_token.clone());
+
             let mut current_text = agent_text;
             let mut current_task_id = task_id;
             let mut current_cancel_token = cancel_token;
@@ -1296,12 +1400,14 @@ impl SlackChannel {
                         let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
                         let min_interval = Duration::from_secs(3);
                         while let Some(update) = new_status_rx.recv().await {
-                            // For queued messages, only show Thinking and ToolStart
-                            if !is_dm {
+                            // For queued messages, only show Thinking, ToolStart, and BudgetExtended
+                            if !is_dm && !matches!(&update, StatusUpdate::BudgetExtended { .. }) {
                                 continue;
                             }
                             let now = tokio::time::Instant::now();
-                            if now.duration_since(last_sent) < min_interval {
+                            let is_budget_ext =
+                                matches!(&update, StatusUpdate::BudgetExtended { .. });
+                            if !is_budget_ext && now.duration_since(last_sent) < min_interval {
                                 continue;
                             }
                             let text = match &update {
@@ -1312,6 +1418,17 @@ impl SlackChannel {
                                     } else {
                                         format!("_Using {}: {}..._", name, summary)
                                     }
+                                }
+                                StatusUpdate::BudgetExtended {
+                                    old_budget,
+                                    new_budget,
+                                    extension,
+                                    max_extensions,
+                                } => {
+                                    format!(
+                                        "_💰 Auto-extended token budget {} → {} ({}/{}) — continuing._",
+                                        old_budget, new_budget, extension, max_extensions
+                                    )
                                 }
                                 _ => continue,
                             };
@@ -1338,6 +1455,14 @@ impl SlackChannel {
 
                     // New typing cancel for queued message (no reaction-based indicator)
                     current_typing_cancel = tokio_util::sync::CancellationToken::new();
+                    // Associate typing token with the new queued task for cancel support
+                    registry
+                        .set_typing_cancel(current_task_id, current_typing_cancel.clone())
+                        .await;
+                    // Update the drop guard to track the new typing token
+                    if let Ok(mut guard_token) = typing_guard_token.lock() {
+                        *guard_token = current_typing_cancel.clone();
+                    }
                 } else {
                     // No more queued messages, exit loop
                     break;
@@ -1360,7 +1485,10 @@ impl SlackChannel {
 
         // Authorization check: fail-closed - deny if no users configured or user not in list
         {
-            let allowed = self.allowed_user_ids.read().unwrap();
+            let allowed = self
+                .allowed_user_ids
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if allowed.is_empty() || !allowed.contains(&user_id.to_string()) {
                 warn!(user_id, "Unauthorized Slack interactive action");
                 return;
@@ -1470,7 +1598,10 @@ impl SlackChannel {
 
         // Authorization check: fail-closed - deny if no users configured or user not in list
         {
-            let allowed = self.allowed_user_ids.read().unwrap();
+            let allowed = self
+                .allowed_user_ids
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if allowed.is_empty() || !allowed.contains(&user_id.to_string()) {
                 warn!(user_id, "Unauthorized Slack slash command");
                 return;
@@ -1551,13 +1682,10 @@ impl SlackChannel {
                 "Auto-routing re-enabled.".to_string()
             }
             "/reload" => match AppConfig::load(&self.config_path) {
-                Ok(new_config) => {
-                    let new_model = new_config.provider.models.primary.clone();
-                    let old_model = self.agent.current_model().await;
-                    self.agent.set_model(new_model.clone()).await;
-                    self.agent.clear_model_override().await;
-                    format!("Config reloaded.\nModel: {} -> {}", old_model, new_model)
-                }
+                Ok(new_config) => match self.agent.reload_provider(&new_config).await {
+                    Ok(status) => format!("Config reloaded. {}", status),
+                    Err(e) => format!("Provider reload failed: {}", e),
+                },
                 Err(e) => {
                     let backup = self.config_path.with_extension("toml.bak");
                     if backup.exists() {
@@ -2021,7 +2149,7 @@ fn restore_mentions_from_cache(text: &str, cache: &HashMap<String, String>) -> S
         return text.to_string();
     }
     let mut result = text.to_string();
-    // Sort by name length descending so "David Loor" matches before "David"
+    // Sort by name length descending so "Jane Smith" matches before "Jane"
     let mut entries: Vec<_> = cache.iter().collect();
     entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
     for (user_id, name) in entries {

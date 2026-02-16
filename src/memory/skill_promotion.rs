@@ -11,13 +11,17 @@ use std::sync::Arc;
 use serde_json::json;
 use tracing::{info, warn};
 
+use crate::llm_runtime::SharedLlmRuntime;
 use crate::skills::{self, Skill};
-use crate::traits::{ModelProvider, Procedure, SkillDraft, StateStore};
+use crate::traits::{Procedure, SkillDraft, StateStore};
 
 /// Minimum number of successes before a procedure is eligible for promotion.
 const DEFAULT_MIN_SUCCESS: i32 = 5;
 /// Minimum success rate (0.0 - 1.0) for promotion eligibility.
 const DEFAULT_MIN_RATE: f32 = 0.8;
+const _: () = {
+    assert!(DEFAULT_MIN_RATE > 0.0 && DEFAULT_MIN_RATE <= 1.0);
+};
 /// Stricter thresholds when evidence gate enforcement is enabled.
 const EVIDENCE_MIN_SUCCESS: i32 = 7;
 const EVIDENCE_MIN_RATE: f32 = 0.9;
@@ -25,8 +29,7 @@ const EVIDENCE_MIN_MARGIN: i32 = 3;
 
 pub struct SkillPromoter {
     state: Arc<dyn StateStore>,
-    provider: Arc<dyn ModelProvider>,
-    fast_model: String,
+    llm_runtime: SharedLlmRuntime,
     skills_dir: PathBuf,
     evidence_gate_enforce: bool,
 }
@@ -34,15 +37,13 @@ pub struct SkillPromoter {
 impl SkillPromoter {
     pub fn new(
         state: Arc<dyn StateStore>,
-        provider: Arc<dyn ModelProvider>,
-        fast_model: String,
+        llm_runtime: SharedLlmRuntime,
         skills_dir: PathBuf,
         evidence_gate_enforce: bool,
     ) -> Self {
         Self {
             state,
-            provider,
-            fast_model,
+            llm_runtime,
             skills_dir,
             evidence_gate_enforce,
         }
@@ -192,7 +193,12 @@ impl SkillPromoter {
             json!({"role": "user", "content": prompt}),
         ];
 
-        let response = self.provider.chat(&self.fast_model, &messages, &[]).await?;
+        let runtime_snapshot = self.llm_runtime.snapshot();
+        let fast_model = runtime_snapshot.fast_model();
+        let response = runtime_snapshot
+            .provider()
+            .chat(&fast_model, &messages, &[])
+            .await?;
 
         // Track token usage for background LLM calls
         if let Some(usage) = &response.usage {
@@ -235,7 +241,7 @@ mod tests {
     #[test]
     fn threshold_constants() {
         assert_eq!(DEFAULT_MIN_SUCCESS, 5);
-        assert!(DEFAULT_MIN_RATE > 0.0 && DEFAULT_MIN_RATE <= 1.0);
+        assert_eq!(DEFAULT_MIN_RATE, 0.8);
     }
 
     #[test]

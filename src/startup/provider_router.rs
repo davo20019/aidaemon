@@ -8,7 +8,6 @@ use crate::traits::ModelProvider;
 
 pub struct ProviderRouterBundle {
     pub provider: Arc<dyn ModelProvider>,
-    pub router: Router,
     pub primary_model: String,
 }
 
@@ -40,7 +39,6 @@ pub fn build_provider_router(config: &AppConfig) -> anyhow::Result<ProviderRoute
 
     Ok(ProviderRouterBundle {
         provider,
-        router,
         primary_model,
     })
 }

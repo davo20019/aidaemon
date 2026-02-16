@@ -3,11 +3,8 @@ use super::*;
 #[async_trait]
 impl crate::traits::MessageStore for SqliteStateStore {
     async fn append_message(&self, msg: &Message) -> anyhow::Result<()> {
-        // Canonical persistence is event-sourced (EventStore). We only keep
-        // an in-memory session window here for fast hot-path reads.
-        //
-        // We ALSO maintain a best-effort `messages` projection table (legacy + background
-        // jobs + dashboard). If the projection write fails, we do not fail the request.
+        // Canonical persistence is event-sourced (events table). Keep only an
+        // in-memory hot window here for low-latency context assembly.
         {
             let mut wm = self.working_memory.write().await;
             let deque = wm
@@ -41,86 +38,6 @@ impl crate::traits::MessageStore for SqliteStateStore {
                 evicted,
                 "append_message: added to working memory"
             );
-        }
-
-        // Best-effort projection write (used by MemoryManager, retention, dashboard).
-        // Store timestamps as RFC3339, matching hydrate_from_messages().
-        let created_at = msg.created_at.to_rfc3339();
-        let write_with_importance = sqlx::query(
-            r#"
-            INSERT INTO messages
-                (id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance)
-            VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                session_id = excluded.session_id,
-                role = excluded.role,
-                content = excluded.content,
-                tool_call_id = excluded.tool_call_id,
-                tool_name = excluded.tool_name,
-                tool_calls_json = excluded.tool_calls_json,
-                created_at = excluded.created_at,
-                importance = excluded.importance
-            "#,
-        )
-        .bind(&msg.id)
-        .bind(&msg.session_id)
-        .bind(&msg.role)
-        .bind(&msg.content)
-        .bind(&msg.tool_call_id)
-        .bind(&msg.tool_name)
-        .bind(&msg.tool_calls_json)
-        .bind(&created_at)
-        .bind(msg.importance)
-        .execute(&self.pool)
-        .await;
-
-        if let Err(e) = write_with_importance {
-            let err = e.to_string();
-            // Back-compat for older DBs that might not have migrated columns.
-            if err.contains("no such column: importance") {
-                let write_legacy = sqlx::query(
-                    r#"
-                    INSERT INTO messages
-                        (id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at)
-                    VALUES
-                        (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        session_id = excluded.session_id,
-                        role = excluded.role,
-                        content = excluded.content,
-                        tool_call_id = excluded.tool_call_id,
-                        tool_name = excluded.tool_name,
-                        tool_calls_json = excluded.tool_calls_json,
-                        created_at = excluded.created_at
-                    "#,
-                )
-                .bind(&msg.id)
-                .bind(&msg.session_id)
-                .bind(&msg.role)
-                .bind(&msg.content)
-                .bind(&msg.tool_call_id)
-                .bind(&msg.tool_name)
-                .bind(&msg.tool_calls_json)
-                .bind(&created_at)
-                .execute(&self.pool)
-                .await;
-                if let Err(e2) = write_legacy {
-                    tracing::warn!(
-                        session_id = %msg.session_id,
-                        msg_id = %msg.id,
-                        error = %e2,
-                        "append_message: failed to write legacy messages projection"
-                    );
-                }
-            } else if !err.contains("no such table: messages") {
-                tracing::warn!(
-                    session_id = %msg.session_id,
-                    msg_id = %msg.id,
-                    error = %e,
-                    "append_message: failed to write messages projection"
-                );
-            }
         }
 
         Ok(())
@@ -196,9 +113,9 @@ impl crate::traits::MessageStore for SqliteStateStore {
             wm.remove(session_id);
         }
 
-        // Delete session rows across canonical + legacy tables.
-        // Some test/legacy DBs may not have all tables yet; treat missing tables as best-effort.
-        for table in ["events", "messages", "conversation_summaries"] {
+        // Delete session rows across canonical tables.
+        // Some test DBs may not have all tables yet; treat missing tables as best-effort.
+        for table in ["events", "conversation_summaries"] {
             let query = format!("DELETE FROM {table} WHERE session_id = ?");
             if let Err(e) = sqlx::query(&query)
                 .bind(session_id)

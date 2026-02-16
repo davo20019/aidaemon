@@ -25,6 +25,24 @@ pub struct ManageSkillsTool {
     registry_urls: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoveOutcomeKind {
+    Removed,
+    DraftsOnly,
+    NotFound,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone)]
+struct RemoveOutcome {
+    kind: RemoveOutcomeKind,
+    requested: String,
+    target_name: String,
+    dismissed_draft_ids: Vec<i64>,
+    ambiguous_candidates: Vec<String>,
+    available_skills: Vec<String>,
+}
+
 impl ManageSkillsTool {
     pub fn new(
         skills_dir: PathBuf,
@@ -117,6 +135,7 @@ impl ManageSkillsTool {
         let content = response.text().await?;
         let skill = match Skill::parse(&content) {
             Some(mut s) => {
+                s.origin = Some(skills::SKILL_ORIGIN_CUSTOM.to_string());
                 s.source = Some("url".to_string());
                 s.source_url = Some(url.to_string());
                 s
@@ -130,6 +149,7 @@ impl ManageSkillsTool {
     async fn handle_add_inline(&self, content: &str) -> anyhow::Result<String> {
         let skill = match Skill::parse(content) {
             Some(mut s) => {
+                s.origin = Some(skills::SKILL_ORIGIN_CUSTOM.to_string());
                 s.source = Some("inline".to_string());
                 s
             }
@@ -147,12 +167,30 @@ impl ManageSkillsTool {
 
         all_skills.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let mut output = format!("**{} skills:**\n", all_skills.len());
+        let mut custom_count = 0usize;
+        let mut contrib_count = 0usize;
         for skill in &all_skills {
+            match skills::infer_skill_origin(skill.origin.as_deref(), skill.source.as_deref()) {
+                skills::SKILL_ORIGIN_CONTRIB => contrib_count += 1,
+                _ => custom_count += 1,
+            }
+        }
+
+        let mut output = format!(
+            "**{} skills:** ({}: {}, {}: {})\n",
+            all_skills.len(),
+            skills::SKILL_ORIGIN_CUSTOM,
+            custom_count,
+            skills::SKILL_ORIGIN_CONTRIB,
+            contrib_count
+        );
+        for skill in &all_skills {
+            let origin =
+                skills::infer_skill_origin(skill.origin.as_deref(), skill.source.as_deref());
             let source = skill.source.as_deref().unwrap_or("filesystem");
             output.push_str(&format!(
-                "- **{}**: {} [source: {}]\n",
-                skill.name, skill.description, source
+                "- **{}**: {} [origin: {}] [source: {}]\n",
+                skill.name, skill.description, origin, source
             ));
             if !skill.triggers.is_empty() {
                 output.push_str(&format!("  triggers: {}\n", skill.triggers.join(", ")));
@@ -173,14 +211,326 @@ impl ManageSkillsTool {
         Ok(output)
     }
 
-    async fn handle_remove(&self, name: &str) -> anyhow::Result<String> {
-        match skills::remove_skill_file(&self.skills_dir, name)? {
-            true => {
-                info!(name = %name, "Skill removed from filesystem");
-                Ok(format!("Skill '{}' removed.", name))
-            }
-            false => Ok(format!("Skill '{}' not found.", name)),
+    fn resolve_skill_name<'a>(
+        all_skills: &'a [Skill],
+        name: &str,
+    ) -> Result<Option<&'a Skill>, Vec<String>> {
+        if all_skills.is_empty() {
+            return Ok(None);
         }
+
+        // Exact case-sensitive match first.
+        if let Some(found) = skills::find_skill_by_name(all_skills, name) {
+            return Ok(Some(found));
+        }
+
+        // Case-insensitive fallback.
+        let mut matches: Vec<&Skill> = all_skills
+            .iter()
+            .filter(|s| s.name.eq_ignore_ascii_case(name))
+            .collect();
+        if matches.len() > 1 {
+            return Err(matches.into_iter().map(|s| s.name.clone()).collect());
+        }
+        if let Some(found) = matches.pop() {
+            return Ok(Some(found));
+        }
+
+        // Canonical filename-based fallback (handles spaces/underscores/hyphen variants).
+        let normalized_query = skills::sanitize_skill_filename(name);
+        let mut normalized_matches: Vec<&Skill> = all_skills
+            .iter()
+            .filter(|s| skills::sanitize_skill_filename(&s.name) == normalized_query)
+            .collect();
+        if normalized_matches.len() > 1 {
+            return Err(normalized_matches
+                .into_iter()
+                .map(|s| s.name.clone())
+                .collect());
+        }
+        if let Some(found) = normalized_matches.pop() {
+            return Ok(Some(found));
+        }
+
+        Ok(None)
+    }
+
+    async fn matching_pending_draft_ids(&self, skill_name: &str) -> anyhow::Result<Vec<i64>> {
+        let pending = self.state.get_pending_skill_drafts().await?;
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let normalized_target = skills::sanitize_skill_filename(skill_name);
+        let mut dismissed_ids = Vec::new();
+        for draft in pending {
+            let name_matches = draft.name.eq_ignore_ascii_case(skill_name)
+                || skills::sanitize_skill_filename(&draft.name) == normalized_target;
+            if name_matches {
+                dismissed_ids.push(draft.id);
+            }
+        }
+
+        Ok(dismissed_ids)
+    }
+
+    async fn dismiss_pending_drafts(&self, draft_ids: &[i64]) -> anyhow::Result<()> {
+        for id in draft_ids {
+            self.state
+                .update_skill_draft_status(*id, "dismissed")
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_skill_internal(
+        &self,
+        name: &str,
+        dry_run: bool,
+    ) -> anyhow::Result<RemoveOutcome> {
+        let all_skills = skills::load_skills(&self.skills_dir);
+        let mut available: Vec<String> = all_skills.iter().map(|s| s.name.clone()).collect();
+        available.sort();
+
+        let resolved_skill = match Self::resolve_skill_name(&all_skills, name) {
+            Ok(skill) => skill,
+            Err(candidates) => {
+                return Ok(RemoveOutcome {
+                    kind: RemoveOutcomeKind::Ambiguous,
+                    requested: name.to_string(),
+                    target_name: name.to_string(),
+                    dismissed_draft_ids: Vec::new(),
+                    ambiguous_candidates: candidates,
+                    available_skills: available,
+                });
+            }
+        };
+
+        let target_name = resolved_skill
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| name.to_string());
+        let dismissed_draft_ids = self.matching_pending_draft_ids(&target_name).await?;
+
+        let removed = if dry_run {
+            let sanitized = skills::sanitize_skill_filename(&target_name);
+            let md_path = self.skills_dir.join(format!("{}.md", sanitized));
+            let dir_path = self.skills_dir.join(&sanitized);
+            resolved_skill.is_some() || md_path.exists() || dir_path.is_dir()
+        } else {
+            skills::remove_skill_file(&self.skills_dir, &target_name)?
+        };
+
+        if !dry_run && !dismissed_draft_ids.is_empty() {
+            self.dismiss_pending_drafts(&dismissed_draft_ids).await?;
+        }
+
+        if removed {
+            return Ok(RemoveOutcome {
+                kind: RemoveOutcomeKind::Removed,
+                requested: name.to_string(),
+                target_name,
+                dismissed_draft_ids,
+                ambiguous_candidates: Vec::new(),
+                available_skills: available,
+            });
+        }
+
+        if !dismissed_draft_ids.is_empty() {
+            return Ok(RemoveOutcome {
+                kind: RemoveOutcomeKind::DraftsOnly,
+                requested: name.to_string(),
+                target_name,
+                dismissed_draft_ids,
+                ambiguous_candidates: Vec::new(),
+                available_skills: available,
+            });
+        }
+
+        Ok(RemoveOutcome {
+            kind: RemoveOutcomeKind::NotFound,
+            requested: name.to_string(),
+            target_name,
+            dismissed_draft_ids: Vec::new(),
+            ambiguous_candidates: Vec::new(),
+            available_skills: available,
+        })
+    }
+
+    async fn handle_remove(&self, name: &str) -> anyhow::Result<String> {
+        let outcome = self.remove_skill_internal(name, false).await?;
+
+        match outcome.kind {
+            RemoveOutcomeKind::Ambiguous => Ok(format!(
+                "Skill name '{}' is ambiguous. Matches: {}. Use the exact skill name from `manage_skills list`.",
+                outcome.requested,
+                outcome.ambiguous_candidates.join(", ")
+            )),
+            RemoveOutcomeKind::Removed => {
+                info!(name = %outcome.target_name, "Skill removed from filesystem");
+                if outcome.dismissed_draft_ids.is_empty() {
+                    Ok(format!("Skill '{}' removed.", outcome.target_name))
+                } else {
+                    let ids = outcome
+                        .dismissed_draft_ids
+                        .iter()
+                        .map(|id| format!("#{}", id))
+                        .collect::<Vec<String>>()
+                        .join(", ");
+                    Ok(format!(
+                        "Skill '{}' removed. Dismissed {} pending draft(s): {}.",
+                        outcome.target_name,
+                        outcome.dismissed_draft_ids.len(),
+                        ids
+                    ))
+                }
+            }
+            RemoveOutcomeKind::DraftsOnly => {
+                let ids = outcome
+                    .dismissed_draft_ids
+                    .iter()
+                    .map(|id| format!("#{}", id))
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                Ok(format!(
+                    "Skill '{}' was not installed, but dismissed {} pending draft(s): {}.",
+                    outcome.target_name,
+                    outcome.dismissed_draft_ids.len(),
+                    ids
+                ))
+            }
+            RemoveOutcomeKind::NotFound => {
+                if outcome.available_skills.is_empty() {
+                    Ok(format!(
+                        "Skill '{}' not found. No skills are currently loaded.",
+                        outcome.requested
+                    ))
+                } else {
+                    Ok(format!(
+                        "Skill '{}' not found. Available skills: {}",
+                        outcome.requested,
+                        outcome.available_skills.join(", ")
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn handle_remove_all(&self, names: &[String], dry_run: bool) -> anyhow::Result<String> {
+        let mut requested: Vec<String> = Vec::new();
+        for name in names {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !requested.iter().any(|n| n.eq_ignore_ascii_case(trimmed)) {
+                requested.push(trimmed.to_string());
+            }
+        }
+
+        if requested.is_empty() {
+            return Ok("No valid skill names were provided.".to_string());
+        }
+
+        let mut removed = Vec::new();
+        let mut drafts_only = Vec::new();
+        let mut not_found = Vec::new();
+        let mut ambiguous: Vec<(String, Vec<String>)> = Vec::new();
+        let mut draft_ids: Vec<i64> = Vec::new();
+
+        for name in &requested {
+            let outcome = self.remove_skill_internal(name, dry_run).await?;
+            draft_ids.extend(outcome.dismissed_draft_ids.iter().copied());
+            match outcome.kind {
+                RemoveOutcomeKind::Removed => removed.push(outcome.target_name),
+                RemoveOutcomeKind::DraftsOnly => drafts_only.push(outcome.target_name),
+                RemoveOutcomeKind::NotFound => not_found.push(outcome.requested),
+                RemoveOutcomeKind::Ambiguous => {
+                    ambiguous.push((outcome.requested, outcome.ambiguous_candidates))
+                }
+            }
+        }
+
+        removed.sort();
+        removed.dedup();
+        drafts_only.sort();
+        drafts_only.dedup();
+        not_found.sort();
+        not_found.dedup();
+        ambiguous.sort_by(|a, b| a.0.cmp(&b.0));
+        draft_ids.sort_unstable();
+        draft_ids.dedup();
+
+        let mut output = if dry_run {
+            format!(
+                "Dry run for remove_all processed {} skill request(s):\n",
+                requested.len()
+            )
+        } else {
+            format!(
+                "remove_all processed {} skill request(s):\n",
+                requested.len()
+            )
+        };
+
+        if !removed.is_empty() {
+            if dry_run {
+                output.push_str(&format!(
+                    "- Would remove {}: {}\n",
+                    removed.len(),
+                    removed.join(", ")
+                ));
+            } else {
+                output.push_str(&format!(
+                    "- Removed {}: {}\n",
+                    removed.len(),
+                    removed.join(", ")
+                ));
+            }
+        }
+        if !drafts_only.is_empty() {
+            output.push_str(&format!(
+                "- No installed skill matched, but pending drafts matched {}: {}\n",
+                drafts_only.len(),
+                drafts_only.join(", ")
+            ));
+        }
+        if !draft_ids.is_empty() {
+            let ids = draft_ids
+                .iter()
+                .map(|id| format!("#{}", id))
+                .collect::<Vec<String>>()
+                .join(", ");
+            if dry_run {
+                output.push_str(&format!("- Would dismiss pending draft(s): {}\n", ids));
+            } else {
+                output.push_str(&format!("- Dismissed pending draft(s): {}\n", ids));
+            }
+        }
+        if !not_found.is_empty() {
+            output.push_str(&format!(
+                "- Not found {}: {}\n",
+                not_found.len(),
+                not_found.join(", ")
+            ));
+        }
+        for (name, candidates) in &ambiguous {
+            output.push_str(&format!(
+                "- Ambiguous '{}': {}. Use exact names from `manage_skills list`.\n",
+                name,
+                candidates.join(", ")
+            ));
+        }
+
+        if removed.is_empty()
+            && drafts_only.is_empty()
+            && draft_ids.is_empty()
+            && not_found.is_empty()
+            && ambiguous.is_empty()
+        {
+            output.push_str("- No changes.");
+        }
+
+        Ok(output)
     }
 
     async fn handle_browse(&self, query: Option<&str>) -> anyhow::Result<String> {
@@ -242,6 +592,7 @@ impl ManageSkillsTool {
         let content = skill_registry::fetch_skill_content(&self.client, &entry).await?;
         let skill = match Skill::parse(&content) {
             Some(mut s) => {
+                s.origin = Some(skills::SKILL_ORIGIN_CONTRIB.to_string());
                 s.source = Some("registry".to_string());
                 s.source_url = Some(entry.url.clone());
                 s
@@ -297,6 +648,10 @@ impl ManageSkillsTool {
         skills::remove_skill_file(&self.skills_dir, name)?;
 
         let mut skill = new_skill;
+        skill.origin = Some(
+            skills::infer_skill_origin(existing.origin.as_deref(), existing.source.as_deref())
+                .to_string(),
+        );
         skill.source = existing.source.clone();
         skill.source_url = Some(source_url);
         let path = skills::write_skill_to_file(&self.skills_dir, &skill)?;
@@ -337,6 +692,7 @@ impl ManageSkillsTool {
                     description: draft.description.clone(),
                     triggers,
                     body: draft.body.clone(),
+                    origin: Some(skills::SKILL_ORIGIN_CUSTOM.to_string()),
                     source: Some("auto".to_string()),
                     source_url: None,
                     dir_path: None,
@@ -405,9 +761,11 @@ struct ManageSkillsArgs {
     url: Option<String>,
     content: Option<String>,
     name: Option<String>,
+    names: Option<Vec<String>>,
     query: Option<String>,
     draft_id: Option<i64>,
     approve: Option<bool>,
+    dry_run: Option<bool>,
 }
 
 #[async_trait]
@@ -417,7 +775,7 @@ impl Tool for ManageSkillsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage skills at runtime. Actions: add (from URL), add_inline (raw markdown), list, remove, browse (search registries), install (from registry), update (re-fetch from source), review (approve/dismiss auto-promoted skill drafts)."
+        "Manage skills at runtime. Actions: add (from URL), add_inline (raw markdown), list, remove (also dismiss matching pending drafts), remove_all (bulk remove with optional dry_run), browse (search registries), install (from registry), update (re-fetch from source), review (approve/dismiss auto-promoted skill drafts)."
     }
 
     fn schema(&self) -> Value {
@@ -429,7 +787,7 @@ impl Tool for ManageSkillsTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "add_inline", "list", "remove", "browse", "install", "update", "review"],
+                        "enum": ["add", "add_inline", "list", "remove", "remove_all", "browse", "install", "update", "review"],
                         "description": "The action to perform"
                     },
                     "url": {
@@ -444,6 +802,11 @@ impl Tool for ManageSkillsTool {
                         "type": "string",
                         "description": "Skill name (for 'remove', 'install', 'update' actions)"
                     },
+                    "names": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "List of skill names (for 'remove_all' action)"
+                    },
                     "query": {
                         "type": "string",
                         "description": "Search query (for 'browse' action)"
@@ -455,6 +818,10 @@ impl Tool for ManageSkillsTool {
                     "approve": {
                         "type": "boolean",
                         "description": "true to approve a draft, false to dismiss (for 'review' action with draft_id)"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, preview `remove_all` changes without removing/dismissing anything."
                     }
                 },
                 "required": ["action"]
@@ -483,6 +850,13 @@ impl Tool for ManageSkillsTool {
                     .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'remove' action"))?;
                 self.handle_remove(name).await
             }
+            "remove_all" => {
+                let names = args
+                    .names
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'names' parameter required for 'remove_all' action"))?;
+                self.handle_remove_all(names, args.dry_run.unwrap_or(false)).await
+            }
             "browse" => {
                 self.handle_browse(args.query.as_deref()).await
             }
@@ -499,7 +873,7 @@ impl Tool for ManageSkillsTool {
             "review" => {
                 self.handle_review(args.draft_id, args.approve).await
             }
-            other => Ok(format!("Unknown action '{}'. Valid actions: add, add_inline, list, remove, browse, install, update, review", other)),
+            other => Ok(format!("Unknown action '{}'. Valid actions: add, add_inline, list, remove, remove_all, browse, install, update, review", other)),
         }
     }
 }
@@ -507,6 +881,48 @@ impl Tool for ManageSkillsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use crate::traits::store_prelude::*;
+    use crate::traits::SkillDraft;
+
+    async fn setup_tool() -> (ManageSkillsTool, Arc<dyn StateStore>, tempfile::TempDir) {
+        let skills_dir = tempfile::TempDir::new().unwrap();
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let sqlite_state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        std::mem::forget(db_file);
+
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(4);
+        let tool = ManageSkillsTool::new(
+            skills_dir.path().to_path_buf(),
+            sqlite_state.clone() as Arc<dyn StateStore>,
+            approval_tx,
+        );
+
+        (tool, sqlite_state as Arc<dyn StateStore>, skills_dir)
+    }
+
+    fn make_skill(name: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: format!("{} skill", name),
+            triggers: vec!["deploy".to_string()],
+            body: "Do the thing.".to_string(),
+            origin: Some(skills::SKILL_ORIGIN_CUSTOM.to_string()),
+            source: Some("inline".to_string()),
+            source_url: None,
+            dir_path: None,
+            resources: vec![],
+        }
+    }
 
     #[test]
     fn parse_valid_skill_markdown() {
@@ -539,5 +955,144 @@ mod tests {
                 .is_ok()
         );
         assert!(validate_url_for_ssrf("https://example.com/skills/deploy.md").is_ok());
+    }
+
+    #[tokio::test]
+    async fn remove_fuzzy_name_removes_skill_and_dismisses_matching_draft() {
+        let (tool, state, skills_dir) = setup_tool().await;
+        let skill = make_skill("send-resume");
+        skills::write_skill_to_file(skills_dir.path(), &skill).unwrap();
+
+        let draft = SkillDraft {
+            id: 0,
+            name: "Send Resume".to_string(),
+            description: "Draft replacement".to_string(),
+            triggers_json: "[]".to_string(),
+            body: "draft body".to_string(),
+            source_procedure: "resume-proc".to_string(),
+            status: "pending".to_string(),
+            created_at: String::new(),
+        };
+        state.add_skill_draft(&draft).await.unwrap();
+
+        let result = tool
+            .call(r#"{"action":"remove","name":"send resume"}"#)
+            .await
+            .unwrap();
+
+        assert!(result.contains("Skill 'send-resume' removed."));
+        assert!(result.contains("Dismissed 1 pending draft(s)"));
+        assert!(skills::load_skills(skills_dir.path()).is_empty());
+        assert!(state.get_pending_skill_drafts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_nonexistent_skill_still_dismisses_pending_draft() {
+        let (tool, state, _skills_dir) = setup_tool().await;
+
+        let draft = SkillDraft {
+            id: 0,
+            name: "deploy-helper".to_string(),
+            description: "Draft replacement".to_string(),
+            triggers_json: "[]".to_string(),
+            body: "draft body".to_string(),
+            source_procedure: "deploy-proc".to_string(),
+            status: "pending".to_string(),
+            created_at: String::new(),
+        };
+        state.add_skill_draft(&draft).await.unwrap();
+
+        let result = tool
+            .call(r#"{"action":"remove","name":"deploy helper"}"#)
+            .await
+            .unwrap();
+
+        let result_lower = result.to_lowercase();
+        assert!(result_lower.contains("was not installed"));
+        assert!(result_lower.contains("dismissed 1 pending draft(s)"));
+        assert!(state.get_pending_skill_drafts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_all_bulk_removes_skills_and_dismisses_drafts() {
+        let (tool, state, skills_dir) = setup_tool().await;
+        skills::write_skill_to_file(skills_dir.path(), &make_skill("send-resume")).unwrap();
+        skills::write_skill_to_file(skills_dir.path(), &make_skill("confirm")).unwrap();
+
+        let draft1 = SkillDraft {
+            id: 0,
+            name: "Send Resume".to_string(),
+            description: "Draft replacement".to_string(),
+            triggers_json: "[]".to_string(),
+            body: "draft body".to_string(),
+            source_procedure: "resume-proc".to_string(),
+            status: "pending".to_string(),
+            created_at: String::new(),
+        };
+        let draft2 = SkillDraft {
+            id: 0,
+            name: "deploy-helper".to_string(),
+            description: "Draft replacement".to_string(),
+            triggers_json: "[]".to_string(),
+            body: "draft body".to_string(),
+            source_procedure: "deploy-proc".to_string(),
+            status: "pending".to_string(),
+            created_at: String::new(),
+        };
+        state.add_skill_draft(&draft1).await.unwrap();
+        state.add_skill_draft(&draft2).await.unwrap();
+
+        let result = tool
+            .call(
+                r#"{
+                    "action":"remove_all",
+                    "names":["send resume","confirm","deploy helper","missing"]
+                }"#,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("remove_all processed 4 skill request(s):"));
+        assert!(result.contains("Removed 2: confirm, send-resume"));
+        assert!(result.contains("pending drafts matched 1: deploy helper"));
+        assert!(result.contains("Dismissed pending draft(s): #"));
+        assert!(result.contains("Not found 1: missing"));
+        assert!(skills::load_skills(skills_dir.path()).is_empty());
+        assert!(state.get_pending_skill_drafts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_all_dry_run_does_not_modify_skills_or_drafts() {
+        let (tool, state, skills_dir) = setup_tool().await;
+        skills::write_skill_to_file(skills_dir.path(), &make_skill("send-resume")).unwrap();
+
+        let draft = SkillDraft {
+            id: 0,
+            name: "Send Resume".to_string(),
+            description: "Draft replacement".to_string(),
+            triggers_json: "[]".to_string(),
+            body: "draft body".to_string(),
+            source_procedure: "resume-proc".to_string(),
+            status: "pending".to_string(),
+            created_at: String::new(),
+        };
+        state.add_skill_draft(&draft).await.unwrap();
+
+        let result = tool
+            .call(
+                r#"{
+                    "action":"remove_all",
+                    "names":["send resume"],
+                    "dry_run":true
+                }"#,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Dry run for remove_all processed 1 skill request(s):"));
+        assert!(result.contains("Would remove 1: send-resume"));
+        assert!(result.contains("Would dismiss pending draft(s): #"));
+        assert_eq!(skills::load_skills(skills_dir.path()).len(), 1);
+        assert_eq!(state.get_pending_skill_drafts().await.unwrap().len(), 1);
     }
 }

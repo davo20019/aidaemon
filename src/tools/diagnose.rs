@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -10,34 +11,50 @@ use crate::events::{
     ErrorType, Event, EventStore, EventType, FailureCategory, RootCauseCandidate, TaskEndData,
     TaskStartData, ThinkingStartData, ToolCallData, ToolResultData,
 };
+use crate::llm_runtime::SharedLlmRuntime;
 use crate::tools::sanitize::redact_secrets;
-use crate::traits::{ModelProvider, ProviderResponse, StateStore, Tool, ToolCapabilities};
+use crate::traits::{ProviderResponse, StateStore, Tool, ToolCapabilities};
 use crate::utils::truncate_str;
 
 pub struct DiagnoseTool {
     event_store: Arc<EventStore>,
     #[allow(dead_code)]
     state: Arc<dyn StateStore>,
-    provider: Arc<dyn ModelProvider>,
-    fast_model: String,
+    llm_runtime: SharedLlmRuntime,
     max_events: usize,
     include_raw_args: bool,
+}
+
+const ROUTE_ALERT_LOOKBACK_DAYS: i64 = 7;
+const ROUTE_ALERT_RECENT_WINDOW: usize = 30;
+const ROUTE_ALERT_MIN_BASELINE_WINDOW: usize = 30;
+const ROUTE_ALERT_TOOLS_REQUIRED_RATE_DELTA_THRESHOLD: f64 = 0.25;
+const ROUTE_ALERT_CLARIFICATION_SUSTAINED_WINDOW: usize = 12;
+const ROUTE_ALERT_CLARIFICATION_MIN_BASELINE: usize = 20;
+const ROUTE_ALERT_CLARIFICATION_RATE_DELTA_THRESHOLD: f64 = 0.20;
+const ROUTE_ALERT_CLARIFICATION_SPIKE_MULTIPLIER: f64 = 2.0;
+const ROUTE_ALERT_CLARIFICATION_MIN_SUSTAINED_RATE: f64 = 0.50;
+
+#[derive(Debug, Clone)]
+struct IntentGateRouteSample {
+    created_at: chrono::DateTime<Utc>,
+    route_reason: String,
+    route_action: String,
+    route_reply_len: Option<usize>,
 }
 
 impl DiagnoseTool {
     pub fn new(
         event_store: Arc<EventStore>,
         state: Arc<dyn StateStore>,
-        provider: Arc<dyn ModelProvider>,
-        fast_model: String,
+        llm_runtime: SharedLlmRuntime,
         max_events: usize,
         include_raw_args: bool,
     ) -> Self {
         Self {
             event_store,
             state,
-            provider,
-            fast_model,
+            llm_runtime,
             max_events: max_events.clamp(50, 1000),
             include_raw_args,
         }
@@ -522,11 +539,16 @@ Rules: no invented event IDs; confidence 0..1.",
             json!({"role":"user","content":user}),
         ];
 
-        let resp: ProviderResponse =
-            match self.provider.chat(&self.fast_model, &messages, &[]).await {
-                Ok(r) => r,
-                Err(_) => return None,
-            };
+        let runtime_snapshot = self.llm_runtime.snapshot();
+        let fast_model = runtime_snapshot.fast_model();
+        let resp: ProviderResponse = match runtime_snapshot
+            .provider()
+            .chat(&fast_model, &messages, &[])
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
         // Track token usage for diagnostic LLM calls
         if let Some(usage) = &resp.usage {
             let _ = self
@@ -860,6 +882,8 @@ Rules: no invented event IDs; confidence 0..1.",
         &self,
         task_id: &str,
         analysis: &DeterministicAnalysis,
+        route_health_alerts_section: &str,
+        route_reason_trends_section: &str,
         recovery_section: &str,
     ) -> String {
         let mut out = format!(
@@ -910,6 +934,11 @@ Rules: no invented event IDs; confidence 0..1.",
             out.push_str("No explicit misleading-validity signal detected.");
         }
 
+        out.push_str("\n\n");
+        out.push_str(route_health_alerts_section);
+        out.push_str("\n\n");
+        out.push_str(route_reason_trends_section);
+
         out.push_str("\n\n### Minimal Fix\n");
         for step in &analysis.minimal_fix {
             out.push_str(&format!("- {}\n", step));
@@ -921,6 +950,250 @@ Rules: no invented event IDs; confidence 0..1.",
         }
         out.push('\n');
         out.push_str(recovery_section);
+        out.trim_end().to_string()
+    }
+
+    fn intent_gate_route_sample_from_event(event: &Event) -> Option<IntentGateRouteSample> {
+        let Ok(dp) = event.parse_data::<DecisionPointData>() else {
+            return None;
+        };
+        if dp.decision_type != DecisionType::IntentGate {
+            return None;
+        }
+        let route_reason = dp
+            .metadata
+            .get("route_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let route_action = dp
+            .metadata
+            .get("route_action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let route_reply_len = dp
+            .metadata
+            .get("route_reply_len")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok());
+        Some(IntentGateRouteSample {
+            created_at: event.created_at,
+            route_reason,
+            route_action,
+            route_reply_len,
+        })
+    }
+
+    fn route_reason_rate(samples: &[IntentGateRouteSample], reason: &str) -> f64 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let hits = samples
+            .iter()
+            .filter(|sample| sample.route_reason == reason)
+            .count();
+        hits as f64 / samples.len() as f64
+    }
+
+    async fn build_route_health_alerts_section(&self, session_id: &str) -> String {
+        let since = Utc::now() - Duration::days(ROUTE_ALERT_LOOKBACK_DAYS);
+        let recent_events = self
+            .event_store
+            .query_events(session_id, since)
+            .await
+            .unwrap_or_default();
+        let mut samples: Vec<IntentGateRouteSample> = recent_events
+            .iter()
+            .filter_map(Self::intent_gate_route_sample_from_event)
+            .collect();
+        samples.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        let mut out = String::from("### Route Health Alerts\n");
+        if samples.is_empty() {
+            out.push_str("- No intent-gate decisions found in the lookback window.\n");
+            return out;
+        }
+
+        let recent_len = samples.len().min(ROUTE_ALERT_RECENT_WINDOW);
+        let recent = &samples[..recent_len];
+        let baseline = samples.get(recent_len..).unwrap_or(&[]);
+
+        let mut alerts: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+
+        let empty_direct_replies: Vec<&IntentGateRouteSample> = samples
+            .iter()
+            .filter(|sample| sample.route_action == "return" && sample.route_reply_len == Some(0))
+            .collect();
+        if let Some(latest) = empty_direct_replies.first() {
+            alerts.push(format!(
+                "Empty direct reply detected {} time(s) in the last {} days (latest at {}).",
+                empty_direct_replies.len(),
+                ROUTE_ALERT_LOOKBACK_DAYS,
+                latest.created_at.to_rfc3339(),
+            ));
+        }
+
+        if recent.len() >= ROUTE_ALERT_RECENT_WINDOW
+            && baseline.len() >= ROUTE_ALERT_MIN_BASELINE_WINDOW
+        {
+            let recent_tools_rate = Self::route_reason_rate(recent, "tools_required");
+            let baseline_tools_rate = Self::route_reason_rate(baseline, "tools_required");
+            let delta = recent_tools_rate - baseline_tools_rate;
+            if delta.abs() >= ROUTE_ALERT_TOOLS_REQUIRED_RATE_DELTA_THRESHOLD {
+                alerts.push(format!(
+                    "`tools_required` rate drifted from {:.0}% (baseline, {} turns) to {:.0}% (recent, {} turns), delta {:+.0}pp.",
+                    baseline_tools_rate * 100.0,
+                    baseline.len(),
+                    recent_tools_rate * 100.0,
+                    recent.len(),
+                    delta * 100.0,
+                ));
+            }
+        } else {
+            notes.push(format!(
+                "Need at least {} recent and {} baseline turns for `tools_required` drift checks (have recent={}, baseline={}).",
+                ROUTE_ALERT_RECENT_WINDOW,
+                ROUTE_ALERT_MIN_BASELINE_WINDOW,
+                recent.len(),
+                baseline.len(),
+            ));
+        }
+
+        let sustained = samples
+            .get(0..ROUTE_ALERT_CLARIFICATION_SUSTAINED_WINDOW)
+            .unwrap_or(&[]);
+        let clarification_baseline = if baseline.len() >= ROUTE_ALERT_CLARIFICATION_MIN_BASELINE {
+            baseline
+        } else {
+            samples
+                .get(ROUTE_ALERT_CLARIFICATION_SUSTAINED_WINDOW..)
+                .unwrap_or(&[])
+        };
+
+        if sustained.len() == ROUTE_ALERT_CLARIFICATION_SUSTAINED_WINDOW
+            && clarification_baseline.len() >= ROUTE_ALERT_CLARIFICATION_MIN_BASELINE
+        {
+            let sustained_rate = Self::route_reason_rate(sustained, "clarification_required");
+            let baseline_rate =
+                Self::route_reason_rate(clarification_baseline, "clarification_required");
+            let relative_spike = if baseline_rate <= f64::EPSILON {
+                sustained_rate >= ROUTE_ALERT_CLARIFICATION_MIN_SUSTAINED_RATE
+            } else {
+                sustained_rate >= baseline_rate * ROUTE_ALERT_CLARIFICATION_SPIKE_MULTIPLIER
+            };
+            let absolute_spike =
+                (sustained_rate - baseline_rate) >= ROUTE_ALERT_CLARIFICATION_RATE_DELTA_THRESHOLD;
+            if sustained_rate >= ROUTE_ALERT_CLARIFICATION_MIN_SUSTAINED_RATE
+                && (relative_spike || absolute_spike)
+            {
+                alerts.push(format!(
+                    "`clarification_required` spiked to {:.0}% in the latest {} turns vs {:.0}% baseline.",
+                    sustained_rate * 100.0,
+                    sustained.len(),
+                    baseline_rate * 100.0,
+                ));
+            }
+        } else {
+            notes.push(format!(
+                "Need {} latest turns and {} baseline turns for clarification spike checks (have latest={}, baseline={}).",
+                ROUTE_ALERT_CLARIFICATION_SUSTAINED_WINDOW,
+                ROUTE_ALERT_CLARIFICATION_MIN_BASELINE,
+                sustained.len(),
+                clarification_baseline.len(),
+            ));
+        }
+
+        out.push_str(&format!(
+            "- Lookback: last {} days in session `{}` ({} intent_gate decisions)\n",
+            ROUTE_ALERT_LOOKBACK_DAYS,
+            session_id,
+            samples.len()
+        ));
+        if alerts.is_empty() {
+            out.push_str("- Status: no active route-health alerts.\n");
+        } else {
+            out.push_str(&format!("- Status: {} active alert(s).\n", alerts.len()));
+            out.push_str("- Alerts:\n");
+            for alert in alerts {
+                out.push_str(&format!("  - {}\n", alert));
+            }
+        }
+        if !notes.is_empty() {
+            out.push_str("- Notes:\n");
+            for note in notes {
+                out.push_str(&format!("  - {}\n", note));
+            }
+        }
+        out.trim_end().to_string()
+    }
+
+    async fn build_route_reason_trends_section(&self, session_id: &str) -> String {
+        let recent = self
+            .event_store
+            .query_recent_intent_gate_decision_points(session_id, 40)
+            .await
+            .unwrap_or_default();
+        let mut reason_counts: HashMap<String, usize> = HashMap::new();
+        let mut action_counts: HashMap<String, usize> = HashMap::new();
+        let mut sequence: Vec<String> = Vec::new();
+        let mut sampled = 0usize;
+
+        for event in &recent {
+            let Some(sample) = Self::intent_gate_route_sample_from_event(event) else {
+                continue;
+            };
+            *reason_counts
+                .entry(sample.route_reason.clone())
+                .or_insert(0) += 1;
+            *action_counts
+                .entry(sample.route_action.clone())
+                .or_insert(0) += 1;
+            if sequence.len() < 6 {
+                sequence.push(format!(
+                    "{} -> {} ({})",
+                    sample.route_reason,
+                    sample.route_action,
+                    sample.created_at.to_rfc3339()
+                ));
+            }
+            sampled += 1;
+        }
+
+        let mut out = String::from("### Recent Route Reason Trends\n");
+        if sampled == 0 {
+            out.push_str("- No recent intent-gate route_reason data found.\n");
+            return out;
+        }
+
+        let mut ranked_reasons: Vec<(String, usize)> = reason_counts.into_iter().collect();
+        ranked_reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut ranked_actions: Vec<(String, usize)> = action_counts.into_iter().collect();
+        ranked_actions.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        out.push_str(&format!(
+            "- Window: last {} intent_gate decisions in session `{}`\n",
+            sampled, session_id
+        ));
+        out.push_str("- Action mix: ");
+        out.push_str(
+            &ranked_actions
+                .iter()
+                .map(|(action, count)| format!("{}={}", action, count))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push('\n');
+        out.push_str("- Top route reasons:\n");
+        for (reason, count) in ranked_reasons.iter().take(5) {
+            let pct = (*count as f64 / sampled as f64) * 100.0;
+            out.push_str(&format!("  - {}: {} ({:.0}%)\n", reason, count, pct));
+        }
+        out.push_str("- Latest route sequence:\n");
+        for item in &sequence {
+            out.push_str(&format!("  - {}\n", item));
+        }
         out.trim_end().to_string()
     }
 
@@ -961,10 +1234,18 @@ Rules: no invented event IDs; confidence 0..1.",
             .llm_rank_candidates(&resolved_task, &timeline_text, &deterministic)
             .await;
         let merged = self.merge_llm_analysis(deterministic, llm, &events);
+        let route_health_alerts = self.build_route_health_alerts_section(session_id).await;
+        let route_reason_trends = self.build_route_reason_trends_section(session_id).await;
         let recovery_section = self
             .build_resume_recovery_section(session_id, &resolved_task, &events)
             .await;
-        Ok(self.format_diagnosis(&resolved_task, &merged, &recovery_section))
+        Ok(self.format_diagnosis(
+            &resolved_task,
+            &merged,
+            &route_health_alerts,
+            &route_reason_trends,
+            &recovery_section,
+        ))
     }
 
     fn signature_for_event(&self, event: &Event) -> String {
@@ -1279,12 +1560,14 @@ impl Tool for DiagnoseTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
 
+    use crate::config::ProviderKind;
     use crate::events::{DecisionPointData, TaskStatus};
+    use crate::llm_runtime::SharedLlmRuntime;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::TokenUsage;
+    use crate::traits::{ModelProvider, TokenUsage};
 
     struct MockProvider {
         content: String,
@@ -1339,11 +1622,16 @@ mod tests {
             })
             .to_string(),
         });
+        let llm_runtime = SharedLlmRuntime::new(
+            provider,
+            None,
+            ProviderKind::OpenaiCompatible,
+            "mock-fast".to_string(),
+        );
         DiagnoseTool::new(
             event_store,
             state as Arc<dyn StateStore>,
-            provider,
-            "mock-fast".to_string(),
+            llm_runtime,
             200,
             false,
         )
@@ -1363,6 +1651,24 @@ mod tests {
         );
         event.task_id = task_id.map(str::to_string);
         event.created_at = Utc::now();
+        tool.event_store.append(event).await.expect("append");
+    }
+
+    async fn append_event_at<T: serde::Serialize>(
+        tool: &DiagnoseTool,
+        session_id: &str,
+        event_type: EventType,
+        data: T,
+        task_id: Option<&str>,
+        created_at: chrono::DateTime<Utc>,
+    ) {
+        let mut event = crate::events::Event::new(
+            session_id.to_string(),
+            event_type,
+            serde_json::to_value(data).unwrap(),
+        );
+        event.task_id = task_id.map(str::to_string);
+        event.created_at = created_at;
         tool.event_store.append(event).await.expect("append");
     }
 
@@ -1499,6 +1805,227 @@ mod tests {
             .unwrap();
         assert!(res.contains("Diagnosis for Task t1"));
         assert!(res.contains("Most Likely Cause(s)"));
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_includes_recent_route_reason_trends() {
+        let tool = setup_tool().await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskStart,
+            TaskStartData {
+                task_id: "t1".to_string(),
+                description: "Run".to_string(),
+                parent_task_id: None,
+                user_message: None,
+            },
+            Some("t1"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::DecisionPoint,
+            DecisionPointData {
+                decision_type: DecisionType::IntentGate,
+                task_id: "t1".to_string(),
+                iteration: 1,
+                metadata: json!({
+                    "needs_tools": true,
+                    "route_reason": "tools_required",
+                    "route_action": "continue"
+                }),
+                summary: "Intent gate routed to tools".to_string(),
+            },
+            Some("t1"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::DecisionPoint,
+            DecisionPointData {
+                decision_type: DecisionType::IntentGate,
+                task_id: "t1".to_string(),
+                iteration: 2,
+                metadata: json!({
+                    "needs_tools": false,
+                    "route_reason": "acknowledgment_direct_reply",
+                    "route_action": "return",
+                    "route_reply_len": 7
+                }),
+                summary: "Intent gate returned direct acknowledgment".to_string(),
+            },
+            Some("t1"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::Error,
+            ErrorData::tool_error(
+                "terminal",
+                "No such file or directory",
+                Some("t1".to_string()),
+            ),
+            Some("t1"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskEnd,
+            TaskEndData {
+                task_id: "t1".to_string(),
+                status: TaskStatus::Failed,
+                duration_secs: 2,
+                iterations: 2,
+                tool_calls_count: 1,
+                error: Some("failed".to_string()),
+                summary: None,
+            },
+            Some("t1"),
+        )
+        .await;
+
+        let res = tool
+            .call(r#"{"action":"diagnose","task_id":"t1","_session_id":"s1"}"#)
+            .await
+            .unwrap();
+        assert!(res.contains("### Route Health Alerts"));
+        assert!(res.contains("### Recent Route Reason Trends"));
+        assert!(res.contains("tools_required"));
+        assert!(res.contains("acknowledgment_direct_reply"));
+        assert!(res.contains("Action mix:"));
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_route_health_alerts_detect_empty_reply_and_drift() {
+        let tool = setup_tool().await;
+
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskStart,
+            TaskStartData {
+                task_id: "t1".to_string(),
+                description: "Run".to_string(),
+                parent_task_id: None,
+                user_message: None,
+            },
+            Some("t1"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::Error,
+            ErrorData::tool_error(
+                "terminal",
+                "No such file or directory",
+                Some("t1".to_string()),
+            ),
+            Some("t1"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskEnd,
+            TaskEndData {
+                task_id: "t1".to_string(),
+                status: TaskStatus::Failed,
+                duration_secs: 2,
+                iterations: 1,
+                tool_calls_count: 1,
+                error: Some("failed".to_string()),
+                summary: None,
+            },
+            Some("t1"),
+        )
+        .await;
+
+        let baseline_start = Utc::now() - Duration::days(3);
+        for i in 0..40 {
+            let reason = if i < 4 {
+                "tools_required"
+            } else if i < 6 {
+                "clarification_required"
+            } else {
+                "default_continue"
+            };
+            let action = if reason == "clarification_required" {
+                "return"
+            } else {
+                "continue"
+            };
+            let reply_len = if action == "return" {
+                Some(24u64)
+            } else {
+                None
+            };
+            append_event_at(
+                &tool,
+                "s1",
+                EventType::DecisionPoint,
+                DecisionPointData {
+                    decision_type: DecisionType::IntentGate,
+                    task_id: "t1".to_string(),
+                    iteration: (i + 1) as u32,
+                    metadata: json!({
+                        "route_reason": reason,
+                        "route_action": action,
+                        "route_reply_len": reply_len
+                    }),
+                    summary: format!("Baseline route {reason}"),
+                },
+                Some("t1"),
+                baseline_start + Duration::seconds(i as i64),
+            )
+            .await;
+        }
+
+        let recent_start = Utc::now() - Duration::minutes(30);
+        for i in 0..30 {
+            let (reason, action, reply_len) = if i >= 18 {
+                ("clarification_required", "return", Some(28u64))
+            } else if i == 10 {
+                ("acknowledgment_direct_reply", "return", Some(0u64))
+            } else {
+                ("tools_required", "continue", None)
+            };
+
+            append_event_at(
+                &tool,
+                "s1",
+                EventType::DecisionPoint,
+                DecisionPointData {
+                    decision_type: DecisionType::IntentGate,
+                    task_id: "t1".to_string(),
+                    iteration: (100 + i) as u32,
+                    metadata: json!({
+                        "route_reason": reason,
+                        "route_action": action,
+                        "route_reply_len": reply_len
+                    }),
+                    summary: format!("Recent route {reason}"),
+                },
+                Some("t1"),
+                recent_start + Duration::seconds(i as i64),
+            )
+            .await;
+        }
+
+        let res = tool
+            .call(r#"{"action":"diagnose","task_id":"t1","_session_id":"s1"}"#)
+            .await
+            .unwrap();
+
+        assert!(res.contains("### Route Health Alerts"));
+        assert!(res.contains("Empty direct reply detected"));
+        assert!(res.contains("`tools_required` rate drifted"));
+        assert!(res.contains("`clarification_required` spiked"));
     }
 
     #[tokio::test]

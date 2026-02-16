@@ -152,9 +152,11 @@ pub async fn extract_task_knowledge(
         if proc.name.is_empty() || proc.steps.is_empty() {
             continue;
         }
+        let keyed_name =
+            crate::memory::procedures::generate_procedure_keyed_name(&proc.name, &proc.steps);
         let procedure = crate::traits::Procedure {
             id: 0,
-            name: proc.name.clone(),
+            name: keyed_name,
             trigger_pattern: proc.trigger_pattern.clone(),
             steps: proc.steps.clone(),
             success_count: 1,

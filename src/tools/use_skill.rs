@@ -74,6 +74,7 @@ mod tests {
             description: format!("{} skill", name),
             triggers: vec![],
             body: body.to_string(),
+            origin: None,
             source: None,
             source_url: None,
             dir_path: None,

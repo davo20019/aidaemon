@@ -148,7 +148,7 @@ mod tests {
         let tool = WriteFileTool;
         let schema = tool.schema();
         assert_eq!(schema["name"], "write_file");
-        assert!(schema["description"].as_str().unwrap().len() > 0);
+        assert!(!schema["description"].as_str().unwrap().is_empty());
         assert!(schema["parameters"]["properties"]["path"].is_object());
         assert!(schema["parameters"]["properties"]["content"].is_object());
     }

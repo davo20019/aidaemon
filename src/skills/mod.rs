@@ -22,7 +22,10 @@ pub struct Skill {
     pub description: String,
     pub triggers: Vec<String>,
     pub body: String,
-    /// Where this skill came from: "filesystem", "url", "inline", "auto"
+    /// Ownership/distribution class: "custom" or "contrib"
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Where this skill came from: "filesystem", "url", "inline", "auto", "registry"
     #[serde(default)]
     pub source: Option<String>,
     /// URL this skill was fetched from (if source is "url")
@@ -53,6 +56,7 @@ impl Skill {
         let mut name = None;
         let mut description = None;
         let mut triggers = Vec::new();
+        let mut origin = None;
         let mut source = None;
         let mut source_url = None;
 
@@ -74,6 +78,11 @@ impl Skill {
                             .filter(|s| !s.is_empty())
                             .collect();
                     }
+                    "origin" => {
+                        if !value.is_empty() {
+                            origin = Some(value.to_string());
+                        }
+                    }
                     "source" => {
                         if !value.is_empty() {
                             source = Some(value.to_string());
@@ -94,6 +103,7 @@ impl Skill {
             description: description.unwrap_or_default(),
             triggers,
             body,
+            origin,
             source,
             source_url,
             dir_path: None,
@@ -111,6 +121,9 @@ impl Skill {
         if !self.triggers.is_empty() {
             md.push_str(&format!("triggers: {}\n", self.triggers.join(", ")));
         }
+        if let Some(ref origin) = self.origin {
+            md.push_str(&format!("origin: {}\n", origin));
+        }
         if let Some(ref source) = self.source {
             md.push_str(&format!("source: {}\n", source));
         }
@@ -123,6 +136,29 @@ impl Skill {
             md.push('\n');
         }
         md
+    }
+}
+
+pub const SKILL_ORIGIN_CUSTOM: &str = "custom";
+pub const SKILL_ORIGIN_CONTRIB: &str = "contrib";
+
+fn normalize_skill_origin(origin: Option<&str>) -> Option<&'static str> {
+    match origin {
+        Some(value) if value.eq_ignore_ascii_case(SKILL_ORIGIN_CUSTOM) => Some(SKILL_ORIGIN_CUSTOM),
+        Some(value) if value.eq_ignore_ascii_case(SKILL_ORIGIN_CONTRIB) => {
+            Some(SKILL_ORIGIN_CONTRIB)
+        }
+        _ => None,
+    }
+}
+
+pub fn infer_skill_origin(origin: Option<&str>, source: Option<&str>) -> &'static str {
+    if let Some(explicit) = normalize_skill_origin(origin) {
+        return explicit;
+    }
+    match source {
+        Some(value) if value.eq_ignore_ascii_case("registry") => SKILL_ORIGIN_CONTRIB,
+        _ => SKILL_ORIGIN_CUSTOM,
     }
 }
 
@@ -365,9 +401,7 @@ impl SkillCache {
 
     /// Returns cached skills, reloading only if the directory has been modified.
     pub fn get(&self) -> Vec<Skill> {
-        let current_mtime = std::fs::metadata(&self.dir)
-            .and_then(|m| m.modified())
-            .ok();
+        let current_mtime = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
 
         let mut inner = self.inner.lock().unwrap();
 
@@ -785,7 +819,7 @@ pub fn build_system_prompt_with_memory(
     let good_procedures: Vec<&Procedure> = memory
         .procedures
         .iter()
-        .filter(|p| p.success_count > p.failure_count && p.success_count >= 2)
+        .filter(|p| p.success_count > p.failure_count && p.success_count >= 1)
         .take(5)
         .collect();
     if !good_procedures.is_empty() {
@@ -809,7 +843,7 @@ pub fn build_system_prompt_with_memory(
     let good_solutions: Vec<&ErrorSolution> = memory
         .error_solutions
         .iter()
-        .filter(|s| s.success_count > s.failure_count && s.success_count >= 2)
+        .filter(|s| s.success_count > s.failure_count && s.success_count >= 1)
         .take(5)
         .collect();
     if !good_solutions.is_empty() {
@@ -901,10 +935,23 @@ pub fn build_system_prompt_with_memory(
     }
 
     // 8. Behavior Patterns (high confidence)
+    let failure_patterns: Vec<&BehaviorPattern> = memory
+        .patterns
+        .iter()
+        .filter(|p| p.pattern_type == "failure" && p.confidence >= 0.5)
+        .take(3)
+        .collect();
+    if !failure_patterns.is_empty() {
+        prompt.push_str("\n\n## Failure Patterns To Avoid\n");
+        for pattern in failure_patterns {
+            prompt.push_str(&format!("- {}\n", pattern.description));
+        }
+    }
+
     let confident_patterns: Vec<&BehaviorPattern> = memory
         .patterns
         .iter()
-        .filter(|p| p.confidence >= 0.7)
+        .filter(|p| p.pattern_type != "failure" && p.confidence >= 0.7)
         .take(3)
         .collect();
     if !confident_patterns.is_empty() {
@@ -1055,6 +1102,7 @@ mod tests {
             description: format!("{} skill", name),
             triggers: triggers.iter().map(|t| t.to_lowercase()).collect(),
             body: String::new(),
+            origin: None,
             source: None,
             source_url: None,
             dir_path: None,
@@ -1303,6 +1351,7 @@ mod tests {
             description: "Deploy the application".to_string(),
             triggers: vec!["deploy".to_string(), "ship".to_string()],
             body: "Run cargo build --release\nCopy binary to server".to_string(),
+            origin: Some("contrib".to_string()),
             source: Some("url".to_string()),
             source_url: Some("https://example.com/deploy.md".to_string()),
             dir_path: None,
@@ -1314,6 +1363,7 @@ mod tests {
         assert_eq!(parsed.description, skill.description);
         assert_eq!(parsed.triggers, skill.triggers);
         assert_eq!(parsed.body, skill.body);
+        assert_eq!(parsed.origin, skill.origin);
         assert_eq!(parsed.source, skill.source);
         assert_eq!(parsed.source_url, skill.source_url);
     }
@@ -1325,6 +1375,7 @@ mod tests {
             description: String::new(),
             triggers: vec![],
             body: "Do the thing.".to_string(),
+            origin: None,
             source: None,
             source_url: None,
             dir_path: None,
@@ -1377,6 +1428,7 @@ mod tests {
             description: "A writable skill".to_string(),
             triggers: vec!["test".to_string()],
             body: "Do tests.".to_string(),
+            origin: None,
             source: None,
             source_url: None,
             dir_path: None,
@@ -1406,6 +1458,7 @@ mod tests {
             description: "Remove me".to_string(),
             triggers: vec![],
             body: "Body.".to_string(),
+            origin: None,
             source: None,
             source_url: None,
             dir_path: None,
@@ -1454,12 +1507,26 @@ mod tests {
 
     #[test]
     fn parse_with_source_fields() {
-        let content = "---\nname: fetched\ndescription: From URL\ntriggers: fetch\nsource: url\nsource_url: https://example.com/skill.md\n---\nFetched body.";
+        let content = "---\nname: fetched\ndescription: From URL\ntriggers: fetch\norigin: contrib\nsource: url\nsource_url: https://example.com/skill.md\n---\nFetched body.";
         let skill = Skill::parse(content).unwrap();
+        assert_eq!(skill.origin.as_deref(), Some("contrib"));
         assert_eq!(skill.source.as_deref(), Some("url"));
         assert_eq!(
             skill.source_url.as_deref(),
             Some("https://example.com/skill.md")
+        );
+    }
+
+    #[test]
+    fn infer_origin_defaults_and_registry() {
+        assert_eq!(infer_skill_origin(None, None), SKILL_ORIGIN_CUSTOM);
+        assert_eq!(
+            infer_skill_origin(None, Some("registry")),
+            SKILL_ORIGIN_CONTRIB
+        );
+        assert_eq!(
+            infer_skill_origin(Some("custom"), Some("registry")),
+            SKILL_ORIGIN_CUSTOM
         );
     }
 }

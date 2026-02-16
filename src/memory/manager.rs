@@ -1,9 +1,10 @@
 use crate::config::PeopleConfig;
 use crate::events::Consolidator;
+use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::scoring::calculate_episode_importance;
-use crate::traits::{BehaviorPattern, Message, ModelProvider, Person, StateStore, UserProfile};
+use crate::traits::{BehaviorPattern, Message, Person, StateStore, UserProfile};
 use crate::types::{ChannelVisibility, FactPrivacy};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -17,8 +18,7 @@ use tracing::{debug, error, info, warn};
 pub struct MemoryManager {
     pool: SqlitePool,
     embedding_service: Arc<EmbeddingService>,
-    provider: Arc<dyn ModelProvider>,
-    fast_model: String,
+    llm_runtime: SharedLlmRuntime,
     consolidation_interval: Duration,
     consolidator: Option<Arc<Consolidator>>,
     state: Option<Arc<dyn StateStore>>,
@@ -29,16 +29,14 @@ impl MemoryManager {
     pub fn new(
         pool: SqlitePool,
         embedding_service: Arc<EmbeddingService>,
-        provider: Arc<dyn ModelProvider>,
-        fast_model: String,
+        llm_runtime: SharedLlmRuntime,
         consolidation_interval: Duration,
         consolidator: Option<Arc<Consolidator>>,
     ) -> Self {
         Self {
             pool,
             embedding_service,
-            provider,
-            fast_model,
+            llm_runtime,
             consolidation_interval,
             consolidator,
             state: None,
@@ -64,17 +62,6 @@ impl MemoryManager {
         self: &Arc<Self>,
         heartbeat: &mut crate::heartbeat::HeartbeatCoordinator,
     ) {
-        // Event → messages projection (every 30s)
-        // Keeps the legacy `messages` table populated for MemoryManager jobs and dashboards.
-        let mgr = self.clone();
-        heartbeat.register_job("event_projection", Duration::from_secs(30), move || {
-            let m = mgr.clone();
-            async move {
-                let _ = m.project_events_to_messages().await?;
-                Ok(())
-            }
-        });
-
         // Embedding generation (every 5s)
         let mgr = self.clone();
         heartbeat.register_job("embeddings", Duration::from_secs(5), move || {
@@ -132,244 +119,11 @@ impl MemoryManager {
         info!("Memory background tasks registered with heartbeat");
     }
 
-    async fn project_events_to_messages(&self) -> anyhow::Result<bool> {
-        let Some(ref state) = self.state else {
-            return Ok(false);
-        };
-
-        // Cursor stored in settings to avoid rescanning from the beginning.
-        const CURSOR_KEY: &str = "event_projection_last_id";
-        let last_id: i64 = state
-            .get_setting(CURSOR_KEY)
-            .await?
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0);
-
-        // Fetch a small batch of conversation events after the cursor.
-        let rows = match sqlx::query(
-            r#"
-            SELECT id, session_id, event_type, data, created_at
-            FROM events
-            WHERE id > ?
-              AND event_type IN ('user_message', 'assistant_response', 'tool_result')
-            ORDER BY id ASC
-            LIMIT 200
-            "#,
-        )
-        .bind(last_id)
-        .fetch_all(&self.pool)
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                // Legacy/test DBs may not have the events table.
-                if e.to_string().contains("no such table: events") {
-                    return Ok(false);
-                }
-                return Err(e.into());
-            }
-        };
-
-        if rows.is_empty() {
-            return Ok(false);
-        }
-
-        let mut max_seen = last_id;
-        for row in rows {
-            let event_id: i64 = row.get("id");
-            let session_id: String = row.get("session_id");
-            let event_type: String = row.get("event_type");
-            let created_at: String = row.get("created_at");
-            let data_raw: String = row.get("data");
-            let data: serde_json::Value =
-                serde_json::from_str(&data_raw).unwrap_or_else(|_| serde_json::json!({}));
-
-            max_seen = max_seen.max(event_id);
-
-            // message_id is preferred; fall back to event id for robustness.
-            let message_id = data
-                .get("message_id")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| event_id.to_string());
-
-            let mut role: &str = "assistant";
-            let mut content: Option<String> = None;
-            let mut tool_call_id: Option<String> = None;
-            let mut tool_name: Option<String> = None;
-            let mut tool_calls_json: Option<String> = None;
-            let mut importance: f32 = 0.5;
-
-            match event_type.as_str() {
-                "user_message" => {
-                    role = "user";
-                    content = data
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let msg = Message {
-                        id: message_id.clone(),
-                        session_id: session_id.clone(),
-                        role: role.to_string(),
-                        content: content.clone(),
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_calls_json: None,
-                        created_at: Utc::now(),
-                        importance: 0.5,
-                        embedding: None,
-                    };
-                    importance = crate::memory::scoring::score_message(&msg);
-                }
-                "assistant_response" => {
-                    role = "assistant";
-                    content = data
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    // Normalize event tool calls into the same ToolCall shape used by MessageStore.
-                    tool_calls_json =
-                        data.get("tool_calls")
-                            .and_then(|v| v.as_array())
-                            .and_then(|calls| {
-                                let mapped: Vec<crate::traits::ToolCall> = calls
-                                    .iter()
-                                    .filter_map(|tc| {
-                                        let id = tc.get("id").and_then(|v| v.as_str())?;
-                                        let name = tc.get("name").and_then(|v| v.as_str())?;
-                                        Some(crate::traits::ToolCall {
-                                            id: id.to_string(),
-                                            name: name.to_string(),
-                                            arguments: tc
-                                                .get("arguments")
-                                                .cloned()
-                                                .unwrap_or_else(|| serde_json::json!({}))
-                                                .to_string(),
-                                            extra_content: tc.get("extra_content").cloned(),
-                                        })
-                                    })
-                                    .collect();
-                                if mapped.is_empty() {
-                                    None
-                                } else {
-                                    serde_json::to_string(&mapped).ok()
-                                }
-                            });
-                }
-                "tool_result" => {
-                    role = "tool";
-                    content = data
-                        .get("result")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    tool_call_id = data
-                        .get("tool_call_id")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| Some(format!("event-tool-{}", event_id)));
-                    tool_name = data
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    importance = 0.3;
-                }
-                _ => {}
-            }
-
-            // Insert/update message projection row. Best-effort.
-            let _ = sqlx::query(
-                r#"
-                INSERT INTO messages
-                    (id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance)
-                VALUES
-                    (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    session_id = excluded.session_id,
-                    role = excluded.role,
-                    content = excluded.content,
-                    tool_call_id = excluded.tool_call_id,
-                    tool_name = excluded.tool_name,
-                    tool_calls_json = excluded.tool_calls_json,
-                    created_at = excluded.created_at,
-                    importance = excluded.importance
-                "#,
-            )
-            .bind(&message_id)
-            .bind(&session_id)
-            .bind(role)
-            .bind(&content)
-            .bind(&tool_call_id)
-            .bind(&tool_name)
-            .bind(&tool_calls_json)
-            .bind(&created_at)
-            .bind(importance)
-            .execute(&self.pool)
-            .await;
-        }
-
-        // Advance cursor after processing the batch.
-        let _ = state.set_setting(CURSOR_KEY, &max_seen.to_string()).await;
-
-        Ok(true)
-    }
-
     async fn process_embeddings(&self) -> anyhow::Result<bool> {
         let mut did_work = false;
-        did_work |= self.process_message_embeddings().await?;
         did_work |= self.process_procedure_embeddings().await?;
         did_work |= self.process_error_solution_embeddings().await?;
         Ok(did_work)
-    }
-
-    async fn process_message_embeddings(&self) -> anyhow::Result<bool> {
-        // Fetch messages without embeddings AND without errors
-        // LIMIT 10 to check incrementally.
-        let rows = sqlx::query(
-            "SELECT id, content FROM messages WHERE embedding IS NULL AND embedding_error IS NULL AND content IS NOT NULL LIMIT 10"
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        if rows.is_empty() {
-            return Ok(false);
-        }
-
-        info!("Generating embeddings for {} messages", rows.len());
-
-        for row in rows {
-            let id: String = row.get("id");
-            let content: Option<String> = row.get("content");
-
-            if let Some(text) = content {
-                match self.embedding_service.embed(text).await {
-                    Ok(embedding) => {
-                        let blob = encode_embedding(&embedding);
-                        sqlx::query("UPDATE messages SET embedding = ? WHERE id = ?")
-                            .bind(blob)
-                            .bind(id)
-                            .execute(&self.pool)
-                            .await?;
-                    }
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        error!(
-                            "Failed to generate embedding for message {}: {}",
-                            id, err_msg
-                        );
-                        sqlx::query("UPDATE messages SET embedding_error = ? WHERE id = ?")
-                            .bind(err_msg)
-                            .bind(id)
-                            .execute(&self.pool)
-                            .await?;
-                    }
-                }
-            }
-        }
-
-        Ok(true)
     }
 
     async fn process_procedure_embeddings(&self) -> anyhow::Result<bool> {
@@ -490,50 +244,183 @@ impl MemoryManager {
         Some(ChannelVisibility::from_str_lossy(vis))
     }
 
-    async fn consolidate_memories(&self) -> anyhow::Result<()> {
-        // Find unconsolidated high-importance messages older than 1 hour, grouped by session
-        let one_hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
-        let cutoff = one_hour_ago.to_rfc3339();
+    fn fact_consolidation_cursor_key(session_id: &str) -> String {
+        format!("memory_fact_consolidation_cursor:{}", session_id)
+    }
 
-        let rows = sqlx::query(
-            "SELECT id, session_id, role, content, created_at
-             FROM messages
-             WHERE importance >= 0.7
-               AND consolidated_at IS NULL
-               AND created_at < ?
-               AND content IS NOT NULL
-             ORDER BY session_id, created_at ASC",
+    async fn get_fact_consolidation_cursor(&self, session_id: &str) -> i64 {
+        let Some(state) = &self.state else {
+            return 0;
+        };
+        let key = Self::fact_consolidation_cursor_key(session_id);
+        match state.get_setting(&key).await {
+            Ok(Some(raw)) => raw.parse::<i64>().unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    async fn set_fact_consolidation_cursor(
+        &self,
+        session_id: &str,
+        event_id: i64,
+    ) -> anyhow::Result<()> {
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+        let key = Self::fact_consolidation_cursor_key(session_id);
+        state.set_setting(&key, &event_id.to_string()).await
+    }
+
+    async fn list_candidate_sessions_for_fact_consolidation(
+        &self,
+        cutoff: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT session_id
+            FROM events
+            WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+              AND created_at < ?
+            "#,
         )
-        .bind(&cutoff)
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn fetch_fact_consolidation_messages(
+        &self,
+        session_id: &str,
+        cutoff: &str,
+        after_event_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::events::ConversationTurn>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, event_type, data, created_at
+            FROM events
+            WHERE session_id = ?
+              AND event_type IN ('user_message', 'assistant_response', 'tool_result')
+              AND id > ?
+              AND created_at < ?
+            ORDER BY id ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(session_id)
+        .bind(after_event_id)
+        .bind(cutoff)
+        .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
 
-        if rows.is_empty() {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_id: i64 = row.get("id");
+            let event_type: String = row.get("event_type");
+            let created_str: String = row.get("created_at");
+            let created_at = DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+            let data_raw: String = row.get("data");
+            let data: serde_json::Value = match serde_json::from_str(&data_raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        session_id,
+                        event_id,
+                        event_type = %event_type,
+                        error = %e,
+                        "Skipping malformed event payload during memory consolidation"
+                    );
+                    continue;
+                }
+            };
+
+            if let Some(turn) =
+                crate::events::turn_from_event(event_id, session_id, &event_type, &data, created_at)
+            {
+                out.push(turn);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn consolidate_memories(&self) -> anyhow::Result<()> {
+        // Consolidate conversation events older than 1 hour.
+        // Per-session cursors avoid rescanning already-processed history.
+        let one_hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
+        let cutoff = one_hour_ago.to_rfc3339();
+
+        let candidate_sessions = self
+            .list_candidate_sessions_for_fact_consolidation(&cutoff)
+            .await?;
+        if candidate_sessions.is_empty() {
             return Ok(());
         }
 
-        // Group by session_id
-        let mut sessions: std::collections::HashMap<String, Vec<(String, String, String)>> =
+        // session_id -> selected high-importance messages (event_id, role, content)
+        let mut sessions: std::collections::HashMap<String, Vec<(i64, String, String)>> =
+            std::collections::HashMap::new();
+        // session_id -> max event id seen this cycle (for cursor advancement)
+        let mut session_max_seen: std::collections::HashMap<String, i64> =
             std::collections::HashMap::new();
 
-        for row in &rows {
-            let id: String = row.get("id");
-            let session_id: String = row.get("session_id");
-            let role: String = row.get("role");
-            let content: String = row.get("content");
+        for session_id in candidate_sessions {
+            let cursor = self.get_fact_consolidation_cursor(&session_id).await;
+            let events = self
+                .fetch_fact_consolidation_messages(&session_id, &cutoff, cursor, 300)
+                .await?;
+            if events.is_empty() {
+                continue;
+            }
+
+            if let Some(max_seen) = events.last().map(|turn| turn.event_id) {
+                session_max_seen.insert(session_id.clone(), max_seen);
+            }
+
             let entry = sessions.entry(session_id).or_default();
-            // Cap at 30 messages per session
-            if entry.len() < 30 {
-                entry.push((id, role, content));
+            for turn in events {
+                let Some(content) = turn.content.clone() else {
+                    continue;
+                };
+                if content.trim().is_empty() {
+                    continue;
+                }
+                let importance = crate::memory::scoring::score_turn(&turn);
+                if importance >= 0.7 && entry.len() < 30 {
+                    entry.push((turn.event_id, turn.role.as_str().to_string(), content));
+                }
             }
         }
 
         let total_messages: usize = sessions.values().map(|v| v.len()).sum();
         info!(
-            "Consolidation: processing {} messages from {} sessions",
+            "Consolidation: processing {} messages from {} sessions (event-native)",
             total_messages,
             sessions.len()
         );
+
+        // If no high-importance candidates were found, advance cursors so we
+        // don't repeatedly rescan low-signal events.
+        if sessions.is_empty() {
+            for (session_id, max_seen) in &session_max_seen {
+                let _ = self
+                    .set_fact_consolidation_cursor(session_id, *max_seen)
+                    .await;
+            }
+            return Ok(());
+        }
+
+        for (session_id, max_seen) in &session_max_seen {
+            if !sessions.contains_key(session_id) {
+                let _ = self
+                    .set_fact_consolidation_cursor(session_id, *max_seen)
+                    .await;
+            }
+        }
 
         // PublicExternal sessions are untrusted: do not learn durable facts from them.
         // (Progressive extraction is already disabled; this closes the consolidation path.)
@@ -577,12 +464,9 @@ impl MemoryManager {
                 .is_some_and(|v| v == ChannelVisibility::PublicExternal)
             {
                 skipped_public_external.insert(session_id.clone());
-                let now = chrono::Utc::now().to_rfc3339();
-                for (id, _role, _content) in messages {
-                    let _ = sqlx::query("UPDATE messages SET consolidated_at = ? WHERE id = ?")
-                        .bind(&now)
-                        .bind(id)
-                        .execute(&self.pool)
+                if let Some(max_seen) = session_max_seen.get(session_id) {
+                    let _ = self
+                        .set_fact_consolidation_cursor(session_id, *max_seen)
                         .await;
                 }
                 info!(
@@ -595,7 +479,7 @@ impl MemoryManager {
             // Build conversation text for this session batch
             let conversation: String = messages
                 .iter()
-                .map(|(_id, role, content)| format!("{}: {}", role, content))
+                .map(|(_event_id, role, content)| format!("{}: {}", role, content))
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -605,9 +489,11 @@ impl MemoryManager {
             ];
 
             // Call LLM with fast model, no tools
-            match self
-                .provider
-                .chat(&self.fast_model, &llm_messages, &[])
+            let runtime_snapshot = self.llm_runtime.snapshot();
+            let fast_model = runtime_snapshot.fast_model();
+            match runtime_snapshot
+                .provider()
+                .chat(&fast_model, &llm_messages, &[])
                 .await
             {
                 Ok(response) => {
@@ -655,31 +541,18 @@ impl MemoryManager {
                                     facts.len(),
                                     session_id
                                 );
+                                if let Some(max_seen) = session_max_seen.get(session_id) {
+                                    let _ = self
+                                        .set_fact_consolidation_cursor(session_id, *max_seen)
+                                        .await;
+                                }
                             }
                             Err(e) => {
                                 warn!(
-                                    "Failed to parse consolidation response for session {}: {} — messages will be retried next cycle",
+                                    "Failed to parse consolidation response for session {}: {} — events will be retried next cycle",
                                     session_id, e
                                 );
                             }
-                        }
-                    }
-
-                    // Only mark messages as consolidated when facts were successfully parsed
-                    // On parse failure, messages remain unconsolidated for retry next cycle
-                    if response
-                        .content
-                        .as_ref()
-                        .is_some_and(|text| parse_consolidation_response(text).is_ok())
-                    {
-                        let now = chrono::Utc::now().to_rfc3339();
-                        for (id, _role, _content) in messages {
-                            let _ =
-                                sqlx::query("UPDATE messages SET consolidated_at = ? WHERE id = ?")
-                                    .bind(&now)
-                                    .bind(id)
-                                    .execute(&self.pool)
-                                    .await;
                         }
                     }
                 }
@@ -1244,9 +1117,11 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             json!({"role": "user", "content": format!("Analyze this conversation:\n\n{}", transcript)}),
         ];
 
-        let response = self
-            .provider
-            .chat(&self.fast_model, &llm_messages, &[])
+        let runtime_snapshot = self.llm_runtime.snapshot();
+        let fast_model = runtime_snapshot.fast_model();
+        let response = runtime_snapshot
+            .provider()
+            .chat(&fast_model, &llm_messages, &[])
             .await?;
 
         // Track token usage for background LLM calls
@@ -1683,17 +1558,18 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
     async fn create_episodes_for_idle_sessions(&self) -> anyhow::Result<()> {
         let thirty_mins_ago = (Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
 
-        // Find sessions with messages older than 30 mins that don't have episodes yet
-        // and have at least 5 messages (meaningful sessions)
+        // Find sessions with conversation events older than 30 mins that don't
+        // have episodes yet and have at least 5 events (meaningful sessions).
         let idle_sessions: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT m.session_id
-             FROM messages m
-             LEFT JOIN episodes e ON e.session_id = m.session_id
-             WHERE m.created_at < ?
+            "SELECT DISTINCT ev.session_id
+             FROM events ev
+             LEFT JOIN episodes e ON e.session_id = ev.session_id
+             WHERE ev.event_type IN ('user_message', 'assistant_response', 'tool_result')
+               AND ev.created_at < ?
                AND e.id IS NULL
-             GROUP BY m.session_id
-             HAVING COUNT(m.id) >= 5
-               AND MAX(m.created_at) < ?",
+             GROUP BY ev.session_id
+             HAVING COUNT(ev.id) >= 5
+               AND MAX(ev.created_at) < ?",
         )
         .bind(&thirty_mins_ago)
         .bind(&thirty_mins_ago)
@@ -1757,37 +1633,45 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
         let rows = sqlx::query(
-            "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
-             FROM messages
+            "SELECT id, session_id, event_type, data, created_at
+             FROM events
              WHERE session_id = ?
+               AND event_type IN ('user_message', 'assistant_response', 'tool_result')
              ORDER BY created_at ASC
-             LIMIT ?"
+             LIMIT ?",
         )
         .bind(session_id)
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
 
-        let messages = rows
-            .into_iter()
-            .map(|row| {
-                let created_str: String = row.get("created_at");
-                Message {
-                    id: row.get("id"),
-                    session_id: row.get("session_id"),
-                    role: row.get("role"),
-                    content: row.get("content"),
-                    tool_call_id: row.get("tool_call_id"),
-                    tool_name: row.get("tool_name"),
-                    tool_calls_json: row.get("tool_calls_json"),
-                    created_at: DateTime::parse_from_rfc3339(&created_str)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
-                    importance: row.get("importance"),
-                    embedding: None,
-                }
-            })
-            .collect();
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_id: i64 = row.get("id");
+            let row_session_id: String = row.get("session_id");
+            let event_type: String = row.get("event_type");
+            let created_str: String = row.get("created_at");
+            let created_at = DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let data_raw: String = row.get("data");
+            let data: serde_json::Value = match serde_json::from_str(&data_raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if let Some(turn) = crate::events::turn_from_event(
+                event_id,
+                &row_session_id,
+                &event_type,
+                &data,
+                created_at,
+            ) {
+                let mut msg = turn.clone().into_message();
+                msg.importance = crate::memory::scoring::score_turn(&turn);
+                messages.push(msg);
+            }
+        }
 
         Ok(messages)
     }
@@ -1799,37 +1683,45 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
         let rows = sqlx::query(
-            "SELECT id, session_id, role, content, tool_call_id, tool_name, tool_calls_json, created_at, importance
-             FROM messages
+            "SELECT id, session_id, event_type, data, created_at
+             FROM events
              WHERE created_at >= ?
+               AND event_type IN ('user_message', 'assistant_response', 'tool_result')
              ORDER BY created_at DESC
-             LIMIT ?"
+             LIMIT ?",
         )
         .bind(since)
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
 
-        let messages = rows
-            .into_iter()
-            .map(|row| {
-                let created_str: String = row.get("created_at");
-                Message {
-                    id: row.get("id"),
-                    session_id: row.get("session_id"),
-                    role: row.get("role"),
-                    content: row.get("content"),
-                    tool_call_id: row.get("tool_call_id"),
-                    tool_name: row.get("tool_name"),
-                    tool_calls_json: row.get("tool_calls_json"),
-                    created_at: DateTime::parse_from_rfc3339(&created_str)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
-                    importance: row.get("importance"),
-                    embedding: None,
-                }
-            })
-            .collect();
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_id: i64 = row.get("id");
+            let session_id: String = row.get("session_id");
+            let event_type: String = row.get("event_type");
+            let created_str: String = row.get("created_at");
+            let created_at = DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let data_raw: String = row.get("data");
+            let data: serde_json::Value = match serde_json::from_str(&data_raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if let Some(turn) = crate::events::turn_from_event(
+                event_id,
+                &session_id,
+                &event_type,
+                &data,
+                created_at,
+            ) {
+                let mut msg = turn.clone().into_message();
+                msg.importance = crate::memory::scoring::score_turn(&turn);
+                messages.push(msg);
+            }
+        }
 
         Ok(messages)
     }
@@ -1887,6 +1779,8 @@ fn parse_consolidation_response(text: &str) -> anyhow::Result<Vec<ExtractedFact>
 mod tests {
     use super::*;
 
+    use crate::config::ProviderKind;
+    use crate::llm_runtime::SharedLlmRuntime;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::MockProvider;
@@ -1898,14 +1792,16 @@ mod tests {
     async fn test_consolidation_skips_public_external_sessions() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-        let store = SqliteStateStore::new(
-            db_file.path().to_str().unwrap(),
-            100,
-            None,
-            embedding_service.clone(),
-        )
-        .await
-        .unwrap();
+        let store = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service.clone(),
+            )
+            .await
+            .unwrap(),
+        );
 
         // Ensure events table exists for visibility lookup.
         sqlx::query(
@@ -1928,21 +1824,7 @@ mod tests {
 
         let session_id = "pubext_session_consolidation";
         let msg_id = uuid::Uuid::new_v4().to_string();
-        let msg = Message {
-            id: msg_id.clone(),
-            session_id: session_id.to_string(),
-            role: "user".to_string(),
-            content: Some("hello world".to_string()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now() - chrono::Duration::hours(2),
-            importance: 0.9,
-            embedding: None,
-        };
-        store.append_message(&msg).await.unwrap();
-
-        // Mark the session as PublicExternal via the latest user_message event metadata.
+        // Mark the session as PublicExternal via the user_message event metadata.
         let data = serde_json::json!({
             "content": "hello world",
             "message_id": msg_id,
@@ -1963,28 +1845,32 @@ mod tests {
         .unwrap();
 
         let provider = Arc::new(MockProvider::new());
+        let llm_runtime = SharedLlmRuntime::new(
+            provider.clone(),
+            None,
+            ProviderKind::OpenaiCompatible,
+            "mock".to_string(),
+        );
         let mgr = MemoryManager::new(
             store.pool(),
             embedding_service,
-            provider.clone(),
-            "mock".to_string(),
+            llm_runtime,
             Duration::from_secs(60),
             None,
-        );
+        )
+        .with_state(store.clone());
 
         mgr.consolidate_memories().await.unwrap();
 
         // Provider should not be called for PublicExternal sessions.
         assert_eq!(provider.call_count().await, 0);
 
-        // Message should be marked consolidated to avoid repeated attempts.
-        let row = sqlx::query("SELECT consolidated_at FROM messages WHERE id = ?")
-            .bind(&msg_id)
-            .fetch_one(&store.pool())
+        // Cursor should advance so we don't repeatedly revisit skipped sessions.
+        let cursor = store
+            .get_setting(&format!("memory_fact_consolidation_cursor:{}", session_id))
             .await
             .unwrap();
-        let consolidated_at: Option<String> = row.get("consolidated_at");
-        assert!(consolidated_at.is_some());
+        assert!(cursor.is_some());
 
         // No facts should be learned.
         let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM facts")

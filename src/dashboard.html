@@ -236,11 +236,7 @@ async function fetchMaintenanceJobs() {
 async function fetchPolicyMetrics() {
   try {
     const d = await api('/api/policy/metrics');
-    const g = d.graduation || {};
     const rows = [
-      ['Router shadow total', fmtNum(d.router_shadow_total)],
-      ['Router divergence', fmtNum(d.router_shadow_diverged)],
-      ['Router divergence rate', ((d.router_divergence_rate || 0) * 100).toFixed(2) + '%'],
       ['Tool exposure samples', fmtNum(d.tool_exposure_samples)],
       ['Avg tools before filter', (d.avg_tools_before_filter || 0).toFixed(2)],
       ['Avg tools after filter', (d.avg_tools_after_filter || 0).toFixed(2)],
@@ -250,9 +246,11 @@ async function fetchPolicyMetrics() {
       ['Context refreshes', fmtNum(d.context_refresh_total)],
       ['Escalations', fmtNum(d.escalation_total)],
       ['Fallback expansions', fmtNum(d.fallback_expansion_total)],
-      ['Graduation observed days', (g.observed_days || 0).toFixed(2)],
-      ['Graduation divergence rate', (((g.divergence_rate || 0) * 100).toFixed(2) + '%')],
-      ['Graduation gate', g.gate_passed ? 'PASS' : 'WAIT'],
+      ['Route reason: clarification_required', fmtNum(d.consultant_route_clarification_required_total)],
+      ['Route reason: tools_required', fmtNum(d.consultant_route_tools_required_total)],
+      ['Route reason: short_correction_direct_reply', fmtNum(d.consultant_route_short_correction_direct_reply_total)],
+      ['Route reason: acknowledgment_direct_reply', fmtNum(d.consultant_route_acknowledgment_direct_reply_total)],
+      ['Route reason: default_continue', fmtNum(d.consultant_route_default_continue_total)],
     ];
     let html = '<table><tr><th>Metric</th><th>Value</th></tr>';
     for (const [k, v] of rows) html += '<tr><td>' + esc(k) + '</td><td class="mono">' + esc(String(v)) + '</td></tr>';
@@ -311,8 +309,6 @@ async function fetchWriteConsistency() {
     let html = '<table><tr><th>Metric</th><th>Value</th></tr>';
     html += '<tr><td>Generated At</td><td class="mono">' + esc(fmtTs(d.generated_at)) + '</td></tr>';
     html += '<tr><td>Consistency Gate</td><td>' + gateBadge + '</td></tr>';
-    html += '<tr><td>Messages Table Present</td><td class="mono">' + (d.messages_table_present ? 'yes' : 'no (event-only mode)') + '</td></tr>';
-    html += '<tr><td>Message Rows</td><td class="mono">' + fmtNum(d.conversation_message_rows) + '</td></tr>';
     html += '<tr><td>Event Rows</td><td class="mono">' + fmtNum(d.conversation_event_rows) + '</td></tr>';
     html += '<tr><td>Missing Message IDs</td><td class="mono">' + fmtNum(d.missing_message_id_events) + '</td></tr>';
     html += '<tr><td>Global Delta</td><td class="mono">' + fmtNum(d.global_delta) + '</td></tr>';

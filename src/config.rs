@@ -1548,15 +1548,6 @@ fn default_autotune_enforce() -> bool {
 fn default_uncertainty_threshold() -> f32 {
     0.55
 }
-fn default_classify_retirement_enabled() -> bool {
-    true
-}
-fn default_classify_retirement_window_days() -> u32 {
-    7
-}
-fn default_classify_retirement_max_divergence() -> f32 {
-    0.05
-}
 fn default_write_consistency_max_abs_global_delta() -> u64 {
     3
 }
@@ -1657,6 +1648,8 @@ impl WriteConsistencyConfig {
 pub struct PolicyConfig {
     #[serde(default = "default_policy_shadow_mode")]
     pub policy_shadow_mode: bool,
+    /// Enforce policy-derived context budget caps. When false, message trimming
+    /// only respects the model provider budget.
     #[serde(default = "default_policy_enforce")]
     pub policy_enforce: bool,
     #[serde(default = "default_tool_filter_enforce")]
@@ -1673,12 +1666,6 @@ pub struct PolicyConfig {
     pub autotune_enforce: bool,
     #[serde(default = "default_uncertainty_threshold")]
     pub uncertainty_clarify_threshold: f32,
-    #[serde(default = "default_classify_retirement_enabled")]
-    pub classify_retirement_enabled: bool,
-    #[serde(default = "default_classify_retirement_window_days")]
-    pub classify_retirement_window_days: u32,
-    #[serde(default = "default_classify_retirement_max_divergence")]
-    pub classify_retirement_max_divergence: f32,
     #[serde(default)]
     pub write_consistency: WriteConsistencyConfig,
 }
@@ -1695,9 +1682,6 @@ impl Default for PolicyConfig {
             autotune_shadow: default_autotune_shadow(),
             autotune_enforce: default_autotune_enforce(),
             uncertainty_clarify_threshold: default_uncertainty_threshold(),
-            classify_retirement_enabled: default_classify_retirement_enabled(),
-            classify_retirement_window_days: default_classify_retirement_window_days(),
-            classify_retirement_max_divergence: default_classify_retirement_max_divergence(),
             write_consistency: WriteConsistencyConfig::default(),
         }
     }
@@ -1964,10 +1948,12 @@ mod tests {
 
     #[test]
     fn iteration_limit_effective_migrates_legacy_config() {
-        let mut config = SubagentsConfig::default();
         // Simulate old config with custom values
-        config.max_iterations = 15;
-        config.max_iterations_cap = 30;
+        let config = SubagentsConfig {
+            max_iterations: 15,
+            max_iterations_cap: 30,
+            ..SubagentsConfig::default()
+        };
 
         match config.effective_iteration_limit() {
             IterationLimitConfig::Hard { initial, cap } => {
@@ -1980,14 +1966,16 @@ mod tests {
 
     #[test]
     fn iteration_limit_explicit_soft_preserved() {
-        let mut config = SubagentsConfig::default();
-        config.iteration_limit = IterationLimitConfig::Soft {
-            threshold: 50,
-            warn_at: 40,
-        };
         // Even with legacy values set, explicit config takes precedence
-        config.max_iterations = 15;
-        config.max_iterations_cap = 30;
+        let config = SubagentsConfig {
+            iteration_limit: IterationLimitConfig::Soft {
+                threshold: 50,
+                warn_at: 40,
+            },
+            max_iterations: 15,
+            max_iterations_cap: 30,
+            ..SubagentsConfig::default()
+        };
 
         match config.effective_iteration_limit() {
             IterationLimitConfig::Soft { threshold, warn_at } => {

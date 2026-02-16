@@ -75,8 +75,31 @@ async fn main() -> anyhow::Result<()> {
 
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, role, tool_name, created_at, substr(COALESCE(content, ''), 1, 240) AS content_preview
-            FROM messages
+            WITH convo AS (
+                SELECT
+                    id AS event_id,
+                    COALESCE(NULLIF(CAST(json_extract(data, '$.message_id') AS TEXT), ''), CAST(id AS TEXT)) AS message_id,
+                    session_id,
+                    CASE event_type
+                        WHEN 'user_message' THEN 'user'
+                        WHEN 'assistant_response' THEN 'assistant'
+                        WHEN 'tool_result' THEN 'tool'
+                        ELSE event_type
+                    END AS role,
+                    COALESCE(tool_name, CAST(json_extract(data, '$.name') AS TEXT)) AS tool_name,
+                    created_at,
+                    CASE event_type
+                        WHEN 'user_message' THEN CAST(json_extract(data, '$.content') AS TEXT)
+                        WHEN 'assistant_response' THEN CAST(json_extract(data, '$.content') AS TEXT)
+                        WHEN 'tool_result' THEN CAST(json_extract(data, '$.result') AS TEXT)
+                        ELSE NULL
+                    END AS content
+                FROM events
+                WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+            )
+            SELECT message_id, event_id, session_id, role, tool_name, created_at,
+                   substr(COALESCE(content, ''), 1, 240) AS content_preview
+            FROM convo
             WHERE COALESCE(content, '') LIKE '%' || ? || '%'
             ORDER BY created_at DESC
             LIMIT ?
@@ -91,7 +114,8 @@ async fn main() -> anyhow::Result<()> {
             println!("(no matches)");
         } else {
             for row in &rows {
-                let msg_id: String = row.get("id");
+                let msg_id: String = row.get("message_id");
+                let event_id: i64 = row.get("event_id");
                 let session_id: String = row.get("session_id");
                 let role: String = row.get("role");
                 let tool_name: Option<String> = row.try_get("tool_name").unwrap_or(None);
@@ -99,8 +123,9 @@ async fn main() -> anyhow::Result<()> {
                 let preview: String = row.get("content_preview");
 
                 println!(
-                    "- msg_id={} session={} role={} tool={:?} at={}\n  {}",
+                    "- msg_id={} event_id={} session={} role={} tool={:?} at={}\n  {}",
                     msg_id,
+                    event_id,
                     session_id,
                     role,
                     tool_name,
@@ -112,8 +137,29 @@ async fn main() -> anyhow::Result<()> {
                     // Surrounding context inside the same session for quick forensics.
                     let before = sqlx::query(
                         r#"
-                        SELECT role, tool_name, created_at, substr(COALESCE(content, ''), 1, 140) AS content_preview
-                        FROM messages
+                        WITH convo AS (
+                            SELECT
+                                session_id,
+                                CASE event_type
+                                    WHEN 'user_message' THEN 'user'
+                                    WHEN 'assistant_response' THEN 'assistant'
+                                    WHEN 'tool_result' THEN 'tool'
+                                    ELSE event_type
+                                END AS role,
+                                COALESCE(tool_name, CAST(json_extract(data, '$.name') AS TEXT)) AS tool_name,
+                                created_at,
+                                CASE event_type
+                                    WHEN 'user_message' THEN CAST(json_extract(data, '$.content') AS TEXT)
+                                    WHEN 'assistant_response' THEN CAST(json_extract(data, '$.content') AS TEXT)
+                                    WHEN 'tool_result' THEN CAST(json_extract(data, '$.result') AS TEXT)
+                                    ELSE NULL
+                                END AS content
+                            FROM events
+                            WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+                        )
+                        SELECT role, tool_name, created_at,
+                               substr(COALESCE(content, ''), 1, 140) AS content_preview
+                        FROM convo
                         WHERE session_id = ?
                           AND created_at < ?
                         ORDER BY created_at DESC
@@ -128,8 +174,29 @@ async fn main() -> anyhow::Result<()> {
 
                     let after = sqlx::query(
                         r#"
-                        SELECT role, tool_name, created_at, substr(COALESCE(content, ''), 1, 140) AS content_preview
-                        FROM messages
+                        WITH convo AS (
+                            SELECT
+                                session_id,
+                                CASE event_type
+                                    WHEN 'user_message' THEN 'user'
+                                    WHEN 'assistant_response' THEN 'assistant'
+                                    WHEN 'tool_result' THEN 'tool'
+                                    ELSE event_type
+                                END AS role,
+                                COALESCE(tool_name, CAST(json_extract(data, '$.name') AS TEXT)) AS tool_name,
+                                created_at,
+                                CASE event_type
+                                    WHEN 'user_message' THEN CAST(json_extract(data, '$.content') AS TEXT)
+                                    WHEN 'assistant_response' THEN CAST(json_extract(data, '$.content') AS TEXT)
+                                    WHEN 'tool_result' THEN CAST(json_extract(data, '$.result') AS TEXT)
+                                    ELSE NULL
+                                END AS content
+                            FROM events
+                            WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+                        )
+                        SELECT role, tool_name, created_at,
+                               substr(COALESCE(content, ''), 1, 140) AS content_preview
+                        FROM convo
                         WHERE session_id = ?
                           AND created_at > ?
                         ORDER BY created_at ASC
@@ -529,8 +596,30 @@ async fn main() -> anyhow::Result<()> {
         println!("\n== Recent Session {} Messages ==", session_id);
         let msgs = sqlx::query(
             r#"
-            SELECT id, role, tool_name, created_at, substr(COALESCE(content, ''), 1, 280) AS content_preview
-            FROM messages
+            WITH convo AS (
+                SELECT
+                    COALESCE(NULLIF(CAST(json_extract(data, '$.message_id') AS TEXT), ''), CAST(id AS TEXT)) AS message_id,
+                    session_id,
+                    CASE event_type
+                        WHEN 'user_message' THEN 'user'
+                        WHEN 'assistant_response' THEN 'assistant'
+                        WHEN 'tool_result' THEN 'tool'
+                        ELSE event_type
+                    END AS role,
+                    COALESCE(tool_name, CAST(json_extract(data, '$.name') AS TEXT)) AS tool_name,
+                    created_at,
+                    CASE event_type
+                        WHEN 'user_message' THEN CAST(json_extract(data, '$.content') AS TEXT)
+                        WHEN 'assistant_response' THEN CAST(json_extract(data, '$.content') AS TEXT)
+                        WHEN 'tool_result' THEN CAST(json_extract(data, '$.result') AS TEXT)
+                        ELSE NULL
+                    END AS content
+                FROM events
+                WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+            )
+            SELECT message_id, role, tool_name, created_at,
+                   substr(COALESCE(content, ''), 1, 280) AS content_preview
+            FROM convo
             WHERE session_id = ?
             ORDER BY created_at DESC
             LIMIT 80
@@ -545,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
             for row in msgs {
                 println!(
                     "- {} {} tool={:?} at={}\n  {}",
-                    row.get::<String, _>("id"),
+                    row.get::<String, _>("message_id"),
                     row.get::<String, _>("role"),
                     row.try_get::<Option<String>, _>("tool_name")
                         .unwrap_or(None),
@@ -559,8 +648,28 @@ async fn main() -> anyhow::Result<()> {
     println!("\n== Recent Messages ==");
     let messages = sqlx::query(
         r#"
-        SELECT id, role, tool_name, substr(content, 1, 180) AS content, created_at
-        FROM messages
+        WITH convo AS (
+            SELECT
+                COALESCE(NULLIF(CAST(json_extract(data, '$.message_id') AS TEXT), ''), CAST(id AS TEXT)) AS message_id,
+                CASE event_type
+                    WHEN 'user_message' THEN 'user'
+                    WHEN 'assistant_response' THEN 'assistant'
+                    WHEN 'tool_result' THEN 'tool'
+                    ELSE event_type
+                END AS role,
+                COALESCE(tool_name, CAST(json_extract(data, '$.name') AS TEXT)) AS tool_name,
+                created_at,
+                CASE event_type
+                    WHEN 'user_message' THEN CAST(json_extract(data, '$.content') AS TEXT)
+                    WHEN 'assistant_response' THEN CAST(json_extract(data, '$.content') AS TEXT)
+                    WHEN 'tool_result' THEN CAST(json_extract(data, '$.result') AS TEXT)
+                    ELSE NULL
+                END AS content
+            FROM events
+            WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+        )
+        SELECT message_id, role, tool_name, substr(COALESCE(content, ''), 1, 180) AS content, created_at
+        FROM convo
         ORDER BY created_at DESC
         LIMIT 20
         "#,
@@ -570,7 +679,7 @@ async fn main() -> anyhow::Result<()> {
     for row in messages {
         println!(
             "- {} {} tool={:?} at={}\n  {}",
-            row.get::<String, _>("id"),
+            row.get::<String, _>("message_id"),
             row.get::<String, _>("role"),
             row.try_get::<Option<String>, _>("tool_name")
                 .unwrap_or(None),

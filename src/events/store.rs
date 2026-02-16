@@ -2,7 +2,7 @@
 //!
 //! The EventStore provides CRUD operations for events, with support for:
 //! - Efficient querying by session, time window, and event type
-//! - Conversation history retrieval (replacing messages table)
+//! - Conversation history retrieval from canonical events
 //! - Consolidation tracking and pruning
 
 use std::sync::Arc;
@@ -11,7 +11,10 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
 
-use super::{Event, EventType, PolicyDecisionData, TaskEndData, TaskStatus, ToolResultData};
+use super::{
+    DecisionPointData, DecisionType, Event, EventType, PolicyDecisionData, TaskEndData, TaskStatus,
+    ToolResultData,
+};
 use crate::traits::Message;
 
 /// The event store backed by SQLite.
@@ -80,8 +83,6 @@ pub struct SessionWriteDrift {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WriteConsistencyReport {
     pub generated_at: String,
-    pub messages_table_present: bool,
-    pub conversation_message_rows: u64,
     pub conversation_event_rows: u64,
     pub missing_message_id_events: u64,
     pub global_delta: i64,
@@ -457,6 +458,38 @@ impl EventStore {
         self.rows_to_events(rows)
     }
 
+    /// Query recent intent-gate decision_point events scoped to a session.
+    /// Returned in reverse-chronological order.
+    pub async fn query_recent_intent_gate_decision_points(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        let fetch_limit = limit.max(1).saturating_mul(5).max(20);
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            FROM events
+            WHERE session_id = ? AND event_type = 'decision_point'
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(session_id)
+        .bind(fetch_limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut events = self.rows_to_events(rows)?;
+        events.retain(|e| {
+            e.parse_data::<DecisionPointData>()
+                .ok()
+                .is_some_and(|d| d.decision_type == DecisionType::IntentGate)
+        });
+        events.truncate(limit.max(1));
+        Ok(events)
+    }
+
     /// Get unconsolidated events for a session (for consolidation)
     pub async fn query_unconsolidated(&self, session_id: &str) -> anyhow::Result<Vec<Event>> {
         let rows = sqlx::query(
@@ -511,11 +544,11 @@ impl EventStore {
     }
 
     // =========================================================================
-    // Read Operations - Conversation History (replaces messages table)
+    // Read Operations - Conversation History
     // =========================================================================
 
     /// Get conversation history for a session (for LLM context)
-    /// Returns events in the format needed for provider messages
+    /// Returns runtime messages projected from canonical events.
     pub async fn get_conversation_history(
         &self,
         session_id: &str,
@@ -533,17 +566,19 @@ impl EventStore {
             )
             .await?;
 
-        // Convert events to Message format (for backwards compatibility).
+        // Convert events to runtime Message format.
         // Reverse to chronological (query returns newest-first).
         let mut messages = Vec::new();
         for event in events.into_iter().rev() {
-            if let Some(msg) = crate::conversation::message_from_event(
+            if let Some(msg) = crate::events::turn_from_event(
                 event.id,
                 &event.session_id,
                 event.event_type.as_str(),
                 &event.data,
                 event.created_at,
-            ) {
+            )
+            .map(|turn| turn.into_message())
+            {
                 messages.push(msg);
             }
         }
@@ -934,9 +969,6 @@ impl EventStore {
     }
 
     /// Return canonical write-path consistency metrics from the event stream.
-    ///
-    /// This report is event-native and does not compare against legacy
-    /// messages table writes.
     pub async fn write_consistency_report(
         &self,
         _top_n_sessions: usize,
@@ -992,8 +1024,6 @@ impl EventStore {
 
         Ok(WriteConsistencyReport {
             generated_at: Utc::now().to_rfc3339(),
-            messages_table_present: false,
-            conversation_message_rows: to_u64(conversation_event_rows),
             conversation_event_rows: to_u64(conversation_event_rows),
             missing_message_id_events: to_u64(missing_message_id_events),
             global_delta: 0,
@@ -1310,24 +1340,32 @@ mod tests {
         .await;
     }
 
+    struct ToolResultFixture<'a> {
+        tool: &'a str,
+        success: bool,
+        duration_ms: u64,
+        result: &'a str,
+        error: Option<&'a str>,
+        created_at: DateTime<Utc>,
+    }
+
     async fn append_tool_result(
         store: &EventStore,
         session_id: &str,
-        tool: &str,
-        success: bool,
-        duration_ms: u64,
-        result: &str,
-        error: Option<&str>,
-        created_at: DateTime<Utc>,
+        fixture: ToolResultFixture<'_>,
     ) {
         let mut payload = json!({
-            "tool_call_id": format!("tc-{}-{}", tool, created_at.timestamp_nanos_opt().unwrap_or(0)),
-            "name": tool,
-            "result": result,
-            "success": success,
-            "duration_ms": duration_ms,
+            "tool_call_id": format!(
+                "tc-{}-{}",
+                fixture.tool,
+                fixture.created_at.timestamp_nanos_opt().unwrap_or(0)
+            ),
+            "name": fixture.tool,
+            "result": fixture.result,
+            "success": fixture.success,
+            "duration_ms": fixture.duration_ms,
         });
-        if let Some(err) = error {
+        if let Some(err) = fixture.error {
             payload["error"] = json!(err);
         }
         append_event_at(
@@ -1335,7 +1373,7 @@ mod tests {
             session_id,
             EventType::ToolResult,
             payload,
-            created_at,
+            fixture.created_at,
         )
         .await;
     }
@@ -1555,6 +1593,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_recent_intent_gate_decision_points_filters_and_scopes() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+
+        append_decision_point(&store, "s1", "task-1", now - Duration::minutes(3)).await;
+        append_event_at(
+            &store,
+            "s1",
+            EventType::DecisionPoint,
+            json!({
+                "decision_type":"stopping_condition",
+                "task_id":"task-1",
+                "iteration":2,
+                "metadata":{"reason":"stall"},
+                "summary":"stopping condition fired"
+            }),
+            now - Duration::minutes(2),
+        )
+        .await;
+        append_decision_point(&store, "s2", "task-2", now - Duration::minutes(1)).await;
+
+        let s1_recent = store
+            .query_recent_intent_gate_decision_points("s1", 10)
+            .await
+            .expect("query recent intent gate decision points");
+        assert_eq!(s1_recent.len(), 1);
+        assert_eq!(s1_recent[0].session_id, "s1");
+        let parsed = s1_recent[0]
+            .parse_data::<DecisionPointData>()
+            .expect("parse decision point");
+        assert_eq!(parsed.decision_type, DecisionType::IntentGate);
+    }
+
+    #[tokio::test]
     async fn reconcile_stale_task_starts_appends_failed_task_end() {
         let (store, _db_file) = setup_store().await;
         let now = Utc::now();
@@ -1682,7 +1754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_consistency_report_works_without_messages_table() {
+    async fn write_consistency_report_uses_event_stream_only() {
         let (store, _db_file) = setup_store().await;
         let now = Utc::now();
 
@@ -1703,8 +1775,6 @@ mod tests {
             .write_consistency_report(5)
             .await
             .expect("write consistency");
-        assert!(!report.messages_table_present);
-        assert_eq!(report.conversation_message_rows, 1);
         assert_eq!(report.conversation_event_rows, 1);
         assert_eq!(report.missing_message_id_events, 0);
         assert_eq!(report.global_delta, 0);
@@ -1717,49 +1787,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_consistency_report_ignores_legacy_messages_table_drift() {
+    async fn write_consistency_report_counts_missing_message_ids() {
         let (store, _db_file) = setup_store().await;
-        let now = Utc::now().to_rfc3339();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT,
-                created_at TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&store.pool())
-        .await
-        .expect("create messages table");
-
-        sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind("m-1")
-        .bind("s-drift")
-        .bind("user")
-        .bind("hello")
-        .bind(&now)
-        .execute(&store.pool())
-        .await
-        .expect("insert message 1");
-
-        sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind("m-2")
-        .bind("s-drift")
-        .bind("assistant")
-        .bind("hi")
-        .bind(&now)
-        .execute(&store.pool())
-        .await
-        .expect("insert message 2");
-
         append_event_at(
             &store,
             "s-drift",
@@ -1778,8 +1807,6 @@ mod tests {
             .await
             .expect("write consistency");
 
-        assert!(!report.messages_table_present);
-        assert_eq!(report.conversation_message_rows, 1);
         assert_eq!(report.conversation_event_rows, 1);
         assert_eq!(report.missing_message_id_events, 1);
         assert_eq!(report.global_delta, 0);
@@ -1800,45 +1827,53 @@ mod tests {
         append_tool_result(
             &store,
             session,
-            "terminal",
-            true,
-            100,
-            "ok",
-            None,
-            now - Duration::minutes(50),
+            ToolResultFixture {
+                tool: "terminal",
+                success: true,
+                duration_ms: 100,
+                result: "ok",
+                error: None,
+                created_at: now - Duration::minutes(50),
+            },
         )
         .await;
         append_tool_result(
             &store,
             session,
-            "terminal",
-            true,
-            300,
-            "ok",
-            None,
-            now - Duration::minutes(40),
+            ToolResultFixture {
+                tool: "terminal",
+                success: true,
+                duration_ms: 300,
+                result: "ok",
+                error: None,
+                created_at: now - Duration::minutes(40),
+            },
         )
         .await;
         append_tool_result(
             &store,
             session,
-            "terminal",
-            false,
-            200,
-            "Error: Connection timed out at /tmp/foo.rs:12:3",
-            Some("Error: Connection timed out at /tmp/foo.rs:12:3"),
-            now - Duration::minutes(30),
+            ToolResultFixture {
+                tool: "terminal",
+                success: false,
+                duration_ms: 200,
+                result: "Error: Connection timed out at /tmp/foo.rs:12:3",
+                error: Some("Error: Connection timed out at /tmp/foo.rs:12:3"),
+                created_at: now - Duration::minutes(30),
+            },
         )
         .await;
         append_tool_result(
             &store,
             session,
-            "terminal",
-            false,
-            400,
-            "Error: Connection timed out at /tmp/bar.rs:99:1",
-            Some("Error: Connection timed out at /tmp/bar.rs:99:1"),
-            now - Duration::minutes(20),
+            ToolResultFixture {
+                tool: "terminal",
+                success: false,
+                duration_ms: 400,
+                result: "Error: Connection timed out at /tmp/bar.rs:99:1",
+                error: Some("Error: Connection timed out at /tmp/bar.rs:99:1"),
+                created_at: now - Duration::minutes(20),
+            },
         )
         .await;
 
@@ -1865,34 +1900,40 @@ mod tests {
         append_tool_result(
             &store,
             session,
-            "web_search",
-            true,
-            0,
-            "[SYSTEM] You have already called web_search 3 times.",
-            None,
-            now - Duration::minutes(10),
+            ToolResultFixture {
+                tool: "web_search",
+                success: true,
+                duration_ms: 0,
+                result: "[SYSTEM] You have already called web_search 3 times.",
+                error: None,
+                created_at: now - Duration::minutes(10),
+            },
         )
         .await;
         append_tool_result(
             &store,
             session,
-            "web_search",
-            true,
-            0,
-            "[SYSTEM] BLOCKED: repetitive tool call",
-            None,
-            now - Duration::minutes(9),
+            ToolResultFixture {
+                tool: "web_search",
+                success: true,
+                duration_ms: 0,
+                result: "[SYSTEM] BLOCKED: repetitive tool call",
+                error: None,
+                created_at: now - Duration::minutes(9),
+            },
         )
         .await;
         append_tool_result(
             &store,
             session,
-            "web_search",
-            true,
-            0,
-            "[SYSTEM] Before executing tools, briefly state what you understand...",
-            None,
-            now - Duration::minutes(8),
+            ToolResultFixture {
+                tool: "web_search",
+                success: true,
+                duration_ms: 0,
+                result: "[SYSTEM] Before executing tools, briefly state what you understand...",
+                error: None,
+                created_at: now - Duration::minutes(8),
+            },
         )
         .await;
 
@@ -1900,12 +1941,14 @@ mod tests {
         append_tool_result(
             &store,
             session,
-            "web_search",
-            true,
-            120,
-            "some results",
-            None,
-            now - Duration::minutes(7),
+            ToolResultFixture {
+                tool: "web_search",
+                success: true,
+                duration_ms: 120,
+                result: "some results",
+                error: None,
+                created_at: now - Duration::minutes(7),
+            },
         )
         .await;
 
@@ -1924,8 +1967,6 @@ mod tests {
     fn write_consistency_gate_can_be_tuned_with_custom_thresholds() {
         let report = WriteConsistencyReport {
             generated_at: Utc::now().to_rfc3339(),
-            messages_table_present: true,
-            conversation_message_rows: 12,
             conversation_event_rows: 10,
             missing_message_id_events: 1,
             global_delta: 2,

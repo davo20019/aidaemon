@@ -86,14 +86,28 @@ impl Tool for EditFileTool {
 
         let content = tokio::fs::read_to_string(&path).await?;
 
-        // Count occurrences
-        let count = content.matches(old_text).count();
+        // Count occurrences using exact match first.
+        let mut effective_old_text = old_text.to_string();
+        let mut effective_new_text = new_text.to_string();
+        let mut count = content.matches(&effective_old_text).count();
+
+        // Self-recovery path: tolerate newline-style mismatch (LF vs CRLF) while
+        // preserving strict exact matching otherwise.
+        if count == 0 {
+            let file_newline = detect_newline_style(&content);
+            let normalized_old = normalize_newlines_for_style(old_text, file_newline);
+            if normalized_old != old_text {
+                let normalized_count = content.matches(&normalized_old).count();
+                if normalized_count > 0 {
+                    effective_old_text = normalized_old;
+                    effective_new_text = normalize_newlines_for_style(new_text, file_newline);
+                    count = normalized_count;
+                }
+            }
+        }
 
         if count == 0 {
-            anyhow::bail!(
-                "Text not found in {}. The old_text must match exactly (including whitespace and indentation).",
-                path_str
-            );
+            anyhow::bail!("{}", build_not_found_message(path_str, &content, old_text));
         }
 
         if count > 1 && !replace_all {
@@ -106,9 +120,9 @@ impl Tool for EditFileTool {
 
         // Perform replacement
         let new_content = if replace_all {
-            content.replace(old_text, new_text)
+            content.replace(&effective_old_text, &effective_new_text)
         } else {
-            content.replacen(old_text, new_text, 1)
+            content.replacen(&effective_old_text, &effective_new_text, 1)
         };
 
         // Backup + atomic write
@@ -126,16 +140,98 @@ impl Tool for EditFileTool {
 
         // Show context around the change
         let replaced_count = if replace_all { count } else { 1 };
-        let context = get_change_context(&new_content, new_text);
+        let context = get_change_context(&new_content, &effective_new_text);
+        let used_newline_recovery = effective_old_text != old_text;
 
         Ok(format!(
-            "Edited {}: replaced {} occurrence{}\n\n{}",
+            "Edited {}: replaced {} occurrence{}{}\n\n{}",
             path_str,
             replaced_count,
             if replaced_count > 1 { "s" } else { "" },
+            if used_newline_recovery {
+                " (newline-normalized match)"
+            } else {
+                ""
+            },
             context
         ))
     }
+}
+
+fn detect_newline_style(content: &str) -> &'static str {
+    let crlf_count = content.matches("\r\n").count();
+    let lf_total = content.matches('\n').count();
+    let lf_only_count = lf_total.saturating_sub(crlf_count);
+    if crlf_count > lf_only_count {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn normalize_newlines_for_style(input: &str, newline: &str) -> String {
+    let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+    if newline == "\r\n" {
+        normalized.replace('\n', "\r\n")
+    } else {
+        normalized
+    }
+}
+
+fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let mut out: String = input.chars().take(max_chars).collect();
+    out.push_str("...");
+    out
+}
+
+fn build_file_preview(content: &str, max_lines: usize, max_chars: usize) -> String {
+    if content.is_empty() {
+        return "(file is empty)".to_string();
+    }
+
+    let mut preview_lines = Vec::new();
+    for (idx, line) in content.lines().take(max_lines).enumerate() {
+        preview_lines.push(format!("{:>4} | {}", idx + 1, line));
+    }
+
+    let total_lines = content.lines().count();
+    if total_lines > max_lines {
+        preview_lines.push(format!("... ({} more lines)", total_lines - max_lines));
+    }
+
+    let joined = preview_lines.join("\n");
+    truncate_with_ellipsis(&joined, max_chars)
+}
+
+fn build_not_found_message(path: &str, content: &str, old_text: &str) -> String {
+    let first_non_empty_old = old_text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(old_text)
+        .trim();
+    let old_hint = if first_non_empty_old.is_empty() {
+        "old_text appears empty or whitespace-only.".to_string()
+    } else {
+        format!(
+            "old_text first non-empty line: `{}`",
+            truncate_with_ellipsis(first_non_empty_old, 120)
+        )
+    };
+
+    let preview = build_file_preview(content, 40, 3500);
+    format!(
+        "Text not found in {}. The old_text must match exactly (including whitespace and indentation).\n\
+{}\n\n\
+Self-recovery steps:\n\
+1. Call read_file on the same path.\n\
+2. Copy the exact block from the file output into old_text and retry edit_file.\n\
+3. If the goal is replacing the whole file, use write_file instead of edit_file.\n\n\
+File preview:\n{}",
+        path, old_hint, preview
+    )
 }
 
 /// Get a few lines of context around where the replacement was made.
@@ -168,7 +264,7 @@ mod tests {
         let tool = EditFileTool;
         let schema = tool.schema();
         assert_eq!(schema["name"], "edit_file");
-        assert!(schema["description"].as_str().unwrap().len() > 0);
+        assert!(!schema["description"].as_str().unwrap().is_empty());
         assert!(schema["parameters"]["properties"]["old_text"].is_object());
     }
 
@@ -194,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn test_edit_multiple_without_flag() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(f, "foo bar foo baz foo\n").unwrap();
+        writeln!(f, "foo bar foo baz foo").unwrap();
         let args = json!({
             "path": f.path().to_str().unwrap(),
             "old_text": "foo",
@@ -210,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn test_edit_replace_all() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(f, "foo bar foo baz foo\n").unwrap();
+        writeln!(f, "foo bar foo baz foo").unwrap();
         let args = json!({
             "path": f.path().to_str().unwrap(),
             "old_text": "foo",
@@ -229,7 +325,7 @@ mod tests {
     #[tokio::test]
     async fn test_edit_text_not_found() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(f, "hello world\n").unwrap();
+        writeln!(f, "hello world").unwrap();
         let args = json!({
             "path": f.path().to_str().unwrap(),
             "old_text": "nonexistent",
@@ -239,7 +335,29 @@ mod tests {
 
         let result = EditFileTool.call(&args).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not found"));
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found"));
+        assert!(err.contains("Self-recovery steps"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_newline_normalization_recovery() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+        let args = json!({
+            "path": f.path().to_str().unwrap(),
+            "old_text": "beta\n",
+            "new_text": "BETA\n"
+        })
+        .to_string();
+
+        let result = EditFileTool.call(&args).await.unwrap();
+        assert!(result.contains("replaced 1 occurrence"));
+        assert!(result.contains("newline-normalized match"));
+
+        let content = tokio::fs::read_to_string(f.path()).await.unwrap();
+        assert!(content.contains("BETA\r\n"));
+        assert!(!content.contains("beta\r\n"));
     }
 
     #[tokio::test]

@@ -29,6 +29,9 @@ pub struct ChannelHub {
     session_map: SessionMap,
     queue_telemetry: Option<Arc<QueueTelemetry>>,
     queue_policy: Option<QueuePolicyConfig>,
+    /// Best-effort duplicate suppression for rapid-fire identical messages.
+    /// Keyed by session_id.
+    last_sent_text: RwLock<HashMap<String, (String, tokio::time::Instant)>>,
 }
 
 impl ChannelHub {
@@ -38,6 +41,7 @@ impl ChannelHub {
             session_map,
             queue_telemetry: None,
             queue_policy: None,
+            last_sent_text: RwLock::new(HashMap::new()),
         }
     }
 
@@ -334,6 +338,23 @@ impl ChannelHub {
     /// Send text to the channel that owns a specific session.
     #[allow(dead_code)]
     pub async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+        // Deduplicate identical spam (e.g. multiple heartbeats) within a short window.
+        // This intentionally remains best-effort: it favors reducing noise over
+        // perfect delivery guarantees.
+        {
+            let now = tokio::time::Instant::now();
+            let text_norm = text.trim();
+            let mut last = self.last_sent_text.write().await;
+            if let Some((prev, prev_at)) = last.get(session_id) {
+                if prev.trim() == text_norm
+                    && now.duration_since(*prev_at) < std::time::Duration::from_secs(10)
+                {
+                    return Ok(());
+                }
+            }
+            last.insert(session_id.to_string(), (text_norm.to_string(), now));
+        }
+
         if let Some(channel) = self.channel_for_session(session_id).await {
             channel.send_text(session_id, text).await
         } else {

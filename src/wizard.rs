@@ -333,7 +333,10 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
         if enable {
             browser_enabled = true;
 
-            let mode_choices = vec!["Visible (recommended for personal computers)", "Headless (recommended for servers)"];
+            let mode_choices = vec![
+                "Visible (recommended for personal computers)",
+                "Headless (recommended for servers)",
+            ];
             let mode_idx = Select::new()
                 .with_prompt("  Browser mode")
                 .items(&mode_choices)
@@ -342,7 +345,14 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
             browser_headless = mode_idx == 1;
 
             println!();
-            println!("  Browser tool enabled ({} mode).", if browser_headless { "headless" } else { "visible" });
+            println!(
+                "  Browser tool enabled ({} mode).",
+                if browser_headless {
+                    "headless"
+                } else {
+                    "visible"
+                }
+            );
             println!("  Run `aidaemon browser login` after setup to log into your services.");
         }
     }
@@ -446,9 +456,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
         format!("base_url = \"{base_url}\"\n")
     };
     let browser_section = if browser_enabled {
-        format!(
-            "\n[browser]\nenabled = true\nheadless = {browser_headless}\n",
-        )
+        format!("\n[browser]\nenabled = true\nheadless = {browser_headless}\n",)
     } else {
         "\n# Uncomment to enable browser tool:\n# [browser]\n# enabled = true\n".to_string()
     };

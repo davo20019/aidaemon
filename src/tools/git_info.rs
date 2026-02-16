@@ -236,7 +236,7 @@ mod tests {
         let tool = GitInfoTool;
         let schema = tool.schema();
         assert_eq!(schema["name"], "git_info");
-        assert!(schema["description"].as_str().unwrap().len() > 0);
+        assert!(!schema["description"].as_str().unwrap().is_empty());
         assert!(schema["parameters"]["properties"]["include"].is_object());
     }
 

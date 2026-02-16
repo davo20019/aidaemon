@@ -9,6 +9,7 @@
 use crate::traits::{ErrorSolution, Message, Procedure};
 use chrono::Utc;
 use regex::Regex;
+use sha2::Digest;
 use std::sync::OnceLock;
 
 // Pre-compiled regexes for better performance
@@ -158,16 +159,48 @@ pub fn extract_trigger_pattern(task_context: &str) -> String {
     }
 }
 
+/// Generate a stable, collision-resistant procedure name.
+///
+/// This keeps the human-readable base prefix while appending a short hash of
+/// normalized steps so semantically different workflows don't overwrite each
+/// other under generic names like "deploy" or "run-tests".
+pub fn generate_procedure_keyed_name(base_name: &str, steps: &[String]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    for step in steps {
+        let normalized = step.to_lowercase();
+        hasher.update(normalized.as_bytes());
+        hasher.update(b"\n");
+    }
+    let digest = hasher.finalize();
+    let suffix: String = digest
+        .iter()
+        .take(4)
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    format!("{}-{}", base_name, suffix)
+}
+
 /// Create a new Procedure from task context.
+#[allow(dead_code)] // Compatibility wrapper
 pub fn create_procedure(name: String, trigger_pattern: String, steps: Vec<String>) -> Procedure {
+    create_procedure_with_outcome(name, trigger_pattern, steps, true)
+}
+
+/// Create a Procedure while explicitly recording the initial outcome.
+pub fn create_procedure_with_outcome(
+    name: String,
+    trigger_pattern: String,
+    steps: Vec<String>,
+    success: bool,
+) -> Procedure {
     let now = Utc::now();
     Procedure {
         id: 0, // Will be set by database
         name,
         trigger_pattern,
         steps,
-        success_count: 1,
-        failure_count: 0,
+        success_count: i32::from(success),
+        failure_count: i32::from(!success),
         avg_duration_secs: None,
         last_used_at: Some(now),
         created_at: now,
@@ -261,5 +294,29 @@ mod tests {
         ];
         let generalized = generalize_procedure(&actions);
         assert!(generalized[1].contains("<path>"));
+    }
+
+    #[test]
+    fn test_generate_procedure_keyed_name_is_stable() {
+        let steps = vec![
+            "terminal(cargo)".to_string(),
+            "terminal(cargo test)".to_string(),
+        ];
+        let name_a = generate_procedure_keyed_name("deploy", &steps);
+        let name_b = generate_procedure_keyed_name("deploy", &steps);
+        assert_eq!(name_a, name_b);
+        assert!(name_a.starts_with("deploy-"));
+    }
+
+    #[test]
+    fn test_create_procedure_with_failure_outcome() {
+        let proc = create_procedure_with_outcome(
+            "run-tests-1234abcd".to_string(),
+            "run tests".to_string(),
+            vec!["cargo test".to_string()],
+            false,
+        );
+        assert_eq!(proc.success_count, 0);
+        assert_eq!(proc.failure_count, 1);
     }
 }

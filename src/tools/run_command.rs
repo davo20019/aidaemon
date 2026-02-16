@@ -326,7 +326,7 @@ mod tests {
         let tool = RunCommandTool;
         let schema = tool.schema();
         assert_eq!(schema["name"], "run_command");
-        assert!(schema["description"].as_str().unwrap().len() > 0);
+        assert!(!schema["description"].as_str().unwrap().is_empty());
         assert!(schema["parameters"]["properties"]["command"].is_object());
     }
 

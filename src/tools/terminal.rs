@@ -112,7 +112,12 @@ fn format_output(stdout: &str, stderr: &str, max_chars: usize) -> String {
         result.push_str("(no output)");
     }
     if result.len() > max_chars {
-        result.truncate(max_chars);
+        // Find the nearest valid UTF-8 char boundary at or before max_chars
+        let mut truncate_at = max_chars;
+        while truncate_at > 0 && !result.is_char_boundary(truncate_at) {
+            truncate_at -= 1;
+        }
+        result.truncate(truncate_at);
         result.push_str("\n... (truncated)");
     }
     result
@@ -1002,6 +1007,21 @@ mod tests {
         // The content portion before the suffix should be exactly max_chars long
         let prefix = &result[..100];
         assert_eq!(prefix, "a".repeat(100));
+    }
+
+    #[test]
+    fn test_format_truncation_multibyte_utf8() {
+        // "é" is 2 bytes in UTF-8, "日" is 3 bytes, "🎉" is 4 bytes
+        let output = "aé日🎉".repeat(50); // mixed multi-byte chars
+                                          // Truncate at various positions that may land mid-char
+        for max in [1, 2, 3, 4, 5, 10, 50, 100] {
+            let result = format_output(&output, "", max);
+            // Must not panic and must be valid UTF-8 (String guarantees this)
+            assert!(!result.is_empty());
+            if output.len() > max {
+                assert!(result.ends_with("\n... (truncated)"));
+            }
+        }
     }
 
     #[tokio::test]

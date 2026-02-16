@@ -3,8 +3,8 @@
 //! Each active goal gets a `CancellationToken`. Task leads and executors
 //! derive child tokens so cancelling a goal cascades to all its agents.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -18,13 +18,46 @@ use crate::traits::Goal;
 #[derive(Clone)]
 pub struct GoalTokenRegistry {
     tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    // Best-effort in-memory guard to avoid spawning duplicate task leads/heartbeats
+    // for the same goal_id within a single daemon process.
+    active_runs: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Guard object returned by `GoalTokenRegistry::try_acquire_run`.
+/// Releases the run lock when dropped.
+pub struct GoalRunGuard {
+    registry: GoalTokenRegistry,
+    goal_id: String,
+}
+
+impl Drop for GoalRunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut runs) = self.registry.active_runs.lock() {
+            runs.remove(&self.goal_id);
+        }
+    }
 }
 
 impl GoalTokenRegistry {
     pub fn new() -> Self {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
+            active_runs: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Try to acquire an in-process "run lock" for a goal. Returns None if another
+    /// run is already active for this goal_id.
+    pub fn try_acquire_run(&self, goal_id: &str) -> Option<GoalRunGuard> {
+        let mut runs = self.active_runs.lock().ok()?;
+        if runs.contains(goal_id) {
+            return None;
+        }
+        runs.insert(goal_id.to_string());
+        Some(GoalRunGuard {
+            registry: self.clone(),
+            goal_id: goal_id.to_string(),
+        })
     }
 
     /// Register a new cancellation token for a goal. Returns the token.
@@ -135,5 +168,24 @@ mod tests {
         // Rebuild again shouldn't duplicate
         registry.rebuild_from_goals(&goals).await;
         assert!(registry.child_token(&goals[0].id).await.is_some());
+    }
+
+    #[test]
+    fn test_try_acquire_run_is_exclusive_and_released_on_drop() {
+        let registry = GoalTokenRegistry::new();
+
+        let g1 = registry
+            .try_acquire_run("goal-1")
+            .expect("first acquire should succeed");
+        assert!(
+            registry.try_acquire_run("goal-1").is_none(),
+            "second acquire should fail while guard is held"
+        );
+
+        drop(g1);
+        assert!(
+            registry.try_acquire_run("goal-1").is_some(),
+            "acquire should succeed again after guard drop"
+        );
     }
 }

@@ -5,6 +5,7 @@ const FACT_LEXICAL_MIN_SCORE: f32 = 0.35;
 const FACT_LEXICAL_MAX_SCORE: f32 = 0.55;
 const FACT_FRESHNESS_MAX_BOOST: f32 = 0.15;
 const FACT_FRESHNESS_DECAY_HOURS: f32 = 168.0; // 7 days
+const FACT_PAD_LOW_CONFIDENCE_RESULTS: bool = false;
 
 async fn bump_fact_recall(pool: &SqlitePool, facts: &[Fact]) {
     if facts.is_empty() {
@@ -131,6 +132,12 @@ fn lexical_fallback_score(query_lower: &str, tokens: &[&str], fact: &Fact) -> f3
     // Values are natural language; prefer word-boundary matching to avoid
     // false positives like "dog" matching "dodger".
     if key.contains(q) || category.contains(q) || value_has_q {
+        return FACT_LEXICAL_MAX_SCORE;
+    }
+
+    // If any query token matches the structured key exactly (word boundary),
+    // treat as high-confidence lexical relevance.
+    if tokens.iter().any(|t| contains_word(&key, t)) {
         return FACT_LEXICAL_MAX_SCORE;
     }
 
@@ -520,7 +527,10 @@ impl crate::traits::FactStore for SqliteStateStore {
         }
 
         // If filtering left us with very few facts, pad with most recent ones
-        if relevant.len() < max / 3 && all_facts.len() > relevant.len() {
+        if FACT_PAD_LOW_CONFIDENCE_RESULTS
+            && relevant.len() < max / 3
+            && all_facts.len() > relevant.len()
+        {
             for fact in &all_facts {
                 if relevant.len() >= max {
                     break;
@@ -543,12 +553,16 @@ impl crate::traits::FactStore for SqliteStateStore {
         channel_id: Option<&str>,
         visibility: ChannelVisibility,
     ) -> anyhow::Result<Vec<Fact>> {
-        // In DM/Internal contexts, return all facts (existing behavior)
+        // In DM/Internal contexts, prioritize complete personal recall and keep
+        // the result capped by `max` for prompt budget safety.
         if matches!(
             visibility,
             ChannelVisibility::Private | ChannelVisibility::Internal
         ) {
-            return self.get_relevant_facts(query, max).await;
+            let mut facts = self.get_facts(None).await?;
+            facts.truncate(max);
+            bump_fact_recall(&self.pool, &facts).await;
+            return Ok(facts);
         }
 
         // PublicExternal: do NOT inject any stored facts (treat as untrusted).
@@ -672,7 +686,10 @@ impl crate::traits::FactStore for SqliteStateStore {
             }
         }
 
-        if relevant.len() < max / 3 && filtered.len() > relevant.len() {
+        if FACT_PAD_LOW_CONFIDENCE_RESULTS
+            && relevant.len() < max / 3
+            && filtered.len() > relevant.len()
+        {
             for fact in &filtered {
                 if relevant.len() >= max {
                     break;

@@ -11,10 +11,9 @@ use crate::config::AppConfig;
 use crate::daemon;
 
 use crate::health::HealthProbeManager;
+use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
 use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
 use crate::queue_telemetry::QueueTelemetry;
-
-use crate::router::Tier;
 use crate::skills;
 use crate::startup::{
     channels as startup_channels, mcp as startup_mcp, memory_pipeline, provider_router,
@@ -31,6 +30,15 @@ const LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC: &str =
 const LEGACY_MEMORY_HEALTH_GOAL_DESC: &str =
     "Maintain memory health: prune old events, clean up retention, remove stale data";
 const LEGACY_SYSTEM_SESSION_ID: &str = "system";
+const LEGACY_MAINTENANCE_MIGRATION_DONE_KEY: &str =
+    "migration_legacy_system_maintenance_goals_retired_v1";
+
+fn is_truthy_setting(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "enabled"
+    )
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct LegacyMaintenanceMigrationStats {
@@ -112,9 +120,15 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     let provider_router::ProviderRouterBundle {
         provider,
-        router,
         primary_model: model,
+        ..
     } = provider_router::build_provider_router(&config)?;
+    let llm_runtime = SharedLlmRuntime::new(
+        provider.clone(),
+        router_from_models(config.provider.models.clone()),
+        config.provider.kind.clone(),
+        model.clone(),
+    );
 
     let memory_pipeline::MemoryPipelineBundle {
         consolidator: _consolidator,
@@ -125,8 +139,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         state.clone(),
         event_store.clone(),
         plan_store.clone(),
-        provider.clone(),
-        &router,
+        llm_runtime.clone(),
         embedding_service.clone(),
     );
 
@@ -153,8 +166,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         &config,
         state.clone(),
         event_store.clone(),
-        provider.clone(),
-        &router,
+        llm_runtime.clone(),
         health_store.clone(),
         approval_tx.clone(),
         media_tx.clone(),
@@ -205,9 +217,6 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     };
     let base_system_prompt = build_base_system_prompt(&config, &skill_names, has_cli_agents);
 
-    // Clone provider before passing to Agent (needed by skill promotion task below)
-    let provider_for_promotion = provider.clone();
-
     let llm_call_timeout_secs = if config.daemon.watchdog.enabled {
         Some(config.daemon.watchdog.llm_call_timeout_secs)
     } else {
@@ -223,7 +232,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
     let agent = Arc::new(Agent::new(
-        provider,
+        llm_runtime.clone(),
         state.clone(),
         event_store.clone(),
         tools,
@@ -236,7 +245,6 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         config.subagents.max_iterations_cap,
         config.subagents.max_response_chars,
         config.subagents.timeout_secs,
-        config.provider.models.clone(),
         config.state.max_facts,
         config.state.daily_token_budget,
         config.subagents.effective_iteration_limit(),
@@ -269,26 +277,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // Migrate legacy seeded maintenance goals to deterministic background jobs.
     // Run before heartbeat starts so no legacy goal tasks are dispatched this boot.
-    match retire_legacy_system_maintenance_goals(state.clone()).await {
-        Ok(stats)
-            if stats.goals_matched > 0
-                || stats.goals_retired > 0
-                || stats.tasks_closed > 0
-                || stats.notifications_deleted > 0 =>
-        {
-            info!(
-                matched = stats.goals_matched,
-                retired = stats.goals_retired,
-                tasks_closed = stats.tasks_closed,
-                notifications_deleted = stats.notifications_deleted,
-                "Applied legacy maintenance-goal migration"
-            );
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "Legacy maintenance-goal migration failed");
-        }
-    }
+    maybe_run_legacy_system_maintenance_goal_migration(state.clone()).await;
 
     // 9c. Heartbeat coordinator (replaces individual background task loops)
     let (_wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(16);
@@ -304,8 +293,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         wake_rx,
         inbox_dir.clone(),
         skills_dir.clone(),
-        provider_for_promotion.clone(),
-        &router,
+        llm_runtime.clone(),
         oauth_gateway.clone(),
         watchdog_stale_threshold_secs,
         goal_token_registry.clone(),
@@ -428,6 +416,23 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     Ok(())
 }
 
+/// Run all startup database migrations and exit.
+///
+/// Useful for post-install/post-upgrade automation:
+/// `aidaemon migrate` can be run non-interactively before starting the daemon.
+pub async fn run_migrations_only(
+    config: AppConfig,
+    config_path: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    let mut config = config;
+    crate::startup::db_security::enforce_database_encryption(&mut config, &config_path).await?;
+
+    let stores::StoreBundle { state, .. } = stores::build_stores(&config).await?;
+    maybe_run_legacy_system_maintenance_goal_migration(state).await;
+
+    Ok(())
+}
+
 struct HeartbeatSetup {
     coordinator: Option<crate::heartbeat::HeartbeatCoordinator>,
     telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>>,
@@ -443,8 +448,7 @@ async fn init_heartbeat_coordinator(
     wake_rx: tokio::sync::mpsc::Receiver<()>,
     inbox_dir: String,
     skills_dir: Option<std::path::PathBuf>,
-    provider_for_promotion: Arc<dyn crate::traits::ModelProvider>,
-    router: &crate::router::Router,
+    llm_runtime: SharedLlmRuntime,
     oauth_gateway: Option<crate::oauth::OAuthGateway>,
     watchdog_stale_threshold_secs: u64,
     goal_token_registry: crate::goal_tokens::GoalTokenRegistry,
@@ -560,8 +564,7 @@ async fn init_heartbeat_coordinator(
         if let Some(sd) = skills_dir {
             let promoter = Arc::new(crate::memory::skill_promotion::SkillPromoter::new(
                 state.clone(),
-                provider_for_promotion,
-                router.select(Tier::Fast).to_string(),
+                llm_runtime.clone(),
                 sd,
                 config.policy.learning_evidence_gate_enforce,
             ));
@@ -845,8 +848,6 @@ fn spawn_dashboard_or_health_server(
                     health_store,
                     heartbeat_telemetry,
                     oauth_gateway,
-                    policy_window_days: config.policy.classify_retirement_window_days,
-                    policy_max_divergence: config.policy.classify_retirement_max_divergence as f64,
                     policy_uncertainty_threshold: config.policy.uncertainty_clarify_threshold,
                     write_consistency_thresholds,
                     queue_telemetry,
@@ -1029,6 +1030,54 @@ fn is_legacy_system_maintenance_goal(goal: &Goal) -> bool {
 
 fn is_open_goal_task_status(status: &str) -> bool {
     matches!(status, "pending" | "claimed" | "running")
+}
+
+async fn maybe_run_legacy_system_maintenance_goal_migration(state: Arc<SqliteStateStore>) {
+    let migration_done = match state
+        .get_setting(LEGACY_MAINTENANCE_MIGRATION_DONE_KEY)
+        .await
+    {
+        Ok(Some(v)) => is_truthy_setting(&v),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to read legacy maintenance-goal migration marker; running migration"
+            );
+            false
+        }
+    };
+    if !migration_done {
+        match retire_legacy_system_maintenance_goals(state.clone()).await {
+            Ok(stats) => {
+                if stats.goals_matched > 0
+                    || stats.goals_retired > 0
+                    || stats.tasks_closed > 0
+                    || stats.notifications_deleted > 0
+                {
+                    info!(
+                        matched = stats.goals_matched,
+                        retired = stats.goals_retired,
+                        tasks_closed = stats.tasks_closed,
+                        notifications_deleted = stats.notifications_deleted,
+                        "Applied legacy maintenance-goal migration"
+                    );
+                }
+                if let Err(e) = state
+                    .set_setting(LEGACY_MAINTENANCE_MIGRATION_DONE_KEY, "1")
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to persist legacy maintenance-goal migration marker"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Legacy maintenance-goal migration failed");
+            }
+        }
+    }
 }
 
 async fn retire_legacy_system_maintenance_goals(
@@ -1232,6 +1281,10 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         2. CRAFT EXPERT PROMPTS — shape each CLI agent into a specialist via system_instruction \
         (e.g. \"You are a security auditor\", \"You are a data analyst\")\n\
         3. DISPATCH — send tasks to CLI agents. Use async_mode=true for parallel sub-tasks.\n\
+        \n  COORDINATION RULES (hard constraints):\n\
+        - NEVER send the same (or very similar) task to multiple agents — pick one agent per sub-task.\n\
+        - NEVER dispatch two agents to the same working_dir concurrently — the runtime will block the second call.\n\
+        - ALWAYS specify working_dir for every cli_agent call so the runtime can detect conflicts.\n\
         4. REVIEW — inspect the output and file changes. Validate correctness.\n\
         5. REPORT — give the user a clear summary.\n\
         \n  ROUTING RULES:\n\
@@ -1240,6 +1293,10 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         - Research requiring multiple searches -> cli_agent\n\
         - Simple quick answers, memory lookups, one-off commands -> handle directly\n\
         - If a cli_agent fails -> retry with different agent or handle directly\n\
+        \n  NO DOUBLE-DIPPING: When you delegate a task to a cli_agent, do NOT also perform the \
+        same work yourself with your own tools (web_search, web_fetch, terminal, etc.). \
+        The cli_agent handles it end-to-end. If you need to research AND build, dispatch \
+        them as separate cli_agent calls — don't research yourself and build with cli_agent.\n\
         \n  Parameters: tool (optional specific agent), prompt (the task), working_dir (project path), \
         system_instruction (specialist role), async_mode (true for parallel dispatch).\n\
         If tool is omitted, the runtime auto-selects the first installed agent in this order: \
@@ -1290,8 +1347,9 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
     let manage_skills_tool_doc = if config.skills.enabled {
         "\n- `manage_skills`: Add, list, remove, browse, install, update, or review skills. \
         Actions: add (from URL), add_inline (from raw markdown), list (show all skills), \
-        remove (by name), browse (search skill registries), install (from registry by name), \
-        update (refresh a skill from its source), review (approve/dismiss auto-promoted skill drafts). \
+        remove (by name), remove_all (bulk remove by names, optional dry_run), browse (search skill registries), \
+        install (from registry by name), update (refresh a skill from its source), \
+        review (approve/dismiss auto-promoted skill drafts). \
         Skills are reusable procedures that activate automatically when triggered by keywords."
     } else {
         ""
@@ -1503,7 +1561,7 @@ learn their preferences, track their goals, and improve through experience.
 | A name doesn't match exactly (\"site-cars\" vs \"cars-site\") | Fuzzy-match: list the directory, find the closest name, proceed |
 | You need current/external data | Use ONE targeted tool call (web_search, system_info, etc.) |
 | The task requires an action (run command, change config) | Use the appropriate tool |
-| A tool call fails | Try ONE alternative, then ask the user for guidance |
+| A tool call fails | Try ONE alternative, then ask the user for guidance. For `edit_file` failures, run `read_file` on the same path and retry once before asking |
 | You searched 2-3 times without finding what you need | Stop searching, tell the user what you tried, ask them |
 
 **Effort must match complexity:**
@@ -1527,7 +1585,11 @@ episodic memory (past session summaries), procedural memory (learned workflows),
 goals, expertise levels, and behavior patterns.
 
 Reference memories conversationally: \"Since you mentioned X last time...\" \
-When you learn something important, store it with `remember_fact` (stable facts/preferences). \
+Use `remember_fact` ONLY for stable, long-term knowledge about the user — preferences, personal info, \
+environment details, communication patterns, and established relationships. \
+Do NOT save task-scoped research, reference material gathered for a specific project, or content being built \
+(e.g., product prices, API docs, website copy). If the information is only useful for the current task and not \
+about the user personally, do not store it as a fact. \
 For personal goals/habits the user wants tracked over time, use `manage_memories` (create_personal_goal/list_goals/complete_goal/abandon_goal). \
 Do NOT store goals as facts. \
 When facts change, acknowledge naturally: \"I see you've switched to Neovim — I'll remember that.\"
@@ -1581,9 +1643,9 @@ information lookups should use memory first, then ask the user.
 ## Tools
 - `read_file`: Read file contents with line numbers. Supports line ranges for large files. Use instead of terminal cat/head/tail.
 - `write_file`: Write or create files with atomic writes and automatic backup. Use instead of terminal echo/cat redirection.
-- `edit_file`: Find and replace text in files. Validates uniqueness, shows context around changes. Use instead of terminal sed/awk.
+- `edit_file`: Find and replace text in files. Validates uniqueness, shows context around changes. Use instead of terminal sed/awk. If it fails with not-found/ambiguous text, call `read_file` for the same path and retry once before asking the user.
 - `search_files`: Search by filename glob and/or content regex. Auto-skips .git/node_modules/target. Use instead of terminal find/grep.
-- `project_inspect`: Understand a project in one call: type detection, metadata, git info, directory structure. Use as first step when exploring any project.
+- `project_inspect`: Understand project(s) in one call: type detection, metadata, git info, directory structure. For multiple folders, prefer one batched call with `paths` instead of many repeated single-path calls.
 - `run_command`: Run safe build/test/lint commands (cargo, npm, pytest, go, git read-only, ls, etc.) without approval flow. For arbitrary/dangerous commands, use terminal.
 - `git_info`: Get comprehensive git state: status, log, branches, remotes, diff, stash — all in one call.
 - `git_commit`: Stage files and commit. Validates changes exist. Use instead of separate git add + git commit terminal calls.

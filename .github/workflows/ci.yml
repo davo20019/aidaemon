@@ -37,7 +37,6 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
-        continue-on-error: true  # Pre-existing failures — hard gate after fmt cleanup PR
 
       - name: Clippy
         run: cargo clippy --all-features -- -D warnings

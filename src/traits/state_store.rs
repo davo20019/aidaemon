@@ -5,7 +5,8 @@ use crate::types::{ChannelVisibility, FactPrivacy};
 /// Session message storage and context retrieval.
 #[async_trait]
 pub trait MessageStore: Send + Sync {
-    /// Append a message to the session history (both DB and working memory).
+    /// Append a message to the session history hot window.
+    /// Canonical persistence is handled via emitted events.
     async fn append_message(&self, msg: &super::Message) -> anyhow::Result<()>;
 
     /// Get recent messages for a session from working memory.
@@ -26,7 +27,7 @@ pub trait MessageStore: Send + Sync {
         self.get_history(session_id, limit).await
     }
 
-    /// Clear conversation history for a session (working memory + DB messages).
+    /// Clear conversation history for a session (working memory + canonical events).
     /// Facts are preserved.
     async fn clear_session(&self, session_id: &str) -> anyhow::Result<()>;
 }
@@ -164,6 +165,19 @@ pub trait LearningStore: Send + Sync {
         _min_confidence: f32,
     ) -> anyhow::Result<Vec<super::BehaviorPattern>> {
         Ok(vec![])
+    }
+
+    /// Insert/update a behavior pattern occurrence.
+    async fn record_behavior_pattern(
+        &self,
+        _pattern_type: &str,
+        _description: &str,
+        _trigger_context: Option<&str>,
+        _action: Option<&str>,
+        _confidence_hint: f32,
+        _occurrence_delta: i32,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Get procedures relevant to a query.
@@ -778,6 +792,18 @@ pub trait GoalStore: Send + Sync {
     /// Reset tokens_used_today to 0 for all active goals.
     async fn reset_daily_token_budgets(&self) -> anyhow::Result<u64> {
         Ok(0)
+    }
+
+    /// Update budget columns only. `None` = keep current value (COALESCE), NOT "clear to NULL".
+    /// This is a targeted UPDATE that avoids the race with `add_goal_tokens_and_get_budget_status()`
+    /// which atomically increments `tokens_used_today` — a full `update_goal()` would clobber that.
+    async fn set_goal_budgets(
+        &self,
+        _goal_id: &str,
+        _budget_per_check: Option<i64>,
+        _budget_daily: Option<i64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Atomically add tokens to a goal's daily usage counter and return budget status.

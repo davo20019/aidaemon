@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -20,13 +20,13 @@ use tracing::{info, warn};
 
 use super::formatting::{build_help_text, format_number, sanitize_filename, split_message};
 use crate::agent::Agent;
-use crate::channels::{ChannelHub, SessionMap};
+use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
-use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate};
+use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 
 /// Discord channel implementation using the serenity library.
 pub struct DiscordChannel {
@@ -53,6 +53,8 @@ pub struct DiscordChannel {
     channel_hub: std::sync::RwLock<Option<Weak<ChannelHub>>>,
     /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
     watchdog_stale_threshold_secs: u64,
+    /// Daemon start time used for post-restart UX guardrails.
+    started_at: Instant,
 }
 
 impl DiscordChannel {
@@ -90,6 +92,7 @@ impl DiscordChannel {
             http: Mutex::new(None),
             channel_hub: std::sync::RwLock::new(None),
             watchdog_stale_threshold_secs,
+            started_at: Instant::now(),
         }
     }
 
@@ -102,7 +105,10 @@ impl DiscordChannel {
 
     /// Get the bot's username (cached after first start).
     fn get_bot_username(&self) -> String {
-        self.bot_username.read().unwrap().clone()
+        self.bot_username
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Set the bot's username (called during start() after fetching from API).
@@ -225,7 +231,10 @@ impl DiscordChannel {
     }
 
     fn is_authorized(&self, user_id: u64) -> bool {
-        let ids = self.allowed_user_ids.read().unwrap();
+        let ids = self
+            .allowed_user_ids
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if ids.is_empty() {
             // No allowed users configured — will be handled by auto-claim in handle_message_event.
             return false;
@@ -250,7 +259,10 @@ impl DiscordChannel {
 
         // Claim: replace any stale IDs with this user.
         {
-            let mut ids = self.allowed_user_ids.write().unwrap();
+            let mut ids = self
+                .allowed_user_ids
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if ids.contains(&user_id) {
                 return true; // Already authorized.
             }
@@ -285,113 +297,25 @@ impl DiscordChannel {
         self.session_id(&base)
     }
 
-    /// Handle an incoming Discord message.
-    async fn handle_message_event(self: &Arc<Self>, ctx: &Context, msg: SerenityMessage) {
-        // Ignore bot messages
-        if msg.author.bot {
-            return;
-        }
-
-        let user_id = msg.author.id.get();
-        let is_dm = msg.guild_id.is_none();
-        // In guild channels, let all server members through — they get Guest role
-        // from determine_role(). Auth gate only applies to DMs.
-        if is_dm && !self.is_authorized(user_id) && !self.try_auto_claim(user_id, is_dm).await {
-            warn!(user_id, "Unauthorized Discord user attempted access");
-            let _ = msg.channel_id.say(&ctx.http, "Unauthorized.").await;
-            return;
-        }
-
-        let text = if msg.content.is_empty() && !msg.attachments.is_empty() {
-            // File message
-            if self.files_enabled {
-                match self.handle_file_message(ctx, &msg).await {
-                    Ok(file_text) => file_text,
-                    Err(e) => {
-                        let _ = msg
-                            .channel_id
-                            .say(&ctx.http, format!("File error: {}", e))
-                            .await;
-                        return;
-                    }
-                }
-            } else {
-                let _ = msg
-                    .channel_id
-                    .say(&ctx.http, "I can only process text messages.")
-                    .await;
-                return;
-            }
-        } else if !msg.content.is_empty() {
-            // Text might be accompanied by attachments
-            let mut text = msg.content.clone();
-            if self.files_enabled && !msg.attachments.is_empty() {
-                match self.handle_file_message(ctx, &msg).await {
-                    Ok(file_text) => {
-                        text = format!("{}\n{}", file_text, text);
-                    }
-                    Err(e) => {
-                        let _ = msg
-                            .channel_id
-                            .say(&ctx.http, format!("File error: {}", e))
-                            .await;
-                        return;
-                    }
-                }
-            }
-            text
-        } else {
-            return;
-        };
-
-        // Handle slash-style commands (text commands starting with /)
-        if text.starts_with('/') {
-            self.handle_text_command(ctx, &msg, &text).await;
-            return;
-        }
-
-        let session_id = self.session_id_from_message(&msg);
-
-        // Register this session with the channel hub (in-memory + persistent)
-        {
-            let channel_name = self.channel_name();
-            let mut map = self.session_map.write().await;
-            map.insert(session_id.clone(), channel_name.clone());
-            let _ = self
-                .state
-                .save_session_channel(&session_id, &channel_name)
-                .await;
-        }
-
-        info!(session_id, "Received Discord message from user {}", user_id);
-
-        // Create heartbeat for watchdog — agent bumps this on every activity point.
-        let heartbeat = Arc::new(AtomicU64::new(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        ));
-
-        // Typing indicator — Discord shows "Bot is typing..." while we hold this.
-        // Also monitors the heartbeat: if it goes stale, notify user and stop typing.
-        let typing_channel = msg.channel_id;
-        let typing_http = ctx.http.clone();
-        let typing_cancel = tokio_util::sync::CancellationToken::new();
+    fn spawn_typing_indicator(
+        typing_channel: ChannelId,
+        typing_http: Arc<serenity::http::Http>,
+        typing_cancel: tokio_util::sync::CancellationToken,
+        heartbeat: Arc<AtomicU64>,
+        stale_threshold_secs: u64,
+    ) {
         let typing_token = typing_cancel.clone();
-        let heartbeat_for_typing = heartbeat.clone();
-        let stale_threshold_secs = self.watchdog_stale_threshold_secs;
         tokio::spawn(async move {
             loop {
                 let _ = typing_channel.broadcast_typing(&typing_http).await;
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(8)) => {
                         if stale_threshold_secs > 0 {
-                            let last_hb = heartbeat_for_typing.load(Ordering::Relaxed);
+                            let last_hb = heartbeat.load(Ordering::Relaxed);
                             let now = SystemTime::now().duration_since(UNIX_EPOCH)
                                 .unwrap_or_default().as_secs();
                             if now.saturating_sub(last_hb) > stale_threshold_secs {
-                                break; // Stop typing indicator
+                                break;
                             }
                         }
                     }
@@ -399,26 +323,31 @@ impl DiscordChannel {
                 }
             }
         });
+    }
 
-        // Status updates
-        let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
-        let status_http = ctx.http.clone();
-        let status_channel_id = msg.channel_id;
-        let is_dm = msg.guild_id.is_none();
-        let status_task = tokio::spawn(async move {
+    fn spawn_status_task(
+        mut status_rx: tokio::sync::mpsc::Receiver<StatusUpdate>,
+        status_http: Arc<serenity::http::Http>,
+        status_channel_id: ChannelId,
+        is_dm: bool,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
             let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
             let min_interval = Duration::from_secs(3);
             while let Some(update) = status_rx.recv().await {
                 // In non-DM channels: suppress all status messages.
                 // Discord's native "typing..." indicator is sufficient.
-                if !is_dm {
+                // (except BudgetExtended which must always reach the user)
+                if !is_dm && !matches!(&update, StatusUpdate::BudgetExtended { .. }) {
                     continue;
                 }
                 let now = tokio::time::Instant::now();
                 // Skip rate limiting for ToolProgress with URLs (e.g., OAuth authorize links)
+                // and for BudgetExtended (cost notifications should always be delivered)
                 let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
                     if chunk.contains("https://") || chunk.contains("http://"));
-                if !has_url && now.duration_since(last_sent) < min_interval {
+                let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
+                if !has_url && !is_budget_ext && now.duration_since(last_sent) < min_interval {
                     continue;
                 }
                 let text = match &update {
@@ -431,7 +360,6 @@ impl DiscordChannel {
                         }
                     }
                     StatusUpdate::ToolProgress { name, chunk } => {
-                        // Don't truncate if the chunk contains a URL (e.g., OAuth authorize links)
                         if chunk.contains("https://") || chunk.contains("http://") {
                             format!("📤 {}\n{}", name, chunk)
                         } else {
@@ -540,29 +468,227 @@ impl DiscordChannel {
                             description, new_total_steps, reason
                         )
                     }
+                    StatusUpdate::BudgetExtended {
+                        old_budget,
+                        new_budget,
+                        extension,
+                        max_extensions,
+                    } => {
+                        format!(
+                            "💰 Auto-extended token budget {} → {} ({}/{}) — continuing.",
+                            old_budget, new_budget, extension, max_extensions
+                        )
+                    }
                 };
                 let _ = status_channel_id.say(&status_http, &text).await;
                 last_sent = tokio::time::Instant::now();
             }
-        });
+        })
+    }
 
-        // Cancel any stale running tasks for this session before starting a new one.
-        let cancelled = self
-            .task_registry
-            .cancel_running_for_session(&session_id)
-            .await;
-        if !cancelled.is_empty() {
-            let cancelled_descriptions: Vec<_> = cancelled
-                .iter()
-                .map(|(id, desc)| format!("#{}: {}", id, desc))
-                .collect();
-            info!(session_id, cancelled = ?cancelled_descriptions, "Cancelled stale tasks for new message");
+    /// Handle an incoming Discord message.
+    async fn handle_message_event(self: &Arc<Self>, ctx: &Context, msg: SerenityMessage) {
+        // Ignore bot messages
+        if msg.author.bot {
+            return;
+        }
+
+        let user_id = msg.author.id.get();
+        let is_dm = msg.guild_id.is_none();
+        // In guild channels, let all server members through — they get Guest role
+        // from determine_role(). Auth gate only applies to DMs.
+        if is_dm && !self.is_authorized(user_id) && !self.try_auto_claim(user_id, is_dm).await {
+            warn!(user_id, "Unauthorized Discord user attempted access");
+            let _ = msg.channel_id.say(&ctx.http, "Unauthorized.").await;
+            return;
+        }
+
+        let text = if msg.content.is_empty() && !msg.attachments.is_empty() {
+            // File message
+            if self.files_enabled {
+                match self.handle_file_message(ctx, &msg).await {
+                    Ok(file_text) => file_text,
+                    Err(e) => {
+                        let _ = msg
+                            .channel_id
+                            .say(&ctx.http, format!("File error: {}", e))
+                            .await;
+                        return;
+                    }
+                }
+            } else {
+                let _ = msg
+                    .channel_id
+                    .say(&ctx.http, "I can only process text messages.")
+                    .await;
+                return;
+            }
+        } else if !msg.content.is_empty() {
+            // Text might be accompanied by attachments
+            let mut text = msg.content.clone();
+            if self.files_enabled && !msg.attachments.is_empty() {
+                match self.handle_file_message(ctx, &msg).await {
+                    Ok(file_text) => {
+                        text = format!("{}\n{}", file_text, text);
+                    }
+                    Err(e) => {
+                        let _ = msg
+                            .channel_id
+                            .say(&ctx.http, format!("File error: {}", e))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            text
+        } else {
+            return;
+        };
+
+        // Handle slash-style commands (text commands starting with /)
+        if text.starts_with('/') {
+            self.handle_text_command(ctx, &msg, &text).await;
+            return;
+        }
+
+        let session_id = self.session_id_from_message(&msg);
+        let user_role = super::telegram::determine_role(&self.owner_user_ids, user_id);
+
+        // Register this session with the channel hub (in-memory + persistent)
+        {
+            let channel_name = self.channel_name();
+            let mut map = self.session_map.write().await;
+            map.insert(session_id.clone(), channel_name.clone());
+            let _ = self
+                .state
+                .save_session_channel(&session_id, &channel_name)
+                .await;
+        }
+
+        info!(session_id, "Received Discord message from user {}", user_id);
+
+        // Handle cancel/stop commands - these bypass the queue.
+        let text_lower = text.to_ascii_lowercase();
+        if text_lower == "cancel" || text_lower == "stop" || text_lower == "abort" {
+            if user_role != UserRole::Owner {
+                let _ = msg
+                    .channel_id
+                    .say(
+                        &ctx.http,
+                        "Only the owner can cancel running work in this session.",
+                    )
+                    .await;
+                return;
+            }
+
+            let cancelled = self
+                .task_registry
+                .cancel_running_for_session(&session_id)
+                .await;
+            let queue_cleared = self.task_registry.queue_len(&session_id).await;
+            self.task_registry.clear_queue(&session_id).await;
+            let cancelled_goals = self
+                .agent
+                .cancel_active_goals_for_session(&session_id)
+                .await;
+
+            if cancelled.is_empty() {
+                if cancelled_goals.is_empty() {
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx.http, "No running task to cancel.")
+                        .await;
+                } else if cancelled_goals.len() == 1 {
+                    let _ = msg
+                        .channel_id
+                        .say(
+                            &ctx.http,
+                            format!("⏹️ Cancelled goal: {}", cancelled_goals[0]),
+                        )
+                        .await;
+                } else {
+                    let response = format!(
+                        "⏹️ Cancelled {} goals:\n{}",
+                        cancelled_goals.len(),
+                        cancelled_goals
+                            .iter()
+                            .map(|d| format!("- {}", d))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                    let _ = msg.channel_id.say(&ctx.http, response).await;
+                }
+            } else {
+                let desc = cancelled
+                    .first()
+                    .map(|(_, d)| d.as_str())
+                    .unwrap_or("unknown");
+                let mut response = format!("⏹️ Cancelled: {}", desc);
+                if queue_cleared > 0 {
+                    response.push_str(&format!(" (+{} queued messages cleared)", queue_cleared));
+                }
+                if !cancelled_goals.is_empty() {
+                    response.push_str(&format!(" (+{} goal(s) cancelled)", cancelled_goals.len()));
+                }
+                let _ = msg.channel_id.say(&ctx.http, response).await;
+            }
+            return;
+        }
+
+        // Check if a task is already running for this session - if so, queue this message.
+        if self.task_registry.has_running_task(&session_id).await {
+            let daemon_uptime = self.started_at.elapsed();
+            if should_ignore_lightweight_interjection(&text, daemon_uptime) {
+                let current_task = self
+                    .task_registry
+                    .get_running_task_description(&session_id)
+                    .await
+                    .unwrap_or_else(|| "processing".to_string());
+                let _ = msg
+                    .channel_id
+                    .say(
+                        &ctx.http,
+                        format!(
+                            "⏳ Still working on: {}. I ignored that short check-in. \
+                             Send `cancel` to stop the current task.",
+                            current_task
+                        ),
+                    )
+                    .await;
+                return;
+            }
+
+            let queue_result = self.task_registry.queue_message(&session_id, &text).await;
+            match queue_result {
+                Some(queue_pos) => {
+                    let current_task = self
+                        .task_registry
+                        .get_running_task_description(&session_id)
+                        .await
+                        .unwrap_or_else(|| "processing".to_string());
+                    let preview: String = text.chars().take(50).collect();
+                    let suffix = if text.len() > 50 { "..." } else { "" };
+                    let _ = msg
+                        .channel_id
+                        .say(
+                            &ctx.http,
+                            format!(
+                                "📥 Queued ({}): \"{}{}\" | Currently: {}",
+                                queue_pos, preview, suffix, current_task
+                            ),
+                        )
+                        .await;
+                }
+                None => {
+                    info!(session_id, "Dropped duplicate queued message");
+                }
+            }
+            return;
         }
 
         // Register task for tracking
         let description: String = text.chars().take(80).collect();
         let (task_id, cancel_token) = self.task_registry.register(&session_id, &description).await;
-        let registry = Arc::clone(&self.task_registry);
 
         // Build channel context from Discord message
         let author_name = msg.author.name.clone();
@@ -593,56 +719,154 @@ impl DiscordChannel {
             }
         };
 
-        let user_role = super::telegram::determine_role(&self.owner_user_ids, msg.author.id.get());
+        // Create heartbeat for watchdog — agent bumps this on every activity point.
+        let heartbeat = Arc::new(AtomicU64::new(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ));
+        let stale_threshold_secs = self.watchdog_stale_threshold_secs;
+        let is_dm = msg.guild_id.is_none();
+
+        // Start typing indicator for this task.
+        let typing_cancel = tokio_util::sync::CancellationToken::new();
+        Self::spawn_typing_indicator(
+            msg.channel_id,
+            ctx.http.clone(),
+            typing_cancel.clone(),
+            heartbeat.clone(),
+            stale_threshold_secs,
+        );
+
+        // Status updates for this task.
+        let (status_tx, status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
+        let status_task =
+            Self::spawn_status_task(status_rx, ctx.http.clone(), msg.channel_id, is_dm);
+
+        self.task_registry
+            .set_typing_cancel(task_id, typing_cancel.clone())
+            .await;
+
+        let registry = Arc::clone(&self.task_registry);
 
         let agent = Arc::clone(&self.agent);
         let channel_id = msg.channel_id;
         let http = ctx.http.clone();
         tokio::spawn(async move {
-            let result = tokio::select! {
-                r = agent.handle_message(&session_id, &text, Some(status_tx), user_role, channel_ctx, Some(heartbeat.clone())) => r,
-                _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
-                stale_mins = super::wait_for_stale_heartbeat(heartbeat.clone(), stale_threshold_secs, 8), if stale_threshold_secs > 0 => {
-                    Err(anyhow::anyhow!(
-                        "Task auto-cancelled due to inactivity ({} minute{} without progress).",
-                        stale_mins,
-                        if stale_mins == 1 { "" } else { "s" }
-                    ))
-                },
-            };
-            typing_cancel.cancel();
-            // Abort the status display task to prevent blocking if a background
-            // CLI agent monitoring task still holds a status_tx clone.
-            status_task.abort();
+            let mut current_text = text;
+            let mut current_task_id = task_id;
+            let mut current_cancel_token = cancel_token;
+            let mut current_status_tx = status_tx;
+            let mut current_status_task = status_task;
+            let mut current_heartbeat = heartbeat;
+            let mut current_typing_cancel = typing_cancel;
 
-            match result {
-                Ok(reply) => {
-                    // Discord supports markdown natively — split at 2000 chars
-                    let chunks = split_message(&reply, 2000);
-                    for chunk in &chunks {
-                        if let Err(e) = channel_id.say(&http, chunk).await {
-                            warn!("Failed to send Discord message: {}", e);
+            loop {
+                let result = tokio::select! {
+                    r = agent.handle_message(
+                        &session_id,
+                        &current_text,
+                        Some(current_status_tx.clone()),
+                        user_role,
+                        channel_ctx.clone(),
+                        Some(current_heartbeat.clone()),
+                    ) => r,
+                    _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
+                    stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 8), if stale_threshold_secs > 0 => {
+                        Err(anyhow::anyhow!(
+                            "Task auto-cancelled due to inactivity ({} minute{} without progress).",
+                            stale_mins,
+                            if stale_mins == 1 { "" } else { "s" }
+                        ))
+                    },
+                };
+                current_typing_cancel.cancel();
+                current_status_task.abort();
+
+                let mut task_error: Option<String> = None;
+                match result {
+                    Ok(reply) => {
+                        let chunks = split_message(&reply, 2000);
+                        for chunk in &chunks {
+                            if let Err(e) = channel_id.say(&http, chunk).await {
+                                warn!("Failed to send Discord message: {}", e);
+                            }
                         }
                     }
-                    registry.complete(task_id).await;
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        if error_msg == "Task cancelled" {
+                            registry.fail(current_task_id, &error_msg).await;
+                            info!("Task #{} cancelled", current_task_id);
+                            return;
+                        }
+                        task_error = Some(error_msg.clone());
+                        if error_msg.starts_with("Task auto-cancelled due to inactivity") {
+                            info!("Task #{} auto-cancelled by stale watchdog", current_task_id);
+                            let _ = channel_id.say(&http, format!("⚠️ {}", error_msg)).await;
+                        } else {
+                            warn!("Agent error: {}", e);
+                            let _ = channel_id.say(&http, format!("Error: {}", e)).await;
+                        }
+                    }
                 }
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    // Don't notify user about task cancellation - it's expected when they send a new message
-                    if error_msg == "Task cancelled" {
-                        registry.fail(task_id, &error_msg).await;
-                        info!("Task #{} cancelled (new message received)", task_id);
-                        return;
-                    }
-                    if error_msg.starts_with("Task auto-cancelled due to inactivity") {
-                        info!("Task #{} auto-cancelled by stale watchdog", task_id);
-                        let _ = channel_id.say(&http, format!("⚠️ {}", error_msg)).await;
-                        registry.fail(task_id, &error_msg).await;
-                        return;
-                    }
-                    warn!("Agent error: {}", e);
-                    let _ = channel_id.say(&http, format!("Error: {}", e)).await;
-                    registry.fail(task_id, &error_msg).await;
+
+                if let Some(ref err) = task_error {
+                    registry.fail(current_task_id, err).await;
+                } else {
+                    registry.complete(current_task_id).await;
+                }
+
+                if let Some(queued) = registry.pop_queued_message(&session_id).await {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+
+                    info!(
+                        session_id,
+                        "Processing queued message: {}",
+                        queued.text.chars().take(50).collect::<String>()
+                    );
+                    let preview: String = queued.text.chars().take(50).collect();
+                    let suffix = if queued.text.len() > 50 { "..." } else { "" };
+                    let _ = channel_id
+                        .say(
+                            &http,
+                            format!("▶️ Processing queued: \"{}{}\"", preview, suffix),
+                        )
+                        .await;
+
+                    current_text = queued.text;
+                    let desc: String = current_text.chars().take(80).collect();
+                    let (new_task_id, new_cancel_token) =
+                        registry.register(&session_id, &desc).await;
+                    current_task_id = new_task_id;
+                    current_cancel_token = new_cancel_token;
+
+                    let (new_status_tx, new_status_rx) =
+                        tokio::sync::mpsc::channel::<StatusUpdate>(16);
+                    current_status_tx = new_status_tx;
+                    current_status_task =
+                        Self::spawn_status_task(new_status_rx, http.clone(), channel_id, is_dm);
+
+                    current_heartbeat = Arc::new(AtomicU64::new(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    ));
+                    current_typing_cancel = tokio_util::sync::CancellationToken::new();
+                    Self::spawn_typing_indicator(
+                        channel_id,
+                        http.clone(),
+                        current_typing_cancel.clone(),
+                        current_heartbeat.clone(),
+                        stale_threshold_secs,
+                    );
+                    registry
+                        .set_typing_cancel(current_task_id, current_typing_cancel.clone())
+                        .await;
+                } else {
+                    break;
                 }
             }
         });
@@ -754,16 +978,10 @@ impl DiscordChannel {
                 "Auto-routing re-enabled. Model will be selected automatically based on query complexity.".to_string()
             }
             "/reload" => match AppConfig::load(&self.config_path) {
-                Ok(new_config) => {
-                    let new_model = new_config.provider.models.primary.clone();
-                    let old_model = self.agent.current_model().await;
-                    self.agent.set_model(new_model.clone()).await;
-                    self.agent.clear_model_override().await;
-                    format!(
-                        "Config reloaded. Auto-routing re-enabled.\nModel: {} -> {}",
-                        old_model, new_model
-                    )
-                }
+                Ok(new_config) => match self.agent.reload_provider(&new_config).await {
+                    Ok(status) => format!("Config reloaded. {}", status),
+                    Err(e) => format!("Provider reload failed: {}", e),
+                },
                 Err(e) => {
                     let backup = self.config_path.with_extension("toml.bak");
                     if backup.exists() {

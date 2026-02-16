@@ -226,7 +226,7 @@ mod tests {
         let tool = CheckEnvironmentTool;
         let schema = tool.schema();
         assert_eq!(schema["name"], "check_environment");
-        assert!(schema["description"].as_str().unwrap().len() > 0);
+        assert!(!schema["description"].as_str().unwrap().is_empty());
     }
 
     #[tokio::test]

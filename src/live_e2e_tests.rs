@@ -19,6 +19,7 @@ use crate::agent::Agent;
 use crate::channels::{ChannelHub, SessionMap};
 use crate::config::{AppConfig, IterationLimitConfig, ProviderKind};
 use crate::events::EventStore;
+use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
 use crate::memory::embeddings::EmbeddingService;
 use crate::state::SqliteStateStore;
 use crate::testing::TestChannel;
@@ -30,7 +31,7 @@ use crate::types::{ChannelContext, UserRole};
 
 /// Check if live tests should run.
 fn should_run_live_tests() -> bool {
-    std::env::var("AIDAEMON_LIVE_TEST").map_or(false, |v| v == "1")
+    std::env::var("AIDAEMON_LIVE_TEST").is_ok_and(|v| v == "1")
 }
 
 /// Set up a live agent with a real LLM provider from config.toml.
@@ -95,9 +96,15 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     ];
 
     let model = config.provider.models.primary.clone();
+    let llm_runtime = SharedLlmRuntime::new(
+        provider.clone(),
+        router_from_models(config.provider.models.clone()),
+        config.provider.kind.clone(),
+        model.clone(),
+    );
 
     let agent = Agent::new(
-        provider,
+        llm_runtime,
         state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
@@ -111,7 +118,6 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
         100,
         8000,
         30,
-        config.provider.models.clone(),
         20,
         None,
         IterationLimitConfig::Unlimited,
@@ -268,9 +274,15 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
     ];
 
     let model = config.provider.models.primary.clone();
+    let llm_runtime = SharedLlmRuntime::new(
+        provider.clone(),
+        router_from_models(config.provider.models.clone()),
+        config.provider.kind.clone(),
+        model.clone(),
+    );
 
     let agent = Agent::new(
-        provider,
+        llm_runtime,
         state.clone() as Arc<dyn crate::traits::StateStore>,
         event_store,
         tools,
@@ -283,7 +295,6 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
         100,
         8000,
         30,
-        config.provider.models.clone(),
         20,
         None,
         IterationLimitConfig::Unlimited,

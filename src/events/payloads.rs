@@ -47,7 +47,7 @@ pub enum SessionEndReason {
 }
 
 // =============================================================================
-// Conversation Events (replaces messages table)
+// Conversation Events (canonical event stream)
 // =============================================================================
 
 /// Data for UserMessage event
@@ -66,7 +66,7 @@ pub struct UserMessageData {
 /// Data for AssistantResponse event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantResponseData {
-    /// Canonical message ID from the messages table (when dual-write is enabled)
+    /// Canonical conversation message ID
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     /// The response text content
@@ -132,7 +132,7 @@ pub struct ToolCallData {
 /// Data for ToolResult event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResultData {
-    /// Canonical message ID from the messages table (when dual-write is enabled)
+    /// Canonical conversation message ID
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     /// Tool call ID (matches ToolCall event)
@@ -178,11 +178,11 @@ pub struct ThinkingStartData {
 pub struct PolicyDecisionData {
     /// Associated task ID.
     pub task_id: String,
-    /// Legacy classify_query()-based model decision.
+    /// Baseline model decision from prior routing path.
     pub old_model: String,
     /// Policy profile-based model decision.
     pub new_model: String,
-    /// Legacy tier ("fast" | "primary" | "smart").
+    /// Baseline tier ("fast" | "primary" | "smart").
     pub old_tier: String,
     /// Policy profile ("cheap" | "balanced" | "strong").
     pub new_profile: String,
@@ -194,6 +194,28 @@ pub struct PolicyDecisionData {
     pub risk_score: f32,
     /// Uncertainty score at routing time.
     pub uncertainty_score: f32,
+}
+
+/// Runtime policy metrics snapshot exposed by the dashboard API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyMetricsData {
+    pub tool_exposure_samples: u64,
+    pub tool_exposure_before_sum: u64,
+    pub tool_exposure_after_sum: u64,
+    pub ambiguity_detected_total: u64,
+    pub uncertainty_clarify_total: u64,
+    pub context_refresh_total: u64,
+    pub escalation_total: u64,
+    pub fallback_expansion_total: u64,
+    pub consultant_direct_return_total: u64,
+    pub consultant_fallthrough_total: u64,
+    pub consultant_route_clarification_required_total: u64,
+    pub consultant_route_tools_required_total: u64,
+    pub consultant_route_short_correction_direct_reply_total: u64,
+    pub consultant_route_acknowledgment_direct_reply_total: u64,
+    pub consultant_route_default_continue_total: u64,
+    pub tokens_failed_tasks_total: u64,
+    pub no_progress_iterations_total: u64,
 }
 
 /// Data for DecisionPoint event (flight recorder).
@@ -223,6 +245,7 @@ pub enum DecisionType {
     ToolBudgetBlock,
     StoppingCondition,
     InstructionsSnapshot,
+    BudgetAutoExtension,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

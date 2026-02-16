@@ -56,8 +56,7 @@ impl ScheduledGoalRunsTool {
 
         let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
         if schedules.is_empty() {
-            return Ok("Only scheduled goals can be updated with scheduled_goal_runs."
-                .to_string());
+            return Ok("Only scheduled goals can be updated with scheduled_goal_runs.".to_string());
         }
 
         let old_per_check = goal.budget_per_check;
@@ -79,7 +78,9 @@ impl ScheduledGoalRunsTool {
             }
         }
 
-        self.state.update_goal(&goal).await?;
+        self.state
+            .set_goal_budgets(&goal.id, budget_per_check, budget_daily)
+            .await?;
 
         let mut out = format!(
             "Updated budget for scheduled goal {}.\n- budget_per_check: {:?} -> {:?}\n- budget_daily: {:?} -> {:?}",
@@ -650,49 +651,49 @@ impl Tool for ScheduledGoalRunsTool {
         "Run scheduled goals now and inspect run history/failures without terminal/sqlite access"
     }
 
-	    fn schema(&self) -> Value {
-	        json!({
-	            "name": "scheduled_goal_runs",
-	            "description": "Run scheduled goals now and inspect execution diagnostics. Use this instead of terminal/sqlite for scheduled-goal run forensics.",
-	            "parameters": {
-	                "type": "object",
-	                "properties": {
-	                    "action": {
-	                        "type": "string",
-	                        "enum": ["run_now", "run_history", "last_failure", "unblock_hints", "set_budget"],
-	                        "description": "Action to perform"
-	                    },
-	                    "goal_id": {
-	                        "type": "string",
-	                        "description": "Scheduled goal ID (full or unique prefix)"
-	                    },
-	                    "schedule_id": {
-	                        "type": "string",
-	                        "description": "Optional schedule ID. For one-shot schedules, run_now can consume a specific schedule when provided."
-	                    },
-	                    "limit": {
-	                        "type": "integer",
-	                        "description": "Max runs to show for run_history (default 10, max 50)"
-	                    },
-	                    "budget_per_check": {
-	                        "type": "integer",
-	                        "description": "New per-check budget (tokens). Only used for set_budget."
-	                    },
-	                    "budget_daily": {
-	                        "type": "integer",
-	                        "description": "New daily budget (tokens). Only used for set_budget."
-	                    }
-	                },
-	                "required": ["action"],
-	                "additionalProperties": false
-	            }
-	        })
+    fn schema(&self) -> Value {
+        json!({
+            "name": "scheduled_goal_runs",
+            "description": "Run scheduled goals now and inspect execution diagnostics. Use this instead of terminal/sqlite for scheduled-goal run forensics.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["run_now", "run_history", "last_failure", "unblock_hints", "set_budget"],
+                        "description": "Action to perform"
+                    },
+                    "goal_id": {
+                        "type": "string",
+                        "description": "Scheduled goal ID (full or unique prefix)"
+                    },
+                    "schedule_id": {
+                        "type": "string",
+                        "description": "Optional schedule ID. For one-shot schedules, run_now can consume a specific schedule when provided."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max runs to show for run_history (default 10, max 50)"
+                    },
+                    "budget_per_check": {
+                        "type": "integer",
+                        "description": "New per-check budget (tokens). Only used for set_budget."
+                    },
+                    "budget_daily": {
+                        "type": "integer",
+                        "description": "New daily budget (tokens). Only used for set_budget."
+                    }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        })
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ScheduledGoalRunsArgs = serde_json::from_str(arguments)?;
 
-	        match args.action.as_str() {
+        match args.action.as_str() {
 	            "run_now" => {
 	                let goal_id = args
 	                    .goal_id
@@ -741,8 +742,8 @@ impl Tool for ScheduledGoalRunsTool {
 	                other
 	            )),
 	        }
-	    }
-	}
+    }
+}
 
 #[cfg(test)]
 mod tests {

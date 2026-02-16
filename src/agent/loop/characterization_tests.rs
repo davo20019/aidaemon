@@ -1,0 +1,466 @@
+use crate::agent::policy_metrics_snapshot;
+use crate::testing::{
+    setup_full_stack_test_agent_with_extra_tools, setup_test_agent, setup_test_agent_with_models,
+    MockProvider,
+};
+use crate::traits::{ProviderResponse, TokenUsage, Tool, ToolCall};
+use crate::types::{ChannelContext, UserRole};
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+#[tokio::test]
+async fn consultant_metrics_capture_direct_return_and_fallthrough_paths() {
+    let before = policy_metrics_snapshot();
+
+    // Direct-return case (pure acknowledgment handled deterministically).
+    let direct_provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "[INTENT_GATE]\n\
+         {\"complexity\":\"simple\",\"can_answer_now\":true,\"needs_tools\":false,\"is_acknowledgment\":true}",
+    )]);
+    let direct_harness =
+        setup_test_agent_with_models(direct_provider, "primary-model", "smart-model")
+            .await
+            .unwrap();
+    let direct_reply = direct_harness
+        .agent
+        .handle_message(
+            "metrics_direct",
+            "Yes",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_reply, "Got it.");
+
+    // Fallthrough case (consultant says needs tools; full loop executes tool then responds).
+    let fallthrough_provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            "I need to inspect the system first.\n\
+             [INTENT_GATE]\n\
+             {\"complexity\":\"simple\",\"can_answer_now\":false,\"needs_tools\":true}",
+        ),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("System inspected."),
+    ]);
+    let fallthrough_harness =
+        setup_test_agent_with_models(fallthrough_provider, "primary-model", "smart-model")
+            .await
+            .unwrap();
+    let fallthrough_reply = fallthrough_harness
+        .agent
+        .handle_message(
+            "metrics_fallthrough",
+            "Check my system status",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fallthrough_reply, "System inspected.");
+
+    let after = policy_metrics_snapshot();
+    let direct_delta = after
+        .consultant_direct_return_total
+        .saturating_sub(before.consultant_direct_return_total);
+    let fallthrough_delta = after
+        .consultant_fallthrough_total
+        .saturating_sub(before.consultant_fallthrough_total);
+
+    assert!(
+        direct_delta >= 1,
+        "expected consultant_direct_return_total to increase by at least 1; before={} after={}",
+        before.consultant_direct_return_total,
+        after.consultant_direct_return_total
+    );
+    assert!(
+        fallthrough_delta >= 1,
+        "expected consultant_fallthrough_total to increase by at least 1; before={} after={}",
+        before.consultant_fallthrough_total,
+        after.consultant_fallthrough_total
+    );
+}
+
+#[tokio::test]
+async fn failed_task_and_no_progress_metrics_are_observable() {
+    let before = policy_metrics_snapshot();
+
+    // Iteration 1: unknown tool call (blocked) => no successful tools => no-progress increment.
+    // Iterations 2..: repeated valid tool call => repetitive-loop failure path.
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("no_such_tool", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", "{}"),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    let _ = harness
+        .agent
+        .handle_message(
+            "metrics_failure_no_progress",
+            "Run system checks repeatedly",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let after = policy_metrics_snapshot();
+    let failed_tokens_delta = after
+        .tokens_failed_tasks_total
+        .saturating_sub(before.tokens_failed_tasks_total);
+    let no_progress_delta = after
+        .no_progress_iterations_total
+        .saturating_sub(before.no_progress_iterations_total);
+
+    assert!(
+        failed_tokens_delta > 0,
+        "expected tokens_failed_tasks_total to increase; before={} after={}",
+        before.tokens_failed_tasks_total,
+        after.tokens_failed_tasks_total
+    );
+    assert!(
+        no_progress_delta >= 1,
+        "expected no_progress_iterations_total to increase by at least 1; before={} after={}",
+        before.no_progress_iterations_total,
+        after.no_progress_iterations_total
+    );
+}
+
+struct RecordingSearchFilesTool {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Tool for RecordingSearchFilesTool {
+    fn name(&self) -> &str {
+        "search_files"
+    }
+
+    fn description(&self) -> &str {
+        "Mock search_files tool for regression testing"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "search_files",
+            "description": "Mock search",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "glob": {"type": "string"},
+                    "path": {"type": "string"}
+                },
+                "additionalProperties": true
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.calls.lock().await.push(arguments.to_string());
+        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+        let path = args["path"].as_str().unwrap_or(".");
+        Ok(format!("No matches found (0 files scanned in {})", path))
+    }
+}
+
+struct RecordingProjectInspectTool {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Tool for RecordingProjectInspectTool {
+    fn name(&self) -> &str {
+        "project_inspect"
+    }
+
+    fn description(&self) -> &str {
+        "Recording project_inspect tool for regression testing"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "project_inspect",
+            "description": "Record project_inspect args",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "paths": {"type": "array", "items": {"type": "string"}}
+                },
+                "additionalProperties": true
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.calls.lock().await.push(arguments.to_string());
+        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+        let primary = args["path"]
+            .as_str()
+            .or_else(|| {
+                args["paths"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or(".");
+        Ok(format!(
+            "# Project: {}\n\n## Structure\n```\nindex.html\nstyles.css\n```\n",
+            primary
+        ))
+    }
+}
+
+struct MockProjectInspectTool;
+
+#[async_trait]
+impl Tool for MockProjectInspectTool {
+    fn name(&self) -> &str {
+        "project_inspect"
+    }
+
+    fn description(&self) -> &str {
+        "Mock project_inspect tool for regression testing"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "project_inspect",
+            "description": "Mock inspect",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "paths": {"type": "array", "items": {"type": "string"}}
+                },
+                "additionalProperties": true
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+        let path = args["path"].as_str().unwrap_or(".");
+        Ok(format!(
+            "# Project: {}\n\n## Structure\n```\nindex.html\nstyles.css\n```\n",
+            path
+        ))
+    }
+}
+
+#[tokio::test]
+async fn contradictory_file_evidence_forces_recheck_before_final_answer() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let project_dir_str = project_dir.path().to_string_lossy().to_string();
+    let search_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("search_files", &json!({"glob":"*.html"}).to_string()),
+        MockProvider::tool_call_response(
+            "project_inspect",
+            &json!({"path": project_dir_str}).to_string(),
+        ),
+        MockProvider::text_response("I couldn't find any HTML files."),
+        MockProvider::tool_call_response(
+            "search_files",
+            &json!({"glob":"*.html", "path": project_dir_str}).to_string(),
+        ),
+        MockProvider::text_response(
+            "After re-checking with an explicit path, I still have no HTML matches.",
+        ),
+    ]);
+
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![
+            Arc::new(RecordingSearchFilesTool {
+                calls: search_calls.clone(),
+            }) as Arc<dyn Tool>,
+            Arc::new(MockProjectInspectTool) as Arc<dyn Tool>,
+        ],
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "contradictory_file_recheck",
+            &format!("Find HTML files under {}", project_dir_str),
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reply,
+        "After re-checking with an explicit path, I still have no HTML matches."
+    );
+    assert_eq!(harness.provider.call_count().await, 5);
+
+    let calls = search_calls.lock().await.clone();
+    assert_eq!(calls.len(), 2, "expected initial search + forced re-check");
+    assert!(
+        calls[0].contains("\"path\"") && calls[0].contains(&project_dir_str),
+        "expected first search_files call to receive injected project path, got: {}",
+        calls[0]
+    );
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    let contradiction_nudge_seen = call_log.iter().any(|entry| {
+        entry.messages.iter().any(|m| {
+            m.get("role").and_then(|v| v.as_str()) == Some("system")
+                && m.get("content")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|c| c.contains("Contradictory file evidence was detected"))
+        })
+    });
+    assert!(
+        contradiction_nudge_seen,
+        "expected contradiction re-check system nudge in provider context"
+    );
+}
+
+#[tokio::test]
+async fn budget_blocked_same_tool_calls_do_not_trigger_false_consecutive_loop_stop() {
+    let burst_calls: Vec<ToolCall> = (0..20)
+        .map(|idx| ToolCall {
+            id: format!("call_{}", idx),
+            name: "project_inspect".to_string(),
+            arguments: json!({"path": format!("/tmp/project_{}", idx)}).to_string(),
+            extra_content: None,
+        })
+        .collect();
+
+    let provider = MockProvider::with_responses(vec![
+        ProviderResponse {
+            content: None,
+            tool_calls: burst_calls,
+            usage: Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 10,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        MockProvider::text_response("Summarized project status."),
+    ]);
+
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![Arc::new(MockProjectInspectTool) as Arc<dyn Tool>],
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "budget_vs_loop_ordering",
+            "Inspect all these project folders and summarize",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "Summarized project status.");
+}
+
+#[tokio::test]
+async fn mixed_project_inspect_path_and_paths_preserves_primary_path_for_follow_up_tools() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let secondary_dir = tempfile::tempdir().unwrap();
+    let primary_dir_str = primary_dir.path().to_string_lossy().to_string();
+    let secondary_dir_str = secondary_dir.path().to_string_lossy().to_string();
+
+    let search_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let inspect_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "project_inspect",
+            &json!({
+                "path": primary_dir_str,
+                "paths": [primary_dir_str, secondary_dir_str]
+            })
+            .to_string(),
+        ),
+        MockProvider::tool_call_response("search_files", &json!({"glob":"*.html"}).to_string()),
+        MockProvider::tool_call_response(
+            "search_files",
+            &json!({"glob":"*.html", "path": primary_dir.path().to_string_lossy()}).to_string(),
+        ),
+        MockProvider::text_response("Inspection complete."),
+    ]);
+
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![
+            Arc::new(RecordingSearchFilesTool {
+                calls: search_calls.clone(),
+            }) as Arc<dyn Tool>,
+            Arc::new(RecordingProjectInspectTool {
+                calls: inspect_calls.clone(),
+            }) as Arc<dyn Tool>,
+        ],
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "mixed_project_inspect_path_paths",
+            "Inspect both project folders and find HTML files",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "Inspection complete.");
+
+    let inspect_args = inspect_calls.lock().await.clone();
+    assert_eq!(inspect_args.len(), 1, "expected one project_inspect call");
+    assert!(
+        inspect_args[0].contains("\"path\"") && inspect_args[0].contains("\"paths\""),
+        "expected mixed path+paths args in project_inspect call, got: {}",
+        inspect_args[0]
+    );
+
+    let search_args = search_calls.lock().await.clone();
+    assert_eq!(
+        search_args.len(),
+        2,
+        "expected one follow-up search_files call plus required explicit re-check"
+    );
+    assert!(
+        search_args[0].contains(&format!("\"path\":\"{}\"", primary_dir.path().display())),
+        "expected first search_files call to inherit primary path from project_inspect(path), got: {}",
+        search_args[0]
+    );
+}

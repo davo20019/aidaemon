@@ -43,6 +43,10 @@ cms_report/
 personal-finance-tracker/
 roses-website/
 telegram-modern-site/
+kyoto-site/
+pingdingshan-website/
+vite-cloudflare-app/
+menu_section.tsx
 *.mvg
 *.svg
 

@@ -9,6 +9,27 @@ impl crate::traits::LearningStore for SqliteStateStore {
         SqliteStateStore::get_behavior_patterns(self, min_confidence).await
     }
 
+    async fn record_behavior_pattern(
+        &self,
+        pattern_type: &str,
+        description: &str,
+        trigger_context: Option<&str>,
+        action: Option<&str>,
+        confidence_hint: f32,
+        occurrence_delta: i32,
+    ) -> anyhow::Result<()> {
+        SqliteStateStore::record_behavior_pattern(
+            self,
+            pattern_type,
+            description,
+            trigger_context,
+            action,
+            confidence_hint,
+            occurrence_delta,
+        )
+        .await
+    }
+
     async fn get_relevant_procedures(
         &self,
         query: &str,

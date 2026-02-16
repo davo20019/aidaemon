@@ -103,7 +103,50 @@ install() {
 
 # --- post-install ---
 
+run_post_install_migration() {
+    # Opt-out for environments that want to skip post-install migration.
+    if [ "${AIDAEMON_RUN_MIGRATION:-1}" = "0" ]; then
+        info "Skipping post-install migration (AIDAEMON_RUN_MIGRATION=0)"
+        return 0
+    fi
+
+    BIN_PATH="${INSTALL_DIR}/${BINARY}"
+    if [ ! -x "$BIN_PATH" ]; then
+        warn "Installed binary not executable at ${BIN_PATH}; skipping migration"
+        return 0
+    fi
+
+    try_migrate_config() {
+        cfg="$1"
+        [ -n "$cfg" ] || return 1
+        [ -f "$cfg" ] || return 1
+
+        info "Running DB migration with config: ${cfg}"
+        if "$BIN_PATH" migrate --config "$cfg"; then
+            info "Migration completed"
+            return 0
+        fi
+
+        warn "Migration failed for ${cfg}; daemon will retry on next startup"
+        return 1
+    }
+
+    # Optional explicit override
+    if [ -n "${AIDAEMON_MIGRATE_CONFIG:-}" ]; then
+        try_migrate_config "${AIDAEMON_MIGRATE_CONFIG}" && return 0
+    fi
+
+    # Common config locations for upgrades
+    try_migrate_config "$PWD/config.toml" && return 0
+    try_migrate_config "${HOME}/.aidaemon/config.toml" && return 0
+    try_migrate_config "${HOME}/.config/aidaemon/config.toml" && return 0
+
+    info "No existing config.toml found; migration will run automatically on first launch"
+}
+
 post_install() {
+    run_post_install_migration
+
     printf '\n'
     info "aidaemon ${VERSION} installed to ${INSTALL_DIR}/${BINARY}"
     printf '\n'

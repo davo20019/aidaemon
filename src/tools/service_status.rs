@@ -227,7 +227,7 @@ mod tests {
         let tool = ServiceStatusTool;
         let schema = tool.schema();
         assert_eq!(schema["name"], "service_status");
-        assert!(schema["description"].as_str().unwrap().len() > 0);
+        assert!(!schema["description"].as_str().unwrap().is_empty());
         assert!(schema["parameters"]["properties"]["include"].is_object());
     }
 

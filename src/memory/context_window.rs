@@ -246,7 +246,14 @@ pub fn compress_tool_result(tool_name: &str, result: &str, max_chars: usize) -> 
     }
 
     let truncate_to = max_chars.saturating_sub(100); // Leave room for annotation
-    let truncated = &result[..truncate_to];
+                                                     // Find a safe char boundary — raw byte-index slicing panics on multi-byte UTF-8.
+    let safe_end = result
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= truncate_to)
+        .last()
+        .unwrap_or(0);
+    let truncated = &result[..safe_end];
     let compressed = format!(
         "{}\n...\n[truncated {} → {} chars]",
         truncated,
@@ -262,6 +269,27 @@ pub fn compress_tool_result(tool_name: &str, result: &str, max_chars: usize) -> 
     );
 
     compressed
+}
+
+fn message_contains_critical_fact_signal(content: &str) -> bool {
+    let lower = content.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    lower.contains("my name is")
+        || lower.contains("owner name")
+        || lower.contains("assistant name")
+        || lower.contains("bot name")
+        || lower.contains("call me ")
+        || lower.contains(" is myself")
+        || lower.contains("daughter")
+        || lower.contains("son")
+        || lower.contains("children")
+        || lower.contains("wife")
+        || lower.contains("husband")
+        || lower.contains("spouse")
+        || (lower.contains("saved fact") && lower.contains("name"))
 }
 
 /// Summarize old messages using a fast LLM.
@@ -285,9 +313,11 @@ pub async fn summarize_messages(
             .get("content")
             .and_then(|c| c.as_str())
             .unwrap_or("[no content]");
+        let contains_critical = message_contains_critical_fact_signal(content);
         // Truncate very long messages in the summary input (char-boundary safe)
-        let truncated = if content.len() > 500 {
-            let mut end = 500;
+        let max_chars = if contains_critical { 1200 } else { 500 };
+        let truncated = if content.len() > max_chars {
+            let mut end = max_chars;
             while !content.is_char_boundary(end) && end > 0 {
                 end -= 1;
             }
@@ -295,19 +325,21 @@ pub async fn summarize_messages(
         } else {
             content
         };
-        conversation_text.push_str(&format!("{}: {}\n", role, truncated));
+        let critical_prefix = if contains_critical { "[CRITICAL] " } else { "" };
+        conversation_text.push_str(&format!("{}{}: {}\n", critical_prefix, role, truncated));
     }
 
     let llm_messages = vec![
         json!({
             "role": "system",
-            "content": "You are a conversation summarizer. Be extremely concise."
+            "content": "You are a conversation summarizer. Be extremely concise and preserve critical identity/profile facts."
         }),
         json!({
             "role": "user",
             "content": format!(
                 "Summarize this conversation concisely. Preserve: topics discussed, decisions made, \
-                 important data/values mentioned, user preferences expressed, pending tasks.\n\
+                 important data/values mentioned, user preferences expressed, pending tasks, \
+                 and critical identity/relationship updates (owner name, assistant name, spouse/children).\n\
                  Output 3-5 sentences max.\n\n{}",
                 conversation_text
             )

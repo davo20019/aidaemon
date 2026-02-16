@@ -72,7 +72,9 @@ impl Tool for SearchFilesTool {
         let args: Value = serde_json::from_str(arguments)?;
         let content_pattern = args["pattern"].as_str();
         let glob_pattern = args["glob"].as_str();
-        let path_str = args["path"].as_str().unwrap_or(".");
+        let path_value = args.get("path").and_then(|v| v.as_str());
+        let path_str = path_value.unwrap_or(".");
+        let used_default_path = path_value.is_none();
         let max_results = args["max_results"]
             .as_u64()
             .map(|n| (n as usize).min(MAX_RESULTS))
@@ -84,7 +86,10 @@ impl Tool for SearchFilesTool {
 
         let search_dir = fs_utils::validate_path(path_str)?;
         if !search_dir.exists() {
-            anyhow::bail!("Directory not found: {}", path_str);
+            anyhow::bail!("Directory not found: {}", search_dir.display());
+        }
+        if !search_dir.is_dir() {
+            anyhow::bail!("Not a directory: {}", search_dir.display());
         }
 
         let content_regex = if let Some(pat) = content_pattern {
@@ -113,19 +118,38 @@ impl Tool for SearchFilesTool {
         )
         .await;
 
+        let default_path_note = used_default_path.then(|| {
+            format!(
+                "Note: no 'path' was provided, so search_files defaulted to current directory: {}",
+                search_dir.display()
+            )
+        });
+
         if results.is_empty() {
-            return Ok(format!(
+            let mut output = format!(
                 "No matches found ({} files scanned in {})",
-                files_scanned, path_str
-            ));
+                files_scanned,
+                search_dir.display()
+            );
+            if let Some(note) = &default_path_note {
+                output.push('\n');
+                output.push_str(note);
+            }
+            return Ok(output);
         }
 
-        let mut output = format!(
-            "Found {} match{} ({} files scanned):\n\n",
+        let mut output = String::new();
+        if let Some(note) = &default_path_note {
+            output.push_str(note);
+            output.push_str("\n\n");
+        }
+        output.push_str(&format!(
+            "Found {} match{} ({} files scanned in {}):\n\n",
             results.len(),
             if results.len() == 1 { "" } else { "es" },
-            files_scanned
-        );
+            files_scanned,
+            search_dir.display()
+        ));
 
         for result in &results {
             output.push_str(&result.format());
@@ -294,7 +318,7 @@ mod tests {
         let tool = SearchFilesTool;
         let schema = tool.schema();
         assert_eq!(schema["name"], "search_files");
-        assert!(schema["description"].as_str().unwrap().len() > 0);
+        assert!(!schema["description"].as_str().unwrap().is_empty());
     }
 
     #[test]
@@ -356,6 +380,7 @@ mod tests {
 
         let result = SearchFilesTool.call(&args).await.unwrap();
         assert!(result.contains("No matches"));
+        assert!(result.contains(dir.path().to_str().unwrap()));
     }
 
     #[tokio::test]
@@ -382,5 +407,17 @@ mod tests {
         let result = SearchFilesTool.call(&args).await.unwrap();
         assert!(result.contains("visible.js"));
         assert!(!result.contains("hidden.js"));
+    }
+
+    #[tokio::test]
+    async fn test_search_warns_when_path_omitted() {
+        let args = json!({
+            "glob": "*",
+            "max_results": 1
+        })
+        .to_string();
+
+        let result = SearchFilesTool.call(&args).await.unwrap();
+        assert!(result.contains("defaulted to current directory"));
     }
 }

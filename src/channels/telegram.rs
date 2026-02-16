@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -20,11 +20,11 @@ use super::formatting::{
     split_message, strip_latex,
 };
 use crate::agent::Agent;
+use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, SessionMap};
 #[cfg(feature = "discord")]
 use crate::channels::{spawn_discord_channel, DiscordChannel};
 #[cfg(feature = "slack")]
 use crate::channels::{spawn_slack_channel, SlackChannel};
-use crate::channels::{ChannelHub, SessionMap};
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
@@ -66,6 +66,8 @@ pub struct TelegramChannel {
     channel_hub: StdRwLock<Option<Weak<ChannelHub>>>,
     /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
     watchdog_stale_threshold_secs: u64,
+    /// Daemon start time used for post-restart UX guardrails.
+    started_at: Instant,
 }
 
 impl TelegramChannel {
@@ -103,6 +105,7 @@ impl TelegramChannel {
             state,
             channel_hub: StdRwLock::new(None),
             watchdog_stale_threshold_secs,
+            started_at: Instant::now(),
         }
     }
 
@@ -153,7 +156,10 @@ impl TelegramChannel {
     async fn get_bot_username(&self) -> String {
         // Check if already fetched (not the default "telegram" placeholder)
         {
-            let guard = self.bot_username.read().unwrap();
+            let guard = self
+                .bot_username
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if *guard != "telegram" {
                 return guard.clone();
             }
@@ -284,7 +290,10 @@ impl TelegramChannel {
         // Fail-closed: deny if no users configured or user not in list.
         let user_id = q.from.id.0;
         let is_authorized = {
-            let allowed = self.allowed_user_ids.read().unwrap();
+            let allowed = self
+                .allowed_user_ids
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             !allowed.is_empty() && allowed.contains(&user_id)
         };
         if !is_authorized {
@@ -389,16 +398,10 @@ impl TelegramChannel {
             }
             "/reload" => {
                 match AppConfig::load(&self.config_path) {
-                    Ok(new_config) => {
-                        let new_model = new_config.provider.models.primary.clone();
-                        let old_model = self.agent.current_model().await;
-                        self.agent.set_model(new_model.clone()).await;
-                        self.agent.clear_model_override().await;
-                        format!(
-                            "Config reloaded. Auto-routing re-enabled.\nModel: {} -> {}",
-                            old_model, new_model
-                        )
-                    }
+                    Ok(new_config) => match self.agent.reload_provider(&new_config).await {
+                        Ok(status) => format!("Config reloaded. {}", status),
+                        Err(e) => format!("Provider reload failed: {}", e),
+                    },
                     Err(e) => {
                         // Config is broken — try to auto-restore from backup
                         let backup = self.config_path.with_extension("toml.bak");
@@ -918,7 +921,10 @@ impl TelegramChannel {
                 // Create the new channel with same config as this one
                 let new_channel = Arc::new(TelegramChannel::new(
                     token,
-                    self.allowed_user_ids.read().unwrap().clone(),
+                    self.allowed_user_ids
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone(),
                     self.owner_user_ids.clone(),
                     Arc::clone(&self.agent),
                     self.config_path.clone(),
@@ -1298,7 +1304,10 @@ impl TelegramChannel {
         // by adding the bot to a group.
         let is_private = matches!(msg.chat.kind, teloxide::types::ChatKind::Private(_));
         let auth_result = {
-            let allowed = self.allowed_user_ids.read().unwrap();
+            let allowed = self
+                .allowed_user_ids
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if allowed.is_empty() {
                 if is_private {
                     warn!(
@@ -1306,7 +1315,10 @@ impl TelegramChannel {
                         "No allowed_user_ids configured — auto-claiming first DM user as owner."
                     );
                     drop(allowed);
-                    let mut allowed = self.allowed_user_ids.write().unwrap();
+                    let mut allowed = self
+                        .allowed_user_ids
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     check_auth(&mut allowed, user_id)
                 } else {
                     // Group message before any owner is set — reject
@@ -1322,7 +1334,11 @@ impl TelegramChannel {
         match auth_result {
             AuthResult::AutoClaimed => {
                 // Persist to config.toml so it survives restarts
-                let ids = self.allowed_user_ids.read().unwrap().clone();
+                let ids = self
+                    .allowed_user_ids
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 if let Err(e) = self.persist_allowed_user_ids(&ids).await {
                     warn!(
                         user_id,
@@ -1433,16 +1449,53 @@ impl TelegramChannel {
 
         // Handle cancel/stop commands - these bypass the queue
         let text_lower = text.to_lowercase();
-        if text_lower == "cancel" || text_lower == "stop" {
+        if text_lower == "cancel" || text_lower == "stop" || text_lower == "abort" {
+            if user_role != UserRole::Owner {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        "Only the owner can cancel running work in this session.",
+                    )
+                    .await;
+                return;
+            }
             let cancelled = self
                 .task_registry
                 .cancel_running_for_session(&session_id)
                 .await;
             self.task_registry.clear_queue(&session_id).await;
+            let cancelled_goals = self
+                .agent
+                .cancel_active_goals_for_session(&session_id)
+                .await;
             if cancelled.is_empty() {
-                let _ = bot
-                    .send_message(msg.chat.id, "No running task to cancel.")
-                    .await;
+                if cancelled_goals.is_empty() {
+                    let _ = bot
+                        .send_message(msg.chat.id, "No running task to cancel.")
+                        .await;
+                } else if cancelled_goals.len() == 1 {
+                    let _ = bot
+                        .send_message(
+                            msg.chat.id,
+                            format!("⏹️ Cancelled goal: {}", cancelled_goals[0]),
+                        )
+                        .await;
+                } else {
+                    let _ = bot
+                        .send_message(
+                            msg.chat.id,
+                            format!(
+                                "⏹️ Cancelled {} goals:\n{}",
+                                cancelled_goals.len(),
+                                cancelled_goals
+                                    .iter()
+                                    .map(|d| format!("- {}", d))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            ),
+                        )
+                        .await;
+                }
             } else {
                 let desc = cancelled
                     .first()
@@ -1453,6 +1506,9 @@ impl TelegramChannel {
                 if queue_cleared > 0 {
                     response.push_str(&format!(" (+{} queued messages cleared)", queue_cleared));
                 }
+                if !cancelled_goals.is_empty() {
+                    response.push_str(&format!(" (+{} goal(s) cancelled)", cancelled_goals.len()));
+                }
                 let _ = bot.send_message(msg.chat.id, response).await;
             }
             return;
@@ -1460,7 +1516,8 @@ impl TelegramChannel {
 
         // Check if a task is already running - if so, queue this message
         if self.task_registry.has_running_task(&session_id).await {
-            if is_lightweight_interjection(&text) {
+            let daemon_uptime = self.started_at.elapsed();
+            if should_ignore_lightweight_interjection(&text, daemon_uptime) {
                 let current_task = self
                     .task_registry
                     .get_running_task_description(&session_id)
@@ -1565,23 +1622,29 @@ impl TelegramChannel {
             while let Some(update) = status_rx.recv().await {
                 // In non-DM channels: only send one "Thinking..." then suppress
                 if !is_dm {
-                    if !sent_thinking
-                        && matches!(
-                            update,
-                            StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. }
-                        )
-                    {
-                        let _ = status_bot.send_message(status_chat_id, "Thinking...").await;
-                        sent_thinking = true;
-                        last_sent = tokio::time::Instant::now();
+                    if matches!(&update, StatusUpdate::BudgetExtended { .. }) {
+                        // Fall through — cost notifications must reach the user
+                    } else {
+                        if !sent_thinking
+                            && matches!(
+                                update,
+                                StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. }
+                            )
+                        {
+                            let _ = status_bot.send_message(status_chat_id, "Thinking...").await;
+                            sent_thinking = true;
+                            last_sent = tokio::time::Instant::now();
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 let now = tokio::time::Instant::now();
                 // Skip rate limiting for ToolProgress with URLs (e.g., OAuth authorize links)
+                // and for BudgetExtended (cost notifications should always be delivered)
                 let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
                     if chunk.contains("https://") || chunk.contains("http://"));
-                if !has_url && now.duration_since(last_sent) < min_interval {
+                let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
+                if !has_url && !is_budget_ext && now.duration_since(last_sent) < min_interval {
                     continue;
                 }
                 let text = match &update {
@@ -1703,6 +1766,17 @@ impl TelegramChannel {
                             description, new_total_steps, reason
                         )
                     }
+                    StatusUpdate::BudgetExtended {
+                        old_budget,
+                        new_budget,
+                        extension,
+                        max_extensions,
+                    } => {
+                        format!(
+                            "💰 Auto-extended token budget {} → {} ({}/{}) — continuing.",
+                            old_budget, new_budget, extension, max_extensions
+                        )
+                    }
                 };
                 let _ = status_bot.send_message(status_chat_id, text).await;
                 last_sent = tokio::time::Instant::now();
@@ -1712,6 +1786,11 @@ impl TelegramChannel {
         // Register this task for tracking and cancellation.
         let description: String = text.chars().take(80).collect();
         let (task_id, cancel_token) = self.task_registry.register(&session_id, &description).await;
+        // Associate the typing indicator with this task so cancel_running_for_session
+        // also stops the typing loop (fixes typing persisting after cancel/panic).
+        self.task_registry
+            .set_typing_cancel(task_id, typing_cancel.clone())
+            .await;
         let registry = Arc::clone(&self.task_registry);
         let files_enabled = self.files_enabled;
 
@@ -1720,6 +1799,22 @@ impl TelegramChannel {
         let agent = Arc::clone(&self.agent);
         let chat_id = msg.chat.id;
         tokio::spawn(async move {
+            // Drop guard: if this task panics, ensure the typing indicator stops.
+            // Without this, a panic in handle_message() would skip the explicit
+            // typing_cancel.cancel() call, leaving the typing loop running.
+            // Uses Arc<Mutex<>> so the guard always tracks the *current* typing token
+            // even when queued messages replace it.
+            let typing_guard_token = Arc::new(std::sync::Mutex::new(typing_cancel.clone()));
+            struct TypingGuard(Arc<std::sync::Mutex<tokio_util::sync::CancellationToken>>);
+            impl Drop for TypingGuard {
+                fn drop(&mut self) {
+                    if let Ok(token) = self.0.lock() {
+                        token.cancel();
+                    }
+                }
+            }
+            let _typing_guard = TypingGuard(typing_guard_token.clone());
+
             let mut current_text = text;
             let mut current_task_id = task_id;
             let mut current_cancel_token = cancel_token;
@@ -1853,21 +1948,30 @@ impl TelegramChannel {
                         let mut sent_thinking = false;
                         while let Some(update) = new_status_rx.recv().await {
                             // In non-DM channels: only send one "Thinking..." then suppress
+                            // (except BudgetExtended which must always reach the user)
                             if !is_dm {
-                                if !sent_thinking
-                                    && matches!(
-                                        update,
-                                        StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. }
-                                    )
-                                {
-                                    let _ = status_bot.send_message(chat_id, "Thinking...").await;
-                                    sent_thinking = true;
-                                    last_sent = tokio::time::Instant::now();
+                                if matches!(&update, StatusUpdate::BudgetExtended { .. }) {
+                                    // Fall through — cost notifications must reach the user
+                                } else {
+                                    if !sent_thinking
+                                        && matches!(
+                                            update,
+                                            StatusUpdate::Thinking(_)
+                                                | StatusUpdate::ToolStart { .. }
+                                        )
+                                    {
+                                        let _ =
+                                            status_bot.send_message(chat_id, "Thinking...").await;
+                                        sent_thinking = true;
+                                        last_sent = tokio::time::Instant::now();
+                                    }
+                                    continue;
                                 }
-                                continue;
                             }
                             let now = tokio::time::Instant::now();
-                            if now.duration_since(last_sent) < min_interval {
+                            let is_budget_ext =
+                                matches!(&update, StatusUpdate::BudgetExtended { .. });
+                            if !is_budget_ext && now.duration_since(last_sent) < min_interval {
                                 continue;
                             }
                             let text = match &update {
@@ -1878,6 +1982,17 @@ impl TelegramChannel {
                                     } else {
                                         format!("Using {}: {}...", name, summary)
                                     }
+                                }
+                                StatusUpdate::BudgetExtended {
+                                    old_budget,
+                                    new_budget,
+                                    extension,
+                                    max_extensions,
+                                } => {
+                                    format!(
+                                        "💰 Auto-extended token budget {} → {} ({}/{}) — continuing.",
+                                        old_budget, new_budget, extension, max_extensions
+                                    )
                                 }
                                 _ => continue, // Skip other status updates for queued messages
                             };
@@ -1899,6 +2014,14 @@ impl TelegramChannel {
                     let typing_bot = bot.clone();
                     let new_typing_cancel = tokio_util::sync::CancellationToken::new();
                     current_typing_cancel = new_typing_cancel.clone();
+                    // Associate typing token with the new queued task for cancel support
+                    registry
+                        .set_typing_cancel(current_task_id, new_typing_cancel.clone())
+                        .await;
+                    // Update the drop guard to track the new typing token
+                    if let Ok(mut guard_token) = typing_guard_token.lock() {
+                        *guard_token = new_typing_cancel.clone();
+                    }
                     let heartbeat_for_queued = new_heartbeat;
                     tokio::spawn(async move {
                         let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
@@ -1937,7 +2060,10 @@ impl TelegramChannel {
 #[async_trait]
 impl Channel for TelegramChannel {
     fn name(&self) -> String {
-        self.cached_channel_name.read().unwrap().clone()
+        self.cached_channel_name
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn capabilities(&self) -> ChannelCapabilities {
@@ -2224,34 +2350,6 @@ pub fn determine_role(owner_ids: &[u64], user_id: u64) -> UserRole {
     }
 }
 
-/// Short conversational check-ins that should not be queued while work is running.
-fn is_lightweight_interjection(text: &str) -> bool {
-    let cleaned = text
-        .trim()
-        .trim_matches(|c: char| c.is_ascii_punctuation())
-        .to_ascii_lowercase();
-    if cleaned.is_empty() || cleaned.len() > 24 {
-        return false;
-    }
-    matches!(
-        cleaned.as_str(),
-        "hey"
-            | "hi"
-            | "hello"
-            | "yo"
-            | "ok"
-            | "okay"
-            | "thanks"
-            | "thank you"
-            | "thx"
-            | "got it"
-            | "cool"
-            | "sure"
-            | "yep"
-            | "yes"
-    )
-}
-
 fn extract_candidate_file_paths(text: &str) -> Vec<String> {
     static PATH_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(/[\w./-]+\.\w{1,10})").unwrap());
     let mut out = Vec::new();
@@ -2324,30 +2422,13 @@ mod tests {
         assert_eq!(determine_role(&[111], 222), UserRole::Guest);
     }
 
-    // --- interjection filtering ---
-
-    #[test]
-    fn lightweight_interjection_detects_short_checkins() {
-        assert!(is_lightweight_interjection("hey"));
-        assert!(is_lightweight_interjection("Thanks!"));
-        assert!(is_lightweight_interjection("OK"));
-        assert!(is_lightweight_interjection("  got it  "));
-    }
-
-    #[test]
-    fn lightweight_interjection_ignores_substantive_requests() {
-        assert!(!is_lightweight_interjection("can you send me my resume?"));
-        assert!(!is_lightweight_interjection("please run the tests"));
-        assert!(!is_lightweight_interjection("check logs and fix the error"));
-    }
-
     #[test]
     fn extract_candidate_file_paths_handles_trailing_punctuation() {
-        let text = "I found it at /Users/davidloor/projects/resume/david-loor-resume.pdf.";
+        let text = "I found it at /tmp/test-docs/sample-resume.pdf.";
         let paths = extract_candidate_file_paths(text);
         assert_eq!(
             paths,
-            vec!["/Users/davidloor/projects/resume/david-loor-resume.pdf"]
+            vec!["/tmp/test-docs/sample-resume.pdf"]
         );
     }
 
@@ -2377,7 +2458,7 @@ allowed_user_ids = []
         // Parse and re-write with the helper logic
         let content = tokio::fs::read_to_string(&config_path).await.unwrap();
         let mut doc: toml::Table = content.parse().unwrap();
-        let ids = vec![12345u64];
+        let ids = [12345u64];
         let ids_toml = toml::Value::Array(
             ids.iter()
                 .map(|&id| toml::Value::Integer(id as i64))
@@ -2410,7 +2491,7 @@ allowed_user_ids = []
 
         let content = tokio::fs::read_to_string(&config_path).await.unwrap();
         let mut doc: toml::Table = content.parse().unwrap();
-        let ids = vec![67890u64];
+        let ids = [67890u64];
         let ids_toml = toml::Value::Array(
             ids.iter()
                 .map(|&id| toml::Value::Integer(id as i64))

@@ -113,12 +113,23 @@ aidaemon
 
 ```bash
 cargo build --release
+./target/release/aidaemon migrate
 ./target/release/aidaemon
 ```
 
 The wizard will guide you through:
 1. Selecting your LLM provider and entering your API key
 2. Selecting and setting up one or more channels (Telegram, Slack, Discord)
+
+### Upgrade automation (migrations only)
+
+For post-install/post-upgrade jobs, run:
+
+```bash
+aidaemon migrate --config /path/to/config.toml
+```
+
+This runs database/schema migrations and exits without starting channels.
 
 ## Configuration
 
