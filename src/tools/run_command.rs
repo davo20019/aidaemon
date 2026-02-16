@@ -7,6 +7,8 @@ use super::daemon_guard::detect_daemonization_primitives;
 use super::fs_utils;
 
 pub struct RunCommandTool;
+const SAFE_NPM_PREFIX_HINT: &str =
+    "`npm test`, `npm run`, `npm ls`, `npm outdated`, `npm audit`";
 
 /// Safe command prefixes that don't require terminal approval flow.
 const SAFE_PREFIXES: &[&str] = &[
@@ -108,7 +110,7 @@ impl Tool for RunCommandTool {
     fn schema(&self) -> Value {
         json!({
             "name": "run_command",
-            "description": "Run safe build, test, lint, and inspection commands without approval flow. Only allows whitelisted command prefixes (cargo, npm, pytest, go, git read-only, ls, etc.). For arbitrary commands, use terminal instead.",
+            "description": "Run safe build, test, lint, and inspection commands without approval flow. Only allows whitelisted command prefixes (cargo, pytest, go, git read-only, ls, etc.). npm is limited to test/run/list/audit-style commands; for installs and arbitrary commands, use terminal instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -170,9 +172,14 @@ impl Tool for RunCommandTool {
 
         // Validate against safe prefixes
         if !is_safe_command(trimmed) {
+            let mut preview: String = trimmed.chars().take(140).collect();
+            if trimmed.chars().count() > 140 {
+                preview.push('…');
+            }
             anyhow::bail!(
-                "Command '{}' is not in the safe command list. Use 'terminal' for this command.\n\nSafe prefixes include: cargo, npm, pytest, go, git (read-only), ls, make, etc.",
-                trimmed.split_whitespace().next().unwrap_or(trimmed)
+                "Command '{}' is not in the safe command list for run_command. Use 'terminal' for this command.\n\nAllowed npm prefixes in run_command: {}.\nFor installs (e.g. `npm install`), use `terminal`.",
+                preview,
+                SAFE_NPM_PREFIX_HINT
             );
         }
 
@@ -366,6 +373,18 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not in the safe command list"));
+    }
+
+    #[tokio::test]
+    async fn test_run_npm_install_rejected_with_actionable_guidance() {
+        let args = json!({"command": "npm install tailwindcss"}).to_string();
+        let result = RunCommandTool.call(&args).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not in the safe command list for run_command"));
+        assert!(err.contains("Allowed npm prefixes"));
+        assert!(err.contains("npm test"));
+        assert!(err.contains("use `terminal`"));
     }
 
     #[tokio::test]

@@ -693,4 +693,53 @@ mod tests {
             25
         ));
     }
+
+    fn ctx_with_single_error(error: &str) -> LearningContext {
+        LearningContext {
+            user_text: "do something".to_string(),
+            intent_domains: vec![],
+            tool_calls: vec![],
+            errors: vec![(error.to_string(), false)],
+            first_error: None,
+            recovery_actions: vec![],
+            start_time: Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+        }
+    }
+
+    #[test]
+    fn test_classify_stall_prefers_tool_policy_block() {
+        let ctx = ctx_with_single_error(
+            "Command 'npm install tailwindcss' is not in the safe command list. Use 'terminal' for this command.",
+        );
+        let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool");
+        assert_eq!(label, "Tool Policy Block");
+        assert!(suggestion.contains("terminal"));
+    }
+
+    #[test]
+    fn test_classify_stall_detects_edit_target_drift() {
+        let ctx = ctx_with_single_error(
+            "Text not found in ~/projects/oaxaca-mezcal-tours/src/components/ContactForm.jsx. The old_text did not match.",
+        );
+        let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool");
+        assert_eq!(label, "Edit Target Drift");
+        assert!(suggestion.contains("Re-read"));
+    }
+
+    #[test]
+    fn test_classify_stall_ignores_generic_5000_values() {
+        let ctx = ctx_with_single_error("Exceeded 5000 characters while building summary.");
+        let (label, _) = classify_stall(&ctx, "deferred-no-tool");
+        assert_eq!(label, "Stuck");
+    }
+
+    #[test]
+    fn test_classify_stall_detects_provider_server_status_codes() {
+        let ctx = ctx_with_single_error("OpenAI API returned status code 503 Service Unavailable.");
+        let (label, _) = classify_stall(&ctx, "deferred-no-tool");
+        assert_eq!(label, "Server Error");
+    }
 }
