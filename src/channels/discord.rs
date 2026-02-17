@@ -1300,10 +1300,17 @@ impl Channel for DiscordChannel {
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
         let http = self.get_http().await?;
         let channel_id = self.resolve_channel_id(session_id).await?;
+        let mut first_err: Option<anyhow::Error> = None;
         for chunk in split_message(text, 2000) {
             if let Err(e) = channel_id.say(&http, &chunk).await {
                 warn!("Failed to send Discord message: {}", e);
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("Failed to send Discord message: {}", e));
+                }
             }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
         }
         Ok(())
     }

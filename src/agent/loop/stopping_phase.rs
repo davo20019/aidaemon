@@ -2,6 +2,7 @@ use super::stopping_conditions::{PureStoppingInputs, StoppingCondition};
 use super::*;
 use crate::execution_policy::PolicyBundle;
 use crate::traits::ConversationSummary;
+use crate::utils::truncate_with_note;
 
 pub(super) enum StoppingPhaseOutcome {
     ContinueLoop,
@@ -29,8 +30,10 @@ pub(super) struct StoppingPhaseCtx<'a> {
     pub consecutive_same_tool: &'a (String, usize),
     pub consecutive_same_tool_arg_hashes: &'a HashSet<u64>,
     pub total_successful_tool_calls: usize,
+    pub pending_background_ack: &'a mut Option<String>,
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
     pub resolved_goal_id: &'a Option<String>,
+    pub effective_daily_budget: &'a mut Option<u64>,
     pub effective_goal_daily_budget: &'a mut Option<i64>,
     pub successful_send_file_keys: &'a HashSet<String>,
     pub model: &'a mut String,
@@ -51,6 +54,33 @@ pub(super) struct StoppingPhaseCtx<'a> {
 }
 
 impl Agent {
+    pub(super) async fn latest_non_system_tool_output_excerpt(
+        &self,
+        session_id: &str,
+        max_chars: usize,
+    ) -> Option<String> {
+        let history = self.state.get_history(session_id, 80).await.ok()?;
+        history.iter().rev().find_map(|msg| {
+            if msg.role != "tool" {
+                return None;
+            }
+            let content = msg.content.as_deref()?.trim();
+            if content.is_empty() || content.starts_with("[SYSTEM]") {
+                return None;
+            }
+            let cleaned = content
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("[SYSTEM]"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let cleaned = cleaned.trim();
+            if cleaned.is_empty() {
+                return None;
+            }
+            Some(truncate_with_note(cleaned, max_chars))
+        })
+    }
+
     pub(super) async fn run_stopping_phase(
         &self,
         ctx: &mut StoppingPhaseCtx<'_>,
@@ -74,8 +104,10 @@ impl Agent {
         let consecutive_same_tool = ctx.consecutive_same_tool;
         let consecutive_same_tool_arg_hashes = ctx.consecutive_same_tool_arg_hashes;
         let total_successful_tool_calls = ctx.total_successful_tool_calls;
+        let mut pending_background_ack = std::mem::take(ctx.pending_background_ack);
         let status_tx = ctx.status_tx;
         let resolved_goal_id = ctx.resolved_goal_id;
+        let mut effective_daily_budget = *ctx.effective_daily_budget;
         let mut effective_goal_daily_budget = *ctx.effective_goal_daily_budget;
         let successful_send_file_keys = ctx.successful_send_file_keys;
         let mut model = ctx.model.clone();
@@ -99,7 +131,9 @@ impl Agent {
                 *ctx.effective_task_budget = effective_task_budget;
                 *ctx.budget_warning_sent = budget_warning_sent;
                 *ctx.budget_extensions_count = budget_extensions_count;
+                *ctx.effective_daily_budget = effective_daily_budget;
                 *ctx.effective_goal_daily_budget = effective_goal_daily_budget;
+                *ctx.pending_background_ack = pending_background_ack.clone();
                 *ctx.model = model.clone();
                 *ctx.soft_limit_warned = soft_limit_warned;
                 *ctx.last_progress_summary = last_progress_summary;
@@ -108,6 +142,57 @@ impl Agent {
                 *ctx.last_escalation_iteration = last_escalation_iteration;
                 *ctx.consecutive_clean_iterations = consecutive_clean_iterations;
             };
+        }
+
+        if self.depth == 0 {
+            if let Some(background_ack) = pending_background_ack.take() {
+                self.emit_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::StoppingCondition,
+                    "Stopping condition fired: deterministic background handoff".to_string(),
+                    json!({
+                        "condition":"background_detach_handoff",
+                        "total_successful_tool_calls": total_successful_tool_calls
+                    }),
+                )
+                .await;
+
+                let assistant_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "assistant".to_string(),
+                    content: Some(background_ack.clone()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.5,
+                    embedding: None,
+                };
+                self.append_assistant_message_with_event(
+                    emitter,
+                    &assistant_msg,
+                    &model,
+                    None,
+                    None,
+                )
+                .await?;
+                self.emit_task_end(
+                    emitter,
+                    task_id,
+                    TaskStatus::Completed,
+                    task_start,
+                    iteration,
+                    learning_ctx.tool_calls.len(),
+                    None,
+                    Some(background_ack.chars().take(200).collect()),
+                )
+                .await;
+                commit_state!();
+                return Ok(StoppingPhaseOutcome::Return(Ok(background_ack)));
+            }
         }
 
         // === STOPPING CONDITIONS ===
@@ -311,6 +396,44 @@ impl Agent {
                     return Ok(StoppingPhaseOutcome::ContinueLoop);
                 }
 
+                if budget < cap_u64
+                    && new_budget_u64 > task_tokens_used
+                    && self
+                        .request_budget_continue_approval(
+                            session_id,
+                            user_role,
+                            "task",
+                            task_tokens_used as i64,
+                            budget as i64,
+                            new_budget_u64 as i64,
+                        )
+                        .await
+                {
+                    effective_task_budget = Some(new_budget_u64);
+                    budget_warning_sent = false;
+                    pending_system_messages.push(format!(
+                        "[SYSTEM] Task token budget extension approved by owner: {} -> {}. \
+                         Continue working.",
+                        budget, new_budget_u64
+                    ));
+                    self.emit_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::BudgetAutoExtension,
+                        "Extended task token budget via owner approval".to_string(),
+                        json!({
+                            "condition": "task_token_budget_extension_manual",
+                            "old_budget": budget,
+                            "new_budget": new_budget_u64,
+                            "task_tokens_used": task_tokens_used,
+                        }),
+                    )
+                    .await;
+                    commit_state!();
+                    return Ok(StoppingPhaseOutcome::ContinueLoop);
+                }
+
                 warn!(
                     session_id,
                     tokens_used = task_tokens_used,
@@ -452,6 +575,45 @@ impl Agent {
                                 return Ok(StoppingPhaseOutcome::ContinueLoop);
                             }
 
+                            if old_gbudget < hard_token_cap
+                                && new_gbudget > status.tokens_used_today
+                                && self
+                                    .request_budget_continue_approval(
+                                        session_id,
+                                        user_role,
+                                        "goal daily",
+                                        status.tokens_used_today,
+                                        old_gbudget,
+                                        new_gbudget,
+                                    )
+                                    .await
+                            {
+                                effective_goal_daily_budget = Some(new_gbudget);
+                                pending_system_messages.push(format!(
+                                    "[SYSTEM] Goal daily token budget extension approved by owner: {} -> {}. \
+                                     Continue working.",
+                                    old_gbudget, new_gbudget
+                                ));
+                                self.emit_decision_point(
+                                    emitter,
+                                    task_id,
+                                    iteration,
+                                    DecisionType::BudgetAutoExtension,
+                                    "Extended goal daily token budget via owner approval"
+                                        .to_string(),
+                                    json!({
+                                        "condition": "goal_daily_budget_extension_manual",
+                                        "goal_id": goal_id,
+                                        "old_budget": old_gbudget,
+                                        "new_budget": new_gbudget,
+                                        "tokens_used_today": status.tokens_used_today,
+                                    }),
+                                )
+                                .await;
+                                commit_state!();
+                                return Ok(StoppingPhaseOutcome::ContinueLoop);
+                            }
+
                             warn!(
                                 session_id,
                                 iteration,
@@ -536,7 +698,7 @@ impl Agent {
         }
 
         // 5. Daily token budget (existing global limit)
-        if let Some(daily_budget) = self.daily_token_budget {
+        if let Some(daily_budget) = effective_daily_budget {
             let today_start = Utc::now().format("%Y-%m-%d 00:00:00").to_string();
             if let Ok(records) = self.state.get_token_usage_since(&today_start).await {
                 let total: u64 = records
@@ -544,6 +706,48 @@ impl Agent {
                     .map(|r| (r.input_tokens + r.output_tokens) as u64)
                     .sum();
                 if total >= daily_budget {
+                    let cap_u64 = hard_token_cap as u64;
+                    let new_daily_budget = daily_budget
+                        .saturating_mul(2)
+                        .max(total.saturating_add(daily_budget / 2))
+                        .min(cap_u64);
+                    if daily_budget < cap_u64
+                        && new_daily_budget > total
+                        && self
+                            .request_budget_continue_approval(
+                                session_id,
+                                user_role,
+                                "global daily",
+                                total as i64,
+                                daily_budget as i64,
+                                new_daily_budget as i64,
+                            )
+                            .await
+                    {
+                        effective_daily_budget = Some(new_daily_budget);
+                        pending_system_messages.push(format!(
+                            "[SYSTEM] Global daily token budget extension approved by owner: {} -> {}. \
+                             Continue working.",
+                            daily_budget, new_daily_budget
+                        ));
+                        self.emit_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::BudgetAutoExtension,
+                            "Extended global daily token budget via owner approval".to_string(),
+                            json!({
+                                "condition":"daily_token_budget_extension_manual",
+                                "old_budget": daily_budget,
+                                "new_budget": new_daily_budget,
+                                "total_today": total
+                            }),
+                        )
+                        .await;
+                        commit_state!();
+                        return Ok(StoppingPhaseOutcome::ContinueLoop);
+                    }
+
                     self.emit_decision_point(
                         emitter,
                         task_id,
@@ -776,6 +980,72 @@ impl Agent {
                 .await;
                 commit_state!();
                 return Ok(StoppingPhaseOutcome::Return(result));
+            }
+
+            // Last-resort deterministic fallback: if tools succeeded and there were
+            // no unrecovered errors, surface the latest tool output directly instead
+            // of returning a generic "Stuck" message.
+            if total_successful_tool_calls > 0 && unrecovered_errors == 0 {
+                if let Some(tool_output) = self
+                    .latest_non_system_tool_output_excerpt(session_id, 2500)
+                    .await
+                {
+                    let reply = format!(
+                        "I executed the requested command, but the loop stalled before composing a final narrative. \
+Here is the latest tool output:\n\n{}",
+                        tool_output
+                    );
+                    self.emit_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::StoppingCondition,
+                        "Stopping condition fired: stall recovered by last tool output fallback"
+                            .to_string(),
+                        json!({
+                            "condition":"stall_with_tool_output_fallback",
+                            "stall_count": stall_count,
+                            "max_stall_iterations": MAX_STALL_ITERATIONS,
+                            "total_successful_tool_calls": total_successful_tool_calls
+                        }),
+                    )
+                    .await;
+
+                    let assistant_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "assistant".to_string(),
+                        content: Some(reply.clone()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.5,
+                        embedding: None,
+                    };
+                    self.append_assistant_message_with_event(
+                        emitter,
+                        &assistant_msg,
+                        &model,
+                        None,
+                        None,
+                    )
+                    .await?;
+
+                    self.emit_task_end(
+                        emitter,
+                        task_id,
+                        TaskStatus::Completed,
+                        task_start,
+                        iteration,
+                        learning_ctx.tool_calls.len(),
+                        None,
+                        Some(reply.chars().take(200).collect()),
+                    )
+                    .await;
+                    commit_state!();
+                    return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
+                }
             }
 
             warn!(

@@ -224,6 +224,10 @@ pub struct PolicyMetricsData {
     pub route_failsafe_active_turn_total: u64,
     pub tokens_failed_tasks_total: u64,
     pub no_progress_iterations_total: u64,
+    pub deferred_no_tool_forced_required_total: u64,
+    pub deferred_no_tool_deferral_detected_total: u64,
+    pub deferred_no_tool_model_switch_total: u64,
+    pub deferred_no_tool_error_marker_total: u64,
 }
 
 /// Data for DecisionPoint event (flight recorder).

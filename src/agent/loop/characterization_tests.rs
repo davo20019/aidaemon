@@ -3,7 +3,9 @@ use crate::testing::{
     setup_full_stack_test_agent_with_extra_tools, setup_test_agent, setup_test_agent_with_models,
     MockProvider,
 };
-use crate::traits::{ProviderResponse, TokenUsage, Tool, ToolCall};
+use crate::traits::{
+    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, Tool, ToolCall, ToolChoiceMode,
+};
 use crate::types::{ChannelContext, UserRole};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -542,5 +544,149 @@ async fn replay_trace_deferred_planning_text_does_not_stall_before_first_tool_ca
     assert!(
         harness.provider.call_count().await >= 3,
         "expected at least consultant + some deferral retries"
+    );
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    let consultant_schema_call = call_log.iter().find(|entry| {
+        matches!(
+            entry.options.response_mode,
+            ResponseMode::JsonSchema {
+                ref name,
+                strict: true,
+                ..
+            } if name == "intent_gate_v1"
+        )
+    });
+    assert!(
+        consultant_schema_call.is_some(),
+        "expected consultant pass to request strict intent_gate_v1 schema"
+    );
+    assert!(
+        consultant_schema_call
+            .as_ref()
+            .is_some_and(|entry| matches!(entry.options.tool_choice, ToolChoiceMode::None)),
+        "expected consultant pass to disable tool calls"
+    );
+
+    let required_tool_choice_seen = call_log
+        .iter()
+        .any(|entry| matches!(entry.options.tool_choice, ToolChoiceMode::Required));
+    assert!(
+        required_tool_choice_seen,
+        "expected deferred-no-tool recovery to require a tool call on a subsequent LLM attempt"
+    );
+}
+
+#[tokio::test]
+async fn deferred_no_tool_forced_required_resets_after_first_successful_tool_call() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            "Need to inspect first.\n\
+             [INTENT_GATE]\n\
+             {\"complexity\":\"simple\",\"can_answer_now\":false,\"needs_tools\":true}",
+        ),
+        MockProvider::text_response("I'll inspect the machine first."),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("I'll format the final summary next."),
+        MockProvider::text_response("Final summary: system inspection completed."),
+    ]);
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "deferred_no_tool_reset_after_success",
+            "Inspect my system and summarize it.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "Final summary: system inspection completed.");
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    let required_indices: Vec<usize> = call_log
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            if matches!(entry.options.tool_choice, ToolChoiceMode::Required) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        required_indices.len(),
+        1,
+        "expected exactly one forced required-tool recovery call before first tool success"
+    );
+
+    let first_required = required_indices[0];
+    assert!(
+        call_log
+            .iter()
+            .skip(first_required + 1)
+            .any(|entry| !matches!(entry.options.tool_choice, ToolChoiceMode::Required)),
+        "expected forced required-tool mode to clear after first successful tool call"
+    );
+}
+
+#[tokio::test]
+async fn provider_option_rejection_falls_back_to_default_chat() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "[INTENT_GATE]\n\
+         {\"complexity\":\"simple\",\"can_answer_now\":true,\"needs_tools\":false,\"is_acknowledgment\":true}",
+    )])
+    .rejecting_non_default_options();
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "provider_option_rejection_fallback",
+            "Yes",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "Got it.");
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert!(
+        call_log.len() >= 2,
+        "expected optioned call + retry without options"
+    );
+    assert!(
+        call_log.iter().any(|entry| {
+            matches!(
+                entry.options.response_mode,
+                ResponseMode::JsonSchema {
+                    ref name,
+                    strict: true,
+                    ..
+                } if name == "intent_gate_v1"
+            )
+        }),
+        "expected at least one advanced-options call"
+    );
+    assert!(
+        call_log
+            .iter()
+            .any(|entry| entry.options == ChatOptions::default()),
+        "expected fallback retry with default chat options"
     );
 }

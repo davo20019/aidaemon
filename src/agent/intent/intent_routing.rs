@@ -237,10 +237,15 @@ pub(super) fn is_internal_maintenance_intent(user_text: &str) -> bool {
 }
 
 pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateDecision {
-    // If the user's message contains a filesystem path, the request almost
-    // certainly requires tool access (terminal) — override the consultant's
-    // analysis and route to the tool loop directly.
-    if super::user_text_references_filesystem_path(user_text) {
+    // Deterministic tool-need overrides:
+    // 1) explicit filesystem paths
+    // 2) explicit local-environment execution/inspection requests
+    //
+    // These requests cannot be satisfied by text-only consultant output and
+    // must run through the tool loop, regardless of model intent-gate output.
+    if super::user_text_references_filesystem_path(user_text)
+        || user_text_requires_local_tool_execution(user_text)
+    {
         return IntentGateDecision {
             can_answer_now: Some(false),
             needs_tools: Some(true),
@@ -275,6 +280,59 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
         schedule_cron: None,
         domains: Vec::new(),
     }
+}
+
+fn user_text_requires_local_tool_execution(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    let explicit_run_request = [
+        "run the command",
+        "run this command",
+        "execute the command",
+        "execute this command",
+        "run command",
+        "execute command",
+        "run in terminal",
+        "execute in terminal",
+    ]
+    .iter()
+    .any(|kw| contains_keyword_as_words(&lower, kw));
+
+    let local_scope_request = [
+        "on this machine",
+        "on this system",
+        "on this host",
+        "on this computer",
+        "on my machine",
+        "on my system",
+        "on my host",
+        "on my computer",
+        "in this environment",
+        "in my environment",
+        "locally",
+        "installed here",
+    ]
+    .iter()
+    .any(|kw| contains_keyword_as_words(&lower, kw));
+
+    let installed_wording = contains_keyword_as_words(&lower, "installed")
+        || contains_keyword_as_words(&lower, "is installed");
+    let installed_version_query = (contains_keyword_as_words(&lower, "what version of")
+        || contains_keyword_as_words(&lower, "which version of"))
+        && installed_wording
+        && local_scope_request;
+
+    let quoted_command_execution = lower.contains('`')
+        && (contains_keyword_as_words(&lower, "run")
+            || contains_keyword_as_words(&lower, "execute"));
+
+    explicit_run_request
+        || local_scope_request
+        || installed_version_query
+        || quoted_command_execution
 }
 
 /// Classify user intent complexity for orchestration routing.
@@ -447,5 +505,42 @@ mod intent_routing_path_override_tests {
     fn infer_intent_gate_forces_tools_for_windows_paths() {
         let d = infer_intent_gate(r"C:\Users\alice\file.txt", "");
         assert_eq!(d.needs_tools, Some(true));
+    }
+
+    #[test]
+    fn infer_intent_gate_forces_tools_for_local_installed_version_query() {
+        let d = infer_intent_gate("What version of rustc is installed on this machine?", "");
+        assert_eq!(d.needs_tools, Some(true));
+        assert_eq!(d.can_answer_now, Some(false));
+    }
+
+    #[test]
+    fn infer_intent_gate_forces_tools_for_explicit_run_command_request() {
+        let d = infer_intent_gate(
+            "Run the command `cat /nonexistent/file.txt` and tell me what happens",
+            "",
+        );
+        assert_eq!(d.needs_tools, Some(true));
+        assert_eq!(d.can_answer_now, Some(false));
+    }
+
+    #[test]
+    fn infer_intent_gate_does_not_force_tools_for_generic_version_question() {
+        let d = infer_intent_gate("What version of rustc was released in 2021?", "");
+        assert!(
+            d.needs_tools.is_none(),
+            "expected needs_tools=None for generic version question, got {:?}",
+            d.needs_tools
+        );
+    }
+
+    #[test]
+    fn infer_intent_gate_does_not_force_tools_for_non_local_installed_question() {
+        let d = infer_intent_gate("What version of Python is installed at the company?", "");
+        assert!(
+            d.needs_tools.is_none(),
+            "expected needs_tools=None for non-local installed wording, got {:?}",
+            d.needs_tools
+        );
     }
 }

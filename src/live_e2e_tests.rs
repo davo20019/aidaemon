@@ -133,6 +133,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
             ..Default::default()
         },
         crate::config::PolicyConfig::default(),
+        crate::config::PathAliasConfig::default(),
     );
 
     let channel = Arc::new(TestChannel::new());
@@ -310,6 +311,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
             ..Default::default()
         },
         crate::config::PolicyConfig::default(),
+        crate::config::PathAliasConfig::default(),
     );
 
     let channel = Arc::new(TestChannel::new());

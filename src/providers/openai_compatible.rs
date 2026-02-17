@@ -7,7 +7,10 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 use crate::providers::ProviderError;
-use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
+use crate::traits::{
+    ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
+    ToolChoiceMode,
+};
 
 pub struct OpenAiCompatibleProvider {
     client: Client,
@@ -74,22 +77,20 @@ impl OpenAiCompatibleProvider {
             api_key: api_key.to_string(),
         })
     }
-}
 
-#[async_trait]
-impl ModelProvider for OpenAiCompatibleProvider {
-    async fn chat(
+    fn build_request_body(
         &self,
         model: &str,
         messages: &[Value],
         tools: &[Value],
-    ) -> anyhow::Result<ProviderResponse> {
+        options: &ChatOptions,
+    ) -> Value {
         // Strip extra_content from tool_calls before sending — the OpenAI-compatible
         // endpoint doesn't understand it (it's used internally for Gemini native round-trip).
         let mut messages_cleaned: Vec<Value> = messages.to_vec();
-        for msg in messages_cleaned.iter_mut() {
+        for msg in &mut messages_cleaned {
             if let Some(tcs) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
-                for tc in tcs.iter_mut() {
+                for tc in tcs {
                     if let Some(obj) = tc.as_object_mut() {
                         obj.remove("extra_content");
                     }
@@ -105,9 +106,80 @@ impl ModelProvider for OpenAiCompatibleProvider {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
+        if !tools.is_empty() {
+            match &options.tool_choice {
+                ToolChoiceMode::Auto => {}
+                ToolChoiceMode::None => body["tool_choice"] = json!("none"),
+                ToolChoiceMode::Required => body["tool_choice"] = json!("required"),
+                ToolChoiceMode::Specific(name) => {
+                    body["tool_choice"] = json!({
+                        "type": "function",
+                        "function": { "name": name }
+                    });
+                }
+            }
+        } else if !matches!(options.tool_choice, ToolChoiceMode::Auto) {
+            warn!(
+                tool_choice = ?options.tool_choice,
+                "Ignoring non-auto tool_choice because no tools were provided"
+            );
+        }
+
+        match &options.response_mode {
+            ResponseMode::Text => {}
+            ResponseMode::JsonObject => {
+                body["response_format"] = json!({ "type": "json_object" });
+            }
+            ResponseMode::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => {
+                body["response_format"] = json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": name,
+                        "schema": schema,
+                        "strict": strict
+                    }
+                });
+            }
+        }
+
+        body
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OpenAiCompatibleProvider {
+    async fn chat(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+    ) -> anyhow::Result<ProviderResponse> {
+        self.chat_with_options(model, messages, tools, &ChatOptions::default())
+            .await
+    }
+
+    async fn chat_with_options(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+        options: &ChatOptions,
+    ) -> anyhow::Result<ProviderResponse> {
+        let body = self.build_request_body(model, messages, tools, options);
 
         let url = format!("{}/chat/completions", self.base_url);
-        info!(model, url = %url, tools = tools.len(), "Calling LLM API");
+        info!(
+            model,
+            url = %url,
+            tools = tools.len(),
+            response_mode = ?options.response_mode,
+            tool_choice = ?options.tool_choice,
+            "Calling LLM API"
+        );
 
         let resp = match self
             .client
@@ -231,6 +303,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_https_accepted() {
@@ -305,5 +378,66 @@ mod tests {
             "base_url should not end with slash, got: {}",
             provider.base_url
         );
+    }
+
+    #[test]
+    fn test_build_request_body_applies_required_tool_choice_and_json_schema() {
+        let provider = OpenAiCompatibleProvider::new("https://api.openai.com/v1", "test-key")
+            .expect("provider should initialize");
+        let messages = vec![json!({"role":"user","content":"plan the task"})];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "search_files",
+                "description": "search project files",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    }
+                }
+            }
+        })];
+        let options = ChatOptions {
+            response_mode: ResponseMode::JsonSchema {
+                name: "intent_gate_v1".to_string(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "needs_tools": {"type": "boolean"}
+                    },
+                    "required": ["needs_tools"],
+                    "additionalProperties": false
+                }),
+                strict: true,
+            },
+            tool_choice: ToolChoiceMode::Required,
+        };
+
+        let body = provider.build_request_body("gpt-4o-mini", &messages, &tools, &options);
+
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "intent_gate_v1"
+        );
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn test_build_request_body_ignores_non_auto_tool_choice_without_tools() {
+        let provider = OpenAiCompatibleProvider::new("https://api.openai.com/v1", "test-key")
+            .expect("provider should initialize");
+        let messages = vec![json!({"role":"user","content":"answer in json"})];
+        let options = ChatOptions {
+            response_mode: ResponseMode::JsonObject,
+            tool_choice: ToolChoiceMode::Required,
+        };
+
+        let body = provider.build_request_body("gpt-4o-mini", &messages, &[], &options);
+
+        assert!(body.get("tool_choice").is_none());
+        assert_eq!(body["response_format"]["type"], "json_object");
     }
 }

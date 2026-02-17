@@ -36,11 +36,13 @@ pub struct BaseToolsBundle {
     pub approval_rx: mpsc::Receiver<ApprovalRequest>,
     pub media_tx: mpsc::Sender<MediaMessage>,
     pub media_rx: mpsc::Receiver<MediaMessage>,
+    pub terminal_tool: Option<Arc<TerminalTool>>,
 }
 
 pub struct OptionalToolsOutcome {
     pub has_cli_agents: bool,
     pub inbox_dir: String,
+    pub cli_agent_tool: Option<Arc<CliAgentTool>>,
 }
 
 pub struct RuntimeToolsOutcome {
@@ -294,9 +296,10 @@ pub async fn build_base_tools(
     let (media_tx, media_rx) = mpsc::channel::<MediaMessage>(media_queue_capacity);
 
     let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(BASE_TOOL_MANIFEST.len());
+    let mut terminal_tool: Option<Arc<TerminalTool>> = None;
 
     for tool_id in BASE_TOOL_MANIFEST {
-        let tool = build_base_tool(
+        let built = build_base_tool(
             *tool_id,
             config,
             &config_path,
@@ -309,7 +312,10 @@ pub async fn build_base_tools(
             tool = tool_id.name(),
             "Registered base tool from startup manifest"
         );
-        tools.push(tool);
+        if terminal_tool.is_none() {
+            terminal_tool = built.terminal_tool.clone();
+        }
+        tools.push(built.tool);
     }
 
     Ok(BaseToolsBundle {
@@ -318,7 +324,13 @@ pub async fn build_base_tools(
         approval_rx,
         media_tx,
         media_rx,
+        terminal_tool,
     })
+}
+
+struct BuiltBaseTool {
+    tool: Arc<dyn Tool>,
+    terminal_tool: Option<Arc<TerminalTool>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -334,6 +346,7 @@ pub async fn register_optional_tools(
 ) -> anyhow::Result<OptionalToolsOutcome> {
     let inbox_dir = shellexpand::tilde(&config.files.inbox_dir).to_string();
     let mut has_cli_agents = false;
+    let mut cli_agent_tool: Option<Arc<CliAgentTool>> = None;
 
     for tool_id in OPTIONAL_TOOL_MANIFEST {
         match tool_id {
@@ -383,6 +396,7 @@ pub async fn register_optional_tools(
                 .await;
                 has_cli_agents = cli_tool.has_tools();
                 let arc = Arc::new(cli_tool);
+                cli_agent_tool = Some(arc.clone());
                 if has_cli_agents {
                     tools.push(arc.clone());
                 } else {
@@ -428,6 +442,7 @@ pub async fn register_optional_tools(
     Ok(OptionalToolsOutcome {
         has_cli_agents,
         inbox_dir,
+        cli_agent_tool,
     })
 }
 
@@ -563,10 +578,13 @@ async fn register_runtime_tool_by_id(
             *oauth_gateway = Some(gateway);
         }
         RuntimeToolId::SpawnAgent => {
-            let st = Arc::new(SpawnAgentTool::new_deferred(
-                config.subagents.max_response_chars,
-                config.subagents.timeout_secs,
-            ));
+            let st = Arc::new(
+                SpawnAgentTool::new_deferred(
+                    config.subagents.max_response_chars,
+                    config.subagents.timeout_secs,
+                )
+                .with_state(state.clone() as Arc<dyn crate::traits::StateStore>),
+            );
             tools.push(st.clone());
             *spawn_tool = Some(st);
         }
@@ -582,47 +600,117 @@ async fn build_base_tool(
     state: Arc<SqliteStateStore>,
     event_store: Arc<EventStore>,
     approval_tx: mpsc::Sender<ApprovalRequest>,
-) -> anyhow::Result<Arc<dyn Tool>> {
-    let tool: Arc<dyn Tool> = match tool_id {
-        BaseToolId::SystemInfo => Arc::new(SystemInfoTool),
-        BaseToolId::Terminal => Arc::new(
-            TerminalTool::new(
-                config.terminal.allowed_prefixes.clone(),
+) -> anyhow::Result<BuiltBaseTool> {
+    let built = match tool_id {
+        BaseToolId::SystemInfo => BuiltBaseTool {
+            tool: Arc::new(SystemInfoTool),
+            terminal_tool: None,
+        },
+        BaseToolId::Terminal => {
+            let terminal = Arc::new(
+                TerminalTool::new(
+                    config.terminal.allowed_prefixes.clone(),
+                    approval_tx,
+                    config.terminal.initial_timeout_secs,
+                    config.terminal.max_output_chars,
+                    config.terminal.permission_mode,
+                    state.pool(),
+                )
+                .await
+                .with_event_store(event_store)
+                .with_state(state as Arc<dyn crate::traits::StateStore>),
+            );
+            BuiltBaseTool {
+                tool: terminal.clone(),
+                terminal_tool: Some(terminal),
+            }
+        }
+        BaseToolId::RememberFact => BuiltBaseTool {
+            tool: Arc::new(RememberFactTool::new(state)),
+            terminal_tool: None,
+        },
+        BaseToolId::ShareMemory => BuiltBaseTool {
+            tool: Arc::new(ShareMemoryTool::new(state, approval_tx)),
+            terminal_tool: None,
+        },
+        BaseToolId::ManageMemories => BuiltBaseTool {
+            tool: Arc::new(ManageMemoriesTool::new(state)),
+            terminal_tool: None,
+        },
+        BaseToolId::ScheduledGoalRuns => BuiltBaseTool {
+            tool: Arc::new(ScheduledGoalRunsTool::new(state)),
+            terminal_tool: None,
+        },
+        BaseToolId::GoalTrace => BuiltBaseTool {
+            tool: Arc::new(GoalTraceTool::new(state)),
+            terminal_tool: None,
+        },
+        BaseToolId::ToolTrace => BuiltBaseTool {
+            tool: Arc::new(ToolTraceTool::new(state)),
+            terminal_tool: None,
+        },
+        BaseToolId::PolicyMetrics => BuiltBaseTool {
+            tool: Arc::new(PolicyMetricsTool),
+            terminal_tool: None,
+        },
+        BaseToolId::ConfigManager => BuiltBaseTool {
+            tool: Arc::new(ConfigManagerTool::new(
+                config_path.to_path_buf(),
                 approval_tx,
-                config.terminal.initial_timeout_secs,
-                config.terminal.max_output_chars,
-                config.terminal.permission_mode,
-                state.pool(),
-            )
-            .await
-            .with_event_store(event_store),
-        ),
-        BaseToolId::RememberFact => Arc::new(RememberFactTool::new(state)),
-        BaseToolId::ShareMemory => Arc::new(ShareMemoryTool::new(state, approval_tx)),
-        BaseToolId::ManageMemories => Arc::new(ManageMemoriesTool::new(state)),
-        BaseToolId::ScheduledGoalRuns => Arc::new(ScheduledGoalRunsTool::new(state)),
-        BaseToolId::GoalTrace => Arc::new(GoalTraceTool::new(state)),
-        BaseToolId::ToolTrace => Arc::new(ToolTraceTool::new(state)),
-        BaseToolId::PolicyMetrics => Arc::new(PolicyMetricsTool),
-        BaseToolId::ConfigManager => Arc::new(ConfigManagerTool::new(
-            config_path.to_path_buf(),
-            approval_tx,
-        )),
-        BaseToolId::WebFetch => Arc::new(WebFetchTool::new()),
-        BaseToolId::WebSearch => Arc::new(WebSearchTool::new(&config.search)),
-        BaseToolId::ReadFile => Arc::new(ReadFileTool),
-        BaseToolId::WriteFile => Arc::new(WriteFileTool),
-        BaseToolId::EditFile => Arc::new(EditFileTool),
-        BaseToolId::SearchFiles => Arc::new(SearchFilesTool),
-        BaseToolId::ProjectInspect => Arc::new(ProjectInspectTool),
-        BaseToolId::RunCommand => Arc::new(RunCommandTool),
-        BaseToolId::GitInfo => Arc::new(GitInfoTool),
-        BaseToolId::GitCommit => Arc::new(GitCommitTool),
-        BaseToolId::CheckEnvironment => Arc::new(CheckEnvironmentTool),
-        BaseToolId::ServiceStatus => Arc::new(ServiceStatusTool),
+            )),
+            terminal_tool: None,
+        },
+        BaseToolId::WebFetch => BuiltBaseTool {
+            tool: Arc::new(WebFetchTool::new()),
+            terminal_tool: None,
+        },
+        BaseToolId::WebSearch => BuiltBaseTool {
+            tool: Arc::new(WebSearchTool::new(&config.search)),
+            terminal_tool: None,
+        },
+        BaseToolId::ReadFile => BuiltBaseTool {
+            tool: Arc::new(ReadFileTool),
+            terminal_tool: None,
+        },
+        BaseToolId::WriteFile => BuiltBaseTool {
+            tool: Arc::new(WriteFileTool),
+            terminal_tool: None,
+        },
+        BaseToolId::EditFile => BuiltBaseTool {
+            tool: Arc::new(EditFileTool),
+            terminal_tool: None,
+        },
+        BaseToolId::SearchFiles => BuiltBaseTool {
+            tool: Arc::new(SearchFilesTool),
+            terminal_tool: None,
+        },
+        BaseToolId::ProjectInspect => BuiltBaseTool {
+            tool: Arc::new(ProjectInspectTool),
+            terminal_tool: None,
+        },
+        BaseToolId::RunCommand => BuiltBaseTool {
+            tool: Arc::new(RunCommandTool),
+            terminal_tool: None,
+        },
+        BaseToolId::GitInfo => BuiltBaseTool {
+            tool: Arc::new(GitInfoTool),
+            terminal_tool: None,
+        },
+        BaseToolId::GitCommit => BuiltBaseTool {
+            tool: Arc::new(GitCommitTool),
+            terminal_tool: None,
+        },
+        BaseToolId::CheckEnvironment => BuiltBaseTool {
+            tool: Arc::new(CheckEnvironmentTool),
+            terminal_tool: None,
+        },
+        BaseToolId::ServiceStatus => BuiltBaseTool {
+            tool: Arc::new(ServiceStatusTool),
+            terminal_tool: None,
+        },
     };
 
-    Ok(tool)
+    Ok(built)
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@
 async fn test_consultant_pass_classifies_then_executor_answers_questions() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
-            "[INTENT_GATE]\n\
+            "I can answer this from memory.\n[INTENT_GATE]\n\
              {\"complexity\": \"knowledge\", \"can_answer_now\": true, \"needs_tools\": false}",
         ),
         MockProvider::text_response(
@@ -104,7 +104,7 @@ async fn test_critical_owner_name_query_is_deterministic() {
 async fn test_personal_recall_turn_routes_at_least_primary_model() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
-            "[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false}",
+            "I can answer this from memory.\n[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false}",
         ),
         MockProvider::text_response("I don't have pet information saved."),
     ]);
@@ -141,6 +141,8 @@ async fn test_consultant_empty_answerable_turn_falls_through_to_tool_path() {
         MockProvider::text_response(
             "[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
         ),
+        // Empty analysis forces needs_tools=true, so executor must use tool calls
+        MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Recovered after memory/tool retry."),
     ]);
 
@@ -161,7 +163,7 @@ async fn test_consultant_empty_answerable_turn_falls_through_to_tool_path() {
 
     assert_eq!(response, "Recovered after memory/tool retry.");
     let calls = harness.provider.call_log.lock().await;
-    assert_eq!(calls.len(), 2);
+    assert!(calls.len() >= 2);
     assert!(
         !calls[1].tools.is_empty(),
         "Empty answerable consultant output should trigger tool-enabled retry path"
@@ -699,7 +701,9 @@ async fn test_consultant_pass_drops_hallucinated_tool_calls() {
             thinking: None,
             response_note: None,
         },
-        // Iteration 2+: execution loop response
+        // Iteration 2+: hallucinated tool calls force needs_tools=true, so executor
+        // must use tool calls (text-only responses are now blocked).
+        MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response(
             "Your website is deployed at your-site.workers.dev on Cloudflare Workers.",
         ),
@@ -731,8 +735,8 @@ async fn test_consultant_pass_drops_hallucinated_tool_calls() {
     // At least 1 LLM call (consultant) + execution loop calls
     let call_count = harness.provider.call_count().await;
     assert!(
-        call_count >= 2,
-        "Expected at least 2 LLM calls — consultant + execution loop (got {})",
+        call_count >= 3,
+        "Expected at least 3 LLM calls — consultant + tool call + final response (got {})",
         call_count
     );
 }
@@ -751,6 +755,8 @@ async fn test_acknowledgment_with_needs_tools_and_empty_analysis_falls_through()
              [INTENT_GATE]\n\
              {\"complexity\":\"simple\",\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"is_acknowledgment\":true}",
         ),
+        // needs_tools=true blocks text-only responses, so executor must use a tool call
+        MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Proceeding with the requested changes."),
     ]);
 
@@ -774,8 +780,8 @@ async fn test_acknowledgment_with_needs_tools_and_empty_analysis_falls_through()
     assert_eq!(response, "Proceeding with the requested changes.");
     assert_eq!(
         harness.provider.call_count().await,
-        2,
-        "Expected consultant pass + execution pass"
+        3,
+        "Expected consultant pass + tool call + execution pass"
     );
 }
 
@@ -900,6 +906,8 @@ async fn test_intent_gate_decision_metadata_includes_route_reason_for_continue()
             "[INTENT_GATE]\n\
              {\"complexity\":\"simple\",\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"is_acknowledgment\":true}",
         ),
+        // needs_tools=true blocks text-only responses, so executor must use a tool call
+        MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Proceeding with the requested changes."),
     ]);
 

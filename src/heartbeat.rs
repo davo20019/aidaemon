@@ -13,7 +13,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 
-use crate::agent::{is_group_session, Agent};
+use crate::agent::{build_goal_task_results_summary, is_group_session, Agent};
 use crate::channels::ChannelHub;
 use crate::goal_tokens::GoalTokenRegistry;
 use crate::traits::{GoalSchedule, StateStore};
@@ -790,36 +790,9 @@ impl HeartbeatCoordinator {
                         .get_tasks_for_goal(&goal.id)
                         .await
                         .unwrap_or_default();
-
-                    let task_results: Vec<String> = completed_tasks
-                        .iter()
-                        .filter(|t| t.status == "completed" && t.error.is_none())
-                        .filter_map(|t| {
-                            t.result.as_ref().map(|r| {
-                                let truncated: String = r.chars().take(800).collect();
-                                format!("**{}**\n{}", t.description, truncated)
-                            })
-                        })
-                        .collect();
-
-                    let task_results_summary = if task_results.is_empty() {
-                        goal.description.chars().take(300).collect::<String>()
-                    } else {
-                        let last_result = task_results.last().unwrap();
-                        if task_results.len() == 1 {
-                            last_result.clone()
-                        } else {
-                            format!(
-                                "{}/{} tasks completed.\n\n{}",
-                                completed_tasks
-                                    .iter()
-                                    .filter(|t| t.status == "completed" && t.error.is_none())
-                                    .count(),
-                                completed_tasks.len(),
-                                last_result
-                            )
-                        }
-                    };
+                    let fallback_summary: String = goal.description.chars().take(300).collect();
+                    let task_results_summary =
+                        build_goal_task_results_summary(&completed_tasks, &fallback_summary);
 
                     // Check for partial success metadata in context
                     let partial_info = goal

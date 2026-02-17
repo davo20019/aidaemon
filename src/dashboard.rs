@@ -548,7 +548,11 @@ async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_j
         "route_drift_failsafe_activation_total": metrics.route_drift_failsafe_activation_total,
         "route_failsafe_active_turn_total": metrics.route_failsafe_active_turn_total,
         "tokens_failed_tasks_total": metrics.tokens_failed_tasks_total,
-        "no_progress_iterations_total": metrics.no_progress_iterations_total
+        "no_progress_iterations_total": metrics.no_progress_iterations_total,
+        "deferred_no_tool_forced_required_total": metrics.deferred_no_tool_forced_required_total,
+        "deferred_no_tool_deferral_detected_total": metrics.deferred_no_tool_deferral_detected_total,
+        "deferred_no_tool_model_switch_total": metrics.deferred_no_tool_model_switch_total,
+        "deferred_no_tool_error_marker_total": metrics.deferred_no_tool_error_marker_total
     }))
 }
 

@@ -116,6 +116,7 @@ impl Agent {
         let mut force_text_response = false;
         let mut budget_warning_sent = false;
         let mut effective_task_budget = self.task_token_budget;
+        let mut effective_daily_budget = self.daily_token_budget;
         // Runtime-only override for goal daily budget extensions.
         // We intentionally do NOT persist auto-extensions to DB to avoid ratcheting.
         let mut effective_goal_daily_budget: Option<i64> = None;
@@ -146,6 +147,8 @@ impl Agent {
         // (consecutive cli_agent completions), then reset after a
         // successful non-cli_agent tool call.
         let mut cli_agent_boundary_injected = false;
+        // Deterministic top-level acknowledgement when a tool detaches to background.
+        let mut pending_background_ack: Option<String> = None;
         // Track identity-attack prefill so we can prepend it to the final reply.
         let mut identity_prefill_text: Option<String> = None;
         // Best-effort project directory hint (seeded from user text, refined by tool calls).
@@ -158,6 +161,9 @@ impl Agent {
         let mut dirs_with_search_no_matches: HashSet<String> = HashSet::new();
         // When true, the assistant must run at least one file re-check before finalizing text.
         let mut require_file_recheck_before_answer = false;
+        // Route fail-safe bypasses consultant pass; seed tools-required state so
+        // text-only completions cannot bypass execution in this mode.
+        let mut needs_tools_for_turn = route_failsafe_active;
 
         // Determine iteration limit behavior
         let (hard_cap, soft_threshold, soft_warn_at) = match &self.iteration_config {
@@ -318,8 +324,10 @@ impl Agent {
                     consecutive_same_tool: &consecutive_same_tool,
                     consecutive_same_tool_arg_hashes: &consecutive_same_tool_arg_hashes,
                     total_successful_tool_calls,
+                    pending_background_ack: &mut pending_background_ack,
                     status_tx: &status_tx,
                     resolved_goal_id: &resolved_goal_id,
+                    effective_daily_budget: &mut effective_daily_budget,
                     effective_goal_daily_budget: &mut effective_goal_daily_budget,
                     successful_send_file_keys: &successful_send_file_keys,
                     model: &mut model,
@@ -379,6 +387,7 @@ impl Agent {
                     llm_provider: llm_provider.clone(),
                     llm_router: llm_router.clone(),
                     model: &model,
+                    user_role,
                     tool_defs: &tool_defs,
                     status_tx: &status_tx,
                     resolved_goal_id: &resolved_goal_id,
@@ -393,6 +402,7 @@ impl Agent {
                     empty_response_retry_pending: &mut empty_response_retry_pending,
                     empty_response_retry_note: &mut empty_response_retry_note,
                     identity_prefill_text: &mut identity_prefill_text,
+                    deferred_no_tool_streak,
                     max_budget_extensions: MAX_BUDGET_EXTENSIONS,
                     hard_token_cap: HARD_TOKEN_CAP,
                 })
@@ -441,8 +451,10 @@ impl Agent {
                     empty_response_retry_pending: &mut empty_response_retry_pending,
                     empty_response_retry_note: &mut empty_response_retry_note,
                     identity_prefill_text: &mut identity_prefill_text,
+                    pending_background_ack: &mut pending_background_ack,
                     require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
                     turn_context: &turn_context,
+                    needs_tools_for_turn: &mut needs_tools_for_turn,
                 })
                 .await?;
             match consultant_outcome {
@@ -515,6 +527,7 @@ impl Agent {
                     recent_tool_names: &mut recent_tool_names,
                     successful_send_file_keys: &mut successful_send_file_keys,
                     cli_agent_boundary_injected: &mut cli_agent_boundary_injected,
+                    pending_background_ack: &mut pending_background_ack,
                     stall_count: &mut stall_count,
                     deferred_no_tool_streak: &mut deferred_no_tool_streak,
                     consecutive_clean_iterations: &mut consecutive_clean_iterations,

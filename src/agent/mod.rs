@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::channels::ChannelHub;
-use crate::config::{IterationLimitConfig, PolicyConfig};
+use crate::config::{IterationLimitConfig, PathAliasConfig, PolicyConfig};
 use crate::events::{
     AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
     PolicyMetricsData, SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData,
@@ -32,8 +32,8 @@ use crate::skills::{self, MemoryContext};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::VerificationTracker;
 use crate::traits::{
-    AgentRole, Goal, Message, ModelProvider, StateStore, TaskActivity, Tool, ToolCall,
-    ToolCapabilities, ToolRole,
+    AgentRole, ChatOptions, Goal, Message, ModelProvider, ResponseMode, StateStore, Task,
+    TaskActivity, Tool, ToolCall, ToolCapabilities, ToolChoiceMode, ToolRole,
 };
 use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
@@ -73,6 +73,7 @@ const ENABLE_SCHEDULE_HEURISTICS: bool = true;
 #[path = "intent/intent_gate.rs"]
 mod intent_gate;
 use intent_gate::extract_intent_gate;
+use intent_gate::intent_gate_schema_json;
 #[cfg(test)]
 use intent_gate::parse_intent_gate_json;
 #[path = "consultant/consultant_analysis.rs"]
@@ -192,6 +193,10 @@ struct PolicyRuntimeMetrics {
     route_failsafe_active_turn_total: AtomicU64,
     tokens_failed_tasks_total: AtomicU64,
     no_progress_iterations_total: AtomicU64,
+    deferred_no_tool_forced_required_total: AtomicU64,
+    deferred_no_tool_deferral_detected_total: AtomicU64,
+    deferred_no_tool_model_switch_total: AtomicU64,
+    deferred_no_tool_error_marker_total: AtomicU64,
 }
 
 impl PolicyRuntimeMetrics {
@@ -222,6 +227,10 @@ impl PolicyRuntimeMetrics {
             route_failsafe_active_turn_total: AtomicU64::new(0),
             tokens_failed_tasks_total: AtomicU64::new(0),
             no_progress_iterations_total: AtomicU64::new(0),
+            deferred_no_tool_forced_required_total: AtomicU64::new(0),
+            deferred_no_tool_deferral_detected_total: AtomicU64::new(0),
+            deferred_no_tool_model_switch_total: AtomicU64::new(0),
+            deferred_no_tool_error_marker_total: AtomicU64::new(0),
         }
     }
 }
@@ -554,6 +563,18 @@ pub fn policy_metrics_snapshot() -> PolicyMetricsData {
             .load(Ordering::Relaxed),
         no_progress_iterations_total: POLICY_METRICS
             .no_progress_iterations_total
+            .load(Ordering::Relaxed),
+        deferred_no_tool_forced_required_total: POLICY_METRICS
+            .deferred_no_tool_forced_required_total
+            .load(Ordering::Relaxed),
+        deferred_no_tool_deferral_detected_total: POLICY_METRICS
+            .deferred_no_tool_deferral_detected_total
+            .load(Ordering::Relaxed),
+        deferred_no_tool_model_switch_total: POLICY_METRICS
+            .deferred_no_tool_model_switch_total
+            .load(Ordering::Relaxed),
+        deferred_no_tool_error_marker_total: POLICY_METRICS
+            .deferred_no_tool_error_marker_total
             .load(Ordering::Relaxed),
     }
 }
@@ -1232,6 +1253,8 @@ pub struct Agent {
     context_window_config: crate::config::ContextWindowConfig,
     /// Policy rollout and enforcement configuration.
     policy_config: PolicyConfig,
+    /// Configured path alias roots (for example, `projects/...`).
+    path_aliases: PathAliasConfig,
     /// Full tool list from the root agent — used by TaskLead when spawning
     /// Executor children so they can access Action tools that were filtered
     /// out of the TaskLead's own `tools` vec.
@@ -1374,6 +1397,113 @@ fn strip_leading_wait(description: &str) -> String {
 /// Used to suppress noisy progress updates in shared channels.
 pub fn is_group_session(session_id: &str) -> bool {
     crate::session::is_group_session(session_id)
+}
+
+/// Detect low-signal task-lead replies that should not be sent as the
+/// primary user-facing result when richer goal/task outputs are available.
+fn is_low_signal_task_lead_reply(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    if trimmed == "Done." || trimmed.eq_ignore_ascii_case("goal completed successfully") {
+        return true;
+    }
+
+    if trimmed.starts_with("Done — ") && !trimmed.contains('\n') {
+        return true;
+    }
+
+    if trimmed.starts_with("Goal ")
+        && trimmed.contains(" completed:")
+        && !trimmed.contains('\n')
+        && trimmed.len() <= 220
+    {
+        return true;
+    }
+
+    false
+}
+
+fn truncate_goal_result_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let truncated: String = trimmed.chars().take(max_chars).collect();
+    if trimmed.chars().count() > max_chars {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+/// Build a user-facing summary from successful task results.
+/// Includes recent completed tasks (bounded) instead of only the last one.
+pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) -> String {
+    const MAX_INCLUDED_TASK_RESULTS: usize = 3;
+    const MAX_CHARS_PER_TASK_RESULT: usize = 800;
+
+    let mut successful: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| t.status == "completed" && t.error.is_none())
+        .filter(|t| t.result.as_deref().is_some_and(|r| !r.trim().is_empty()))
+        .collect();
+
+    if successful.is_empty() {
+        return fallback.chars().take(4000).collect();
+    }
+
+    successful.sort_by(|a, b| {
+        let a_key = a.completed_at.as_deref().unwrap_or(a.created_at.as_str());
+        let b_key = b.completed_at.as_deref().unwrap_or(b.created_at.as_str());
+        a_key
+            .cmp(b_key)
+            .then_with(|| a.task_order.cmp(&b.task_order))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut selected: Vec<&Task> = successful
+        .iter()
+        .rev()
+        .take(MAX_INCLUDED_TASK_RESULTS)
+        .copied()
+        .collect();
+    selected.reverse();
+
+    let sections: Vec<String> = selected
+        .iter()
+        .map(|t| {
+            let result = t.result.as_deref().unwrap_or("");
+            format!(
+                "**{}**\n{}",
+                t.description,
+                truncate_goal_result_text(result, MAX_CHARS_PER_TASK_RESULT)
+            )
+        })
+        .collect();
+
+    if sections.is_empty() {
+        return fallback.chars().take(4000).collect();
+    }
+
+    let omitted = successful.len().saturating_sub(selected.len());
+    if sections.len() == 1 && omitted == 0 {
+        return sections[0].clone();
+    }
+
+    let mut summary = format!(
+        "{}/{} tasks completed.\n\n{}",
+        successful.len(),
+        tasks.len(),
+        sections.join("\n\n")
+    );
+    if omitted > 0 {
+        let suffix = if omitted == 1 { "" } else { "s" };
+        summary.push_str(&format!(
+            "\n\n(+{} earlier completed task result{} omitted)",
+            omitted, suffix
+        ));
+    }
+    summary
 }
 
 /// Spawn a task lead in the background (free function to satisfy Send requirements).
@@ -1561,7 +1691,7 @@ pub fn spawn_background_task_lead(
                     {
                         repeated_progress = repeated_progress.saturating_add(1);
                         // Reduce spam for long-running tasks with unchanged state.
-                        repeated_progress % 3 == 0
+                        repeated_progress.is_multiple_of(3)
                     } else {
                         last_progress_key = Some(progress_key);
                         repeated_progress = 0;
@@ -1655,21 +1785,14 @@ pub fn spawn_background_task_lead(
             )
             .await;
 
-        // Deliver the task lead result to the originating channel.
-        // Without this, scheduled/background task results are stored in DB
-        // but never sent to the user (notifications only fire on goal completion).
-        let mut delivered_directly = false;
-        if let Ok(ref response) = result {
-            if !response.trim().is_empty() {
-                if let Some(hub_weak) = &hub {
-                    if let Some(hub_arc) = hub_weak.upgrade() {
-                        if hub_arc.send_text(&session_id, response).await.is_ok() {
-                            delivered_directly = true;
-                        }
-                    }
-                }
-            }
-        }
+        // Keep the task-lead textual response, but defer relay until we know
+        // whether the goal is terminal. For terminal goals, we prefer the
+        // canonical completion summary built from task results.
+        let task_lead_response = result
+            .as_ref()
+            .ok()
+            .map(|response| response.trim().to_string())
+            .filter(|response| !response.is_empty());
 
         // Auto-dispatch: dispatch remaining pending tasks after task lead returns.
         // This handles both cases: LLMs that create tasks but don't spawn executors,
@@ -2054,6 +2177,17 @@ pub fn spawn_background_task_lead(
             .unwrap_or("unknown");
         // Only notify for terminal states — "active" means it's still in progress
         if status == "active" || status == "pending" {
+            // Goal still in progress: optionally relay substantive task-lead text.
+            if let Some(response) = task_lead_response.as_ref() {
+                if !is_low_signal_task_lead_reply(response) {
+                    if let Some(hub_weak) = &hub {
+                        if let Some(hub_arc) = hub_weak.upgrade() {
+                            let _ = hub_arc.send_text(&session_id, response).await;
+                        }
+                    }
+                }
+            }
+
             // Goal is still active, no notification needed.
             // Clean up cancellation token and return.
             if let Some(ref registry) = goal_token_registry {
@@ -2170,45 +2304,12 @@ pub fn spawn_background_task_lead(
                     // the real outputs come from the executor tasks.
                     let completed_tasks =
                         state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
-
-                    // Build a result summary from completed tasks (skip the echo/setup tasks
-                    // and focus on tasks that produced meaningful output)
-                    let task_results: Vec<String> = completed_tasks
-                        .iter()
-                        .filter(|t| t.status == "completed" && t.error.is_none())
-                        .filter_map(|t| {
-                            t.result.as_ref().map(|r| {
-                                let truncated: String = r.chars().take(800).collect();
-                                format!("**{}**\n{}", t.description, truncated)
-                            })
-                        })
-                        .collect();
-
-                    let task_results_summary = if task_results.is_empty() {
-                        // Fall back to task lead response if no task results exist
-                        result
-                            .as_ref()
-                            .map(|r| r.chars().take(4000).collect::<String>())
-                            .unwrap_or_else(|_| "All tasks completed.".to_string())
-                    } else {
-                        // Use the last task's result as primary output (usually the final
-                        // deliverable like a report or summary), with a brief header
-                        let last_result = task_results.last().unwrap();
-                        if task_results.len() == 1 {
-                            last_result.clone()
-                        } else {
-                            // Show count and the final result
-                            format!(
-                                "{}/{} tasks completed.\n\n{}",
-                                completed_tasks
-                                    .iter()
-                                    .filter(|t| t.status == "completed" && t.error.is_none())
-                                    .count(),
-                                completed_tasks.len(),
-                                last_result
-                            )
-                        }
+                    let fallback_summary = match &result {
+                        Ok(r) => r.as_str(),
+                        Err(_) => "All tasks completed.",
                     };
+                    let task_results_summary =
+                        build_goal_task_results_summary(&completed_tasks, fallback_summary);
 
                     // Check for partial success metadata in the goal context
                     let partial_info = final_goal
@@ -2275,17 +2376,6 @@ pub fn spawn_background_task_lead(
                 ),
             }
         };
-
-        // Skip completion notification if we already delivered the result directly
-        // to avoid sending the same content twice. Still notify for failures/stalls
-        // since those carry different information.
-        if delivered_directly && notification_type == "completed" {
-            let _ = state.mark_goal_notified(&goal_id).await;
-            if let Some(ref registry) = goal_token_registry {
-                registry.remove(&goal_id).await;
-            }
-            return;
-        }
 
         let entry =
             crate::traits::NotificationEntry::new(&goal_id, &session_id, notification_type, &msg);
@@ -2359,6 +2449,7 @@ impl Agent {
         record_decision_points: bool,
         context_window_config: crate::config::ContextWindowConfig,
         policy_config: PolicyConfig,
+        path_aliases: PathAliasConfig,
     ) -> Self {
         init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
         let fallback = model.clone();
@@ -2425,6 +2516,7 @@ impl Agent {
             self_ref: RwLock::new(None),
             context_window_config,
             policy_config,
+            path_aliases,
             root_tools: None, // Root agent — its own tools ARE the root tools
             record_decision_points,
         }
@@ -2490,6 +2582,7 @@ impl Agent {
         record_decision_points: bool,
         context_window_config: crate::config::ContextWindowConfig,
         policy_config: PolicyConfig,
+        path_aliases: PathAliasConfig,
         root_tools: Option<Vec<Arc<dyn Tool>>>,
     ) -> Self {
         let fallback = model.clone();
@@ -2528,6 +2621,7 @@ impl Agent {
             self_ref: RwLock::new(None),
             context_window_config,
             policy_config,
+            path_aliases,
             root_tools,
             record_decision_points,
         }

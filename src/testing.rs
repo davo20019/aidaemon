@@ -17,12 +17,14 @@ use crate::config::{IterationLimitConfig, ModelsConfig, ProviderKind};
 use crate::events::EventStore;
 use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
 use crate::memory::embeddings::EmbeddingService;
+use crate::providers::ProviderError;
 use crate::state::SqliteStateStore;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::memory::RememberFactTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
 use crate::traits::{
-    Channel, ChannelCapabilities, ModelProvider, ProviderResponse, TokenUsage, Tool, ToolCall,
+    Channel, ChannelCapabilities, ChatOptions, ModelProvider, ProviderResponse, TokenUsage, Tool,
+    ToolCall,
 };
 use crate::types::{ApprovalResponse, MediaMessage};
 
@@ -37,12 +39,14 @@ pub struct MockChatCall {
     pub model: String,
     pub messages: Vec<Value>,
     pub tools: Vec<Value>,
+    pub options: ChatOptions,
 }
 
 /// Mock LLM provider that returns scripted responses.
 pub struct MockProvider {
     responses: Mutex<Vec<ProviderResponse>>,
     pub call_log: Mutex<Vec<MockChatCall>>,
+    reject_non_default_options: bool,
 }
 
 impl MockProvider {
@@ -51,6 +55,7 @@ impl MockProvider {
         Self {
             responses: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
+            reject_non_default_options: false,
         }
     }
 
@@ -59,7 +64,15 @@ impl MockProvider {
         Self {
             responses: Mutex::new(responses),
             call_log: Mutex::new(Vec::new()),
+            reject_non_default_options: false,
         }
+    }
+
+    /// Simulate a provider/model that rejects advanced per-call options.
+    /// Useful for testing compatibility fallback paths.
+    pub fn rejecting_non_default_options(mut self) -> Self {
+        self.reject_non_default_options = true;
+        self
     }
 
     /// Helper: build a text-only ProviderResponse.
@@ -111,12 +124,28 @@ impl ModelProvider for MockProvider {
         messages: &[Value],
         tools: &[Value],
     ) -> anyhow::Result<ProviderResponse> {
+        self.chat_with_options(model, messages, tools, &ChatOptions::default())
+            .await
+    }
+
+    async fn chat_with_options(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+        options: &ChatOptions,
+    ) -> anyhow::Result<ProviderResponse> {
         // Record the call
         self.call_log.lock().await.push(MockChatCall {
             model: model.to_string(),
             messages: messages.to_vec(),
             tools: tools.to_vec(),
+            options: options.clone(),
         });
+
+        if self.reject_non_default_options && *options != ChatOptions::default() {
+            return Err(ProviderError::from_status(400, "unsupported chat options").into());
+        }
 
         // Return next scripted response, or a default
         let mut responses = self.responses.lock().await;
@@ -306,6 +335,7 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
             ..Default::default()
         },
         crate::config::PolicyConfig::default(),
+        crate::config::PathAliasConfig::default(),
     );
 
     // Set executor mode so integration tests exercise the execution loop directly,
@@ -398,6 +428,7 @@ pub async fn setup_test_agent_with_models(
             ..Default::default()
         },
         crate::config::PolicyConfig::default(),
+        crate::config::PathAliasConfig::default(),
     );
     // Note: keeps orchestrator mode (depth=0) — used by consultant pass tests
 
@@ -478,6 +509,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
             ..Default::default()
         },
         crate::config::PolicyConfig::default(),
+        crate::config::PathAliasConfig::default(),
     );
 
     let channel = Arc::new(TestChannel::new());
@@ -682,6 +714,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
             ..Default::default()
         },
         crate::config::PolicyConfig::default(),
+        crate::config::PathAliasConfig::default(),
     );
 
     // Set executor mode so tests exercise the execution loop directly

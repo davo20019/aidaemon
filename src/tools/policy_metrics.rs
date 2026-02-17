@@ -123,7 +123,11 @@ impl Tool for PolicyMetricsTool {
                  - route_drift_failsafe_activation_total: {}\n\
                  - route_failsafe_active_turn_total: {}\n\
                  - tokens_failed_tasks_total: {}\n\
-                 - no_progress_iterations_total: {}",
+                 - no_progress_iterations_total: {}\n\
+                 - deferred_no_tool_forced_required_total: {}\n\
+                 - deferred_no_tool_deferral_detected_total: {}\n\
+                 - deferred_no_tool_model_switch_total: {}\n\
+                 - deferred_no_tool_error_marker_total: {}",
                 metrics.consultant_direct_return_total,
                 metrics.consultant_fallthrough_total,
                 consultant_direct_return_rate,
@@ -145,6 +149,10 @@ impl Tool for PolicyMetricsTool {
                 metrics.route_failsafe_active_turn_total,
                 metrics.tokens_failed_tasks_total,
                 metrics.no_progress_iterations_total,
+                metrics.deferred_no_tool_forced_required_total,
+                metrics.deferred_no_tool_deferral_detected_total,
+                metrics.deferred_no_tool_model_switch_total,
+                metrics.deferred_no_tool_error_marker_total,
             ));
         }
 
@@ -161,7 +169,15 @@ impl Tool for PolicyMetricsTool {
                 "context_integrity_guard_events_total": metrics.context_bleed_prevented_total
                     + metrics.context_mismatch_preflight_drop_total
                     + metrics.followup_mode_overrides_total
-                    + metrics.cross_scope_blocked_total
+                    + metrics.cross_scope_blocked_total,
+                "deferred_no_tool_recovery_effectiveness_rate": if metrics.deferred_no_tool_forced_required_total > 0 {
+                    metrics
+                        .deferred_no_tool_forced_required_total
+                        .saturating_sub(metrics.deferred_no_tool_error_marker_total) as f64
+                        / metrics.deferred_no_tool_forced_required_total as f64
+                } else {
+                    0.0
+                }
             }
         });
         Ok(serde_json::to_string_pretty(&payload)?)
@@ -203,6 +219,14 @@ mod tests {
         assert!(parsed
             .get("metrics")
             .and_then(|m| m.get("cross_scope_blocked_total"))
+            .is_some());
+        assert!(parsed
+            .get("metrics")
+            .and_then(|m| m.get("deferred_no_tool_forced_required_total"))
+            .is_some());
+        assert!(parsed
+            .get("metrics")
+            .and_then(|m| m.get("deferred_no_tool_model_switch_total"))
             .is_some());
     }
 }

@@ -103,7 +103,7 @@ async fn test_orchestrator_knowledge_no_tool_execution() {
     // The model should still avoid tool execution for simple knowledge answers.
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
-            "[INTENT_GATE]\n{\"complexity\": \"knowledge\", \"can_answer_now\": true, \"needs_tools\": false}",
+            "I can answer this from memory.\n[INTENT_GATE]\n{\"complexity\": \"knowledge\", \"can_answer_now\": true, \"needs_tools\": false}",
         ),
         MockProvider::text_response("The capital of France is Paris."),
     ]);
@@ -272,7 +272,7 @@ async fn test_synthesized_done_persisted() {
         MockProvider::text_response(""),
         // Turn 2, iteration 1 (consultant pass): classifier output
         MockProvider::text_response(
-            "[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false}",
+            "I can answer this from memory.\n[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false}",
         ),
         // Turn 2, iteration 2 (execution): final user-visible answer
         MockProvider::text_response("Weather is sunny."),
@@ -282,7 +282,7 @@ async fn test_synthesized_done_persisted() {
     // Reset to depth=0 so orchestrator mode + "Done" synthesis fires
     harness.agent.set_test_orchestrator_mode();
 
-    // Turn 1: should trigger "Done" synthesis
+    // Turn 1: should trigger completion recovery (tool output or Done synthesis)
     let r1 = harness
         .agent
         .handle_message(
@@ -295,9 +295,11 @@ async fn test_synthesized_done_persisted() {
         )
         .await
         .unwrap();
+    // After tool execution with empty final response, the agent recovers from
+    // the latest tool output ("Here is the latest tool output:") or synthesizes "Done".
     assert!(
-        r1.starts_with("Done"),
-        "Expected Done synthesis, got: {}",
+        r1.starts_with("Done") || r1.starts_with("Here is the latest tool output"),
+        "Expected Done synthesis or tool output recovery, got: {}",
         r1
     );
 
@@ -331,16 +333,17 @@ async fn test_synthesized_done_persisted() {
         user_msgs.len()
     );
 
-    // Verify: there should be a "Done" assistant message between the user messages
-    let done_assistant = turn2_call.messages.iter().any(|m| {
+    // Verify: there should be a completion assistant message between the user messages
+    // (either "Done" synthesis or "Here is the latest tool output" recovery)
+    let completion_assistant = turn2_call.messages.iter().any(|m| {
         m.get("role").and_then(|r| r.as_str()) == Some("assistant")
             && m.get("content")
                 .and_then(|c| c.as_str())
-                .is_some_and(|s| s.starts_with("Done"))
+                .is_some_and(|s| s.starts_with("Done") || s.starts_with("Here is the latest tool output"))
     });
     assert!(
-        done_assistant,
-        "Turn 2's history should contain the persisted 'Done' assistant message from Turn 1"
+        completion_assistant,
+        "Turn 2's history should contain the persisted completion assistant message from Turn 1"
     );
 }
 

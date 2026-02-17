@@ -244,10 +244,13 @@ impl Agent {
         let saved_task_id = task_id.clone();
 
         let result = if add_spawn_tool {
-            let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(
-                self.max_response_chars,
-                self.timeout_secs,
-            ));
+            let spawn_tool = Arc::new(
+                crate::tools::spawn::SpawnAgentTool::new_deferred(
+                    self.max_response_chars,
+                    self.timeout_secs,
+                )
+                .with_state(self.state.clone()),
+            );
 
             let mut child_tools: Vec<Arc<dyn Tool>> = tools.to_vec();
             child_tools.push(spawn_tool.clone());
@@ -286,6 +289,7 @@ impl Agent {
                 self.record_decision_points,
                 self.context_window_config.clone(),
                 self.policy_config.clone(),
+                self.path_aliases.clone(),
                 root_tools,
             ));
 
@@ -337,6 +341,7 @@ impl Agent {
                 self.record_decision_points,
                 self.context_window_config.clone(),
                 self.policy_config.clone(),
+                self.path_aliases.clone(),
                 root_tools,
             ));
 
@@ -515,10 +520,13 @@ impl Agent {
             let start = std::time::Instant::now();
 
             // Task lead can spawn executors, so give it a SpawnAgentTool
-            let spawn_tool = Arc::new(crate::tools::spawn::SpawnAgentTool::new_deferred(
-                self.max_response_chars,
-                self.timeout_secs,
-            ));
+            let spawn_tool = Arc::new(
+                crate::tools::spawn::SpawnAgentTool::new_deferred(
+                    self.max_response_chars,
+                    self.timeout_secs,
+                )
+                .with_state(self.state.clone()),
+            );
             tl_tools.push(spawn_tool.clone());
 
             // Get a child cancellation token from the goal's token
@@ -570,6 +578,7 @@ impl Agent {
                 self.record_decision_points,
                 self.context_window_config.clone(),
                 self.policy_config.clone(),
+                self.path_aliases.clone(),
                 Some(root_tools_for_tl), // root_tools for Executor inheritance
             ));
 
@@ -651,7 +660,8 @@ impl Agent {
              - Spawn executors one at a time (sequential execution)\n\
              - Each executor gets a single, focused task\n\
              - Always check list_tasks before spawning the next executor\n\
-             - If an executor reports a blocker, resolve it or adjust the plan"
+             - If an executor reports a blocker, resolve it or adjust the plan\n\
+             - When finishing the goal, your final reply MUST include concrete executor results (outputs, paths, data), not just \"goal completed\""
         );
 
         if let Some(ctx) = goal_context {
@@ -676,6 +686,9 @@ impl Agent {
              - EXECUTE the task immediately. Do NOT ask for permission or confirmation.\n\
              - Do NOT ask \"Shall I proceed?\" or \"Would you like me to...?\". Just do the work.\n\
              - There is no human in this loop — you are an autonomous executor.\n\
+             - For searching files by name/content, use `search_files` (NOT recursive terminal grep/find).\n\
+             - Prefer `project_inspect` for high-level project discovery before ad-hoc shell exploration.\n\
+             - If terminal is unavoidable, scope commands to explicit directories and avoid scanning `target`, `node_modules`, and `.git` trees.\n\
              - If you encounter ambiguity or a blocker you cannot resolve, use report_blocker immediately.\n\
              - Return the FULL content you produced — not a meta-description of what you did.\n\
              - If your task is research: return all findings, data points, and analysis in detail.\n\
@@ -686,5 +699,25 @@ impl Agent {
              - If you create or write a file, include its FULL ABSOLUTE PATH in your result text.\n\
              - Do NOT spawn sub-agents."
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Agent;
+
+    #[test]
+    fn executor_prompt_includes_search_files_preference() {
+        let prompt = Agent::build_executor_prompt("find async fns", 2, 4);
+        assert!(prompt.contains("use `search_files`"));
+        assert!(prompt.contains("NOT recursive terminal grep/find"));
+        assert!(prompt.contains("avoid scanning `target`, `node_modules`, and `.git`"));
+    }
+
+    #[test]
+    fn task_lead_prompt_requires_concrete_final_results() {
+        let prompt = Agent::build_task_lead_prompt("goal_1", "audit disk usage", None, 1, 3);
+        assert!(prompt.contains("final reply MUST include concrete executor results"));
+        assert!(prompt.contains("not just \"goal completed\""));
     }
 }

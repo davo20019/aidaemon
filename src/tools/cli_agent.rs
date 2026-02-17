@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -18,6 +18,7 @@ use super::{
     command_risk::{PermissionMode, RiskLevel},
     daemon_guard::detect_daemonization_primitives,
 };
+use crate::channels::ChannelHub;
 use crate::config::CliAgentsConfig;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::tools::terminal::ApprovalRequest;
@@ -170,6 +171,13 @@ struct RunningCliAgent {
     working_dir: Option<String>,
 }
 
+/// Finalized background CLI task output retained briefly so `action="check"`
+/// can still return results after automatic reaping.
+struct CompletedCliAgent {
+    result: String,
+    completed_at: Instant,
+}
+
 /// A working directory claim with enough metadata to explain conflicts.
 struct WorkingDirClaim {
     task_id: String,
@@ -226,6 +234,7 @@ pub struct CliAgentTool {
     tools: Arc<std::sync::RwLock<HashMap<String, CliToolEntry>>>,
     tool_names: Arc<std::sync::RwLock<Vec<String>>>,
     running: Arc<Mutex<HashMap<String, RunningCliAgent>>>, // task_id -> RunningCliAgent
+    completed: Arc<Mutex<HashMap<String, CompletedCliAgent>>>, // task_id -> finalized output
     working_dir_claims: Arc<Mutex<HashMap<String, WorkingDirClaim>>>, // normalized dir -> claim
     state: Arc<dyn StateStore>,
     #[allow(dead_code)] // Reserved for future interactive feedback
@@ -235,6 +244,7 @@ pub struct CliAgentTool {
     max_concurrent: usize,
     concurrency_limiter: Arc<Semaphore>,
     approval_tx: mpsc::Sender<ApprovalRequest>,
+    hub: OnceLock<Weak<ChannelHub>>,
 }
 
 /// Default tool definitions when the user enables cli_agents but doesn't specify tools.
@@ -306,6 +316,50 @@ async fn command_exists(command: &str) -> bool {
 }
 
 impl CliAgentTool {
+    fn prune_completed_map(completed: &mut HashMap<String, CompletedCliAgent>) {
+        const COMPLETED_TTL: Duration = Duration::from_secs(10 * 60);
+        const COMPLETED_CAP: usize = 128;
+
+        completed.retain(|_, entry| entry.completed_at.elapsed() <= COMPLETED_TTL);
+        if completed.len() <= COMPLETED_CAP {
+            return;
+        }
+
+        let mut by_age: Vec<(String, Instant)> = completed
+            .iter()
+            .map(|(task_id, entry)| (task_id.clone(), entry.completed_at))
+            .collect();
+        by_age.sort_by_key(|(_, ts)| *ts);
+        let to_remove = by_age.len().saturating_sub(COMPLETED_CAP);
+        for (task_id, _) in by_age.into_iter().take(to_remove) {
+            completed.remove(&task_id);
+        }
+    }
+
+    async fn build_finished_result(agent: &RunningCliAgent) -> String {
+        let elapsed = agent.started_at.elapsed().as_secs();
+        let stdout_output = agent.stdout_buf.lock().await.clone();
+        let result = extract_meaningful_output(&stdout_output, 10000);
+
+        // Capture git diff for finished background tasks.
+        let diff_section = if let Some(ref dir) = agent.working_dir {
+            Self::capture_git_diff(dir)
+                .await
+                .map(|diff| format!("\n\n## File Changes\n```diff\n{}\n```", diff))
+        } else {
+            None
+        };
+
+        let mut final_result = format!(
+            "CLI agent '{}' finished after {}s.\n\nResult:\n{}",
+            agent.tool_name, elapsed, result
+        );
+        if let Some(diff) = diff_section {
+            final_result.push_str(&diff);
+        }
+        final_result
+    }
+
     fn tool_priority(name: &str) -> usize {
         let lower = name.to_ascii_lowercase();
         DEFAULT_TOOL_PRIORITY
@@ -479,6 +533,7 @@ impl CliAgentTool {
             tools: Arc::new(std::sync::RwLock::new(tools)),
             tool_names: Arc::new(std::sync::RwLock::new(tool_names)),
             running: Arc::new(Mutex::new(HashMap::new())),
+            completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
             state,
             llm_runtime,
@@ -487,12 +542,22 @@ impl CliAgentTool {
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             concurrency_limiter: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
             approval_tx,
+            hub: OnceLock::new(),
         };
 
         // Load dynamic agents from DB
         tool.load_dynamic_agents().await;
 
         tool
+    }
+
+    /// Set channel hub reference for immediate background completion delivery.
+    pub fn set_hub(&self, hub: Weak<ChannelHub>) {
+        let _ = self.hub.set(hub);
+    }
+
+    fn get_hub(&self) -> Option<Arc<ChannelHub>> {
+        self.hub.get().and_then(|w| w.upgrade())
     }
 
     /// Load dynamically registered agents from the database.
@@ -694,29 +759,47 @@ impl CliAgentTool {
 
     /// Clean up any finished CLI agent tasks.
     async fn reap_finished(&self) {
-        let mut running = self.running.lock().await;
-        let finished: Vec<String> = running
-            .iter()
-            .filter(|(_, agent)| !is_process_alive(agent.child_id))
-            .map(|(id, _)| id.clone())
-            .collect();
+        let finished: Vec<(String, RunningCliAgent)> = {
+            let mut running = self.running.lock().await;
+            let finished_ids: Vec<String> = running
+                .iter()
+                .filter(|(_, agent)| !is_process_alive(agent.child_id))
+                .map(|(id, _)| id.clone())
+                .collect();
 
-        // Also release working-dir claims for finished tasks.
-        // Lock ordering: running -> working_dir_claims.
-        let mut claims = self.working_dir_claims.lock().await;
-        for task_id in finished {
-            if let Some(agent) = running.remove(&task_id) {
-                if let Some(ref dir) = agent.working_dir {
-                    let should_remove = claims
-                        .get(dir)
-                        .map(|claim| claim.task_id == task_id)
-                        .unwrap_or(false);
-                    if should_remove {
-                        claims.remove(dir);
+            // Also release working-dir claims for finished tasks.
+            // Lock ordering: running -> working_dir_claims.
+            let mut claims = self.working_dir_claims.lock().await;
+            let mut removed: Vec<(String, RunningCliAgent)> = Vec::new();
+            for task_id in finished_ids {
+                if let Some(agent) = running.remove(&task_id) {
+                    if let Some(ref dir) = agent.working_dir {
+                        let should_remove = claims
+                            .get(dir)
+                            .map(|claim| claim.task_id == task_id)
+                            .unwrap_or(false);
+                        if should_remove {
+                            claims.remove(dir);
+                        }
                     }
+                    removed.push((task_id, agent));
                 }
-                info!(task_id, tool = %agent.tool_name, "Reaped finished CLI agent");
             }
+            removed
+        };
+
+        for (task_id, agent) in finished {
+            let final_result = Self::build_finished_result(&agent).await;
+            let mut completed = self.completed.lock().await;
+            completed.insert(
+                task_id.clone(),
+                CompletedCliAgent {
+                    result: final_result,
+                    completed_at: Instant::now(),
+                },
+            );
+            Self::prune_completed_map(&mut completed);
+            info!(task_id, tool = %agent.tool_name, "Reaped finished CLI agent");
         }
     }
 
@@ -1231,6 +1314,8 @@ impl CliAgentTool {
         let notify_async = async_mode;
         let notify_goal_id = goal_id.map(|s| s.to_string()).unwrap_or_default();
         let notify_working_dir = canonical_working_dir.clone();
+        let hub_for_completion = self.get_hub();
+        let task_id_for_notify = task_id.clone();
         let should_notify_for_task = Arc::clone(&should_notify);
         let slot_permit_for_task = slot_permit;
         tokio::spawn(async move {
@@ -1528,14 +1613,37 @@ impl CliAgentTool {
                         diff_section.unwrap_or_default(),
                     );
 
-                    let notification_type = if success { "completed" } else { "failed" };
-                    let entry = crate::traits::NotificationEntry::new(
-                        &notify_goal_id,
-                        &notify_session_id,
-                        notification_type,
-                        &message,
-                    );
-                    let _ = state_for_completion.enqueue_notification(&entry).await;
+                    let mut delivered = false;
+                    if let Some(ref hub) = hub_for_completion {
+                        if let Err(e) = hub.send_text(&notify_session_id, &message).await {
+                            warn!(
+                                task_id = %task_id_for_notify,
+                                session_id = %notify_session_id,
+                                error = %e,
+                                "cli_agent background completion direct hub delivery failed"
+                            );
+                        } else {
+                            delivered = true;
+                        }
+                    }
+
+                    if !delivered {
+                        let notification_type = if success { "completed" } else { "failed" };
+                        let entry = crate::traits::NotificationEntry::new(
+                            &notify_goal_id,
+                            &notify_session_id,
+                            notification_type,
+                            &message,
+                        );
+                        if let Err(e) = state_for_completion.enqueue_notification(&entry).await {
+                            warn!(
+                                task_id = %task_id_for_notify,
+                                session_id = %notify_session_id,
+                                error = %e,
+                                "cli_agent background completion enqueue failed"
+                            );
+                        }
+                    }
                 }
             }
             let _ = completion_tx.send((exit_code, loop_detected, loop_pattern_count));
@@ -1734,6 +1842,11 @@ impl CliAgentTool {
         let running = self.running.lock().await;
 
         let Some(agent) = running.get(task_id) else {
+            drop(running);
+            let mut completed = self.completed.lock().await;
+            if let Some(done) = completed.remove(task_id) {
+                return Ok(done.result);
+            }
             return Ok(format!("No running CLI agent with task_id '{}'", task_id));
         };
 
@@ -1744,27 +1857,7 @@ impl CliAgentTool {
         let is_running = is_process_alive(agent.child_id);
 
         if !is_running {
-            // Process finished - try to extract meaningful output from stdout
-            let stdout_output = agent.stdout_buf.lock().await.clone();
-            let result = extract_meaningful_output(&stdout_output, 10000);
-
-            // Capture git diff for finished background tasks
-            let diff_section = if let Some(ref dir) = agent.working_dir {
-                Self::capture_git_diff(dir)
-                    .await
-                    .map(|diff| format!("\n\n## File Changes\n```diff\n{}\n```", diff))
-            } else {
-                None
-            };
-
-            let mut final_result = format!(
-                "CLI agent '{}' finished after {}s.\n\nResult:\n{}",
-                agent.tool_name, elapsed, result
-            );
-            if let Some(diff) = diff_section {
-                final_result.push_str(&diff);
-            }
-            Ok(final_result)
+            Ok(Self::build_finished_result(agent).await)
         } else {
             Ok(format!(
                 "CLI agent '{}' still running ({}s elapsed, pid={}).\n\
@@ -1789,6 +1882,7 @@ impl CliAgentTool {
             };
             agent
         };
+        self.completed.lock().await.remove(task_id);
 
         let display_output = agent.display_buf.lock().await.clone();
         let elapsed = agent.started_at.elapsed().as_secs();
@@ -1835,6 +1929,7 @@ impl CliAgentTool {
 
         let mut cancelled = Vec::new();
         for (task_id, agent) in to_cancel {
+            self.completed.lock().await.remove(&task_id);
             if let Some(ref dir) = agent.working_dir {
                 self.release_working_dir_claim(dir, &task_id).await;
             }
@@ -2444,6 +2539,18 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    fn extract_task_id_from_background_message(msg: &str) -> String {
+        let marker = "task_id=";
+        let start = msg
+            .find(marker)
+            .expect("background response should include task_id")
+            + marker.len();
+        msg[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect()
+    }
+
     /// Create a CliAgentTool with `echo` registered as a test tool.
     /// Uses a real temp-file SQLite DB for state persistence.
     async fn setup_echo_tool() -> (CliAgentTool, tempfile::NamedTempFile) {
@@ -2479,6 +2586,7 @@ mod tests {
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
+            completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
@@ -2492,6 +2600,7 @@ mod tests {
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
+            hub: OnceLock::new(),
         };
 
         (tool, db_file)
@@ -2531,6 +2640,7 @@ mod tests {
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash-agent".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
+            completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
@@ -2544,6 +2654,7 @@ mod tests {
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
+            hub: OnceLock::new(),
         };
 
         (tool, db_file)
@@ -3493,6 +3604,7 @@ mod tests {
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
+            completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
@@ -3506,6 +3618,7 @@ mod tests {
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
+            hub: OnceLock::new(),
         };
 
         // Run a command
@@ -3560,6 +3673,7 @@ mod tests {
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
+            completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
@@ -3573,6 +3687,7 @@ mod tests {
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
+            hub: OnceLock::new(),
         };
 
         // Run a command that will exceed the short timeout and be moved to background,
@@ -3608,6 +3723,79 @@ mod tests {
             invocations[0].duration_secs.unwrap_or(0.0) > 0.0,
             "Expected a positive duration"
         );
+    }
+
+    #[tokio::test]
+    async fn test_background_cli_check_returns_result_after_reap() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+        let provider = Arc::new(MockProvider::new());
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+
+        let mut tools_map = HashMap::new();
+        tools_map.insert(
+            "bash".to_string(),
+            CliToolEntry {
+                command: "bash".to_string(),
+                args: vec!["-c".to_string()],
+                description: "".to_string(),
+                timeout: Duration::from_millis(50),
+                max_output_chars: 10000,
+                is_dynamic: false,
+            },
+        );
+
+        let tool = CliAgentTool {
+            tools: Arc::new(std::sync::RwLock::new(tools_map)),
+            tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
+            running: Arc::new(Mutex::new(HashMap::new())),
+            completed: Arc::new(Mutex::new(HashMap::new())),
+            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
+            state: state as Arc<dyn StateStore>,
+            llm_runtime: SharedLlmRuntime::new(
+                provider as Arc<dyn crate::traits::ModelProvider>,
+                None,
+                crate::config::ProviderKind::OpenaiCompatible,
+                "mock".to_string(),
+            ),
+            default_timeout: Duration::from_secs(10),
+            default_max_output: 10000,
+            max_concurrent: 3,
+            concurrency_limiter: Arc::new(Semaphore::new(3)),
+            approval_tx,
+            hub: OnceLock::new(),
+        };
+
+        let resp = tool
+            .call(
+                r#"{"action":"run","tool":"bash","prompt":"sleep 0.2; echo cli-reap-ok","_session_id":"sess1"}"#,
+            )
+            .await
+            .unwrap();
+        let task_id = extract_task_id_from_background_message(&resp);
+
+        // Let it finish so next call reaps before check.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let check = tool
+            .call(&format!(
+                r#"{{"action":"check","task_id":"{}","_session_id":"sess1"}}"#,
+                task_id
+            ))
+            .await
+            .unwrap();
+        assert!(check.contains("cli-reap-ok"));
+        assert!(check.contains("finished"));
     }
 
     // -----------------------------------------------------------------------

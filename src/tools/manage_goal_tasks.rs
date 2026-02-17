@@ -30,6 +30,96 @@ impl ManageGoalTasksTool {
             task_id, list
         )
     }
+
+    fn truncate_result_for_tool_output(text: &str, max_chars: usize) -> String {
+        let truncated: String = text.chars().take(max_chars).collect();
+        if text.chars().count() > max_chars {
+            format!("{truncated}...")
+        } else {
+            truncated
+        }
+    }
+
+    async fn build_completed_task_result_excerpt(&self) -> anyhow::Result<Option<String>> {
+        let tasks = self.state.get_tasks_for_goal(&self.goal_id).await?;
+        if tasks.is_empty() {
+            return Ok(None);
+        }
+
+        let mut successful: Vec<&Task> = tasks
+            .iter()
+            .filter(|t| t.status == "completed" && t.error.is_none())
+            .filter(|t| t.result.as_deref().is_some_and(|r| !r.trim().is_empty()))
+            .collect();
+        if successful.is_empty() {
+            return Ok(None);
+        }
+
+        successful.sort_by(|a, b| {
+            let a_key = a.completed_at.as_deref().unwrap_or(a.created_at.as_str());
+            let b_key = b.completed_at.as_deref().unwrap_or(b.created_at.as_str());
+            a_key
+                .cmp(b_key)
+                .then_with(|| a.task_order.cmp(&b.task_order))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        let successful_count = successful.len();
+        let total_count = tasks.len();
+        const MAX_INCLUDED_RESULTS: usize = 3;
+        const MAX_RESULT_CHARS_PER_TASK: usize = 700;
+        let mut selected: Vec<&Task> = successful
+            .iter()
+            .rev()
+            .take(MAX_INCLUDED_RESULTS)
+            .copied()
+            .collect();
+        selected.reverse();
+
+        let mut excerpt = String::new();
+        if successful_count > 1 {
+            excerpt.push_str(&format!(
+                "{successful_count}/{total_count} tasks completed.\n\n"
+            ));
+        }
+        if selected.len() == 1 {
+            let task = selected[0];
+            excerpt.push_str("Task result:\n");
+            excerpt.push_str(&format!(
+                "**{}**\n{}",
+                task.description,
+                Self::truncate_result_for_tool_output(
+                    task.result.as_deref().unwrap_or(""),
+                    MAX_RESULT_CHARS_PER_TASK
+                )
+            ));
+        } else {
+            excerpt.push_str("Recent task results:\n\n");
+            for (idx, task) in selected.iter().enumerate() {
+                if idx > 0 {
+                    excerpt.push_str("\n\n");
+                }
+                excerpt.push_str(&format!(
+                    "**{}**\n{}",
+                    task.description,
+                    Self::truncate_result_for_tool_output(
+                        task.result.as_deref().unwrap_or(""),
+                        MAX_RESULT_CHARS_PER_TASK
+                    )
+                ));
+            }
+
+            let omitted = successful_count.saturating_sub(selected.len());
+            if omitted > 0 {
+                let suffix = if omitted == 1 { "" } else { "s" };
+                excerpt.push_str(&format!(
+                    "\n\n(+{} earlier completed task result{} omitted)",
+                    omitted, suffix
+                ));
+            }
+        }
+        Ok(Some(excerpt))
+    }
 }
 
 #[derive(Deserialize)]
@@ -557,7 +647,12 @@ impl ManageGoalTasksTool {
             .summary
             .as_deref()
             .unwrap_or("Goal completed successfully");
-        Ok(format!("Goal {} completed: {}", self.goal_id, summary))
+        let mut response = format!("Goal {} completed: {}", self.goal_id, summary);
+        if let Some(excerpt) = self.build_completed_task_result_excerpt().await? {
+            response.push_str("\n\n");
+            response.push_str(&excerpt);
+        }
+        Ok(response)
     }
 
     /// Append a completed task's summary to the goal's context JSON,
@@ -846,6 +941,104 @@ mod tests {
         let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
         assert_eq!(goal.status, "completed");
         assert!(goal.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_complete_goal_includes_final_task_result_excerpt() {
+        let (state, goal_id) = setup_test_state().await;
+        let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
+
+        tool.call(
+            &json!({
+                "action": "create_task",
+                "description": "Find largest directories"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
+        let task_id = &tasks[0].id;
+
+        tool.call(
+            &json!({
+                "action": "update_task",
+                "task_id": task_id,
+                "status": "completed",
+                "result": "1.2G /Users/me/projects/aidaemon/target"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "complete_goal",
+                    "summary": "Finished disk usage audit"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Goal"));
+        assert!(result.contains("Finished disk usage audit"));
+        assert!(result.contains("Task result:"));
+        assert!(result.contains("1.2G /Users/me/projects/aidaemon/target"));
+    }
+
+    #[tokio::test]
+    async fn test_complete_goal_includes_multiple_recent_task_results() {
+        let (state, goal_id) = setup_test_state().await;
+        let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
+
+        for i in 1..=4 {
+            tool.call(
+                &json!({
+                    "action": "create_task",
+                    "description": format!("Research step {}", i)
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
+        for task in &tasks {
+            tool.call(
+                &json!({
+                    "action": "update_task",
+                    "task_id": task.id,
+                    "status": "completed",
+                    "result": format!("Result payload for {}", task.description)
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "complete_goal",
+                    "summary": "Compiled multi-step research outputs"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("4/4 tasks completed."));
+        assert!(result.contains("Recent task results:"));
+        assert!(result.contains("Research step 4"));
+        assert!(result.contains("Research step 3"));
+        assert!(result.contains("Research step 2"));
+        assert!(result.contains("(+1 earlier completed task result omitted)"));
     }
 
     #[tokio::test]

@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
@@ -11,11 +14,13 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use crate::channels::ChannelHub;
 use crate::events::{
     ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, EventStore, EventType,
 };
-use crate::traits::{Tool, ToolCapabilities};
-use crate::types::ApprovalResponse;
+use crate::traits::{StateStore, Tool, ToolCapabilities};
+use crate::types::{ApprovalResponse, StatusUpdate};
+use crate::utils::{truncate_str, truncate_with_note};
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
 use super::command_risk::{classify_command, hard_block_reason, PermissionMode, RiskLevel};
@@ -24,6 +29,10 @@ use super::process_control::{configure_command_for_process_group, send_sigkill, 
 
 /// Max bytes per stream buffer (1 MB) to prevent unbounded memory growth.
 const BUFFER_CAP: usize = 1_048_576;
+#[cfg(test)]
+const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 1;
+#[cfg(not(test))]
+const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 35;
 
 /// A request sent to the ChannelHub for command approval.
 pub struct ApprovalRequest {
@@ -41,8 +50,16 @@ struct RunningProcess {
     started_at: Instant,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
-    reader_handle: JoinHandle<Option<std::process::ExitStatus>>,
+    reader_handle: JoinHandle<Option<i32>>,
     child_id: u32,
+    notify_on_completion: Arc<AtomicBool>,
+}
+
+/// Finalized background process output retained briefly so `action="check"`
+/// can still return results after automatic reaping.
+struct CompletedProcess {
+    output: String,
+    completed_at: Instant,
 }
 
 pub struct TerminalTool {
@@ -54,10 +71,13 @@ pub struct TerminalTool {
     permission_mode: PermissionMode,
     approval_tx: mpsc::Sender<ApprovalRequest>,
     running: Arc<Mutex<HashMap<u32, RunningProcess>>>,
+    completed: Arc<Mutex<HashMap<u32, CompletedProcess>>>,
     initial_timeout: Duration,
     max_output_chars: usize,
     pool: Option<SqlitePool>,
     event_store: Option<Arc<EventStore>>,
+    state: Option<Arc<dyn StateStore>>,
+    hub: OnceLock<Weak<ChannelHub>>,
 }
 
 /// Check if a command string contains shell operators.
@@ -106,8 +126,8 @@ fn has_recursive_grep_scope_controls(command: &str) -> bool {
         || lower.contains("-dskip")
 }
 
-fn detect_unscoped_recursive_grep(command: &str) -> Option<(String, String)> {
-    let tokens = shell_words::split(command).ok()?;
+fn detect_unscoped_recursive_grep_segment(segment: &str) -> Option<(String, String)> {
+    let tokens = shell_words::split(segment).ok()?;
     let first = tokens.first()?;
     if !is_grep_command(first) {
         return None;
@@ -117,7 +137,7 @@ fn detect_unscoped_recursive_grep(command: &str) -> Option<(String, String)> {
         .iter()
         .skip(1)
         .any(|tok| grep_has_recursive_flag(tok));
-    if !recursive || has_recursive_grep_scope_controls(command) {
+    if !recursive || has_recursive_grep_scope_controls(segment) {
         return None;
     }
 
@@ -144,6 +164,29 @@ fn detect_unscoped_recursive_grep(command: &str) -> Option<(String, String)> {
     }
 
     Some((pattern, paths.join(" ")))
+}
+
+fn detect_unscoped_recursive_grep(command: &str) -> Option<(String, String)> {
+    if let Some(hit) = detect_unscoped_recursive_grep_segment(command) {
+        return Some(hit);
+    }
+
+    // Also scan chained shell segments (e.g. "cd repo && grep -rc ... .").
+    // This is intentionally simple and best-effort: it catches common cases
+    // without trying to fully parse shell grammar.
+    static SHELL_CHAIN_SPLIT_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?:&&|\|\||;|\|)").expect("valid chain regex"));
+    for segment in SHELL_CHAIN_SPLIT_RE.split(command) {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(hit) = detect_unscoped_recursive_grep_segment(trimmed) {
+            return Some(hit);
+        }
+    }
+
+    None
 }
 
 fn recursive_grep_block_message(pattern: &str, path: &str) -> String {
@@ -259,16 +302,33 @@ impl TerminalTool {
             permission_mode,
             approval_tx,
             running: Arc::new(Mutex::new(HashMap::new())),
+            completed: Arc::new(Mutex::new(HashMap::new())),
             initial_timeout: Duration::from_secs(initial_timeout_secs),
             max_output_chars,
             pool: Some(pool),
             event_store: None,
+            state: None,
+            hub: OnceLock::new(),
         }
     }
 
     pub fn with_event_store(mut self, event_store: Arc<EventStore>) -> Self {
         self.event_store = Some(event_store);
         self
+    }
+
+    pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    /// Set channel hub reference for immediate background progress/completion delivery.
+    pub fn set_hub(&self, hub: Weak<ChannelHub>) {
+        let _ = self.hub.set(hub);
+    }
+
+    fn get_hub(&self) -> Option<Arc<ChannelHub>> {
+        self.hub.get().and_then(|w| w.upgrade())
     }
 
     async fn is_allowed(&self, command: &str) -> bool {
@@ -523,23 +583,87 @@ impl TerminalTool {
         }
     }
 
-    /// Clean up any background processes whose reader tasks have finished.
-    async fn reap_finished(&self) {
-        let mut running = self.running.lock().await;
-        let finished: Vec<u32> = running
+    fn prune_completed_map(completed: &mut HashMap<u32, CompletedProcess>) {
+        const COMPLETED_TTL: Duration = Duration::from_secs(10 * 60);
+        const COMPLETED_CAP: usize = 128;
+
+        completed.retain(|_, entry| entry.completed_at.elapsed() <= COMPLETED_TTL);
+        if completed.len() <= COMPLETED_CAP {
+            return;
+        }
+
+        let mut by_age: Vec<(u32, Instant)> = completed
             .iter()
-            .filter(|(_, p)| p.reader_handle.is_finished())
-            .map(|(pid, _)| *pid)
+            .map(|(pid, entry)| (*pid, entry.completed_at))
             .collect();
-        for pid in finished {
-            if let Some(proc) = running.remove(&pid) {
-                info!(pid, command = %proc.command, "Reaped finished background process");
+        by_age.sort_by_key(|(_, ts)| *ts);
+        let to_remove = by_age.len().saturating_sub(COMPLETED_CAP);
+        for (pid, _) in by_age.into_iter().take(to_remove) {
+            completed.remove(&pid);
+        }
+    }
+
+    /// Clean up any background processes whose reader tasks have finished.
+    /// Finished outputs are retained briefly in `completed` so follow-up
+    /// `action="check"` can still retrieve the final result.
+    async fn reap_finished(&self) {
+        let finished: Vec<(u32, RunningProcess)> = {
+            let mut running = self.running.lock().await;
+            let pids: Vec<u32> = running
+                .iter()
+                .filter(|(_, p)| p.reader_handle.is_finished())
+                .map(|(pid, _)| *pid)
+                .collect();
+            let mut removed = Vec::with_capacity(pids.len());
+            for pid in pids {
+                if let Some(proc) = running.remove(&pid) {
+                    removed.push((pid, proc));
+                }
             }
+            removed
+        };
+
+        if finished.is_empty() {
+            return;
+        }
+
+        for (pid, proc) in finished {
+            let exit_code = proc.reader_handle.await.ok().flatten();
+            let stdout = String::from_utf8_lossy(&proc.stdout_buf.lock().await).to_string();
+            let stderr = String::from_utf8_lossy(&proc.stderr_buf.lock().await).to_string();
+            let mut output = format!(
+                "[Process pid={} finished after {:.0}s]\n",
+                pid,
+                proc.started_at.elapsed().as_secs_f64()
+            );
+            output.push_str(&format_output(&stdout, &stderr, self.max_output_chars));
+            if let Some(code) = exit_code {
+                if code != 0 {
+                    output.push_str(&format!("\n[exit code: {}]", code));
+                }
+            }
+
+            let mut completed = self.completed.lock().await;
+            completed.insert(
+                pid,
+                CompletedProcess {
+                    output,
+                    completed_at: Instant::now(),
+                },
+            );
+            Self::prune_completed_map(&mut completed);
+            info!(pid, command = %proc.command, "Reaped finished background process");
         }
     }
 
     /// Run a command: spawn, wait up to initial_timeout, return output or move to background.
-    async fn handle_run(&self, command: &str) -> anyhow::Result<String> {
+    async fn handle_run(
+        &self,
+        command: &str,
+        notify_session_id: &str,
+        notify_goal_id: Option<&str>,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")
             .arg(command)
@@ -558,13 +682,16 @@ impl TerminalTool {
 
         let stdout_buf_c = stdout_buf.clone();
         let stderr_buf_c = stderr_buf.clone();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<Option<i32>>();
 
         // Spawn a task that drains both streams and then waits for the child to exit.
         let reader_handle = tokio::spawn(async move {
             let stdout_drain = drain_to_buffer(stdout_pipe, stdout_buf_c);
             let stderr_drain = drain_to_buffer(stderr_pipe, stderr_buf_c);
             tokio::join!(stdout_drain, stderr_drain);
-            child.wait().await.ok()
+            let exit_code = child.wait().await.ok().and_then(|status| status.code());
+            let _ = completion_tx.send(exit_code);
+            exit_code
         });
 
         // Wait up to initial_timeout for the reader (and thus the process) to finish.
@@ -580,15 +707,15 @@ impl TerminalTool {
         match tokio::time::timeout(self.initial_timeout, poll_finished).await {
             Ok(()) => {
                 // Process finished within timeout — collect output.
-                let status = reader_handle.await.ok().flatten();
+                let exit_code = reader_handle.await.ok().flatten();
                 let stdout_data = stdout_buf.lock().await;
                 let stderr_data = stderr_buf.lock().await;
                 let stdout = String::from_utf8_lossy(&stdout_data);
                 let stderr = String::from_utf8_lossy(&stderr_data);
                 let mut output = format_output(&stdout, &stderr, self.max_output_chars);
-                if let Some(s) = status {
-                    if !s.success() {
-                        output.push_str(&format!("\n[exit code: {}]", s.code().unwrap_or(-1)));
+                if let Some(code) = exit_code {
+                    if code != 0 {
+                        output.push_str(&format!("\n[exit code: {}]", code));
                     }
                 }
                 Ok(output)
@@ -605,6 +732,7 @@ impl TerminalTool {
                     };
                     String::from_utf8_lossy(tail).to_string()
                 };
+                let notify_on_completion = Arc::new(AtomicBool::new(true));
 
                 let proc = RunningProcess {
                     command: command.to_string(),
@@ -613,9 +741,267 @@ impl TerminalTool {
                     stderr_buf,
                     reader_handle,
                     child_id: pid,
+                    notify_on_completion: notify_on_completion.clone(),
                 };
 
                 self.running.lock().await.insert(pid, proc);
+
+                // Deterministic completion delivery: notify user when background command finishes
+                // even if the agent loop ends before an explicit `action="check"` call.
+                let state_for_notify = self.state.clone();
+                let hub_for_notify = self.get_hub();
+                if state_for_notify.is_some() || hub_for_notify.is_some() {
+                    let goal_id_for_notify = notify_goal_id.unwrap_or("").to_string();
+                    let session_for_notify = notify_session_id.trim().to_string();
+                    let command_for_notify = command.to_string();
+                    let stdout_for_notify = {
+                        let running = self.running.lock().await;
+                        running.get(&pid).map(|p| p.stdout_buf.clone())
+                    };
+                    let stderr_for_notify = {
+                        let running = self.running.lock().await;
+                        running.get(&pid).map(|p| p.stderr_buf.clone())
+                    };
+                    let started_at_for_notify = Instant::now() - self.initial_timeout;
+                    let max_output_chars = self.max_output_chars;
+                    let status_tx_for_notify = status_tx.clone();
+                    if let (Some(stdout_buf), Some(stderr_buf)) =
+                        (stdout_for_notify, stderr_for_notify)
+                    {
+                        tokio::spawn(async move {
+                            if session_for_notify.is_empty() {
+                                warn!(
+                                    pid,
+                                    command = %command_for_notify,
+                                    "Terminal background notifier skipped enqueue due to empty session id"
+                                );
+                                return;
+                            }
+                            let command_summary = truncate_str(
+                                &command_for_notify
+                                    .split_whitespace()
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                                160,
+                            );
+
+                            let mut completion_rx = completion_rx;
+                            let mut ping_interval = tokio::time::interval(Duration::from_secs(
+                                BACKGROUND_PROGRESS_INTERVAL_SECS,
+                            ));
+                            ping_interval
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            // Consume the immediate first tick; we want periodic pings only.
+                            ping_interval.tick().await;
+
+                            loop {
+                                tokio::select! {
+                                    exit = &mut completion_rx => {
+                                        let exit_code = match exit {
+                                            Ok(code) => code,
+                                            Err(e) => {
+                                                warn!(
+                                                    pid,
+                                                    error = %e,
+                                                    command = %command_for_notify,
+                                                    "Terminal background notifier lost completion signal"
+                                                );
+                                                None
+                                            }
+                                        };
+                                        if !notify_on_completion.load(Ordering::Relaxed) {
+                                            warn!(
+                                                pid,
+                                                command = %command_for_notify,
+                                                "Terminal background notifier suppressed (check/kill already handled notification)"
+                                            );
+                                            return;
+                                        }
+
+                                        let stdout = String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
+                                        let stderr = String::from_utf8_lossy(&stderr_buf.lock().await).to_string();
+                                        let output = truncate_with_note(
+                                            &format_output(&stdout, &stderr, max_output_chars),
+                                            2500,
+                                        );
+                                        let elapsed_secs = started_at_for_notify.elapsed().as_secs();
+                                        let status = if exit_code == Some(0) {
+                                            "completed"
+                                        } else {
+                                            "finished with errors"
+                                        };
+                                        let mut message = format!(
+                                            "Background terminal command {} after {}s.\nCommand: `{}`\n\nOutput:\n{}",
+                                            status, elapsed_secs, command_summary, output
+                                        );
+                                        if let Some(code) = exit_code {
+                                            if code != 0 {
+                                                message.push_str(&format!("\n[exit code: {}]", code));
+                                            }
+                                        }
+
+                                        if let Some(ref tx) = status_tx_for_notify {
+                                            if let Err(e) = tx.try_send(StatusUpdate::ToolProgress {
+                                                name: "terminal".to_string(),
+                                                chunk: format!(
+                                                    "Background command finished (pid={}): {}",
+                                                    pid, command_summary
+                                                ),
+                                            }) {
+                                                warn!(
+                                                    pid,
+                                                    error = %e,
+                                                    command = %command_for_notify,
+                                                    "Terminal background notifier failed to send progress status update"
+                                                );
+                                            }
+                                        }
+
+                                        let mut delivered = false;
+                                        if let Some(ref hub) = hub_for_notify {
+                                            if let Err(e) = hub.send_text(&session_for_notify, &message).await {
+                                                warn!(
+                                                    pid,
+                                                    error = %e,
+                                                    session_id = %session_for_notify,
+                                                    command = %command_for_notify,
+                                                    "Terminal background notifier failed direct hub completion delivery"
+                                                );
+                                            } else {
+                                                delivered = true;
+                                            }
+                                        }
+                                        if !delivered {
+                                            if let Some(ref state) = state_for_notify {
+                                                let entry = crate::traits::NotificationEntry::new(
+                                                    &goal_id_for_notify,
+                                                    &session_for_notify,
+                                                    "progress",
+                                                    &message,
+                                                );
+                                                if let Err(e) = state.enqueue_notification(&entry).await {
+                                                    warn!(
+                                                        pid,
+                                                        error = %e,
+                                                        session_id = %session_for_notify,
+                                                        goal_id = %goal_id_for_notify,
+                                                        command = %command_for_notify,
+                                                        "Terminal background notifier failed to enqueue completion notification"
+                                                    );
+                                                }
+                                            } else {
+                                                warn!(
+                                                    pid,
+                                                    session_id = %session_for_notify,
+                                                    command = %command_for_notify,
+                                                    "Terminal background notifier has no fallback queue; completion update dropped"
+                                                );
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    _ = ping_interval.tick() => {
+                                        if !notify_on_completion.load(Ordering::Relaxed) {
+                                            warn!(
+                                                pid,
+                                                command = %command_for_notify,
+                                                "Terminal background progress pings suppressed (check/kill already handled notification)"
+                                            );
+                                            return;
+                                        }
+
+                                        let elapsed_secs = started_at_for_notify.elapsed().as_secs();
+                                        let stdout = String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
+                                        let stderr = String::from_utf8_lossy(&stderr_buf.lock().await).to_string();
+                                        let latest_output = truncate_with_note(
+                                            &format_output(&stdout, &stderr, max_output_chars),
+                                            1000,
+                                        );
+                                        let mut message = format!(
+                                            "Background terminal command still running after {}s (pid={}).\nCommand: `{}`",
+                                            elapsed_secs, pid, command_summary
+                                        );
+                                        if !latest_output.trim().is_empty() {
+                                            message.push_str(&format!("\n\nLatest output:\n{}", latest_output));
+                                        }
+
+                                        if let Some(ref tx) = status_tx_for_notify {
+                                            if let Err(e) = tx.try_send(StatusUpdate::ToolProgress {
+                                                name: "terminal".to_string(),
+                                                chunk: format!(
+                                                    "Background command still running (pid={}, {}s elapsed): {}",
+                                                    pid, elapsed_secs, command_summary
+                                                ),
+                                            }) {
+                                                warn!(
+                                                    pid,
+                                                    error = %e,
+                                                    command = %command_for_notify,
+                                                    "Terminal background notifier failed to send periodic progress status update"
+                                                );
+                                            }
+                                        }
+
+                                        let mut delivered = false;
+                                        if let Some(ref hub) = hub_for_notify {
+                                            if let Err(e) = hub.send_text(&session_for_notify, &message).await {
+                                                warn!(
+                                                    pid,
+                                                    error = %e,
+                                                    session_id = %session_for_notify,
+                                                    command = %command_for_notify,
+                                                    "Terminal background notifier failed direct hub periodic delivery"
+                                                );
+                                            } else {
+                                                delivered = true;
+                                            }
+                                        }
+
+                                        if !delivered {
+                                            if let Some(ref state) = state_for_notify {
+                                                let entry = crate::traits::NotificationEntry::new(
+                                                    &goal_id_for_notify,
+                                                    &session_for_notify,
+                                                    "progress",
+                                                    &message,
+                                                );
+                                                if let Err(e) = state.enqueue_notification(&entry).await {
+                                                    warn!(
+                                                        pid,
+                                                        error = %e,
+                                                        session_id = %session_for_notify,
+                                                        goal_id = %goal_id_for_notify,
+                                                        command = %command_for_notify,
+                                                        "Terminal background notifier failed to enqueue periodic progress notification"
+                                                    );
+                                                }
+                                            } else {
+                                                warn!(
+                                                    pid,
+                                                    session_id = %session_for_notify,
+                                                    command = %command_for_notify,
+                                                    "Terminal background notifier has no fallback queue; periodic update dropped"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    } else {
+                        warn!(
+                            pid,
+                            command = %command,
+                            "Terminal background notifier not started because process buffers were unavailable"
+                        );
+                    }
+                } else {
+                    warn!(
+                        pid,
+                        command = %command,
+                        "Terminal background notifier disabled: neither state queue nor channel hub is configured"
+                    );
+                }
 
                 let mut msg = format!(
                     "Command still running after {}s. Moved to background (pid={}).\n\
@@ -635,6 +1021,11 @@ impl TerminalTool {
         let mut running = self.running.lock().await;
 
         let Some(proc) = running.get(&pid) else {
+            drop(running);
+            let mut completed = self.completed.lock().await;
+            if let Some(done) = completed.remove(&pid) {
+                return Ok(done.output);
+            }
             return Ok(format!(
                 "No tracked process with pid={}. It may have already finished and been reaped.",
                 pid
@@ -644,7 +1035,8 @@ impl TerminalTool {
         if proc.reader_handle.is_finished() {
             // Process done — collect final output and remove from map.
             let proc = running.remove(&pid).unwrap();
-            let status = proc.reader_handle.await.ok().flatten();
+            proc.notify_on_completion.store(false, Ordering::Relaxed);
+            let exit_code = proc.reader_handle.await.ok().flatten();
             let stdout = String::from_utf8_lossy(&proc.stdout_buf.lock().await).to_string();
             let stderr = String::from_utf8_lossy(&proc.stderr_buf.lock().await).to_string();
             let mut output = format!(
@@ -653,9 +1045,9 @@ impl TerminalTool {
                 proc.started_at.elapsed().as_secs_f64()
             );
             output.push_str(&format_output(&stdout, &stderr, self.max_output_chars));
-            if let Some(s) = status {
-                if !s.success() {
-                    output.push_str(&format!("\n[exit code: {}]", s.code().unwrap_or(-1)));
+            if let Some(code) = exit_code {
+                if code != 0 {
+                    output.push_str(&format!("\n[exit code: {}]", code));
                 }
             }
             Ok(output)
@@ -700,6 +1092,9 @@ impl TerminalTool {
                 pid
             ));
         };
+        proc.notify_on_completion.store(false, Ordering::Relaxed);
+        drop(running);
+        self.completed.lock().await.remove(&pid);
 
         // Send SIGTERM
         let term_sent = send_sigterm(proc.child_id);
@@ -762,6 +1157,9 @@ struct TerminalArgs {
     _session_id: String,
     #[serde(default)]
     _task_id: Option<String>,
+    /// Injected by agent - goal context for routing background notifications.
+    #[serde(default)]
+    _goal_id: Option<String>,
     /// Injected by agent for role-aware safeguards.
     #[serde(default)]
     _user_role: Option<String>,
@@ -822,10 +1220,30 @@ impl Tool for TerminalTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        // For backwards compatibility, delegate to call_with_status with no sender.
+        self.call_with_status(arguments, None).await
+    }
+
+    async fn call_with_status(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
         let args: TerminalArgs = serde_json::from_str(arguments)?;
 
         // Reap any finished background processes on each call.
         self.reap_finished().await;
+
+        // Route background completion notifications to the origin session
+        // when this terminal run is tied to a goal/task lead.
+        let mut notify_session_id = args._session_id.clone();
+        if let (Some(state), Some(goal_id)) = (self.state.as_ref(), args._goal_id.as_deref()) {
+            if let Ok(Some(goal)) = state.get_goal(goal_id).await {
+                if !goal.session_id.trim().is_empty() {
+                    notify_session_id = goal.session_id;
+                }
+            }
+        }
 
         match args.action.as_str() {
             "check" => {
@@ -1033,7 +1451,13 @@ impl Tool for TerminalTool {
                     }
                 }
 
-                self.handle_run(command).await
+                self.handle_run(
+                    command,
+                    &notify_session_id,
+                    args._goal_id.as_deref(),
+                    status_tx,
+                )
+                .await
             }
         }
     }
@@ -1042,7 +1466,25 @@ impl Tool for TerminalTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use crate::traits::{NotificationStore, StateStore};
     use sqlx::SqlitePool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn extract_pid_from_background_message(msg: &str) -> u32 {
+        let marker = "pid=";
+        let start = msg
+            .find(marker)
+            .expect("background response should include pid")
+            + marker.len();
+        let digits: String = msg[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().expect("pid should parse as u32")
+    }
 
     // ── contains_shell_operator tests ──
 
@@ -1108,6 +1550,19 @@ mod tests {
             r#"grep -R --exclude-dir=node_modules --exclude-dir=target "todo" ."#,
         );
         assert!(detected.is_none(), "grep with excludes should be allowed");
+    }
+
+    #[test]
+    fn test_detect_unscoped_recursive_grep_in_chained_shell_command() {
+        let detected =
+            detect_unscoped_recursive_grep(r#"cd /tmp/project && grep -rc "async fn" ."#);
+        assert!(
+            detected.is_some(),
+            "expected chained command recursive grep to be detected"
+        );
+        let (pattern, path) = detected.unwrap();
+        assert_eq!(pattern, "async fn");
+        assert_eq!(path, ".");
     }
 
     // ── format_output tests ──
@@ -1233,5 +1688,212 @@ mod tests {
         assert!(response.contains("Blocked: broad recursive `grep`"));
         assert!(response.contains("search_files"));
         assert!(response.contains("rg -n --glob"));
+    }
+
+    #[tokio::test]
+    async fn test_background_terminal_completion_enqueues_notification() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state.clone() as Arc<dyn StateStore>);
+
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"sleep 2; echo terminal-notify-ok","_session_id":"sess_notify","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(response.contains("Moved to background (pid="));
+
+        let mut found = false;
+        for _ in 0..40 {
+            let pending = state.get_pending_notifications(20).await.unwrap();
+            if pending.iter().any(|entry| {
+                entry.session_id == "sess_notify"
+                    && entry.notification_type == "progress"
+                    && entry.message.contains("Background terminal command")
+                    && entry.message.contains("terminal-notify-ok")
+            }) {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        assert!(
+            found,
+            "expected background completion notification to be enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_background_terminal_ack_progress_and_completion_sequence() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state.clone() as Arc<dyn StateStore>);
+
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"sleep 3; echo terminal-sequence-ok","_session_id":"sess_seq","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.contains("Moved to background (pid="),
+            "expected background ack in tool response, got: {}",
+            response
+        );
+
+        let mut saw_progress_ping = false;
+        let mut saw_completion = false;
+        for _ in 0..60 {
+            let pending = state.get_pending_notifications(50).await.unwrap();
+            for entry in pending.iter().filter(|entry| {
+                entry.session_id == "sess_seq" && entry.notification_type == "progress"
+            }) {
+                if entry.message.contains("still running after") {
+                    saw_progress_ping = true;
+                }
+                if entry.message.contains("completed")
+                    && entry.message.contains("terminal-sequence-ok")
+                {
+                    saw_completion = true;
+                }
+            }
+            if saw_progress_ping && saw_completion {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        assert!(
+            saw_progress_ping,
+            "expected at least one periodic background progress ping"
+        );
+        assert!(
+            saw_completion,
+            "expected background completion notification with final output"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_background_terminal_kill_suppresses_completion_notification() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state.clone() as Arc<dyn StateStore>);
+
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"sleep 10","_session_id":"sess_kill","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        let pid = extract_pid_from_background_message(&response);
+
+        let kill_response = tool
+            .call(&format!(
+                r#"{{"action":"kill","pid":{},"_session_id":"sess_kill","_user_role":"Owner"}}"#,
+                pid
+            ))
+            .await
+            .unwrap();
+        assert!(kill_response.contains("killed"));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let pending = state.get_pending_notifications(20).await.unwrap();
+        assert!(
+            !pending.iter().any(|entry| {
+                entry.session_id == "sess_kill"
+                    && entry.notification_type == "progress"
+                    && entry.message.contains("Background terminal command")
+            }),
+            "kill action should suppress background completion notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_background_terminal_check_returns_result_after_reap() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"sleep 2; echo post-reap-ok","_session_id":"s1","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        let pid = extract_pid_from_background_message(&response);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // This call will reap finished processes first; check must still return final output.
+        let check = tool
+            .call(&format!(
+                r#"{{"action":"check","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
+                pid
+            ))
+            .await
+            .unwrap();
+        assert!(check.contains("post-reap-ok"));
+        assert!(check.contains(&format!("pid={}", pid)));
     }
 }

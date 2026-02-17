@@ -149,6 +149,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         approval_rx,
         media_tx,
         media_rx,
+        terminal_tool,
     } = startup_tools::build_base_tools(
         &config,
         config_path.clone(),
@@ -161,6 +162,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     let startup_tools::OptionalToolsOutcome {
         has_cli_agents,
         inbox_dir,
+        cli_agent_tool,
     } = startup_tools::register_optional_tools(
         &mut tools,
         &config,
@@ -257,6 +259,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         config.diagnostics.record_decision_points,
         config.state.context_window.clone(),
         config.policy.clone(),
+        config.path_aliases.clone(),
     ));
 
     // Close the loop: give the spawn tool a weak reference to the agent.
@@ -331,6 +334,15 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // Give the spawn tool a reference to the hub for background mode notifications.
     if let Some(st) = spawn_tool {
         st.set_hub(Arc::downgrade(&hub));
+    }
+
+    // Give terminal a reference to the hub so background command progress/completion
+    // can be delivered immediately (not only via heartbeat queue polling).
+    if let Some(tt) = terminal_tool {
+        tt.set_hub(Arc::downgrade(&hub));
+    }
+    if let Some(cat) = cli_agent_tool {
+        cat.set_hub(Arc::downgrade(&hub));
     }
 
     // Give the agent a reference to the hub for background task notifications.
@@ -1663,7 +1675,8 @@ user (personal info), preference (tool/workflow prefs), project (current work), 
 (environment details), relationship (communication patterns), behavior (observed patterns).
 - `manage_config`: Read and update your own config.toml. Use this for configuration changes: \
 add owner IDs (`set` key `users.owner_ids.telegram` etc.), change model names, \
-update API keys, toggle features. Use this tool directly for config operations.
+update API keys, toggle features, configure project path aliases (`set` key `path_aliases.projects`). \
+Use this tool directly for config operations.
 - `scheduled_goal_runs`: Run and debug scheduled-goal executions without terminal/sqlite. \
 Actions: run_now (trigger a scheduled goal immediately), run_history (recent runs + status mix), \
 last_failure (latest failed/blocked run with recent activity), unblock_hints (concrete fix suggestions).

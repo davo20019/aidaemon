@@ -89,16 +89,18 @@ impl Agent {
                 }
                 // Inject user role so tools can enforce role-based access control
                 map.insert("_user_role".to_string(), json!(format!("{:?}", user_role)));
-                // Inject goal context for tools that need it (e.g. spawn_agent and cli_agent).
+                // Inject goal context for tools that need it (e.g. spawn_agent, cli_agent, terminal).
                 //
                 // `cli_agent` uses this to route async/timeout notifications to the *origin* session
                 // (goal.session_id), since sub-agent sessions ("sub-...") are not routable.
-                if name == "spawn_agent" || name == "cli_agent" {
+                //
+                // `terminal` uses this for the same reason when commands move to background.
+                if matches!(name, "spawn_agent" | "cli_agent" | "terminal") {
                     if let Some(ref gid) = self.goal_id {
                         map.insert("_goal_id".to_string(), json!(gid));
-                    } else if name == "cli_agent" {
+                    } else if matches!(name, "cli_agent" | "terminal") {
                         // Executors typically don't carry goal_id, but do carry task_id.
-                        // Resolve goal_id via task to keep cli_agent notifications deliverable.
+                        // Resolve goal_id via task so background notifications stay deliverable.
                         if let Some(ref executor_task_id) = self.task_id {
                             if let Ok(Some(task)) = self.state.get_task(executor_task_id).await {
                                 map.insert("_goal_id".to_string(), json!(task.goal_id));

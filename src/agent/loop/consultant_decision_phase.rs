@@ -33,6 +33,7 @@ pub(super) struct ConsultantDecisionCtx<'a> {
     pub channel_ctx: ChannelContext,
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
     pub turn_context: &'a TurnContext,
+    pub needs_tools_for_turn: &'a mut bool,
 }
 
 impl Agent {
@@ -61,10 +62,11 @@ impl Agent {
             })
             .await?;
 
-        let intent_gate = match intent_outcome {
+        let (intent_gate, needs_tools) = match intent_outcome {
             ConsultantIntentGateOutcome::Return(outcome) => return Ok(Some(outcome)),
-            ConsultantIntentGateOutcome::Continue(data) => data.intent_gate,
+            ConsultantIntentGateOutcome::Continue(data) => (data.intent_gate, data.needs_tools),
         };
+        *ctx.needs_tools_for_turn = needs_tools;
 
         self.run_consultant_orchestration_phase(&mut ConsultantOrchestrationCtx {
             emitter: ctx.emitter,

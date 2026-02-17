@@ -47,8 +47,10 @@ pub(super) struct ConsultantPhaseCtx<'a> {
     pub empty_response_retry_pending: &'a mut bool,
     pub empty_response_retry_note: &'a mut Option<String>,
     pub identity_prefill_text: &'a mut Option<String>,
+    pub pending_background_ack: &'a mut Option<String>,
     pub require_file_recheck_before_answer: &'a mut bool,
     pub turn_context: &'a TurnContext,
+    pub needs_tools_for_turn: &'a mut bool,
 }
 
 impl Agent {
@@ -85,6 +87,7 @@ impl Agent {
                 channel_ctx: ctx.channel_ctx.clone(),
                 status_tx: ctx.status_tx.clone(),
                 turn_context: ctx.turn_context,
+                needs_tools_for_turn: &mut *ctx.needs_tools_for_turn,
             })
             .await?;
         if let Some(outcome) = decision_outcome {
@@ -121,7 +124,9 @@ impl Agent {
                 empty_response_retry_pending: &mut *ctx.empty_response_retry_pending,
                 empty_response_retry_note: &mut *ctx.empty_response_retry_note,
                 identity_prefill_text: &mut *ctx.identity_prefill_text,
+                pending_background_ack: &mut *ctx.pending_background_ack,
                 require_file_recheck_before_answer: &mut *ctx.require_file_recheck_before_answer,
+                needs_tools_for_turn: *ctx.needs_tools_for_turn,
             })
             .await?;
         if let Some(outcome) = completion_outcome {

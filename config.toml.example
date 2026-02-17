@@ -34,6 +34,14 @@ working_memory_cap = 50
 # Set to ["*"] to allow all commands (only if you trust the LLM fully)
 allowed_prefixes = ["ls", "cat", "head", "tail", "echo", "date", "whoami", "pwd", "find", "wc", "grep", "tree", "file", "stat", "uname", "df", "du", "ps", "which", "env", "printenv"]
 
+# Optional path alias roots for relative "projects/..." requests.
+# Precedence for scoped path resolution:
+# 1) explicit absolute/anchored paths
+# 2) existing relative paths in current working directory
+# 3) alias roots below
+# [path_aliases]
+# projects = ["~/projects"]
+
 [daemon]
 health_port = 8080
 

@@ -229,9 +229,34 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
         return None;
     }
 
-    obj.insert(key.to_string(), json!(project_dir));
+    let injected_dir = if tool_name == "run_command" {
+        // Scaffolding flow: if the target project dir doesn't exist yet, use
+        // the nearest existing parent as working_dir so creation commands can run.
+        let resolved = crate::tools::fs_utils::validate_path(project_dir).ok();
+        if let Some(path) = resolved {
+            if !path.is_dir() {
+                if let Some(parent) = path.parent() {
+                    if parent.is_dir() {
+                        parent.to_string_lossy().to_string()
+                    } else {
+                        project_dir.to_string()
+                    }
+                } else {
+                    project_dir.to_string()
+                }
+            } else {
+                project_dir.to_string()
+            }
+        } else {
+            project_dir.to_string()
+        }
+    } else {
+        project_dir.to_string()
+    };
+
+    obj.insert(key.to_string(), json!(injected_dir));
     let updated = serde_json::to_string(&parsed).ok()?;
-    Some((updated, project_dir.to_string()))
+    Some((updated, injected_dir))
 }
 
 pub(super) fn scope_allows_project_dir(scope_path: &str, candidate_path: &str) -> bool {
@@ -403,6 +428,25 @@ mod tests {
     fn scope_allows_only_descendant_paths() {
         assert!(scope_allows_project_dir("/tmp/a", "/tmp/a/src"));
         assert!(!scope_allows_project_dir("/tmp/a", "/tmp/b/src"));
+    }
+
+    #[test]
+    fn run_command_injection_falls_back_to_existing_parent_when_target_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("projects");
+        std::fs::create_dir_all(&parent).expect("create parent");
+        let target = parent.join("new-site");
+        let args = r#"{"command":"pwd"}"#;
+
+        let (updated, injected) = maybe_inject_project_dir_into_tool_args(
+            "run_command",
+            args,
+            Some(target.to_string_lossy().as_ref()),
+        )
+        .expect("injection");
+
+        assert_eq!(injected, parent.to_string_lossy());
+        assert!(updated.contains(r#""working_dir":"#));
     }
 
     proptest! {

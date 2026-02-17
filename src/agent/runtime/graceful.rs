@@ -1,6 +1,68 @@
 use super::*;
 
 impl Agent {
+    /// Ask the owner to approve a one-time budget extension for the current run.
+    ///
+    /// Returns true only when the owner explicitly approves.
+    pub(super) async fn request_budget_continue_approval(
+        &self,
+        session_id: &str,
+        user_role: UserRole,
+        scope_label: &str,
+        used_tokens: i64,
+        current_budget: i64,
+        proposed_budget: i64,
+    ) -> bool {
+        if user_role != UserRole::Owner {
+            return false;
+        }
+        if proposed_budget <= current_budget {
+            return false;
+        }
+
+        let hub_weak = self.hub.read().await.clone();
+        let Some(hub_weak) = hub_weak else {
+            return false;
+        };
+        let Some(hub_arc) = hub_weak.upgrade() else {
+            return false;
+        };
+
+        let approval_desc = format!(
+            "Extend {} token budget from {} to {} and continue?",
+            scope_label, current_budget, proposed_budget
+        );
+        let warnings = vec![
+            format!("Current usage: {} tokens.", used_tokens),
+            "This may increase spend for this run.".to_string(),
+        ];
+
+        match hub_arc
+            .request_inline_approval(
+                session_id,
+                &approval_desc,
+                RiskLevel::High,
+                &warnings,
+                PermissionMode::Cautious,
+            )
+            .await
+        {
+            Ok(ApprovalResponse::AllowOnce)
+            | Ok(ApprovalResponse::AllowSession)
+            | Ok(ApprovalResponse::AllowAlways) => true,
+            Ok(ApprovalResponse::Deny) => false,
+            Err(e) => {
+                warn!(
+                    session_id,
+                    scope = scope_label,
+                    error = %e,
+                    "Budget extension approval unavailable"
+                );
+                false
+            }
+        }
+    }
+
     async fn append_graceful_assistant_summary(
         &self,
         emitter: &crate::events::EventEmitter,

@@ -65,9 +65,29 @@ fn project_scope_violation_for_tool_call(
         return None;
     }
 
+    let allow_scaffold_parent_dir = |candidate: &str| -> bool {
+        if tool_name != "run_command" {
+            return false;
+        }
+        let Some(scope_path) = crate::tools::fs_utils::validate_path(allowed_scope).ok() else {
+            return false;
+        };
+        if scope_path.is_dir() {
+            return false;
+        }
+        let Some(candidate_path) = crate::tools::fs_utils::validate_path(candidate).ok() else {
+            return false;
+        };
+        scope_path
+            .parent()
+            .is_some_and(|parent| parent.is_dir() && candidate_path == parent)
+    };
+
     let violations: Vec<String> = candidate_dirs
         .iter()
-        .filter(|dir| !scope_allows_project_dir(allowed_scope, dir))
+        .filter(|dir| {
+            !scope_allows_project_dir(allowed_scope, dir) && !allow_scaffold_parent_dir(dir)
+        })
         .cloned()
         .collect();
     if violations.is_empty() {
@@ -86,6 +106,83 @@ fn is_hard_policy_tool_budget_reached(
     policy_tool_budget: usize,
 ) -> bool {
     policy_tool_budget > 0 && total_tool_calls_attempted >= policy_tool_budget
+}
+
+fn tool_result_indicates_background_detach(tool_name: &str, result_text: &str) -> bool {
+    let _ = tool_name;
+    result_text.contains("Moved to background")
+        || result_text.contains("started in background")
+        || result_text.contains("spawned in background")
+}
+
+fn build_background_detach_ack(tool_name: &str, result_text: &str) -> String {
+    let default_prefix = match tool_name {
+        "terminal" => "The command is running in the background.",
+        "cli_agent" => "The CLI agent task is running in the background.",
+        "spawn_agent" => "The spawned sub-agent is running in the background.",
+        _ => "The task is running in the background.",
+    };
+    let first_line = result_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("[SYSTEM]"))
+        .unwrap_or(default_prefix);
+    format!(
+        "{} Completion notifications are enabled, and the final result will be sent automatically when it finishes.",
+        first_line
+    )
+}
+
+fn run_command_policy_block_requires_terminal(result_text: &str) -> bool {
+    let lower = result_text.to_ascii_lowercase();
+    lower.contains("safe command list")
+        || lower.contains("use 'terminal' for this command")
+        || lower.contains("use `terminal`")
+        || lower.contains("shell operators")
+        || lower.contains("daemonization primitives are blocked in run_command")
+}
+
+fn shell_single_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\"'\"'");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn build_terminal_fallback_arguments_from_run_command(raw_arguments: &str) -> Option<String> {
+    let args = serde_json::from_str::<Value>(raw_arguments).ok()?;
+    let map = args.as_object()?;
+    let command = map.get("command").and_then(|v| v.as_str())?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let working_dir = map
+        .get("working_dir")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let terminal_command = if let Some(dir) = working_dir {
+        format!("cd {} && {}", shell_single_quote(dir), command)
+    } else {
+        command.to_string()
+    };
+    Some(
+        json!({
+            "action": "run",
+            "command": terminal_command,
+        })
+        .to_string(),
+    )
 }
 
 impl Agent {
@@ -138,6 +235,7 @@ impl Agent {
         let mut recent_tool_names = std::mem::take(ctx.recent_tool_names);
         let mut successful_send_file_keys = std::mem::take(ctx.successful_send_file_keys);
         let mut cli_agent_boundary_injected = *ctx.cli_agent_boundary_injected;
+        let mut pending_background_ack = std::mem::take(ctx.pending_background_ack);
         let mut stall_count = *ctx.stall_count;
         let mut deferred_no_tool_streak = *ctx.deferred_no_tool_streak;
         let mut consecutive_clean_iterations = *ctx.consecutive_clean_iterations;
@@ -172,6 +270,7 @@ impl Agent {
                 *ctx.recent_tool_names = recent_tool_names;
                 *ctx.successful_send_file_keys = successful_send_file_keys;
                 *ctx.cli_agent_boundary_injected = cli_agent_boundary_injected;
+                *ctx.pending_background_ack = pending_background_ack;
                 *ctx.stall_count = stall_count;
                 *ctx.deferred_no_tool_streak = deferred_no_tool_streak;
                 *ctx.consecutive_clean_iterations = consecutive_clean_iterations;
@@ -192,7 +291,12 @@ impl Agent {
         let mut iteration_had_tool_failures = false;
         for tc in &resp.tool_calls {
             let policy_tool_budget = policy_bundle.policy.tool_budget;
-            if is_hard_policy_tool_budget_reached(total_tool_calls_attempted, policy_tool_budget) {
+            if self.policy_config.policy_enforce
+                && is_hard_policy_tool_budget_reached(
+                    total_tool_calls_attempted,
+                    policy_tool_budget,
+                )
+            {
                 force_text_response = true;
                 pending_system_messages.push(format!(
                     "[SYSTEM] Hard tool budget reached ({} calls). Stop calling tools and answer with the evidence already collected.",
@@ -332,7 +436,13 @@ impl Agent {
             ) {
                 effective_arguments = updated_args;
                 injected_project_dir = Some(injected.clone());
-                known_project_dir = Some(injected);
+                let preserve_existing_target_scope = tc.name == "run_command"
+                    && known_project_dir
+                        .as_deref()
+                        .is_some_and(|known| known != injected.as_str());
+                if !preserve_existing_target_scope {
+                    known_project_dir = Some(injected);
+                }
             }
             let attempted_required_file_recheck = require_file_recheck_before_answer
                 && is_file_recheck_tool(&tc.name)
@@ -476,7 +586,58 @@ impl Agent {
                 )
                 .await;
             let mut result_text = io.result_text;
-            let tool_duration_ms = io.tool_duration_ms;
+            let mut tool_duration_ms = io.tool_duration_ms;
+            if tc.name == "run_command" && run_command_policy_block_requires_terminal(&result_text)
+            {
+                if let Some(terminal_args) =
+                    build_terminal_fallback_arguments_from_run_command(&effective_arguments)
+                {
+                    let fallback_started = Instant::now();
+                    let terminal_result = self
+                        .execute_tool_with_watchdog(
+                            "terminal",
+                            &terminal_args,
+                            &tool_exec::ToolExecCtx {
+                                session_id,
+                                task_id: Some(task_id),
+                                status_tx: status_tx.clone(),
+                                channel_visibility: channel_ctx.visibility,
+                                channel_id: channel_ctx.channel_id.as_deref(),
+                                trusted: channel_ctx.trusted,
+                                user_role,
+                            },
+                        )
+                        .await;
+                    let fallback_duration =
+                        fallback_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    tool_duration_ms = tool_duration_ms.saturating_add(fallback_duration);
+                    let fallback_note =
+                        "[SYSTEM] run_command was blocked by policy; auto-routed to `terminal`.";
+                    result_text = match terminal_result {
+                        Ok(text) => format!("{}\n\n{}", text, fallback_note),
+                        Err(e) => format!("Error: {}\n\n{}", e, fallback_note),
+                    };
+                    if self.context_window_config.enabled {
+                        result_text = crate::memory::context_window::compress_tool_result(
+                            "terminal",
+                            &result_text,
+                            self.context_window_config.max_tool_result_chars,
+                        );
+                    }
+                }
+            }
+            let background_detached =
+                tool_result_indicates_background_detach(&tc.name, &result_text);
+
+            if background_detached {
+                pending_background_ack = Some(build_background_detach_ack(&tc.name, &result_text));
+                force_text_response = true;
+                let system_msg = "[SYSTEM] A background task is now running and completion notifications are enabled. \
+Do NOT call additional tools or poll status in this turn. Reply to the user now that work continues in background and results will be sent automatically."
+                    .to_string();
+                pending_system_messages.push(system_msg.clone());
+                result_text = format!("{}\n\n{}", result_text, system_msg);
+            }
 
             // Track total calls per tool
             *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
@@ -605,6 +766,16 @@ impl Agent {
                     warn!(task_id = %tid, error = %e, "Failed to log task activity");
                 }
             }
+
+            if background_detached {
+                info!(
+                    session_id,
+                    iteration,
+                    tool = %tc.name,
+                    "Background task detached; ending tool execution phase early and forcing text response"
+                );
+                break;
+            }
         }
 
         self.apply_post_tool_iteration_controls(
@@ -679,10 +850,98 @@ mod tests {
     }
 
     #[test]
+    fn run_command_policy_block_requires_terminal_detects_policy_errors() {
+        assert!(run_command_policy_block_requires_terminal(
+            "Error: Command 'npm install' is not in the safe command list for run_command. Use 'terminal' for this command."
+        ));
+        assert!(!run_command_policy_block_requires_terminal(
+            "$ cargo test (exit: 0, 22ms)"
+        ));
+    }
+
+    #[test]
+    fn build_terminal_fallback_arguments_preserves_working_dir() {
+        let args = r#"{"command":"npm create vite@latest whatsapp-site -- --template react","working_dir":"/tmp/my folder"}"#;
+        let terminal_args = build_terminal_fallback_arguments_from_run_command(args)
+            .expect("fallback args expected");
+        let parsed: Value = serde_json::from_str(&terminal_args).expect("valid json");
+        assert_eq!(parsed["action"], "run");
+        assert_eq!(
+            parsed["command"],
+            "cd '/tmp/my folder' && npm create vite@latest whatsapp-site -- --template react"
+        );
+    }
+
+    #[test]
+    fn build_terminal_fallback_arguments_escapes_single_quotes() {
+        let args = r#"{"command":"npm create vite@latest whatsapp-site -- --template react","working_dir":"/tmp/david's projects"}"#;
+        let terminal_args = build_terminal_fallback_arguments_from_run_command(args)
+            .expect("fallback args expected");
+        let parsed: Value = serde_json::from_str(&terminal_args).expect("valid json");
+        assert_eq!(
+            parsed["command"],
+            "cd '/tmp/david'\"'\"'s projects' && npm create vite@latest whatsapp-site -- --template react"
+        );
+    }
+
+    #[test]
+    fn project_scope_violation_allows_run_command_parent_dir_for_new_project_scaffolding() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("projects");
+        std::fs::create_dir_all(&parent).expect("create parent");
+        let target = parent.join("new-site");
+        let args = format!(
+            r#"{{"command":"pwd","working_dir":"{}"}}"#,
+            parent.to_string_lossy()
+        );
+        let violation = project_scope_violation_for_tool_call(
+            "run_command",
+            &args,
+            Some(target.to_string_lossy().as_ref()),
+            false,
+        );
+        assert!(violation.is_none());
+    }
+
+    #[test]
     fn hard_policy_tool_budget_reached_when_attempts_hit_limit() {
         assert!(is_hard_policy_tool_budget_reached(6, 6));
         assert!(is_hard_policy_tool_budget_reached(7, 6));
         assert!(!is_hard_policy_tool_budget_reached(5, 6));
         assert!(!is_hard_policy_tool_budget_reached(10, 0));
+    }
+
+    #[test]
+    fn detects_background_detach_markers_for_supported_tools() {
+        assert!(tool_result_indicates_background_detach(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=123)."
+        ));
+        assert!(tool_result_indicates_background_detach(
+            "cli_agent",
+            "CLI agent 'x' started in background (task_id=abc)."
+        ));
+        assert!(tool_result_indicates_background_detach(
+            "spawn_agent",
+            "Sub-agent spawned in background for mission: \"...\""
+        ));
+        assert!(tool_result_indicates_background_detach(
+            "web_search",
+            "Moved to background (pid=1)"
+        ));
+        assert!(!tool_result_indicates_background_detach(
+            "terminal",
+            "Process finished normally."
+        ));
+    }
+
+    #[test]
+    fn builds_deterministic_background_ack_from_tool_result() {
+        let ack = build_background_detach_ack(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=123).\n\n[SYSTEM] ...",
+        );
+        assert!(ack.contains("Moved to background (pid=123)"));
+        assert!(ack.contains("final result will be sent automatically"));
     }
 }

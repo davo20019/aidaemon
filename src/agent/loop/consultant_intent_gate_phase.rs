@@ -5,6 +5,7 @@ use crate::traits::ProviderResponse;
 
 pub(super) struct ConsultantIntentGateData {
     pub intent_gate: IntentGateDecision,
+    pub needs_tools: bool,
 }
 
 pub(super) enum ConsultantIntentGateOutcome {
@@ -161,6 +162,7 @@ impl Agent {
         let (analysis_without_gate, model_intent_gate) = extract_intent_gate(&raw_analysis);
         let analysis = sanitize_consultant_analysis(&analysis_without_gate);
         let inferred_gate = infer_intent_gate(user_text, &analysis);
+        let deterministic_tools_required = inferred_gate.needs_tools.unwrap_or(false);
         let mut intent_gate = merge_intent_gate_decision(model_intent_gate, inferred_gate);
         let is_acknowledgment = intent_gate.is_acknowledgment.unwrap_or(false);
 
@@ -219,6 +221,20 @@ impl Agent {
                 intent_gate.needs_clarification.unwrap_or(false),
             )
         };
+        if deterministic_tools_required
+            && !needs_tools
+            && !user_is_short_correction
+            && !is_acknowledgment
+        {
+            info!(
+                session_id,
+                "Consultant pass: deterministic local-execution signal detected — forcing tools mode"
+            );
+            can_answer_now = false;
+            needs_tools = true;
+            intent_gate.can_answer_now = Some(false);
+            intent_gate.needs_tools = Some(true);
+        }
         if can_answer_now
             && !needs_tools
             && analysis.trim().is_empty()
@@ -465,7 +481,10 @@ impl Agent {
         }
 
         Ok(ConsultantIntentGateOutcome::Continue(
-            ConsultantIntentGateData { intent_gate },
+            ConsultantIntentGateData {
+                intent_gate,
+                needs_tools,
+            },
         ))
     }
 }

@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::{IntentGateDecision, INTENT_GATE_MARKER};
 
@@ -66,6 +66,52 @@ pub(super) fn parse_intent_gate_json(text: &str) -> Option<IntentGateDecision> {
                 out
             })
             .unwrap_or_default(),
+    })
+}
+
+pub(super) fn intent_gate_schema_json() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "can_answer_now": { "type": "boolean" },
+            "needs_tools": { "type": "boolean" },
+            "needs_clarification": { "type": "boolean" },
+            "clarifying_question": { "type": "string" },
+            "missing_info": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "complexity": {
+                "type": "string",
+                "enum": ["knowledge", "simple", "complex"]
+            },
+            "cancel_intent": { "type": "boolean" },
+            "cancel_scope": { "type": "string" },
+            "is_acknowledgment": { "type": "boolean" },
+            "schedule": { "type": "string" },
+            "schedule_type": { "type": "string" },
+            "schedule_cron": { "type": "string" },
+            "domains": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
+        },
+        "required": [
+            "can_answer_now",
+            "needs_tools",
+            "needs_clarification",
+            "clarifying_question",
+            "missing_info",
+            "complexity",
+            "cancel_intent",
+            "cancel_scope",
+            "is_acknowledgment",
+            "schedule",
+            "schedule_type",
+            "schedule_cron",
+            "domains"
+        ],
+        "additionalProperties": false
     })
 }
 

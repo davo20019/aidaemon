@@ -129,6 +129,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub terminal: TerminalConfig,
     #[serde(default)]
+    pub path_aliases: PathAliasConfig,
+    #[serde(default)]
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub triggers: TriggersConfig,
@@ -535,6 +537,16 @@ impl Default for TerminalConfig {
             permission_mode: PermissionMode::default(),
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct PathAliasConfig {
+    /// Optional alias roots for "projects/..." paths.
+    /// Example:
+    /// [path_aliases]
+    /// projects = ["~/projects"]
+    #[serde(default)]
+    pub projects: Vec<String>,
 }
 
 fn default_initial_timeout_secs() -> u64 {

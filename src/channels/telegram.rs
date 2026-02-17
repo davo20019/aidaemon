@@ -2087,11 +2087,18 @@ impl Channel for TelegramChannel {
             });
         let html = markdown_to_telegram_html(text);
         let plain = strip_latex(text);
+        let mut first_err: Option<anyhow::Error> = None;
         for chunk in split_message(&html, 4096) {
             if let Err(e) = send_html_or_fallback(&self.bot, ChatId(chat_id), &chunk, &plain).await
             {
                 warn!("Failed to send message: {}", e);
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("Failed to send Telegram message: {}", e));
+                }
             }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
         }
         Ok(())
     }

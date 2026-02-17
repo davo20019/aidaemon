@@ -8,7 +8,10 @@ use zeroize::Zeroize;
 
 use crate::llm_markers::CONSULTANT_TEXT_ONLY_MARKER;
 use crate::providers::ProviderError;
-use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
+use crate::traits::{
+    ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
+    ToolChoiceMode,
+};
 
 /// Recursively strip fields unsupported by Gemini API from a JSON value.
 /// Google Gemini rejects `$schema` and `additionalProperties` in function parameter schemas.
@@ -370,11 +373,16 @@ impl GoogleGenAiProvider {
         system_instruction: Option<Value>,
         contents: Vec<Value>,
         tools: &[Value],
+        options: &ChatOptions,
     ) -> (Value, bool, bool, bool) {
         let consultant_text_only_mode = Self::is_consultant_text_only_mode(&system_instruction);
         let has_function_tools = !tools.is_empty();
-        let include_grounding = !has_function_tools && !consultant_text_only_mode;
-        let disable_function_calling = !has_function_tools || consultant_text_only_mode;
+        let include_grounding = matches!(options.tool_choice, ToolChoiceMode::Auto)
+            && !has_function_tools
+            && !consultant_text_only_mode;
+        let disable_function_calling = !has_function_tools
+            || consultant_text_only_mode
+            || matches!(options.tool_choice, ToolChoiceMode::None);
         let gemini_tools = self.convert_tools(tools, include_grounding);
 
         let mut body = json!({
@@ -388,9 +396,39 @@ impl GoogleGenAiProvider {
             body["tools"] = json!(gt);
         }
         if disable_function_calling {
-            body["tool_config"] = json!({
-                "function_calling_config": { "mode": "NONE" }
-            });
+            body["tool_config"] = json!({ "function_calling_config": { "mode": "NONE" } });
+        } else {
+            match &options.tool_choice {
+                ToolChoiceMode::Required => {
+                    body["tool_config"] = json!({ "function_calling_config": { "mode": "ANY" } });
+                }
+                ToolChoiceMode::Specific(name) => {
+                    body["tool_config"] = json!({
+                        "function_calling_config": {
+                            "mode": "ANY",
+                            "allowed_function_names": [name]
+                        }
+                    });
+                }
+                ToolChoiceMode::Auto | ToolChoiceMode::None => {}
+            }
+        }
+
+        match &options.response_mode {
+            ResponseMode::Text => {}
+            ResponseMode::JsonObject => {
+                body["generation_config"] = json!({
+                    "response_mime_type": "application/json"
+                });
+            }
+            ResponseMode::JsonSchema { schema, .. } => {
+                let mut stripped = schema.clone();
+                strip_unsupported_fields(&mut stripped);
+                body["generation_config"] = json!({
+                    "response_mime_type": "application/json",
+                    "response_schema": stripped
+                });
+            }
         }
 
         (
@@ -599,11 +637,22 @@ impl ModelProvider for GoogleGenAiProvider {
         messages: &[Value],
         tools: &[Value],
     ) -> anyhow::Result<ProviderResponse> {
+        self.chat_with_options(model, messages, tools, &ChatOptions::default())
+            .await
+    }
+
+    async fn chat_with_options(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+        options: &ChatOptions,
+    ) -> anyhow::Result<ProviderResponse> {
         let (system_instruction, contents) = self.convert_messages(messages);
         let original_contents = contents.clone();
         let has_function_tools = !tools.is_empty();
         let (body, consultant_text_only_mode, include_grounding, disable_function_calling) =
-            self.build_request_body(system_instruction, contents, tools);
+            self.build_request_body(system_instruction, contents, tools, options);
 
         // Use header-based authentication instead of URL query parameter
         // to avoid API key exposure in logs, proxies, and error messages
@@ -616,8 +665,23 @@ impl ModelProvider for GoogleGenAiProvider {
             has_function_tools,
             include_grounding,
             disable_function_calling,
+            response_mode = ?options.response_mode,
+            tool_choice = ?options.tool_choice,
             "Calling Google GenAI"
         );
+
+        if has_function_tools
+            && matches!(
+                options.tool_choice,
+                ToolChoiceMode::Required | ToolChoiceMode::Specific(_)
+            )
+            && disable_function_calling
+        {
+            warn!(
+                tool_choice = ?options.tool_choice,
+                "Requested required/specific tool_choice but function calling is disabled by mode constraints"
+            );
+        }
 
         let resp = match self
             .client
@@ -924,7 +988,7 @@ mod tests {
         })];
 
         let (body, consultant_mode, include_grounding, disable_fn_calling) =
-            p.build_request_body(system_instruction, contents, &[]);
+            p.build_request_body(system_instruction, contents, &[], &ChatOptions::default());
 
         assert!(consultant_mode);
         assert!(!include_grounding);
@@ -948,7 +1012,7 @@ mod tests {
         })];
 
         let (body, consultant_mode, include_grounding, disable_fn_calling) =
-            p.build_request_body(system_instruction, contents, &[]);
+            p.build_request_body(system_instruction, contents, &[], &ChatOptions::default());
 
         assert!(!consultant_mode);
         assert!(include_grounding);
@@ -961,6 +1025,83 @@ mod tests {
         assert!(
             tools.iter().any(|t| t.get("google_search").is_some()),
             "expected google_search grounding when not in consultant mode"
+        );
+    }
+
+    #[test]
+    fn test_request_body_required_tool_choice_sets_any_mode() {
+        let p = provider();
+        let system_instruction = Some(json!({
+            "parts": [{ "text": "normal system prompt" }]
+        }));
+        let contents = vec![json!({
+            "role": "user",
+            "parts": [{ "text": "run a tool" }]
+        })];
+        let tools = vec![openai_tool(
+            "search_files",
+            json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }),
+        )];
+        let options = ChatOptions {
+            response_mode: ResponseMode::Text,
+            tool_choice: ToolChoiceMode::Required,
+        };
+
+        let (body, consultant_mode, include_grounding, disable_fn_calling) =
+            p.build_request_body(system_instruction, contents, &tools, &options);
+
+        assert!(!consultant_mode);
+        assert!(!include_grounding);
+        assert!(!disable_fn_calling);
+        assert_eq!(
+            body["tool_config"]["function_calling_config"]["mode"],
+            "ANY"
+        );
+    }
+
+    #[test]
+    fn test_request_body_json_schema_sets_generation_config_and_strips_unsupported_fields() {
+        let p = provider();
+        let system_instruction = Some(json!({
+            "parts": [{ "text": "normal system prompt" }]
+        }));
+        let contents = vec![json!({
+            "role": "user",
+            "parts": [{ "text": "return intent gate json" }]
+        })];
+        let options = ChatOptions {
+            response_mode: ResponseMode::JsonSchema {
+                name: "intent_gate_v1".to_string(),
+                schema: json!({
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "can_answer_now": { "type": "boolean" }
+                    },
+                    "required": ["can_answer_now"]
+                }),
+                strict: true,
+            },
+            tool_choice: ToolChoiceMode::Auto,
+        };
+
+        let (body, _, _, _) = p.build_request_body(system_instruction, contents, &[], &options);
+
+        assert_eq!(
+            body["generation_config"]["response_mime_type"],
+            "application/json"
+        );
+        assert_no_schema_field(
+            &body["generation_config"]["response_schema"],
+            "generation_config.response_schema",
+        );
+        assert_no_additional_properties(
+            &body["generation_config"]["response_schema"],
+            "generation_config.response_schema",
         );
     }
 

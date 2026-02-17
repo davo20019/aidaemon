@@ -31,6 +31,7 @@ impl Agent {
 
     /// Try up to 2 different fallback models after retries are exhausted.
     /// On success, switches the active model.
+    #[allow(clippy::too_many_arguments)]
     async fn cascade_fallback(
         &self,
         provider: &Arc<dyn ModelProvider>,
@@ -38,6 +39,7 @@ impl Agent {
         failed_model: &str,
         messages: &[Value],
         tool_defs: &[Value],
+        options: &ChatOptions,
         last_err: &ProviderError,
     ) -> anyhow::Result<crate::traits::ProviderResponse> {
         let mut tried: Vec<String> = vec![failed_model.to_string()];
@@ -58,7 +60,10 @@ impl Agent {
                 "Cascade fallback attempt"
             );
 
-            match provider.chat(&fallback, messages, tool_defs).await {
+            match provider
+                .chat_with_options(&fallback, messages, tool_defs, options)
+                .await
+            {
                 Ok(resp) => {
                     *self.model.write().await = fallback;
                     self.stamp_lastgood().await;
@@ -85,8 +90,12 @@ impl Agent {
         model: &str,
         messages: &[Value],
         tool_defs: &[Value],
+        options: &ChatOptions,
     ) -> anyhow::Result<crate::traits::ProviderResponse> {
-        match provider.chat(model, messages, tool_defs).await {
+        match provider
+            .chat_with_options(model, messages, tool_defs, options)
+            .await
+        {
             Ok(resp) => {
                 // Config works — stamp as last known good (best-effort, non-blocking)
                 self.stamp_lastgood().await;
@@ -108,9 +117,31 @@ impl Agent {
 
                 match provider_err.kind {
                     // --- Non-retryable: tell the user, stop ---
-                    ProviderErrorKind::Auth
-                    | ProviderErrorKind::Billing
-                    | ProviderErrorKind::BadRequest => {
+                    ProviderErrorKind::Auth | ProviderErrorKind::Billing => {
+                        Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                    }
+                    ProviderErrorKind::BadRequest => {
+                        if *options != ChatOptions::default() {
+                            warn!(
+                                model,
+                                response_mode = ?options.response_mode,
+                                tool_choice = ?options.tool_choice,
+                                "Provider rejected advanced chat options; retrying once with default options"
+                            );
+                            match provider.chat(model, messages, tool_defs).await {
+                                Ok(resp) => {
+                                    self.stamp_lastgood().await;
+                                    return Ok(resp);
+                                }
+                                Err(retry_err) => {
+                                    warn!(
+                                        model,
+                                        error = %retry_err,
+                                        "Fallback retry without advanced options also failed"
+                                    );
+                                }
+                            }
+                        }
                         Err(anyhow::anyhow!("{}", provider_err.user_message()))
                     }
 
@@ -126,7 +157,10 @@ impl Agent {
                                 "Rate limited, waiting before retry"
                             );
                             tokio::time::sleep(Duration::from_secs(wait)).await;
-                            match provider.chat(model, messages, tool_defs).await {
+                            match provider
+                                .chat_with_options(model, messages, tool_defs, options)
+                                .await
+                            {
                                 Ok(resp) => {
                                     self.stamp_lastgood().await;
                                     return Ok(resp);
@@ -142,6 +176,7 @@ impl Agent {
                             model,
                             messages,
                             tool_defs,
+                            options,
                             &provider_err,
                         )
                         .await
@@ -160,7 +195,10 @@ impl Agent {
                                 "Retrying after transient error"
                             );
                             tokio::time::sleep(Duration::from_secs(wait)).await;
-                            match provider.chat(model, messages, tool_defs).await {
+                            match provider
+                                .chat_with_options(model, messages, tool_defs, options)
+                                .await
+                            {
                                 Ok(resp) => {
                                     self.stamp_lastgood().await;
                                     return Ok(resp);
@@ -176,6 +214,7 @@ impl Agent {
                             model,
                             messages,
                             tool_defs,
+                            options,
                             &provider_err,
                         )
                         .await
@@ -193,6 +232,7 @@ impl Agent {
                             model,
                             messages,
                             tool_defs,
+                            options,
                             &provider_err,
                         )
                         .await

@@ -25,7 +25,10 @@ pub use memory::{
     BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Procedure, UserProfile,
 };
 pub use people::{Person, PersonFact};
-pub use provider::{ModelProvider, ProviderResponse, TokenUsage, TokenUsageRecord};
+pub use provider::{
+    ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord,
+    ToolChoiceMode,
+};
 pub use tools::{AgentRole, Tool, ToolCapabilities, ToolRole};
 pub use trigger_event::TriggerEvent;
 

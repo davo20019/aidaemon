@@ -8,11 +8,11 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info};
+use tracing::{info, warn};
 
 use crate::agent::{Agent, StatusUpdate};
 use crate::channels::ChannelHub;
-use crate::traits::{AgentRole, Tool};
+use crate::traits::{AgentRole, StateStore, Tool};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
@@ -27,10 +27,16 @@ use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 pub struct SpawnAgentTool {
     agent: OnceLock<Weak<Agent>>,
     hub: OnceLock<Weak<ChannelHub>>,
+    state: Option<Arc<dyn StateStore>>,
     max_response_chars: usize,
     timeout_secs: u64,
     executor_task_runs: Arc<Mutex<HashSet<String>>>,
 }
+
+#[cfg(test)]
+const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 1;
+#[cfg(not(test))]
+const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 20;
 
 impl SpawnAgentTool {
     /// Create a SpawnAgentTool with a known agent reference.
@@ -41,6 +47,7 @@ impl SpawnAgentTool {
         Self {
             agent: lock,
             hub: OnceLock::new(),
+            state: None,
             max_response_chars,
             timeout_secs,
             executor_task_runs: Arc::new(Mutex::new(HashSet::new())),
@@ -53,10 +60,18 @@ impl SpawnAgentTool {
         Self {
             agent: OnceLock::new(),
             hub: OnceLock::new(),
+            state: None,
             max_response_chars,
             timeout_secs,
             executor_task_runs: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Set state store reference for queued background notifications when direct
+    /// channel delivery is unavailable.
+    pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
+        self.state = Some(state);
+        self
     }
 
     /// Set the agent reference. Must be called exactly once after the owning
@@ -153,6 +168,56 @@ fn strip_leading_wait(task: &str) -> String {
         String::new()
     } else {
         trimmed
+    }
+}
+
+async fn deliver_background_notification(
+    hub: Option<&Arc<ChannelHub>>,
+    state: Option<&Arc<dyn StateStore>>,
+    goal_id: &str,
+    session_id: &str,
+    notification_type: &str,
+    message: &str,
+    context: &str,
+) {
+    let mut delivered = false;
+    if let Some(hub_arc) = hub {
+        if let Err(e) = hub_arc.send_text(session_id, message).await {
+            warn!(
+                session_id = %session_id,
+                goal_id = %goal_id,
+                notification_type = %notification_type,
+                error = %e,
+                "{context}: direct hub delivery failed"
+            );
+        } else {
+            delivered = true;
+        }
+    }
+
+    if delivered {
+        return;
+    }
+
+    if let Some(state_store) = state {
+        let entry =
+            crate::traits::NotificationEntry::new(goal_id, session_id, notification_type, message);
+        if let Err(e) = state_store.enqueue_notification(&entry).await {
+            warn!(
+                session_id = %session_id,
+                goal_id = %goal_id,
+                notification_type = %notification_type,
+                error = %e,
+                "{context}: enqueue fallback failed"
+            );
+        }
+    } else {
+        warn!(
+            session_id = %session_id,
+            goal_id = %goal_id,
+            notification_type = %notification_type,
+            "{context}: no hub and no queue fallback configured; update dropped"
+        );
     }
 }
 
@@ -372,30 +437,31 @@ impl Tool for SpawnAgentTool {
             return result;
         }
 
-        // Background mode: need hub + session_id, fall back to sync if unavailable
-        let hub = match self.get_hub() {
-            Some(h) => h,
-            None => {
-                info!("Background mode requested but hub not available, falling back to sync");
-                let result = self
-                    .run_sync(
-                        agent,
-                        &effective_mission,
-                        &effective_task,
-                        status_tx,
-                        channel_ctx,
-                        user_role,
-                        child_role,
-                        goal_id_ref.as_deref(),
-                        task_id_ref.as_deref(),
-                    )
-                    .await;
-                if let Some(ref task_id) = executor_task_id {
-                    self.finish_executor_task(task_id).await;
-                }
-                return result;
+        // Background mode: need at least one completion delivery path.
+        let hub = self.get_hub();
+        let state = self.state.clone();
+        if hub.is_none() && state.is_none() {
+            info!(
+                "Background mode requested but no hub/state notification path is available, falling back to sync"
+            );
+            let result = self
+                .run_sync(
+                    agent,
+                    &effective_mission,
+                    &effective_task,
+                    status_tx,
+                    channel_ctx,
+                    user_role,
+                    child_role,
+                    goal_id_ref.as_deref(),
+                    task_id_ref.as_deref(),
+                )
+                .await;
+            if let Some(ref task_id) = executor_task_id {
+                self.finish_executor_task(task_id).await;
             }
-        };
+            return result;
+        }
         let session_id = match args._session_id {
             Some(ref id) if !id.is_empty() => id.clone(),
             _ => {
@@ -426,57 +492,100 @@ impl Tool for SpawnAgentTool {
         let max_response_chars = self.max_response_chars;
         let executor_task_runs = Arc::clone(&self.executor_task_runs);
         let executor_task_id_for_bg = executor_task_id;
+        let notify_goal_id = goal_id_ref.clone().unwrap_or_else(|| "global".to_string());
+        let notify_status_tx = status_tx.clone();
 
         tokio::spawn(async move {
+            let started_at = std::time::Instant::now();
+            let mut progress_interval =
+                tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
+            progress_interval.tick().await; // consume immediate tick
             let timeout_duration = Duration::from_secs(timeout_secs);
-            let result = tokio::time::timeout(
+            let mut result_fut = std::pin::pin!(tokio::time::timeout(
                 timeout_duration,
                 agent.spawn_child(
                     &mission,
                     &task,
-                    status_tx,
+                    status_tx.clone(),
                     channel_ctx,
                     user_role,
                     child_role,
                     goal_id_ref.as_deref(),
                     task_id_ref.as_deref(),
                 ),
-            )
-            .await;
+            ));
+            let result = loop {
+                tokio::select! {
+                    res = &mut result_fut => break res,
+                    _ = progress_interval.tick() => {
+                        let elapsed_secs = started_at.elapsed().as_secs();
+                        let progress_message = format!(
+                            "Background sub-agent still running after {}s.\nMission: {}",
+                            elapsed_secs, mission
+                        );
+                        if let Some(ref tx) = notify_status_tx {
+                            let _ = tx.try_send(StatusUpdate::ToolProgress {
+                                name: "spawn_agent".to_string(),
+                                chunk: format!(
+                                    "Background sub-agent still running ({}s): {}",
+                                    elapsed_secs, mission
+                                ),
+                            });
+                        }
+                        deliver_background_notification(
+                            hub.as_ref(),
+                            state.as_ref(),
+                            &notify_goal_id,
+                            &session_id,
+                            "progress",
+                            &progress_message,
+                            "spawn_agent background progress notifier",
+                        )
+                        .await;
+                    }
+                }
+            };
 
-            let message = match result {
+            let (notification_type, message) = match result {
                 Ok(Ok(response)) => {
                     let text = if response.len() > max_response_chars {
                         truncate_utf8(&response, max_response_chars).to_string()
                     } else {
                         response
                     };
-                    format!(
-                        "\u{2705} Background task complete\nMission: {}\n\n{}",
-                        mission, text
+                    (
+                        "completed",
+                        format!(
+                            "\u{2705} Background task complete\nMission: {}\n\n{}",
+                            mission, text
+                        ),
                     )
                 }
-                Ok(Err(e)) => {
+                Ok(Err(e)) => (
+                    "failed",
                     format!(
                         "\u{274c} Background task failed\nMission: {}\nError: {}",
                         mission, e
-                    )
-                }
-                Err(_) => {
+                    ),
+                ),
+                Err(_) => (
+                    "failed",
                     format!(
                         "\u{23f1} Background task timed out\nMission: {}\nTimed out after {}s",
                         mission, timeout_secs
-                    )
-                }
+                    ),
+                ),
             };
-
-            if let Err(e) = hub.send_text(&session_id, &message).await {
-                error!(
-                    session_id = %session_id,
-                    error = %e,
-                    "Failed to send background task result"
-                );
-            }
+            deliver_background_notification(
+                hub.as_ref(),
+                state.as_ref(),
+                &notify_goal_id,
+                &session_id,
+                notification_type,
+                &message,
+                "spawn_agent background completion notifier",
+            )
+            .await;
 
             if let Some(task_id) = executor_task_id_for_bg {
                 executor_task_runs.lock().await.remove(&task_id);
@@ -547,6 +656,10 @@ impl SpawnAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use crate::traits::{NotificationStore, StateStore};
+    use std::sync::Arc;
 
     #[test]
     fn truncate_utf8_ascii() {
@@ -668,5 +781,37 @@ mod tests {
             tool.try_begin_executor_task("task-1").await,
             "Task lock should be reusable after release"
         );
+    }
+
+    #[tokio::test]
+    async fn background_notification_falls_back_to_queue_when_hub_missing() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let state_dyn: Arc<dyn StateStore> = state.clone();
+
+        deliver_background_notification(
+            None,
+            Some(&state_dyn),
+            "goal_spawn_test",
+            "sess_spawn_test",
+            "progress",
+            "Background sub-agent still running after 20s.\nMission: test",
+            "spawn_test",
+        )
+        .await;
+
+        let pending = state.get_pending_notifications(10).await.unwrap();
+        assert!(pending.iter().any(|entry| {
+            entry.goal_id == "goal_spawn_test"
+                && entry.session_id == "sess_spawn_test"
+                && entry.notification_type == "progress"
+                && entry.message.contains("still running")
+        }));
     }
 }

@@ -3,11 +3,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use zeroize::Zeroize;
 
 use crate::providers::ProviderError;
-use crate::traits::{ModelProvider, ProviderResponse, TokenUsage, ToolCall};
+use crate::traits::{
+    ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
+    ToolChoiceMode,
+};
 
 pub struct AnthropicNativeProvider {
     client: Client,
@@ -194,18 +197,21 @@ impl AnthropicNativeProvider {
         }
         Some(anthropic_tools)
     }
-}
 
-#[async_trait]
-impl ModelProvider for AnthropicNativeProvider {
-    async fn chat(
+    fn build_request_body(
         &self,
         model: &str,
         messages: &[Value],
         tools: &[Value],
-    ) -> anyhow::Result<ProviderResponse> {
+        options: &ChatOptions,
+    ) -> Value {
         let (system, converted_msgs) = self.convert_messages(messages);
-        let anthropic_tools = self.convert_tools(tools);
+        let effective_tools: &[Value] = if matches!(options.tool_choice, ToolChoiceMode::None) {
+            &[]
+        } else {
+            tools
+        };
+        let anthropic_tools = self.convert_tools(effective_tools);
 
         let mut body = json!({
             "model": model,
@@ -220,7 +226,68 @@ impl ModelProvider for AnthropicNativeProvider {
             body["tools"] = json!(at);
         }
 
-        info!(model, url = %self.base_url, "Calling Anthropic Native");
+        if !effective_tools.is_empty() {
+            match &options.tool_choice {
+                ToolChoiceMode::Auto | ToolChoiceMode::None => {}
+                ToolChoiceMode::Required => {
+                    body["tool_choice"] = json!({ "type": "any" });
+                }
+                ToolChoiceMode::Specific(name) => {
+                    body["tool_choice"] = json!({
+                        "type": "tool",
+                        "name": name
+                    });
+                }
+            }
+        } else if matches!(
+            options.tool_choice,
+            ToolChoiceMode::Required | ToolChoiceMode::Specific(_)
+        ) {
+            warn!(
+                tool_choice = ?options.tool_choice,
+                "Ignoring required/specific tool_choice because no tools were provided"
+            );
+        }
+
+        body
+    }
+}
+
+#[async_trait]
+impl ModelProvider for AnthropicNativeProvider {
+    async fn chat(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+    ) -> anyhow::Result<ProviderResponse> {
+        self.chat_with_options(model, messages, tools, &ChatOptions::default())
+            .await
+    }
+
+    async fn chat_with_options(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+        options: &ChatOptions,
+    ) -> anyhow::Result<ProviderResponse> {
+        let body = self.build_request_body(model, messages, tools, options);
+
+        if !matches!(options.response_mode, ResponseMode::Text) {
+            warn!(
+                response_mode = ?options.response_mode,
+                "Anthropic native provider does not enforce response_mode; relying on prompt contract"
+            );
+        }
+
+        info!(
+            model,
+            url = %self.base_url,
+            response_mode = ?options.response_mode,
+            tool_choice = ?options.tool_choice,
+            "Calling Anthropic Native"
+        );
 
         let resp = match self
             .client
@@ -509,5 +576,91 @@ mod tests {
             msgs.len()
         );
         assert_eq!(msgs[0]["role"], "user");
+    }
+
+    fn openai_tool(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "test tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn test_build_request_body_required_tool_choice_sets_any() {
+        let p = provider();
+        let messages = vec![json!({"role": "user", "content": "run a tool"})];
+        let tools = vec![openai_tool("search_files")];
+        let options = ChatOptions {
+            response_mode: ResponseMode::Text,
+            tool_choice: ToolChoiceMode::Required,
+        };
+
+        let body = p.build_request_body("claude-3-5-sonnet-20241022", &messages, &tools, &options);
+
+        assert_eq!(body["tool_choice"]["type"], "any");
+        assert!(body.get("tools").is_some(), "tools should be present");
+    }
+
+    #[test]
+    fn test_build_request_body_specific_tool_choice_sets_named_tool() {
+        let p = provider();
+        let messages = vec![json!({"role": "user", "content": "run search_files"})];
+        let tools = vec![openai_tool("search_files")];
+        let options = ChatOptions {
+            response_mode: ResponseMode::Text,
+            tool_choice: ToolChoiceMode::Specific("search_files".to_string()),
+        };
+
+        let body = p.build_request_body("claude-3-5-sonnet-20241022", &messages, &tools, &options);
+
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "search_files");
+    }
+
+    #[test]
+    fn test_build_request_body_none_tool_choice_strips_tools() {
+        let p = provider();
+        let messages = vec![json!({"role": "user", "content": "just answer text"})];
+        let tools = vec![openai_tool("search_files")];
+        let options = ChatOptions {
+            response_mode: ResponseMode::Text,
+            tool_choice: ToolChoiceMode::None,
+        };
+
+        let body = p.build_request_body("claude-3-5-sonnet-20241022", &messages, &tools, &options);
+
+        assert!(body.get("tools").is_none(), "tools should be stripped");
+        assert!(
+            body.get("tool_choice").is_none(),
+            "tool_choice should be omitted when tools are stripped"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_consultant_style_none_with_empty_tools_is_safe() {
+        let p = provider();
+        let messages = vec![json!({"role": "user", "content": "classify intent"})];
+        let tools: Vec<Value> = vec![];
+        let options = ChatOptions {
+            response_mode: ResponseMode::Text,
+            tool_choice: ToolChoiceMode::None,
+        };
+
+        let body = p.build_request_body("claude-3-5-sonnet-20241022", &messages, &tools, &options);
+
+        assert!(body.get("tools").is_none(), "tools should be omitted");
+        assert!(
+            body.get("tool_choice").is_none(),
+            "tool_choice should stay omitted when no tools are provided"
+        );
     }
 }

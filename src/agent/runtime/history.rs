@@ -397,6 +397,61 @@ fn token_looks_like_filesystem_path(token: &str) -> bool {
         || looks_windows_abs
 }
 
+fn token_is_absolute_like(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let looks_windows_abs = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    token.starts_with('/')
+        || token.starts_with("~/")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || looks_windows_abs
+}
+
+fn resolve_projects_folder_alias(raw_path: &str, alias_roots: &[String]) -> Option<String> {
+    if alias_roots.is_empty() {
+        return None;
+    }
+    let trimmed = raw_path.trim();
+    if token_is_absolute_like(trimmed) {
+        return None;
+    }
+    let relative = trimmed
+        .strip_prefix("./")
+        .unwrap_or(trimmed)
+        .trim_start_matches('/');
+    let starts_with_projects =
+        relative.starts_with("projects/") || relative.starts_with("projects\\");
+    if !starts_with_projects {
+        return None;
+    }
+
+    let suffix = relative
+        .strip_prefix("projects/")
+        .or_else(|| relative.strip_prefix("projects\\"))
+        .unwrap_or("");
+    for root in alias_roots {
+        let Ok(root_path) = crate::tools::fs_utils::validate_path(root) else {
+            continue;
+        };
+        if !root_path.is_dir() {
+            continue;
+        }
+        let candidate = if suffix.is_empty() {
+            root_path.clone()
+        } else {
+            root_path.join(suffix.replace('\\', "/"))
+        };
+        let parent_exists = candidate.parent().is_some_and(|parent| parent.is_dir());
+        if parent_exists {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
 fn is_common_path_segment(token: &str) -> bool {
     matches!(
         token,
@@ -579,8 +634,39 @@ fn extract_project_hints_from_history(
     hints
 }
 
-fn normalize_project_scope_path(raw_path: &str) -> Option<String> {
-    let mut normalized = crate::tools::fs_utils::validate_path(raw_path).ok()?;
+fn normalize_project_scope_path_with_aliases(
+    raw_path: &str,
+    alias_roots: &[String],
+) -> Option<String> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Precedence:
+    // 1) explicit absolute/anchored path (always honor as-is)
+    // 2) existing relative path resolved from current working directory
+    // 3) configured alias roots for "projects/..."
+    let path_for_resolution = if token_is_absolute_like(trimmed) {
+        trimmed.to_string()
+    } else {
+        let cwd_relative = crate::tools::fs_utils::validate_path(trimmed).ok();
+        if let Some(candidate) = cwd_relative {
+            if candidate.exists() {
+                candidate.to_string_lossy().to_string()
+            } else if let Some(alias_candidate) =
+                resolve_projects_folder_alias(trimmed, alias_roots)
+            {
+                alias_candidate
+            } else {
+                candidate.to_string_lossy().to_string()
+            }
+        } else if let Some(alias_candidate) = resolve_projects_folder_alias(trimmed, alias_roots) {
+            alias_candidate
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let mut normalized = crate::tools::fs_utils::validate_path(&path_for_resolution).ok()?;
 
     let trimmed = raw_path.trim_end_matches('/');
     let file_name_looks_like_file = std::path::Path::new(trimmed)
@@ -603,7 +689,12 @@ fn push_project_scope(scopes: &mut Vec<String>, scope: String, max_scopes: usize
     scopes.push(scope);
 }
 
-fn extract_project_scopes_from_text(text: &str, scopes: &mut Vec<String>, max_scopes: usize) {
+fn extract_project_scopes_from_text(
+    text: &str,
+    scopes: &mut Vec<String>,
+    max_scopes: usize,
+    alias_roots: &[String],
+) {
     for raw in text.split_whitespace() {
         if scopes.len() >= max_scopes {
             break;
@@ -620,7 +711,7 @@ fn extract_project_scopes_from_text(text: &str, scopes: &mut Vec<String>, max_sc
         if token.is_empty() || token.contains("://") || !token_looks_like_filesystem_path(token) {
             continue;
         }
-        if let Some(scope) = normalize_project_scope_path(token) {
+        if let Some(scope) = normalize_project_scope_path_with_aliases(token, alias_roots) {
             push_project_scope(scopes, scope, max_scopes);
         }
     }
@@ -631,9 +722,10 @@ fn extract_project_scopes_from_history(
     current_user_text: &str,
     max_scopes: usize,
     include_history_scopes: bool,
+    alias_roots: &[String],
 ) -> Vec<String> {
     let mut scopes = Vec::new();
-    extract_project_scopes_from_text(current_user_text, &mut scopes, max_scopes);
+    extract_project_scopes_from_text(current_user_text, &mut scopes, max_scopes, alias_roots);
 
     if !include_history_scopes {
         return scopes;
@@ -648,7 +740,7 @@ fn extract_project_scopes_from_history(
         };
         match msg.role.as_str() {
             "user" | "assistant" | "tool" => {
-                extract_project_scopes_from_text(content, &mut scopes, max_scopes);
+                extract_project_scopes_from_text(content, &mut scopes, max_scopes, alias_roots);
             }
             _ => {}
         }
@@ -733,6 +825,7 @@ impl Agent {
             current,
             GOAL_CONTEXT_MAX_PROJECT_SCOPES,
             followup_mode != FollowupMode::NewTask,
+            &self.path_aliases.projects,
         );
         let allow_multi_project_scope =
             looks_like_multi_project_request(&current.to_ascii_lowercase());
@@ -1009,7 +1102,7 @@ mod tests {
     fn project_scope_extraction_uses_explicit_current_path() {
         let history = vec![msg("assistant", "Earlier we touched ~/projects/old-one")];
         let current = "Please work in ~/projects/new-one/src and review the files.";
-        let scopes = extract_project_scopes_from_history(&history, current, 4, true);
+        let scopes = extract_project_scopes_from_history(&history, current, 4, true, &[]);
         assert!(!scopes.is_empty());
         assert!(
             scopes[0].contains("new-one"),
@@ -1025,7 +1118,7 @@ mod tests {
             "Found symlink: /Users/davidloor/.openclaw and other directories.",
         )];
         let current = "Find all Rust files in the aidaemon project that contain async fn.";
-        let scopes = extract_project_scopes_from_history(&history, current, 4, false);
+        let scopes = extract_project_scopes_from_history(&history, current, 4, false, &[]);
         assert!(
             scopes.iter().all(|scope| !scope.contains(".openclaw")),
             "new task scope should not inherit prior assistant paths: {:?}",
@@ -1043,7 +1136,7 @@ mod tests {
             msg("assistant", "Should I proceed with a full scan?"),
         ];
         let current = "Yes, do it.";
-        let scopes = extract_project_scopes_from_history(&history, current, 4, true);
+        let scopes = extract_project_scopes_from_history(&history, current, 4, true, &[]);
         assert!(
             scopes
                 .iter()
@@ -1051,6 +1144,52 @@ mod tests {
             "followup should carry prior project scope when explicit: {:?}",
             scopes
         );
+    }
+
+    #[test]
+    fn project_scope_extraction_resolves_projects_folder_alias_to_configured_root() {
+        let history = vec![];
+        let mut project_name = format!("alias-test-{}", uuid::Uuid::new_v4().simple());
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut cwd_candidate = cwd.join("projects").join(&project_name);
+        if cwd_candidate.exists() {
+            project_name = format!("alias-test-{}", uuid::Uuid::new_v4().simple());
+            cwd_candidate = cwd.join("projects").join(&project_name);
+        }
+        assert!(
+            !cwd_candidate.exists(),
+            "cwd candidate unexpectedly exists: {}",
+            cwd_candidate.display()
+        );
+        let current = format!("Initialize a Vite app at projects/{}", project_name);
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects-root");
+        std::fs::create_dir_all(&alias_root).expect("create alias root");
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+        let scopes =
+            extract_project_scopes_from_history(&history, &current, 4, false, &alias_roots);
+        let expected = alias_root.join(&project_name).to_string_lossy().to_string();
+        assert!(
+            scopes.iter().any(|scope| scope == &expected),
+            "expected aliased projects scope '{}', got {:?}",
+            expected,
+            scopes
+        );
+    }
+
+    #[test]
+    fn project_scope_normalization_prefers_absolute_paths_over_aliases() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects-root");
+        std::fs::create_dir_all(&alias_root).expect("create alias root");
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+        let absolute = root.path().join("absolute-target");
+        let normalized = normalize_project_scope_path_with_aliases(
+            absolute.to_string_lossy().as_ref(),
+            &alias_roots,
+        )
+        .expect("normalized absolute path");
+        assert_eq!(normalized, absolute.to_string_lossy());
     }
 
     #[test]

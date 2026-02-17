@@ -4,6 +4,33 @@ use super::*;
 use crate::execution_policy::PolicyBundle;
 use crate::traits::ProviderResponse;
 
+fn build_tool_output_completion_reply(tool_output: &str) -> String {
+    format!("Here is the latest tool output:\n\n{}", tool_output.trim())
+}
+
+fn should_recover_completion_from_tool_output(
+    reply: &str,
+    depth: usize,
+    total_successful_tool_calls: usize,
+) -> bool {
+    if depth != 0 || total_successful_tool_calls == 0 {
+        return false;
+    }
+    reply.trim().is_empty() || is_low_signal_task_lead_reply(reply)
+}
+
+fn should_enforce_no_tool_text_when_tools_required(
+    reply: &str,
+    needs_tools_for_turn: bool,
+    attempted_tool_calls: usize,
+    depth: usize,
+) -> bool {
+    if depth != 0 || !needs_tools_for_turn || attempted_tool_calls > 0 {
+        return false;
+    }
+    !reply.trim().is_empty()
+}
+
 pub(super) struct ConsultantCompletionCtx<'a> {
     pub resp: &'a mut ProviderResponse,
     pub emitter: &'a crate::events::EventEmitter,
@@ -33,7 +60,9 @@ pub(super) struct ConsultantCompletionCtx<'a> {
     pub empty_response_retry_pending: &'a mut bool,
     pub empty_response_retry_note: &'a mut Option<String>,
     pub identity_prefill_text: &'a mut Option<String>,
+    pub pending_background_ack: &'a mut Option<String>,
     pub require_file_recheck_before_answer: &'a mut bool,
+    pub needs_tools_for_turn: bool,
 }
 
 impl Agent {
@@ -69,7 +98,9 @@ impl Agent {
         let mut empty_response_retry_pending = *ctx.empty_response_retry_pending;
         let mut empty_response_retry_note = ctx.empty_response_retry_note.clone();
         let mut identity_prefill_text = ctx.identity_prefill_text.clone();
+        let mut pending_background_ack = std::mem::take(ctx.pending_background_ack);
         let mut require_file_recheck_before_answer = *ctx.require_file_recheck_before_answer;
+        let needs_tools_for_turn = ctx.needs_tools_for_turn;
 
         macro_rules! commit_state {
             () => {
@@ -84,6 +115,7 @@ impl Agent {
                 *ctx.empty_response_retry_pending = empty_response_retry_pending;
                 *ctx.empty_response_retry_note = empty_response_retry_note.clone();
                 *ctx.identity_prefill_text = identity_prefill_text.clone();
+                *ctx.pending_background_ack = pending_background_ack.clone();
                 *ctx.require_file_recheck_before_answer = require_file_recheck_before_answer;
             };
         }
@@ -107,78 +139,94 @@ impl Agent {
                 identity_prefill_text = None;
             }
 
-            if reply.is_empty() {
-                // If the agent actually executed tool calls successfully
-                // and this is the top-level agent (depth 0), send a brief completion note
-                // so the user knows the task finished. Without this, the user gets silence
-                // because the LLM decided the tool output already communicated the answer.
-                // Note: we check total_successful_tool_calls, NOT iteration > 1, because
-                // the consultant pass (iteration 1) doesn't count as real work.
-                if total_successful_tool_calls > 0 && self.depth == 0 {
-                    let task_hint: String = learning_ctx.user_text.chars().take(80).collect();
-                    let task_hint = task_hint.trim();
-                    let reply = if task_hint.is_empty() {
-                        "Done.".to_string()
-                    } else if learning_ctx.user_text.len() > 80 {
-                        format!("Done — {}...", task_hint)
-                    } else {
-                        format!("Done — {}", task_hint)
-                    };
+            // Deterministic cross-model behavior: once a long-running tool detaches
+            // to background, do not rely on model compliance for the handoff text.
+            if self.depth == 0 {
+                if let Some(background_ack) = pending_background_ack.take() {
                     info!(
                         session_id,
-                        iteration, "Agent completed with synthesized completion message"
+                        iteration, "Background detach acknowledgement enforced"
                     );
+                    reply = background_ack;
+                }
+            }
 
-                    // Persist the synthesized reply so it appears in history
-                    // for subsequent interactions (prevents context bleed from
-                    // missing assistant message between two user messages).
-                    let assistant_msg = Message {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: session_id.to_string(),
-                        role: "assistant".to_string(),
-                        content: Some(reply.clone()),
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_calls_json: None,
-                        created_at: Utc::now(),
-                        importance: 0.5,
-                        embedding: None,
-                    };
-                    self.append_assistant_message_with_event(
-                        emitter,
-                        &assistant_msg,
-                        &model,
-                        resp.usage.as_ref().map(|u| u.input_tokens),
-                        resp.usage.as_ref().map(|u| u.output_tokens),
-                    )
-                    .await?;
-
-                    self.emit_task_end(
+            if should_enforce_no_tool_text_when_tools_required(
+                &reply,
+                needs_tools_for_turn,
+                learning_ctx.tool_calls.len(),
+                self.depth,
+            ) {
+                if tool_defs.is_empty() {
+                    warn!(
+                        session_id,
+                        iteration, "Tool-required response blocked, but no tools are available"
+                    );
+                    reply = "I can't complete that request in this context because it requires running tools, but no tools are currently available. Please retry in a tool-enabled context."
+                        .to_string();
+                } else {
+                    deferred_no_tool_streak = deferred_no_tool_streak.saturating_add(1);
+                    stall_count = 0;
+                    consecutive_clean_iterations = 0;
+                    pending_system_messages.push(
+                        "[SYSTEM] ROUTING CONTRACT ENFORCEMENT: This turn requires tool execution. \
+Ignore prior-turn outputs, run the required tool call(s) for the current user message, and then answer with concrete results."
+                            .to_string(),
+                    );
+                    self.emit_decision_point(
                         emitter,
                         task_id,
-                        TaskStatus::Completed,
-                        task_start,
                         iteration,
-                        learning_ctx.tool_calls.len(),
-                        None,
-                        Some(reply.chars().take(200).collect()),
+                        DecisionType::IntentGate,
+                        "Intent gate contract enforced: blocked text-only answer while tools required"
+                            .to_string(),
+                        json!({
+                            "condition":"tools_required_no_tool_response",
+                            "reply_len": reply.len(),
+                            "deferred_no_tool_streak": deferred_no_tool_streak
+                        }),
                     )
                     .await;
-
-                    learning_ctx.completed_naturally = true;
-                    let learning_ctx_for_task = learning_ctx.clone();
-                    let state_clone = self.state.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            post_task::process_learning(&state_clone, learning_ctx_for_task).await
-                        {
-                            warn!("Learning failed: {}", e);
-                        }
-                    });
-
+                    warn!(
+                        session_id,
+                        iteration,
+                        deferred_no_tool_streak,
+                        "Blocked no-tool completion because current turn requires tools"
+                    );
                     commit_state!();
-                    return Ok(Some(ConsultantPhaseOutcome::Return(Ok(reply))));
+                    return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
                 }
+            }
+
+            let low_signal_completion = is_low_signal_task_lead_reply(&reply);
+            if should_recover_completion_from_tool_output(
+                &reply,
+                self.depth,
+                total_successful_tool_calls,
+            ) {
+                if let Some(tool_output) = self
+                    .latest_non_system_tool_output_excerpt(session_id, 2500)
+                    .await
+                {
+                    reply = build_tool_output_completion_reply(&tool_output);
+                    info!(
+                        session_id,
+                        iteration,
+                        low_signal_completion,
+                        "Recovered completion reply from latest tool output"
+                    );
+                }
+            }
+
+            if reply.is_empty() && total_successful_tool_calls > 0 && self.depth == 0 {
+                reply = "I executed the requested tools, but I couldn't recover a usable output snapshot. Please ask me to rerun the command and I'll return the exact result.".to_string();
+                info!(
+                    session_id,
+                    iteration, "Tool execution completed but no output snapshot was available"
+                );
+            }
+
+            if reply.is_empty() {
                 // User-facing empty response: never return silence.
                 // Retry once; if the model remains empty, return an explicit fallback.
                 if !is_trigger_session(session_id) {
@@ -357,6 +405,9 @@ impl Agent {
                     // we don't fail as "stuck" before any tool ever executes.
                     if total_successful_tool_calls == 0 {
                         deferred_no_tool_streak = deferred_no_tool_streak.saturating_add(1);
+                        POLICY_METRICS
+                            .deferred_no_tool_deferral_detected_total
+                            .fetch_add(1, Ordering::Relaxed);
                     } else {
                         stall_count = stall_count.saturating_add(1);
                         deferred_no_tool_streak = 0;
@@ -437,6 +488,9 @@ impl Agent {
                             );
                             model = next_model;
                             deferred_no_tool_model_switches += 1;
+                            POLICY_METRICS
+                                .deferred_no_tool_model_switch_total
+                                .fetch_add(1, Ordering::Relaxed);
                             // Strategy changed, give the new model a fresh stall budget.
                             stall_count = 0;
                             pending_system_messages.push(
@@ -456,6 +510,15 @@ impl Agent {
                         learning_ctx
                             .errors
                             .push((DEFERRED_NO_TOOL_ERROR_MARKER.to_string(), false));
+                        POLICY_METRICS
+                            .deferred_no_tool_error_marker_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            session_id,
+                            iteration,
+                            deferred_no_tool_streak,
+                            "Deferred/no-tool recovery exhausted: recording terminal marker"
+                        );
                     }
 
                     commit_state!();
@@ -567,5 +630,98 @@ impl Agent {
 
         commit_state!();
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_tool_output_completion_reply, should_enforce_no_tool_text_when_tools_required,
+        should_recover_completion_from_tool_output,
+    };
+
+    #[test]
+    fn tool_output_reply_is_result_focused() {
+        let reply = build_tool_output_completion_reply("cat: /nonexistent/file.txt: No such file");
+        assert!(reply.contains("latest tool output"));
+        assert!(reply.contains("/nonexistent/file.txt"));
+        assert!(!reply.starts_with("Done —"));
+    }
+
+    #[test]
+    fn recover_completion_when_reply_is_empty_after_tools() {
+        assert!(should_recover_completion_from_tool_output("", 0, 1));
+    }
+
+    #[test]
+    fn recover_completion_when_reply_is_low_signal_after_tools() {
+        assert!(should_recover_completion_from_tool_output(
+            "Done — Run the command \"cat /nonexistent/file.txt\" and tell me what happens",
+            0,
+            2
+        ));
+    }
+
+    #[test]
+    fn do_not_recover_completion_for_substantive_reply() {
+        assert!(!should_recover_completion_from_tool_output(
+            "The command returned: file not found.",
+            0,
+            1
+        ));
+    }
+
+    #[test]
+    fn do_not_recover_completion_without_tool_progress() {
+        assert!(!should_recover_completion_from_tool_output("", 0, 0));
+    }
+
+    #[test]
+    fn do_not_recover_completion_for_sub_agent_depth() {
+        assert!(!should_recover_completion_from_tool_output("Done.", 1, 1));
+    }
+
+    #[test]
+    fn enforce_tools_contract_for_text_reply_without_any_tool_attempt() {
+        assert!(should_enforce_no_tool_text_when_tools_required(
+            "The file was not found.",
+            true,
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    fn do_not_enforce_tools_contract_after_tool_attempts_exist() {
+        assert!(!should_enforce_no_tool_text_when_tools_required(
+            "The command failed.",
+            true,
+            1,
+            0
+        ));
+    }
+
+    #[test]
+    fn do_not_enforce_tools_contract_when_turn_does_not_require_tools() {
+        assert!(!should_enforce_no_tool_text_when_tools_required(
+            "Paris.", false, 0, 0
+        ));
+    }
+
+    #[test]
+    fn do_not_enforce_tools_contract_for_empty_reply() {
+        assert!(!should_enforce_no_tool_text_when_tools_required(
+            "", true, 0, 0
+        ));
+    }
+
+    #[test]
+    fn do_not_enforce_tools_contract_for_sub_agent_depth() {
+        assert!(!should_enforce_no_tool_text_when_tools_required(
+            "Need to run tools.",
+            true,
+            0,
+            1
+        ));
     }
 }
