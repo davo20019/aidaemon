@@ -20,7 +20,7 @@ I built this because I wanted to control my computer from my phone, from anywher
 - **It's always on** — runs as a background daemon. Message it on Telegram at 3am from your phone. Schedule tasks with cron syntax or natural language. It's not an app you open — it's an assistant that's always available.
 - **It can act** — 40+ tools: terminal commands, file operations, git, web browsing, web research, HTTP requests with OAuth, MCP servers. It doesn't just answer questions — it does things.
 - **It's a single binary** — no Docker, no Node.js, no Python environment. One binary, copy it anywhere and run it. Starts in milliseconds, uses minimal RAM.
-- **It works with any LLM** — OpenAI, Anthropic, Google Gemini, DeepSeek, Ollama, OpenRouter, or any OpenAI-compatible API. Switch providers without changing anything else.
+- **It works with any LLM** — OpenAI, Anthropic, Google Gemini, DeepSeek, Moonshot, MiniMax, Ollama, OpenRouter, Cloudflare AI Gateway, or any OpenAI-compatible API. Switch providers without changing anything else.
 
 ## Quick Start
 

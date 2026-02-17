@@ -12,6 +12,18 @@
 api_key = "keychain"
 # api_key = "${AIDAEMON_API_KEY}"
 base_url = "https://openrouter.ai/api/v1"
+# Optional: Cloudflare AI Gateway authenticated mode
+# gateway_token = "keychain"
+# # gateway_token = "${AIDAEMON_GATEWAY_TOKEN}"
+#
+# Moonshot OpenAI-compatible base URL:
+# base_url = "https://api.moonshot.ai/v1"
+#
+# MiniMax OpenAI-compatible base URL:
+# base_url = "https://api.minimax.io/v1"
+#
+# Cloudflare AI Gateway base URL format:
+# base_url = "https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/compat"
 
 [provider.models]
 primary = "openai/gpt-4o"

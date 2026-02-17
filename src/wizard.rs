@@ -13,6 +13,8 @@ struct ProviderPreset {
     needs_key: bool,
     key_url: &'static str,
     key_hint: &'static str,
+    prompt_base_url: bool,
+    supports_gateway_token: bool,
 }
 
 const PRESETS: &[ProviderPreset] = &[
@@ -26,6 +28,8 @@ const PRESETS: &[ProviderPreset] = &[
         needs_key: true,
         key_url: "https://aistudio.google.com/apikey",
         key_hint: "Get a free API key from Google AI Studio (free tier, includes web grounding)",
+        prompt_base_url: false,
+        supports_gateway_token: false,
     },
     ProviderPreset {
         name: "OpenAI",
@@ -37,6 +41,8 @@ const PRESETS: &[ProviderPreset] = &[
         needs_key: true,
         key_url: "https://platform.openai.com/api-keys",
         key_hint: "Starts with \"sk-\"",
+        prompt_base_url: false,
+        supports_gateway_token: false,
     },
     ProviderPreset {
         name: "Anthropic (Native)",
@@ -48,6 +54,8 @@ const PRESETS: &[ProviderPreset] = &[
         needs_key: true,
         key_url: "https://console.anthropic.com/settings/keys",
         key_hint: "Starts with \"sk-ant-\"",
+        prompt_base_url: false,
+        supports_gateway_token: false,
     },
     ProviderPreset {
         name: "Anthropic (via OpenRouter)",
@@ -59,6 +67,8 @@ const PRESETS: &[ProviderPreset] = &[
         needs_key: true,
         key_url: "https://openrouter.ai/keys",
         key_hint: "Starts with \"sk-or-\"",
+        prompt_base_url: false,
+        supports_gateway_token: false,
     },
     ProviderPreset {
         name: "OpenRouter",
@@ -70,6 +80,8 @@ const PRESETS: &[ProviderPreset] = &[
         needs_key: true,
         key_url: "https://openrouter.ai/keys",
         key_hint: "Starts with \"sk-or-\". Gives access to many providers in one key.",
+        prompt_base_url: false,
+        supports_gateway_token: false,
     },
     ProviderPreset {
         name: "DeepSeek",
@@ -81,6 +93,47 @@ const PRESETS: &[ProviderPreset] = &[
         needs_key: true,
         key_url: "https://platform.deepseek.com/api_keys",
         key_hint: "Starts with \"sk-\". Affordable pricing with strong reasoning models.",
+        prompt_base_url: false,
+        supports_gateway_token: false,
+    },
+    ProviderPreset {
+        name: "Moonshot AI (Kimi)",
+        base_url: "https://api.moonshot.ai/v1",
+        kind: "openai_compatible",
+        primary: "kimi-k2.5",
+        fast: "kimi-k2.5",
+        smart: "kimi-k2-thinking",
+        needs_key: true,
+        key_url: "https://platform.moonshot.ai/",
+        key_hint: "Moonshot OpenAI-compatible endpoint. Use your Moonshot API key.",
+        prompt_base_url: false,
+        supports_gateway_token: false,
+    },
+    ProviderPreset {
+        name: "MiniMax",
+        base_url: "https://api.minimax.io/v1",
+        kind: "openai_compatible",
+        primary: "MiniMax-M2.5",
+        fast: "MiniMax-M2.5-highspeed",
+        smart: "MiniMax-M2.5",
+        needs_key: true,
+        key_url: "https://platform.minimax.io/user-center/basic-information",
+        key_hint: "MiniMax OpenAI-compatible endpoint. Use your MiniMax API key.",
+        prompt_base_url: false,
+        supports_gateway_token: false,
+    },
+    ProviderPreset {
+        name: "Cloudflare AI Gateway",
+        base_url: "https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/compat",
+        kind: "openai_compatible",
+        primary: "gpt-4o-mini",
+        fast: "gpt-4o-mini",
+        smart: "gpt-4o",
+        needs_key: true,
+        key_url: "https://dash.cloudflare.com/",
+        key_hint: "Use your upstream LLM provider API key. You can optionally add a Cloudflare gateway token in the next step.",
+        prompt_base_url: true,
+        supports_gateway_token: true,
     },
     ProviderPreset {
         name: "Ollama (local)",
@@ -92,6 +145,8 @@ const PRESETS: &[ProviderPreset] = &[
         needs_key: false,
         key_url: "",
         key_hint: "",
+        prompt_base_url: false,
+        supports_gateway_token: false,
     },
     ProviderPreset {
         name: "Custom (OpenAI Compatible)",
@@ -103,6 +158,8 @@ const PRESETS: &[ProviderPreset] = &[
         needs_key: true,
         key_url: "",
         key_hint: "",
+        prompt_base_url: true,
+        supports_gateway_token: false,
     },
 ];
 
@@ -142,8 +199,8 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     let mut fast = preset.fast.to_string();
     let mut smart = preset.smart.to_string();
 
-    // Custom base URL
-    if preset.name == "Custom (OpenAI Compatible)" {
+    // Optional base URL prompt (custom providers, Cloudflare gateway)
+    if preset.prompt_base_url {
         base_url = Input::new()
             .with_prompt("Base URL (OpenAI-compatible endpoint)")
             .default(base_url)
@@ -180,6 +237,22 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     } else {
         "ollama".to_string()
     };
+
+    let mut gateway_token: Option<String> = None;
+    if preset.supports_gateway_token {
+        println!();
+        println!("  Optional: enable Cloudflare Authenticated Gateway token.");
+        let use_gateway_token = Confirm::new()
+            .with_prompt("Add `cf-aig-authorization` gateway token?")
+            .default(false)
+            .interact()?;
+        if use_gateway_token {
+            let token: String = Input::new()
+                .with_prompt("Paste Cloudflare gateway token")
+                .interact_text()?;
+            gateway_token = Some(token);
+        }
+    }
 
     // Ollama auto-discovery
     if preset.name == "Ollama (local)" {
@@ -366,6 +439,16 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
         println!("  API key stored in OS keychain.");
     }
 
+    let mut gateway_token_config: Option<String> = None;
+    if let Some(token) = gateway_token.as_deref() {
+        let (value, stored) = secret_config_value("gateway_token", token);
+        gateway_token_config = Some(value);
+        if stored {
+            any_secret_in_keychain = true;
+            println!("  Cloudflare gateway token stored in OS keychain.");
+        }
+    }
+
     let mut telegram_bot_token_config: Option<String> = None;
     if let Some(token) = telegram_bot_token.as_deref() {
         let (value, stored) = secret_config_value("bot_token", token);
@@ -455,6 +538,10 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     } else {
         format!("base_url = \"{base_url}\"\n")
     };
+    let gateway_token_line = gateway_token_config
+        .as_ref()
+        .map(|v| format!("gateway_token = {v}\n"))
+        .unwrap_or_default();
     let browser_section = if browser_enabled {
         format!("\n[browser]\nenabled = true\nheadless = {browser_headless}\n",)
     } else {
@@ -465,6 +552,7 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
         r#"[provider]
 kind = "{}"
 api_key = {api_key_config}
+{gateway_token_line}
 {base_url_line}
 [provider.models]
 primary = "{primary}"
@@ -680,6 +768,26 @@ fn human_list(items: &[String]) -> String {
     }
 }
 
+fn is_cloudflare_ai_gateway_base(base_url: &str) -> bool {
+    let parsed = match reqwest::Url::parse(base_url) {
+        Ok(url) => url,
+        Err(_) => return false,
+    };
+    matches!(
+        parsed.host_str(),
+        Some(host) if host.eq_ignore_ascii_case("gateway.ai.cloudflare.com")
+    )
+}
+
+fn cloudflare_models_probe_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/compat") {
+        format!("{trimmed}/v1/models")
+    } else {
+        format!("{trimmed}/compat/v1/models")
+    }
+}
+
 /// Validate an API key by making a lightweight request to the provider.
 fn validate_api_key(key: &str, kind: &str, base_url: &str) -> anyhow::Result<()> {
     let client = reqwest::blocking::Client::builder()
@@ -718,14 +826,36 @@ fn validate_api_key(key: &str, kind: &str, base_url: &str) -> anyhow::Result<()>
         _ => {
             // OpenAI-compatible: hit /models
             let url = format!("{}/models", base_url.trim_end_matches('/'));
-            let resp = client
+            let status = client
                 .get(&url)
                 .header("Authorization", format!("Bearer {}", key))
-                .send()?;
-            let status = resp.status().as_u16();
+                .send()?
+                .status()
+                .as_u16();
             if status == 401 || status == 403 {
                 anyhow::bail!("invalid API key");
             }
+
+            if is_cloudflare_ai_gateway_base(base_url) && (status == 404 || status == 405) {
+                let cf_url = cloudflare_models_probe_url(base_url);
+                let cf_status = client
+                    .get(&cf_url)
+                    .header("Authorization", format!("Bearer {}", key))
+                    .send()?
+                    .status()
+                    .as_u16();
+                if cf_status == 401 || cf_status == 403 {
+                    anyhow::bail!("invalid API key");
+                }
+                if cf_status == 404 || cf_status == 405 {
+                    anyhow::bail!(
+                        "could not verify API key: models endpoint unavailable at '{}' and '{}'",
+                        url,
+                        cf_url
+                    );
+                }
+            }
+
             Ok(())
         }
     }
@@ -835,4 +965,35 @@ fn discover_ollama_models() -> anyhow::Result<Vec<String>> {
         })
         .unwrap_or_default();
     Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cloudflare_models_probe_url, is_cloudflare_ai_gateway_base};
+
+    #[test]
+    fn cloudflare_gateway_host_detection() {
+        assert!(is_cloudflare_ai_gateway_base(
+            "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        ));
+        assert!(!is_cloudflare_ai_gateway_base("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn cloudflare_models_probe_url_with_compat_suffix() {
+        assert_eq!(
+            cloudflare_models_probe_url(
+                "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+            ),
+            "https://gateway.ai.cloudflare.com/v1/account/gateway/compat/v1/models"
+        );
+    }
+
+    #[test]
+    fn cloudflare_models_probe_url_without_compat_suffix() {
+        assert_eq!(
+            cloudflare_models_probe_url("https://gateway.ai.cloudflare.com/v1/account/gateway"),
+            "https://gateway.ai.cloudflare.com/v1/account/gateway/compat/v1/models"
+        );
+    }
 }
