@@ -216,6 +216,8 @@ impl Agent {
         let mut total_tool_calls_attempted = *ctx.total_tool_calls_attempted;
         let mut total_successful_tool_calls = *ctx.total_successful_tool_calls;
         let mut tool_failure_count = std::mem::take(ctx.tool_failure_count);
+        let mut tool_transient_failure_count = std::mem::take(ctx.tool_transient_failure_count);
+        let mut tool_cooldown_until_iteration = std::mem::take(ctx.tool_cooldown_until_iteration);
         let mut tool_call_count = std::mem::take(ctx.tool_call_count);
         let mut personal_memory_tool_calls = *ctx.personal_memory_tool_calls;
         let mut no_evidence_result_streak = *ctx.no_evidence_result_streak;
@@ -252,6 +254,8 @@ impl Agent {
                 *ctx.total_tool_calls_attempted = total_tool_calls_attempted;
                 *ctx.total_successful_tool_calls = total_successful_tool_calls;
                 *ctx.tool_failure_count = tool_failure_count;
+                *ctx.tool_transient_failure_count = tool_transient_failure_count;
+                *ctx.tool_cooldown_until_iteration = tool_cooldown_until_iteration;
                 *ctx.tool_call_count = tool_call_count;
                 *ctx.personal_memory_tool_calls = personal_memory_tool_calls;
                 *ctx.no_evidence_result_streak = no_evidence_result_streak;
@@ -500,12 +504,14 @@ impl Agent {
             if self
                 .maybe_block_tool_by_budget(
                     tc,
-                    &ToolBudgetBlockCtx {
+                    &mut ToolBudgetBlockCtx {
                         emitter,
                         task_id,
                         session_id,
                         iteration,
                         tool_failure_count: &tool_failure_count,
+                        tool_transient_failure_count: &tool_transient_failure_count,
+                        tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
                         tool_call_count: &tool_call_count,
                         unknown_tools: &unknown_tools,
                     },
@@ -650,10 +656,10 @@ Do NOT call additional tools or poll status in this turn. Reply to the user now 
             );
             learning_ctx.tool_calls.push(tool_summary.clone());
 
-            // Track tool failures across iterations (actual errors only)
-            let is_error = result_text.starts_with("ERROR:")
-                || result_text.starts_with("Error:")
-                || result_text.starts_with("Failed to ");
+            // Track tool failures across iterations using structured detection
+            // (prefixes, JSON error payloads, HTTP statuses, non-zero exit codes).
+            let failure_class = classify_tool_result_failure(&tc.name, &result_text);
+            let is_error = failure_class.is_some();
 
             let learning_env = ResultLearningEnv {
                 attempted_required_file_recheck,
@@ -675,6 +681,8 @@ Do NOT call additional tools or poll status in this turn. Reply to the user now 
                 evidence_gain_count: &mut evidence_gain_count,
                 unknown_tools: &mut unknown_tools,
                 tool_failure_count: &mut tool_failure_count,
+                tool_transient_failure_count: &mut tool_transient_failure_count,
+                tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
                 pending_error_solution_ids: &mut pending_error_solution_ids,
                 tool_failure_patterns: &mut tool_failure_patterns,
                 last_tool_failure: &mut last_tool_failure,
@@ -700,6 +708,7 @@ Do NOT call additional tools or poll status in this turn. Reply to the user now 
                     tc,
                     &mut result_text,
                     is_error,
+                    failure_class,
                     &learning_env,
                     &mut learning_state,
                 )
@@ -789,6 +798,7 @@ Do NOT call additional tools or poll status in this turn. Reply to the user now 
             available_capabilities,
             policy_bundle,
             total_tool_calls_attempted,
+            resolved_goal_id.is_some(),
             &mut total_successful_tool_calls,
             &mut force_text_response,
             &mut pending_system_messages,

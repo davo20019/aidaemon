@@ -17,6 +17,7 @@ impl Agent {
         available_capabilities: &HashMap<String, ToolCapabilities>,
         policy_bundle: &PolicyBundle,
         total_tool_calls_attempted: usize,
+        has_active_goal: bool,
         total_successful_tool_calls: &mut usize,
         force_text_response: &mut bool,
         pending_system_messages: &mut Vec<String>,
@@ -30,31 +31,39 @@ impl Agent {
         // to stop exploring and respond. After a hard threshold, strip tools
         // entirely to force a text response on the next iteration.
         const NUDGE_INTERVAL: usize = 6;
-        const FORCE_TEXT_AT: usize = 30;
+        const FORCE_TEXT_BASE: usize = 30;
+        const FORCE_TEXT_GOAL_BACKED: usize = 55;
+        let force_text_at = if has_active_goal {
+            FORCE_TEXT_GOAL_BACKED
+        } else {
+            FORCE_TEXT_BASE
+        };
         if total_tool_calls_attempted > 0
             && total_tool_calls_attempted.is_multiple_of(NUDGE_INTERVAL)
-            && total_tool_calls_attempted < FORCE_TEXT_AT
+            && total_tool_calls_attempted < force_text_at
         {
-            let urgency = if total_tool_calls_attempted >= 24 {
+            let critical_threshold = force_text_at.saturating_sub(6);
+            let important_threshold = force_text_at / 2;
+            let urgency = if total_tool_calls_attempted >= critical_threshold {
                 format!(
                     "[SYSTEM] CRITICAL: You have used {} tokens across {} tool calls. \
-                     Stop immediately and respond to the user with what you have. \
-                     No more exploration.",
-                    task_tokens_used, total_tool_calls_attempted
+                     Stop immediately and respond to the user with what you have \
+                     before the hard limit ({} calls). No more exploration.",
+                    task_tokens_used, total_tool_calls_attempted, force_text_at
                 )
-            } else if total_tool_calls_attempted >= 12 {
+            } else if total_tool_calls_attempted >= important_threshold {
                 format!(
                     "[SYSTEM] IMPORTANT: You have used {} tokens in {} tool calls. \
-                     You MUST stop calling tools and respond to the user NOW. \
-                     Summarize your findings immediately.",
-                    task_tokens_used, total_tool_calls_attempted
+                     You MUST stop calling tools soon and respond to the user. \
+                     Hard limit for this task is {} tool calls.",
+                    task_tokens_used, total_tool_calls_attempted, force_text_at
                 )
             } else {
                 format!(
                     "[SYSTEM] You have used {} tokens in {} tool calls. If you have \
                      enough information to answer the user's question, stop calling \
-                     tools and respond now with your findings.",
-                    task_tokens_used, total_tool_calls_attempted
+                     tools and respond now with your findings (hard limit: {} calls).",
+                    task_tokens_used, total_tool_calls_attempted, force_text_at
                 )
             };
             pending_system_messages.push(urgency);
@@ -66,16 +75,19 @@ impl Agent {
 
         // Hard force-stop: after FORCE_TEXT_AT tool calls, strip tools on
         // the next LLM call so the model MUST produce a text response.
-        if total_tool_calls_attempted >= FORCE_TEXT_AT && !*force_text_response {
+        if total_tool_calls_attempted >= force_text_at && !*force_text_response {
             *force_text_response = true;
-            pending_system_messages.push(
-                "[SYSTEM] Tool limit reached. You must now respond to the user with \
-                     a summary of everything you found. No more tool calls are available."
-                    .to_string(),
-            );
+            pending_system_messages.push(format!(
+                "[SYSTEM] Tool limit reached ({} calls). You must now respond to the user \
+with a summary of everything you found. No more tool calls are available.",
+                force_text_at
+            ));
             warn!(
                 session_id,
-                total_tool_calls_attempted, "Force-text response activated — tools stripped"
+                total_tool_calls_attempted,
+                force_text_at,
+                has_active_goal,
+                "Force-text response activated — tools stripped"
             );
         }
 

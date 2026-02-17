@@ -23,6 +23,23 @@ fn test_build_consultant_system_prompt_adds_marker_and_strips_tools() {
 }
 
 #[test]
+fn test_build_tool_loop_system_prompt_strips_heavy_sections() {
+    let prompt = "## Identity\nA\n## Tool Selection Guide\nB\n## Tools\nC\n## Behavior\nD";
+
+    let standard = build_tool_loop_system_prompt(prompt, ToolLoopPromptStyle::Standard);
+    assert!(standard.contains("## Identity"));
+    assert!(standard.contains("## Tool Selection Guide"));
+    assert!(standard.contains("## Behavior"));
+    assert!(!standard.contains("## Tools"));
+
+    let lite = build_tool_loop_system_prompt(prompt, ToolLoopPromptStyle::Lite);
+    assert!(lite.contains("## Identity"));
+    assert!(lite.contains("## Behavior"));
+    assert!(!lite.contains("## Tool Selection Guide"));
+    assert!(!lite.contains("## Tools"));
+}
+
+#[test]
 fn test_extract_intent_gate_single_line_json() {
     let input = "Answer first.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[\"deployment_url\"]}";
     let (cleaned, gate) = extract_intent_gate(input);

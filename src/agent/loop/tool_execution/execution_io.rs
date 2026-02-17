@@ -112,6 +112,8 @@ impl Agent {
                 if !crate::tools::sanitize::is_trusted_tool(&tc.name) {
                     let sanitized = crate::tools::sanitize::sanitize_external_content(&text);
                     crate::tools::sanitize::wrap_untrusted_output(&tc.name, &sanitized)
+                } else if tc.name == "terminal" {
+                    crate::tools::sanitize::strip_internal_control_markers(&text)
                 } else {
                     text
                 }

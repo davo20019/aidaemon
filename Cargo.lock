@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "assert_cmd",

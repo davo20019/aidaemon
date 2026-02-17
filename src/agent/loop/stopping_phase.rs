@@ -81,6 +81,47 @@ impl Agent {
         })
     }
 
+    fn stall_threshold_for_state(
+        &self,
+        learning_ctx: &LearningContext,
+        deferred_no_tool_streak: usize,
+    ) -> (usize, &'static str) {
+        let recent_errors = learning_ctx
+            .errors
+            .iter()
+            .rev()
+            .take(8)
+            .map(|(e, _)| e.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if deferred_no_tool_streak >= DEFERRED_NO_TOOL_SWITCH_THRESHOLD
+            || recent_errors.contains(DEFERRED_NO_TOOL_ERROR_MARKER)
+        {
+            return (MAX_STALL_ITERATIONS, "deferred_no_tool");
+        }
+
+        let transient_signals = recent_errors.contains("rate limit")
+            || recent_errors.contains("too many requests")
+            || recent_errors.contains("429")
+            || recent_errors.contains("timed out")
+            || recent_errors.contains("timeout")
+            || recent_errors.contains("network")
+            || recent_errors.contains("connection")
+            || recent_errors.contains("service unavailable")
+            || recent_errors.contains("bad gateway")
+            || recent_errors.contains("gateway timeout");
+        if transient_signals {
+            return (MAX_STALL_ITERATIONS + 2, "transient");
+        }
+
+        if recent_errors.contains("empty_response(") || recent_errors.contains("empty response") {
+            return (MAX_STALL_ITERATIONS + 2, "empty_response");
+        }
+
+        (MAX_STALL_ITERATIONS, "default")
+    }
+
     pub(super) async fn run_stopping_phase(
         &self,
         ctx: &mut StoppingPhaseCtx<'_>,
@@ -848,6 +889,8 @@ impl Agent {
         }
 
         // 7. Stall detection — agent spinning without progress
+        let (stall_limit, stall_mode) =
+            self.stall_threshold_for_state(learning_ctx, deferred_no_tool_streak);
         let stall_detected = matches!(
             PureStoppingInputs {
                 iteration,
@@ -857,7 +900,7 @@ impl Agent {
                 task_token_budget: None,
                 task_tokens_used: 0,
                 stall_count,
-                max_stall_iterations: MAX_STALL_ITERATIONS,
+                max_stall_iterations: stall_limit,
             }
             .evaluate(),
             Some(StoppingCondition::Stall { .. })
@@ -875,7 +918,8 @@ impl Agent {
                     json!({
                         "condition":"post_send_file_stall",
                         "stall_count": stall_count,
-                        "max_stall_iterations": MAX_STALL_ITERATIONS,
+                        "max_stall_iterations": stall_limit,
+                        "stall_mode": stall_mode,
                         "successful_send_file_count": successful_send_file_keys.len()
                     }),
                 )
@@ -942,7 +986,8 @@ impl Agent {
                     json!({
                         "condition":"stall_with_progress",
                         "stall_count": stall_count,
-                        "max_stall_iterations": MAX_STALL_ITERATIONS,
+                        "max_stall_iterations": stall_limit,
+                        "stall_mode": stall_mode,
                         "total_successful_tool_calls": total_successful_tool_calls,
                         "unrecovered_errors": unrecovered_errors
                     }),
@@ -1005,7 +1050,8 @@ Here is the latest tool output:\n\n{}",
                         json!({
                             "condition":"stall_with_tool_output_fallback",
                             "stall_count": stall_count,
-                            "max_stall_iterations": MAX_STALL_ITERATIONS,
+                            "max_stall_iterations": stall_limit,
+                            "stall_mode": stall_mode,
                             "total_successful_tool_calls": total_successful_tool_calls
                         }),
                     )
@@ -1061,7 +1107,8 @@ Here is the latest tool output:\n\n{}",
                 json!({
                     "condition":"stall",
                     "stall_count": stall_count,
-                    "max_stall_iterations": MAX_STALL_ITERATIONS
+                    "max_stall_iterations": stall_limit,
+                    "stall_mode": stall_mode
                 }),
             )
             .await;

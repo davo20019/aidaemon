@@ -341,15 +341,21 @@ impl Agent {
             );
         }
 
-        // For the consultant pass, force text-only behavior and strip
-        // tool-heavy docs from the system prompt to reduce hallucinated
-        // functionCall output on Gemini thinking models.
+        // Prompt shaping:
+        // - Iteration 1 consultant pass: force text-only mode with stripped tool docs.
+        // - Iterations >1: use compact tool-loop prompt to reduce repeated token overhead.
         let effective_system_prompt = if iteration == 1 && consultant_pass_active {
             let style = match policy_bundle.policy.model_profile {
                 ModelProfile::Cheap => ConsultantPromptStyle::Lite,
                 ModelProfile::Balanced | ModelProfile::Strong => ConsultantPromptStyle::Full,
             };
             build_consultant_system_prompt(system_prompt, style)
+        } else if iteration > 1 {
+            let style = match policy_bundle.policy.model_profile {
+                ModelProfile::Cheap => ToolLoopPromptStyle::Lite,
+                ModelProfile::Balanced | ModelProfile::Strong => ToolLoopPromptStyle::Standard,
+            };
+            build_tool_loop_system_prompt(system_prompt, style)
         } else {
             system_prompt.to_string()
         };

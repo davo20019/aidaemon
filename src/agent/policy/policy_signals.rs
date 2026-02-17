@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::contains_keyword_as_words;
 use crate::execution_policy::{
     score_risk_from_capabilities, score_uncertainty, PolicyBundle, UncertaintySignals,
 };
@@ -70,55 +71,51 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
 }
 
+fn contains_any_as_words(haystack: &str, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| contains_keyword_as_words(haystack, needle))
+}
+
 fn estimate_risk_from_text(user_text: &str) -> f32 {
     let lower = user_text.to_ascii_lowercase();
     let mut score = 0.18f32;
 
-    if contains_any(
+    if contains_any_as_words(
         &lower,
         &[
-            "write ",
-            "edit ",
-            "change ",
-            "modify ",
-            "create ",
-            "delete ",
-            "remove ",
-            "fix ",
-            "deploy ",
-            "install ",
-            "run ",
-            "execute ",
-            "commit ",
-            "schedule ",
+            "write", "edit", "change", "modify", "create", "delete", "remove", "fix", "deploy",
+            "install", "run", "execute", "commit", "schedule",
         ],
     ) {
         score += 0.28;
     }
 
-    if contains_any(
+    if contains_any_as_words(
         &lower,
         &[
-            "api ",
+            "api",
             "http",
             "webhook",
-            "send ",
-            "post ",
-            "publish ",
+            "send",
+            "post",
+            "publish",
             "external",
             "production",
         ],
-    ) {
+    ) || lower.contains("http://")
+        || lower.contains("https://")
+    {
         score += 0.20;
     }
 
-    if contains_any(
+    if contains_any_as_words(
         &lower,
         &[
-            "rm ",
+            "rm",
             "sudo",
-            "drop ",
-            "truncate ",
+            "drop",
+            "truncate",
             "force",
             "dangerous",
             "overwrite",

@@ -27,6 +27,8 @@ pub(super) struct ResultLearningState<'a> {
     pub evidence_gain_count: &'a mut usize,
     pub unknown_tools: &'a mut HashSet<String>,
     pub tool_failure_count: &'a mut HashMap<String, usize>,
+    pub tool_transient_failure_count: &'a mut HashMap<String, usize>,
+    pub tool_cooldown_until_iteration: &'a mut HashMap<String, usize>,
     pub pending_error_solution_ids: &'a mut Vec<i64>,
     pub tool_failure_patterns: &'a mut HashMap<(String, String), usize>,
     pub last_tool_failure: &'a mut Option<(String, String)>,
@@ -61,6 +63,7 @@ impl Agent {
         tc: &ToolCall,
         result_text: &mut String,
         is_error: bool,
+        failure_class: Option<ToolFailureClass>,
         env: &ResultLearningEnv<'_>,
         state: &mut ResultLearningState<'_>,
     ) -> anyhow::Result<Option<ToolExecutionOutcome>> {
@@ -73,170 +76,191 @@ impl Agent {
                 state.unknown_tools.insert(tc.name.clone());
             }
 
-            let count = state.tool_failure_count.entry(tc.name.clone()).or_insert(0);
-            *count += 1;
-
             let base_error = strip_appended_diagnostics(result_text).to_string();
-            if tc.name == "edit_file" {
-                let edit_path = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("path")
-                            .and_then(|p| p.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_else(|| "<same file>".to_string());
-                if base_error.contains("Text not found in ") {
-                    *result_text = format!(
-                        "{}\n\n[SYSTEM] edit_file recovery: do NOT ask the user for file contents yet. \
+            let failure_class = failure_class.unwrap_or(ToolFailureClass::Semantic);
+            if matches!(failure_class, ToolFailureClass::Transient) {
+                state.pending_error_solution_ids.clear();
+                let transient_count = state
+                    .tool_transient_failure_count
+                    .entry(tc.name.clone())
+                    .or_insert(0);
+                *transient_count += 1;
+                let cooldown_iters = 2usize;
+                let cooldown_until = env.iteration.saturating_add(cooldown_iters);
+                state
+                    .tool_cooldown_until_iteration
+                    .insert(tc.name.clone(), cooldown_until);
+                *result_text = format!(
+                    "{}\n\n[SYSTEM] Detected transient failure for `{}` (timeouts/network/rate limits). \
+Avoid retrying this tool until iteration {} (cooldown {} iterations). Use another approach for now.",
+                    result_text, tc.name, cooldown_until, cooldown_iters
+                );
+            } else {
+                let count = state.tool_failure_count.entry(tc.name.clone()).or_insert(0);
+                *count += 1;
+                let semantic_count = *count;
+
+                if tc.name == "edit_file" {
+                    let edit_path = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("path")
+                                .and_then(|p| p.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_else(|| "<same file>".to_string());
+                    if base_error.contains("Text not found in ") {
+                        *result_text = format!(
+                            "{}\n\n[SYSTEM] edit_file recovery: do NOT ask the user for file contents yet. \
 Call read_file(path=\"{}\") now, then retry edit_file with exact copied old_text. \
 If the user asked for a full rewrite, use write_file for full content replacement.",
-                        result_text, edit_path
-                    );
-                } else if base_error.contains("Set replace_all=true")
-                    || base_error.contains("occurrences of the text")
-                {
-                    *result_text = format!(
-                        "{}\n\n[SYSTEM] edit_file recovery: disambiguate by either setting replace_all=true \
-or expanding old_text with nearby unique context from read_file(path=\"{}\").",
-                        result_text, edit_path
-                    );
-                }
-            }
-            let err_pattern = crate::memory::procedures::extract_error_pattern(&base_error);
-            if !err_pattern.trim().is_empty() {
-                let key = (tc.name.clone(), err_pattern.clone());
-                let pattern_count = state.tool_failure_patterns.entry(key.clone()).or_insert(0);
-                *pattern_count += 1;
-                *state.last_tool_failure = Some(key);
-
-                // Persist repeated dead-end workflows as explicit failure patterns.
-                if *pattern_count >= 3 {
-                    let state_store = self.state.clone();
-                    let tool_name = tc.name.clone();
-                    let error_pattern = err_pattern.clone();
-                    let observed_count = *pattern_count;
-                    tokio::spawn(async move {
-                        let description = format!(
-                            "Repeated {} failures for {} on '{}'; pivot to a different approach earlier.",
-                            observed_count, tool_name, error_pattern
+                            result_text, edit_path
                         );
-                        let confidence = (0.5 + (observed_count as f32 * 0.05)).min(0.9);
-                        if let Err(e) = state_store
-                            .record_behavior_pattern(
-                                "failure",
-                                &description,
-                                Some(&tool_name),
-                                Some("pivot to alternate tool/strategy"),
-                                confidence,
-                                1,
-                            )
-                            .await
-                        {
-                            warn!(
-                                tool = %tool_name,
-                                error = %e,
-                                "Failed to record failure behavior pattern"
-                            );
-                        }
-                    });
-                }
-            }
-
-            // DIAGNOSTIC LOOP: On first failure, query memory for similar errors
-            if *count == 1 {
-                state.pending_error_solution_ids.clear();
-                if let Ok(solutions) = self
-                    .state
-                    .get_relevant_error_solutions(&base_error, 3)
-                    .await
-                {
-                    if !solutions.is_empty() {
-                        *state.pending_error_solution_ids =
-                            solutions.first().map(|s| s.id).into_iter().collect();
-                        let diagnostic_hints: Vec<String> = solutions
-                            .iter()
-                            .map(|s| {
-                                if let Some(ref steps) = s.solution_steps {
-                                    format!(
-                                        "- {}\n  Steps: {}",
-                                        s.solution_summary,
-                                        steps.join(" -> ")
-                                    )
-                                } else {
-                                    format!("- {}", s.solution_summary)
-                                }
-                            })
-                            .collect();
+                    } else if base_error.contains("Set replace_all=true")
+                        || base_error.contains("occurrences of the text")
+                    {
                         *result_text = format!(
-                            "{}\n\n[DIAGNOSTIC] Similar errors resolved before:\n{}",
-                            result_text,
-                            diagnostic_hints.join("\n")
-                        );
-                        info!(
-                            tool = %tc.name,
-                            solutions_found = solutions.len(),
-                            "Diagnostic loop: injected error solutions"
+                            "{}\n\n[SYSTEM] edit_file recovery: disambiguate by either setting replace_all=true \
+or expanding old_text with nearby unique context from read_file(path=\"{}\").",
+                            result_text, edit_path
                         );
                     }
                 }
+                let err_pattern = crate::memory::procedures::extract_error_pattern(&base_error);
+                if !err_pattern.trim().is_empty() {
+                    let key = (tc.name.clone(), err_pattern.clone());
+                    let pattern_count = state.tool_failure_patterns.entry(key.clone()).or_insert(0);
+                    *pattern_count += 1;
+                    *state.last_tool_failure = Some(key);
 
-                // Inline tool failure stats to help the model decide whether to retry or pivot.
-                // Bounded query (LIMIT 500) and guarded for graceful degradation.
-                let since = Utc::now() - chrono::Duration::hours(24);
-                if let Ok(stats) = self.event_store.get_tool_stats(&tc.name, since).await {
-                    if stats.total_calls >= 3 {
-                        // total_calls is bounded by the underlying LIMIT and guarded above.
-                        let failure_pct =
-                            ((stats.failed * 100) + (stats.total_calls / 2)) / stats.total_calls;
-                        let mut lines = Vec::new();
-                        lines.push(format!(
-                            "[TOOL STATS] {} (24h): {} calls, {} failed ({}%), avg {}ms",
-                            tc.name,
-                            stats.total_calls,
-                            stats.failed,
-                            failure_pct,
-                            stats.avg_duration_ms
-                        ));
-                        for (pattern, count) in stats.common_errors.into_iter().take(2) {
-                            let limit = 100usize;
-                            let head: String = pattern.chars().take(limit).collect();
-                            let preview = if pattern.chars().count() > limit {
-                                format!("{}...", head)
-                            } else {
-                                head
-                            };
-                            lines.push(format!("  - {}x: {}", count, preview));
-                        }
-                        *result_text = format!("{}\n\n{}", result_text, lines.join("\n"));
+                    // Persist repeated dead-end workflows as explicit failure patterns.
+                    if *pattern_count >= 3 {
+                        let state_store = self.state.clone();
+                        let tool_name = tc.name.clone();
+                        let error_pattern = err_pattern.clone();
+                        let observed_count = *pattern_count;
+                        tokio::spawn(async move {
+                            let description = format!(
+                                "Repeated {} failures for {} on '{}'; pivot to a different approach earlier.",
+                                observed_count, tool_name, error_pattern
+                            );
+                            let confidence = (0.5 + (observed_count as f32 * 0.05)).min(0.9);
+                            if let Err(e) = state_store
+                                .record_behavior_pattern(
+                                    "failure",
+                                    &description,
+                                    Some(&tool_name),
+                                    Some("pivot to alternate tool/strategy"),
+                                    confidence,
+                                    1,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    tool = %tool_name,
+                                    error = %e,
+                                    "Failed to record failure behavior pattern"
+                                );
+                            }
+                        });
                     }
                 }
-            }
 
-            if *count >= 2 {
-                // Hint was shown but the same tool failed again: record a miss.
-                if let Some(solution_id) = state.pending_error_solution_ids.first().copied() {
+                // DIAGNOSTIC LOOP: On first semantic failure, query memory for similar errors.
+                if semantic_count == 1 {
                     state.pending_error_solution_ids.clear();
-                    let state_store = self.state.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = state_store
-                            .update_error_solution_outcome(solution_id, false)
-                            .await
-                        {
-                            warn!(
-                                solution_id,
-                                error = %e,
-                                "Failed to record error solution failure"
+                    if let Ok(solutions) = self
+                        .state
+                        .get_relevant_error_solutions(&base_error, 3)
+                        .await
+                    {
+                        if !solutions.is_empty() {
+                            *state.pending_error_solution_ids =
+                                solutions.first().map(|s| s.id).into_iter().collect();
+                            let diagnostic_hints: Vec<String> = solutions
+                                .iter()
+                                .map(|s| {
+                                    if let Some(ref steps) = s.solution_steps {
+                                        format!(
+                                            "- {}\n  Steps: {}",
+                                            s.solution_summary,
+                                            steps.join(" -> ")
+                                        )
+                                    } else {
+                                        format!("- {}", s.solution_summary)
+                                    }
+                                })
+                                .collect();
+                            *result_text = format!(
+                                "{}\n\n[DIAGNOSTIC] Similar errors resolved before:\n{}",
+                                result_text,
+                                diagnostic_hints.join("\n")
+                            );
+                            info!(
+                                tool = %tc.name,
+                                solutions_found = solutions.len(),
+                                "Diagnostic loop: injected error solutions"
                             );
                         }
-                    });
+                    }
+
+                    // Inline tool failure stats to help the model decide whether to retry or pivot.
+                    // Bounded query (LIMIT 500) and guarded for graceful degradation.
+                    let since = Utc::now() - chrono::Duration::hours(24);
+                    if let Ok(stats) = self.event_store.get_tool_stats(&tc.name, since).await {
+                        if stats.total_calls >= 3 {
+                            // total_calls is bounded by the underlying LIMIT and guarded above.
+                            let failure_pct = ((stats.failed * 100) + (stats.total_calls / 2))
+                                / stats.total_calls;
+                            let mut lines = Vec::new();
+                            lines.push(format!(
+                                "[TOOL STATS] {} (24h): {} calls, {} failed ({}%), avg {}ms",
+                                tc.name,
+                                stats.total_calls,
+                                stats.failed,
+                                failure_pct,
+                                stats.avg_duration_ms
+                            ));
+                            for (pattern, count) in stats.common_errors.into_iter().take(2) {
+                                let limit = 100usize;
+                                let head: String = pattern.chars().take(limit).collect();
+                                let preview = if pattern.chars().count() > limit {
+                                    format!("{}...", head)
+                                } else {
+                                    head
+                                };
+                                lines.push(format!("  - {}x: {}", count, preview));
+                            }
+                            *result_text = format!("{}\n\n{}", result_text, lines.join("\n"));
+                        }
+                    }
                 }
 
-                *result_text = format!(
-                    "{}\n\n[SYSTEM] This tool has errored {} times. Do NOT retry it. \
-                     Use a different approach or respond with what you have.",
-                    result_text, count
-                );
+                if semantic_count >= 2 {
+                    // Hint was shown but the same tool failed again: record a miss.
+                    if let Some(solution_id) = state.pending_error_solution_ids.first().copied() {
+                        state.pending_error_solution_ids.clear();
+                        let state_store = self.state.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = state_store
+                                .update_error_solution_outcome(solution_id, false)
+                                .await
+                            {
+                                warn!(
+                                    solution_id,
+                                    error = %e,
+                                    "Failed to record error solution failure"
+                                );
+                            }
+                        });
+                    }
+
+                    *result_text = format!(
+                        "{}\n\n[SYSTEM] This tool has errored {} semantic times. Do NOT retry it. \
+Use a different approach or respond with what you have.",
+                        result_text, semantic_count
+                    );
+                }
             }
 
             // Track error for learning

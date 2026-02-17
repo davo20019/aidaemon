@@ -30,7 +30,7 @@ impl Agent {
     }
 
     /// Try up to 2 different fallback models after retries are exhausted.
-    /// On success, switches the active model.
+    /// On success, returns the response for this call only (no persistent model downgrade).
     #[allow(clippy::too_many_arguments)]
     async fn cascade_fallback(
         &self,
@@ -64,11 +64,7 @@ impl Agent {
                 .chat_with_options(&fallback, messages, tool_defs, options)
                 .await
             {
-                Ok(resp) => {
-                    *self.model.write().await = fallback;
-                    self.stamp_lastgood().await;
-                    return Ok(resp);
-                }
+                Ok(resp) => return Ok(resp),
                 Err(_) => {
                     tried.push(fallback);
                 }

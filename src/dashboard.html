@@ -51,7 +51,7 @@ tr:last-child td { border-bottom: none; }
 
 <div id="auth-overlay">
   <div id="auth-box">
-    <h1>aidaemon</h1>
+    <h1><a href="/" style="color:inherit;text-decoration:none">aidaemon</a></h1>
     <p style="color:var(--fg2);margin-bottom:.5rem">Enter dashboard token</p>
     <div><input id="token-input" type="password" placeholder="Bearer token" autocomplete="off"></div>
     <div><button onclick="submitToken()">Connect</button></div>
@@ -60,7 +60,7 @@ tr:last-child td { border-bottom: none; }
 </div>
 
 <div id="app" style="display:none">
-  <h1>aidaemon <span style="font-weight:400;color:var(--fg2);font-size:.85rem" id="version"></span></h1>
+  <h1><a href="/" style="color:inherit;text-decoration:none">aidaemon</a> <span style="font-weight:400;color:var(--fg2);font-size:.85rem" id="version"></span></h1>
   <div class="cards">
     <div class="card" id="status-card">
       <h2>Status</h2>

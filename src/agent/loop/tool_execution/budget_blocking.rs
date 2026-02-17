@@ -7,6 +7,8 @@ pub(super) struct ToolBudgetBlockCtx<'a> {
     pub session_id: &'a str,
     pub iteration: usize,
     pub tool_failure_count: &'a HashMap<String, usize>,
+    pub tool_transient_failure_count: &'a HashMap<String, usize>,
+    pub tool_cooldown_until_iteration: &'a mut HashMap<String, usize>,
     pub tool_call_count: &'a HashMap<String, usize>,
     pub unknown_tools: &'a HashSet<String>,
 }
@@ -30,11 +32,50 @@ impl Agent {
     pub(super) async fn maybe_block_tool_by_budget(
         &self,
         tc: &ToolCall,
-        ctx: &ToolBudgetBlockCtx<'_>,
+        ctx: &mut ToolBudgetBlockCtx<'_>,
     ) -> anyhow::Result<bool> {
         // Check if this tool has been called too many times or failed too often
-        let prior_failures = ctx.tool_failure_count.get(&tc.name).copied().unwrap_or(0);
+        let prior_semantic_failures = ctx.tool_failure_count.get(&tc.name).copied().unwrap_or(0);
+        let prior_transient_failures = ctx
+            .tool_transient_failure_count
+            .get(&tc.name)
+            .copied()
+            .unwrap_or(0);
         let prior_calls = ctx.tool_call_count.get(&tc.name).copied().unwrap_or(0);
+
+        if let Some(until_iteration) = ctx.tool_cooldown_until_iteration.get(&tc.name).copied() {
+            if ctx.iteration <= until_iteration {
+                let result_text = format!(
+                    "[SYSTEM] Tool '{}' is in transient-failure cooldown until iteration {}. \
+                     Do not call it yet; use a different approach first.",
+                    tc.name, until_iteration
+                );
+                let tool_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: ctx.session_id.to_string(),
+                    role: "tool".to_string(),
+                    content: Some(result_text),
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_name: Some(tc.name.clone()),
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.1,
+                    embedding: None,
+                };
+                self.append_tool_message_with_result_event(
+                    ctx.emitter,
+                    &tool_msg,
+                    true,
+                    0,
+                    None,
+                    Some(ctx.task_id),
+                )
+                .await?;
+                return Ok(true);
+            }
+            // Cooldown has elapsed; allow attempts again.
+            ctx.tool_cooldown_until_iteration.remove(&tc.name);
+        }
 
         // Combined web tool budget: web_search + web_fetch together
         let web_search_calls = ctx.tool_call_count.get("web_search").copied().unwrap_or(0);
@@ -50,12 +91,13 @@ impl Agent {
                  Do NOT invent tool names.",
                 tc.name
             ))
-        } else if prior_failures >= failure_limit {
+        } else if prior_semantic_failures >= failure_limit {
             Some(format!(
-                "[SYSTEM] Tool '{}' has encountered {} errors. \
+                "[SYSTEM] Tool '{}' has encountered {} semantic errors \
+                 (and {} transient failures). \
                  Do not call it again. Use a different approach or \
                  answer the user with what you have.",
-                tc.name, prior_failures
+                tc.name, prior_semantic_failures, prior_transient_failures
             ))
         } else if tc.name == "web_search" && prior_calls >= 3 {
             Some(format!(
@@ -98,7 +140,7 @@ impl Agent {
             && !tc.name.contains("__")
         // MCP tools (prefix__name)
         {
-            if tc.name == "web_search" && prior_failures == 0 {
+            if tc.name == "web_search" && prior_semantic_failures == 0 {
                 Some(format!(
                     "[SYSTEM] web_search returned no useful results {} times. \
                      The DuckDuckGo backend is likely blocked.\n\n\
@@ -141,7 +183,8 @@ impl Agent {
 
         warn!(
             tool = %tc.name,
-            failures = prior_failures,
+            semantic_failures = prior_semantic_failures,
+            transient_failures = prior_transient_failures,
             calls = prior_calls,
             "Blocking repeated tool call"
         );
@@ -153,7 +196,8 @@ impl Agent {
             format!("Blocked tool {} due to repeated failures/calls", tc.name),
             json!({
                 "tool": tc.name,
-                "prior_failures": prior_failures,
+                "prior_semantic_failures": prior_semantic_failures,
+                "prior_transient_failures": prior_transient_failures,
                 "prior_calls": prior_calls
             }),
         )

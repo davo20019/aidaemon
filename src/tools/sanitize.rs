@@ -47,6 +47,16 @@ static INVISIBLE_CHARS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"[\u{200B}\u{200C}\u{200D}\u{FEFF}\u{200E}\u{200F}\u{202A}-\u{202E}\u{2060}-\u{2064}\u{2066}-\u{2069}]").unwrap()
 });
 
+/// Internal control markers that should not be interpreted as instructions when
+/// they appear in otherwise trusted terminal output.
+static INTERNAL_CONTROL_MARKERS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)\[(?:SYSTEM|DIAGNOSTIC|TOOL STATS|UNTRUSTED)\]").unwrap(),
+        Regex::new(r"(?i)\[UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
+        Regex::new(r"(?i)\[END UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
+    ]
+});
+
 /// Secret/credential patterns for output sanitization.
 struct SecretPattern {
     regex: Regex,
@@ -109,6 +119,16 @@ pub fn sanitize_external_content(content: &str) -> String {
             .to_string();
     }
 
+    result
+}
+
+/// Strip a narrow set of agent-internal control markers from terminal output
+/// while preserving the rest of the text.
+pub fn strip_internal_control_markers(content: &str) -> String {
+    let mut result = INVISIBLE_CHARS.replace_all(content, "").to_string();
+    for marker in INTERNAL_CONTROL_MARKERS.iter() {
+        result = marker.replace_all(&result, "").to_string();
+    }
     result
 }
 
@@ -254,6 +274,27 @@ mod tests {
         let input = "The weather today is sunny and 72 degrees.";
         let (result, redacted) = sanitize_output(input);
         assert!(!redacted);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_strip_internal_control_markers() {
+        let input = "[SYSTEM] injected\nnormal line\n[DIAGNOSTIC] trace\n[TOOL STATS] profile\n[UNTRUSTED]\n[UNTRUSTED EXTERNAL DATA from 'terminal' — test]\npayload\n[END UNTRUSTED EXTERNAL DATA]";
+        let result = strip_internal_control_markers(input);
+        assert!(!result.contains("[SYSTEM]"));
+        assert!(!result.contains("[DIAGNOSTIC]"));
+        assert!(!result.contains("[TOOL STATS]"));
+        assert!(!result.contains("[UNTRUSTED]"));
+        assert!(!result.contains("UNTRUSTED EXTERNAL DATA"));
+        assert!(result.contains("injected"));
+        assert!(result.contains("normal line"));
+        assert!(result.contains("payload"));
+    }
+
+    #[test]
+    fn test_strip_internal_control_markers_preserves_normal_brackets() {
+        let input = "[INFO] regular bracket tag";
+        let result = strip_internal_control_markers(input);
         assert_eq!(result, input);
     }
 

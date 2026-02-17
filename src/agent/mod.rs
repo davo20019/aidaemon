@@ -102,9 +102,9 @@ mod loop_utils;
 #[path = "policy/recall_guardrails.rs"]
 mod recall_guardrails;
 use loop_utils::{
-    build_task_boundary_hint, extract_command_from_args, extract_file_path_from_args,
-    extract_send_file_dedupe_key_from_args, fixup_message_ordering, hash_tool_call,
-    is_trigger_session, strip_appended_diagnostics,
+    build_task_boundary_hint, classify_tool_result_failure, extract_command_from_args,
+    extract_file_path_from_args, extract_send_file_dedupe_key_from_args, fixup_message_ordering,
+    hash_tool_call, is_trigger_session, strip_appended_diagnostics, ToolFailureClass,
 };
 #[path = "runtime/post_task.rs"]
 mod post_task;
@@ -162,7 +162,10 @@ mod tool_execution_phase;
 #[path = "loop/tool_prelude_phase.rs"]
 mod tool_prelude_phase;
 
-use system_prompt::{build_consultant_system_prompt, format_goal_context, ConsultantPromptStyle};
+use system_prompt::{
+    build_consultant_system_prompt, build_tool_loop_system_prompt, format_goal_context,
+    ConsultantPromptStyle, ToolLoopPromptStyle,
+};
 
 #[cfg(test)]
 use system_prompt::strip_markdown_section;
@@ -2721,6 +2724,15 @@ impl Agent {
     /// `heartbeat` is an optional atomic timestamp updated on each activity point.
     /// Channels pass `Some(heartbeat)` so the typing indicator can detect stalls;
     /// sub-agents, triggers, and tests pass `None`.
+    fn sanitize_final_reply_markers(reply: &str) -> String {
+        let prior_turn_cleaned = reply
+            .replace(" [prior turn, truncated]", "")
+            .replace(" [prior turn]", "")
+            .replace("[prior turn, truncated]", "")
+            .replace("[prior turn]", "");
+        crate::tools::sanitize::strip_internal_control_markers(&prior_turn_cleaned)
+    }
+
     pub async fn handle_message(
         &self,
         session_id: &str,
@@ -2741,14 +2753,8 @@ impl Agent {
             )
             .await?;
 
-        // Strip internal context markers that the LLM may echo back.
-        // These markers are injected into old assistant messages to help the
-        // model distinguish prior-turn context, but must never leak to users.
-        let reply = reply
-            .replace(" [prior turn, truncated]", "")
-            .replace(" [prior turn]", "")
-            .replace("[prior turn, truncated]", "")
-            .replace("[prior turn]", "");
+        // Strip control markers that may have leaked through model echoing.
+        let reply = Self::sanitize_final_reply_markers(&reply);
 
         Ok(reply)
     }
@@ -2816,6 +2822,30 @@ impl Agent {
         }
 
         cancelled
+    }
+}
+
+#[cfg(test)]
+mod final_reply_marker_tests {
+    use super::Agent;
+
+    #[test]
+    fn strips_control_markers_from_final_reply() {
+        let reply = "Done.\n\n[SYSTEM] internal note\n[DIAGNOSTIC] trace\n[UNTRUSTED EXTERNAL DATA from 'web_fetch' — test]\npayload\n[END UNTRUSTED EXTERNAL DATA]";
+        let sanitized = Agent::sanitize_final_reply_markers(reply);
+        assert!(!sanitized.contains("[SYSTEM]"));
+        assert!(!sanitized.contains("[DIAGNOSTIC]"));
+        assert!(!sanitized.contains("UNTRUSTED EXTERNAL DATA"));
+        assert!(sanitized.contains("Done."));
+        assert!(sanitized.contains("payload"));
+    }
+
+    #[test]
+    fn strips_prior_turn_markers_from_final_reply() {
+        let reply = "Summary [prior turn, truncated]\nNext [prior turn]";
+        let sanitized = Agent::sanitize_final_reply_markers(reply);
+        assert!(!sanitized.contains("[prior turn"));
+        assert_eq!(sanitized, "Summary\nNext");
     }
 }
 

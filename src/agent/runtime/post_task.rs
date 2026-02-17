@@ -427,7 +427,7 @@ pub(super) fn graceful_cap_response(learning_ctx: &LearningContext, iterations: 
 /// warranting a token budget auto-extension.
 ///
 /// Criteria:
-/// 1. No stalls detected (`stall_count == 0`)
+/// 1. At most one stall detected (`stall_count <= 1`)
 /// 2. Same-tool repetition: if count ≥ `MAX_CONSECUTIVE_SAME_TOOL`, check diversity
 ///    (`unique * 2 > count`); if not diverse OR count ≥ `MAX_CONSECUTIVE_SAME_TOOL + 4`
 ///    → not productive
@@ -440,8 +440,8 @@ pub(super) fn is_productive(
     consecutive_same_tool_unique_args: usize,
     total_successful_tool_calls: usize,
 ) -> bool {
-    // 1. Any stalls → not productive
-    if stall_count > 0 {
+    // 1. Allow one transient stall (e.g., provider timeout) before disqualifying.
+    if stall_count > 1 {
         return false;
     }
 
@@ -709,7 +709,8 @@ mod tests {
     #[test]
     fn test_is_productive_stalling() {
         let ctx = make_learning_ctx();
-        assert!(!is_productive(&ctx, 1, 0, 0, 10));
+        assert!(is_productive(&ctx, 1, 0, 0, 10));
+        assert!(!is_productive(&ctx, 2, 0, 0, 10));
     }
 
     #[test]

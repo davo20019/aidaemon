@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::{json, Value};
 use tracing::warn;
 
@@ -19,6 +21,336 @@ pub(super) fn strip_appended_diagnostics(raw: &str) -> &str {
         None => raw,
     };
     trimmed.trim()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToolFailureClass {
+    Semantic,
+    Transient,
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+static HTTP_STATUS_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)\bhttp/\d(?:\.\d+)?\s+([1-5][0-9]{2})\b|\bstatus\s+code\s+([1-5][0-9]{2})\b|\bstatus\s*[:=]\s*([1-5][0-9]{2})\b|"(?:status|status_code|statusCode|http_status|httpStatus)"\s*:\s*"?([1-5][0-9]{2})"?"#)
+        .expect("http status regex must compile")
+});
+
+static EXIT_CODE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:\bexit\s*:\s*|\bexit\s*code\s*[:=]?\s*|\[exit\s*code:\s*)(-?\d+)")
+        .expect("exit code regex must compile")
+});
+
+fn classify_http_status(status: u16) -> Option<ToolFailureClass> {
+    if status >= 500 || matches!(status, 408 | 409 | 425 | 429) {
+        return Some(ToolFailureClass::Transient);
+    }
+    if status >= 400 {
+        return Some(ToolFailureClass::Semantic);
+    }
+    None
+}
+
+fn extract_status_from_value(value: &Value) -> Option<u16> {
+    match value {
+        Value::Number(n) => n.as_u64().and_then(|v| u16::try_from(v).ok()),
+        Value::String(s) => s.parse::<u16>().ok(),
+        _ => None,
+    }
+}
+
+fn classify_text_error(lower: &str) -> ToolFailureClass {
+    if contains_any(
+        lower,
+        &[
+            "rate limit",
+            "too many requests",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "service unavailable",
+            "bad gateway",
+            "gateway timeout",
+            "network error",
+            "connection reset",
+            "connection refused",
+            "connection aborted",
+            "connection failed",
+            "retry later",
+            "try again later",
+            "econnreset",
+            "etimedout",
+            "ehostunreach",
+            "unreachable",
+            "dns",
+        ],
+    ) {
+        return ToolFailureClass::Transient;
+    }
+    ToolFailureClass::Semantic
+}
+
+fn looks_like_error_signal(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "error:",
+            "failed to ",
+            "exception",
+            "traceback",
+            "unknown tool",
+            "not a real tool",
+            "invalid",
+            "missing required",
+            "permission denied",
+            "unauthorized",
+            "forbidden",
+            "file not found",
+            "command not found",
+            "resource not found",
+            "404 not found",
+            "no such file",
+            "status code ",
+            "http/",
+            "timed out",
+            "timeout",
+            "rate limit",
+            "too many requests",
+            "connection reset",
+            "connection refused",
+            "connection aborted",
+            "connection failed",
+            "connection timed out",
+        ],
+    )
+}
+
+fn classify_json_error(value: &Value) -> Option<ToolFailureClass> {
+    match value {
+        Value::Object(map) => {
+            for key in [
+                "status",
+                "status_code",
+                "statusCode",
+                "http_status",
+                "httpStatus",
+                "code",
+            ] {
+                if let Some(status_value) = map.get(key) {
+                    if let Some(status) = extract_status_from_value(status_value) {
+                        if let Some(kind) = classify_http_status(status) {
+                            return Some(kind);
+                        }
+                    }
+                }
+            }
+
+            if map.get("success").and_then(Value::as_bool) == Some(false)
+                || map.get("ok").and_then(Value::as_bool) == Some(false)
+            {
+                if let Some(error_value) = map.get("error") {
+                    if !error_value.is_null() {
+                        if let Some(kind) = classify_json_error(error_value) {
+                            return Some(kind);
+                        }
+                    }
+                }
+                if let Some(message) = map.get("message").and_then(Value::as_str) {
+                    let lower = message.to_ascii_lowercase();
+                    if looks_like_error_signal(&lower) {
+                        return Some(classify_text_error(&lower));
+                    }
+                }
+                return Some(ToolFailureClass::Semantic);
+            }
+
+            if let Some(error_value) = map.get("error") {
+                if !error_value.is_null() {
+                    if let Some(kind) = classify_json_error(error_value) {
+                        return Some(kind);
+                    }
+                    return Some(ToolFailureClass::Semantic);
+                }
+            }
+
+            if let Some(errors_value) = map.get("errors") {
+                match errors_value {
+                    Value::Array(arr) if !arr.is_empty() => {
+                        for entry in arr {
+                            if let Some(kind) = classify_json_error(entry) {
+                                return Some(kind);
+                            }
+                        }
+                        return Some(ToolFailureClass::Semantic);
+                    }
+                    Value::Object(obj) if !obj.is_empty() => {
+                        return Some(ToolFailureClass::Semantic)
+                    }
+                    Value::String(s) if !s.trim().is_empty() => {
+                        let lower = s.to_ascii_lowercase();
+                        return Some(classify_text_error(&lower));
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(message) = map.get("message").and_then(Value::as_str) {
+                let lower = message.to_ascii_lowercase();
+                if looks_like_error_signal(&lower) {
+                    return Some(classify_text_error(&lower));
+                }
+            }
+
+            for nested in map.values() {
+                if let Some(kind) = classify_json_error(nested) {
+                    return Some(kind);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(classify_json_error),
+        Value::String(s) => {
+            let lower = s.to_ascii_lowercase();
+            if looks_like_error_signal(&lower) {
+                Some(classify_text_error(&lower))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_http_status_from_text(text: &str) -> Option<u16> {
+    let caps = HTTP_STATUS_RE.captures(text)?;
+    for idx in 1..=4 {
+        if let Some(m) = caps.get(idx) {
+            if let Ok(code) = m.as_str().parse::<u16>() {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+fn classify_embedded_json_error(text: &str) -> Option<ToolFailureClass> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut candidates = 0usize;
+
+    for (idx, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth = depth.saturating_add(1);
+            }
+            '}' => {
+                if depth == 0 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start.take() {
+                        let end = idx + ch.len_utf8();
+                        if let Ok(value) = serde_json::from_str::<Value>(&text[s..end]) {
+                            if let Some(kind) = classify_json_error(&value) {
+                                return Some(kind);
+                            }
+                        }
+                        candidates += 1;
+                        if candidates >= 8 {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn extract_nonzero_exit_code(text: &str) -> Option<i32> {
+    let captures = EXIT_CODE_RE.captures(text)?;
+    let parsed = captures.get(1)?.as_str().parse::<i32>().ok()?;
+    if parsed == 0 {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+pub(super) fn classify_tool_result_failure(
+    _tool_name: &str,
+    result_text: &str,
+) -> Option<ToolFailureClass> {
+    let cleaned = strip_appended_diagnostics(result_text).trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let lower = cleaned.to_ascii_lowercase();
+
+    if cleaned.starts_with("ERROR:")
+        || cleaned.starts_with("Error:")
+        || cleaned.starts_with("Failed to ")
+    {
+        return Some(classify_text_error(&lower));
+    }
+
+    if let Some(status) = extract_http_status_from_text(cleaned) {
+        if let Some(kind) = classify_http_status(status) {
+            return Some(kind);
+        }
+    }
+
+    if cleaned.starts_with('{') || cleaned.starts_with('[') {
+        if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
+            if let Some(kind) = classify_json_error(&value) {
+                return Some(kind);
+            }
+        }
+    }
+
+    if let Some(kind) = classify_embedded_json_error(cleaned) {
+        return Some(kind);
+    }
+
+    if let Some(exit_code) = extract_nonzero_exit_code(cleaned) {
+        let _ = exit_code;
+        return Some(classify_text_error(&lower));
+    }
+
+    if lower == "null" {
+        return Some(ToolFailureClass::Semantic);
+    }
+
+    if looks_like_error_signal(&lower) {
+        return Some(classify_text_error(&lower));
+    }
+
+    None
 }
 
 pub(super) fn build_task_boundary_hint(user_text: &str, max_chars: usize) -> String {
@@ -134,6 +466,90 @@ mod task_boundary_hint_tests {
     fn truncates_with_ellipsis() {
         let hint = build_task_boundary_hint("abcdefghijk", 5);
         assert_eq!(hint, "abcde...");
+    }
+}
+
+#[cfg(test)]
+mod tool_error_detection_tests {
+    use super::{classify_tool_result_failure, ToolFailureClass};
+
+    #[test]
+    fn detects_prefixed_transient_error() {
+        let result = "Error: request timed out while connecting to api";
+        let classified = classify_tool_result_failure("http_request", result);
+        assert_eq!(classified, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn detects_json_semantic_error() {
+        let result = r#"{"error":"invalid arguments: missing required field"}"#;
+        let classified = classify_tool_result_failure("manage_memories", result);
+        assert_eq!(classified, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn detects_http_status_failures() {
+        let semantic = classify_tool_result_failure("http_request", "Status: 404 Not Found");
+        assert_eq!(semantic, Some(ToolFailureClass::Semantic));
+
+        let transient =
+            classify_tool_result_failure("http_request", "HTTP/1.1 503 Service Unavailable");
+        assert_eq!(transient, Some(ToolFailureClass::Transient));
+
+        let transient_h2 = classify_tool_result_failure("http_request", "HTTP/2 503");
+        assert_eq!(transient_h2, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn detects_nonzero_exit_without_prefix() {
+        let classified = classify_tool_result_failure("run_command", "$ make test (exit: 2, 22ms)");
+        assert_eq!(classified, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn detects_terminal_style_exit_code_marker() {
+        let classified =
+            classify_tool_result_failure("terminal", "[Process pid=123 finished]\n[exit code: 42]");
+        assert_eq!(classified, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn detects_embedded_json_error_payload_inside_wrapper_text() {
+        let wrapped = "[UNTRUSTED EXTERNAL DATA from 'web_fetch']\n{\"error\":\"not found\",\"status\":404}\n[END UNTRUSTED EXTERNAL DATA]";
+        let classified = classify_tool_result_failure("web_fetch", wrapped);
+        assert_eq!(classified, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn detects_embedded_json_error_payload_with_command_header() {
+        let result =
+            "$ curl -s https://api.example.com (exit: 0, 9ms)\n\n{\"error\":\"not found\"}";
+        let classified = classify_tool_result_failure("run_command", result);
+        assert_eq!(classified, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn does_not_flag_success_output() {
+        let classified = classify_tool_result_failure("terminal", "$ cargo test (exit: 0, 1.2s)");
+        assert_eq!(classified, None);
+    }
+
+    #[test]
+    fn does_not_flag_generic_connection_success_text() {
+        let classified = classify_tool_result_failure(
+            "terminal",
+            "Connection established successfully to upstream service",
+        );
+        assert_eq!(classified, None);
+    }
+
+    #[test]
+    fn does_not_flag_generic_not_found_summary_text() {
+        let classified = classify_tool_result_failure(
+            "search_files",
+            "Search complete: 24 files scanned, 0 patterns not found",
+        );
+        assert_eq!(classified, None);
     }
 }
 
@@ -356,10 +772,6 @@ pub(super) fn fixup_message_ordering(messages: &mut Vec<Value>) {
     }
 }
 
-fn tool_content_is_error_prefix(s: &str) -> bool {
-    s.starts_with("ERROR:") || s.starts_with("Error:") || s.starts_with("Failed to ")
-}
-
 /// Collapse repeated tool error payloads in the current interaction to avoid
 /// runaway context growth.
 ///
@@ -397,7 +809,7 @@ pub(super) fn collapse_repeated_tool_errors(messages: &mut [Value]) -> usize {
             .get("content")
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        let is_error = tool_content_is_error_prefix(content);
+        let is_error = classify_tool_result_failure(&name, content).is_some();
 
         if is_error {
             if let Some(prev_idx) = last_error_idx_by_tool.insert(name.clone(), idx) {

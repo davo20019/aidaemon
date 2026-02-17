@@ -146,13 +146,21 @@ impl Agent {
         // Deterministic critical-fact resolver for high-trust identity/profile recall.
         // This avoids model drift when context is compressed or the fast model is selected.
         let critical_fact_query = detect_critical_fact_query(user_text);
+        let owner_dm_fact_cache = if self.depth == 0
+            && user_role == UserRole::Owner
+            && channel_ctx.should_inject_personal_memory()
+        {
+            Some(self.state.get_facts(None).await.unwrap_or_default())
+        } else {
+            None
+        };
         if self.depth == 0
             && user_role == UserRole::Owner
             && channel_ctx.should_inject_personal_memory()
         {
             if let Some(query) = critical_fact_query {
-                let facts = self.state.get_facts(None).await.unwrap_or_default();
-                let mut summary = extract_critical_fact_summary(&facts);
+                let facts = owner_dm_fact_cache.as_deref().unwrap_or(&[]);
+                let mut summary = extract_critical_fact_summary(facts);
                 if summary.assistant_name.is_none() {
                     summary.assistant_name = self.system_prompt.lines().find_map(|line| {
                         let trimmed = line.trim();
@@ -445,6 +453,7 @@ impl Agent {
                 &channel_ctx,
                 tool_defs.len(),
                 resume_checkpoint.as_ref(),
+                owner_dm_fact_cache.as_deref(),
             )
             .await?;
 

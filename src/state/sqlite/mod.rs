@@ -908,7 +908,7 @@ impl SqliteStateStore {
                 }
             };
 
-            if score > 0.3 {
+            if score > 0.4 {
                 scored.push((procedure, score));
             }
         }

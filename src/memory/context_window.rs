@@ -239,36 +239,89 @@ pub fn fit_messages_with_source_quotas(
 /// Compress a tool result if it exceeds the character limit.
 ///
 /// Below `max_chars`: returns as-is.
-/// Above: truncates and appends annotation.
+/// Above: preserves head+tail and drops the middle.
 pub fn compress_tool_result(tool_name: &str, result: &str, max_chars: usize) -> String {
-    if result.len() <= max_chars {
+    let total_chars = result.chars().count();
+    if total_chars <= max_chars {
         return result.to_string();
     }
 
-    let truncate_to = max_chars.saturating_sub(100); // Leave room for annotation
-                                                     // Find a safe char boundary — raw byte-index slicing panics on multi-byte UTF-8.
-    let safe_end = result
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|&i| i <= truncate_to)
-        .last()
-        .unwrap_or(0);
-    let truncated = &result[..safe_end];
+    // Keep space for marker text; preserve as much head+tail signal as possible.
+    const ANNOTATION_OVERHEAD: usize = 64;
+    const MAX_HEAD_CHARS: usize = 1000;
+    const MAX_TAIL_CHARS: usize = 800;
+    const MIN_HEAD_CHARS: usize = 120;
+    const MIN_TAIL_CHARS: usize = 80;
+
+    if max_chars <= ANNOTATION_OVERHEAD + MIN_HEAD_CHARS + MIN_TAIL_CHARS {
+        let head_chars = max_chars.saturating_sub(ANNOTATION_OVERHEAD).max(1);
+        let head_end = byte_index_after_chars(result, head_chars);
+        let omitted = total_chars.saturating_sub(head_chars);
+        return format!(
+            "{}\n\n[truncated {} chars from {} total]",
+            &result[..head_end],
+            omitted,
+            total_chars
+        );
+    }
+
+    let available = max_chars.saturating_sub(ANNOTATION_OVERHEAD);
+    let mut head_chars = (available * 5) / 9;
+    let mut tail_chars = available.saturating_sub(head_chars);
+    head_chars = head_chars.clamp(MIN_HEAD_CHARS, MAX_HEAD_CHARS);
+    tail_chars = tail_chars.clamp(MIN_TAIL_CHARS, MAX_TAIL_CHARS);
+    if head_chars + tail_chars > available {
+        tail_chars = available.saturating_sub(head_chars);
+    }
+    if tail_chars < MIN_TAIL_CHARS {
+        tail_chars = MIN_TAIL_CHARS.min(available.saturating_sub(1));
+        head_chars = available.saturating_sub(tail_chars);
+    }
+
+    if total_chars <= head_chars + tail_chars {
+        return result.to_string();
+    }
+
+    let head_end = byte_index_after_chars(result, head_chars);
+    let tail_start = byte_index_before_last_chars(result, tail_chars);
+    let omitted = total_chars.saturating_sub(head_chars + tail_chars);
     let compressed = format!(
-        "{}\n...\n[truncated {} → {} chars]",
-        truncated,
-        result.len(),
-        truncate_to
+        "{}\n\n[truncated {} chars from middle of {} total]\n\n{}",
+        &result[..head_end],
+        omitted,
+        total_chars,
+        &result[tail_start..]
     );
 
     debug!(
         tool = tool_name,
-        original_len = result.len(),
+        original_len = total_chars,
         compressed_len = compressed.len(),
         "Compressed tool result"
     );
 
     compressed
+}
+
+fn byte_index_after_chars(s: &str, char_count: usize) -> usize {
+    if char_count == 0 {
+        return 0;
+    }
+    s.char_indices()
+        .map(|(idx, _)| idx)
+        .nth(char_count)
+        .unwrap_or(s.len())
+}
+
+fn byte_index_before_last_chars(s: &str, char_count: usize) -> usize {
+    if char_count == 0 {
+        return s.len();
+    }
+    let total = s.chars().count();
+    if char_count >= total {
+        return 0;
+    }
+    byte_index_after_chars(s, total.saturating_sub(char_count))
 }
 
 fn message_contains_critical_fact_signal(content: &str) -> bool {
@@ -738,11 +791,12 @@ mod tests {
 
     #[test]
     fn test_compress_tool_result_long() {
-        let long = "x".repeat(5000);
+        let long = format!("HEAD:{}:TAIL", "x".repeat(5000));
         let result = compress_tool_result("test_tool", &long, 2000);
-        assert!(result.len() < 5000);
+        assert!(result.len() < long.len());
         assert!(result.contains("[truncated"));
-        assert!(result.contains("5000"));
+        assert!(result.contains("HEAD:"));
+        assert!(result.contains(":TAIL"));
     }
 
     #[test]
