@@ -100,9 +100,7 @@ impl Agent {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         task_id: &str,
     ) {
-        if self.depth != 0
-            || user_role != UserRole::Owner
-            || !looks_like_mid_task_pivot(user_text)
+        if self.depth != 0 || user_role != UserRole::Owner || !looks_like_mid_task_pivot(user_text)
         {
             return;
         }

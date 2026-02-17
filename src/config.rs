@@ -79,12 +79,11 @@ pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
 /// Store a secret in the OS keychain under the `aidaemon` service.
 pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
     if keychain_disabled() {
-        tracing::warn!(
+        anyhow::bail!(
             "Keychain disabled — set env var {}={} to persist this credential",
             field_name.to_uppercase(),
             "[REDACTED]"
         );
-        return Ok(());
     }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
     entry.set_password(value)?;

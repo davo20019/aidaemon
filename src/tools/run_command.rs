@@ -7,8 +7,7 @@ use super::daemon_guard::detect_daemonization_primitives;
 use super::fs_utils;
 
 pub struct RunCommandTool;
-const SAFE_NPM_PREFIX_HINT: &str =
-    "`npm test`, `npm run`, `npm ls`, `npm outdated`, `npm audit`";
+const SAFE_NPM_PREFIX_HINT: &str = "`npm test`, `npm run`, `npm ls`, `npm outdated`, `npm audit`";
 
 /// Safe command prefixes that don't require terminal approval flow.
 const SAFE_PREFIXES: &[&str] = &[

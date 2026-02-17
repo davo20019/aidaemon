@@ -2426,10 +2426,7 @@ mod tests {
     fn extract_candidate_file_paths_handles_trailing_punctuation() {
         let text = "I found it at /tmp/test-docs/sample-resume.pdf.";
         let paths = extract_candidate_file_paths(text);
-        assert_eq!(
-            paths,
-            vec!["/tmp/test-docs/sample-resume.pdf"]
-        );
+        assert_eq!(paths, vec!["/tmp/test-docs/sample-resume.pdf"]);
     }
 
     #[test]
