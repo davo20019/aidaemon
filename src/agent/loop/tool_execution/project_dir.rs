@@ -1,5 +1,20 @@
 use crate::agent::*;
 
+const PATH_ARGUMENT_KEYS: &[&str] = &[
+    "path",
+    "paths",
+    "file_path",
+    "working_dir",
+    "cwd",
+    "directory",
+    "project_path",
+    "root",
+    "src",
+    "dst",
+    "from",
+    "to",
+];
+
 pub(crate) fn extract_project_dir_hint(text: &str) -> Option<String> {
     let mut best: Option<(usize, String)> = None;
 
@@ -63,6 +78,104 @@ fn normalize_project_dir(raw_path: &str) -> Option<String> {
     Some(normalized.to_string_lossy().to_string())
 }
 
+fn push_unique_project_dir(collected: &mut Vec<String>, candidate: String) {
+    if !collected.iter().any(|existing| existing == &candidate) {
+        collected.push(candidate);
+    }
+}
+
+fn extract_terminal_cd_dirs(command: &str) -> Vec<String> {
+    let mut dirs = Vec::new();
+    for segment in command.split([';', '\n']) {
+        let trimmed = segment.trim();
+        let Some(rest) = trimmed.strip_prefix("cd ") else {
+            continue;
+        };
+
+        let token = if let Some(stripped) = rest.strip_prefix('"') {
+            stripped.split('"').next().unwrap_or("").trim()
+        } else if let Some(stripped) = rest.strip_prefix('\'') {
+            stripped.split('\'').next().unwrap_or("").trim()
+        } else {
+            rest.split_whitespace().next().unwrap_or("").trim()
+        };
+        if token.is_empty() || token == "-" {
+            continue;
+        }
+        if let Some(dir) = normalize_project_dir(token) {
+            push_unique_project_dir(&mut dirs, dir);
+        }
+    }
+    dirs
+}
+
+fn collect_project_dirs_from_value(
+    value: &Value,
+    parent_key: Option<&str>,
+    collected: &mut Vec<String>,
+) {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let key_is_path_like = parent_key
+                .map(|k| PATH_ARGUMENT_KEYS.contains(&k))
+                .unwrap_or(false);
+            if !key_is_path_like {
+                return;
+            }
+            if let Some(dir) = normalize_project_dir(trimmed) {
+                push_unique_project_dir(collected, dir);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_project_dirs_from_value(item, parent_key, collected);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                if k.starts_with('_') {
+                    continue;
+                }
+                collect_project_dirs_from_value(v, Some(k.as_str()), collected);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn extract_project_dirs_from_tool_args(tool_name: &str, args_json: &str) -> Vec<String> {
+    let parsed = match serde_json::from_str::<Value>(args_json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut dirs = Vec::new();
+    if tool_name == "terminal" {
+        if let Some(command) = parsed.get("command").and_then(|v| v.as_str()) {
+            for dir in extract_terminal_cd_dirs(command) {
+                push_unique_project_dir(&mut dirs, dir);
+            }
+        }
+        return dirs;
+    }
+    if tool_name == "project_inspect" {
+        if let Some(path) = parsed.get("path") {
+            collect_project_dirs_from_value(path, Some("path"), &mut dirs);
+        }
+        if let Some(paths) = parsed.get("paths") {
+            collect_project_dirs_from_value(paths, Some("paths"), &mut dirs);
+        }
+        return dirs;
+    }
+
+    collect_project_dirs_from_value(&parsed, None, &mut dirs);
+    dirs
+}
+
 fn project_dir_arg_key_for_tool(tool_name: &str) -> Option<&'static str> {
     match tool_name {
         "search_files" | "project_inspect" | "git_info" | "git_commit" | "check_environment" => {
@@ -74,35 +187,9 @@ fn project_dir_arg_key_for_tool(tool_name: &str) -> Option<&'static str> {
 }
 
 pub(super) fn project_dir_from_tool_args(tool_name: &str, args_json: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<Value>(args_json).ok()?;
-    if tool_name == "project_inspect" {
-        if let Some(raw_path) = parsed.get("path").and_then(|v| v.as_str()) {
-            let trimmed = raw_path.trim();
-            if !trimmed.is_empty() {
-                return normalize_project_dir(trimmed);
-            }
-        }
-        if let Some(raw_path) = parsed
-            .get("paths")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| {
-                arr.iter()
-                    .filter_map(|entry| entry.as_str())
-                    .map(str::trim)
-                    .find(|entry| !entry.is_empty())
-            })
-        {
-            return normalize_project_dir(raw_path);
-        }
-        return None;
-    }
-
-    let key = project_dir_arg_key_for_tool(tool_name)?;
-    let raw = parsed.get(key)?.as_str()?.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    normalize_project_dir(raw)
+    extract_project_dirs_from_tool_args(tool_name, args_json)
+        .into_iter()
+        .next()
 }
 
 pub(super) fn tool_call_includes_project_path(tool_name: &str, args_json: &str) -> bool {
@@ -145,6 +232,16 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
     obj.insert(key.to_string(), json!(project_dir));
     let updated = serde_json::to_string(&parsed).ok()?;
     Some((updated, project_dir.to_string()))
+}
+
+pub(super) fn scope_allows_project_dir(scope_path: &str, candidate_path: &str) -> bool {
+    let Some(scope) = crate::tools::fs_utils::validate_path(scope_path).ok() else {
+        return true;
+    };
+    let Some(candidate) = crate::tools::fs_utils::validate_path(candidate_path).ok() else {
+        return true;
+    };
+    candidate.starts_with(scope)
 }
 
 pub(super) fn is_file_recheck_tool(tool_name: &str) -> bool {
@@ -218,6 +315,7 @@ pub(super) fn search_files_result_no_matches(output: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn extracts_project_hint_from_user_text() {
@@ -283,5 +381,42 @@ mod tests {
         let text = "Search under /tmp/.myproject for html files";
         let hint = extract_project_dir_hint(text).expect("project hint");
         assert_eq!(hint, "/tmp/.myproject");
+    }
+
+    #[test]
+    fn extracts_project_dirs_from_nested_path_arguments() {
+        let args =
+            r#"{"path":"./workspace/app","changes":[{"file_path":"./workspace/app/src/main.rs"}]}"#;
+        let dirs = extract_project_dirs_from_tool_args("edit_file", args);
+        assert!(!dirs.is_empty());
+        assert!(dirs.iter().any(|d| d.ends_with("/workspace/app")));
+    }
+
+    #[test]
+    fn extracts_terminal_cd_dirs_for_scope_locking() {
+        let args = r#"{"command":"cd ~/projects/demo && npm run build"}"#;
+        let dirs = extract_project_dirs_from_tool_args("terminal", args);
+        assert!(dirs.iter().any(|d| d.contains("projects/demo")));
+    }
+
+    #[test]
+    fn scope_allows_only_descendant_paths() {
+        assert!(scope_allows_project_dir("/tmp/a", "/tmp/a/src"));
+        assert!(!scope_allows_project_dir("/tmp/a", "/tmp/b/src"));
+    }
+
+    proptest! {
+        #[test]
+        fn extracted_project_dirs_are_deduped_for_duplicate_inputs(name in "[a-z0-9_-]{3,12}") {
+            let path = format!("/tmp/{name}");
+            let args = json!({
+                "paths": [path.clone(), path.clone()],
+                "path": path.clone()
+            })
+            .to_string();
+            let dirs = extract_project_dirs_from_tool_args("project_inspect", &args);
+            let unique: std::collections::HashSet<String> = dirs.iter().cloned().collect();
+            prop_assert_eq!(dirs.len(), unique.len());
+        }
     }
 }

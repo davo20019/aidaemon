@@ -2,13 +2,91 @@ use super::budget_blocking::{DuplicateSendFileNoopCtx, ToolBudgetBlockCtx};
 use super::execution_io::ToolExecutionIoCtx;
 use super::guards::LoopPatternGuardOutcome;
 use super::project_dir::{
-    extract_project_dir_hint, is_file_recheck_tool, maybe_inject_project_dir_into_tool_args,
-    project_dir_from_tool_args, tool_call_includes_project_path,
+    extract_project_dir_hint, extract_project_dirs_from_tool_args, is_file_recheck_tool,
+    maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args, scope_allows_project_dir,
+    tool_call_includes_project_path,
 };
 use super::result_learning::{ResultLearningEnv, ResultLearningState};
 use super::types::{ToolExecutionCtx, ToolExecutionOutcome};
 use crate::agent::recall_guardrails::is_personal_memory_tool;
 use crate::agent::*;
+
+fn raw_internal_scope_violation(
+    raw_arguments: &str,
+    session_id: &str,
+    resolved_goal_id: Option<&str>,
+) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(raw_arguments).ok()?;
+    let map = parsed.as_object()?;
+
+    if let Some(candidate_session_id) = map.get("_session_id").and_then(|v| v.as_str()) {
+        if candidate_session_id != session_id {
+            return Some(format!(
+                "_session_id mismatch (expected `{}`, got `{}`)",
+                session_id, candidate_session_id
+            ));
+        }
+    }
+
+    if let Some(candidate_goal_id) = map.get("_goal_id").and_then(|v| v.as_str()) {
+        match resolved_goal_id {
+            Some(expected_goal_id) if candidate_goal_id != expected_goal_id => {
+                return Some(format!(
+                    "_goal_id mismatch (expected `{}`, got `{}`)",
+                    expected_goal_id, candidate_goal_id
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "_goal_id `{}` provided but no goal scope is active",
+                    candidate_goal_id
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn project_scope_violation_for_tool_call(
+    tool_name: &str,
+    effective_arguments: &str,
+    allowed_scope: Option<&str>,
+    allow_multi_project_scope: bool,
+) -> Option<String> {
+    if allow_multi_project_scope {
+        return None;
+    }
+
+    let allowed_scope = allowed_scope?;
+    let candidate_dirs = extract_project_dirs_from_tool_args(tool_name, effective_arguments);
+    if candidate_dirs.is_empty() {
+        return None;
+    }
+
+    let violations: Vec<String> = candidate_dirs
+        .iter()
+        .filter(|dir| !scope_allows_project_dir(allowed_scope, dir))
+        .cloned()
+        .collect();
+    if violations.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "project scope lock violation (allowed scope `{}`, requested path(s): {})",
+            allowed_scope,
+            violations.join(", ")
+        ))
+    }
+}
+
+fn is_hard_policy_tool_budget_reached(
+    total_tool_calls_attempted: usize,
+    policy_tool_budget: usize,
+) -> bool {
+    policy_tool_budget > 0 && total_tool_calls_attempted >= policy_tool_budget
+}
 
 impl Agent {
     pub(in crate::agent) async fn run_tool_execution_phase(
@@ -34,6 +112,8 @@ impl Agent {
         let channel_ctx = ctx.channel_ctx;
         let user_role = ctx.user_role;
         let heartbeat = ctx.heartbeat;
+        let turn_context = ctx.turn_context;
+        let resolved_goal_id = ctx.resolved_goal_id;
 
         let mut tool_defs = std::mem::take(ctx.tool_defs);
         let mut total_tool_calls_attempted = *ctx.total_tool_calls_attempted;
@@ -111,6 +191,58 @@ impl Agent {
         let mut successful_tool_calls = 0;
         let mut iteration_had_tool_failures = false;
         for tc in &resp.tool_calls {
+            let policy_tool_budget = policy_bundle.policy.tool_budget;
+            if is_hard_policy_tool_budget_reached(total_tool_calls_attempted, policy_tool_budget) {
+                force_text_response = true;
+                pending_system_messages.push(format!(
+                    "[SYSTEM] Hard tool budget reached ({} calls). Stop calling tools and answer with the evidence already collected.",
+                    policy_tool_budget
+                ));
+                self.emit_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::ToolBudgetBlock,
+                    format!(
+                        "Blocked tool {} because hard tool budget was reached",
+                        tc.name
+                    ),
+                    json!({
+                        "tool": tc.name,
+                        "policy_tool_budget": policy_tool_budget,
+                        "total_tool_calls_attempted": total_tool_calls_attempted,
+                        "reason": "hard_policy_tool_budget_reached"
+                    }),
+                )
+                .await;
+                let result_text = format!(
+                    "[SYSTEM] Hard tool budget reached: {} calls allowed per turn for this policy profile. \
+                     This call to `{}` was blocked. Synthesize and answer now.",
+                    policy_tool_budget, tc.name
+                );
+                let tool_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "tool".to_string(),
+                    content: Some(result_text),
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_name: Some(tc.name.clone()),
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.2,
+                    embedding: None,
+                };
+                self.append_tool_message_with_result_event(
+                    emitter,
+                    &tool_msg,
+                    true,
+                    0,
+                    None,
+                    Some(task_id),
+                )
+                .await?;
+                continue;
+            }
             total_tool_calls_attempted = total_tool_calls_attempted.saturating_add(1);
             let send_file_key = if tc.name == "send_file" {
                 extract_send_file_dedupe_key_from_args(&tc.arguments)
@@ -205,6 +337,55 @@ impl Agent {
             let attempted_required_file_recheck = require_file_recheck_before_answer
                 && is_file_recheck_tool(&tc.name)
                 && tool_call_includes_project_path(&tc.name, &effective_arguments);
+
+            let internal_scope_violation =
+                raw_internal_scope_violation(&tc.arguments, session_id, resolved_goal_id);
+            let allowed_project_scope = turn_context
+                .primary_project_scope
+                .as_deref()
+                .or(known_project_dir.as_deref());
+            let project_scope_violation = project_scope_violation_for_tool_call(
+                &tc.name,
+                &effective_arguments,
+                allowed_project_scope,
+                turn_context.allow_multi_project_scope,
+            );
+            if let Some(scope_reason) = internal_scope_violation.or(project_scope_violation) {
+                POLICY_METRICS
+                    .cross_scope_blocked_total
+                    .fetch_add(1, Ordering::Relaxed);
+                *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+                let result_text = format!(
+                    "[SYSTEM] Scope lock blocked `{}`: {}. Continue with tools that stay inside the active request scope.",
+                    tc.name, scope_reason
+                );
+                let tool_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "tool".to_string(),
+                    content: Some(result_text.clone()),
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_name: Some(tc.name.clone()),
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.2,
+                    embedding: None,
+                };
+                self.append_tool_message_with_result_event(
+                    emitter,
+                    &tool_msg,
+                    true,
+                    0,
+                    None,
+                    Some(task_id),
+                )
+                .await?;
+                pending_system_messages.push(format!(
+                    "[SYSTEM] The previous `{}` tool call was blocked by deterministic scope locks ({}). Use paths/tool args aligned with the current request scope.",
+                    tc.name, scope_reason
+                ));
+                continue;
+            }
 
             if self
                 .maybe_block_tool_by_budget(
@@ -448,5 +629,60 @@ impl Agent {
         );
         commit_state!();
         Ok(ToolExecutionOutcome::NextIteration)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_scope_violation_detects_session_mismatch() {
+        let raw = r#"{"_session_id":"other-session"}"#;
+        let violation = raw_internal_scope_violation(raw, "expected-session", None);
+        assert!(violation.is_some());
+        let message = violation.unwrap_or_default();
+        assert!(message.contains("_session_id mismatch"));
+    }
+
+    #[test]
+    fn internal_scope_violation_detects_goal_mismatch() {
+        let raw = r#"{"_goal_id":"goal-2"}"#;
+        let violation = raw_internal_scope_violation(raw, "s", Some("goal-1"));
+        assert!(violation.is_some());
+        let message = violation.unwrap_or_default();
+        assert!(message.contains("_goal_id mismatch"));
+    }
+
+    #[test]
+    fn project_scope_violation_flags_out_of_scope_path() {
+        let args = r#"{"path":"/tmp/project-b/src"}"#;
+        let violation = project_scope_violation_for_tool_call(
+            "search_files",
+            args,
+            Some("/tmp/project-a"),
+            false,
+        );
+        assert!(violation.is_some());
+    }
+
+    #[test]
+    fn project_scope_violation_allows_multi_project_requests() {
+        let args = r#"{"path":"/tmp/project-b/src"}"#;
+        let violation = project_scope_violation_for_tool_call(
+            "search_files",
+            args,
+            Some("/tmp/project-a"),
+            true,
+        );
+        assert!(violation.is_none());
+    }
+
+    #[test]
+    fn hard_policy_tool_budget_reached_when_attempts_hit_limit() {
+        assert!(is_hard_policy_tool_budget_reached(6, 6));
+        assert!(is_hard_policy_tool_budget_reached(7, 6));
+        assert!(!is_hard_policy_tool_budget_reached(5, 6));
+        assert!(!is_hard_policy_tool_budget_reached(10, 0));
     }
 }

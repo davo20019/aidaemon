@@ -32,6 +32,7 @@ pub(super) struct ConsultantDecisionCtx<'a> {
     pub user_role: UserRole,
     pub channel_ctx: ChannelContext,
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    pub turn_context: &'a TurnContext,
 }
 
 impl Agent {
@@ -87,6 +88,7 @@ impl Agent {
             channel_ctx: ctx.channel_ctx.clone(),
             status_tx: ctx.status_tx.clone(),
             intent_gate: &intent_gate,
+            turn_context: ctx.turn_context,
         })
         .await
     }

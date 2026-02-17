@@ -114,6 +114,14 @@ impl Tool for PolicyMetricsTool {
                  - consultant_route_default_continue_total: {}\n\
                  - consultant_route_tools_required_rate: {:.3}\n\
                  - consultant_route_return_rate: {:.3}\n\
+                 - context_bleed_prevented_total: {}\n\
+                 - context_mismatch_preflight_drop_total: {}\n\
+                 - followup_mode_overrides_total: {}\n\
+                 - cross_scope_blocked_total: {}\n\
+                 - tool_schema_contract_rejections_total: {}\n\
+                 - route_drift_alert_total: {}\n\
+                 - route_drift_failsafe_activation_total: {}\n\
+                 - route_failsafe_active_turn_total: {}\n\
                  - tokens_failed_tasks_total: {}\n\
                  - no_progress_iterations_total: {}",
                 metrics.consultant_direct_return_total,
@@ -127,6 +135,14 @@ impl Tool for PolicyMetricsTool {
                 metrics.consultant_route_default_continue_total,
                 route_reason_tools_required_rate,
                 route_reason_return_rate,
+                metrics.context_bleed_prevented_total,
+                metrics.context_mismatch_preflight_drop_total,
+                metrics.followup_mode_overrides_total,
+                metrics.cross_scope_blocked_total,
+                metrics.tool_schema_contract_rejections_total,
+                metrics.route_drift_alert_total,
+                metrics.route_drift_failsafe_activation_total,
+                metrics.route_failsafe_active_turn_total,
                 metrics.tokens_failed_tasks_total,
                 metrics.no_progress_iterations_total,
             ));
@@ -140,7 +156,12 @@ impl Tool for PolicyMetricsTool {
                 "consultant_fallthrough_rate": consultant_fallthrough_rate,
                 "consultant_route_reason_total": route_reason_total,
                 "consultant_route_tools_required_rate": route_reason_tools_required_rate,
-                "consultant_route_return_rate": route_reason_return_rate
+                "consultant_route_return_rate": route_reason_return_rate,
+                "route_drift_total": metrics.route_drift_alert_total,
+                "context_integrity_guard_events_total": metrics.context_bleed_prevented_total
+                    + metrics.context_mismatch_preflight_drop_total
+                    + metrics.followup_mode_overrides_total
+                    + metrics.cross_scope_blocked_total
             }
         });
         Ok(serde_json::to_string_pretty(&payload)?)
@@ -178,6 +199,10 @@ mod tests {
         assert!(parsed
             .get("metrics")
             .and_then(|m| m.get("no_progress_iterations_total"))
+            .is_some());
+        assert!(parsed
+            .get("metrics")
+            .and_then(|m| m.get("cross_scope_blocked_total"))
             .is_some());
     }
 }

@@ -23,4 +23,5 @@ pub(in crate::agent) struct ConsultantOrchestrationCtx<'a> {
     pub channel_ctx: ChannelContext,
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
     pub intent_gate: &'a IntentGateDecision,
+    pub turn_context: &'a TurnContext,
 }

@@ -68,4 +68,6 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub dirs_with_project_inspect_file_evidence: &'a mut HashSet<String>,
     pub dirs_with_search_no_matches: &'a mut HashSet<String>,
     pub require_file_recheck_before_answer: &'a mut bool,
+    pub turn_context: &'a TurnContext,
+    pub resolved_goal_id: Option<&'a str>,
 }

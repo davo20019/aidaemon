@@ -33,6 +33,7 @@ pub(in crate::agent) struct BootstrapData {
     pub llm_router: Option<Router>,
     pub model: String,
     pub consultant_pass_active: bool,
+    pub route_failsafe_active: bool,
     pub system_prompt: String,
     pub pinned_memories: Vec<Message>,
     pub session_summary: Option<ConversationSummary>,

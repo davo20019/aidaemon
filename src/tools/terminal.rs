@@ -18,7 +18,7 @@ use crate::traits::{Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
-use super::command_risk::{classify_command, PermissionMode, RiskLevel};
+use super::command_risk::{classify_command, hard_block_reason, PermissionMode, RiskLevel};
 use super::daemon_guard::detect_daemonization_primitives;
 use super::process_control::{configure_command_for_process_group, send_sigkill, send_sigterm};
 
@@ -75,6 +75,90 @@ fn contains_shell_operator(cmd: &str) -> bool {
         }
     }
     false
+}
+
+fn is_grep_command(token: &str) -> bool {
+    std::path::Path::new(token)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "grep")
+}
+
+fn grep_has_recursive_flag(token: &str) -> bool {
+    if matches!(token, "--recursive" | "--dereference-recursive") {
+        return true;
+    }
+    if token.starts_with("--") {
+        return false;
+    }
+    token
+        .strip_prefix('-')
+        .is_some_and(|flags| flags.chars().any(|c| c == 'r' || c == 'R'))
+}
+
+fn has_recursive_grep_scope_controls(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.contains("--exclude-dir")
+        || lower.contains("--exclude=")
+        || lower.contains("--exclude ")
+        || lower.contains("--include")
+        || lower.contains("-d skip")
+        || lower.contains("-dskip")
+}
+
+fn detect_unscoped_recursive_grep(command: &str) -> Option<(String, String)> {
+    let tokens = shell_words::split(command).ok()?;
+    let first = tokens.first()?;
+    if !is_grep_command(first) {
+        return None;
+    }
+
+    let recursive = tokens
+        .iter()
+        .skip(1)
+        .any(|tok| grep_has_recursive_flag(tok));
+    if !recursive || has_recursive_grep_scope_controls(command) {
+        return None;
+    }
+
+    // grep syntax: grep [OPTIONS] PATTERN [FILE...]
+    // We use a lightweight parse here: non-option tokens are treated as
+    // positional args; first positional = pattern, remaining = target paths.
+    let positionals: Vec<String> = tokens
+        .iter()
+        .skip(1)
+        .filter(|tok| !tok.starts_with('-'))
+        .cloned()
+        .collect();
+    let pattern = positionals.first()?.clone();
+    let paths = if positionals.len() >= 2 {
+        positionals[1..].to_vec()
+    } else {
+        vec![".".to_string()]
+    };
+    let broad_scope = paths
+        .iter()
+        .any(|p| matches!(p.as_str(), "." | "./" | "/" | "~" | "~/"));
+    if !broad_scope {
+        return None;
+    }
+
+    Some((pattern, paths.join(" ")))
+}
+
+fn recursive_grep_block_message(pattern: &str, path: &str) -> String {
+    let ignore_globs = super::fs_utils::DEFAULT_IGNORE_DIRS.join(",");
+    format!(
+        "Blocked: broad recursive `grep` without include/exclude filters is likely to stall on large trees.\n\
+Detected pattern: \"{}\"\n\
+Detected path: {}\n\n\
+Use one of these instead:\n\
+- `search_files` (preferred) with explicit `path`, optional `glob`, and regex `pattern`\n\
+- Terminal `rg` with exclusions:\n\
+  `rg -n --glob '!{{{}}}' \"<pattern>\" <path>`\n\
+- If you must use grep, add `--exclude-dir` and/or `--include` so the scan is bounded.",
+        pattern, path, ignore_globs
+    )
 }
 
 /// Drain an async reader into a capped buffer.
@@ -764,6 +848,10 @@ impl Tool for TerminalTool {
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("command is required for action=\"run\""))?;
 
+                if let Some((pattern, path)) = detect_unscoped_recursive_grep(command) {
+                    return Ok(recursive_grep_block_message(&pattern, &path));
+                }
+
                 let daemon_hits = detect_daemonization_primitives(command);
                 let mut daemonization_approved = false;
                 if !daemon_hits.is_empty() {
@@ -817,12 +905,30 @@ impl Tool for TerminalTool {
                 // Classify command risk
                 let mut assessment = classify_command(command);
 
+                // Deterministic hard block for irreversible broad-path deletes.
+                if let Some(reason) = hard_block_reason(command) {
+                    warn!(
+                        session_id = %args._session_id,
+                        task_id = ?args._task_id,
+                        command = %command,
+                        reason = %reason,
+                        "Blocked dangerous irreversible command"
+                    );
+                    return Ok(format!(
+                        "{} Use scoped, non-destructive commands instead.",
+                        reason
+                    ));
+                }
+
                 // Check for learned patterns and potentially lower risk
                 if let Some(ref pool) = self.pool {
                     if let Ok(Some((pattern, similarity))) =
                         find_matching_pattern(pool, command).await
                     {
-                        if pattern.is_trusted() && similarity >= 0.9 {
+                        if pattern.is_trusted()
+                            && similarity >= 0.9
+                            && assessment.level != RiskLevel::Critical
+                        {
                             // Trusted pattern with high similarity - lower risk by one level
                             let original_level = assessment.level;
                             assessment.level = match assessment.level {
@@ -975,6 +1081,35 @@ mod tests {
         assert!(!contains_shell_operator("ls -la /tmp"));
     }
 
+    #[test]
+    fn test_detect_unscoped_recursive_grep_broad_path() {
+        let detected = detect_unscoped_recursive_grep(r#"grep -rc "async fn" ."#);
+        assert!(
+            detected.is_some(),
+            "expected broad recursive grep to be detected"
+        );
+        let (pattern, path) = detected.unwrap();
+        assert_eq!(pattern, "async fn");
+        assert_eq!(path, ".");
+    }
+
+    #[test]
+    fn test_detect_unscoped_recursive_grep_allows_scoped_dir() {
+        let detected = detect_unscoped_recursive_grep(r#"grep -R "todo" src"#);
+        assert!(
+            detected.is_none(),
+            "scoped directory search should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_detect_unscoped_recursive_grep_allows_excludes() {
+        let detected = detect_unscoped_recursive_grep(
+            r#"grep -R --exclude-dir=node_modules --exclude-dir=target "todo" ."#,
+        );
+        assert!(detected.is_none(), "grep with excludes should be allowed");
+    }
+
     // ── format_output tests ──
 
     #[test]
@@ -1047,5 +1182,56 @@ mod tests {
             .await
             .unwrap();
         assert!(response.contains("only owners can approve"));
+    }
+
+    #[tokio::test]
+    async fn test_terminal_hard_blocks_broad_irreversible_delete_even_in_yolo() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            1000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let response = tool
+            .call(r#"{"action":"run","command":"find / -delete","_session_id":"s1","_user_role":"Owner"}"#)
+            .await
+            .unwrap();
+        assert!(response.contains("Blocked irreversible delete"));
+        assert!(response.contains("scoped, non-destructive"));
+    }
+
+    #[tokio::test]
+    async fn test_terminal_blocks_unscoped_recursive_grep() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            1000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"grep -rc \"async fn\" .","_session_id":"s1","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(response.contains("Blocked: broad recursive `grep`"));
+        assert!(response.contains("search_files"));
+        assert!(response.contains("rg -n --glob"));
     }
 }

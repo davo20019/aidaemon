@@ -740,7 +740,12 @@ impl Agent {
             "{}\n\n[Response Focus]\n\
              Respond ONLY to the user's latest message.\n\
              Do NOT repeat, re-answer, or revisit earlier questions from the conversation history unless the latest message explicitly asks you to.\n\
-             Use earlier messages only as context to answer what the user is asking now.",
+             Use earlier messages only as context to answer what the user is asking now.\n\
+             \n\
+             [Recall Priority]\n\
+             For questions about recent conversation (for example: \"what did I just ask\", \"what were the last 3 things\", \"summarize our chat\"), use the conversation history already in context FIRST.\n\
+             Do NOT jump to goal/task forensics tools for simple recall.\n\
+             Use `goal_trace` / `tool_trace` only when the user explicitly asks for execution forensics (task timelines, tool failures, retries, or specific goal/task IDs).",
             system_prompt
         );
 

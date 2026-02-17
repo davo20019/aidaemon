@@ -272,6 +272,25 @@ fn test_classify_no_complexity_defaults_simple() {
 }
 
 #[test]
+fn test_classify_missing_complexity_promotes_cross_project_analysis_to_complex() {
+    let gate = gate_with_answer(false);
+    assert!(gate.complexity.is_none());
+    let (complexity, _) = classify_intent_complexity(
+        "Compare the package.json files across all my projects, identify shared dependencies, calculate total node_modules disk usage, and summarize version conflicts.",
+        &gate,
+    );
+    assert_eq!(complexity, IntentComplexity::Complex);
+}
+
+#[test]
+fn test_classify_missing_complexity_keeps_simple_requests_simple() {
+    let gate = gate_with_answer(false);
+    assert!(gate.complexity.is_none());
+    let (complexity, _) = classify_intent_complexity("run ls -la", &gate);
+    assert_eq!(complexity, IntentComplexity::Simple);
+}
+
+#[test]
 fn test_classify_complexity_knowledge_field_with_can_answer() {
     // When can_answer_now=true, knowledge complexity stays Knowledge
     let mut gate = gate_with_answer(true);

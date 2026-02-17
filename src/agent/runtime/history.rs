@@ -1,15 +1,62 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FollowupMode {
+    NewTask,
+    Followup,
+    ClarificationAnswer,
+}
+
+impl FollowupMode {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            FollowupMode::NewTask => "new_task",
+            FollowupMode::Followup => "followup",
+            FollowupMode::ClarificationAnswer => "clarification_answer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TurnContextReason {
+    DefaultNewTask,
+    ExplicitFollowup,
+    ClarificationAnswer,
+    FollowupOverrideStandalone,
+    FollowupOverrideMismatchPreflight,
+    CarryoverSanitized,
+}
+
+impl TurnContextReason {
+    pub(super) fn as_code(&self) -> &'static str {
+        match self {
+            TurnContextReason::DefaultNewTask => "default_new_task",
+            TurnContextReason::ExplicitFollowup => "explicit_followup",
+            TurnContextReason::ClarificationAnswer => "clarification_answer",
+            TurnContextReason::FollowupOverrideStandalone => "followup_override_standalone",
+            TurnContextReason::FollowupOverrideMismatchPreflight => {
+                "followup_override_mismatch_preflight"
+            }
+            TurnContextReason::CarryoverSanitized => "carryover_sanitized",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
-pub(super) struct GoalPromptContext {
+pub(super) struct TurnContext {
     pub goal_user_text: String,
     pub recent_messages: Vec<Value>,
     pub project_hints: Vec<String>,
+    pub primary_project_scope: Option<String>,
+    pub allow_multi_project_scope: bool,
+    pub followup_mode: Option<FollowupMode>,
+    pub reasons: Vec<TurnContextReason>,
 }
 
 const GOAL_CONTEXT_RECENT_MESSAGES_LIMIT: usize = 6;
 const GOAL_CONTEXT_HINT_HISTORY_LIMIT: usize = 30;
 const GOAL_CONTEXT_MAX_PROJECT_HINTS: usize = 8;
+const GOAL_CONTEXT_MAX_PROJECT_SCOPES: usize = 6;
 
 fn find_previous_turns(
     history: &[Message],
@@ -97,21 +144,103 @@ fn looks_like_style_followup(lower_text: &str) -> bool {
     style_markers.iter().any(|m| lower_text.contains(m))
 }
 
-fn looks_like_followup_reply(current: &str, prev_assistant: Option<&str>) -> bool {
+fn looks_like_standalone_goal_request(lower_text: &str) -> bool {
+    let word_count = lower_text.split_whitespace().count();
+    if word_count < 8 {
+        return false;
+    }
+
+    let asks_for_uninterrupted_execution = contains_keyword_as_words(lower_text, "dont ask")
+        || contains_keyword_as_words(lower_text, "don't ask")
+        || contains_keyword_as_words(lower_text, "without asking")
+        || contains_keyword_as_words(lower_text, "just do it");
+
+    let has_action_verb = [
+        "compare",
+        "analyze",
+        "analyse",
+        "build",
+        "create",
+        "write",
+        "read",
+        "parse",
+        "scan",
+        "search",
+        "find",
+        "clean",
+        "delete",
+        "install",
+        "fix",
+        "refactor",
+        "audit",
+        "summarize",
+        "review",
+    ]
+    .iter()
+    .any(|kw| contains_keyword_as_words(lower_text, kw));
+
+    let has_scope_detail = lower_text.contains('/')
+        || lower_text.contains(".json")
+        || lower_text.contains("all my projects")
+        || lower_text.contains("across all")
+        || lower_text.contains("dependencies")
+        || lower_text.contains("versions")
+        || lower_text.contains("node_modules");
+
+    (asks_for_uninterrupted_execution && has_action_verb)
+        || (word_count >= 14 && has_action_verb && has_scope_detail)
+}
+
+fn looks_like_multi_project_request(lower_text: &str) -> bool {
+    contains_keyword_as_words(lower_text, "all my projects")
+        || contains_keyword_as_words(lower_text, "across all projects")
+        || contains_keyword_as_words(lower_text, "across my projects")
+        || contains_keyword_as_words(lower_text, "every project")
+        || (contains_keyword_as_words(lower_text, "all projects")
+            && contains_keyword_as_words(lower_text, "compare"))
+}
+
+fn sanitize_carryover_blocks(input: &str) -> (String, bool) {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return (String::new(), false);
+    }
+    let markers = ["Original request:", "Assistant asked:", "Follow-up:"];
+    let mut sanitized = trimmed.to_string();
+    let mut changed = false;
+    for marker in markers {
+        if sanitized.contains(marker) {
+            changed = true;
+            sanitized = sanitized.replace(marker, "");
+        }
+    }
+    (sanitized.trim().to_string(), changed)
+}
+
+fn classify_followup_mode(
+    current: &str,
+    prev_assistant: Option<&str>,
+) -> (FollowupMode, Vec<TurnContextReason>) {
+    let mut reasons = Vec::new();
     let trimmed = current.trim();
     if trimmed.is_empty() {
-        return false;
+        reasons.push(TurnContextReason::DefaultNewTask);
+        return (FollowupMode::NewTask, reasons);
     }
     let lower = trimmed.to_ascii_lowercase();
     let is_short = trimmed.chars().count() <= 260;
     if !is_short || looks_like_explicit_task_switch(&lower) {
-        return false;
+        reasons.push(TurnContextReason::DefaultNewTask);
+        return (FollowupMode::NewTask, reasons);
     }
 
-    let explicit_followup = lower.starts_with("also ")
-        || lower.starts_with("and ")
-        || lower.starts_with("plus ")
-        || contains_keyword_as_words(&lower, "yes")
+    if looks_like_standalone_goal_request(&lower) {
+        reasons.push(TurnContextReason::FollowupOverrideStandalone);
+        reasons.push(TurnContextReason::DefaultNewTask);
+        return (FollowupMode::NewTask, reasons);
+    }
+
+    let ack_like = contains_keyword_as_words(&lower, "yes")
         || contains_keyword_as_words(&lower, "confirm")
         || contains_keyword_as_words(&lower, "go ahead")
         || contains_keyword_as_words(&lower, "do it")
@@ -119,18 +248,52 @@ fn looks_like_followup_reply(current: &str, prev_assistant: Option<&str>) -> boo
         || contains_keyword_as_words(&lower, "ok")
         || contains_keyword_as_words(&lower, "okay")
         || contains_keyword_as_words(&lower, "sounds good")
-        || contains_keyword_as_words(&lower, "just use")
+        || contains_keyword_as_words(&lower, "just use");
+    let concise_ack_like = ack_like && trimmed.chars().count() <= 80;
+    let explicit_followup = lower.starts_with("also ")
+        || lower.starts_with("and ")
+        || lower.starts_with("plus ")
+        || concise_ack_like
         || looks_like_style_followup(&lower);
-
     if explicit_followup {
-        return true;
+        reasons.push(TurnContextReason::ExplicitFollowup);
+        return (FollowupMode::Followup, reasons);
     }
 
-    prev_assistant.is_some_and(|prev| {
+    if prev_assistant.is_some_and(|prev| {
         assistant_message_looks_like_clarifying_question(prev)
             && !trimmed.trim_end().ends_with('?')
             && !looks_like_explicit_task_switch(&lower)
-    })
+    }) {
+        reasons.push(TurnContextReason::ClarificationAnswer);
+        return (FollowupMode::ClarificationAnswer, reasons);
+    }
+
+    reasons.push(TurnContextReason::DefaultNewTask);
+    (FollowupMode::NewTask, reasons)
+}
+
+fn has_project_scope_divergence(prev_user_text: &str, current: &str) -> bool {
+    let mut prev_hints = Vec::new();
+    let mut current_hints = Vec::new();
+    extract_project_hints_from_text(prev_user_text, &mut prev_hints, 6, false);
+    extract_project_hints_from_text(current, &mut current_hints, 6, false);
+    if prev_hints.is_empty() || current_hints.is_empty() {
+        return false;
+    }
+    !current_hints
+        .iter()
+        .any(|hint| prev_hints.iter().any(|p| p == hint))
+}
+
+#[cfg(test)]
+fn looks_like_followup_reply(current: &str, prev_assistant: Option<&str>) -> bool {
+    let trimmed = current.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let (mode, _) = classify_followup_mode(current, prev_assistant);
+    mode != FollowupMode::NewTask
 }
 
 fn trim_assistant_context_content(content: &str) -> String {
@@ -217,6 +380,21 @@ fn is_likely_filename(token: &str) -> bool {
         && !ext.is_empty()
         && ext.len() <= 8
         && ext.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+fn token_looks_like_filesystem_path(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let looks_windows_abs = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    token.starts_with('/')
+        || token.starts_with("~/")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.contains('/')
+        || token.contains('\\')
+        || looks_windows_abs
 }
 
 fn is_common_path_segment(token: &str) -> bool {
@@ -401,15 +579,93 @@ fn extract_project_hints_from_history(
     hints
 }
 
+fn normalize_project_scope_path(raw_path: &str) -> Option<String> {
+    let mut normalized = crate::tools::fs_utils::validate_path(raw_path).ok()?;
+
+    let trimmed = raw_path.trim_end_matches('/');
+    let file_name_looks_like_file = std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name.contains('.') && !name.starts_with('.') && !name.ends_with('.'));
+    if file_name_looks_like_file || normalized.is_file() {
+        if let Some(parent) = normalized.parent() {
+            normalized = parent.to_path_buf();
+        }
+    }
+
+    Some(normalized.to_string_lossy().to_string())
+}
+
+fn push_project_scope(scopes: &mut Vec<String>, scope: String, max_scopes: usize) {
+    if scopes.len() >= max_scopes || scopes.iter().any(|existing| existing == &scope) {
+        return;
+    }
+    scopes.push(scope);
+}
+
+fn extract_project_scopes_from_text(text: &str, scopes: &mut Vec<String>, max_scopes: usize) {
+    for raw in text.split_whitespace() {
+        if scopes.len() >= max_scopes {
+            break;
+        }
+        let token = raw
+            .trim_matches(|c: char| {
+                c.is_ascii_whitespace()
+                    || matches!(
+                        c,
+                        '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+                    )
+            })
+            .trim();
+        if token.is_empty() || token.contains("://") || !token_looks_like_filesystem_path(token) {
+            continue;
+        }
+        if let Some(scope) = normalize_project_scope_path(token) {
+            push_project_scope(scopes, scope, max_scopes);
+        }
+    }
+}
+
+fn extract_project_scopes_from_history(
+    history: &[Message],
+    current_user_text: &str,
+    max_scopes: usize,
+    include_history_scopes: bool,
+) -> Vec<String> {
+    let mut scopes = Vec::new();
+    extract_project_scopes_from_text(current_user_text, &mut scopes, max_scopes);
+
+    if !include_history_scopes {
+        return scopes;
+    }
+
+    for msg in history.iter().rev() {
+        if scopes.len() >= max_scopes {
+            break;
+        }
+        let Some(content) = msg.content.as_deref() else {
+            continue;
+        };
+        match msg.role.as_str() {
+            "user" | "assistant" | "tool" => {
+                extract_project_scopes_from_text(content, &mut scopes, max_scopes);
+            }
+            _ => {}
+        }
+    }
+
+    scopes
+}
+
 impl Agent {
-    pub(super) async fn build_goal_prompt_context_from_recent_history(
+    pub(super) async fn build_turn_context_from_recent_history(
         &self,
         session_id: &str,
         user_text: &str,
-    ) -> GoalPromptContext {
+    ) -> TurnContext {
         let current = user_text.trim();
         if current.is_empty() {
-            return GoalPromptContext::default();
+            return TurnContext::default();
         }
 
         let history = self
@@ -418,16 +674,35 @@ impl Agent {
             .await
             .unwrap_or_default();
         let (prev_assistant, prev_user) = find_previous_turns(&history, current);
+        let (mut followup_mode, mut reasons) =
+            classify_followup_mode(current, prev_assistant.as_deref());
 
-        let goal_user_text = match prev_user {
-            Some(prev_user_text)
-                if looks_like_followup_reply(current, prev_assistant.as_deref())
-                    && !prev_user_text.trim().eq_ignore_ascii_case(current) =>
+        let mut goal_user_text = current.to_string();
+        if followup_mode != FollowupMode::NewTask {
+            let mismatch_preflight_drop = prev_user
+                .as_deref()
+                .is_some_and(|prev| has_project_scope_divergence(prev, current));
+            if mismatch_preflight_drop {
+                followup_mode = FollowupMode::NewTask;
+                reasons.push(TurnContextReason::FollowupOverrideMismatchPreflight);
+                reasons.push(TurnContextReason::DefaultNewTask);
+                POLICY_METRICS
+                    .context_mismatch_preflight_drop_total
+                    .fetch_add(1, Ordering::Relaxed);
+                POLICY_METRICS
+                    .followup_mode_overrides_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if followup_mode != FollowupMode::NewTask {
+            if let Some(prev_user_text) = prev_user
+                .as_deref()
+                .filter(|prev| !prev.trim().eq_ignore_ascii_case(current))
             {
                 let mut combined = String::new();
                 combined.push_str("Original request:\n");
                 combined.push_str(&truncate_for_resume(prev_user_text.trim(), 2000));
-                if let Some(prev_assistant_text) = prev_assistant {
+                if let Some(prev_assistant_text) = prev_assistant.as_deref() {
                     let trimmed = prev_assistant_text.trim();
                     if !trimmed.is_empty() && trimmed.contains('?') {
                         combined.push_str("\n\nAssistant asked:\n");
@@ -436,22 +711,43 @@ impl Agent {
                 }
                 combined.push_str("\n\nFollow-up:\n");
                 combined.push_str(&truncate_for_resume(current, 800));
-                combined
+                goal_user_text = combined;
             }
-            _ => current.to_string(),
-        };
+        } else {
+            let (sanitized, changed) = sanitize_carryover_blocks(current);
+            if changed {
+                reasons.push(TurnContextReason::CarryoverSanitized);
+                POLICY_METRICS
+                    .context_bleed_prevented_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if !sanitized.is_empty() {
+                goal_user_text = sanitized;
+            }
+        }
 
-        GoalPromptContext {
+        let project_hints =
+            extract_project_hints_from_history(&history, current, GOAL_CONTEXT_MAX_PROJECT_HINTS);
+        let project_scopes = extract_project_scopes_from_history(
+            &history,
+            current,
+            GOAL_CONTEXT_MAX_PROJECT_SCOPES,
+            followup_mode != FollowupMode::NewTask,
+        );
+        let allow_multi_project_scope =
+            looks_like_multi_project_request(&current.to_ascii_lowercase());
+        let primary_project_scope = project_scopes.first().cloned();
+        TurnContext {
             goal_user_text,
             recent_messages: extract_recent_parent_messages(
                 &history,
                 GOAL_CONTEXT_RECENT_MESSAGES_LIMIT,
             ),
-            project_hints: extract_project_hints_from_history(
-                &history,
-                current,
-                GOAL_CONTEXT_MAX_PROJECT_HINTS,
-            ),
+            project_hints,
+            primary_project_scope,
+            allow_multi_project_scope,
+            followup_mode: Some(followup_mode),
+            reasons,
         }
     }
 
@@ -612,6 +908,7 @@ impl Agent {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use proptest::prelude::*;
 
     fn msg(role: &str, content: &str) -> Message {
         Message {
@@ -641,6 +938,20 @@ mod tests {
         let followup = "New task: build a dashboard from scratch.";
         let prev = "Should I continue with this page or focus on another one?";
         assert!(!looks_like_followup_reply(followup, Some(prev)));
+    }
+
+    #[test]
+    fn followup_rejects_standalone_request_with_do_it_suffix() {
+        let followup = "Compare the package.json files across all my projects in ~/projects. Which ones share dependencies? Don't ask questions, just do it.";
+        let prev = "Which directories are taking up the most space?";
+        assert!(!looks_like_followup_reply(followup, Some(prev)));
+    }
+
+    #[test]
+    fn followup_accepts_concise_do_it_ack() {
+        let followup = "Yes, do it.";
+        let prev = "Should I proceed with this change?";
+        assert!(looks_like_followup_reply(followup, Some(prev)));
     }
 
     #[test]
@@ -695,6 +1006,54 @@ mod tests {
     }
 
     #[test]
+    fn project_scope_extraction_uses_explicit_current_path() {
+        let history = vec![msg("assistant", "Earlier we touched ~/projects/old-one")];
+        let current = "Please work in ~/projects/new-one/src and review the files.";
+        let scopes = extract_project_scopes_from_history(&history, current, 4, true);
+        assert!(!scopes.is_empty());
+        assert!(
+            scopes[0].contains("new-one"),
+            "expected first scope to come from current request, got {:?}",
+            scopes
+        );
+    }
+
+    #[test]
+    fn project_scope_extraction_ignores_history_for_new_tasks() {
+        let history = vec![msg(
+            "assistant",
+            "Found symlink: /Users/davidloor/.openclaw and other directories.",
+        )];
+        let current = "Find all Rust files in the aidaemon project that contain async fn.";
+        let scopes = extract_project_scopes_from_history(&history, current, 4, false);
+        assert!(
+            scopes.iter().all(|scope| !scope.contains(".openclaw")),
+            "new task scope should not inherit prior assistant paths: {:?}",
+            scopes
+        );
+    }
+
+    #[test]
+    fn project_scope_extraction_keeps_history_for_followups() {
+        let history = vec![
+            msg(
+                "user",
+                "Please work in /Users/davidloor/projects/aidaemon and inspect async functions.",
+            ),
+            msg("assistant", "Should I proceed with a full scan?"),
+        ];
+        let current = "Yes, do it.";
+        let scopes = extract_project_scopes_from_history(&history, current, 4, true);
+        assert!(
+            scopes
+                .iter()
+                .any(|scope| scope.contains("/projects/aidaemon")),
+            "followup should carry prior project scope when explicit: {:?}",
+            scopes
+        );
+    }
+
+    #[test]
     fn recent_parent_messages_strip_intent_gate_payload() {
         let history = vec![
             msg("user", "Build a site"),
@@ -711,5 +1070,39 @@ mod tests {
             .unwrap_or_default();
         assert!(!assistant_content.contains("[INTENT_GATE]"));
         assert_eq!(assistant_content, "Sure, I can help.");
+    }
+
+    proptest! {
+        #[test]
+        fn sanitize_carryover_blocks_removes_known_markers(payload in ".*") {
+            let input = format!(
+                "Original request:\n{}\n\nAssistant asked:\n{}\n\nFollow-up:\n{}",
+                payload, payload, payload
+            );
+            let (sanitized, changed) = sanitize_carryover_blocks(&input);
+            prop_assert!(changed);
+            prop_assert!(!sanitized.contains("Original request:"));
+            prop_assert!(!sanitized.contains("Assistant asked:"));
+            prop_assert!(!sanitized.contains("Follow-up:"));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn standalone_cross_project_requests_do_not_classify_as_followup(
+            scope in "[a-z0-9_-]{3,20}",
+            verb in prop::sample::select(vec!["compare", "analyze", "scan", "review", "audit"]),
+        ) {
+            let current = format!(
+                "{} dependencies across all my projects in ~/projects/{}. Don't ask questions, just do it.",
+                verb, scope
+            );
+            let (mode, reasons) = classify_followup_mode(
+                &current,
+                Some("Which directories should I inspect?")
+            );
+            prop_assert_eq!(mode, FollowupMode::NewTask);
+            prop_assert!(reasons.contains(&TurnContextReason::FollowupOverrideStandalone));
+        }
     }
 }

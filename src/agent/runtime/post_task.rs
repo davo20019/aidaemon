@@ -333,6 +333,52 @@ pub(super) fn graceful_stall_response(
     summary
 }
 
+/// Graceful response when agent stalled after making meaningful progress.
+pub(super) fn graceful_partial_stall_response(
+    learning_ctx: &LearningContext,
+    sent_file_successfully: bool,
+    deferred_no_tool_error_marker: &str,
+) -> String {
+    let (label, suggestion) = classify_stall(learning_ctx, deferred_no_tool_error_marker);
+    let recent_errors = learning_ctx
+        .errors
+        .iter()
+        .rev()
+        .take(3)
+        .map(|(e, _)| format!("- {}", e.chars().take(100).collect::<String>()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if sent_file_successfully {
+        format!(
+            "I completed the primary deliverable and made additional progress, then got stuck in follow-up steps.\n\n\
+                Stopping reason: **{}**\n\
+                - {} tool calls executed\n\
+                - {} errors encountered\n\n\
+                {}\n\n\
+                Recent errors:\n{}",
+            label,
+            learning_ctx.tool_calls.len(),
+            learning_ctx.errors.len(),
+            suggestion,
+            recent_errors
+        )
+    } else {
+        format!(
+            "I made meaningful progress, but got stuck before fully finishing.\n\n\
+                Stopping reason: **{}**\n\
+                - {} tool calls executed\n\
+                - {} errors encountered\n\n\
+                {}\n\n\
+                Recent errors:\n{}",
+            label,
+            learning_ctx.tool_calls.len(),
+            learning_ctx.errors.len(),
+            suggestion,
+            recent_errors
+        )
+    }
+}
+
 /// Graceful response when repetitive tool calls are detected.
 pub(super) fn graceful_repetitive_response(
     learning_ctx: &LearningContext,
@@ -608,6 +654,30 @@ mod tests {
         };
         let result = graceful_budget_response(&ctx, 500_000);
         assert!(result.len() <= 1502); // 1500 + "…"
+    }
+
+    #[test]
+    fn test_graceful_partial_stall_response_mentions_progress() {
+        let ctx = LearningContext {
+            user_text: "fix build".to_string(),
+            intent_domains: vec![],
+            tool_calls: vec![
+                "read_file(Cargo.toml)".to_string(),
+                "run_command(cargo build)".to_string(),
+                "edit_file(src/lib.rs)".to_string(),
+                "run_command(cargo build)".to_string(),
+            ],
+            errors: vec![("Text not found in src/lib.rs".to_string(), false)],
+            first_error: None,
+            recovery_actions: vec![],
+            start_time: Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+        };
+        let result = graceful_partial_stall_response(&ctx, false, "deferred");
+        assert!(result.contains("made meaningful progress"));
+        assert!(result.contains("4 tool calls"));
     }
 
     fn make_learning_ctx() -> LearningContext {

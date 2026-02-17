@@ -34,6 +34,7 @@ const ROUTE_ALERT_CLARIFICATION_MIN_BASELINE: usize = 20;
 const ROUTE_ALERT_CLARIFICATION_RATE_DELTA_THRESHOLD: f64 = 0.20;
 const ROUTE_ALERT_CLARIFICATION_SPIKE_MULTIPLIER: f64 = 2.0;
 const ROUTE_ALERT_CLARIFICATION_MIN_SUSTAINED_RATE: f64 = 0.50;
+const CONTEXT_SCOPE_ALERT_THRESHOLD: u64 = 1;
 
 #[derive(Debug, Clone)]
 struct IntentGateRouteSample {
@@ -884,6 +885,7 @@ Rules: no invented event IDs; confidence 0..1.",
         analysis: &DeterministicAnalysis,
         route_health_alerts_section: &str,
         route_reason_trends_section: &str,
+        context_scope_guards_section: &str,
         recovery_section: &str,
     ) -> String {
         let mut out = format!(
@@ -938,6 +940,8 @@ Rules: no invented event IDs; confidence 0..1.",
         out.push_str(route_health_alerts_section);
         out.push_str("\n\n");
         out.push_str(route_reason_trends_section);
+        out.push_str("\n\n");
+        out.push_str(context_scope_guards_section);
 
         out.push_str("\n\n### Minimal Fix\n");
         for step in &analysis.minimal_fix {
@@ -950,6 +954,54 @@ Rules: no invented event IDs; confidence 0..1.",
         }
         out.push('\n');
         out.push_str(recovery_section);
+        out.trim_end().to_string()
+    }
+
+    fn build_context_scope_guards_section(&self) -> String {
+        let metrics = crate::agent::policy_metrics_snapshot();
+        let mut out = String::from("### Context/Scope Guardrails\n");
+        let total_guard_interventions = metrics.context_bleed_prevented_total
+            + metrics.context_mismatch_preflight_drop_total
+            + metrics.followup_mode_overrides_total
+            + metrics.cross_scope_blocked_total;
+
+        out.push_str(&format!(
+            "- context_bleed_prevented_total: {}\n",
+            metrics.context_bleed_prevented_total
+        ));
+        out.push_str(&format!(
+            "- context_mismatch_preflight_drop_total: {}\n",
+            metrics.context_mismatch_preflight_drop_total
+        ));
+        out.push_str(&format!(
+            "- followup_mode_overrides_total: {}\n",
+            metrics.followup_mode_overrides_total
+        ));
+        out.push_str(&format!(
+            "- cross_scope_blocked_total: {}\n",
+            metrics.cross_scope_blocked_total
+        ));
+        out.push_str(&format!(
+            "- route_drift_alert_total: {}\n",
+            metrics.route_drift_alert_total
+        ));
+        out.push_str(&format!(
+            "- route_drift_failsafe_activation_total: {}\n",
+            metrics.route_drift_failsafe_activation_total
+        ));
+        out.push_str(&format!(
+            "- route_failsafe_active_turn_total: {}\n",
+            metrics.route_failsafe_active_turn_total
+        ));
+
+        if total_guard_interventions >= CONTEXT_SCOPE_ALERT_THRESHOLD {
+            out.push_str(&format!(
+                "- Status: alert ({} guard intervention(s) observed).\n",
+                total_guard_interventions
+            ));
+        } else {
+            out.push_str("- Status: healthy (no context/scope guard interventions observed).\n");
+        }
         out.trim_end().to_string()
     }
 
@@ -1236,6 +1288,7 @@ Rules: no invented event IDs; confidence 0..1.",
         let merged = self.merge_llm_analysis(deterministic, llm, &events);
         let route_health_alerts = self.build_route_health_alerts_section(session_id).await;
         let route_reason_trends = self.build_route_reason_trends_section(session_id).await;
+        let context_scope_guards = self.build_context_scope_guards_section();
         let recovery_section = self
             .build_resume_recovery_section(session_id, &resolved_task, &events)
             .await;
@@ -1244,6 +1297,7 @@ Rules: no invented event IDs; confidence 0..1.",
             &merged,
             &route_health_alerts,
             &route_reason_trends,
+            &context_scope_guards,
             &recovery_section,
         ))
     }
@@ -1898,6 +1952,57 @@ mod tests {
         assert!(res.contains("tools_required"));
         assert!(res.contains("acknowledgment_direct_reply"));
         assert!(res.contains("Action mix:"));
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_includes_context_scope_guardrails_section() {
+        let tool = setup_tool().await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskStart,
+            TaskStartData {
+                task_id: "t-ctx".to_string(),
+                description: "Run".to_string(),
+                parent_task_id: None,
+                user_message: None,
+            },
+            Some("t-ctx"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::Error,
+            ErrorData::tool_error("terminal", "boom", Some("t-ctx".to_string())),
+            Some("t-ctx"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskEnd,
+            TaskEndData {
+                task_id: "t-ctx".to_string(),
+                status: TaskStatus::Failed,
+                duration_secs: 1,
+                iterations: 1,
+                tool_calls_count: 0,
+                error: Some("failed".to_string()),
+                summary: None,
+            },
+            Some("t-ctx"),
+        )
+        .await;
+
+        let res = tool
+            .call(r#"{"action":"diagnose","task_id":"t-ctx","_session_id":"s1"}"#)
+            .await
+            .unwrap();
+
+        assert!(res.contains("### Context/Scope Guardrails"));
+        assert!(res.contains("context_bleed_prevented_total"));
+        assert!(res.contains("cross_scope_blocked_total"));
     }
 
     #[tokio::test]

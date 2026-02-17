@@ -185,6 +185,23 @@ impl Agent {
             .await
     }
 
+    /// Graceful response when agent stalled after making meaningful progress.
+    pub(super) async fn graceful_partial_stall_response(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        session_id: &str,
+        learning_ctx: &LearningContext,
+        sent_file_successfully: bool,
+    ) -> anyhow::Result<String> {
+        let summary = post_task::graceful_partial_stall_response(
+            learning_ctx,
+            sent_file_successfully,
+            DEFERRED_NO_TOOL_ERROR_MARKER,
+        );
+        self.append_graceful_assistant_summary(emitter, session_id, summary)
+            .await
+    }
+
     /// Graceful response when repetitive tool calls are detected.
     pub(super) async fn graceful_repetitive_response(
         &self,

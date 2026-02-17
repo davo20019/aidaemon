@@ -333,6 +333,33 @@ impl Agent {
             .await;
         }
 
+        if let Some(drift_signal) =
+            observe_route_reason_for_drift(session_id, route_reason, route_action, route_reply_len)
+        {
+            warn!(
+                session_id,
+                failsafe_activated = drift_signal.failsafe_activated,
+                summary = %drift_signal.summary,
+                "Consultant route drift monitor triggered"
+            );
+            if self.record_decision_points {
+                self.emit_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::RouteDriftAlert,
+                    drift_signal.summary.clone(),
+                    json!({
+                        "route_reason": route_reason,
+                        "route_action": route_action,
+                        "route_reply_len": route_reply_len,
+                        "failsafe_activated": drift_signal.failsafe_activated
+                    }),
+                )
+                .await;
+            }
+        }
+
         if !intent_gate.domains.is_empty() {
             learning_ctx.intent_domains = intent_gate.domains.clone();
         }

@@ -251,6 +251,10 @@ async function fetchPolicyMetrics() {
       ['Route reason: short_correction_direct_reply', fmtNum(d.consultant_route_short_correction_direct_reply_total)],
       ['Route reason: acknowledgment_direct_reply', fmtNum(d.consultant_route_acknowledgment_direct_reply_total)],
       ['Route reason: default_continue', fmtNum(d.consultant_route_default_continue_total)],
+      ['Tool schema contract rejections', fmtNum(d.tool_schema_contract_rejections_total)],
+      ['Route drift alerts', fmtNum(d.route_drift_alert_total)],
+      ['Route fail-safe activations', fmtNum(d.route_drift_failsafe_activation_total)],
+      ['Route fail-safe active turns', fmtNum(d.route_failsafe_active_turn_total)],
     ];
     let html = '<table><tr><th>Metric</th><th>Value</th></tr>';
     for (const [k, v] of rows) html += '<tr><td>' + esc(k) + '</td><td class="mono">' + esc(String(v)) + '</td></tr>';

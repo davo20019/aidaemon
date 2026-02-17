@@ -25,6 +25,7 @@ pub(super) struct StoppingPhaseCtx<'a> {
     pub user_role: UserRole,
     pub evidence_gain_count: usize,
     pub stall_count: usize,
+    pub deferred_no_tool_streak: usize,
     pub consecutive_same_tool: &'a (String, usize),
     pub consecutive_same_tool_arg_hashes: &'a HashSet<u64>,
     pub total_successful_tool_calls: usize,
@@ -69,6 +70,7 @@ impl Agent {
         let user_role = ctx.user_role;
         let evidence_gain_count = ctx.evidence_gain_count;
         let stall_count = ctx.stall_count;
+        let deferred_no_tool_streak = ctx.deferred_no_tool_streak;
         let consecutive_same_tool = ctx.consecutive_same_tool;
         let consecutive_same_tool_arg_hashes = ctx.consecutive_same_tool_arg_hashes;
         let total_successful_tool_calls = ctx.total_successful_tool_calls;
@@ -587,7 +589,61 @@ impl Agent {
             }
         }
 
-        // 6. Stall detection — agent spinning without progress
+        // 6. Pre-execution deferral guard — the model keeps narrating
+        // planned actions without issuing any tool calls.
+        const MAX_PRE_TOOL_DEFERRALS: usize = 6;
+        if total_successful_tool_calls == 0 && deferred_no_tool_streak >= MAX_PRE_TOOL_DEFERRALS {
+            warn!(
+                session_id,
+                deferred_no_tool_streak, "Pre-tool deferral threshold reached"
+            );
+            self.emit_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                DecisionType::StoppingCondition,
+                "Stopping condition fired: repeated pre-tool deferrals".to_string(),
+                json!({
+                    "condition":"pre_tool_deferral_stall",
+                    "deferred_no_tool_streak": deferred_no_tool_streak,
+                    "max_pre_tool_deferrals": MAX_PRE_TOOL_DEFERRALS
+                }),
+            )
+            .await;
+            let reply = "I’m still getting planning-only outputs and haven’t started tool execution yet. Please resend the request and I’ll retry with stricter tool-call mode."
+                .to_string();
+            let assistant_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "assistant".to_string(),
+                content: Some(reply.clone()),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.5,
+                embedding: None,
+            };
+            self.append_assistant_message_with_event(emitter, &assistant_msg, &model, None, None)
+                .await?;
+
+            self.emit_task_end(
+                emitter,
+                task_id,
+                TaskStatus::Failed,
+                task_start,
+                iteration,
+                learning_ctx.tool_calls.len(),
+                Some("Repeated pre-tool deferrals".to_string()),
+                Some(reply.chars().take(200).collect()),
+            )
+            .await;
+            record_failed_task_tokens(task_tokens_used);
+            commit_state!();
+            return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
+        }
+
+        // 7. Stall detection — agent spinning without progress
         let stall_detected = matches!(
             PureStoppingInputs {
                 iteration,
@@ -655,6 +711,71 @@ impl Agent {
                 .await;
                 commit_state!();
                 return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
+            }
+
+            let unrecovered_errors = learning_ctx
+                .errors
+                .iter()
+                .filter(|(_, recovered)| !recovered)
+                .count();
+            let meaningful_progress = (total_successful_tool_calls >= 3
+                || evidence_gain_count >= 2)
+                && total_successful_tool_calls > unrecovered_errors;
+            if meaningful_progress {
+                warn!(
+                    session_id,
+                    stall_count,
+                    total_successful_tool_calls,
+                    unrecovered_errors,
+                    "Agent stalled after meaningful progress"
+                );
+                self.emit_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::StoppingCondition,
+                    "Stopping condition fired: stall after meaningful progress".to_string(),
+                    json!({
+                        "condition":"stall_with_progress",
+                        "stall_count": stall_count,
+                        "max_stall_iterations": MAX_STALL_ITERATIONS,
+                        "total_successful_tool_calls": total_successful_tool_calls,
+                        "unrecovered_errors": unrecovered_errors
+                    }),
+                )
+                .await;
+                let result = self
+                    .graceful_partial_stall_response(
+                        emitter,
+                        session_id,
+                        learning_ctx,
+                        !successful_send_file_keys.is_empty(),
+                    )
+                    .await;
+                let (status, error, summary) = match &result {
+                    Ok(reply) => (
+                        TaskStatus::Completed,
+                        None,
+                        Some(reply.chars().take(200).collect()),
+                    ),
+                    Err(e) => (TaskStatus::Failed, Some(e.to_string()), None),
+                };
+                if status == TaskStatus::Failed {
+                    record_failed_task_tokens(task_tokens_used);
+                }
+                self.emit_task_end(
+                    emitter,
+                    task_id,
+                    status,
+                    task_start,
+                    iteration,
+                    learning_ctx.tool_calls.len(),
+                    error,
+                    summary,
+                )
+                .await;
+                commit_state!();
+                return Ok(StoppingPhaseOutcome::Return(result));
             }
 
             warn!(

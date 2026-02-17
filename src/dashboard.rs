@@ -543,6 +543,10 @@ async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_j
         "consultant_route_short_correction_direct_reply_total": metrics.consultant_route_short_correction_direct_reply_total,
         "consultant_route_acknowledgment_direct_reply_total": metrics.consultant_route_acknowledgment_direct_reply_total,
         "consultant_route_default_continue_total": metrics.consultant_route_default_continue_total,
+        "tool_schema_contract_rejections_total": metrics.tool_schema_contract_rejections_total,
+        "route_drift_alert_total": metrics.route_drift_alert_total,
+        "route_drift_failsafe_activation_total": metrics.route_drift_failsafe_activation_total,
+        "route_failsafe_active_turn_total": metrics.route_failsafe_active_turn_total,
         "tokens_failed_tasks_total": metrics.tokens_failed_tasks_total,
         "no_progress_iterations_total": metrics.no_progress_iterations_total
     }))

@@ -276,10 +276,7 @@ impl Agent {
             return Ok(consultant_direct_return_ok(msg));
         }
 
-        let goal_prompt_ctx = self
-            .build_goal_prompt_context_from_recent_history(ctx.session_id, ctx.user_text)
-            .await;
-        let goal_user_text = goal_prompt_ctx.goal_user_text.clone();
+        let goal_user_text = ctx.turn_context.goal_user_text.clone();
 
         let mut goal = if actually_one_shot {
             Goal::new_deferred_finite(&goal_user_text, ctx.session_id)
@@ -291,8 +288,8 @@ impl Agent {
             .build_goal_feed_forward_context(
                 ctx.session_id,
                 &goal_user_text,
-                &goal_prompt_ctx.recent_messages,
-                &goal_prompt_ctx.project_hints,
+                &ctx.turn_context.recent_messages,
+                &ctx.turn_context.project_hints,
             )
             .await
         {
@@ -611,10 +608,7 @@ impl Agent {
         }
 
         // Create goal
-        let goal_prompt_ctx = self
-            .build_goal_prompt_context_from_recent_history(ctx.session_id, ctx.user_text)
-            .await;
-        let goal_user_text = goal_prompt_ctx.goal_user_text.clone();
+        let goal_user_text = ctx.turn_context.goal_user_text.clone();
         let mut goal = Goal::new_finite(&goal_user_text, ctx.session_id);
 
         // Feed-forward relevant knowledge into goal context.
@@ -622,8 +616,8 @@ impl Agent {
             .build_goal_feed_forward_context(
                 ctx.session_id,
                 &goal_user_text,
-                &goal_prompt_ctx.recent_messages,
-                &goal_prompt_ctx.project_hints,
+                &ctx.turn_context.recent_messages,
+                &ctx.turn_context.project_hints,
             )
             .await
         {

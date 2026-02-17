@@ -628,7 +628,90 @@ async fn build_base_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Agent;
+    use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use crate::testing::MockProvider;
+    use crate::traits::{ModelProvider, StateStore};
+    use proptest::prelude::*;
+    use serde_json::json;
     use std::collections::HashSet;
+    use tempfile::{NamedTempFile, TempDir};
+
+    async fn build_tool_schemas_for_contract_validation(
+        diagnostics_enabled: bool,
+        files_enabled: bool,
+        subagents_enabled: bool,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let mut config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test-key"
+            "#,
+        )?;
+        config.provider.models.apply_defaults(&config.provider.kind);
+        config.diagnostics.enabled = diagnostics_enabled;
+        config.files.enabled = files_enabled;
+        config.subagents.enabled = subagents_enabled;
+        config.cli_agents.enabled = false;
+        config.oauth.enabled = false;
+
+        let io_temp = TempDir::new()?;
+        config.files.inbox_dir = io_temp.path().join("inbox").display().to_string();
+        config.files.outbox_dirs = vec![io_temp.path().join("outbox").display().to_string()];
+
+        let db_file = NamedTempFile::new()?;
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new()?);
+        let state = Arc::new(SqliteStateStore::new(&db_path, 100, None, embedding_service).await?);
+        let event_store = Arc::new(EventStore::new(state.pool()).await?);
+        let config_file = NamedTempFile::new()?;
+
+        let mut bundle = build_base_tools(
+            &config,
+            config_file.path().to_path_buf(),
+            state.clone(),
+            event_store.clone(),
+            32,
+            8,
+        )
+        .await?;
+        let model_provider = Arc::new(MockProvider::new()) as Arc<dyn ModelProvider>;
+        let llm_runtime = SharedLlmRuntime::new(
+            model_provider,
+            router_from_models(config.provider.models.clone()),
+            config.provider.kind.clone(),
+            config.provider.models.primary.clone(),
+        );
+        let _optional = register_optional_tools(
+            &mut bundle.tools,
+            &config,
+            state.clone(),
+            event_store.clone(),
+            llm_runtime,
+            None,
+            bundle.approval_tx.clone(),
+            bundle.media_tx.clone(),
+        )
+        .await?;
+
+        let mcp_registry = McpRegistry::new(state.clone() as Arc<dyn StateStore>);
+        let _runtime = register_runtime_tools(
+            &mut bundle.tools,
+            &config,
+            state.clone(),
+            mcp_registry,
+            bundle.approval_tx.clone(),
+        )
+        .await?;
+
+        Ok(bundle
+            .tools
+            .iter()
+            .map(|tool| json!({"type":"function","function": tool.schema()}))
+            .collect())
+    }
 
     #[test]
     fn manifest_has_unique_tool_names() {
@@ -756,5 +839,61 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("dependency appears after it"));
+    }
+
+    #[tokio::test]
+    async fn built_tools_have_schemas_that_match_agent_contract() {
+        let schemas = build_tool_schemas_for_contract_validation(true, true, true)
+            .await
+            .unwrap();
+        assert!(!schemas.is_empty(), "expected startup to register tools");
+        for schema in schemas {
+            let tool_name = schema["function"]["name"]
+                .as_str()
+                .unwrap_or("<unknown>")
+                .to_string();
+            let result = Agent::validate_tool_definition_contract(&schema);
+            assert!(
+                result.is_ok(),
+                "tool schema contract failed for {}: {:?}",
+                tool_name,
+                result.err()
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(8))]
+        #[test]
+        fn built_tool_schema_contract_holds_under_random_feature_flags(
+            diagnostics_enabled in any::<bool>(),
+            files_enabled in any::<bool>(),
+            subagents_enabled in any::<bool>(),
+        ) {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let schemas = build_tool_schemas_for_contract_validation(
+                    diagnostics_enabled,
+                    files_enabled,
+                    subagents_enabled,
+                )
+                .await
+                .unwrap();
+                assert!(!schemas.is_empty());
+                for schema in schemas {
+                    let tool_name = schema["function"]["name"]
+                        .as_str()
+                        .unwrap_or("<unknown>")
+                        .to_string();
+                    let result = Agent::validate_tool_definition_contract(&schema);
+                    assert!(
+                        result.is_ok(),
+                        "tool schema contract failed for {}: {:?}",
+                        tool_name,
+                        result.err()
+                    );
+                }
+            });
+        }
     }
 }

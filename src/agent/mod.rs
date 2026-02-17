@@ -133,6 +133,7 @@ mod consultant_phase;
 mod graceful;
 #[path = "runtime/history.rs"]
 mod history;
+pub(in crate::agent) use history::TurnContext;
 #[path = "runtime/llm.rs"]
 mod llm;
 #[path = "loop/llm_phase.rs"]
@@ -169,6 +170,7 @@ struct PolicyRuntimeMetrics {
     tool_exposure_samples: AtomicU64,
     tool_exposure_before_sum: AtomicU64,
     tool_exposure_after_sum: AtomicU64,
+    tool_schema_contract_rejections_total: AtomicU64,
     ambiguity_detected_total: AtomicU64,
     uncertainty_clarify_total: AtomicU64,
     context_refresh_total: AtomicU64,
@@ -181,6 +183,13 @@ struct PolicyRuntimeMetrics {
     consultant_route_short_correction_direct_reply_total: AtomicU64,
     consultant_route_acknowledgment_direct_reply_total: AtomicU64,
     consultant_route_default_continue_total: AtomicU64,
+    context_bleed_prevented_total: AtomicU64,
+    context_mismatch_preflight_drop_total: AtomicU64,
+    followup_mode_overrides_total: AtomicU64,
+    cross_scope_blocked_total: AtomicU64,
+    route_drift_alert_total: AtomicU64,
+    route_drift_failsafe_activation_total: AtomicU64,
+    route_failsafe_active_turn_total: AtomicU64,
     tokens_failed_tasks_total: AtomicU64,
     no_progress_iterations_total: AtomicU64,
 }
@@ -191,6 +200,7 @@ impl PolicyRuntimeMetrics {
             tool_exposure_samples: AtomicU64::new(0),
             tool_exposure_before_sum: AtomicU64::new(0),
             tool_exposure_after_sum: AtomicU64::new(0),
+            tool_schema_contract_rejections_total: AtomicU64::new(0),
             ambiguity_detected_total: AtomicU64::new(0),
             uncertainty_clarify_total: AtomicU64::new(0),
             context_refresh_total: AtomicU64::new(0),
@@ -203,6 +213,13 @@ impl PolicyRuntimeMetrics {
             consultant_route_short_correction_direct_reply_total: AtomicU64::new(0),
             consultant_route_acknowledgment_direct_reply_total: AtomicU64::new(0),
             consultant_route_default_continue_total: AtomicU64::new(0),
+            context_bleed_prevented_total: AtomicU64::new(0),
+            context_mismatch_preflight_drop_total: AtomicU64::new(0),
+            followup_mode_overrides_total: AtomicU64::new(0),
+            cross_scope_blocked_total: AtomicU64::new(0),
+            route_drift_alert_total: AtomicU64::new(0),
+            route_drift_failsafe_activation_total: AtomicU64::new(0),
+            route_failsafe_active_turn_total: AtomicU64::new(0),
             tokens_failed_tasks_total: AtomicU64::new(0),
             no_progress_iterations_total: AtomicU64::new(0),
         }
@@ -210,6 +227,245 @@ impl PolicyRuntimeMetrics {
 }
 
 static POLICY_METRICS: Lazy<PolicyRuntimeMetrics> = Lazy::new(PolicyRuntimeMetrics::new);
+
+#[derive(Debug, Clone, Copy)]
+struct RouteDriftSample {
+    reason: RouteDriftReason,
+    action: RouteDriftAction,
+    reply_len: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteDriftReason {
+    ClarificationRequired,
+    ToolsRequired,
+    ShortCorrectionDirectReply,
+    AcknowledgmentDirectReply,
+    DefaultContinue,
+    Unknown,
+}
+
+impl RouteDriftReason {
+    fn from_str(reason: &str) -> Self {
+        match reason {
+            "clarification_required" => Self::ClarificationRequired,
+            "tools_required" => Self::ToolsRequired,
+            "short_correction_direct_reply" => Self::ShortCorrectionDirectReply,
+            "acknowledgment_direct_reply" => Self::AcknowledgmentDirectReply,
+            "default_continue" => Self::DefaultContinue,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteDriftAction {
+    Return,
+    Continue,
+    Unknown,
+}
+
+impl RouteDriftAction {
+    fn from_str(action: &str) -> Self {
+        match action {
+            "return" => Self::Return,
+            "continue" => Self::Continue,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RouteDriftSessionState {
+    samples: VecDeque<RouteDriftSample>,
+    last_seen_epoch_secs: u64,
+    last_alert_epoch_secs: u64,
+    consecutive_anomaly_windows: u32,
+    failsafe_until_epoch_secs: u64,
+}
+
+#[derive(Debug, Default)]
+struct RouteDriftMonitor {
+    sessions: HashMap<String, RouteDriftSessionState>,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::agent) struct RouteDriftSignal {
+    pub summary: String,
+    pub failsafe_activated: bool,
+}
+
+const ROUTE_DRIFT_WINDOW_SIZE: usize = 24;
+const ROUTE_DRIFT_MIN_WINDOW: usize = 12;
+const ROUTE_DRIFT_ALERT_COOLDOWN_SECS: u64 = 300;
+const ROUTE_DRIFT_FAILSAFE_DURATION_SECS: u64 = 900;
+const ROUTE_DRIFT_FAILSAFE_STREAK: u32 = 2;
+const ROUTE_DRIFT_MAX_TRACKED_SESSIONS: usize = 256;
+const ROUTE_DRIFT_STALE_SESSION_SECS: u64 = 7200;
+
+static ROUTE_DRIFT_MONITOR: Lazy<std::sync::Mutex<RouteDriftMonitor>> =
+    Lazy::new(|| std::sync::Mutex::new(RouteDriftMonitor::default()));
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn prune_route_drift_sessions(monitor: &mut RouteDriftMonitor, now: u64) {
+    monitor.sessions.retain(|_, state| {
+        now.saturating_sub(state.last_seen_epoch_secs) <= ROUTE_DRIFT_STALE_SESSION_SECS
+            || state.failsafe_until_epoch_secs > now
+    });
+
+    if monitor.sessions.len() <= ROUTE_DRIFT_MAX_TRACKED_SESSIONS {
+        return;
+    }
+
+    let mut oldest: Vec<(String, u64)> = monitor
+        .sessions
+        .iter()
+        .map(|(session_id, state)| (session_id.clone(), state.last_seen_epoch_secs))
+        .collect();
+    oldest.sort_by_key(|(_, ts)| *ts);
+    let remove_count = monitor
+        .sessions
+        .len()
+        .saturating_sub(ROUTE_DRIFT_MAX_TRACKED_SESSIONS);
+    for (session_id, _) in oldest.into_iter().take(remove_count) {
+        monitor.sessions.remove(&session_id);
+    }
+}
+
+pub(in crate::agent) fn observe_route_reason_for_drift(
+    session_id: &str,
+    route_reason: &str,
+    route_action: &str,
+    route_reply_len: Option<usize>,
+) -> Option<RouteDriftSignal> {
+    let now = now_epoch_secs();
+    let Ok(mut monitor) = ROUTE_DRIFT_MONITOR.lock() else {
+        return None;
+    };
+    let state = monitor
+        .sessions
+        .entry(session_id.to_string())
+        .or_insert_with(RouteDriftSessionState::default);
+    state.last_seen_epoch_secs = now;
+    state.samples.push_back(RouteDriftSample {
+        reason: RouteDriftReason::from_str(route_reason),
+        action: RouteDriftAction::from_str(route_action),
+        reply_len: route_reply_len,
+    });
+    while state.samples.len() > ROUTE_DRIFT_WINDOW_SIZE {
+        state.samples.pop_front();
+    }
+
+    let sample_count = state.samples.len();
+    if sample_count < ROUTE_DRIFT_MIN_WINDOW {
+        prune_route_drift_sessions(&mut monitor, now);
+        return None;
+    }
+
+    let tools_required = state
+        .samples
+        .iter()
+        .filter(|sample| sample.reason == RouteDriftReason::ToolsRequired)
+        .count();
+    let default_continue = state
+        .samples
+        .iter()
+        .filter(|sample| sample.reason == RouteDriftReason::DefaultContinue)
+        .count();
+    let clarification_required = state
+        .samples
+        .iter()
+        .filter(|sample| sample.reason == RouteDriftReason::ClarificationRequired)
+        .count();
+    let empty_direct_replies = state
+        .samples
+        .iter()
+        .filter(|sample| sample.action == RouteDriftAction::Return && sample.reply_len == Some(0))
+        .count();
+
+    let total = sample_count as f64;
+    let tools_rate = tools_required as f64 / total;
+    let default_rate = default_continue as f64 / total;
+    let clarification_rate = clarification_required as f64 / total;
+
+    let mut anomaly_reasons: Vec<String> = Vec::new();
+    if empty_direct_replies > 0 {
+        anomaly_reasons.push(format!("empty_direct_replies={}", empty_direct_replies));
+    }
+    if tools_rate <= 0.05 && default_rate >= 0.85 {
+        anomaly_reasons.push(format!(
+            "tools_required_rate={:.0}% default_continue_rate={:.0}%",
+            tools_rate * 100.0,
+            default_rate * 100.0
+        ));
+    }
+    if clarification_rate >= 0.75 {
+        anomaly_reasons.push(format!(
+            "clarification_required_rate={:.0}%",
+            clarification_rate * 100.0
+        ));
+    }
+
+    let mut signal: Option<RouteDriftSignal> = None;
+    if anomaly_reasons.is_empty() {
+        state.consecutive_anomaly_windows = 0;
+    } else {
+        state.consecutive_anomaly_windows = state.consecutive_anomaly_windows.saturating_add(1);
+        let cooldown_elapsed =
+            now.saturating_sub(state.last_alert_epoch_secs) >= ROUTE_DRIFT_ALERT_COOLDOWN_SECS;
+        let mut failsafe_activated = false;
+        if state.consecutive_anomaly_windows >= ROUTE_DRIFT_FAILSAFE_STREAK
+            && state.failsafe_until_epoch_secs <= now
+        {
+            state.failsafe_until_epoch_secs = now + ROUTE_DRIFT_FAILSAFE_DURATION_SECS;
+            POLICY_METRICS
+                .route_drift_failsafe_activation_total
+                .fetch_add(1, Ordering::Relaxed);
+            failsafe_activated = true;
+        }
+        if cooldown_elapsed || failsafe_activated {
+            state.last_alert_epoch_secs = now;
+            POLICY_METRICS
+                .route_drift_alert_total
+                .fetch_add(1, Ordering::Relaxed);
+            signal = Some(RouteDriftSignal {
+                summary: format!(
+                    "route drift anomaly: {} (window={} turns)",
+                    anomaly_reasons.join(", "),
+                    sample_count
+                ),
+                failsafe_activated,
+            });
+        }
+    }
+
+    prune_route_drift_sessions(&mut monitor, now);
+    signal
+}
+
+pub(in crate::agent) fn route_failsafe_active_for_session(session_id: &str) -> bool {
+    let now = now_epoch_secs();
+    let Ok(mut monitor) = ROUTE_DRIFT_MONITOR.lock() else {
+        return false;
+    };
+    let active = monitor
+        .sessions
+        .get(session_id)
+        .is_some_and(|state| state.failsafe_until_epoch_secs > now);
+    if active {
+        POLICY_METRICS
+            .route_failsafe_active_turn_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    prune_route_drift_sessions(&mut monitor, now);
+    active
+}
 
 struct PolicyRuntimeTunables {
     initialized: AtomicBool,
@@ -236,6 +492,9 @@ pub fn policy_metrics_snapshot() -> PolicyMetricsData {
             .load(Ordering::Relaxed),
         tool_exposure_after_sum: POLICY_METRICS
             .tool_exposure_after_sum
+            .load(Ordering::Relaxed),
+        tool_schema_contract_rejections_total: POLICY_METRICS
+            .tool_schema_contract_rejections_total
             .load(Ordering::Relaxed),
         ambiguity_detected_total: POLICY_METRICS
             .ambiguity_detected_total
@@ -268,6 +527,27 @@ pub fn policy_metrics_snapshot() -> PolicyMetricsData {
             .load(Ordering::Relaxed),
         consultant_route_default_continue_total: POLICY_METRICS
             .consultant_route_default_continue_total
+            .load(Ordering::Relaxed),
+        context_bleed_prevented_total: POLICY_METRICS
+            .context_bleed_prevented_total
+            .load(Ordering::Relaxed),
+        context_mismatch_preflight_drop_total: POLICY_METRICS
+            .context_mismatch_preflight_drop_total
+            .load(Ordering::Relaxed),
+        followup_mode_overrides_total: POLICY_METRICS
+            .followup_mode_overrides_total
+            .load(Ordering::Relaxed),
+        cross_scope_blocked_total: POLICY_METRICS
+            .cross_scope_blocked_total
+            .load(Ordering::Relaxed),
+        route_drift_alert_total: POLICY_METRICS
+            .route_drift_alert_total
+            .load(Ordering::Relaxed),
+        route_drift_failsafe_activation_total: POLICY_METRICS
+            .route_drift_failsafe_activation_total
+            .load(Ordering::Relaxed),
+        route_failsafe_active_turn_total: POLICY_METRICS
+            .route_failsafe_active_turn_total
             .load(Ordering::Relaxed),
         tokens_failed_tasks_total: POLICY_METRICS
             .tokens_failed_tasks_total
@@ -1197,6 +1477,8 @@ pub fn spawn_background_task_lead(
                 return;
             }
             let mut interval_count = 0u32;
+            let mut last_progress_key: Option<String> = None;
+            let mut repeated_progress = 0u32;
             loop {
                 // First update after 15s, then every 30s
                 let wait_secs = if interval_count == 0 { 15 } else { 30 };
@@ -1229,15 +1511,34 @@ pub fn spawn_background_task_lead(
                         .iter()
                         .filter(|t| t.status == "completed" && t.error.is_none())
                         .count();
+                    let started = tasks.iter().filter(|t| t.status != "pending").count();
+                    let active_count = tasks
+                        .iter()
+                        .filter(|t| t.status == "claimed" || t.status == "running")
+                        .count();
                     let total = tasks.len();
                     let in_progress: Vec<&str> = tasks
                         .iter()
-                        .filter(|t| t.status == "claimed" || t.status == "pending")
+                        .filter(|t| t.status == "claimed" || t.status == "running")
                         .take(2)
                         .map(|t| t.description.as_str())
                         .collect();
                     let progress_msg = if in_progress.is_empty() && completed == total {
                         format!("⏳ Progress: {}/{} steps completed", completed, total)
+                    } else if active_count > 0 {
+                        format!(
+                            "⏳ Progress: {}/{} steps completed ({} in progress, {} started). Working on: {}",
+                            completed,
+                            total,
+                            active_count,
+                            started,
+                            in_progress.join(", ")
+                        )
+                    } else if started > completed {
+                        format!(
+                            "⏳ Progress: {}/{} steps completed ({} started).",
+                            completed, total, started
+                        )
                     } else if in_progress.is_empty() {
                         "⏳ Still working on your request...".to_string()
                     } else {
@@ -1248,6 +1549,27 @@ pub fn spawn_background_task_lead(
                             in_progress.join(", ")
                         )
                     };
+
+                    let progress_key = format!(
+                        "{}|{}|{}|{}",
+                        completed,
+                        total,
+                        active_count,
+                        in_progress.join("|")
+                    );
+                    let should_emit = if last_progress_key.as_deref() == Some(progress_key.as_str())
+                    {
+                        repeated_progress = repeated_progress.saturating_add(1);
+                        // Reduce spam for long-running tasks with unchanged state.
+                        repeated_progress % 3 == 0
+                    } else {
+                        last_progress_key = Some(progress_key);
+                        repeated_progress = 0;
+                        true
+                    };
+                    if !should_emit {
+                        continue;
+                    }
                     if let Some(hub_weak) = &heartbeat_hub {
                         if let Some(hub_arc) = hub_weak.upgrade() {
                             let _ = hub_arc.send_text(&heartbeat_session, &progress_msg).await;

@@ -35,11 +35,13 @@ impl Agent {
             .iter()
             .filter(|&&h| h == call_hash)
             .count();
+        let repetitive_redirect_threshold =
+            repetitive_redirect_threshold_for_call(&tc.name, &tc.arguments);
 
         // Soft redirect: skip execution and coach the LLM to adapt.
         // This fires BEFORE the hard stall, giving the agent a chance
         // to change approach instead of just giving up.
-        if (REPETITIVE_REDIRECT_THRESHOLD..MAX_REPETITIVE_CALLS).contains(&repetitive_count) {
+        if (repetitive_redirect_threshold..MAX_REPETITIVE_CALLS).contains(&repetitive_count) {
             warn!(
                 session_id,
                 tool = %tc.name,
@@ -308,5 +310,74 @@ impl Agent {
         }
 
         Ok(None)
+    }
+}
+
+fn is_background_status_poll(tool_name: &str, arguments: &str) -> bool {
+    if !matches!(tool_name, "terminal" | "cli_agent" | "spawn_agent") {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| {
+            v.get("action")
+                .and_then(|a| a.as_str())
+                .map(|s| s.eq_ignore_ascii_case("check"))
+        })
+        .unwrap_or(false)
+}
+
+fn repetitive_redirect_threshold_for_call(tool_name: &str, arguments: &str) -> usize {
+    if is_background_status_poll(tool_name, arguments) {
+        // Background status checks can consume budget quickly with little progress.
+        2
+    } else {
+        REPETITIVE_REDIRECT_THRESHOLD
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_background_status_poll, repetitive_redirect_threshold_for_call};
+    use crate::agent::REPETITIVE_REDIRECT_THRESHOLD;
+
+    #[test]
+    fn detects_terminal_check_action() {
+        assert!(is_background_status_poll(
+            "terminal",
+            r#"{"action":"check","pid":123}"#
+        ));
+    }
+
+    #[test]
+    fn ignores_terminal_run_action() {
+        assert!(!is_background_status_poll(
+            "terminal",
+            r#"{"action":"run","command":"ls"}"#
+        ));
+    }
+
+    #[test]
+    fn detects_cli_agent_check_action() {
+        assert!(is_background_status_poll(
+            "cli_agent",
+            r#"{"action":"check","task_id":"abc"}"#
+        ));
+    }
+
+    #[test]
+    fn lowers_redirect_threshold_for_background_polls() {
+        assert_eq!(
+            repetitive_redirect_threshold_for_call("terminal", r#"{"action":"check","pid":7}"#),
+            2
+        );
+        assert_eq!(
+            repetitive_redirect_threshold_for_call("cli_agent", r#"{"action":"check"}"#),
+            2
+        );
+        assert_eq!(
+            repetitive_redirect_threshold_for_call("terminal", r#"{"action":"run"}"#),
+            REPETITIVE_REDIRECT_THRESHOLD
+        );
     }
 }

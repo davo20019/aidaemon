@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-02-16
+
+### Added
+
+- **Turn context resolution**: Followup mode classification (new/followup/clarification) with scope carryover detection and multi-project scope awareness.
+- **Graceful partial-stall responses**: When the agent stalls after meaningful progress (3+ successful tool calls), it now acknowledges progress before stopping instead of a generic stall message.
+- **Project directory scope constraints**: Tool calls are validated against the resolved project scope to prevent cross-project file operations.
+- **Hard-block destructive commands**: `find -delete` and `rm -rf` on broad/sensitive paths are now blocked before the approval flow, even in yolo mode.
+- **Context integrity metrics**: New policy counters for context bleed prevention, mismatch preflight drops, followup mode overrides, and cross-scope blocking.
+- **Stall classification tests**: Tests for tool policy block, edit target drift, generic value filtering, and provider server error detection.
+- **npm command rejection guidance**: `run_command` now shows allowed npm prefixes and suggests `terminal` for installs.
+
+### Changed
+
+- **Stopping phase**: Meaningful progress detection (total_successful_tool_calls >= 3 or evidence_gain_count >= 2) triggers graceful exit instead of hard stall.
+- **Project directory hints**: Seeded from turn context's primary project scope rather than just user text extraction.
+- **System prompt guidance**: Prefer `search_files`/`project_inspect` over raw terminal for discovery; added recursive grep guidance.
+
+### Fixed
+
+- **Compilation error**: Fixed `borrow of moved value` in tool_defs.rs capabilities entry.
+- **Format string error**: Fixed unescaped parentheses in system prompt format macro.
+
 ## [0.9.0] - 2026-02-16
 
 ### Added

@@ -1556,8 +1556,8 @@ learn their preferences, track their goals, and improve through experience.
 | You know the answer from memory/facts | Answer directly, no tools needed |
 | You have a partial answer | Share what you know, ask the user to fill gaps |
 | The request is ambiguous AND you have no hints | Ask the user to clarify before doing anything |
-| The user gave a location hint (\"in projects\", \"under src\") | Explore that location immediately with terminal (ls, find) — do NOT ask again |
-| The user said to check/find something yourself | USE YOUR TOOLS. Never say you can't access files/folders — you have `terminal` |
+| The user gave a location hint (\"in projects\", \"under src\") | Explore immediately. Prefer `search_files` / `project_inspect` for discovery; use `terminal` only for shell-specific steps. Do NOT ask again |
+| The user said to check/find something yourself | USE YOUR TOOLS. Never say you can't access files/folders — you have `search_files`, `project_inspect`, `read_file`, and `terminal` |
 | A name doesn't match exactly (\"site-cars\" vs \"cars-site\") | Fuzzy-match: list the directory, find the closest name, proceed |
 | You need current/external data | Use ONE targeted tool call (web_search, system_info, etc.) |
 | The task requires an action (run command, change config) | Use the appropriate tool |
@@ -1568,6 +1568,7 @@ learn their preferences, track their goals, and improve through experience.
 - Simple lookup → answer from memory or 1 tool call
 - Config change → one `manage_config` call
 - Quick question → answer directly, no tools
+- Recent chat recall — use conversation history already in context; do not call `goal_trace` unless the user asks for execution forensics
 - Bug fix / feature work → use terminal as needed
 - Use `terminal` for running commands and coding tasks, not for information lookups
 
@@ -1654,6 +1655,7 @@ information lookups should use memory first, then ask the user.
 - `terminal`: Run shell commands (git, npm, pip, cargo, docker, curl, etc.). \
 Use for coding tasks, builds, deployments, and system administration. \
 Check if a dedicated tool exists first (read_file, write_file, edit_file, search_files, run_command, git_info, git_commit). \
+For recursive code/text search, prefer `search_files`; if using `terminal`, avoid broad `grep -r` over `.` without `--include` / `--exclude-dir` filters. \
 Commands that aren't pre-approved go through the user approval flow.
 - `system_info`: Get CPU, memory, and OS information.
 - `remember_fact`: Store important facts about the user for long-term memory. Categories: \

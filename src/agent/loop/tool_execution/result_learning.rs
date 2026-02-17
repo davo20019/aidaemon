@@ -47,6 +47,14 @@ pub(super) struct ResultLearningState<'a> {
     pub dirs_with_search_no_matches: &'a mut HashSet<String>,
 }
 
+fn cli_result_is_substantive(result_text: &str) -> bool {
+    let cleaned = strip_appended_diagnostics(result_text).trim().to_string();
+    !cleaned.is_empty()
+        && cleaned.chars().count() >= 500
+        && !cleaned.to_ascii_lowercase().contains("error:")
+        && !cleaned.to_ascii_lowercase().contains("failed")
+}
+
 impl Agent {
     pub(super) async fn apply_result_learning(
         &self,
@@ -379,6 +387,16 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
             state.consecutive_same_tool_arg_hashes.clear();
             state.recent_tool_names.clear();
 
+            if cli_result_is_substantive(result_text) {
+                let present_results_msg = "[SYSTEM] The CLI agent completed successfully and returned substantive results. \
+Present those results to the user directly now. Do NOT claim you cannot complete the request."
+                    .to_string();
+                state
+                    .pending_system_messages
+                    .push(present_results_msg.clone());
+                *result_text = format!("{}\n\n{}", result_text, present_results_msg);
+            }
+
             if self.depth == 0 && !*state.cli_agent_boundary_injected {
                 let task_hint = build_task_boundary_hint(&state.learning_ctx.user_text, 120);
                 *result_text = format!(
@@ -461,5 +479,18 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_result_substantive_detection_prefers_large_non_error_payloads() {
+        let payload = "x".repeat(600);
+        assert!(cli_result_is_substantive(&payload));
+        assert!(!cli_result_is_substantive("ERROR: agent failed to run"));
+        assert!(!cli_result_is_substantive("short output"));
     }
 }

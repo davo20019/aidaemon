@@ -53,6 +53,7 @@ pub struct RiskAssessment {
 /// These are matched as path segments (between / or at start/end) to avoid false positives.
 const SENSITIVE_PATH_SEGMENTS: &[&str] = &[
     ".env",
+    ".ssh",
     "id_rsa",
     "id_ed25519",
     "id_dsa",
@@ -318,6 +319,115 @@ fn is_recursive_force_delete(parts: &[String]) -> bool {
     has_recursive && has_force
 }
 
+fn uses_find_delete(parts: &[String]) -> bool {
+    parts.iter().skip(1).any(|arg| arg == "-delete")
+}
+
+fn is_find_expression_start(arg: &str) -> bool {
+    arg.starts_with('-') || matches!(arg, "(" | ")" | "!" | ",")
+}
+
+fn find_roots(parts: &[String]) -> Vec<&str> {
+    let mut roots = Vec::new();
+    for arg in parts.iter().skip(1) {
+        if is_find_expression_start(arg) {
+            break;
+        }
+        roots.push(arg.as_str());
+    }
+    if roots.is_empty() {
+        roots.push(".");
+    }
+    roots
+}
+
+fn is_broad_or_sensitive_delete_target(raw_target: &str) -> bool {
+    let target = raw_target.trim_matches(|c| c == '"' || c == '\'');
+    if target.is_empty() {
+        return false;
+    }
+
+    if matches!(target, "/" | "/*" | "~" | "~/") {
+        return true;
+    }
+    if target.starts_with("~/")
+        || target.starts_with("$HOME/")
+        || target.starts_with("${HOME}/")
+        || target.starts_with("~/.ssh")
+        || target.starts_with("$HOME/.ssh")
+        || target.starts_with("${HOME}/.ssh")
+    {
+        return true;
+    }
+
+    let broad_prefixes = [
+        "/home", "/Users", "/root", "/etc", "/boot", "/sys", "/proc", "/dev", "/usr", "/var",
+        "/opt", "/bin", "/sbin", "/lib",
+    ];
+    if broad_prefixes
+        .iter()
+        .any(|p| target == *p || target.starts_with(&format!("{}/", p)))
+    {
+        return true;
+    }
+
+    if target.contains("/.ssh/") || target.ends_with("/.ssh") {
+        return true;
+    }
+
+    contains_sensitive_path(target).is_some()
+}
+
+/// Returns a hard-block reason for irreversible destructive delete patterns.
+/// Used by terminal to reject obviously dangerous commands even when approved.
+pub fn hard_block_reason(command: &str) -> Option<String> {
+    for (segment, _) in split_by_operators(command) {
+        if segment.is_empty() {
+            continue;
+        }
+        let Ok(parts) = shell_words::split(&segment) else {
+            continue;
+        };
+        if parts.is_empty() {
+            continue;
+        }
+
+        let base_cmd = Path::new(&parts[0])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&parts[0]);
+
+        if base_cmd == "rm" && is_recursive_force_delete(&parts) {
+            if let Some(target) = parts
+                .iter()
+                .skip(1)
+                .filter(|arg| !arg.starts_with('-'))
+                .find(|arg| is_broad_or_sensitive_delete_target(arg))
+            {
+                return Some(format!(
+                    "Blocked irreversible delete: `rm -rf` targeting broad/sensitive path `{}`.",
+                    target
+                ));
+            }
+        }
+
+        if base_cmd == "find" && uses_find_delete(&parts) {
+            let roots = find_roots(&parts);
+            if let Some(root) = roots
+                .iter()
+                .copied()
+                .find(|root| is_broad_or_sensitive_delete_target(root))
+            {
+                return Some(format!(
+                    "Blocked irreversible delete: `find ... -delete` targeting broad/sensitive path `{}`.",
+                    root
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Classify a single command segment (no pipes/chains).
 fn classify_single_segment(segment: &str) -> RiskAssessment {
     let mut warnings = Vec::new();
@@ -379,6 +489,19 @@ fn classify_single_segment(segment: &str) -> RiskAssessment {
     // Cloud provider / infrastructure commands with destructive sub-commands
     let has_sub = |sub: &str| parts.iter().skip(1).any(|a| a == sub);
     match base_cmd {
+        "find" => {
+            if uses_find_delete(&parts) {
+                level = std::cmp::max(level, RiskLevel::High);
+                warnings.push("'find -delete' removes files immediately".to_string());
+                if find_roots(&parts)
+                    .iter()
+                    .any(|root| is_broad_or_sensitive_delete_target(root))
+                {
+                    level = RiskLevel::Critical;
+                    warnings.push("'find -delete' targets a broad or sensitive path".to_string());
+                }
+            }
+        }
         "wrangler" | "npx" if parts.iter().any(|a| a == "wrangler") => {
             if has_sub("delete") || has_sub("destroy") {
                 level = std::cmp::max(level, RiskLevel::High);
@@ -844,6 +967,40 @@ mod tests {
 
         let assessment = classify_command("kubectl get pods");
         assert_eq!(assessment.level, RiskLevel::Safe);
+    }
+
+    #[test]
+    fn test_find_delete_classification() {
+        let assessment = classify_command("find . -name '*.tmp' -delete");
+        assert_eq!(assessment.level, RiskLevel::High);
+        assert!(assessment
+            .warnings
+            .iter()
+            .any(|w| w.contains("find -delete")));
+
+        let assessment = classify_command("find / -name '*.tmp' -delete");
+        assert_eq!(assessment.level, RiskLevel::Critical);
+        assert!(assessment
+            .warnings
+            .iter()
+            .any(|w| w.contains("broad or sensitive path")));
+    }
+
+    #[test]
+    fn test_hard_block_reason_for_broad_irreversible_deletes() {
+        let rm_reason = hard_block_reason("rm -rf ~/projects");
+        assert!(rm_reason.is_some());
+        assert!(rm_reason.unwrap().contains("Blocked irreversible delete"));
+
+        let find_reason = hard_block_reason("find / -delete");
+        assert!(find_reason.is_some());
+        assert!(find_reason.unwrap().contains("find ... -delete"));
+    }
+
+    #[test]
+    fn test_hard_block_reason_allows_scoped_delete_patterns() {
+        assert!(hard_block_reason("find . -name '*.log' -delete").is_none());
+        assert!(hard_block_reason("rm -rf ./build").is_none());
     }
 
     #[test]

@@ -104,6 +104,44 @@ impl GoalTraceTool {
         }
     }
 
+    async fn recent_goal_summary(&self, limit: usize) -> anyhow::Result<String> {
+        let mut goals = self.state.get_active_goals().await?;
+        for g in self.state.get_scheduled_goals().await? {
+            if !goals.iter().any(|existing| existing.id == g.id) {
+                goals.push(g);
+            }
+        }
+
+        goals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        goals.truncate(limit.clamp(1, 20));
+
+        if goals.is_empty() {
+            return Ok(
+                "No recent goals found. For simple chat recall questions, use conversation history instead of goal_trace."
+                    .to_string(),
+            );
+        }
+
+        let mut out = String::from(
+            "**Goal Trace (Recent Goals)**\n\n\
+             No `goal_id` was provided, so here are the most recent active/scheduled goals:\n",
+        );
+        for goal in goals {
+            out.push_str(&format!(
+                "- {} ({}) updated {}\n  id: {}",
+                Self::truncate(&goal.description, 100),
+                goal.status,
+                goal.updated_at,
+                goal.id
+            ));
+            out.push('\n');
+        }
+        out.push_str(
+            "\nTip: call `goal_trace` again with `goal_id` (full or unique prefix) for full task/tool timeline details.",
+        );
+        Ok(out)
+    }
+
     async fn gather_goal_activities(
         &self,
         goal_id: &str,
@@ -358,7 +396,7 @@ impl Tool for GoalTraceTool {
     fn schema(&self) -> Value {
         json!({
             "name": "goal_trace",
-            "description": "Execution observability for goals and tools. Use this for what-happened forensics instead of terminal/sqlite log digging.",
+            "description": "Execution observability for goals and tools. Use this for task/tool forensics. If goal_id is omitted, it returns a recent-goal summary.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -412,25 +450,29 @@ impl Tool for GoalTraceTool {
         let args: GoalTraceArgs = serde_json::from_str(arguments)?;
         match args.action.as_str() {
             "goal_trace" => {
-                let goal_id = args
-                    .goal_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for goal_trace"))?;
-                self.goal_trace(
-                    goal_id,
-                    args.max_tasks.unwrap_or(20),
-                    args.max_activities_per_task.unwrap_or(6),
-                )
-                .await
+                if let Some(goal_id) = args.goal_id.as_deref() {
+                    self.goal_trace(
+                        goal_id,
+                        args.max_tasks.unwrap_or(20),
+                        args.max_activities_per_task.unwrap_or(6),
+                    )
+                    .await
+                } else {
+                    self.recent_goal_summary(8).await
+                }
             }
             "tool_trace" => {
-                self.tool_trace(
-                    args.goal_id.as_deref(),
-                    args.task_id.as_deref(),
-                    args.tool_name.as_deref(),
-                    args.limit.unwrap_or(30),
-                )
-                .await
+                if args.goal_id.is_none() && args.task_id.is_none() {
+                    self.recent_goal_summary(8).await
+                } else {
+                    self.tool_trace(
+                        args.goal_id.as_deref(),
+                        args.task_id.as_deref(),
+                        args.tool_name.as_deref(),
+                        args.limit.unwrap_or(30),
+                    )
+                    .await
+                }
             }
             other => Ok(format!(
                 "Unknown action: '{}'. Use goal_trace or tool_trace.",
@@ -614,5 +656,50 @@ mod tests {
         assert!(result.contains("Tool Trace"));
         assert!(result.contains("Filter tool: web_fetch"));
         assert!(result.contains("web_fetch: calls 1"));
+    }
+
+    #[tokio::test]
+    async fn goal_trace_without_goal_id_returns_recent_goal_summary() {
+        let state = setup_state().await;
+        let tool = GoalTraceTool::new(state.clone());
+
+        let goal = Goal::new_finite("Investigate scheduler failures", "user-session");
+        state.create_goal(&goal).await.unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "goal_trace"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Goal Trace (Recent Goals)"));
+        assert!(result.contains("Investigate scheduler failures"));
+        assert!(result.contains("Tip: call `goal_trace` again with `goal_id`"));
+    }
+
+    #[tokio::test]
+    async fn tool_trace_without_scope_returns_recent_goal_summary() {
+        let state = setup_state().await;
+        let tool = GoalTraceTool::new(state.clone());
+
+        let goal = Goal::new_finite("Collect deployment diagnostics", "user-session");
+        state.create_goal(&goal).await.unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "tool_trace"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Goal Trace (Recent Goals)"));
+        assert!(result.contains("Collect deployment diagnostics"));
     }
 }

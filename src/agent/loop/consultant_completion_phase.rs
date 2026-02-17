@@ -352,24 +352,28 @@ impl Agent {
                     reply = "I wasn't able to complete that request because no execution tools are available in this context. Please try again in a context with tool access."
                     .to_string();
                 } else {
-                    stall_count += 1;
-                    consecutive_clean_iterations = 0;
+                    // Pre-execution deferrals ("I'll do X") should not consume the
+                    // main stall budget. Reserve stall_count for post-tool loops so
+                    // we don't fail as "stuck" before any tool ever executes.
                     if total_successful_tool_calls == 0 {
                         deferred_no_tool_streak = deferred_no_tool_streak.saturating_add(1);
                     } else {
+                        stall_count = stall_count.saturating_add(1);
                         deferred_no_tool_streak = 0;
                     }
+                    consecutive_clean_iterations = 0;
                     warn!(
                         session_id,
                         iteration,
                         stall_count,
+                        deferred_no_tool_streak,
                         total_successful_tool_calls,
                         "Deferred-action reply without concrete results; continuing loop"
                     );
 
                     let deferred_nudge = if total_successful_tool_calls == 0 {
-                        "[SYSTEM] You promised to perform an action but did not execute any tools. \
-                     Execute the required tools now, then return concrete results."
+                        "[SYSTEM] HARD REQUIREMENT: your next reply MUST include at least one tool call. \
+                     Do NOT return planning text like \"I'll do X\". Text-only replies are invalid for this request."
                             .to_string()
                     } else {
                         "[SYSTEM] You narrated future work instead of providing results. \
@@ -381,7 +385,12 @@ impl Agent {
 
                     // Fallback expansion: widen tool set once after exactly two
                     // no-progress iterations, even in no-tool-call paths.
-                    if stall_count == 2 && !fallback_expanded_once {
+                    let fallback_trigger = if total_successful_tool_calls == 0 {
+                        deferred_no_tool_streak == 2
+                    } else {
+                        stall_count == 2
+                    };
+                    if fallback_trigger && !fallback_expanded_once {
                         fallback_expanded_once = true;
                         let previous_count = tool_defs.len();
                         let widened = self.filter_tool_definitions_for_policy(
@@ -438,7 +447,7 @@ impl Agent {
                     }
 
                     if total_successful_tool_calls == 0
-                        && stall_count >= MAX_STALL_ITERATIONS
+                        && deferred_no_tool_streak >= MAX_STALL_ITERATIONS
                         && !learning_ctx
                             .errors
                             .iter()

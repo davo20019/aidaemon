@@ -50,7 +50,8 @@ impl Agent {
             llm_provider,
             llm_router,
             mut model,
-            consultant_pass_active,
+            mut consultant_pass_active,
+            route_failsafe_active,
             system_prompt,
             pinned_memories,
             mut session_summary,
@@ -58,6 +59,26 @@ impl Agent {
             BootstrapOutcome::Return(result) => return result,
             BootstrapOutcome::Continue(data) => *data,
         };
+        let turn_context = self
+            .build_turn_context_from_recent_history(session_id, user_text)
+            .await;
+        let followup_mode = turn_context
+            .followup_mode
+            .map(|mode| mode.as_str())
+            .unwrap_or("unknown");
+        let turn_context_reasons: Vec<&'static str> = turn_context
+            .reasons
+            .iter()
+            .map(|reason| reason.as_code())
+            .collect();
+        info!(
+            session_id,
+            followup_mode,
+            reasons = ?turn_context_reasons,
+            primary_project_scope = ?turn_context.primary_project_scope,
+            allow_multi_project_scope = turn_context.allow_multi_project_scope,
+            "Turn context resolved"
+        );
         // 3. Agentic loop — runs until natural completion or safety limits
         let task_start = Instant::now();
         let mut last_progress_summary = Instant::now();
@@ -102,6 +123,13 @@ impl Agent {
         const MAX_BUDGET_EXTENSIONS: usize = 3;
         const HARD_TOKEN_CAP: i64 = 2_000_000;
         let mut pending_system_messages: Vec<String> = Vec::new();
+        if route_failsafe_active {
+            consultant_pass_active = false;
+            pending_system_messages.push(
+                "[SYSTEM] Route fail-safe is active for this session. Use explicit tools/results, avoid direct-return shortcuts, and prioritize concrete execution evidence."
+                    .to_string(),
+            );
+        }
         // Track recent tool names for alternating pattern detection (A-B-A-B cycles)
         let mut recent_tool_names: VecDeque<String> = VecDeque::new();
         // Mid-loop adaptation and fallback expansion controls.
@@ -121,8 +149,10 @@ impl Agent {
         // Track identity-attack prefill so we can prepend it to the final reply.
         let mut identity_prefill_text: Option<String> = None;
         // Best-effort project directory hint (seeded from user text, refined by tool calls).
-        let mut known_project_dir =
-            super::tool_execution_phase::extract_project_dir_hint(user_text);
+        let mut known_project_dir = turn_context
+            .primary_project_scope
+            .clone()
+            .or_else(|| super::tool_execution_phase::extract_project_dir_hint(user_text));
         // Cross-iteration directory evidence tracking for contradiction detection.
         let mut dirs_with_project_inspect_file_evidence: HashSet<String> = HashSet::new();
         let mut dirs_with_search_no_matches: HashSet<String> = HashSet::new();
@@ -284,6 +314,7 @@ impl Agent {
                     user_role,
                     evidence_gain_count,
                     stall_count,
+                    deferred_no_tool_streak,
                     consecutive_same_tool: &consecutive_same_tool,
                     consecutive_same_tool_arg_hashes: &consecutive_same_tool_arg_hashes,
                     total_successful_tool_calls,
@@ -411,6 +442,7 @@ impl Agent {
                     empty_response_retry_note: &mut empty_response_retry_note,
                     identity_prefill_text: &mut identity_prefill_text,
                     require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
+                    turn_context: &turn_context,
                 })
                 .await?;
             match consultant_outcome {
@@ -492,6 +524,8 @@ impl Agent {
                         &mut dirs_with_project_inspect_file_evidence,
                     dirs_with_search_no_matches: &mut dirs_with_search_no_matches,
                     require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
+                    turn_context: &turn_context,
+                    resolved_goal_id: resolved_goal_id.as_deref(),
                 })
                 .await?;
             match tool_execution_outcome {

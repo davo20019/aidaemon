@@ -355,7 +355,7 @@ impl Agent {
         // Model selection: route to the appropriate model tier.
         // The consultant pass (iteration 1 without tools) uses the SAME model
         // — it's about forcing text-only response, not needing a smarter model.
-        let (selected_model, consultant_pass_active) = {
+        let (selected_model, mut consultant_pass_active) = {
             let is_override = *self.model_override.read().await;
             if !is_override {
                 if let Some(ref router) = llm_router {
@@ -401,7 +401,38 @@ impl Agent {
                 (m, is_top_level_orchestrator)
             }
         };
-        let model = selected_model.clone();
+        let mut model = selected_model.clone();
+        let route_failsafe_active = route_failsafe_active_for_session(session_id);
+        if route_failsafe_active {
+            // Fail-safe mode: bypass consultant direct-return routing and force
+            // strong profile/model selection for this turn.
+            consultant_pass_active = false;
+            if !matches!(policy_bundle.policy.model_profile, ModelProfile::Strong) {
+                policy_bundle.policy = ExecutionPolicy::for_profile(ModelProfile::Strong);
+                policy_bundle
+                    .policy
+                    .escalation_reasons
+                    .push("route_drift_failsafe".to_string());
+            }
+            if let Some(ref router) = llm_router {
+                model = router.select_for_profile(ModelProfile::Strong).to_string();
+            }
+            if !tool_defs.is_empty() {
+                tool_defs = self.filter_tool_definitions_for_policy(
+                    &base_tool_defs,
+                    &available_capabilities,
+                    &policy_bundle.policy,
+                    policy_bundle.risk_score,
+                    false,
+                );
+            }
+            warn!(
+                session_id,
+                model = %model,
+                profile = ?policy_bundle.policy.model_profile,
+                "Route drift fail-safe active: forcing strong routing policy"
+            );
+        }
 
         // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
         let system_prompt = self
@@ -472,6 +503,7 @@ impl Agent {
             llm_router,
             model,
             consultant_pass_active,
+            route_failsafe_active,
             system_prompt,
             pinned_memories,
             session_summary,

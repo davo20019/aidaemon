@@ -48,6 +48,7 @@ pub(super) struct ConsultantPhaseCtx<'a> {
     pub empty_response_retry_note: &'a mut Option<String>,
     pub identity_prefill_text: &'a mut Option<String>,
     pub require_file_recheck_before_answer: &'a mut bool,
+    pub turn_context: &'a TurnContext,
 }
 
 impl Agent {
@@ -83,6 +84,7 @@ impl Agent {
                 user_role: ctx.user_role,
                 channel_ctx: ctx.channel_ctx.clone(),
                 status_tx: ctx.status_tx.clone(),
+                turn_context: ctx.turn_context,
             })
             .await?;
         if let Some(outcome) = decision_outcome {

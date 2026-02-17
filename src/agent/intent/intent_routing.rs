@@ -350,6 +350,13 @@ pub(super) fn classify_intent_complexity(
     if intent_gate.can_answer_now.unwrap_or(false) && !intent_gate.needs_tools.unwrap_or(false) {
         return (IntentComplexity::Knowledge, vec![]);
     }
+
+    // Consultant-empty fallback: when the model omits `complexity`, promote
+    // obviously cross-project / multi-question, multi-step requests to Complex.
+    if intent_gate.complexity.is_none() && looks_like_complex_request_fallback(user_text) {
+        return (IntentComplexity::Complex, vec![]);
+    }
+
     // When can_answer_now=false, don't classify as Knowledge even if
     // complexity="knowledge" — the model can't answer, so we should
     // try tools (memory search, manage_people, etc.) as Simple.
@@ -358,6 +365,43 @@ pub(super) fn classify_intent_complexity(
         Some("complex") => (IntentComplexity::Complex, vec![]),
         _ => (IntentComplexity::Simple, vec![]),
     }
+}
+
+fn looks_like_complex_request_fallback(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    let cross_project_scope = contains_keyword_as_words(&lower, "all my projects")
+        || contains_keyword_as_words(&lower, "across all projects")
+        || contains_keyword_as_words(&lower, "across my projects")
+        || (contains_keyword_as_words(&lower, "all projects")
+            && contains_keyword_as_words(&lower, "compare"));
+
+    let action_markers = [
+        "compare",
+        "analyze",
+        "analyse",
+        "identify",
+        "find",
+        "count",
+        "calculate",
+        "summarize",
+        "report",
+        "list",
+    ];
+    let action_hits = action_markers
+        .iter()
+        .filter(|marker| contains_keyword_as_words(&lower, marker))
+        .count();
+    let multi_question = user_text.matches('?').count() >= 2;
+    let compound_request =
+        lower.contains(" and ") || lower.contains(" then ") || lower.contains(" also ");
+
+    cross_project_scope
+        || (action_hits >= 3 && (multi_question || compound_request))
+        || (action_hits >= 2 && user_text.chars().count() >= 140)
 }
 
 #[cfg(test)]

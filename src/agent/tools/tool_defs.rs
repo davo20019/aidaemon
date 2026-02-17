@@ -1,6 +1,68 @@
 use super::*;
 
+fn validate_required_fields_contract(parameters: &Value) -> Result<(), String> {
+    let properties = parameters
+        .get("properties")
+        .ok_or_else(|| "missing parameters.properties".to_string())?
+        .as_object()
+        .ok_or_else(|| "parameters.properties must be an object".to_string())?;
+
+    if let Some(required) = parameters.get("required") {
+        let required_items = required
+            .as_array()
+            .ok_or_else(|| "parameters.required must be an array".to_string())?;
+        for item in required_items {
+            let key = item
+                .as_str()
+                .ok_or_else(|| "parameters.required entries must be strings".to_string())?;
+            if !properties.contains_key(key) {
+                return Err(format!(
+                    "parameters.required references unknown property '{}'",
+                    key
+                ));
+            }
+        }
+    }
+
+    if let Some(additional) = parameters.get("additionalProperties") {
+        if !additional.is_boolean() {
+            return Err("parameters.additionalProperties must be a boolean".to_string());
+        }
+    }
+
+    Ok(())
+}
+
 impl Agent {
+    pub(crate) fn validate_tool_definition_contract(def: &Value) -> Result<(), String> {
+        let func = def
+            .get("function")
+            .ok_or_else(|| "missing function object".to_string())?;
+        let name = func
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(str::trim)
+            .ok_or_else(|| "missing function.name".to_string())?;
+        if name.is_empty() {
+            return Err("function.name must be non-empty".to_string());
+        }
+        if func
+            .get("description")
+            .and_then(|d| d.as_str())
+            .is_none_or(|d| d.trim().is_empty())
+        {
+            return Err(format!("tool '{}' is missing function.description", name));
+        }
+        let parameters = func
+            .get("parameters")
+            .ok_or_else(|| format!("tool '{}' is missing function.parameters", name))?;
+        if parameters.get("type").and_then(|t| t.as_str()) != Some("object") {
+            return Err(format!("tool '{}' must use object parameters schema", name));
+        }
+        validate_required_fields_contract(parameters)?;
+        Ok(())
+    }
+
     /// Build OpenAI-format tool definitions plus capability metadata map.
     pub(super) async fn tool_definitions_with_capabilities(
         &self,
@@ -12,10 +74,23 @@ impl Agent {
         for tool in &self.tools {
             let name = tool.name().to_string();
             capabilities.insert(name.clone(), tool.capabilities());
-            defs.push(json!({
+            let candidate = json!({
                 "type": "function",
                 "function": tool.schema()
-            }));
+            });
+            match Self::validate_tool_definition_contract(&candidate) {
+                Ok(()) => defs.push(candidate),
+                Err(reason) => {
+                    POLICY_METRICS
+                        .tool_schema_contract_rejections_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        tool = %name,
+                        error = %reason,
+                        "Dropping tool definition that violates schema contract"
+                    );
+                }
+            }
         }
 
         // MCP composition stage 1: explicit trigger matching
@@ -23,11 +98,24 @@ impl Agent {
             let mcp_tools = registry.match_tools(user_message).await;
             for tool in mcp_tools {
                 let name = tool.name().to_string();
-                capabilities.entry(name).or_default();
-                defs.push(json!({
+                capabilities.entry(name.clone()).or_default();
+                let candidate = json!({
                     "type": "function",
                     "function": tool.schema()
-                }));
+                });
+                match Self::validate_tool_definition_contract(&candidate) {
+                    Ok(()) => defs.push(candidate),
+                    Err(reason) => {
+                        POLICY_METRICS
+                            .tool_schema_contract_rejections_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            tool = %name,
+                            error = %reason,
+                            "Dropping MCP tool definition that violates schema contract"
+                        );
+                    }
+                }
             }
         }
 
@@ -152,5 +240,53 @@ impl Agent {
         }
 
         (defs, base_defs, caps)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn valid_tool_def() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "demo_tool",
+                "description": "demo",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn tool_definition_contract_accepts_valid_definition() {
+        let def = valid_tool_def();
+        assert!(Agent::validate_tool_definition_contract(&def).is_ok());
+    }
+
+    proptest! {
+        #[test]
+        fn tool_definition_contract_rejects_invalid_required_keys(required_key in "[a-z]{1,12}") {
+            let mut def = valid_tool_def();
+            def["function"]["parameters"]["required"] = json!([required_key, "missing_key"]);
+            let result = Agent::validate_tool_definition_contract(&def);
+            prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn tool_definition_contract_rejects_non_boolean_additional_properties(flag in ".*") {
+            let mut def = valid_tool_def();
+            def["function"]["parameters"]["additionalProperties"] = json!(flag);
+            let result = Agent::validate_tool_definition_contract(&def);
+            prop_assert!(result.is_err());
+        }
     }
 }
