@@ -1,4 +1,5 @@
 use super::bootstrap_phase::{BootstrapCtx, BootstrapData, BootstrapOutcome};
+use super::consultant_orchestration_phase::ConsultantOrchestrationCtx;
 use super::consultant_phase::{ConsultantPhaseCtx, ConsultantPhaseOutcome};
 use super::llm_phase::{LlmPhaseCtx, LlmPhaseOutcome};
 use super::message_build_phase::{MessageBuildCtx, MessageBuildData};
@@ -6,6 +7,43 @@ use super::stopping_phase::{StoppingPhaseCtx, StoppingPhaseOutcome};
 use super::tool_execution_phase::{ToolExecutionCtx, ToolExecutionOutcome};
 use super::tool_prelude_phase::{ToolPreludeCtx, ToolPreludeOutcome};
 use super::*;
+
+fn infer_deterministic_orchestration_intent(user_text: &str) -> IntentGateDecision {
+    let mut intent_gate = infer_intent_gate(user_text, "");
+    let lower = user_text.trim().to_ascii_lowercase();
+    let explicit_cancel_command = lower == "/cancel" || lower.starts_with("/cancel ");
+    let has_cancel_phrase = [
+        "cancel",
+        "stop",
+        "abort",
+        "never mind",
+        "nevermind",
+        "forget it",
+        "scratch that",
+    ]
+    .iter()
+    .any(|kw| contains_keyword_as_words(&lower, kw));
+    if explicit_cancel_command || has_cancel_phrase {
+        let targeted_cancel = [
+            "goal",
+            "task",
+            "job",
+            "this goal",
+            "that goal",
+            "specific",
+            "id",
+        ]
+        .iter()
+        .any(|kw| contains_keyword_as_words(&lower, kw));
+        intent_gate.cancel_intent = Some(true);
+        intent_gate.cancel_scope = Some(if targeted_cancel {
+            "targeted".to_string()
+        } else {
+            "generic".to_string()
+        });
+    }
+    intent_gate
+}
 
 impl Agent {
     /// Run the agentic loop for a user message in the given session.
@@ -354,6 +392,50 @@ impl Agent {
                 StoppingPhaseOutcome::Return(result) => return result,
                 StoppingPhaseOutcome::Proceed => {}
             }
+
+            // Deterministic control-plane routing on iteration 1:
+            // handle cancel/schedule/complex intents before the first LLM call.
+            if iteration == 1
+                && self.depth == 0
+                && self.role == AgentRole::Orchestrator
+                && !route_failsafe_active
+            {
+                let intent_gate = infer_deterministic_orchestration_intent(user_text);
+                if let Some(outcome) = self
+                    .run_consultant_orchestration_phase(&mut ConsultantOrchestrationCtx {
+                        emitter: &emitter,
+                        task_id: &task_id,
+                        session_id,
+                        user_text,
+                        iteration,
+                        task_start,
+                        task_tokens_used,
+                        pending_system_messages: &mut pending_system_messages,
+                        tool_defs: &mut tool_defs,
+                        base_tool_defs: &mut base_tool_defs,
+                        available_capabilities: &mut available_capabilities,
+                        policy_bundle: &mut policy_bundle,
+                        tools_allowed_for_user,
+                        restrict_to_personal_memory_tools,
+                        llm_provider: llm_provider.clone(),
+                        llm_router: llm_router.clone(),
+                        model: &model,
+                        user_role,
+                        channel_ctx: channel_ctx.clone(),
+                        status_tx: status_tx.clone(),
+                        intent_gate: &intent_gate,
+                        turn_context: &turn_context,
+                    })
+                    .await?
+                {
+                    match outcome {
+                        ConsultantPhaseOutcome::ContinueLoop => continue,
+                        ConsultantPhaseOutcome::Return(result) => return result,
+                        ConsultantPhaseOutcome::ProceedToToolExecution => {}
+                    }
+                }
+            }
+
             let MessageBuildData { mut messages } = self
                 .run_message_build_phase(&mut MessageBuildCtx {
                     session_id,

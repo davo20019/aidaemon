@@ -33,7 +33,7 @@ impl Agent {
         let user_text = ctx.user_text;
         let model = ctx.model;
         let system_prompt = ctx.system_prompt;
-        let consultant_pass_active = ctx.consultant_pass_active;
+        let _consultant_pass_active = ctx.consultant_pass_active;
         let pinned_memories = ctx.pinned_memories;
         let tool_defs = ctx.tool_defs;
         let policy_bundle = ctx.policy_bundle;
@@ -342,15 +342,8 @@ impl Agent {
         }
 
         // Prompt shaping:
-        // - Iteration 1 consultant pass: force text-only mode with stripped tool docs.
         // - Iterations >1: use compact tool-loop prompt to reduce repeated token overhead.
-        let effective_system_prompt = if iteration == 1 && consultant_pass_active {
-            let style = match policy_bundle.policy.model_profile {
-                ModelProfile::Cheap => ConsultantPromptStyle::Lite,
-                ModelProfile::Balanced | ModelProfile::Strong => ConsultantPromptStyle::Full,
-            };
-            build_consultant_system_prompt(system_prompt, style)
-        } else if iteration > 1 {
+        let effective_system_prompt = if iteration > 1 {
             let style = match policy_bundle.policy.model_profile {
                 ModelProfile::Cheap => ToolLoopPromptStyle::Lite,
                 ModelProfile::Balanced | ModelProfile::Strong => ToolLoopPromptStyle::Standard,

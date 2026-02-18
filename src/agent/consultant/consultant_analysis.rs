@@ -148,6 +148,43 @@ pub(super) fn has_action_promise(text: &str) -> bool {
     false
 }
 
+/// Check whether a model response contains substantive text content rather
+/// than just deferred-action phrases.  Used to decide whether to accept a
+/// text-only response after repeated deferred-no-tool retries: if the model
+/// finally produced real content (greeting, explanation, joke, etc.) we should
+/// let it through instead of stalling further.
+///
+/// The heuristic:
+/// 1. The text must be at least `min_len` characters (default 50).
+/// 2. After stripping lines that are purely deferred-action phrases, there must
+///    still be substantive content left.
+pub(super) fn is_substantive_text_response(text: &str, min_len: usize) -> bool {
+    let trimmed = text.trim();
+    if trimmed.len() < min_len {
+        return false;
+    }
+
+    // Strip lines that are purely deferred-action phrases.
+    // If most of the text survives, the response is substantive.
+    let substantive_lines: Vec<&str> = trimmed
+        .lines()
+        .filter(|line| {
+            let l = line.trim();
+            if l.is_empty() {
+                return false;
+            }
+            // Keep lines that do NOT look like pure deferral text
+            !has_action_promise(&l.to_ascii_lowercase())
+        })
+        .collect();
+
+    let substantive_text: String = substantive_lines.join(" ");
+    let substantive_len = substantive_text.trim().len();
+
+    // Must have at least min_len chars of non-deferred content
+    substantive_len >= min_len
+}
+
 /// Remove leaked consultant control markers and pseudo tool-call text.
 pub(super) fn sanitize_consultant_analysis(analysis: &str) -> String {
     let lines: Vec<&str> = analysis.lines().collect();

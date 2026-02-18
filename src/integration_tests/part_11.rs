@@ -356,7 +356,7 @@ async fn test_goal_budget_auto_extends_and_persists() {
 
     // With only 3 successful tool calls, is_productive returns false → budget stops execution
     assert!(
-        response.contains("daily token budget"),
+        response.contains("processing limit"),
         "Expected budget-exceeded message, got: {}",
         response
     );

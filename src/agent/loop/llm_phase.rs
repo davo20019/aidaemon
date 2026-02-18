@@ -54,7 +54,7 @@ impl Agent {
         let session_id = ctx.session_id;
         let user_text = ctx.user_text;
         let iteration = ctx.iteration;
-        let consultant_pass_active = ctx.consultant_pass_active;
+        let _consultant_pass_active = ctx.consultant_pass_active;
         let force_text_response = ctx.force_text_response;
         let task_start = ctx.task_start;
         let task_tokens_used = &mut *ctx.task_tokens_used;
@@ -135,16 +135,8 @@ impl Agent {
             }
         }
 
-        // Consultant pass: on iteration 1, omit tools so the smart model
-        // must respond from knowledge / injected facts instead of searching.
         // Force-text: after too many tool calls, strip tools to force a response.
-        let effective_tools: &[Value] = if iteration == 1 && consultant_pass_active {
-            info!(
-                session_id,
-                "Consultant pass: calling without tools (iteration 1)"
-            );
-            &[]
-        } else if force_text_response {
+        let effective_tools: &[Value] = if force_text_response {
             info!(
                 session_id,
                 iteration,
@@ -156,21 +148,18 @@ impl Agent {
             tool_defs
         };
         let mut llm_options = ChatOptions::default();
-        if iteration == 1 && consultant_pass_active {
-            llm_options.response_mode = ResponseMode::JsonSchema {
-                name: "intent_gate_v1".to_string(),
-                schema: intent_gate_schema_json(),
-                strict: true,
-            };
-            llm_options.tool_choice = ToolChoiceMode::None;
-        } else if force_text_response {
+        if force_text_response {
             llm_options.tool_choice = ToolChoiceMode::None;
         } else if deferred_no_tool_streak > 0
+            && deferred_no_tool_streak < DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
             && total_successful_tool_calls == 0
             && !effective_tools.is_empty()
         {
             // Deterministic escalation: once the model has already deferred work
             // without tools, require a tool call on subsequent retries.
+            // BUT: after DEFERRED_NO_TOOL_ACCEPT_THRESHOLD retries, stop forcing —
+            // the query may genuinely not need tools (greetings, capability questions,
+            // jokes, etc.) and forcing tool_choice=required just causes stalls.
             llm_options.tool_choice = ToolChoiceMode::Required;
             POLICY_METRICS
                 .deferred_no_tool_forced_required_total

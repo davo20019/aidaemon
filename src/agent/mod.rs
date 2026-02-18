@@ -32,8 +32,8 @@ use crate::skills::{self, MemoryContext};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::VerificationTracker;
 use crate::traits::{
-    AgentRole, ChatOptions, Goal, Message, ModelProvider, ResponseMode, StateStore, Task,
-    TaskActivity, Tool, ToolCall, ToolCapabilities, ToolChoiceMode, ToolRole,
+    AgentRole, ChatOptions, Goal, Message, ModelProvider, StateStore, Task, TaskActivity, Tool,
+    ToolCall, ToolCapabilities, ToolChoiceMode, ToolRole,
 };
 use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
@@ -44,6 +44,10 @@ const MAX_STALL_ITERATIONS: usize = 3;
 const DEFERRED_NO_TOOL_SWITCH_THRESHOLD: usize = 2;
 const MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES: usize = 1;
 const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
+/// After this many deferred-no-tool retries, accept substantive text-only responses
+/// instead of continuing to force tool use. This prevents stalls on simple
+/// conversational queries (greetings, capability questions, jokes) that don't need tools.
+const DEFERRED_NO_TOOL_ACCEPT_THRESHOLD: usize = 3;
 const MAX_REPETITIVE_CALLS: usize = 8;
 const RECENT_CALLS_WINDOW: usize = 12;
 /// After this many identical calls (same tool+args hash), skip execution and
@@ -73,7 +77,6 @@ const ENABLE_SCHEDULE_HEURISTICS: bool = true;
 #[path = "intent/intent_gate.rs"]
 mod intent_gate;
 use intent_gate::extract_intent_gate;
-use intent_gate::intent_gate_schema_json;
 #[cfg(test)]
 use intent_gate::parse_intent_gate_json;
 #[path = "consultant/consultant_analysis.rs"]
@@ -82,7 +85,9 @@ mod consultant_analysis;
 mod consultant_pass;
 #[cfg(test)]
 use consultant_analysis::has_action_promise;
-use consultant_analysis::{looks_like_deferred_action_response, sanitize_consultant_analysis};
+use consultant_analysis::{
+    is_substantive_text_response, looks_like_deferred_action_response, sanitize_consultant_analysis,
+};
 #[path = "intent/intent_routing.rs"]
 mod intent_routing;
 use intent_routing::{
@@ -102,7 +107,7 @@ mod loop_utils;
 #[path = "policy/recall_guardrails.rs"]
 mod recall_guardrails;
 use loop_utils::{
-    build_task_boundary_hint, classify_tool_result_failure, extract_command_from_args,
+    build_task_boundary_hint, classify_tool_result_failure_with_args, extract_command_from_args,
     extract_file_path_from_args, extract_send_file_dedupe_key_from_args, fixup_message_ordering,
     hash_tool_call, is_trigger_session, strip_appended_diagnostics, ToolFailureClass,
 };
@@ -162,10 +167,9 @@ mod tool_execution_phase;
 #[path = "loop/tool_prelude_phase.rs"]
 mod tool_prelude_phase;
 
-use system_prompt::{
-    build_consultant_system_prompt, build_tool_loop_system_prompt, format_goal_context,
-    ConsultantPromptStyle, ToolLoopPromptStyle,
-};
+use system_prompt::{build_tool_loop_system_prompt, format_goal_context, ToolLoopPromptStyle};
+#[cfg(test)]
+use system_prompt::{build_consultant_system_prompt, ConsultantPromptStyle};
 
 #[cfg(test)]
 use system_prompt::strip_markdown_section;
@@ -2455,17 +2459,20 @@ impl Agent {
         path_aliases: PathAliasConfig,
     ) -> Self {
         init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
-        let fallback = model.clone();
-        if let Some(router) = llm_runtime.router() {
+        let fallback = if let Some(router) = llm_runtime.router() {
             info!(
-                fast = router.select(crate::router::Tier::Fast),
-                primary = router.select(crate::router::Tier::Primary),
-                smart = router.select(crate::router::Tier::Smart),
-                "Smart router enabled"
+                default_model = router.default_model(),
+                fallbacks = ?router.fallback_models(),
+                "Model router enabled"
             );
+            router
+                .first_fallback()
+                .map(str::to_string)
+                .unwrap_or_else(|| model.clone())
         } else {
-            info!("All model tiers identical, auto-routing disabled");
-        }
+            info!("No distinct fallback models configured; fallback cascade limited");
+            model.clone()
+        };
 
         // Log iteration config
         match &iteration_config {
@@ -2588,7 +2595,10 @@ impl Agent {
         path_aliases: PathAliasConfig,
         root_tools: Option<Vec<Arc<dyn Tool>>>,
     ) -> Self {
-        let fallback = model.clone();
+        let fallback = llm_runtime
+            .router()
+            .and_then(|router| router.first_fallback().map(str::to_string))
+            .unwrap_or_else(|| model.clone());
         Self {
             llm_runtime,
             state,
@@ -2730,7 +2740,11 @@ impl Agent {
             .replace(" [prior turn]", "")
             .replace("[prior turn, truncated]", "")
             .replace("[prior turn]", "");
-        crate::tools::sanitize::strip_internal_control_markers(&prior_turn_cleaned)
+        let control_cleaned =
+            crate::tools::sanitize::strip_internal_control_markers(&prior_turn_cleaned);
+        let identity_cleaned =
+            crate::tools::sanitize::strip_model_identity_leaks(&control_cleaned);
+        crate::tools::sanitize::strip_tool_name_references(&identity_cleaned)
     }
 
     pub async fn handle_message(
@@ -2846,6 +2860,14 @@ mod final_reply_marker_tests {
         let sanitized = Agent::sanitize_final_reply_markers(reply);
         assert!(!sanitized.contains("[prior turn"));
         assert_eq!(sanitized, "Summary\nNext");
+    }
+
+    #[test]
+    fn strips_model_identity_leaks_from_final_reply() {
+        let reply = "I am a large language model, trained by Google. How can I help?";
+        let sanitized = Agent::sanitize_final_reply_markers(reply);
+        assert!(!sanitized.contains("trained by Google"));
+        assert!(sanitized.contains("aidaemon"));
     }
 }
 

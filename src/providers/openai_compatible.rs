@@ -16,11 +16,16 @@ pub struct OpenAiCompatibleProvider {
     client: Client,
     base_url: String,
     api_key: String,
+    gateway_token: Option<String>,
+    is_cloudflare_gateway: bool,
 }
 
 impl Drop for OpenAiCompatibleProvider {
     fn drop(&mut self) {
         self.api_key.zeroize();
+        if let Some(token) = self.gateway_token.as_mut() {
+            token.zeroize();
+        }
     }
 }
 
@@ -64,18 +69,74 @@ fn validate_base_url(base_url: &str) -> Result<(), String> {
     }
 }
 
+fn is_cloudflare_ai_gateway_base(base_url: &str) -> bool {
+    let parsed = match reqwest::Url::parse(base_url) {
+        Ok(url) => url,
+        Err(_) => return false,
+    };
+    matches!(
+        parsed.host_str(),
+        Some(host) if host.eq_ignore_ascii_case("gateway.ai.cloudflare.com")
+    )
+}
+
 impl OpenAiCompatibleProvider {
     pub fn new(base_url: &str, api_key: &str) -> Result<Self, String> {
+        Self::new_with_gateway_token(base_url, api_key, None)
+    }
+
+    pub fn new_with_gateway_token(
+        base_url: &str,
+        api_key: &str,
+        gateway_token: Option<&str>,
+    ) -> Result<Self, String> {
         // Validate URL security before creating provider
         validate_base_url(base_url)?;
 
         let client = crate::providers::build_http_client(Duration::from_secs(120))?;
+        let normalized_base_url = base_url.trim_end_matches('/').to_string();
 
         Ok(Self {
             client,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            is_cloudflare_gateway: is_cloudflare_ai_gateway_base(&normalized_base_url),
+            base_url: normalized_base_url,
             api_key: api_key.to_string(),
+            gateway_token: gateway_token.map(|s| s.to_string()),
         })
+    }
+
+    fn with_auth_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = request.header("Authorization", format!("Bearer {}", self.api_key));
+        if let Some(token) = self.gateway_token.as_deref() {
+            if token.is_empty() {
+                return request;
+            }
+            request.header("cf-aig-authorization", format!("Bearer {}", token))
+        } else {
+            request
+        }
+    }
+
+    fn parse_models_response(text: &str) -> anyhow::Result<Vec<String>> {
+        let data: Value = serde_json::from_str(text)?;
+        // OpenAI format: { "data": [{ "id": "model-name" }, ...] }
+        let models = data["data"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        Ok(models)
+    }
+
+    fn cloudflare_models_fallback_url(&self) -> String {
+        if self.base_url.ends_with("/compat") {
+            format!("{}/v1/models", self.base_url)
+        } else {
+            format!("{}/compat/v1/models", self.base_url)
+        }
     }
 
     fn build_request_body(
@@ -181,15 +242,11 @@ impl ModelProvider for OpenAiCompatibleProvider {
             "Calling LLM API"
         );
 
-        let resp = match self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+        let request = self
+            .with_auth_headers(self.client.post(&url))
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-        {
+            .json(&body);
+        let resp = match request.send().await {
             Ok(r) => r,
             Err(e) => {
                 error!("HTTP request failed: {}", e);
@@ -268,35 +325,50 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        let url = format!("{}/models", self.base_url);
-
-        let resp = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+        let primary_url = format!("{}/models", self.base_url);
+        let primary_resp = self
+            .with_auth_headers(self.client.get(&primary_url))
             .send()
             .await?;
 
-        let status = resp.status();
-        let text = resp.text().await?;
-
-        if !status.is_success() {
-            anyhow::bail!("Failed to list models ({}): {}", status, text);
+        let primary_status = primary_resp.status();
+        let primary_text = primary_resp.text().await?;
+        if primary_status.is_success() {
+            return Self::parse_models_response(&primary_text);
         }
 
-        let data: Value = serde_json::from_str(&text)?;
+        let should_try_cf_fallback =
+            self.is_cloudflare_gateway && matches!(primary_status.as_u16(), 404 | 405);
+        if !should_try_cf_fallback {
+            anyhow::bail!(
+                "Failed to list models at '{}' ({}): {}",
+                primary_url,
+                primary_status,
+                primary_text
+            );
+        }
 
-        // OpenAI format: { "data": [{ "id": "model-name" }, ...] }
-        let models = data["data"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default();
+        let fallback_url = self.cloudflare_models_fallback_url();
+        let fallback_resp = self
+            .with_auth_headers(self.client.get(&fallback_url))
+            .send()
+            .await?;
+        let fallback_status = fallback_resp.status();
+        let fallback_text = fallback_resp.text().await?;
 
-        Ok(models)
+        if fallback_status.is_success() {
+            return Self::parse_models_response(&fallback_text);
+        }
+
+        anyhow::bail!(
+            "Failed to list models at '{}' ({}): {}. Fallback '{}' ({}): {}",
+            primary_url,
+            primary_status,
+            primary_text,
+            fallback_url,
+            fallback_status,
+            fallback_text
+        );
     }
 }
 
@@ -439,5 +511,73 @@ mod tests {
 
         assert!(body.get("tool_choice").is_none());
         assert_eq!(body["response_format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn test_detects_cloudflare_gateway_host() {
+        assert!(is_cloudflare_ai_gateway_base(
+            "https://gateway.ai.cloudflare.com/v1/acct/gw/compat"
+        ));
+        assert!(!is_cloudflare_ai_gateway_base("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn test_cloudflare_models_fallback_url_when_base_has_compat() {
+        let provider = OpenAiCompatibleProvider::new_with_gateway_token(
+            "https://gateway.ai.cloudflare.com/v1/a/g/compat",
+            "test-key",
+            None,
+        )
+        .expect("provider should initialize");
+        assert_eq!(
+            provider.cloudflare_models_fallback_url(),
+            "https://gateway.ai.cloudflare.com/v1/a/g/compat/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_cloudflare_models_fallback_url_when_base_has_no_compat() {
+        let provider = OpenAiCompatibleProvider::new_with_gateway_token(
+            "https://gateway.ai.cloudflare.com/v1/a/g",
+            "test-key",
+            None,
+        )
+        .expect("provider should initialize");
+        assert_eq!(
+            provider.cloudflare_models_fallback_url(),
+            "https://gateway.ai.cloudflare.com/v1/a/g/compat/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_with_auth_headers_includes_gateway_header_when_set() {
+        let provider = OpenAiCompatibleProvider::new_with_gateway_token(
+            "https://api.openai.com/v1",
+            "test-key",
+            Some("cf-gateway-token"),
+        )
+        .expect("provider should initialize");
+        let request = provider
+            .with_auth_headers(provider.client.get("https://example.com/models"))
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request.headers().get("Authorization").unwrap(),
+            "Bearer test-key"
+        );
+        assert_eq!(
+            request.headers().get("cf-aig-authorization").unwrap(),
+            "Bearer cf-gateway-token"
+        );
+    }
+
+    #[test]
+    fn test_parse_models_response_parses_openai_shape() {
+        let models = OpenAiCompatibleProvider::parse_models_response(
+            r#"{"data":[{"id":"gpt-4o-mini"},{"id":"gpt-4.1"}]}"#,
+        )
+        .expect("models should parse");
+        assert_eq!(models, vec!["gpt-4o-mini", "gpt-4.1"]);
     }
 }

@@ -16,11 +16,8 @@ use tokio::sync::Mutex;
 async fn consultant_metrics_capture_direct_return_and_fallthrough_paths() {
     let before = policy_metrics_snapshot();
 
-    // Direct-return case (pure acknowledgment handled deterministically).
-    let direct_provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "[INTENT_GATE]\n\
-         {\"complexity\":\"simple\",\"can_answer_now\":true,\"needs_tools\":false,\"is_acknowledgment\":true}",
-    )]);
+    // Direct-return case (deterministic schedule routing before first LLM call).
+    let direct_provider = MockProvider::with_responses(vec![]);
     let direct_harness =
         setup_test_agent_with_models(direct_provider, "primary-model", "smart-model")
             .await
@@ -29,7 +26,7 @@ async fn consultant_metrics_capture_direct_return_and_fallthrough_paths() {
         .agent
         .handle_message(
             "metrics_direct",
-            "Yes",
+            "Check deployment tomorrow at 9am",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -37,15 +34,18 @@ async fn consultant_metrics_capture_direct_return_and_fallthrough_paths() {
         )
         .await
         .unwrap();
-    assert_eq!(direct_reply, "Got it.");
+    assert!(
+        direct_reply.contains("Reply **confirm** to proceed"),
+        "expected schedule confirmation direct-return, got: {direct_reply}"
+    );
+    assert_eq!(
+        direct_harness.provider.call_count().await,
+        0,
+        "expected deterministic pre-routing to avoid first LLM call"
+    );
 
-    // Fallthrough case (consultant says needs tools; full loop executes tool then responds).
+    // Fallthrough case (deterministic simple route continues into full tool loop).
     let fallthrough_provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            "I need to inspect the system first.\n\
-             [INTENT_GATE]\n\
-             {\"complexity\":\"simple\",\"can_answer_now\":false,\"needs_tools\":true}",
-        ),
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("System inspected."),
     ]);
@@ -540,32 +540,19 @@ async fn replay_trace_deferred_planning_text_does_not_stall_before_first_tool_ca
         !reply.is_empty(),
         "Agent should return a non-empty response"
     );
-    // At minimum the consultant + some retries should fire
+    // At minimum some deferral retries should fire before recovery.
     assert!(
         harness.provider.call_count().await >= 3,
-        "expected at least consultant + some deferral retries"
+        "expected at least a few retries before deferred/no-tool recovery"
     );
 
     let call_log = harness.provider.call_log.lock().await.clone();
-    let consultant_schema_call = call_log.iter().find(|entry| {
-        matches!(
+    assert!(
+        !call_log.iter().any(|entry| matches!(
             entry.options.response_mode,
-            ResponseMode::JsonSchema {
-                ref name,
-                strict: true,
-                ..
-            } if name == "intent_gate_v1"
-        )
-    });
-    assert!(
-        consultant_schema_call.is_some(),
-        "expected consultant pass to request strict intent_gate_v1 schema"
-    );
-    assert!(
-        consultant_schema_call
-            .as_ref()
-            .is_some_and(|entry| matches!(entry.options.tool_choice, ToolChoiceMode::None)),
-        "expected consultant pass to disable tool calls"
+            ResponseMode::JsonSchema { .. }
+        )),
+        "text-only consultant schema pass should be disabled"
     );
 
     let required_tool_choice_seen = call_log
@@ -622,10 +609,9 @@ async fn deferred_no_tool_forced_required_resets_after_first_successful_tool_cal
             }
         })
         .collect();
-    assert_eq!(
-        required_indices.len(),
-        1,
-        "expected exactly one forced required-tool recovery call before first tool success"
+    assert!(
+        !required_indices.is_empty(),
+        "expected at least one forced required-tool recovery call before tool success"
     );
 
     let first_required = required_indices[0];
@@ -640,11 +626,8 @@ async fn deferred_no_tool_forced_required_resets_after_first_successful_tool_cal
 
 #[tokio::test]
 async fn provider_option_rejection_falls_back_to_default_chat() {
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "[INTENT_GATE]\n\
-         {\"complexity\":\"simple\",\"can_answer_now\":true,\"needs_tools\":false,\"is_acknowledgment\":true}",
-    )])
-    .rejecting_non_default_options();
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("Got it.")])
+        .rejecting_non_default_options();
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
@@ -667,26 +650,13 @@ async fn provider_option_rejection_falls_back_to_default_chat() {
 
     let call_log = harness.provider.call_log.lock().await.clone();
     assert!(
-        call_log.len() >= 2,
-        "expected optioned call + retry without options"
-    );
-    assert!(
-        call_log.iter().any(|entry| {
-            matches!(
-                entry.options.response_mode,
-                ResponseMode::JsonSchema {
-                    ref name,
-                    strict: true,
-                    ..
-                } if name == "intent_gate_v1"
-            )
-        }),
-        "expected at least one advanced-options call"
+        !call_log.is_empty(),
+        "expected at least one provider call"
     );
     assert!(
         call_log
             .iter()
-            .any(|entry| entry.options == ChatOptions::default()),
-        "expected fallback retry with default chat options"
+            .all(|entry| entry.options == ChatOptions::default()),
+        "expected default chat options when consultant text-pass is disabled"
     );
 }

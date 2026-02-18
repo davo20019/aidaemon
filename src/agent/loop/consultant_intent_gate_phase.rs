@@ -237,19 +237,52 @@ impl Agent {
         }
         if can_answer_now
             && !needs_tools
-            && analysis.trim().is_empty()
+            && raw_analysis.trim().is_empty()
             && !is_acknowledgment
             && !user_is_short_correction
         {
             info!(
                 session_id,
-                "Consultant pass: can_answer_now=true but analysis was empty — forcing tool retry"
+                "Consultant pass: can_answer_now=true but raw analysis was empty — forcing tool retry"
             );
             can_answer_now = false;
             needs_tools = true;
             intent_gate.can_answer_now = Some(false);
             intent_gate.needs_tools = Some(true);
+        } else if can_answer_now
+            && !needs_tools
+            && analysis.trim().is_empty()
+            && !raw_analysis.trim().is_empty()
+        {
+            info!(
+                session_id,
+                raw_len = raw_analysis.len(),
+                "Consultant pass: analysis was sanitized to empty but raw was non-empty — trusting can_answer_now"
+            );
         }
+        // Knowledge-complexity override: if the model classified the query
+        // as "knowledge" (fully answerable from training data) but still set
+        // needs_tools=true, trust the complexity signal over needs_tools.
+        // This prevents stalls on simple conversational queries like
+        // "Tell me a joke in Spanish" that the model can answer directly.
+        if needs_tools
+            && !user_references_fs_path
+            && !deterministic_tools_required
+            && !is_acknowledgment
+            && intent_gate
+                .complexity
+                .as_deref()
+                .is_some_and(|c| c == "knowledge" || c == "simple")
+        {
+            info!(
+                session_id,
+                complexity = intent_gate.complexity.as_deref().unwrap_or("unknown"),
+                "Consultant pass: simple/knowledge complexity overrides needs_tools — allowing direct answer"
+            );
+            can_answer_now = true;
+            needs_tools = false;
+        }
+
         intent_gate.can_answer_now = Some(can_answer_now);
         intent_gate.needs_tools = Some(needs_tools);
         intent_gate.needs_clarification = Some(needs_clarification);

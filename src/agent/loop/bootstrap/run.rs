@@ -267,16 +267,16 @@ impl Agent {
             };
 
         // Tool access is owner-only.
-        // Orchestrator (depth 0) gets NO action tools.
-        // It classifies intent and delegates to task leads or falls through to the full agent loop.
+        // Orchestrator (depth 0) now keeps tools available from iteration 1.
+        // Deterministic control-plane routing still handles cancel/schedule/goal fast-paths
+        // before the first LLM call.
         // Sub-agents (depth > 0) get tools based on their role (set in spawn_child).
-        let is_top_level_orchestrator = self.depth == 0 && self.role == AgentRole::Orchestrator;
         let tools_allowed_for_user = user_role == UserRole::Owner;
 
         let mut available_capabilities: HashMap<String, ToolCapabilities> = HashMap::new();
         let mut base_tool_defs: Vec<Value> = Vec::new();
         let mut tool_defs: Vec<Value> = Vec::new();
-        if tools_allowed_for_user && !is_top_level_orchestrator {
+        if tools_allowed_for_user {
             let (mut defs, mut caps) = self.tool_definitions_with_capabilities(user_text).await;
 
             // Filter tools by channel visibility
@@ -360,9 +360,9 @@ impl Agent {
             None
         };
 
-        // Model selection: route to the appropriate model tier.
-        // The consultant pass (iteration 1 without tools) uses the SAME model
-        // — it's about forcing text-only response, not needing a smarter model.
+        // Model selection: route to the appropriate model.
+        // Consultant text-only pre-pass is disabled; iteration 1 runs deterministic
+        // control-plane routing before entering the normal tool-enabled loop.
         let (selected_model, mut consultant_pass_active) = {
             let is_override = *self.model_override.read().await;
             if !is_override {
@@ -388,10 +388,7 @@ impl Agent {
                         policy_profile = ?policy_bundle.policy.model_profile,
                         "Selected model for task"
                     );
-                    // Consultant pass: mandatory for top-level orchestrator (all tiers),
-                    // skip for sub-agents (depth > 0) which have their own tool scoping.
-                    let do_consultant = is_top_level_orchestrator;
-                    (routed_model, do_consultant)
+                    (routed_model, false)
                 } else {
                     // No router: for top-level auto mode, pick the model from the same
                     // runtime snapshot as provider/router to avoid transient reload races.
@@ -401,12 +398,12 @@ impl Agent {
                     } else {
                         self.model.read().await.clone()
                     };
-                    (m, is_top_level_orchestrator)
+                    (m, false)
                 }
             } else {
-                // Model override: still enforce consultant pass for top-level orchestrator
+                // Model override keeps normal loop behavior.
                 let m = self.model.read().await.clone();
-                (m, is_top_level_orchestrator)
+                (m, false)
             }
         };
         let mut model = selected_model.clone();

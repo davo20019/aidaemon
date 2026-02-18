@@ -154,8 +154,13 @@ async function fetchStatus() {
     const d = await api('/api/status');
     document.getElementById('version').textContent = 'v' + esc(d.version);
     let html = '';
+    const fallbackModels = Array.isArray(d.models.fallback) && d.models.fallback.length
+      ? d.models.fallback.join(', ')
+      : '-';
     const items = [
       ['Provider', d.provider],
+      ['Default', d.models.default || d.models.primary],
+      ['Fallbacks', fallbackModels],
       ['Primary', d.models.primary],
       ['Fast', d.models.fast],
       ['Smart', d.models.smart],

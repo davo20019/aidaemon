@@ -69,6 +69,7 @@ pub(super) fn parse_intent_gate_json(text: &str) -> Option<IntentGateDecision> {
     })
 }
 
+#[allow(dead_code)]
 pub(super) fn intent_gate_schema_json() -> Value {
     json!({
         "type": "object",

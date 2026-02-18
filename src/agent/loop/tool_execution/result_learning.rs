@@ -92,7 +92,8 @@ impl Agent {
                     .insert(tc.name.clone(), cooldown_until);
                 *result_text = format!(
                     "{}\n\n[SYSTEM] Detected transient failure for `{}` (timeouts/network/rate limits). \
-Avoid retrying this tool until iteration {} (cooldown {} iterations). Use another approach for now.",
+Avoid retrying this tool until iteration {} (cooldown {} iterations). Use another approach for now. \
+Only report attempts that were actually executed; do not describe retries that were blocked or skipped.",
                     result_text, tc.name, cooldown_until, cooldown_iters
                 );
             } else {

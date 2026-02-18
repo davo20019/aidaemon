@@ -34,8 +34,15 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 }
 
 static HTTP_STATUS_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?i)\bhttp/\d(?:\.\d+)?\s+([1-5][0-9]{2})\b|\bstatus\s+code\s+([1-5][0-9]{2})\b|\bstatus\s*[:=]\s*([1-5][0-9]{2})\b|"(?:status|status_code|statusCode|http_status|httpStatus)"\s*:\s*"?([1-5][0-9]{2})"?"#)
+    Regex::new(r#"(?i)\bhttp/\d(?:\.\d+)?\s+([1-5][0-9]{2})\b|\bstatus\s+code\s+([1-5][0-9]{2})\b|\bstatus\s*[:=]\s*([1-5][0-9]{2})\b|"(?:status|status_code|statusCode|http_status|httpStatus)"\s*:\s*"?([1-5][0-9]{2})"?|\battempt\s+\d+\s*[:=-]\s*([1-5][0-9]{2})\b|\b(?:http\s*)?code\s*[:=]\s*([1-5][0-9]{2})\b"#)
         .expect("http status regex must compile")
+});
+
+static HTTPBIN_STATUS_URL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?i)\bhttps?://(?:[^/\s]+\.)?httpbin\.org/status/([1-5][0-9]{2})(?:[/?#][^\s]*)?"#,
+    )
+    .expect("httpbin status url regex must compile")
 });
 
 static EXIT_CODE_RE: Lazy<Regex> = Lazy::new(|| {
@@ -225,7 +232,7 @@ fn classify_json_error(value: &Value) -> Option<ToolFailureClass> {
 
 fn extract_http_status_from_text(text: &str) -> Option<u16> {
     let caps = HTTP_STATUS_RE.captures(text)?;
-    for idx in 1..=4 {
+    for idx in 1..caps.len() {
         if let Some(m) = caps.get(idx) {
             if let Ok(code) = m.as_str().parse::<u16>() {
                 return Some(code);
@@ -233,6 +240,16 @@ fn extract_http_status_from_text(text: &str) -> Option<u16> {
         }
     }
     None
+}
+
+fn extract_httpbin_status_hint_from_command(command: &str) -> Option<u16> {
+    let caps = HTTPBIN_STATUS_URL_RE.captures(command)?;
+    caps.get(1)?.as_str().parse::<u16>().ok()
+}
+
+fn looks_like_empty_tool_output(text: &str) -> bool {
+    let cleaned = strip_appended_diagnostics(text).trim();
+    cleaned.is_empty() || cleaned.eq_ignore_ascii_case("(no output)")
 }
 
 fn classify_embedded_json_error(text: &str) -> Option<ToolFailureClass> {
@@ -353,6 +370,27 @@ pub(super) fn classify_tool_result_failure(
     None
 }
 
+pub(super) fn classify_tool_result_failure_with_args(
+    tool_name: &str,
+    result_text: &str,
+    tool_arguments: Option<&str>,
+) -> Option<ToolFailureClass> {
+    let classified = classify_tool_result_failure(tool_name, result_text);
+    if classified.is_some() {
+        return classified;
+    }
+
+    if !matches!(tool_name, "terminal" | "run_command")
+        || !looks_like_empty_tool_output(result_text)
+    {
+        return None;
+    }
+
+    let command = tool_arguments.and_then(extract_command_from_args)?;
+    let hinted_status = extract_httpbin_status_hint_from_command(&command)?;
+    classify_http_status(hinted_status)
+}
+
 pub(super) fn build_task_boundary_hint(user_text: &str, max_chars: usize) -> String {
     // Treat user content as untrusted in system messages: collapse whitespace,
     // drop control chars, and neutralize punctuation commonly used in prompt
@@ -471,7 +509,9 @@ mod task_boundary_hint_tests {
 
 #[cfg(test)]
 mod tool_error_detection_tests {
-    use super::{classify_tool_result_failure, ToolFailureClass};
+    use super::{
+        classify_tool_result_failure, classify_tool_result_failure_with_args, ToolFailureClass,
+    };
 
     #[test]
     fn detects_prefixed_transient_error() {
@@ -498,6 +538,35 @@ mod tool_error_detection_tests {
 
         let transient_h2 = classify_tool_result_failure("http_request", "HTTP/2 503");
         assert_eq!(transient_h2, Some(ToolFailureClass::Transient));
+
+        let transient_attempt = classify_tool_result_failure("terminal", "Attempt 2: 503");
+        assert_eq!(transient_attempt, Some(ToolFailureClass::Transient));
+
+        let semantic_attempt = classify_tool_result_failure("terminal", "Attempt 1: 404");
+        assert_eq!(semantic_attempt, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn infers_httpbin_status_for_empty_curl_output() {
+        let args = r#"{"action":"run","command":"curl -s https://httpbin.org/status/503"}"#;
+        let classified =
+            classify_tool_result_failure_with_args("terminal", "(no output)", Some(args));
+        assert_eq!(classified, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn does_not_infer_httpbin_status_when_output_is_non_empty() {
+        let args = r#"{"action":"run","command":"curl -s https://httpbin.org/status/503"}"#;
+        let classified = classify_tool_result_failure_with_args("terminal", "ok", Some(args));
+        assert_eq!(classified, None);
+    }
+
+    #[test]
+    fn does_not_infer_non_httpbin_status_urls() {
+        let args = r#"{"action":"run","command":"curl -s https://example.com/status/503"}"#;
+        let classified =
+            classify_tool_result_failure_with_args("terminal", "(no output)", Some(args));
+        assert_eq!(classified, None);
     }
 
     #[test]

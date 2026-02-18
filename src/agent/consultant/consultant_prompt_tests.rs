@@ -290,7 +290,7 @@ fn test_classify_stall_detects_deferred_no_tool_loop() {
 
     let (label, suggestion) = Agent::classify_stall(&learning_ctx);
     assert_eq!(label, "Deferred No-Tool Loop");
-    assert!(suggestion.contains("never called tools"));
+    assert!(suggestion.contains("rephrasing"));
 }
 
 #[test]
@@ -358,4 +358,60 @@ fn test_extract_intent_gate_bare_json_does_not_strip_unrelated_json() {
     let (cleaned, gate) = extract_intent_gate(input);
     assert!(gate.is_none());
     assert!(cleaned.contains("{\"name\":\"Alice\""));
+}
+
+#[test]
+fn test_is_substantive_text_response_accepts_real_content() {
+    // A greeting with enough substance should be accepted
+    assert!(is_substantive_text_response(
+        "Hola! Claro que sí, puedo hablar en español. ¿En qué puedo ayudarte hoy?",
+        50
+    ));
+
+    // A capability listing should be accepted
+    assert!(is_substantive_text_response(
+        "Here are my main capabilities:\n\
+         1. I can run terminal commands\n\
+         2. I can search the web\n\
+         3. I can read and write files\n\
+         4. I can manage your schedule",
+        50
+    ));
+
+    // A joke should be accepted
+    assert!(is_substantive_text_response(
+        "Here's a joke for you: Why do programmers prefer dark mode? Because light attracts bugs!",
+        50
+    ));
+}
+
+#[test]
+fn test_is_substantive_text_response_rejects_short_text() {
+    // Too short to be substantive
+    assert!(!is_substantive_text_response("Sure!", 50));
+    assert!(!is_substantive_text_response("OK, I can do that.", 50));
+}
+
+#[test]
+fn test_is_substantive_text_response_rejects_pure_deferrals() {
+    // Pure deferral text: every line is an action promise
+    assert!(!is_substantive_text_response(
+        "I'll search the web for that information and get back to you right away.",
+        50
+    ));
+
+    // Short deferral
+    assert!(!is_substantive_text_response("Let me check that for you.", 50));
+}
+
+#[test]
+fn test_is_substantive_text_response_accepts_mixed_content() {
+    // Some deferred-looking phrasing mixed with real content — the
+    // substantive parts exceed the min_len threshold.
+    assert!(is_substantive_text_response(
+        "I'll help you with that.\n\n\
+         The capital of France is Paris. It is the largest city in France \
+         and serves as the country's political, economic, and cultural center.",
+        50
+    ));
 }

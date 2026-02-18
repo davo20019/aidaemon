@@ -250,6 +250,8 @@ async fn api_status(State(state): State<DashboardState>) -> Json<serde_json::Val
     Json(json!({
         "provider": state.provider_kind,
         "models": {
+            "default": state.models.default_model,
+            "fallback": state.models.fallback_models,
             "primary": state.models.primary,
             "fast": state.models.fast,
             "smart": state.models.smart,

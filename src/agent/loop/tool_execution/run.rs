@@ -658,7 +658,11 @@ Do NOT call additional tools or poll status in this turn. Reply to the user now 
 
             // Track tool failures across iterations using structured detection
             // (prefixes, JSON error payloads, HTTP statuses, non-zero exit codes).
-            let failure_class = classify_tool_result_failure(&tc.name, &result_text);
+            let failure_class = classify_tool_result_failure_with_args(
+                &tc.name,
+                &result_text,
+                Some(&effective_arguments),
+            );
             let is_error = failure_class.is_some();
 
             let learning_env = ResultLearningEnv {

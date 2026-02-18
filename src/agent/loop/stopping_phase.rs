@@ -855,7 +855,7 @@ impl Agent {
                 }),
             )
             .await;
-            let reply = "I’m still getting planning-only outputs and haven’t started tool execution yet. Please resend the request and I’ll retry with stricter tool-call mode."
+            let reply = "I'm having trouble processing this request. Could you try rephrasing it or breaking it into smaller steps?"
                 .to_string();
             let assistant_msg = Message {
                 id: Uuid::new_v4().to_string(),

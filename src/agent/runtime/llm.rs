@@ -2,7 +2,8 @@ use super::*;
 
 impl Agent {
     /// Pick a fallback model, skipping `failed_model` and any models in the `exclude` list.
-    /// Tries stored fallback first, then cycles through router tiers.
+    /// Tries stored fallback first, then cycles through router ordered models
+    /// (`default` + `fallback[]`).
     pub(super) async fn pick_fallback_excluding(
         &self,
         failed_model: &str,
@@ -13,14 +14,9 @@ impl Agent {
         if stored != failed_model && !exclude.contains(&stored.as_str()) {
             return Some(stored);
         }
-        // Stored fallback is the same or excluded — try the router tiers
+        // Stored fallback is the same or excluded — try router candidates.
         if let Some(router) = router {
-            for tier in &[
-                crate::router::Tier::Primary,
-                crate::router::Tier::Smart,
-                crate::router::Tier::Fast,
-            ] {
-                let candidate = router.select(*tier).to_string();
+            for candidate in router.all_models_ordered() {
                 if candidate != failed_model && !exclude.contains(&candidate.as_str()) {
                     return Some(candidate);
                 }

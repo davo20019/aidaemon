@@ -32,6 +32,14 @@ impl Agent {
         let new_router = crate::llm_runtime::router_from_models(config.provider.models.clone());
         let new_kind = config.provider.kind.clone();
         let new_primary = bundle.primary_model.clone();
+        let new_fallback = config
+            .provider
+            .models
+            .fallback_models
+            .iter()
+            .find(|m| m.as_str() != new_primary)
+            .cloned()
+            .unwrap_or_else(|| new_primary.clone());
         let old_model = self.model.read().await.clone();
 
         let old_runtime = self.llm_runtime.swap(
@@ -45,7 +53,7 @@ impl Agent {
             let mut model = self.model.write().await;
             let mut fallback = self.fallback_model.write().await;
             *model = new_primary.clone();
-            *fallback = new_primary.clone();
+            *fallback = new_fallback.clone();
         }
         *self.model_override.write().await = false;
 
@@ -54,6 +62,7 @@ impl Agent {
             new_provider = ?new_kind,
             old_model = %old_model,
             new_model = %new_primary,
+            new_fallback = %new_fallback,
             "Provider runtime reloaded"
         );
 

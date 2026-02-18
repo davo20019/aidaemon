@@ -57,6 +57,29 @@ static INTERNAL_CONTROL_MARKERS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
+/// Patterns that indicate the underlying LLM is leaking its training identity.
+static MODEL_IDENTITY_LEAKS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)I am a large language model,? trained by Google\.?").unwrap(),
+        Regex::new(r"(?i)I(?:'m| am) (?:a |an )?(?:AI )?(?:language )?model (?:created|made|trained|developed|built) by (?:Google|OpenAI|Anthropic|Meta|DeepMind)\.?").unwrap(),
+        Regex::new(r"(?i)I(?:'m| am) (?:Google(?:'s)? )?Gemini\.?").unwrap(),
+        Regex::new(r"(?i)I(?:'m| am) ChatGPT\.?").unwrap(),
+        Regex::new(r"(?i)I(?:'m| am) Claude\.?").unwrap(),
+        Regex::new(r"(?i)As an AI (?:language )?model trained by (?:Google|OpenAI|Anthropic)").unwrap(),
+    ]
+});
+
+/// Strip model identity leak phrases from a reply, replacing with aidaemon identity.
+pub fn strip_model_identity_leaks(content: &str) -> String {
+    let mut result = content.to_string();
+    for pattern in MODEL_IDENTITY_LEAKS.iter() {
+        result = pattern
+            .replace_all(&result, "I'm aidaemon, your personal AI assistant.")
+            .to_string();
+    }
+    result
+}
+
 /// Secret/credential patterns for output sanitization.
 struct SecretPattern {
     regex: Regex,
@@ -170,6 +193,149 @@ pub fn redact_secrets(text: &str) -> String {
                 .to_string();
         }
     }
+    result
+}
+
+/// Known internal tool names that should never appear in user-facing replies.
+/// The LLM sometimes wraps these in backticks (e.g. `send_file`) or mentions
+/// them as plain text (e.g. "the send_file tool").  This list covers all
+/// registered built-in tools as well as a few names the LLM hallucinates.
+const INTERNAL_TOOL_NAMES: &[&str] = &[
+    "terminal",
+    "web_search",
+    "web_fetch",
+    "remember_fact",
+    "manage_memories",
+    "system_info",
+    "send_file",
+    "search_files",
+    "send_resume",
+    "read_channel_history",
+    "scheduled_goal_runs",
+    "goal_trace",
+    "tool_trace",
+    "self_diagnose",
+    "share_memory",
+    "manage_goals",
+    "use_skill",
+    "manage_skills",
+    "spawn_agent",
+    "plan_manager",
+    "scheduler",
+    "config_manager",
+    "manage_config",
+    "health_probe",
+    "skill_resources",
+    "manage_people",
+    "manage_mcp",
+    "manage_cli_agents",
+    "cli_agent",
+    "browser",
+    "policy_metrics",
+    "project_inspect",
+    "manage_oauth",
+    "http_request",
+    "token_usage",
+    "check_environment",
+    "run_command",
+    "git_info",
+    "git_commit",
+    "edit_file",
+    "read_file",
+    "write_file",
+    "service_status",
+    "report_blocker",
+    "manage_goal_tasks",
+];
+
+/// Compiled patterns for stripping tool name references from user-facing replies.
+///
+/// We target the forms the LLM most commonly uses:
+///   - backtick-wrapped:  `tool_name`  (with surrounding context phrases)
+///   - quoted:            "tool_name"  (with surrounding context phrases)
+///   - plain:             the tool_name tool   /  using tool_name   /  call tool_name
+///
+/// The patterns are designed to consume the surrounding phrasing so the
+/// replacement reads naturally.  For backtick/quote-wrapped names we strip the
+/// entire mention.  For bare names we only match when accompanied by
+/// contextual keywords to avoid false-positives on words like "terminal" or
+/// "browser" used in their normal English sense.
+static TOOL_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    let names = INTERNAL_TOOL_NAMES
+        .iter()
+        .map(|n| regex::escape(n))
+        .collect::<Vec<_>>()
+        .join("|");
+
+    vec![
+        // ── backtick-wrapped with surrounding phrasing ──────────────────
+        // "I couldn't find a `tool` tool"  /  "find a `tool`"  /  "find the `tool` tool"
+        Regex::new(&format!(
+            r"(?i)(?:find|found|locate|use|using|call|called|invoke|run|try|via|with)\s+(?:a\s+|an\s+|the\s+)?`(?:{names})`(?:\s+tool)?"
+        )).unwrap(),
+        // "the `tool` tool"  /  "the `tool`"
+        Regex::new(&format!(
+            r"(?i)the\s+`(?:{names})`(?:\s+tool)?"
+        )).unwrap(),
+        // "using the `tool` tool"  (already partially covered above, but catch leftovers)
+        // Standalone backtick-wrapped tool name (e.g. "I can try `search_files` if…")
+        Regex::new(&format!(
+            r"`(?:{names})`(?:\s+tool)?"
+        )).unwrap(),
+
+        // ── double-quote-wrapped with surrounding phrasing ──────────────
+        Regex::new(&format!(
+            r#"(?i)(?:find|found|locate|use|using|call|called|invoke|run|try|via|with)\s+(?:a\s+|an\s+|the\s+)?"(?:{names})"(?:\s+tool)?"#
+        )).unwrap(),
+        Regex::new(&format!(
+            r#"(?i)the\s+"(?:{names})"(?:\s+tool)?"#
+        )).unwrap(),
+        Regex::new(&format!(
+            r#""(?:{names})"(?:\s+tool)?"#
+        )).unwrap(),
+
+        // ── bare (no backtick/quote) with required context keywords ─────
+        // "the tool_name tool"  /  "a tool_name tool"
+        Regex::new(&format!(
+            r"(?i)(?:the|a|an)\s+(?:{names})\s+tool"
+        )).unwrap(),
+        // "use tool_name"  /  "using tool_name"  /  "call tool_name"  /  "via tool_name"
+        Regex::new(&format!(
+            r"(?i)(?:use|using|call|calling|invoke|invoking|run|running|via)\s+(?:the\s+)?(?:{names})(?:\s+tool)?"
+        )).unwrap(),
+    ]
+});
+
+/// Strip references to internal tool names from a user-facing reply.
+///
+/// The LLM occasionally exposes tool names like `send_file` or `search_files`
+/// in its final text responses.  This function removes or replaces those
+/// references so the end user never sees implementation details.
+///
+/// Only call this on **final user-facing replies** — not on internal tool
+/// outputs, logs, or agent-to-agent messages.
+pub fn strip_tool_name_references(content: &str) -> String {
+    let mut result = content.to_string();
+    for pattern in TOOL_NAME_PATTERNS.iter() {
+        result = pattern.replace_all(&result, "that").to_string();
+    }
+    // Clean up artefacts left by replacements:
+    //  - double/triple "that" from overlapping patterns
+    //  - "a that" / "an that" / "the that" → "that"
+    //  - leftover double spaces
+    static DOUBLE_THAT: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\bthat\s+that\b").unwrap());
+    static ARTICLE_THAT: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\b(?:a|an|the)\s+that\b").unwrap());
+    static MULTI_SPACE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"  +").unwrap());
+
+    // Collapse repeated "that that" → "that" (may need two passes)
+    for _ in 0..2 {
+        result = DOUBLE_THAT.replace_all(&result, "that").to_string();
+    }
+    result = ARTICLE_THAT.replace_all(&result, "that").to_string();
+    result = MULTI_SPACE.replace_all(&result, " ").to_string();
     result
 }
 
@@ -328,6 +494,128 @@ mod tests {
         assert!(!is_trusted_tool("web_search"));
         assert!(!is_trusted_tool("web_fetch"));
         assert!(!is_trusted_tool("mcp_some_tool"));
+    }
+
+    // ── strip_tool_name_references tests ──────────────────────────────
+
+    #[test]
+    fn test_strip_backtick_tool_name_with_context() {
+        let input = "I couldn't find a `send_resume` tool. I can try to find your resume files using `search_files` if you can tell me where they might be located.";
+        let result = strip_tool_name_references(input);
+        assert!(!result.contains("send_resume"), "send_resume leaked: {result}");
+        assert!(!result.contains("search_files"), "search_files leaked: {result}");
+        assert!(!result.contains('`'), "backticks leaked: {result}");
+    }
+
+    #[test]
+    fn test_strip_backtick_the_tool_pattern() {
+        let input = "You can use the `send_file` tool to share documents.";
+        let result = strip_tool_name_references(input);
+        assert!(!result.contains("send_file"), "send_file leaked: {result}");
+        assert!(!result.contains('`'), "backticks leaked: {result}");
+    }
+
+    #[test]
+    fn test_strip_backtick_using_tool() {
+        let input = "I'll search for that using `web_search`.";
+        let result = strip_tool_name_references(input);
+        assert!(!result.contains("web_search"), "web_search leaked: {result}");
+    }
+
+    #[test]
+    fn test_strip_backtick_standalone() {
+        let input = "Try `terminal` to run commands.";
+        let result = strip_tool_name_references(input);
+        assert!(!result.contains("`terminal`"), "backtick terminal leaked: {result}");
+    }
+
+    #[test]
+    fn test_strip_quoted_tool_name() {
+        let input = r#"I can use "web_fetch" to retrieve that page."#;
+        let result = strip_tool_name_references(input);
+        assert!(!result.contains("web_fetch"), "web_fetch leaked: {result}");
+    }
+
+    #[test]
+    fn test_strip_bare_the_tool_pattern() {
+        let input = "The send_file tool can help with that.";
+        let result = strip_tool_name_references(input);
+        assert!(!result.contains("send_file"), "send_file leaked: {result}");
+    }
+
+    #[test]
+    fn test_strip_bare_using_pattern() {
+        let input = "I'll do it using terminal for this.";
+        let result = strip_tool_name_references(input);
+        assert!(!result.contains("using terminal"), "bare using terminal leaked: {result}");
+    }
+
+    #[test]
+    fn test_strip_bare_call_pattern() {
+        let input = "Let me call spawn_agent to handle this.";
+        let result = strip_tool_name_references(input);
+        assert!(!result.contains("spawn_agent"), "spawn_agent leaked: {result}");
+    }
+
+    #[test]
+    fn test_no_false_positive_terminal_as_english_word() {
+        // "terminal" without tool-context phrasing should be preserved.
+        let input = "The airport terminal was crowded.";
+        let result = strip_tool_name_references(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_no_false_positive_browser_as_english_word() {
+        let input = "Open your browser and navigate to the page.";
+        let result = strip_tool_name_references(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_no_false_positive_scheduler_as_english_word() {
+        let input = "A task scheduler runs background jobs.";
+        let result = strip_tool_name_references(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_normal_text_unchanged() {
+        let input = "Here is the answer to your math question: 42.";
+        let result = strip_tool_name_references(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_multiple_tool_references_stripped() {
+        let input = "I tried `web_search` and `web_fetch` but neither worked. Try the `terminal` tool.";
+        let result = strip_tool_name_references(input);
+        assert!(!result.contains("web_search"), "web_search leaked: {result}");
+        assert!(!result.contains("web_fetch"), "web_fetch leaked: {result}");
+        assert!(!result.contains("`terminal`"), "backtick terminal leaked: {result}");
+    }
+
+    #[test]
+    fn test_case_insensitive_context() {
+        let input = "Using `search_files` I found your document.";
+        let result = strip_tool_name_references(input);
+        assert!(!result.contains("search_files"), "search_files leaked: {result}");
+    }
+
+    #[test]
+    fn test_send_file_tool_full_example() {
+        let input = "if you'd like me to send a file, please provide the file path using the `send_file` tool.";
+        let result = strip_tool_name_references(input);
+        assert!(!result.contains("send_file"), "send_file leaked: {result}");
+        assert!(!result.contains('`'), "backticks leaked: {result}");
+    }
+
+    #[test]
+    fn test_strip_tool_name_idempotent() {
+        let input = "Try using `search_files` or the `terminal` tool.";
+        let once = strip_tool_name_references(input);
+        let twice = strip_tool_name_references(&once);
+        assert_eq!(once, twice, "not idempotent: first={once}, second={twice}");
     }
 
     mod proptest_sanitize {

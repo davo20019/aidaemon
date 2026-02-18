@@ -110,37 +110,37 @@ pub(super) fn classify_stall(
     if recent_errors.contains("rate limit") || recent_errors.contains("429") {
         (
             "Rate Limited",
-            "The AI provider is throttling requests. Try again in a few minutes, or consider switching to a different model tier.",
+            "I'm being rate-limited right now. Try again in a few minutes.",
         )
     } else if recent_errors.contains("timed out") || recent_errors.contains("timeout") {
         (
             "Timeout",
-            "The AI provider is responding slowly. This usually resolves on its own — try again shortly, or try a simpler request.",
+            "Responses are taking too long right now. This usually resolves on its own -- try again shortly, or try a simpler request.",
         )
     } else if recent_errors.contains("network") || recent_errors.contains("connection") {
         (
             "Network Error",
-            "There's a connectivity issue reaching the AI provider. Check your network connection and try again.",
+            "There seems to be a connectivity issue. Check your network connection and try again.",
         )
     } else if is_tool_policy_block(&recent_errors) {
         (
             "Tool Policy Block",
-            "A command/tool step was blocked by safety policy. Use `terminal` for non-whitelisted commands, or adjust the request to allowed tool prefixes.",
+            "A step was blocked by safety policy. Try adjusting the request or running the blocked command yourself.",
         )
     } else if is_edit_target_drift(&recent_errors) {
         (
             "Edit Target Drift",
-            "The requested edit target no longer matched the file/project state. Re-read the current files and retry with updated paths/text anchors.",
+            "I had trouble editing files because the content changed while I was working. Try again so I can re-read the files first.",
         )
     } else if looks_like_provider_server_error(&recent_errors) {
         (
             "Server Error",
-            "The AI provider is experiencing issues. This is usually temporary — try again in a few minutes.",
+            "I'm experiencing temporary server issues. Try again in a few minutes.",
         )
     } else if recent_errors.contains("unknown tool") {
         (
             "Unknown Tool",
-            "The model tried to call a tool that doesn't exist. This usually resolves on retry — if it recurs, try a different model or rephrase your request.",
+            "Something went wrong on my end. This usually resolves on retry -- try again, or rephrase your request.",
         )
     } else if recent_errors.contains("unauthorized")
         || recent_errors.contains("api key")
@@ -154,7 +154,7 @@ pub(super) fn classify_stall(
     } else if recent_errors.contains(deferred_no_tool_error_marker) {
         (
             "Deferred No-Tool Loop",
-            "The model repeatedly promised actions but never called tools. Retry the request; if it recurs, switch model/profile or ask for a direct text answer.",
+            "I'm having trouble processing this request. Could you try rephrasing it or breaking it into smaller steps?",
         )
     } else {
         (
@@ -218,14 +218,10 @@ pub(super) fn graceful_timeout_response(
 ) -> String {
     let activity = categorize_tool_calls(&learning_ctx.tool_calls);
     let mut summary = format!(
-        "I've been working on this task for {} minutes and reached the time limit. \
-            Here's what I accomplished:\n\n\
-            - {} tool calls executed\n\
-            - {} errors encountered\n\n{}\
-            The task may be incomplete. You can continue where I left off or try breaking it into smaller parts.",
+        "I've been working on this for {} minutes and reached the time limit. \
+            Here's what I accomplished so far:\n\n{}\
+            The task may be incomplete. You can ask me to continue where I left off or try breaking it into smaller parts.",
         elapsed.as_secs() / 60,
-        learning_ctx.tool_calls.len(),
-        learning_ctx.errors.len(),
         activity,
     );
     if summary.len() > 1500 {
@@ -240,17 +236,12 @@ pub(super) fn graceful_timeout_response(
 }
 
 /// Graceful response when task token budget is exhausted.
-pub(super) fn graceful_budget_response(learning_ctx: &LearningContext, tokens_used: u64) -> String {
+pub(super) fn graceful_budget_response(learning_ctx: &LearningContext, _tokens_used: u64) -> String {
     let activity = categorize_tool_calls(&learning_ctx.tool_calls);
     let mut summary = format!(
-        "I've used {} tokens on this task and reached the budget limit. \
-            Here's what I accomplished:\n\n\
-            - {} tool calls executed\n\
-            - {} errors encountered\n\n{}\
-            The task may be incomplete. You can continue where I left off.",
-        tokens_used,
-        learning_ctx.tool_calls.len(),
-        learning_ctx.errors.len(),
+        "I've reached my processing limit for this task. \
+            Here's what I accomplished so far:\n\n{}\
+            The task may be incomplete. You can ask me to continue where I left off.",
         activity,
     );
     // Cap to avoid bloating conversation history while preserving key context.
@@ -268,22 +259,28 @@ pub(super) fn graceful_budget_response(learning_ctx: &LearningContext, tokens_us
 /// Graceful response when a goal hits its daily token budget.
 pub(super) fn graceful_goal_daily_budget_response(
     learning_ctx: &LearningContext,
-    tokens_used_today: i64,
-    budget_daily: i64,
+    _tokens_used_today: i64,
+    _budget_daily: i64,
 ) -> String {
-    format!(
-        "This goal has reached its daily token budget (used {} / limit {}). \
-            I'm stopping now to prevent runaway spend.\n\n\
-            Here's what I accomplished:\n\n\
-            - {} tool calls executed\n\
-            - {} errors encountered\n\n\
-            If you want me to continue, you can retry later after the daily budget resets, \
-            or (for scheduled goals) increase the budget via scheduled_goal_runs(action='set_budget', goal_id='…', budget_daily=…).",
-        tokens_used_today,
-        budget_daily,
-        learning_ctx.tool_calls.len(),
-        learning_ctx.errors.len()
-    )
+    let tool_count = learning_ctx.tool_calls.len();
+    let error_count = learning_ctx.errors.len();
+    let mut msg = String::from(
+        "I've reached my processing limit for this task today. ",
+    );
+    if tool_count > 0 || error_count > 0 {
+        msg.push_str(&format!(
+            "Here's what I accomplished: {} steps completed",
+            tool_count
+        ));
+        if error_count > 0 {
+            msg.push_str(&format!(", {} issues encountered", error_count));
+        }
+        msg.push_str(".\n\n");
+    }
+    msg.push_str(
+        "You can ask me to continue this later, or I'll pick it up when my limit resets.",
+    );
+    msg
 }
 
 /// Graceful response when agent is stalled (no progress).
@@ -292,45 +289,26 @@ pub(super) fn graceful_stall_response(
     sent_file_successfully: bool,
     deferred_no_tool_error_marker: &str,
 ) -> String {
-    let (label, suggestion) = classify_stall(learning_ctx, deferred_no_tool_error_marker);
-    let recent_errors = learning_ctx
-        .errors
-        .iter()
-        .rev()
-        .take(3)
-        .map(|(e, _)| format!("- {}", e.chars().take(100).collect::<String>()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let summary = if sent_file_successfully {
-        format!(
-            "I already sent at least one requested file, then got stuck in follow-up steps.\n\n\
-                Stopping reason: **{}**\n\
-                - {} tool calls executed\n\
-                - {} errors encountered\n\n\
-                {}\n\n\
-                Recent errors:\n{}",
-            label,
-            learning_ctx.tool_calls.len(),
-            learning_ctx.errors.len(),
-            suggestion,
-            recent_errors
-        )
+    let (_label, suggestion) = classify_stall(learning_ctx, deferred_no_tool_error_marker);
+    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    if sent_file_successfully {
+        let mut msg = String::from(
+            "I sent the requested file(s), but ran into issues with the remaining steps.\n\n",
+        );
+        if !activity.is_empty() {
+            msg.push_str(&activity);
+        }
+        msg.push_str(suggestion);
+        msg
     } else {
-        format!(
-            "I'm unable to make progress — **{}**.\n\n\
-                Here's what I tried:\n\
-                - {} tool calls executed\n\
-                - {} errors encountered\n\n\
-                {}\n\n\
-                Recent errors:\n{}",
-            label,
-            learning_ctx.tool_calls.len(),
-            learning_ctx.errors.len(),
-            suggestion,
-            recent_errors
-        )
-    };
-    summary
+        let mut msg = String::from("I wasn't able to complete this task.\n\n");
+        if !activity.is_empty() {
+            msg.push_str(&activity);
+            msg.push('\n');
+        }
+        msg.push_str(suggestion);
+        msg
+    }
 }
 
 /// Graceful response when agent stalled after making meaningful progress.
@@ -339,77 +317,55 @@ pub(super) fn graceful_partial_stall_response(
     sent_file_successfully: bool,
     deferred_no_tool_error_marker: &str,
 ) -> String {
-    let (label, suggestion) = classify_stall(learning_ctx, deferred_no_tool_error_marker);
-    let recent_errors = learning_ctx
-        .errors
-        .iter()
-        .rev()
-        .take(3)
-        .map(|(e, _)| format!("- {}", e.chars().take(100).collect::<String>()))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let (_label, suggestion) = classify_stall(learning_ctx, deferred_no_tool_error_marker);
+    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
     if sent_file_successfully {
-        format!(
-            "I completed the primary deliverable and made additional progress, then got stuck in follow-up steps.\n\n\
-                Stopping reason: **{}**\n\
-                - {} tool calls executed\n\
-                - {} errors encountered\n\n\
-                {}\n\n\
-                Recent errors:\n{}",
-            label,
-            learning_ctx.tool_calls.len(),
-            learning_ctx.errors.len(),
-            suggestion,
-            recent_errors
-        )
+        let mut msg = String::from(
+            "I completed the main deliverable but wasn't able to finish everything.\n\n",
+        );
+        if !activity.is_empty() {
+            msg.push_str(&activity);
+        }
+        msg.push_str(suggestion);
+        msg
     } else {
-        format!(
-            "I made meaningful progress, but got stuck before fully finishing.\n\n\
-                Stopping reason: **{}**\n\
-                - {} tool calls executed\n\
-                - {} errors encountered\n\n\
-                {}\n\n\
-                Recent errors:\n{}",
-            label,
-            learning_ctx.tool_calls.len(),
-            learning_ctx.errors.len(),
-            suggestion,
-            recent_errors
-        )
+        let mut msg = String::from(
+            "I made some progress but wasn't able to fully complete the task.\n\n",
+        );
+        if !activity.is_empty() {
+            msg.push_str(&activity);
+            msg.push('\n');
+        }
+        msg.push_str(suggestion);
+        msg
     }
 }
 
 /// Graceful response when repetitive tool calls are detected.
 pub(super) fn graceful_repetitive_response(
     learning_ctx: &LearningContext,
-    tool_name: &str,
+    _tool_name: &str,
 ) -> String {
-    // Plan pausing removed (plans deprecated in favor of goals/tasks).
-    let summary = format!(
-        "I noticed I'm calling `{}` repeatedly with similar parameters, which suggests I'm stuck in a loop. \
-            Here's what I've done so far:\n\n\
-            - {} tool calls executed\n\
-            - {} errors encountered\n\n\
-            Please try a different approach or provide more specific instructions.",
-        tool_name,
-        learning_ctx.tool_calls.len(),
-        learning_ctx.errors.len()
+    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let mut msg = String::from(
+        "I seem to be stuck on this task.\n\n",
     );
-    summary
+    if !activity.is_empty() {
+        msg.push_str("Here's what I've done so far:\n");
+        msg.push_str(&activity);
+        msg.push('\n');
+    }
+    msg.push_str("Could you try a different approach or provide more specific instructions?");
+    msg
 }
 
 /// Graceful response when hard iteration cap is reached (legacy mode).
-pub(super) fn graceful_cap_response(learning_ctx: &LearningContext, iterations: usize) -> String {
+pub(super) fn graceful_cap_response(learning_ctx: &LearningContext, _iterations: usize) -> String {
     let activity = categorize_tool_calls(&learning_ctx.tool_calls);
     let mut summary = format!(
-        "I've reached the maximum iteration limit ({} iterations). \
-            Here's what I accomplished:\n\n\
-            - {} tool calls executed\n\
-            - {} errors encountered\n\n{}\
-            The task may be incomplete. Consider increasing the iteration limit in config or using unlimited mode.",
-        iterations,
-        learning_ctx.tool_calls.len(),
-        learning_ctx.errors.len(),
+        "I've reached my processing limit for this task. \
+            Here's what I accomplished so far:\n\n{}\
+            The task may be incomplete. You can ask me to continue where I left off or try breaking it into smaller parts.",
         activity,
     );
     if summary.len() > 1500 {
@@ -623,11 +579,14 @@ mod tests {
             explicit_negative_signals: 0,
         };
         let result = graceful_budget_response(&ctx, 500_000);
-        assert!(result.contains("500000 tokens"));
-        assert!(result.contains("4 tool calls"));
+        assert!(result.contains("processing limit"));
         assert!(result.contains("Activity summary:"));
         assert!(result.contains("Files read: App.jsx"));
         assert!(result.contains("Files sent: out.pdf"));
+        // Should NOT contain internal details
+        assert!(!result.contains("500000 tokens"));
+        assert!(!result.contains("tool calls executed"));
+        assert!(!result.contains("errors encountered"));
     }
 
     #[test]
@@ -676,8 +635,12 @@ mod tests {
             explicit_negative_signals: 0,
         };
         let result = graceful_partial_stall_response(&ctx, false, "deferred");
-        assert!(result.contains("made meaningful progress"));
-        assert!(result.contains("4 tool calls"));
+        assert!(result.contains("some progress"));
+        assert!(result.contains("Activity summary:"));
+        // Should NOT contain internal details
+        assert!(!result.contains("tool calls executed"));
+        assert!(!result.contains("errors encountered"));
+        assert!(!result.contains("Stopping reason"));
     }
 
     fn make_learning_ctx() -> LearningContext {
@@ -787,7 +750,7 @@ mod tests {
         );
         let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool");
         assert_eq!(label, "Tool Policy Block");
-        assert!(suggestion.contains("terminal"));
+        assert!(suggestion.contains("safety policy"));
     }
 
     #[test]
@@ -797,7 +760,7 @@ mod tests {
         );
         let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool");
         assert_eq!(label, "Edit Target Drift");
-        assert!(suggestion.contains("Re-read"));
+        assert!(suggestion.contains("re-read"));
     }
 
     #[test]

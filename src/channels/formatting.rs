@@ -622,6 +622,10 @@ pub(crate) fn build_help_text(
          _\"Show me docker container status\"_\n\
          _\"Deploy the staging branch\"_\n\
          \n\
+         **Switch AI providers with guidance**\n\
+         _\"Switch to Moonshot\"_\n\
+         _\"Move me to Cloudflare Gateway and ask for what you need\"_\n\
+         \n\
          **Remember things about you**\n\
          _\"I prefer dark mode and vim keybindings\"_\n\
          _\"My deploy server is 10.0.1.50\"_\n\

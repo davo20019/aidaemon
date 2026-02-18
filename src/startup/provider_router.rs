@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::config::{AppConfig, ProviderKind};
-use crate::router::{Router, Tier};
+use crate::router::Router;
 use crate::traits::ModelProvider;
 
 pub struct ProviderRouterBundle {
@@ -14,9 +14,10 @@ pub struct ProviderRouterBundle {
 pub fn build_provider_router(config: &AppConfig) -> anyhow::Result<ProviderRouterBundle> {
     let provider: Arc<dyn crate::traits::ModelProvider> = match config.provider.kind {
         ProviderKind::OpenaiCompatible => Arc::new(
-            crate::providers::OpenAiCompatibleProvider::new(
+            crate::providers::OpenAiCompatibleProvider::new_with_gateway_token(
                 &config.provider.base_url,
                 &config.provider.api_key,
+                config.provider.gateway_token.as_deref(),
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?,
         ),
@@ -29,11 +30,10 @@ pub fn build_provider_router(config: &AppConfig) -> anyhow::Result<ProviderRoute
     };
 
     let router = Router::new(config.provider.models.clone());
-    let primary_model = router.select(Tier::Primary).to_string();
+    let primary_model = router.default_model().to_string();
     info!(
-        primary = router.select(Tier::Primary),
-        fast = router.select(Tier::Fast),
-        smart = router.select(Tier::Smart),
+        default_model = router.default_model(),
+        fallbacks = ?router.fallback_models(),
         "Model router configured"
     );
 

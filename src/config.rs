@@ -173,6 +173,8 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub kind: ProviderKind,
     pub api_key: String,
+    #[serde(default)]
+    pub gateway_token: Option<String>,
     #[serde(default = "default_base_url")]
     pub base_url: String,
     #[serde(default)]
@@ -184,6 +186,7 @@ impl fmt::Debug for ProviderConfig {
         f.debug_struct("ProviderConfig")
             .field("kind", &self.kind)
             .field("api_key", &redact(&self.api_key))
+            .field("gateway_token", &redact_option(&self.gateway_token))
             .field("base_url", &self.base_url)
             .field("models", &self.models)
             .finish()
@@ -209,30 +212,86 @@ fn default_base_url() -> String {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ModelsConfig {
+    /// Canonical default model used for normal requests.
+    /// TOML key: `provider.models.default`
+    #[serde(default, rename = "default")]
+    pub default_model: String,
+    /// Ordered fallback models used only when calls fail.
+    /// TOML key: `provider.models.fallback = [\"...\"]`
+    #[serde(default, rename = "fallback")]
+    pub fallback_models: Vec<String>,
+    /// Legacy key kept for backward compatibility.
     #[serde(default)]
     pub primary: String,
+    /// Legacy key kept for backward compatibility.
     #[serde(default)]
     pub fast: String,
+    /// Legacy key kept for backward compatibility.
     #[serde(default)]
     pub smart: String,
 }
 
 impl ModelsConfig {
-    /// Fill in unset model tiers. `fast` and `smart` default to `primary`;
-    /// `primary` defaults to a sensible model for the provider kind.
+    /// Normalize legacy and new model keys into:
+    /// - `default_model`
+    /// - `fallback_models` (ordered, deduped, excluding default)
+    ///
+    /// Legacy fields (`primary`, `fast`, `smart`) remain populated for
+    /// compatibility with older code paths and existing config tooling.
     pub fn apply_defaults(&mut self, provider_kind: &ProviderKind) {
-        if self.primary.is_empty() {
-            self.primary = match provider_kind {
-                ProviderKind::GoogleGenai => "gemini-3-flash-preview".to_string(),
-                ProviderKind::Anthropic => "claude-sonnet-4-20250514".to_string(),
-                ProviderKind::OpenaiCompatible => "openai/gpt-4o".to_string(),
-            };
+        let provider_default = match provider_kind {
+            ProviderKind::GoogleGenai => "gemini-3-flash-preview".to_string(),
+            ProviderKind::Anthropic => "claude-sonnet-4-20250514".to_string(),
+            ProviderKind::OpenaiCompatible => "openai/gpt-4o".to_string(),
+        };
+
+        let default_model = if !self.default_model.trim().is_empty() {
+            self.default_model.trim().to_string()
+        } else if !self.primary.trim().is_empty() {
+            self.primary.trim().to_string()
+        } else {
+            provider_default
+        };
+
+        // If fallback[] was not explicitly provided, derive it from legacy tier keys.
+        if self.fallback_models.is_empty() {
+            for legacy in [&self.smart, &self.fast] {
+                let candidate = legacy.trim();
+                if candidate.is_empty() || candidate == default_model {
+                    continue;
+                }
+                if !self.fallback_models.iter().any(|m| m == candidate) {
+                    self.fallback_models.push(candidate.to_string());
+                }
+            }
+        } else {
+            // Sanitize explicit fallback[].
+            let mut deduped = Vec::new();
+            for raw in &self.fallback_models {
+                let candidate = raw.trim();
+                if candidate.is_empty() || candidate == default_model {
+                    continue;
+                }
+                if !deduped.iter().any(|m: &String| m == candidate) {
+                    deduped.push(candidate.to_string());
+                }
+            }
+            self.fallback_models = deduped;
         }
-        if self.fast.is_empty() {
-            self.fast = self.primary.clone();
+
+        self.default_model = default_model.clone();
+        self.primary = default_model.clone();
+
+        let first_fallback = self
+            .fallback_models
+            .first()
+            .cloned()
+            .unwrap_or_else(|| default_model.clone());
+        if self.fast.trim().is_empty() {
+            self.fast = first_fallback.clone();
         }
-        if self.smart.is_empty() {
-            self.smart = self.primary.clone();
+        if self.smart.trim().is_empty() {
+            self.smart = first_fallback;
         }
     }
 }
@@ -1771,6 +1830,9 @@ impl AppConfig {
         if self.provider.api_key == "keychain" {
             self.provider.api_key = resolve_from_keychain("api_key")?;
         }
+        if self.provider.gateway_token.as_deref() == Some("keychain") {
+            self.provider.gateway_token = Some(resolve_from_keychain("gateway_token")?);
+        }
 
         // Legacy telegram config
         if let Some(ref mut telegram) = self.telegram {
@@ -1937,6 +1999,74 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("AIDAEMON_MISS_X"));
         assert!(msg.contains("AIDAEMON_MISS_Y"));
+    }
+
+    #[test]
+    fn provider_gateway_token_defaults_to_none() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+
+[provider.models]
+primary = "gpt-4o"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        assert_eq!(cfg.provider.gateway_token, None);
+    }
+
+    #[test]
+    fn provider_gateway_token_parses_when_set() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+gateway_token = "cf-gw-token"
+
+[provider.models]
+primary = "gpt-4o"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        assert_eq!(cfg.provider.gateway_token.as_deref(), Some("cf-gw-token"));
+    }
+
+    #[test]
+    fn provider_models_support_default_and_fallback_keys() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+
+[provider.models]
+default = "kimi-k2.5"
+fallback = ["mistral-nemo", "gpt-4o-mini"]
+"#;
+        let mut cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        cfg.provider.models.apply_defaults(&cfg.provider.kind);
+        assert_eq!(cfg.provider.models.default_model, "kimi-k2.5");
+        assert_eq!(
+            cfg.provider.models.fallback_models,
+            vec!["mistral-nemo".to_string(), "gpt-4o-mini".to_string()]
+        );
+        // Legacy compatibility mirrors default/fallback.
+        assert_eq!(cfg.provider.models.primary, "kimi-k2.5");
+    }
+
+    #[test]
+    fn provider_models_legacy_keys_derive_default_and_fallback() {
+        let mut models = ModelsConfig {
+            default_model: String::new(),
+            fallback_models: Vec::new(),
+            primary: "primary-model".to_string(),
+            fast: "fast-model".to_string(),
+            smart: "smart-model".to_string(),
+        };
+        models.apply_defaults(&ProviderKind::OpenaiCompatible);
+        assert_eq!(models.default_model, "primary-model");
+        assert_eq!(
+            models.fallback_models,
+            vec!["smart-model".to_string(), "fast-model".to_string()]
+        );
     }
 
     #[test]

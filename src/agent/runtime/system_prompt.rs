@@ -124,6 +124,7 @@ pub(super) fn strip_markdown_section(prompt: &str, heading: &str) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(super) enum ConsultantPromptStyle {
     /// Full consultant instructions (best for stronger models).
     Full,
@@ -132,6 +133,7 @@ pub(super) enum ConsultantPromptStyle {
 }
 
 /// Build a consultant prompt that keeps memory/context but strips tool docs.
+#[allow(dead_code)]
 pub(super) fn build_consultant_system_prompt(
     system_prompt: &str,
     style: ConsultantPromptStyle,
@@ -150,7 +152,8 @@ Output EXACTLY ONE LINE (no extra text before/after):
 [INTENT_GATE] {"can_answer_now":false,"needs_tools":true,"needs_clarification":false,"clarifying_question":"","missing_info":[],"complexity":"simple","cancel_intent":false,"cancel_scope":"","is_acknowledgment":false,"schedule":"","schedule_type":"","schedule_cron":"","domains":[]}
 
 Guidelines:
-- complexity: "knowledge" = fully answerable now without tools; "simple" = needs tools but doable now; "complex" = multi-session project.
+- complexity: "knowledge" = fully answerable now without tools (greetings, jokes, translations, general knowledge, conversational chat); "simple" = needs tools but doable now; "complex" = multi-session project.
+- When complexity is "knowledge", ALWAYS set can_answer_now=true and needs_tools=false.
 - Only include schedule fields if the user explicitly asks for deferred/recurring execution.
 - domains is optional; if set, use: rust, python, javascript, go, docker, kubernetes, infrastructure, web-frontend, web-backend, databases, git, system-admin, general."#
         }
@@ -790,6 +793,22 @@ impl Agent {
             system_prompt
         );
 
+        // Model identity concealment rule — prevent underlying LLM from leaking its training origin
+        system_prompt = format!(
+            "{}\n\n[Model Identity — CRITICAL]\n\
+             You are aidaemon. You are NOT Gemini, GPT, Claude, LLaMA, or any other model.\n\
+             NEVER say:\n\
+             - \"I am a large language model\"\n\
+             - \"I was trained by Google/OpenAI/Anthropic/Meta\"\n\
+             - \"My training data...\"\n\
+             - \"I'm based on [model name]\"\n\
+             - \"As a Google/OpenAI product...\"\n\n\
+             If asked about your nature, respond: \"I'm aidaemon, your personal AI assistant.\"\n\
+             If asked what model you use: \"I use a mix of AI models under the hood, but I'm aidaemon.\"\n\
+             NEVER reveal or reference the underlying model provider or architecture.",
+            system_prompt
+        );
+
         // Credential protection rule — applies to ALL channels and visibility tiers
         system_prompt = format!(
             "{}\n\n[Credential Protection — ABSOLUTE RULE]\n\
@@ -861,6 +880,31 @@ impl Agent {
              For questions about recent conversation (for example: \"what did I just ask\", \"what were the last 3 things\", \"summarize our chat\"), use the conversation history already in context FIRST.\n\
              Do NOT jump to goal/task forensics tools for simple recall.\n\
              Use `goal_trace` / `tool_trace` only when the user explicitly asks for execution forensics (task timelines, tool failures, retries, or specific goal/task IDs).",
+            system_prompt
+        );
+
+        // Truthfulness and memory accuracy guardrails — prevent hallucinated actions,
+        // wrong fact recall, and blind acceptance of contradictory identity claims.
+        system_prompt = format!(
+            "{}\n\n[Truthfulness and Memory Accuracy]\n\
+             1. **Never claim actions were performed unless confirmed by a tool result.** \
+             If you did not execute a tool and receive a success result, do NOT tell the user you performed an action. \
+             Do not fabricate completed actions, settings changes, or operations that never happened. \
+             Only report actions that you actually executed and whose results you can see.\n\
+             2. **Cross-reference memory before answering fact questions.** \
+             When the user asks about stored preferences, personal details, or previously saved information \
+             (favorite color, name, location, etc.), retrieve the actual stored value using your memory/fact tools \
+             before answering. Do not guess, assume, or fill in from general knowledge. If no stored fact exists, say so.\n\
+             3. **Question contradictory identity claims.** \
+             If someone states information that directly contradicts an established fact in your records \
+             (e.g., a different name, identity, or key personal detail), do NOT silently accept and overwrite it. \
+             Acknowledge the discrepancy and ask for confirmation: \
+             \"I have you recorded as [X]. Would you like me to update this to [Y]?\" \
+             Only update after explicit confirmation.\n\
+             4. **Never mention tool names in responses.** \
+             Do not reference internal tool names like `remember_fact`, `terminal`, `web_search`, or any other tool \
+             by its programmatic name in your replies. Describe actions in natural language instead \
+             (e.g., \"I'll look that up\" not \"I'll use the web_search tool\").",
             system_prompt
         );
 

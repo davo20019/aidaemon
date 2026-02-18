@@ -168,33 +168,53 @@ impl Agent {
                     deferred_no_tool_streak = deferred_no_tool_streak.saturating_add(1);
                     stall_count = 0;
                     consecutive_clean_iterations = 0;
-                    pending_system_messages.push(
-                        "[SYSTEM] ROUTING CONTRACT ENFORCEMENT: This turn requires tool execution. \
+
+                    // Early acceptance: after enough retries, if the model's text is
+                    // substantive (not just "I'll do X"), accept it instead of looping
+                    // forever.  This prevents stalls on queries the intent gate
+                    // classified as needing tools but the model can answer directly
+                    // (e.g., "Tell me a joke in Spanish", "List your capabilities").
+                    if deferred_no_tool_streak >= DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
+                        && is_substantive_text_response(&reply, 15)
+                    {
+                        info!(
+                            session_id,
+                            iteration,
+                            deferred_no_tool_streak,
+                            reply_len = reply.len(),
+                            "Accepting substantive text-only response after repeated tool-required retries"
+                        );
+                        deferred_no_tool_streak = 0;
+                        // Fall through to normal completion path
+                    } else {
+                        pending_system_messages.push(
+                            "[SYSTEM] ROUTING CONTRACT ENFORCEMENT: This turn requires tool execution. \
 Ignore prior-turn outputs, run the required tool call(s) for the current user message, and then answer with concrete results."
-                            .to_string(),
-                    );
-                    self.emit_decision_point(
-                        emitter,
-                        task_id,
-                        iteration,
-                        DecisionType::IntentGate,
-                        "Intent gate contract enforced: blocked text-only answer while tools required"
-                            .to_string(),
-                        json!({
-                            "condition":"tools_required_no_tool_response",
-                            "reply_len": reply.len(),
-                            "deferred_no_tool_streak": deferred_no_tool_streak
-                        }),
-                    )
-                    .await;
-                    warn!(
-                        session_id,
-                        iteration,
-                        deferred_no_tool_streak,
-                        "Blocked no-tool completion because current turn requires tools"
-                    );
-                    commit_state!();
-                    return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
+                                .to_string(),
+                        );
+                        self.emit_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::IntentGate,
+                            "Intent gate contract enforced: blocked text-only answer while tools required"
+                                .to_string(),
+                            json!({
+                                "condition":"tools_required_no_tool_response",
+                                "reply_len": reply.len(),
+                                "deferred_no_tool_streak": deferred_no_tool_streak
+                            }),
+                        )
+                        .await;
+                        warn!(
+                            session_id,
+                            iteration,
+                            deferred_no_tool_streak,
+                            "Blocked no-tool completion because current turn requires tools"
+                        );
+                        commit_state!();
+                        return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
+                    }
                 }
             }
 
@@ -399,6 +419,23 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
                     );
                     reply = "I wasn't able to complete that request because no execution tools are available in this context. Please try again in a context with tool access."
                     .to_string();
+                } else if total_successful_tool_calls == 0
+                    && deferred_no_tool_streak >= DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
+                    && is_substantive_text_response(&reply, 50)
+                {
+                    // Early acceptance: the model keeps producing deferred-action text
+                    // but the underlying content is substantive (e.g., a greeting,
+                    // explanation, joke, or capability listing).  Queries that genuinely
+                    // don't need tools should not stall for 6 retries.
+                    info!(
+                        session_id,
+                        iteration,
+                        deferred_no_tool_streak,
+                        reply_len = reply.len(),
+                        "Accepting substantive text-only response after repeated deferred-no-tool retries"
+                    );
+                    deferred_no_tool_streak = 0;
+                    // Fall through to the normal completion path below
                 } else {
                     // Pre-execution deferrals ("I'll do X") should not consume the
                     // main stall budget. Reserve stall_count for post-tool loops so

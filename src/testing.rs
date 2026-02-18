@@ -295,6 +295,8 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
 
     // Models config (all tiers point to "mock-model")
     let models_config = ModelsConfig {
+        default_model: "mock-model".to_string(),
+        fallback_models: Vec::new(),
         primary: "mock-model".to_string(),
         fast: "mock-model".to_string(),
         smart: "mock-model".to_string(),
@@ -386,8 +388,10 @@ pub async fn setup_test_agent_with_models(
         )),
     ];
 
-    // Non-uniform: smart != primary → router is enabled, consultant pass activates
+    // Configure default + fallback so router is enabled in tests.
     let models_config = ModelsConfig {
+        default_model: primary_model.to_string(),
+        fallback_models: vec![smart_model.to_string()],
         primary: primary_model.to_string(),
         fast: smart_model.to_string(),
         smart: smart_model.to_string(),
@@ -467,8 +471,10 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         )),
     ];
 
-    // Non-uniform: smart != primary → router is enabled, consultant pass activates
+    // Configure default + fallback so router is enabled in tests.
     let models_config = ModelsConfig {
+        default_model: "primary-model".to_string(),
+        fallback_models: vec!["fast-model".to_string(), "smart-model".to_string()],
         primary: "primary-model".to_string(),
         fast: "fast-model".to_string(),
         smart: "smart-model".to_string(),
@@ -674,6 +680,8 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
 
     // Models config
     let models_config = ModelsConfig {
+        default_model: "mock-model".to_string(),
+        fallback_models: Vec::new(),
         primary: "mock-model".to_string(),
         fast: "mock-model".to_string(),
         smart: "mock-model".to_string(),
