@@ -290,7 +290,11 @@ impl Tool for WebFetchTool {
         let text = {
             let mut cursor = Cursor::new(html.as_bytes());
             match llm_readability::extractor::extract(&mut cursor, &parsed_url) {
-                Ok(product) if !product.text.trim().is_empty() => product.text,
+                Ok(product) if !product.text.trim().is_empty() => {
+                    // Readability extracts clean HTML (ads/nav stripped);
+                    // convert to markdown to preserve links, headings, code blocks, lists
+                    htmd::convert(&product.content).unwrap_or(product.text)
+                }
                 _ => {
                     // Fallback: convert raw HTML to markdown
                     htmd::convert(&html).unwrap_or_else(|_| html.clone())
