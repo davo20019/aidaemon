@@ -54,6 +54,7 @@ menu_section.tsx
 /*.md
 !README.md
 !CLAUDE.md
+!AGENTS.md
 !CHANGELOG.md
 
 # Documentation (local only)
