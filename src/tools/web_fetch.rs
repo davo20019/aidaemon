@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use htmd::HtmlToMarkdown;
 use reqwest::Client;
 use serde_json::{json, Value};
 
@@ -287,17 +288,23 @@ impl Tool for WebFetchTool {
         // Try readability extraction first
         let parsed_url = reqwest::Url::parse(url)
             .unwrap_or_else(|_| reqwest::Url::parse("http://example.com").unwrap());
+
+        // Skip images/media — the LLM can't render them, so they just waste tokens
+        let md = HtmlToMarkdown::builder()
+            .skip_tags(vec!["img", "picture", "video", "audio", "source", "svg"])
+            .build();
+
         let text = {
             let mut cursor = Cursor::new(html.as_bytes());
             match llm_readability::extractor::extract(&mut cursor, &parsed_url) {
                 Ok(product) if !product.text.trim().is_empty() => {
                     // Readability extracts clean HTML (ads/nav stripped);
                     // convert to markdown to preserve links, headings, code blocks, lists
-                    htmd::convert(&product.content).unwrap_or(product.text)
+                    md.convert(&product.content).unwrap_or(product.text)
                 }
                 _ => {
                     // Fallback: convert raw HTML to markdown
-                    htmd::convert(&html).unwrap_or_else(|_| html.clone())
+                    md.convert(&html).unwrap_or_else(|_| html.clone())
                 }
             }
         };
