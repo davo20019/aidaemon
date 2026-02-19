@@ -60,7 +60,7 @@ No `rustfmt.toml` — uses default Rust formatting conventions.
 main.rs → config loading → core.rs (subsystem init) → spawn channels + agent + background tasks
 ```
 
-The **agent loop** (`agent.rs`) is the heart: user message → build history → smart router selects model tier → LLM call → if tool calls, execute and loop → return response. It has stall detection (same tool 3+ times), repetition detection, and hard iteration limits.
+The **agent loop** (`agent/`) is the heart: user message → build history → router selects model → LLM call → if tool calls, execute and loop → return response. It has stall detection (same tool 3+ times), repetition detection, and hard iteration limits. The agent was decomposed in v0.9.0 into submodules: `agent/loop/` (phases), `agent/runtime/` (LLM calls, history, system prompt), `agent/consultant/` (multi-pass analysis), `agent/intent/` (intent classification), `agent/policy/` (guardrails).
 
 ### Key Abstractions (traits.rs)
 
@@ -129,15 +129,24 @@ contains_keyword_as_words("I'll check the report", "i'll check") // true ✓
 ### Module Map
 
 - **`core.rs`** — orchestrates startup: creates state store, event store, provider, router, tools, agent, channels, dashboard. Handles the deferred wiring for `SpawnAgentTool` (circular dep: Agent ↔ SpawnAgentTool resolved via weak reference + `set_agent()`).
-- **`agent.rs`** (~100KB) — agent loop, message handling, system prompt construction, tool execution with status updates. Largest file; most feature changes touch this.
+- **`agent/`** — modular agent system decomposed into submodules:
+  - `mod.rs` (~3000 lines) — agent struct, message handling, tool registration.
+  - `loop/` — phase-based agent loop: `main_loop.rs`, `llm_phase.rs`, `message_build_phase.rs`, `stopping_phase.rs`, `bootstrap/`, `tool_execution/` (budget, guards, result learning), `consultant_*` phases.
+  - `runtime/` — LLM calls (`llm.rs`), history management (`history.rs`), system prompt construction (`system_prompt.rs`), graceful shutdown (`graceful.rs`), model selection (`models.rs`), post-task processing (`post_task.rs`).
+  - `consultant/` — multi-pass analysis for complex queries.
+  - `intent/` — intent classification and gate logic.
+  - `policy/` — guardrails and safety signal detection.
 - **`channels/hub.rs`** — `ChannelHub` routes messages between session IDs and channels via `SessionMap: Arc<RwLock<HashMap<String, String>>>`.
-- **`state/sqlite.rs`** (~83KB) — multi-layer memory: messages, facts (with embeddings), episodes, goals, behavior patterns, procedures, error solutions, expertise, user profiles, token usage. Schema migrations are inline.
-- **`router.rs`** — classifies queries into Fast/Primary/Smart model tiers using keyword heuristics and message length.
+- **`state/sqlite/`** (~400KB across 20 files) — multi-layer memory: `mod.rs` (core CRUD), `facts.rs` (fact storage with semantic dedup + embeddings), `episodes.rs` (conversation summaries with channel scoping), `migrations.rs` (schema migrations), `messages.rs`, `goals.rs`, `people.rs`, `skills.rs`, `dynamic_bots.rs`, `dynamic_cli_agents.rs`, `learning.rs`, `token_usage.rs`, `tests.rs`, and more.
+- **`router.rs`** — routes queries to `default_model` or `fallback_models`. Legacy Fast/Primary/Smart tiers are auto-migrated to the default+fallback model chain on startup.
 - **`events/`** — event sourcing: all agent activity is immutable events. `consolidation.rs` processes events into facts/procedures daily. `context.rs` compiles session context from events.
-- **`memory/`** — background consolidation (embeddings every 5s, fact extraction every 6h, decay daily). Uses `fastembed` AllMiniLML6V2 for vector embeddings.
+- **`memory/`** — background consolidation (embeddings every 5s, fact extraction every 6h, decay daily). Uses `fastembed` AllMiniLML6V2 for vector embeddings. `manager.rs` handles episode creation for both idle and active long-running sessions. `comprehensive_tests.rs` has 17 test subsystems (A-M) covering canonical keys, supersession, privacy, retrieval, episodes, procedures, concurrency, and more.
 - **`plans/`** — persistent multi-step task plans with detection, generation, tracking, and crash recovery.
 - **`tools/terminal.rs`** — shell execution with risk assessment (`command_risk.rs`) and inline approval flow (Allow Once / Allow Always / Deny).
-- **`providers/`** — `openai_compatible.rs`, `google_genai.rs`, `anthropic_native.rs` — pluggable LLM backends.
+- **`tools/sanitize.rs`** — reply sanitization pipeline: strips model identity leaks, internal tool name references, and diagnostic/system blocks from user-facing output. Also provides `sanitize_external_content()` for input sanitization and `redact_secrets()`.
+- **`tools/config_manager.rs`** — runtime provider switching with presets (OpenAI, Anthropic, Google, Moonshot, MiniMax, etc.) and config management actions.
+- **`tools/memory.rs`** — `RememberFactTool` with batch fact storage (multiple facts in one call) and `ManageMemoriesTool` with fuzzy forget (canonical, case-insensitive, substring matching).
+- **`providers/`** — `openai_compatible.rs` (with optional Cloudflare AI Gateway support), `google_genai.rs`, `anthropic_native.rs` — pluggable LLM backends.
 - **`skills/mod.rs`** — advanced skill system with trigger-based matching, bundled resources, and dynamic management. Skills can come from filesystem (`.md` files), URLs, inline content, remote registries, or auto-promotion from successful procedures. `SharedSkillRegistry` (`Arc<RwLock<Vec<Skill>>>`) allows runtime add/remove. Each skill has metadata (name, description, triggers, source, source_url, enabled flag) and can bundle resource files (scripts, references, configs) in a directory structure. Matching is whole-word + case-insensitive with optional LLM confirmation via fast model.
 - **`skills/resources.rs`** — `ResourceEntry` and `ResourceResolver` trait (`FileSystemResolver` impl) for loading bundled skill files on demand with path traversal protection and 32KB size cap.
 - **`tools/use_skill.rs`** — `UseSkillTool` lets the agent activate skills on demand by name.
@@ -167,10 +176,11 @@ Keyring crate uses platform-native backends: `apple-native` (macOS), `sync-secre
 
 ### Testing
 
-Tests are spread across 40+ files as `#[cfg(test)]` modules, totaling 400+ tests. Key test areas:
+Tests are spread across 40+ files as `#[cfg(test)]` modules, totaling 1300+ tests. Key test areas:
 
-- **Unit tests:** router tier classification, memory/embedding math, plan detection, event context, command risk patterns, skill matching, scheduler parsing, SQLite state store CRUD, provider message conversion, terminal output formatting, channel hub routing, content sanitization, markdown formatting
-- **Integration tests:** 60+ tests exercising the full agent loop with mock LLM
+- **Unit tests:** router classification, memory/embedding math, plan detection, event context, command risk patterns, skill matching, scheduler parsing, SQLite state store CRUD, provider message conversion, terminal output formatting, channel hub routing, content sanitization, markdown formatting, semantic fact dedup, episode lifecycle
+- **Integration tests:** 13 test files (`part_00` through `part_11` + `scheduler_flaw`) exercising the full agent loop with mock LLM
+- **Comprehensive memory tests:** `memory/comprehensive_tests.rs` — 17 subsystems (A-M) covering canonical keys, supersession chains, privacy/channel scoping, retrieval, episodes, procedures, patterns, people, decay, cleanup, concurrency
 - **Property-based tests:** `proptest` for fuzz-testing command risk classification, string truncation, content sanitization, and markdown formatting
 - **Dev-dependencies:** `tempfile`, `proptest`, `insta` (with `yaml` feature)
 
