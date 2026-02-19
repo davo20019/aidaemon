@@ -1,4 +1,5 @@
 mod agent;
+mod biometric;
 mod channels;
 mod config;
 mod conversation;

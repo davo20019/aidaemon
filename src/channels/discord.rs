@@ -41,6 +41,8 @@ pub struct DiscordChannel {
     agent: Arc<Agent>,
     config_path: PathBuf,
     pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
+    /// Pending identity verification requests keyed by session_id.
+    pending_verifications: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
     session_map: SessionMap,
     task_registry: Arc<TaskRegistry>,
     files_enabled: bool,
@@ -83,6 +85,7 @@ impl DiscordChannel {
             agent,
             config_path,
             pending_approvals: Mutex::new(HashMap::new()),
+            pending_verifications: Mutex::new(HashMap::new()),
             session_map,
             task_registry,
             files_enabled,
@@ -545,14 +548,23 @@ impl DiscordChannel {
             return;
         };
 
+        let session_id = self.session_id_from_message(&msg);
+        let user_role = super::telegram::determine_role(&self.owner_user_ids, user_id);
+
+        // Identity verification interception
+        {
+            let mut pending = self.pending_verifications.lock().await;
+            if let Some(tx) = pending.remove(&session_id) {
+                let _ = tx.send(text.clone());
+                return;
+            }
+        }
+
         // Handle slash-style commands (text commands starting with /)
         if text.starts_with('/') {
             self.handle_text_command(ctx, &msg, &text).await;
             return;
         }
-
-        let session_id = self.session_id_from_message(&msg);
-        let user_role = super::telegram::determine_role(&self.owner_user_ids, user_id);
 
         // Register this session with the channel hub (in-memory + persistent)
         {
@@ -1467,6 +1479,46 @@ impl Channel for DiscordChannel {
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
                 Ok(ApprovalResponse::Deny)
+            }
+        }
+    }
+
+    async fn request_identity_verification(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<Option<String>> {
+        let channel_id = crate::session::discord_channel_id_from_session(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Invalid Discord session ID: {}", session_id))?;
+
+        let http_guard = self.http.lock().await;
+        let http = http_guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Discord HTTP client not initialized"))?;
+
+        let message = format!("🔐 **Identity Verification Required**\n\n{}", prompt);
+        let _ = serenity::model::id::ChannelId::new(channel_id)
+            .say(http, &message)
+            .await;
+
+        // Register pending verification
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self.pending_verifications.lock().await;
+            pending.insert(session_id.to_string(), tx);
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(answer)) => Ok(Some(answer)),
+            Ok(Err(_)) => Ok(None),
+            Err(_) => {
+                let mut pending = self.pending_verifications.lock().await;
+                pending.remove(session_id);
+                let _ = serenity::model::id::ChannelId::new(channel_id)
+                    .say(http, "⏰ Verification timed out.")
+                    .await;
+                Ok(None)
             }
         }
     }

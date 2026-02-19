@@ -166,6 +166,8 @@ pub struct AppConfig {
     pub policy: PolicyConfig,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+    #[serde(default)]
+    pub security: crate::biometric::SecurityConfig,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1916,6 +1918,19 @@ impl AppConfig {
                     };
                     bot.bot_token = resolve_from_keychain(&key)?;
                 }
+            }
+        }
+
+        // Security / biometric config
+        for (i, challenge) in self.security.challenges.iter_mut().enumerate() {
+            if challenge.answer_hash == "keychain" {
+                let key = format!("security_challenge_answer_{}", i);
+                challenge.answer_hash = resolve_from_keychain(&key)?;
+            }
+        }
+        if let Some(ref mut totp) = self.security.totp {
+            if totp.secret == "keychain" {
+                totp.secret = resolve_from_keychain("security_totp_secret")?;
             }
         }
 

@@ -78,6 +78,8 @@ pub struct TerminalTool {
     event_store: Option<Arc<EventStore>>,
     state: Option<Arc<dyn StateStore>>,
     hub: OnceLock<Weak<ChannelHub>>,
+    /// Biometric verifier for identity-gated approval (None = disabled).
+    biometric_verifier: Option<Arc<crate::biometric::BiometricVerifier>>,
 }
 
 /// Check if a command string contains shell operators.
@@ -309,6 +311,7 @@ impl TerminalTool {
             event_store: None,
             state: None,
             hub: OnceLock::new(),
+            biometric_verifier: None,
         }
     }
 
@@ -319,6 +322,14 @@ impl TerminalTool {
 
     pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
         self.state = Some(state);
+        self
+    }
+
+    pub fn with_biometric_verifier(
+        mut self,
+        verifier: Arc<crate::biometric::BiometricVerifier>,
+    ) -> Self {
+        self.biometric_verifier = Some(verifier);
         self
     }
 
@@ -370,6 +381,284 @@ impl TerminalTool {
                 prefix,
                 "Added to session-approved prefixes (will reset on restart)"
             );
+        }
+    }
+
+    /// Run biometric identity verification through the channel hub.
+    /// Returns Ok(true) if verified, Ok(false) if failed/denied/timed out.
+    async fn run_biometric_verification(
+        &self,
+        verifier: &Arc<crate::biometric::BiometricVerifier>,
+        session_id: &str,
+        command: &str,
+        trigger: &crate::biometric::BiometricTrigger,
+        task_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        use crate::biometric::{
+            BiometricVerificationRequestedData, VerificationMethod, VerificationResult,
+        };
+
+        // Skip if recently verified (within cooldown window)
+        if verifier.is_recently_verified(session_id).await {
+            info!(session_id, "Skipping biometric: recently verified");
+            return Ok(true);
+        }
+
+        // Check lockout
+        if let Some(remaining) = verifier.check_lockout(session_id).await {
+            warn!(
+                session_id,
+                remaining_secs = remaining,
+                "Biometric verification locked out"
+            );
+            return Ok(false);
+        }
+
+        let hub = self
+            .hub
+            .get()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| anyhow::anyhow!("Channel hub not available for verification"))?;
+
+        let methods = verifier.available_methods();
+        let verification_timeout = 120u64; // 2 minutes to respond
+
+        for attempt in 0..verifier.max_attempts() {
+            // Choose verification method: prefer TOTP if available, else challenge
+            if methods.contains(&VerificationMethod::Totp) {
+                // Emit event
+                if let Some(store) = &self.event_store {
+                    let emitter =
+                        crate::events::EventEmitter::new(store.clone(), session_id.to_string());
+                    let _ = emitter
+                        .emit(
+                            EventType::ApprovalRequested,
+                            BiometricVerificationRequestedData {
+                                method: "totp".to_string(),
+                                trigger: trigger.as_str().to_string(),
+                                context: command.to_string(),
+                                task_id: task_id.map(str::to_string),
+                            },
+                        )
+                        .await;
+                }
+
+                let prompt = format!(
+                    "This operation requires identity verification.\n\
+                     Command: `{}`\n\n\
+                     Please enter your TOTP code (from your authenticator app):",
+                    command
+                );
+
+                match hub
+                    .request_identity_verification(session_id, &prompt, verification_timeout)
+                    .await
+                {
+                    Ok(Some(code)) => {
+                        let result = verifier.validate_totp(session_id, code.trim()).await;
+                        match result {
+                            VerificationResult::Verified => {
+                                self.emit_biometric_success(session_id, "totp", trigger, task_id)
+                                    .await;
+                                return Ok(true);
+                            }
+                            VerificationResult::LockedOut { remaining_secs } => {
+                                self.emit_biometric_failure(
+                                    session_id,
+                                    "totp",
+                                    trigger,
+                                    "Locked out",
+                                    attempt + 1,
+                                    true,
+                                    task_id,
+                                )
+                                .await;
+                                let _ = hub
+                                    .send_text(
+                                        session_id,
+                                        &format!(
+                                            "🔒 Too many failed attempts. Locked for {} seconds.",
+                                            remaining_secs
+                                        ),
+                                    )
+                                    .await;
+                                return Ok(false);
+                            }
+                            VerificationResult::Failed { ref reason } => {
+                                self.emit_biometric_failure(
+                                    session_id,
+                                    "totp",
+                                    trigger,
+                                    reason,
+                                    attempt + 1,
+                                    false,
+                                    task_id,
+                                )
+                                .await;
+                                let _ = hub.send_text(session_id, &format!("❌ {}", reason)).await;
+                                continue;
+                            }
+                            _ => return Ok(false),
+                        }
+                    }
+                    Ok(None) => {
+                        // Timed out or cancelled
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Identity verification channel error");
+                        return Err(e);
+                    }
+                }
+            } else if methods.contains(&VerificationMethod::ChallengeResponse) {
+                let (idx, question) = verifier
+                    .random_challenge()
+                    .ok_or_else(|| anyhow::anyhow!("No challenge questions configured"))?;
+
+                // Emit event
+                if let Some(store) = &self.event_store {
+                    let emitter =
+                        crate::events::EventEmitter::new(store.clone(), session_id.to_string());
+                    let _ = emitter
+                        .emit(
+                            EventType::ApprovalRequested,
+                            BiometricVerificationRequestedData {
+                                method: "challenge_response".to_string(),
+                                trigger: trigger.as_str().to_string(),
+                                context: command.to_string(),
+                                task_id: task_id.map(str::to_string),
+                            },
+                        )
+                        .await;
+                }
+
+                let prompt = format!(
+                    "This operation requires identity verification.\n\
+                     Command: `{}`\n\n\
+                     Security question: {}",
+                    command, question
+                );
+
+                match hub
+                    .request_identity_verification(session_id, &prompt, verification_timeout)
+                    .await
+                {
+                    Ok(Some(answer)) => {
+                        let result = verifier.validate_challenge(session_id, idx, &answer).await;
+                        match result {
+                            VerificationResult::Verified => {
+                                self.emit_biometric_success(
+                                    session_id,
+                                    "challenge_response",
+                                    trigger,
+                                    task_id,
+                                )
+                                .await;
+                                return Ok(true);
+                            }
+                            VerificationResult::LockedOut { remaining_secs } => {
+                                self.emit_biometric_failure(
+                                    session_id,
+                                    "challenge_response",
+                                    trigger,
+                                    "Locked out",
+                                    attempt + 1,
+                                    true,
+                                    task_id,
+                                )
+                                .await;
+                                let _ = hub
+                                    .send_text(
+                                        session_id,
+                                        &format!(
+                                            "🔒 Too many failed attempts. Locked for {} seconds.",
+                                            remaining_secs
+                                        ),
+                                    )
+                                    .await;
+                                return Ok(false);
+                            }
+                            VerificationResult::Failed { ref reason } => {
+                                self.emit_biometric_failure(
+                                    session_id,
+                                    "challenge_response",
+                                    trigger,
+                                    reason,
+                                    attempt + 1,
+                                    false,
+                                    task_id,
+                                )
+                                .await;
+                                let _ = hub.send_text(session_id, &format!("❌ {}", reason)).await;
+                                continue;
+                            }
+                            _ => return Ok(false),
+                        }
+                    }
+                    Ok(None) => return Ok(false),
+                    Err(e) => {
+                        warn!(error = %e, "Identity verification channel error");
+                        return Err(e);
+                    }
+                }
+            } else {
+                // No methods available
+                return Ok(true);
+            }
+        }
+
+        // Exhausted all attempts
+        Ok(false)
+    }
+
+    async fn emit_biometric_success(
+        &self,
+        session_id: &str,
+        method: &str,
+        trigger: &crate::biometric::BiometricTrigger,
+        task_id: Option<&str>,
+    ) {
+        if let Some(store) = &self.event_store {
+            let emitter = crate::events::EventEmitter::new(store.clone(), session_id.to_string());
+            let _ = emitter
+                .emit(
+                    EventType::ApprovalGranted,
+                    crate::biometric::BiometricVerificationSucceededData {
+                        method: method.to_string(),
+                        trigger: trigger.as_str().to_string(),
+                        task_id: task_id.map(str::to_string),
+                    },
+                )
+                .await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_biometric_failure(
+        &self,
+        session_id: &str,
+        method: &str,
+        trigger: &crate::biometric::BiometricTrigger,
+        reason: &str,
+        attempt_number: u32,
+        locked_out: bool,
+        task_id: Option<&str>,
+    ) {
+        if let Some(store) = &self.event_store {
+            let emitter = crate::events::EventEmitter::new(store.clone(), session_id.to_string());
+            let _ = emitter
+                .emit(
+                    EventType::ApprovalDenied,
+                    crate::biometric::BiometricVerificationFailedData {
+                        method: method.to_string(),
+                        trigger: trigger.as_str().to_string(),
+                        reason: reason.to_string(),
+                        attempt_number,
+                        locked_out,
+                        task_id: task_id.map(str::to_string),
+                    },
+                )
+                .await;
         }
     }
 
@@ -1408,7 +1697,7 @@ impl Tool for TerminalTool {
                 };
 
                 if needs_approval {
-                    match self
+                    let approval_response = match self
                         .request_approval(
                             &args._session_id,
                             command,
@@ -1418,35 +1707,82 @@ impl Tool for TerminalTool {
                         )
                         .await
                     {
-                        Ok(ApprovalResponse::AllowOnce) => {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Ok(format!("Could not get approval: {}", e));
+                        }
+                    };
+
+                    // Biometric verification gate: after the user approves,
+                    // check if the operation requires identity verification.
+                    if !matches!(approval_response, ApprovalResponse::Deny) {
+                        if let Some(ref verifier) = self.biometric_verifier {
+                            let trigger = if assessment.level == RiskLevel::Critical {
+                                Some(crate::biometric::BiometricTrigger::CriticalCommands)
+                            } else if matches!(approval_response, ApprovalResponse::AllowAlways) {
+                                Some(crate::biometric::BiometricTrigger::AllowAlways)
+                            } else {
+                                None
+                            };
+
+                            if let Some(trigger) = trigger {
+                                if verifier.requires_verification(&trigger) {
+                                    match self
+                                        .run_biometric_verification(
+                                            verifier,
+                                            &args._session_id,
+                                            command,
+                                            &trigger,
+                                            args._task_id.as_deref(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => { /* Verified, continue */ }
+                                        Ok(false) => {
+                                            return Ok(
+                                                "Command denied: identity verification failed."
+                                                    .to_string(),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            return Ok(format!(
+                                                "Identity verification error: {}",
+                                                e
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    match approval_response {
+                        ApprovalResponse::AllowOnce => {
                             // Just run this once, but still learn from it
                             if let Some(ref pool) = self.pool {
                                 let _ = record_approval(pool, command).await;
                             }
                         }
-                        Ok(ApprovalResponse::AllowSession) => {
+                        ApprovalResponse::AllowSession => {
                             // Save to session-only storage (cleared on restart)
                             self.add_session_prefix(command).await;
                             if let Some(ref pool) = self.pool {
                                 let _ = record_approval(pool, command).await;
                             }
                         }
-                        Ok(ApprovalResponse::AllowAlways) => {
+                        ApprovalResponse::AllowAlways => {
                             // Save to permanent storage (DB)
                             self.add_prefix(command).await;
                             if let Some(ref pool) = self.pool {
                                 let _ = record_approval(pool, command).await;
                             }
                         }
-                        Ok(ApprovalResponse::Deny) => {
+                        ApprovalResponse::Deny => {
                             // Record denial for learning
                             if let Some(ref pool) = self.pool {
                                 let _ = record_denial(pool, command).await;
                             }
                             return Ok("Command denied by user.".to_string());
-                        }
-                        Err(e) => {
-                            return Ok(format!("Could not get approval: {}", e));
                         }
                     }
                 }

@@ -607,19 +607,29 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::Terminal => {
-            let terminal = Arc::new(
-                TerminalTool::new(
-                    config.terminal.allowed_prefixes.clone(),
-                    approval_tx,
-                    config.terminal.initial_timeout_secs,
-                    config.terminal.max_output_chars,
-                    config.terminal.permission_mode,
-                    state.pool(),
-                )
-                .await
-                .with_event_store(event_store)
-                .with_state(state as Arc<dyn crate::traits::StateStore>),
-            );
+            let mut tool = TerminalTool::new(
+                config.terminal.allowed_prefixes.clone(),
+                approval_tx,
+                config.terminal.initial_timeout_secs,
+                config.terminal.max_output_chars,
+                config.terminal.permission_mode,
+                state.pool(),
+            )
+            .await
+            .with_event_store(event_store)
+            .with_state(state.clone() as Arc<dyn crate::traits::StateStore>);
+
+            // Wire up biometric verifier if security config is enabled
+            let verifier = crate::biometric::BiometricVerifier::new(config.security.clone());
+            if verifier.is_enabled() {
+                tracing::info!(
+                    methods = ?verifier.available_methods(),
+                    "Biometric verification enabled for terminal approvals"
+                );
+                tool = tool.with_biometric_verifier(std::sync::Arc::new(verifier));
+            }
+
+            let terminal = Arc::new(tool);
             BuiltBaseTool {
                 tool: terminal.clone(),
                 terminal_tool: Some(terminal),

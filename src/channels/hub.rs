@@ -85,6 +85,25 @@ impl ChannelHub {
         None
     }
 
+    /// Request identity verification through the channel that owns a session.
+    ///
+    /// Used by the biometric verification flow to send a challenge prompt and
+    /// receive the user's text response.
+    pub async fn request_identity_verification(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<Option<String>> {
+        let channel = self
+            .channel_for_session(session_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No channel found for session {}", session_id))?;
+        channel
+            .request_identity_verification(session_id, prompt, timeout_secs)
+            .await
+    }
+
     /// Request approval through a channel that supports inline buttons.
     ///
     /// Used for UX flows that require button consistency (for example scheduled

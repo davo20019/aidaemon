@@ -40,6 +40,8 @@ pub struct SlackChannel {
     agent: Arc<Agent>,
     config_path: PathBuf,
     pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
+    /// Pending identity verification requests keyed by session_id.
+    pending_verifications: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
     session_map: SessionMap,
     task_registry: Arc<TaskRegistry>,
     files_enabled: bool,
@@ -90,6 +92,7 @@ impl SlackChannel {
             agent,
             config_path,
             pending_approvals: Mutex::new(HashMap::new()),
+            pending_verifications: Mutex::new(HashMap::new()),
             session_map,
             task_registry,
             files_enabled,
@@ -857,6 +860,15 @@ impl SlackChannel {
         };
 
         let session_id = self.build_session_id(&channel_id, reply_thread.as_deref());
+
+        // Identity verification interception
+        {
+            let mut pending = self.pending_verifications.lock().await;
+            if let Some(tx) = pending.remove(&session_id) {
+                let _ = tx.send(agent_text.to_string());
+                return;
+            }
+        }
 
         // Handle cancel/stop commands - these bypass the queue
         let text_lower = agent_text.to_lowercase();
@@ -2396,6 +2408,45 @@ impl Channel for SlackChannel {
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
                 Ok(ApprovalResponse::Deny)
+            }
+        }
+    }
+
+    async fn request_identity_verification(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<Option<String>> {
+        // Parse channel_id and optional thread_ts from session_id
+        let (channel_id, thread_ts) = crate::session::slack_channel_from_session(session_id);
+
+        let message = format!("🔐 *Identity Verification Required*\n\n{}", prompt);
+        let _ = self
+            .post_message(&channel_id, &message, thread_ts.as_deref())
+            .await;
+
+        // Register pending verification
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self.pending_verifications.lock().await;
+            pending.insert(session_id.to_string(), tx);
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(answer)) => Ok(Some(answer)),
+            Ok(Err(_)) => Ok(None),
+            Err(_) => {
+                let mut pending = self.pending_verifications.lock().await;
+                pending.remove(session_id);
+                let _ = self
+                    .post_message(
+                        &channel_id,
+                        "⏰ Verification timed out.",
+                        thread_ts.as_deref(),
+                    )
+                    .await;
+                Ok(None)
             }
         }
     }

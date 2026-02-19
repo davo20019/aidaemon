@@ -49,6 +49,10 @@ pub struct TelegramChannel {
     config_path: PathBuf,
     /// Pending approvals keyed by a unique callback ID.
     pending_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>,
+    /// Pending identity verification requests keyed by session_id.
+    /// When set, the next text message from that session is routed to the
+    /// verification handler instead of the normal agent loop.
+    pending_verifications: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
     /// Shared session map — maps session_id to channel name.
     session_map: SessionMap,
     /// Task registry for tracking background agent work.
@@ -97,6 +101,7 @@ impl TelegramChannel {
             agent,
             config_path,
             pending_approvals: Mutex::new(HashMap::new()),
+            pending_verifications: Mutex::new(HashMap::new()),
             session_map,
             task_registry,
             files_enabled,
@@ -1395,14 +1400,25 @@ impl TelegramChannel {
             return;
         };
 
+        // Use chat ID as session ID, prefixed with bot name if multi-bot
+        let session_id = self.session_id(msg.chat.id.0).await;
+
+        // Identity verification interception: if there's a pending verification
+        // for this session, route the text reply to the verification handler
+        // instead of the normal agent loop.
+        {
+            let mut pending = self.pending_verifications.lock().await;
+            if let Some(tx) = pending.remove(&session_id) {
+                let _ = tx.send(text.clone());
+                return;
+            }
+        }
+
         // Handle slash commands
         if text.starts_with('/') {
             self.handle_command(&text, &msg, &bot).await;
             return;
         }
-
-        // Use chat ID as session ID, prefixed with bot name if multi-bot
-        let session_id = self.session_id(msg.chat.id.0).await;
 
         // Register this session with the channel hub so outbound messages
         // (approvals, media, notifications) route back to this Telegram bot.
@@ -2271,6 +2287,53 @@ impl Channel for TelegramChannel {
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
                 Ok(ApprovalResponse::Deny)
+            }
+        }
+    }
+
+    async fn request_identity_verification(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<Option<String>> {
+        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
+            .unwrap_or_else(|| {
+                self.allowed_user_ids
+                    .read()
+                    .unwrap()
+                    .first()
+                    .copied()
+                    .unwrap_or(0) as i64
+            });
+
+        // Send the verification prompt (plain text to avoid markdown escaping issues)
+        let message = format!("🔐 Identity Verification Required\n\n{}", prompt);
+        let _ = self.bot.send_message(ChatId(chat_id), &message).await;
+
+        // Register pending verification for this session
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self.pending_verifications.lock().await;
+            pending.insert(session_id.to_string(), tx);
+        }
+
+        // Wait for response with configurable timeout
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(answer)) => Ok(Some(answer)),
+            Ok(Err(_)) => {
+                // Channel closed
+                Ok(None)
+            }
+            Err(_) => {
+                // Timed out — remove pending verification
+                let mut pending = self.pending_verifications.lock().await;
+                pending.remove(session_id);
+                let _ = self
+                    .bot
+                    .send_message(ChatId(chat_id), "⏰ Verification timed out.")
+                    .await;
+                Ok(None)
             }
         }
     }

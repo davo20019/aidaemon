@@ -53,4 +53,25 @@ pub trait Channel: Send + Sync {
         warnings: &[String],
         permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse>;
+
+    /// Request identity verification from the user (biometric second factor).
+    ///
+    /// Sends a verification prompt (challenge question or TOTP request) and
+    /// waits for the user's text response. Returns the user's answer text,
+    /// or `None` if the user cancelled or timed out.
+    ///
+    /// Default implementation returns an error — channels must opt in to
+    /// identity verification by overriding this method.
+    async fn request_identity_verification(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        _timeout_secs: u64,
+    ) -> anyhow::Result<Option<String>> {
+        let _ = (session_id, prompt);
+        anyhow::bail!(
+            "Channel {} does not support identity verification",
+            self.name()
+        )
+    }
 }

@@ -127,6 +127,49 @@ pub fn is_group_session(session_id: &str) -> bool {
     false
 }
 
+/// Extract a Discord channel/DM ID from a session ID.
+///
+/// Supports:
+/// - "discord:ch:12345" or "discord:dm:12345"
+/// - "{bot}:discord:ch:12345"
+#[cfg(feature = "discord")]
+pub fn discord_channel_id_from_session(session_id: &str) -> Option<u64> {
+    if let Some((marker, rest)) = find_platform_substring(session_id) {
+        if marker != "discord:" {
+            return None;
+        }
+        // rest looks like "discord:ch:12345" or "discord:dm:12345"
+        let stripped = rest.strip_prefix("discord:")?;
+        // stripped is "ch:12345" or "dm:12345"
+        let id_str = stripped
+            .strip_prefix("ch:")
+            .or_else(|| stripped.strip_prefix("dm:"))?;
+        return id_str.trim().parse::<u64>().ok();
+    }
+    None
+}
+
+/// Extract Slack channel ID and optional thread_ts from a session ID.
+///
+/// Supports:
+/// - "slack:C12345"
+/// - "slack:C12345:1234567890.123456"
+/// - "{bot}:slack:C12345:ts"
+#[cfg(feature = "slack")]
+pub fn slack_channel_from_session(session_id: &str) -> (String, Option<String>) {
+    if let Some((marker, rest)) = find_platform_substring(session_id) {
+        if marker == "slack:" {
+            let stripped = rest.strip_prefix("slack:").unwrap_or(rest);
+            let parts: Vec<&str> = stripped.splitn(2, ':').collect();
+            let channel_id = parts[0].to_string();
+            let thread_ts = parts.get(1).map(|s| s.to_string());
+            return (channel_id, thread_ts);
+        }
+    }
+    // Fallback: return the whole session_id as channel, no thread
+    (session_id.to_string(), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
