@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-02-18
+
+### Added
+
+- **Semantic fact dedup**: `upsert_fact()` detects synonym keys (e.g., `editor` vs `preferred_editor`) via embedding similarity (0.85 threshold) with token-overlap guards to prevent false merges.
+- **Mid-session episode creation**: Long-running sessions (20+ events since last episode) get episodes captured before context rotates out, preventing permanent context loss.
+- **Multiple episodes per session**: Removed unique constraint on `session_id` in episodes table to support incremental episode capture.
+- **Batch fact storage**: `remember_fact` tool accepts a `facts` array for storing multiple facts in one call.
+- **Fuzzy forget matching**: Forget action uses canonical, case-insensitive, and substring matching with cross-category fallback.
+- **Reply sanitization pipeline**: Strips model identity leaks, internal tool name references, and diagnostic/system blocks from user-facing replies.
+- **Default + fallback model routing**: New `default_model` + `fallback_models` config replaces the old fast/primary/smart tier system (legacy keys still work).
+- **Deterministic pre-routing**: Schedule/cancel/goal fast-paths handled before first LLM call, removing the consultant classification pass.
+- **Cloudflare AI Gateway support**: Optional `gateway_token` for OpenAI-compatible providers with automatic gateway detection.
+- **Moonshot and MiniMax provider presets**: New OpenAI-compatible provider presets.
+- **Comprehensive memory tests**: New test suite covering fact dedup, episode lifecycle, and memory retrieval edge cases.
+- **Scheduler flaw tests**: New integration tests for scheduler edge cases.
+
+### Changed
+
+- **Episode retrieval threshold**: Lowered from 0.5 to 0.3, matching the fact retrieval threshold for better recall.
+- **Agent proactivity default**: `asks_before_acting` defaults to `false` for new user profiles — agent only confirms destructive actions.
+- **Telegram message splitting**: Long replies split at 4096-char boundary instead of truncating.
+- **Tools available from iteration 1**: All LLM calls have tools available, removing the tool-free consultant pass.
+
+### Fixed
+
+- **Stale fact duplicates (BUG-8)**: Semantically identical facts with different keys no longer accumulate as duplicates.
+- **Episode recall on context rotation (BUG-9)**: Long sessions no longer lose conversational context when the 20-message window rotates.
+- **Path normalization**: `validate_path()` now normalizes `.` components correctly.
+- **Provider JSON error messages**: Anthropic and Google providers wrap parse errors with proper `ProviderError` context.
+
 ## [0.9.3] - 2026-02-17
 
 ### Added
