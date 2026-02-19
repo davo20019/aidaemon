@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use htmd::HtmlToMarkdown;
+use htmd::{Element, HtmlToMarkdown};
 use reqwest::Client;
 use serde_json::{json, Value};
 
@@ -289,9 +289,16 @@ impl Tool for WebFetchTool {
         let parsed_url = reqwest::Url::parse(url)
             .unwrap_or_else(|_| reqwest::Url::parse("http://example.com").unwrap());
 
-        // Skip images/media — the LLM can't render them, so they just waste tokens
+        // Strip media URLs the LLM can't see, but keep alt text for context
         let md = HtmlToMarkdown::builder()
-            .skip_tags(vec!["img", "picture", "video", "audio", "source", "svg"])
+            .skip_tags(vec!["picture", "video", "audio", "source", "svg"])
+            .add_handler(vec!["img"], |element: Element| {
+                let alt = element
+                    .attr("alt")
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty());
+                alt.map(|a| format!("[Image: {}]", a))
+            })
             .build();
 
         let text = {
