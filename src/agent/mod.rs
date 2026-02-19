@@ -167,9 +167,9 @@ mod tool_execution_phase;
 #[path = "loop/tool_prelude_phase.rs"]
 mod tool_prelude_phase;
 
-use system_prompt::{build_tool_loop_system_prompt, format_goal_context, ToolLoopPromptStyle};
 #[cfg(test)]
 use system_prompt::{build_consultant_system_prompt, ConsultantPromptStyle};
+use system_prompt::{build_tool_loop_system_prompt, format_goal_context, ToolLoopPromptStyle};
 
 #[cfg(test)]
 use system_prompt::strip_markdown_section;
@@ -2748,13 +2748,11 @@ impl Agent {
             .replace("[prior turn, truncated]", "")
             .replace("[prior turn]", "");
         // First pass: strip entire diagnostic/control blocks (tag + content).
-        let blocks_cleaned =
-            crate::tools::sanitize::strip_diagnostic_blocks(&prior_turn_cleaned);
+        let blocks_cleaned = crate::tools::sanitize::strip_diagnostic_blocks(&prior_turn_cleaned);
         // Second pass: catch any remaining bare marker tags the block pass missed.
         let control_cleaned =
             crate::tools::sanitize::strip_internal_control_markers(&blocks_cleaned);
-        let identity_cleaned =
-            crate::tools::sanitize::strip_model_identity_leaks(&control_cleaned);
+        let identity_cleaned = crate::tools::sanitize::strip_model_identity_leaks(&control_cleaned);
         crate::tools::sanitize::strip_tool_name_references(&identity_cleaned)
     }
 
@@ -2860,7 +2858,10 @@ mod final_reply_marker_tests {
         let sanitized = Agent::sanitize_final_reply_markers(reply);
         assert!(!sanitized.contains("[SYSTEM]"));
         assert!(!sanitized.contains("[DIAGNOSTIC]"));
-        assert!(!sanitized.contains("internal note"), "SYSTEM content leaked: {sanitized}");
+        assert!(
+            !sanitized.contains("internal note"),
+            "SYSTEM content leaked: {sanitized}"
+        );
         assert!(!sanitized.contains("UNTRUSTED EXTERNAL DATA"));
         assert!(sanitized.contains("Done."));
     }
@@ -2876,16 +2877,34 @@ mod final_reply_marker_tests {
             [SYSTEM] This tool has errored 2 semantic times. Do NOT retry it.\n\n\
             I will try a different approach.";
         let sanitized = Agent::sanitize_final_reply_markers(reply);
-        assert!(!sanitized.contains("[DIAGNOSTIC]"), "DIAGNOSTIC tag leaked: {sanitized}");
+        assert!(
+            !sanitized.contains("[DIAGNOSTIC]"),
+            "DIAGNOSTIC tag leaked: {sanitized}"
+        );
         assert!(
             !sanitized.contains("Similar errors resolved before"),
             "diagnostic content leaked: {sanitized}"
         );
-        assert!(!sanitized.contains("Used terminal"), "solution leaked: {sanitized}");
-        assert!(!sanitized.contains("[TOOL STATS]"), "TOOL STATS tag leaked: {sanitized}");
-        assert!(!sanitized.contains("8 calls"), "stats content leaked: {sanitized}");
-        assert!(!sanitized.contains("296ms"), "stats duration leaked: {sanitized}");
-        assert!(!sanitized.contains("[SYSTEM]"), "SYSTEM tag leaked: {sanitized}");
+        assert!(
+            !sanitized.contains("Used terminal"),
+            "solution leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("[TOOL STATS]"),
+            "TOOL STATS tag leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("8 calls"),
+            "stats content leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("296ms"),
+            "stats duration leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("[SYSTEM]"),
+            "SYSTEM tag leaked: {sanitized}"
+        );
         assert!(
             !sanitized.contains("errored 2 semantic times"),
             "system content leaked: {sanitized}"

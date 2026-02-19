@@ -482,12 +482,12 @@ impl ConfigManagerTool {
             args.smart_model.trim().to_string()
         };
 
-        let gateway_token = if preset.supports_gateway_token && !args.gateway_token.trim().is_empty()
-        {
-            Some(args.gateway_token.trim().to_string())
-        } else {
-            None
-        };
+        let gateway_token =
+            if preset.supports_gateway_token && !args.gateway_token.trim().is_empty() {
+                Some(args.gateway_token.trim().to_string())
+            } else {
+                None
+            };
 
         let approval_description = format!(
             "Switch provider to {} (kind={}, base_url={}, models={}/{}/{})",

@@ -320,7 +320,10 @@ impl ModelProvider for AnthropicNativeProvider {
             ProviderError {
                 kind: ProviderErrorKind::ServerError,
                 status: Some(200),
-                message: format!("Malformed response from LLM provider (JSON parse error: {})", e),
+                message: format!(
+                    "Malformed response from LLM provider (JSON parse error: {})",
+                    e
+                ),
                 retry_after_secs: None,
             }
         })?;

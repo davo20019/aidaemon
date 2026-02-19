@@ -236,7 +236,10 @@ pub(super) fn graceful_timeout_response(
 }
 
 /// Graceful response when task token budget is exhausted.
-pub(super) fn graceful_budget_response(learning_ctx: &LearningContext, _tokens_used: u64) -> String {
+pub(super) fn graceful_budget_response(
+    learning_ctx: &LearningContext,
+    _tokens_used: u64,
+) -> String {
     let activity = categorize_tool_calls(&learning_ctx.tool_calls);
     let mut summary = format!(
         "I've reached my processing limit for this task. \
@@ -264,9 +267,7 @@ pub(super) fn graceful_goal_daily_budget_response(
 ) -> String {
     let tool_count = learning_ctx.tool_calls.len();
     let error_count = learning_ctx.errors.len();
-    let mut msg = String::from(
-        "I've reached my processing limit for this task today. ",
-    );
+    let mut msg = String::from("I've reached my processing limit for this task today. ");
     if tool_count > 0 || error_count > 0 {
         msg.push_str(&format!(
             "Here's what I accomplished: {} steps completed",
@@ -277,9 +278,7 @@ pub(super) fn graceful_goal_daily_budget_response(
         }
         msg.push_str(".\n\n");
     }
-    msg.push_str(
-        "You can ask me to continue this later, or I'll pick it up when my limit resets.",
-    );
+    msg.push_str("You can ask me to continue this later, or I'll pick it up when my limit resets.");
     msg
 }
 
@@ -329,9 +328,8 @@ pub(super) fn graceful_partial_stall_response(
         msg.push_str(suggestion);
         msg
     } else {
-        let mut msg = String::from(
-            "I made some progress but wasn't able to fully complete the task.\n\n",
-        );
+        let mut msg =
+            String::from("I made some progress but wasn't able to fully complete the task.\n\n");
         if !activity.is_empty() {
             msg.push_str(&activity);
             msg.push('\n');
@@ -347,9 +345,7 @@ pub(super) fn graceful_repetitive_response(
     _tool_name: &str,
 ) -> String {
     let activity = categorize_tool_calls(&learning_ctx.tool_calls);
-    let mut msg = String::from(
-        "I seem to be stuck on this task.\n\n",
-    );
+    let mut msg = String::from("I seem to be stuck on this task.\n\n");
     if !activity.is_empty() {
         msg.push_str("Here's what I've done so far:\n");
         msg.push_str(&activity);

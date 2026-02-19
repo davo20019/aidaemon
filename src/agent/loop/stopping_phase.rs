@@ -1034,8 +1034,7 @@ impl Agent {
                         .latest_non_system_tool_output_excerpt(session_id, 2500)
                         .await
                     {
-                        let activity =
-                            post_task::categorize_tool_calls(&learning_ctx.tool_calls);
+                        let activity = post_task::categorize_tool_calls(&learning_ctx.tool_calls);
                         let mut reply = String::from(
                             "I completed the requested work but the loop stalled before \
                              composing a final summary. Here's what was done:\n\n",

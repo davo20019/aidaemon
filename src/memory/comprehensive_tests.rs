@@ -48,7 +48,14 @@ async fn test_canonical_key_prevents_duplicates() {
 
     // Insert with "Dog Name"
     store
-        .upsert_fact("user", "Dog Name", "Bella", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "Dog Name",
+            "Bella",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
 
@@ -61,7 +68,11 @@ async fn test_canonical_key_prevents_duplicates() {
     // Only one active fact should exist
     let facts = store.get_facts(Some("user")).await.unwrap();
     let active: Vec<_> = facts.iter().filter(|f| f.superseded_at.is_none()).collect();
-    assert_eq!(active.len(), 1, "Should have exactly one active fact after canonical key match");
+    assert_eq!(
+        active.len(),
+        1,
+        "Should have exactly one active fact after canonical key match"
+    );
     assert_eq!(active[0].value, "Max", "Latest value should be Max");
 }
 
@@ -85,7 +96,11 @@ async fn test_canonical_key_case_insensitive_variants() {
 
     let facts = store.get_facts(Some("user")).await.unwrap();
     let active: Vec<_> = facts.iter().filter(|f| f.superseded_at.is_none()).collect();
-    assert_eq!(active.len(), 1, "All key variants should resolve to same canonical key");
+    assert_eq!(
+        active.len(),
+        1,
+        "All key variants should resolve to same canonical key"
+    );
     assert_eq!(active[0].value, "V3");
 }
 
@@ -97,44 +112,91 @@ async fn test_canonical_key_punctuation_normalization() {
 
     // "my-dog's-name" canonicalizes to "my_dog_s_name" (apostrophe = separator)
     store
-        .upsert_fact("user", "my-dog's-name", "Bella", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "my-dog's-name",
+            "Bella",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
     // "my dogs name" canonicalizes to "my_dogs_name" (different from above)
     store
-        .upsert_fact("user", "my dogs name", "Max", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "my dogs name",
+            "Max",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
 
     // These are DIFFERENT canonical keys, so both should be active
     let facts = store.get_facts(Some("user")).await.unwrap();
     let active: Vec<_> = facts.iter().filter(|f| f.superseded_at.is_none()).collect();
-    assert_eq!(active.len(), 2, "Different canonical keys should create separate facts");
+    assert_eq!(
+        active.len(),
+        2,
+        "Different canonical keys should create separate facts"
+    );
 
     // But keys that differ only in separator type should match:
     // "my-dogs-name" → "my_dogs_name" same as "my dogs name" → "my_dogs_name"
     store
-        .upsert_fact("user", "my-dogs-name", "Cooper", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "my-dogs-name",
+            "Cooper",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
 
     let facts = store.get_facts(Some("user")).await.unwrap();
     let active: Vec<_> = facts.iter().filter(|f| f.superseded_at.is_none()).collect();
-    assert_eq!(active.len(), 2, "my-dogs-name should supersede my dogs name (same canonical key)");
+    assert_eq!(
+        active.len(),
+        2,
+        "my-dogs-name should supersede my dogs name (same canonical key)"
+    );
     // The "my dogs name" fact should now have value "Cooper" (superseded by "my-dogs-name")
     let dogs_fact = active.iter().find(|f| {
         // Replicate canonical key logic: lowercase, non-alphanumeric → '_', collapse underscores
-        let canon: String = f.key.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+        let canon: String = f
+            .key
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
         let canon = canon.trim_matches('_').to_string();
         // Collapse consecutive underscores
         let mut prev = false;
-        let canon: String = canon.chars().filter(|&c| {
-            if c == '_' { if prev { return false; } prev = true; } else { prev = false; }
-            true
-        }).collect();
+        let canon: String = canon
+            .chars()
+            .filter(|&c| {
+                if c == '_' {
+                    if prev {
+                        return false;
+                    }
+                    prev = true;
+                } else {
+                    prev = false;
+                }
+                true
+            })
+            .collect();
         canon == "my_dogs_name"
     });
-    assert!(dogs_fact.is_some(), "Should have a fact with canonical key my_dogs_name");
+    assert!(
+        dogs_fact.is_some(),
+        "Should have a fact with canonical key my_dogs_name"
+    );
     assert_eq!(dogs_fact.unwrap().value, "Cooper");
 }
 
@@ -162,7 +224,14 @@ async fn test_fact_long_value() {
     let long_value = "x".repeat(10_000);
 
     store
-        .upsert_fact("user", "long_val", &long_value, "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "long_val",
+            &long_value,
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
 
@@ -183,7 +252,11 @@ async fn test_fact_special_characters() {
         ("emoji_mood", "😀=great, 😐=okay, 😢=bad", "Emoji"),
         ("newlines", "line1\nline2\nline3", "Newlines"),
         ("quotes", r#"She said "hello" and it's fine"#, "Quotes"),
-        ("sql_injection", "'; DROP TABLE facts; --", "SQL injection attempt"),
+        (
+            "sql_injection",
+            "'; DROP TABLE facts; --",
+            "SQL injection attempt",
+        ),
     ];
 
     for (key, value, _label) in &test_cases {
@@ -194,7 +267,11 @@ async fn test_fact_special_characters() {
     }
 
     let facts = store.get_facts(Some("test")).await.unwrap();
-    assert_eq!(facts.len(), test_cases.len(), "All special char facts should be stored");
+    assert_eq!(
+        facts.len(),
+        test_cases.len(),
+        "All special char facts should be stored"
+    );
 
     for (key, value, label) in &test_cases {
         let found = facts.iter().find(|f| f.key == *key);
@@ -275,12 +352,18 @@ async fn test_supersession_chain() {
     // get_facts returns only active (non-superseded) facts
     let active_facts = store.get_facts(Some("user")).await.unwrap();
     assert_eq!(active_facts.len(), 1, "Only one fact should be active");
-    assert_eq!(active_facts[0].value, "hamster", "Latest value should be active");
+    assert_eq!(
+        active_facts[0].value, "hamster",
+        "Latest value should be active"
+    );
 
     // get_fact_history returns ALL versions including superseded
     let history = store.get_fact_history("user", "pet").await.unwrap();
     assert_eq!(history.len(), 3, "Should have 3 total versions in history");
-    let superseded: Vec<_> = history.iter().filter(|f| f.superseded_at.is_some()).collect();
+    let superseded: Vec<_> = history
+        .iter()
+        .filter(|f| f.superseded_at.is_some())
+        .collect();
     assert_eq!(superseded.len(), 2, "Two facts should be superseded");
 }
 
@@ -290,16 +373,34 @@ async fn test_upsert_same_value_no_supersession() {
     let (store, _db) = setup_test_store().await;
 
     store
-        .upsert_fact("user", "stable", "unchanged", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "stable",
+            "unchanged",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
     store
-        .upsert_fact("user", "stable", "unchanged", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "stable",
+            "unchanged",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
 
     let facts = store.get_facts(Some("user")).await.unwrap();
-    assert_eq!(facts.len(), 1, "Same value upsert should not create supersession history");
+    assert_eq!(
+        facts.len(),
+        1,
+        "Same value upsert should not create supersession history"
+    );
     assert!(facts[0].superseded_at.is_none());
 }
 
@@ -340,7 +441,11 @@ async fn test_active_fact_count() {
 
     let facts = store.get_facts(Some("user")).await.unwrap();
     let active: Vec<_> = facts.iter().filter(|f| f.superseded_at.is_none()).collect();
-    assert_eq!(active.len(), 10, "Should still have 10 active facts (superseded ones replaced)");
+    assert_eq!(
+        active.len(),
+        10,
+        "Should still have 10 active facts (superseded ones replaced)"
+    );
 }
 
 // ==================== D. Fact Privacy & Channel Scoping ====================
@@ -380,10 +485,7 @@ async fn test_channel_scoped_fact_isolation_deep() {
     // Note: upsert_fact doesn't check channel_id for matching — it matches by category+key.
     // So the second upsert will supersede the first regardless of channel.
     // This is a design assumption test.
-    assert!(
-        active.len() >= 1,
-        "At least one active fact should exist"
-    );
+    assert!(active.len() >= 1, "At least one active fact should exist");
 }
 
 /// Verify Global facts are accessible from any context.
@@ -463,7 +565,10 @@ async fn test_private_fact_dm_only() {
     let has_ssn_public = public_facts.iter().any(|f| f.key == "ssn");
 
     assert!(has_ssn_dm, "Private fact should be accessible in OwnerDm");
-    assert!(!has_ssn_public, "Private fact should NOT be accessible in PublicExternal");
+    assert!(
+        !has_ssn_public,
+        "Private fact should NOT be accessible in PublicExternal"
+    );
 }
 
 /// Verify null channel_id legacy facts are accessible (backward compat).
@@ -473,13 +578,23 @@ async fn test_null_channel_legacy_facts() {
 
     // Insert with no channel_id (legacy)
     store
-        .upsert_fact("user", "legacy_pref", "vim", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "legacy_pref",
+            "vim",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
 
     let facts = store.get_facts(Some("user")).await.unwrap();
     assert_eq!(facts.len(), 1);
-    assert!(facts[0].channel_id.is_none(), "Legacy fact should have null channel_id");
+    assert!(
+        facts[0].channel_id.is_none(),
+        "Legacy fact should have null channel_id"
+    );
 }
 
 // ==================== E. Fact Retrieval & Search Edge Cases ====================
@@ -550,7 +665,11 @@ async fn test_search_top_k_limiting() {
     }
 
     let facts = store.get_relevant_facts("preference", 5).await.unwrap();
-    assert!(facts.len() <= 5, "Should return at most 5 results, got {}", facts.len());
+    assert!(
+        facts.len() <= 5,
+        "Should return at most 5 results, got {}",
+        facts.len()
+    );
 }
 
 /// Verify very long search query doesn't timeout or OOM.
@@ -648,7 +767,10 @@ async fn test_episode_embedding_and_search() {
     assert_eq!(backfilled, 2, "Should backfill 2 episodes");
 
     // Search for rust-related content
-    let results = store.get_relevant_episodes("Rust web development", 5).await.unwrap();
+    let results = store
+        .get_relevant_episodes("Rust web development", 5)
+        .await
+        .unwrap();
     assert!(!results.is_empty(), "Should find episodes for Rust query");
     // First result should be the Rust episode (higher similarity)
     if results.len() >= 2 {
@@ -689,7 +811,10 @@ async fn test_episode_duplicate_prevention() {
         ..ep.clone()
     };
     let id2 = store.insert_episode(&ep2).await.unwrap();
-    assert_ne!(id1, id2, "Different sessions should get different episode IDs");
+    assert_ne!(
+        id1, id2,
+        "Different sessions should get different episode IDs"
+    );
 }
 
 // ==================== G. Procedures & Error Solutions ====================
@@ -699,13 +824,25 @@ async fn test_episode_duplicate_prevention() {
 async fn test_procedure_keyed_name_uniqueness() {
     use crate::memory::procedures::generate_procedure_keyed_name;
 
-    let name1 = generate_procedure_keyed_name("deploy", &["step1".to_string(), "step2".to_string()]);
-    let name2 = generate_procedure_keyed_name("deploy", &["step3".to_string(), "step4".to_string()]);
-    let name3 = generate_procedure_keyed_name("deploy", &["step1".to_string(), "step2".to_string()]);
+    let name1 =
+        generate_procedure_keyed_name("deploy", &["step1".to_string(), "step2".to_string()]);
+    let name2 =
+        generate_procedure_keyed_name("deploy", &["step3".to_string(), "step4".to_string()]);
+    let name3 =
+        generate_procedure_keyed_name("deploy", &["step1".to_string(), "step2".to_string()]);
 
-    assert_ne!(name1, name2, "Different steps should produce different keyed names");
-    assert_eq!(name1, name3, "Same steps should produce same keyed name (deterministic)");
-    assert!(name1.starts_with("deploy-"), "Keyed name should start with base name");
+    assert_ne!(
+        name1, name2,
+        "Different steps should produce different keyed names"
+    );
+    assert_eq!(
+        name1, name3,
+        "Same steps should produce same keyed name (deterministic)"
+    );
+    assert!(
+        name1.starts_with("deploy-"),
+        "Keyed name should start with base name"
+    );
 }
 
 /// Verify procedure creation with outcome tracking.
@@ -748,7 +885,10 @@ async fn test_procedure_outcome_tracking() {
         .await
         .unwrap();
     let p = procs.iter().find(|p| p.name == "test-proc-abc123").unwrap();
-    assert_eq!(p.success_count, 3, "Should have 3 successes (1 initial + 2)");
+    assert_eq!(
+        p.success_count, 3,
+        "Should have 3 successes (1 initial + 2)"
+    );
     assert_eq!(p.failure_count, 1, "Should have 1 failure");
 }
 
@@ -847,7 +987,10 @@ async fn test_behavior_pattern_confidence_update() {
         "Confidence should be 0.5 + 0.3 = 0.8, got {}",
         p.confidence
     );
-    assert_eq!(p.occurrence_count, 6, "Occurrence count should be incremented");
+    assert_eq!(
+        p.occurrence_count, 6,
+        "Occurrence count should be incremented"
+    );
 }
 
 // ==================== I. People Intelligence CRUD ====================
@@ -910,7 +1053,10 @@ async fn test_person_find_by_name_case_insensitive() {
     assert_eq!(found.unwrap().name, "Bob Smith");
 
     let found_upper = store.find_person_by_name("BOB SMITH").await.unwrap();
-    assert!(found_upper.is_some(), "Should find person by uppercase name");
+    assert!(
+        found_upper.is_some(),
+        "Should find person by uppercase name"
+    );
 }
 
 /// Verify person fact CRUD operations.
@@ -950,7 +1096,10 @@ async fn test_person_fact_crud() {
     assert_eq!(facts.len(), 2, "Should have 2 person facts");
 
     // Retrieve filtered by category
-    let work_facts = store.get_person_facts(person_id, Some("work")).await.unwrap();
+    let work_facts = store
+        .get_person_facts(person_id, Some("work"))
+        .await
+        .unwrap();
     assert_eq!(work_facts.len(), 1);
     assert_eq!(work_facts[0].value, "Google");
 
@@ -998,12 +1147,18 @@ async fn test_person_platform_id_linking() {
         .get_person_by_platform_id("telegram:12345")
         .await
         .unwrap();
-    assert!(found_tg.is_some(), "Should find person by telegram platform ID");
+    assert!(
+        found_tg.is_some(),
+        "Should find person by telegram platform ID"
+    );
     assert_eq!(found_tg.unwrap().name, "Alice");
 
     // Look up by slack platform ID
     let found_slack = store.get_person_by_platform_id("slack:U789").await.unwrap();
-    assert!(found_slack.is_some(), "Should find person by slack platform ID");
+    assert!(
+        found_slack.is_some(),
+        "Should find person by slack platform ID"
+    );
 }
 
 /// Verify interaction tracking increments correctly.
@@ -1080,7 +1235,10 @@ async fn test_person_deletion_cascades() {
 
     // Person facts should also be gone
     let facts_after = store.get_person_facts(person_id, None).await.unwrap();
-    assert!(facts_after.is_empty(), "Person facts should be cascaded on delete");
+    assert!(
+        facts_after.is_empty(),
+        "Person facts should be cascaded on delete"
+    );
 }
 
 /// Verify person fact confirmation sets confidence to 1.0.
@@ -1111,7 +1269,10 @@ async fn test_person_fact_confirmation() {
 
     let facts = store.get_person_facts(person_id, None).await.unwrap();
     let fact_id = facts[0].id;
-    assert!((facts[0].confidence - 0.7).abs() < 0.01, "Initial confidence should be 0.7");
+    assert!(
+        (facts[0].confidence - 0.7).abs() < 0.01,
+        "Initial confidence should be 0.7"
+    );
 
     // Confirm the fact
     store.confirm_person_fact(fact_id).await.unwrap();
@@ -1182,7 +1343,14 @@ async fn test_decay_no_negative_recall() {
     let (store, _db) = setup_test_store().await;
 
     store
-        .upsert_fact("user", "zero_recall", "val", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "zero_recall",
+            "val",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
 
@@ -1199,7 +1367,10 @@ async fn test_decay_no_negative_recall() {
     .unwrap();
 
     let facts = store.get_facts(Some("user")).await.unwrap();
-    assert_eq!(facts[0].recall_count, 0, "Recall count should not go negative");
+    assert_eq!(
+        facts[0].recall_count, 0,
+        "Recall count should not go negative"
+    );
 }
 
 /// Verify behavior pattern confidence decay.
@@ -1254,11 +1425,25 @@ async fn test_retention_superseded_facts_cleanup() {
 
     // Insert and supersede a fact
     store
-        .upsert_fact("user", "old_key", "old_val", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "old_key",
+            "old_val",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
     store
-        .upsert_fact("user", "old_key", "new_val", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "old_key",
+            "new_val",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
 
@@ -1294,7 +1479,14 @@ async fn test_retention_preserves_active_facts() {
     let (store, _db) = setup_test_store().await;
 
     store
-        .upsert_fact("user", "keep_me", "important", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "keep_me",
+            "important",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
 
@@ -1314,7 +1506,11 @@ async fn test_retention_preserves_active_facts() {
 
     // Active fact should NOT be deleted
     let facts = store.get_facts(Some("user")).await.unwrap();
-    assert_eq!(facts.len(), 1, "Active fact should be preserved even if old");
+    assert_eq!(
+        facts.len(),
+        1,
+        "Active fact should be preserved even if old"
+    );
     assert_eq!(facts[0].value, "important");
 }
 
@@ -1516,13 +1712,21 @@ async fn test_concurrent_fact_upserts() {
     // All should succeed (no DB errors)
     for handle in handles {
         let result = handle.await.unwrap();
-        assert!(result.is_ok(), "Concurrent upsert should not error: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Concurrent upsert should not error: {:?}",
+            result.err()
+        );
     }
 
     // Exactly one active fact should remain
     let facts = store.get_facts(Some("concurrent")).await.unwrap();
     let active: Vec<_> = facts.iter().filter(|f| f.superseded_at.is_none()).collect();
-    assert_eq!(active.len(), 1, "Exactly one active fact should remain after concurrent upserts");
+    assert_eq!(
+        active.len(),
+        1,
+        "Exactly one active fact should remain after concurrent upserts"
+    );
 }
 
 /// Verify SQL injection attempt is safely handled via parameterized queries.
@@ -1563,7 +1767,10 @@ async fn test_sql_injection_safe() {
 
     // Table should still work
     let facts = store.get_facts(Some("user")).await.unwrap();
-    assert!(facts.len() >= 2, "Should have both facts, table survived injection attempt");
+    assert!(
+        facts.len() >= 2,
+        "Should have both facts, table survived injection attempt"
+    );
 }
 
 /// Verify database migration creates all tables on fresh DB.
@@ -1578,10 +1785,7 @@ async fn test_fresh_db_migration() {
     let episodes = store.get_recent_episodes(10).await.unwrap();
     assert!(episodes.is_empty(), "Fresh DB should have no episodes");
 
-    let procs = store
-        .get_relevant_procedures("anything", 10)
-        .await
-        .unwrap();
+    let procs = store.get_relevant_procedures("anything", 10).await.unwrap();
     assert!(procs.is_empty(), "Fresh DB should have no procedures");
 
     let patterns = store.get_behavior_patterns(0.0).await.unwrap();
@@ -1672,9 +1876,18 @@ async fn test_fact_history_retrieval() {
 
     // Most recent first (ORDER BY created_at DESC)
     assert_eq!(history[0].value, "purple", "Most recent should be first");
-    assert!(history[0].superseded_at.is_none(), "Latest should not be superseded");
-    assert!(history[1].superseded_at.is_some(), "Middle should be superseded");
-    assert!(history[2].superseded_at.is_some(), "Oldest should be superseded");
+    assert!(
+        history[0].superseded_at.is_none(),
+        "Latest should not be superseded"
+    );
+    assert!(
+        history[1].superseded_at.is_some(),
+        "Middle should be superseded"
+    );
+    assert!(
+        history[2].superseded_at.is_some(),
+        "Oldest should be superseded"
+    );
 }
 
 /// Verify get_facts returns only active (non-superseded) facts.
@@ -1704,7 +1917,11 @@ async fn test_get_facts_only_active() {
             f.value
         );
     }
-    assert_eq!(facts.len(), 2, "Should have 2 active facts (city=LA, country=USA)");
+    assert_eq!(
+        facts.len(),
+        2,
+        "Should have 2 active facts (city=LA, country=USA)"
+    );
 }
 
 /// Verify retention on empty database doesn't crash.
@@ -1767,27 +1984,29 @@ async fn test_error_solution_multiple_domains() {
         .get_relevant_error_solutions("borrow of moved value", 10)
         .await
         .unwrap();
-    assert!(
-        !rust_results.is_empty(),
-        "Should find rust error solution"
-    );
+    assert!(!rust_results.is_empty(), "Should find rust error solution");
 }
 
 /// Verify procedure extraction from messages.
 #[tokio::test]
 async fn test_procedure_extraction_helpers() {
     use crate::memory::procedures::{
-        extract_error_pattern, extract_trigger_pattern, generate_procedure_name,
-        generalize_procedure,
+        extract_error_pattern, extract_trigger_pattern, generalize_procedure,
+        generate_procedure_name,
     };
 
     // Test procedure name generation
-    assert_eq!(generate_procedure_name("Build the Rust project"), "rust-build");
+    assert_eq!(
+        generate_procedure_name("Build the Rust project"),
+        "rust-build"
+    );
     assert_eq!(generate_procedure_name("Run the test suite"), "run-tests");
     assert_eq!(generate_procedure_name("Deploy to production"), "deploy");
 
     // Test trigger pattern extraction
-    let trigger = extract_trigger_pattern("Build and deploy the Rust application. This is a long description that goes on and on.");
+    let trigger = extract_trigger_pattern(
+        "Build and deploy the Rust application. This is a long description that goes on and on.",
+    );
     assert!(trigger.len() <= 100, "Trigger should be at most 100 chars");
 
     // Test path generalization
@@ -1814,14 +2033,8 @@ async fn test_procedure_extraction_helpers() {
     let pattern = extract_error_pattern(
         "error[E0382]: borrow of moved value: `x` at /Users/dave/src/main.rs:42:10",
     );
-    assert!(
-        pattern.contains("E0382"),
-        "Should preserve error code"
-    );
-    assert!(
-        !pattern.contains("/Users/dave"),
-        "Should generalize path"
-    );
+    assert!(pattern.contains("E0382"), "Should preserve error code");
+    assert!(!pattern.contains("/Users/dave"), "Should generalize path");
 }
 
 /// Verify stale person fact pruning works.
@@ -1848,7 +2061,14 @@ async fn test_stale_person_fact_pruning() {
 
     // Add a low-confidence fact
     store
-        .upsert_person_fact(person_id, "hobby", "gardening", "auto_observed", "consolidation", 0.5)
+        .upsert_person_fact(
+            person_id,
+            "hobby",
+            "gardening",
+            "auto_observed",
+            "consolidation",
+            0.5,
+        )
         .await
         .unwrap();
 
@@ -1943,7 +2163,14 @@ async fn test_fact_soft_delete() {
     let (store, _db) = setup_test_store().await;
 
     store
-        .upsert_fact("user", "to_delete", "value", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "user",
+            "to_delete",
+            "value",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
 
@@ -1954,7 +2181,10 @@ async fn test_fact_soft_delete() {
     store.delete_fact(fact_id).await.unwrap();
 
     let facts_after = store.get_facts(Some("user")).await.unwrap();
-    assert!(facts_after.is_empty(), "Deleted fact should not appear in active facts");
+    assert!(
+        facts_after.is_empty(),
+        "Deleted fact should not appear in active facts"
+    );
 }
 
 /// Verify fact privacy update.
@@ -1963,7 +2193,14 @@ async fn test_fact_privacy_update() {
     let (store, _db) = setup_test_store().await;
 
     store
-        .upsert_fact("user", "email", "test@example.com", "test", None, FactPrivacy::Channel)
+        .upsert_fact(
+            "user",
+            "email",
+            "test@example.com",
+            "test",
+            None,
+            FactPrivacy::Channel,
+        )
         .await
         .unwrap();
 
@@ -1978,7 +2215,11 @@ async fn test_fact_privacy_update() {
         .unwrap();
 
     let facts = store.get_facts(Some("user")).await.unwrap();
-    assert_eq!(facts[0].privacy, FactPrivacy::Global, "Privacy should be updated to Global");
+    assert_eq!(
+        facts[0].privacy,
+        FactPrivacy::Global,
+        "Privacy should be updated to Global"
+    );
 }
 
 /// Verify multiple facts across different categories.
@@ -1991,11 +2232,25 @@ async fn test_facts_across_categories() {
         .await
         .unwrap();
     store
-        .upsert_fact("preference", "editor", "vim", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "preference",
+            "editor",
+            "vim",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
     store
-        .upsert_fact("technical", "language", "Rust", "test", None, FactPrivacy::Global)
+        .upsert_fact(
+            "technical",
+            "language",
+            "Rust",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
         .await
         .unwrap();
 
@@ -2010,7 +2265,11 @@ async fn test_facts_across_categories() {
 
     // Get all facts
     let all_facts = store.get_facts(None).await.unwrap();
-    assert_eq!(all_facts.len(), 3, "Should have 3 facts across all categories");
+    assert_eq!(
+        all_facts.len(),
+        3,
+        "Should have 3 facts across all categories"
+    );
 }
 
 /// Verify skill promotion: a procedure with sufficient successes/rate would be promotable.
@@ -2055,10 +2314,7 @@ async fn test_procedure_promotion_eligibility_criteria() {
     assert!(proc2_id > 0);
 
     // Both should be stored and retrievable
-    let procs = store
-        .get_relevant_procedures("deploy", 10)
-        .await
-        .unwrap();
+    let procs = store.get_relevant_procedures("deploy", 10).await.unwrap();
     assert!(
         procs.iter().any(|p| p.name == "promotable-proc"),
         "Promotable procedure should be stored"
@@ -2090,6 +2346,10 @@ async fn test_should_extract_facts_filtering() {
     assert!(!should_extract_facts("short")); // <20 chars
 
     // Meaningful messages should pass
-    assert!(should_extract_facts("My dog's name is Bella and she's a golden retriever"));
-    assert!(should_extract_facts("I work at Acme Corp in the engineering department"));
+    assert!(should_extract_facts(
+        "My dog's name is Bella and she's a golden retriever"
+    ));
+    assert!(should_extract_facts(
+        "I work at Acme Corp in the engineering department"
+    ));
 }

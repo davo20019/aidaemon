@@ -548,10 +548,9 @@ async fn replay_trace_deferred_planning_text_does_not_stall_before_first_tool_ca
 
     let call_log = harness.provider.call_log.lock().await.clone();
     assert!(
-        !call_log.iter().any(|entry| matches!(
-            entry.options.response_mode,
-            ResponseMode::JsonSchema { .. }
-        )),
+        !call_log
+            .iter()
+            .any(|entry| matches!(entry.options.response_mode, ResponseMode::JsonSchema { .. })),
         "text-only consultant schema pass should be disabled"
     );
 
@@ -649,10 +648,7 @@ async fn provider_option_rejection_falls_back_to_default_chat() {
     assert_eq!(reply, "Got it.");
 
     let call_log = harness.provider.call_log.lock().await.clone();
-    assert!(
-        !call_log.is_empty(),
-        "expected at least one provider call"
-    );
+    assert!(!call_log.is_empty(), "expected at least one provider call");
     assert!(
         call_log
             .iter()

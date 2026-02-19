@@ -3164,7 +3164,11 @@ async fn test_multiple_episodes_per_session_allowed() {
         .iter()
         .filter(|e| e.session_id == "multi-ep-sess")
         .collect();
-    assert_eq!(session_eps.len(), 2, "Both episodes should exist for same session");
+    assert_eq!(
+        session_eps.len(),
+        2,
+        "Both episodes should exist for same session"
+    );
 }
 
 #[tokio::test]
@@ -3175,7 +3179,8 @@ async fn test_episode_retrieval_at_lower_threshold() {
     let ep = Episode {
         id: 0,
         session_id: "threshold-test".to_string(),
-        summary: "We discussed using Kubernetes for container orchestration in production".to_string(),
+        summary: "We discussed using Kubernetes for container orchestration in production"
+            .to_string(),
         topics: Some(vec!["kubernetes".to_string(), "devops".to_string()]),
         emotional_tone: Some("technical".to_string()),
         outcome: Some("decided on k8s".to_string()),

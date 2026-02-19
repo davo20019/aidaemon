@@ -36,7 +36,7 @@ fn is_exhaustive_query(query: &str) -> bool {
 /// Focuses on category + readable key (no value) so that dedup detects
 /// keys referring to the same concept regardless of their values.
 fn build_dedup_key_text(category: &str, key: &str) -> String {
-    let readable_key = key.replace('_', " ").replace('-', " ");
+    let readable_key = key.replace(['_', '-'], " ");
     format!(
         "The user's {} {}. {} attribute: {}",
         category, readable_key, category, readable_key
@@ -52,7 +52,7 @@ fn build_dedup_key_text(category: &str, key: &str) -> String {
 /// like "What tech stack does my project use?".
 pub(crate) fn build_fact_embedding_text(category: &str, key: &str, value: &str) -> String {
     // Convert underscore/hyphen keys to readable form
-    let readable_key = key.replace('_', " ").replace('-', " ");
+    let readable_key = key.replace(['_', '-'], " ");
 
     // Build a natural-language sentence
     format!(
@@ -287,10 +287,8 @@ impl crate::traits::FactStore for SqliteStateStore {
                 .fetch_all(&self.pool)
                 .await?;
 
-                let new_tokens: std::collections::HashSet<&str> = canonical_key
-                    .split('_')
-                    .filter(|t| !t.is_empty())
-                    .collect();
+                let new_tokens: std::collections::HashSet<&str> =
+                    canonical_key.split('_').filter(|t| !t.is_empty()).collect();
 
                 let mut best_match: Option<(i64, String, String, f32)> = None;
                 for row in &category_facts {
@@ -310,11 +308,10 @@ impl crate::traits::FactStore for SqliteStateStore {
                     // - Keys that are just reordered (same tokens, same count):
                     //   "company_previous" vs "previous_company" — all shared, proceed.
                     // - Keys with zero overlap: completely different concepts.
-                    let existing_tokens: std::collections::HashSet<&str> =
-                        existing_canonical
-                            .split('_')
-                            .filter(|t| !t.is_empty())
-                            .collect();
+                    let existing_tokens: std::collections::HashSet<&str> = existing_canonical
+                        .split('_')
+                        .filter(|t| !t.is_empty())
+                        .collect();
                     let shared = new_tokens.intersection(&existing_tokens).count();
                     let new_count = new_tokens.len();
                     let existing_count = existing_tokens.len();
@@ -350,18 +347,12 @@ impl crate::traits::FactStore for SqliteStateStore {
                         continue;
                     }
 
-                    let existing_key_text =
-                        build_dedup_key_text(category_clean, &existing_key);
-                    if let Ok(existing_vec) =
-                        self.embedding_service.embed(existing_key_text).await
+                    let existing_key_text = build_dedup_key_text(category_clean, &existing_key);
+                    if let Ok(existing_vec) = self.embedding_service.embed(existing_key_text).await
                     {
-                        let sim = crate::memory::math::cosine_similarity(
-                            &new_vec,
-                            &existing_vec,
-                        );
+                        let sim = crate::memory::math::cosine_similarity(&new_vec, &existing_vec);
                         if sim > 0.85 {
-                            let score =
-                                best_match.as_ref().map(|m| m.3).unwrap_or(0.0);
+                            let score = best_match.as_ref().map(|m| m.3).unwrap_or(0.0);
                             if sim > score {
                                 best_match = Some((
                                     row.get("id"),

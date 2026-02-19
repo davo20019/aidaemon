@@ -345,8 +345,15 @@ impl Agent {
                 // categories directly instead of get_facts(None) which returns all.
                 let mut identity_facts = Vec::new();
                 for cat in &[
-                    "identity", "personal", "profile", "user", "assistant", "bot",
-                    "relationship", "preference", "family",
+                    "identity",
+                    "personal",
+                    "profile",
+                    "user",
+                    "assistant",
+                    "bot",
+                    "relationship",
+                    "preference",
+                    "family",
                 ] {
                     if let Ok(mut facts) = self.state.get_facts(Some(cat)).await {
                         identity_facts.append(&mut facts);

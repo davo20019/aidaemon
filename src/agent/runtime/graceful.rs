@@ -314,7 +314,9 @@ impl Agent {
         user_text: &str,
         error_summary: &str,
     ) -> Option<anyhow::Result<String>> {
-        let answer = self.try_knowledge_fallback(user_text, error_summary).await?;
+        let answer = self
+            .try_knowledge_fallback(user_text, error_summary)
+            .await?;
         Some(
             self.append_graceful_assistant_summary(emitter, session_id, answer)
                 .await,

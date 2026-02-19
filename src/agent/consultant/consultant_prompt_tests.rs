@@ -401,7 +401,10 @@ fn test_is_substantive_text_response_rejects_pure_deferrals() {
     ));
 
     // Short deferral
-    assert!(!is_substantive_text_response("Let me check that for you.", 50));
+    assert!(!is_substantive_text_response(
+        "Let me check that for you.",
+        50
+    ));
 }
 
 #[test]

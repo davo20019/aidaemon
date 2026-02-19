@@ -71,7 +71,10 @@ static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         // [SYSTEM] ... single line (no continuation)
         Regex::new(r"(?m)\[SYSTEM\][^\n]*").unwrap(),
         // [UNTRUSTED EXTERNAL DATA ...] block through [END UNTRUSTED ...]
-        Regex::new(r"(?si)\[UNTRUSTED EXTERNAL DATA[^\]]*\].*?\[END UNTRUSTED EXTERNAL DATA\][^\n]*").unwrap(),
+        Regex::new(
+            r"(?si)\[UNTRUSTED EXTERNAL DATA[^\]]*\].*?\[END UNTRUSTED EXTERNAL DATA\][^\n]*",
+        )
+        .unwrap(),
         // Standalone [UNTRUSTED EXTERNAL DATA ...] without closing tag
         Regex::new(r"(?m)\[UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
         Regex::new(r"(?m)\[END UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
@@ -365,12 +368,10 @@ pub fn strip_tool_name_references(content: &str) -> String {
     //  - double/triple "that" from overlapping patterns
     //  - "a that" / "an that" / "the that" → "that"
     //  - leftover double spaces
-    static DOUBLE_THAT: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"\bthat\s+that\b").unwrap());
+    static DOUBLE_THAT: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bthat\s+that\b").unwrap());
     static ARTICLE_THAT: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"\b(?:a|an|the)\s+that\b").unwrap());
-    static MULTI_SPACE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"  +").unwrap());
+    static MULTI_SPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"  +").unwrap());
 
     // Collapse repeated "that that" → "that" (may need two passes)
     for _ in 0..2 {
@@ -544,8 +545,14 @@ mod tests {
     fn test_strip_backtick_tool_name_with_context() {
         let input = "I couldn't find a `send_resume` tool. I can try to find your resume files using `search_files` if you can tell me where they might be located.";
         let result = strip_tool_name_references(input);
-        assert!(!result.contains("send_resume"), "send_resume leaked: {result}");
-        assert!(!result.contains("search_files"), "search_files leaked: {result}");
+        assert!(
+            !result.contains("send_resume"),
+            "send_resume leaked: {result}"
+        );
+        assert!(
+            !result.contains("search_files"),
+            "search_files leaked: {result}"
+        );
         assert!(!result.contains('`'), "backticks leaked: {result}");
     }
 
@@ -561,14 +568,20 @@ mod tests {
     fn test_strip_backtick_using_tool() {
         let input = "I'll search for that using `web_search`.";
         let result = strip_tool_name_references(input);
-        assert!(!result.contains("web_search"), "web_search leaked: {result}");
+        assert!(
+            !result.contains("web_search"),
+            "web_search leaked: {result}"
+        );
     }
 
     #[test]
     fn test_strip_backtick_standalone() {
         let input = "Try `terminal` to run commands.";
         let result = strip_tool_name_references(input);
-        assert!(!result.contains("`terminal`"), "backtick terminal leaked: {result}");
+        assert!(
+            !result.contains("`terminal`"),
+            "backtick terminal leaked: {result}"
+        );
     }
 
     #[test]
@@ -589,14 +602,20 @@ mod tests {
     fn test_strip_bare_using_pattern() {
         let input = "I'll do it using terminal for this.";
         let result = strip_tool_name_references(input);
-        assert!(!result.contains("using terminal"), "bare using terminal leaked: {result}");
+        assert!(
+            !result.contains("using terminal"),
+            "bare using terminal leaked: {result}"
+        );
     }
 
     #[test]
     fn test_strip_bare_call_pattern() {
         let input = "Let me call spawn_agent to handle this.";
         let result = strip_tool_name_references(input);
-        assert!(!result.contains("spawn_agent"), "spawn_agent leaked: {result}");
+        assert!(
+            !result.contains("spawn_agent"),
+            "spawn_agent leaked: {result}"
+        );
     }
 
     #[test]
@@ -630,18 +649,28 @@ mod tests {
 
     #[test]
     fn test_multiple_tool_references_stripped() {
-        let input = "I tried `web_search` and `web_fetch` but neither worked. Try the `terminal` tool.";
+        let input =
+            "I tried `web_search` and `web_fetch` but neither worked. Try the `terminal` tool.";
         let result = strip_tool_name_references(input);
-        assert!(!result.contains("web_search"), "web_search leaked: {result}");
+        assert!(
+            !result.contains("web_search"),
+            "web_search leaked: {result}"
+        );
         assert!(!result.contains("web_fetch"), "web_fetch leaked: {result}");
-        assert!(!result.contains("`terminal`"), "backtick terminal leaked: {result}");
+        assert!(
+            !result.contains("`terminal`"),
+            "backtick terminal leaked: {result}"
+        );
     }
 
     #[test]
     fn test_case_insensitive_context() {
         let input = "Using `search_files` I found your document.";
         let result = strip_tool_name_references(input);
-        assert!(!result.contains("search_files"), "search_files leaked: {result}");
+        assert!(
+            !result.contains("search_files"),
+            "search_files leaked: {result}"
+        );
     }
 
     #[test]
@@ -666,12 +695,18 @@ mod tests {
     fn test_strip_diagnostic_block_with_continuation_lines() {
         let input = "I encountered an error.\n\n[DIAGNOSTIC] Similar errors resolved before:\n- Used terminal to resolve\n  Steps: run cargo build -> fix errors\n\nHere is what I found.";
         let result = strip_diagnostic_blocks(input);
-        assert!(!result.contains("[DIAGNOSTIC]"), "DIAGNOSTIC tag leaked: {result}");
+        assert!(
+            !result.contains("[DIAGNOSTIC]"),
+            "DIAGNOSTIC tag leaked: {result}"
+        );
         assert!(
             !result.contains("Similar errors resolved before"),
             "diagnostic content leaked: {result}"
         );
-        assert!(!result.contains("Used terminal"), "solution leaked: {result}");
+        assert!(
+            !result.contains("Used terminal"),
+            "solution leaked: {result}"
+        );
         assert!(!result.contains("Steps:"), "steps leaked: {result}");
         assert!(result.contains("I encountered an error."));
         assert!(result.contains("Here is what I found."));
@@ -681,8 +716,14 @@ mod tests {
     fn test_strip_tool_stats_block() {
         let input = "The search failed.\n\n[TOOL STATS] search_files (24h): 8 calls, 0 failed (0%), avg 296ms\n  - 2x: pattern not found\n\nPlease try again.";
         let result = strip_diagnostic_blocks(input);
-        assert!(!result.contains("[TOOL STATS]"), "TOOL STATS tag leaked: {result}");
-        assert!(!result.contains("8 calls"), "stats content leaked: {result}");
+        assert!(
+            !result.contains("[TOOL STATS]"),
+            "TOOL STATS tag leaked: {result}"
+        );
+        assert!(
+            !result.contains("8 calls"),
+            "stats content leaked: {result}"
+        );
         assert!(!result.contains("296ms"), "stats content leaked: {result}");
         assert!(result.contains("The search failed."));
         assert!(result.contains("Please try again."));

@@ -1051,15 +1051,13 @@ impl MemoryManager {
 
         if result.rows_affected() == 0 {
             // Shouldn't happen now that unique constraint is removed, but handle gracefully.
-            info!(
-                session_id,
-                "Episode insert returned 0 rows affected"
-            );
-            let existing: Option<(i64,)> =
-                sqlx::query_as("SELECT id FROM episodes WHERE session_id = ? ORDER BY created_at DESC LIMIT 1")
-                    .bind(session_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
+            info!(session_id, "Episode insert returned 0 rows affected");
+            let existing: Option<(i64,)> = sqlx::query_as(
+                "SELECT id FROM episodes WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?;
             let episode_id = existing.map(|(id,)| id).unwrap_or(0);
             return Ok(episode_id);
         }
@@ -1646,8 +1644,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                     Ok(episode_id) => {
                         info!(
                             session_id,
-                            episode_id,
-                            "Created mid-session episode for long-running session"
+                            episode_id, "Created mid-session episode for long-running session"
                         );
                     }
                     Err(e) => {
@@ -1671,13 +1668,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
-        let last_episode_end: Option<String> = sqlx::query_scalar(
-            "SELECT MAX(end_time) FROM episodes WHERE session_id = ?",
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .flatten();
+        let last_episode_end: Option<String> =
+            sqlx::query_scalar("SELECT MAX(end_time) FROM episodes WHERE session_id = ?")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
 
         let rows = if let Some(ref since) = last_episode_end {
             sqlx::query(

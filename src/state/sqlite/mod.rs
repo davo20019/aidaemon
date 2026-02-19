@@ -475,7 +475,8 @@ impl SqliteStateStore {
             let category: String = row.get("category");
             let key: String = row.get("key");
             let value: String = row.get("value");
-            let fact_text = super::sqlite::facts::build_fact_embedding_text(&category, &key, &value);
+            let fact_text =
+                super::sqlite::facts::build_fact_embedding_text(&category, &key, &value);
 
             match self.embedding_service.embed(fact_text).await {
                 Ok(embedding) => {
