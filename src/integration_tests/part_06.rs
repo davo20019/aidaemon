@@ -1,9 +1,10 @@
 // ---------------------------------------------------------------------------
-// Consultant pass tests — no-tools first turn with smart router
+// Default+fallback routing tests — iteration 1 always has tools available
 // ---------------------------------------------------------------------------
 
-/// Classifier-only consultant flow: iteration 1 classifies intent via INTENT_GATE,
-/// then the execution loop produces the user-visible answer.
+/// With non-uniform models, iteration 1 runs with tools available (no separate
+/// consultant text-only pass). The INTENT_GATE in the response is still parsed
+/// and the execution loop produces the user-visible answer.
 #[tokio::test]
 async fn test_consultant_pass_classifies_then_executor_answers_questions() {
     let provider = MockProvider::with_responses(vec![
@@ -33,7 +34,7 @@ async fn test_consultant_pass_classifies_then_executor_answers_questions() {
         .await
         .unwrap();
 
-    // Question (contains ?) -> consultant classifies, executor answers.
+    // Question (contains ?) -> intent gate classifies, executor answers.
     let response = harness
         .agent
         .handle_message(
@@ -54,9 +55,10 @@ async fn test_consultant_pass_classifies_then_executor_answers_questions() {
 
     assert_eq!(harness.provider.call_count().await, 2);
     let calls = harness.provider.call_log.lock().await;
+    // With default+fallback routing, all LLM calls include tools
     assert!(
-        calls[0].tools.is_empty(),
-        "Consultant classifier call should have no tools"
+        !calls[0].tools.is_empty(),
+        "First call should have tools (no separate tool-free consultant pass)"
     );
 }
 
@@ -102,10 +104,10 @@ async fn test_critical_owner_name_query_is_deterministic() {
 
 #[tokio::test]
 async fn test_personal_recall_turn_routes_at_least_primary_model() {
+    // With deterministic routing (no consultant LLM pass), the execution loop
+    // handles the request directly with a single LLM call.
     let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            "I can answer this from memory.\n[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false}",
-        ),
+        // Execution loop — direct answer (no consultant pass response needed)
         MockProvider::text_response("I don't have pet information saved."),
     ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
@@ -123,11 +125,14 @@ async fn test_personal_recall_turn_routes_at_least_primary_model() {
         .await
         .unwrap();
 
-    assert!(response.contains("don't have pet information"));
+    assert!(
+        response.contains("don't have pet information"),
+        "Expected pet information response, got: {response}"
+    );
     let calls = harness.provider.call_log.lock().await;
     assert!(
-        calls.len() >= 2,
-        "Classifier-only flow should include consultant + executor calls"
+        calls.len() >= 1,
+        "Execution loop should make at least one LLM call"
     );
     assert_eq!(
         calls[0].model, "primary-model",
@@ -227,15 +232,14 @@ async fn test_identity_tool_result_survives_context_collapse() {
     );
 }
 
-/// For action requests (non-questions), the consultant classifies and the
-/// execution model handles tool use.
+/// For action requests (non-questions), the first LLM call has tools available
+/// and the execution model handles tool use.
 #[tokio::test]
 async fn test_consultant_pass_continues_for_actions() {
     // Three responses:
-    //   1. Consultant (no tools) → analysis of the action
-    //   2. Full agent loop → tool call (system_info)
-    //   3. Full agent loop → final text with tool result
-    // Orchestration routes "show me system info" as Simple → falls through to full agent loop.
+    //   1. First call (with tools) → text analysis of the action
+    //   2. Agent loop → tool call (system_info)
+    //   3. Agent loop → final text with tool result
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("I'll check the system information for you."),
         MockProvider::tool_call_response("system_info", "{}"),
@@ -246,7 +250,7 @@ async fn test_consultant_pass_continues_for_actions() {
         .await
         .unwrap();
 
-    // Action request (imperative, no ?) → consultant pass → full agent loop
+    // Action request (imperative, no ?) → full agent loop with tools
     let response = harness
         .agent
         .handle_message(
@@ -265,14 +269,14 @@ async fn test_consultant_pass_continues_for_actions() {
     let call_count = harness.provider.call_count().await;
     assert!(
         call_count >= 2,
-        "Expected at least 2 LLM calls (consultant + full loop)"
+        "Expected at least 2 LLM calls (intent classification + tool execution)"
     );
 
     let calls = harness.provider.call_log.lock().await;
-    // First call: no tools (consultant pass)
+    // With default+fallback routing, all LLM calls include tools
     assert!(
-        calls[0].tools.is_empty(),
-        "Consultant call should have no tools"
+        !calls[0].tools.is_empty(),
+        "First call should have tools (no separate tool-free consultant pass)"
     );
 }
 
@@ -282,15 +286,15 @@ async fn test_consultant_pass_continues_for_actions() {
 #[tokio::test]
 async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
     let provider = MockProvider::with_responses(vec![
-        // 1) Consultant pass
+        // 1) First call (with tools) → INTENT_GATE classification
         MockProvider::text_response(
             "I'll check and send it over.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"simple\"}",
         ),
-        // 2) Full loop (bad): deferred action text, no tool calls
+        // 2) Execution loop (bad): deferred action text, no tool calls
         MockProvider::text_response(
             "I'll find your resume and send it over right away.\nStarting the send-resume workflow...",
         ),
-        // 3) Full loop (good): actual tool execution
+        // 3) Execution loop (good): actual tool execution
         MockProvider::tool_call_response("system_info", "{}"),
         // 4) Final answer
         MockProvider::text_response("Found it and sent it."),
@@ -317,13 +321,14 @@ async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
     assert_eq!(harness.provider.call_count().await, 4);
 
     let calls = harness.provider.call_log.lock().await;
+    // All calls now have tools available (no separate tool-free consultant pass)
     assert!(
-        calls[0].tools.is_empty(),
-        "Consultant pass must be tool-free"
+        !calls[0].tools.is_empty(),
+        "First call should have tools available"
     );
     assert!(
         !calls[1].tools.is_empty(),
-        "Execution loop must have tools available after consultant pass"
+        "Execution loop must have tools available"
     );
 }
 
@@ -332,17 +337,17 @@ async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
 #[tokio::test]
 async fn test_deferred_action_after_tool_progress_does_not_complete_task() {
     let provider = MockProvider::with_responses(vec![
-        // 1) Consultant pass
+        // 1) First call (with tools) → INTENT_GATE classification
         MockProvider::text_response(
             "I'll find it for you.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"simple\"}",
         ),
-        // 2) Full loop: executes a tool successfully
+        // 2) Execution loop: executes a tool successfully
         MockProvider::tool_call_response("system_info", "{}"),
-        // 3) Full loop (bad): deferred narration instead of results
+        // 3) Execution loop (bad): deferred narration instead of results
         MockProvider::text_response(
             "I'll send it over once I locate the exact file. Give me a moment.",
         ),
-        // 4) Full loop (good): concrete outcome
+        // 4) Execution loop (good): concrete outcome
         MockProvider::text_response("I couldn't find a matching SOW PDF in the project files."),
     ]);
 
@@ -370,13 +375,14 @@ async fn test_deferred_action_after_tool_progress_does_not_complete_task() {
     assert_eq!(harness.provider.call_count().await, 4);
 
     let calls = harness.provider.call_log.lock().await;
+    // All calls now have tools available (no separate tool-free consultant pass)
     assert!(
-        calls[0].tools.is_empty(),
-        "Consultant pass must be tool-free"
+        !calls[0].tools.is_empty(),
+        "First call should have tools available"
     );
     assert!(
         !calls[1].tools.is_empty(),
-        "Execution loop must have tools available after consultant pass"
+        "Execution loop must have tools available"
     );
 }
 
@@ -461,12 +467,12 @@ async fn test_consultant_pass_empty_response_not_intercepted() {
 }
 
 /// Regression: when the execution loop keeps returning empty content with no
-/// tool calls after consultant pass, the agent should attempt one recovery
-/// pass, then persist the fallback response and emit task completion.
+/// tool calls, the agent should attempt one recovery pass, then persist
+/// the fallback response and emit task completion.
 #[tokio::test]
 async fn test_empty_execution_response_persists_fallback_message() {
     let provider = MockProvider::with_responses(vec![
-        // Consultant pass (iteration 1): empty response, falls through.
+        // Iteration 1: empty response -> retry nudge.
         ProviderResponse {
             content: Some(String::new()),
             tool_calls: vec![],
@@ -478,19 +484,7 @@ async fn test_empty_execution_response_persists_fallback_message() {
             thinking: None,
             response_note: None,
         },
-        // Execution loop (iteration 2): empty -> one retry nudge.
-        ProviderResponse {
-            content: Some(String::new()),
-            tool_calls: vec![],
-            usage: Some(crate::traits::TokenUsage {
-                input_tokens: 20,
-                output_tokens: 0,
-                model: "mock".to_string(),
-            }),
-            thinking: None,
-            response_note: None,
-        },
-        // Execution loop (iteration 3): still empty -> fallback.
+        // Iteration 2: still empty -> fallback.
         ProviderResponse {
             content: Some(String::new()),
             tool_calls: vec![],
@@ -523,7 +517,7 @@ async fn test_empty_execution_response_persists_fallback_message() {
 
     let expected = "I wasn't able to process that request. Could you try rephrasing?";
     assert_eq!(response, expected);
-    assert_eq!(harness.provider.call_count().await, 3);
+    assert_eq!(harness.provider.call_count().await, 2);
 
     let history = harness.state.get_history("test_session", 10).await.unwrap();
     assert!(
@@ -538,20 +532,7 @@ async fn test_empty_execution_response_persists_fallback_message() {
 #[tokio::test]
 async fn test_empty_execution_response_surfaces_provider_note() {
     let provider = MockProvider::with_responses(vec![
-        // Consultant pass (iteration 1): empty response, falls through.
-        ProviderResponse {
-            content: Some(String::new()),
-            tool_calls: vec![],
-            usage: Some(crate::traits::TokenUsage {
-                input_tokens: 10,
-                output_tokens: 0,
-                model: "mock".to_string(),
-            }),
-            thinking: None,
-            response_note: None,
-        },
-        // Execution loop (iteration 2): empty response with provider note
-        // -> one retry nudge.
+        // Iteration 1: empty response with provider note -> retry nudge.
         ProviderResponse {
             content: Some(String::new()),
             tool_calls: vec![],
@@ -566,8 +547,7 @@ async fn test_empty_execution_response_surfaces_provider_note() {
                     .to_string(),
             ),
         },
-        // Execution loop (iteration 3): still empty, no note.
-        // The fallback should still surface the previous retry note.
+        // Iteration 2: still empty, no note -> fallback surfaces the previous note.
         ProviderResponse {
             content: Some(String::new()),
             tool_calls: vec![],
@@ -601,7 +581,7 @@ async fn test_empty_execution_response_surfaces_provider_note() {
     assert!(response.starts_with("I wasn't able to process that request."));
     assert!(response.contains("The model returned no usable output (finish reason: SAFETY; candidate safety categories: HARM_CATEGORY_HATE_SPEECH)."));
     assert!(response.ends_with("Could you try rephrasing?"));
-    assert_eq!(harness.provider.call_count().await, 3);
+    assert_eq!(harness.provider.call_count().await, 2);
 
     let history = harness.state.get_history("test_session", 10).await.unwrap();
     assert!(
@@ -616,7 +596,7 @@ async fn test_empty_execution_response_surfaces_provider_note() {
 #[tokio::test]
 async fn test_empty_execution_response_retry_recovers_with_text() {
     let provider = MockProvider::with_responses(vec![
-        // Consultant pass (iteration 1): empty response, falls through.
+        // Iteration 1: empty response -> retry nudge.
         ProviderResponse {
             content: Some(String::new()),
             tool_calls: vec![],
@@ -628,19 +608,7 @@ async fn test_empty_execution_response_retry_recovers_with_text() {
             thinking: None,
             response_note: None,
         },
-        // Execution loop (iteration 2): empty response -> retry nudge.
-        ProviderResponse {
-            content: Some(String::new()),
-            tool_calls: vec![],
-            usage: Some(crate::traits::TokenUsage {
-                input_tokens: 20,
-                output_tokens: 0,
-                model: "mock".to_string(),
-            }),
-            thinking: None,
-            response_note: None,
-        },
-        // Execution loop (iteration 3): recovery succeeds with text.
+        // Iteration 2: recovery succeeds with text.
         MockProvider::text_response("Recovered response."),
     ]);
 
@@ -662,7 +630,7 @@ async fn test_empty_execution_response_retry_recovers_with_text() {
         .unwrap();
 
     assert_eq!(response, "Recovered response.");
-    assert_eq!(harness.provider.call_count().await, 3);
+    assert_eq!(harness.provider.call_count().await, 2);
     assert!(!response.contains("I wasn't able to process that request."));
 }
 
@@ -785,14 +753,18 @@ async fn test_acknowledgment_with_needs_tools_and_empty_analysis_falls_through()
     );
 }
 
-/// Empty consultant text for a pure acknowledgment should produce a safe
-/// non-empty conversational reply instead of persisting an empty assistant turn.
+/// With default+fallback routing (consultant pass disabled), an LLM response
+/// containing only INTENT_GATE metadata is treated as deferred action text
+/// (structural marker detected) and the agent loops to get a real response.
 #[tokio::test]
 async fn test_acknowledgment_with_empty_analysis_returns_default_reply() {
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "[INTENT_GATE]\n\
-         {\"complexity\":\"simple\",\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"is_acknowledgment\":true}",
-    )]);
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            "[INTENT_GATE]\n\
+             {\"complexity\":\"simple\",\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"is_acknowledgment\":true}",
+        ),
+        MockProvider::text_response("Got it, understood."),
+    ]);
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
@@ -811,18 +783,24 @@ async fn test_acknowledgment_with_empty_analysis_returns_default_reply() {
         .await
         .unwrap();
 
-    assert_eq!(response, "Got it.");
-    assert_eq!(harness.provider.call_count().await, 1);
+    // With consultant pass disabled, the INTENT_GATE-only response is treated
+    // as deferred action text, so the agent loops and gets the second response.
+    assert_eq!(response, "Got it, understood.");
+    assert_eq!(harness.provider.call_count().await, 2);
 }
 
-/// Keep short-correction guardrail behavior: empty consultant analysis still
-/// yields the fixed correction acknowledgment response.
+/// With default+fallback routing (consultant pass disabled), an LLM response
+/// containing only INTENT_GATE metadata is treated as deferred action text
+/// and the agent loops to get a real response for corrections too.
 #[tokio::test]
 async fn test_short_correction_with_empty_analysis_returns_default_reply() {
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "[INTENT_GATE]\n\
-         {\"complexity\":\"simple\",\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"is_acknowledgment\":false}",
-    )]);
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            "[INTENT_GATE]\n\
+             {\"complexity\":\"simple\",\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"is_acknowledgment\":false}",
+        ),
+        MockProvider::text_response("You're right, my apologies for the confusion."),
+    ]);
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
@@ -841,16 +819,25 @@ async fn test_short_correction_with_empty_analysis_returns_default_reply() {
         .await
         .unwrap();
 
-    assert_eq!(response, "You're right — thanks for the correction.");
-    assert_eq!(harness.provider.call_count().await, 1);
+    // With consultant pass disabled, the INTENT_GATE-only response triggers
+    // deferred action detection, so the agent loops and returns the second response.
+    assert_eq!(response, "You're right, my apologies for the confusion.");
+    assert_eq!(harness.provider.call_count().await, 2);
 }
 
+/// With default+fallback routing (consultant pass disabled), intent_gate
+/// decision points are not emitted for direct replies. The LLM response
+/// with INTENT_GATE metadata is treated as deferred action text and the
+/// agent loops to produce a real response.
 #[tokio::test]
 async fn test_intent_gate_decision_metadata_includes_route_reason_for_direct_reply() {
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "[INTENT_GATE]\n\
-         {\"complexity\":\"simple\",\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"is_acknowledgment\":true}",
-    )]);
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            "[INTENT_GATE]\n\
+             {\"complexity\":\"simple\",\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"is_acknowledgment\":true}",
+        ),
+        MockProvider::text_response("Got it, understood."),
+    ]);
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
@@ -868,8 +855,15 @@ async fn test_intent_gate_decision_metadata_includes_route_reason_for_direct_rep
         )
         .await
         .unwrap();
-    assert_eq!(response, "Got it.");
+    // With consultant pass disabled, INTENT_GATE-only responses trigger
+    // deferred action detection; the agent loops and returns the second response.
+    assert_eq!(response, "Got it, understood.");
+    assert_eq!(harness.provider.call_count().await, 2);
 
+    // Intent gate decision points are no longer emitted when consultant pass is disabled.
+    // Verify that intent_gate contract enforcement decision points may still be emitted
+    // (from the completion phase), but the specific route_reason metadata from the
+    // consultant decision phase is not present.
     let event_rows: Vec<String> = sqlx::query_scalar(
         "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point' ORDER BY id DESC",
     )
@@ -878,27 +872,29 @@ async fn test_intent_gate_decision_metadata_includes_route_reason_for_direct_rep
     .await
     .unwrap();
 
-    let intent_gate_decision = event_rows
-        .into_iter()
-        .map(|raw| serde_json::from_str::<serde_json::Value>(&raw).unwrap())
-        .find(|data| data.get("decision_type").and_then(|v| v.as_str()) == Some("intent_gate"))
-        .expect("expected at least one intent_gate decision point");
+    let intent_gate_direct_reply = event_rows
+        .iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+        .find(|data| {
+            data.get("decision_type").and_then(|v| v.as_str()) == Some("intent_gate")
+                && data
+                    .get("metadata")
+                    .and_then(|m| m.get("route_reason"))
+                    .and_then(|v| v.as_str())
+                    == Some("acknowledgment_direct_reply")
+        });
 
-    let metadata = intent_gate_decision
-        .get("metadata")
-        .cloned()
-        .unwrap_or_default();
-    assert_eq!(
-        metadata.get("route_reason").and_then(|v| v.as_str()),
-        Some("acknowledgment_direct_reply")
+    // With consultant pass disabled, no acknowledgment_direct_reply decision points
+    assert!(
+        intent_gate_direct_reply.is_none(),
+        "With consultant pass disabled, acknowledgment_direct_reply intent_gate decisions should not be emitted"
     );
-    assert_eq!(
-        metadata.get("route_action").and_then(|v| v.as_str()),
-        Some("return")
-    );
-    assert_eq!(metadata.get("route_reply_len").and_then(|v| v.as_u64()), Some(7));
 }
 
+/// With default+fallback routing (consultant pass disabled), intent_gate
+/// decision points from the consultant decision phase are not emitted.
+/// The LLM response with INTENT_GATE metadata is treated as deferred action
+/// text, and the agent continues looping with tools available.
 #[tokio::test]
 async fn test_intent_gate_decision_metadata_includes_route_reason_for_continue() {
     let provider = MockProvider::with_responses(vec![
@@ -906,7 +902,7 @@ async fn test_intent_gate_decision_metadata_includes_route_reason_for_continue()
             "[INTENT_GATE]\n\
              {\"complexity\":\"simple\",\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"is_acknowledgment\":true}",
         ),
-        // needs_tools=true blocks text-only responses, so executor must use a tool call
+        // INTENT_GATE text triggers deferred action detection, agent loops
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Proceeding with the requested changes."),
     ]);
@@ -937,23 +933,22 @@ async fn test_intent_gate_decision_metadata_includes_route_reason_for_continue()
     .await
     .unwrap();
 
-    let intent_gate_decision = event_rows
-        .into_iter()
-        .map(|raw| serde_json::from_str::<serde_json::Value>(&raw).unwrap())
-        .find(|data| data.get("decision_type").and_then(|v| v.as_str()) == Some("intent_gate"))
-        .expect("expected at least one intent_gate decision point");
+    // With consultant pass disabled, the specific tools_required route_reason
+    // from the consultant decision phase is not emitted.
+    let intent_gate_tools_required = event_rows
+        .iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+        .find(|data| {
+            data.get("decision_type").and_then(|v| v.as_str()) == Some("intent_gate")
+                && data
+                    .get("metadata")
+                    .and_then(|m| m.get("route_reason"))
+                    .and_then(|v| v.as_str())
+                    == Some("tools_required")
+        });
 
-    let metadata = intent_gate_decision
-        .get("metadata")
-        .cloned()
-        .unwrap_or_default();
-    assert_eq!(
-        metadata.get("route_reason").and_then(|v| v.as_str()),
-        Some("tools_required")
+    assert!(
+        intent_gate_tools_required.is_none(),
+        "With consultant pass disabled, tools_required intent_gate decisions from consultant decision phase should not be emitted"
     );
-    assert_eq!(
-        metadata.get("route_action").and_then(|v| v.as_str()),
-        Some("continue")
-    );
-    assert_eq!(metadata.get("route_reply_len").and_then(|v| v.as_u64()), None);
 }

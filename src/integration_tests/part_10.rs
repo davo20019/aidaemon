@@ -1,16 +1,16 @@
-// ==================== Orchestrator Tool Isolation Regression Tests ====================
+// ==================== Orchestrator Tool Presence Regression Tests ====================
 
 #[tokio::test]
-async fn test_orchestrator_consultant_pass_has_no_tools() {
-    // The consultant pass (iteration 1) must have no tool definitions.
-    // After the consultant pass, Simple tasks fall through to the full agent loop
-    // which DOES have tools.
+async fn test_orchestrator_first_call_has_tools() {
+    // With default+fallback routing, the consultant text-only pre-pass is disabled.
+    // The first LLM call ALWAYS includes tools, even at depth=0 (orchestrator).
+    // After the intent gate classifies the task, tools remain available for execution.
     let provider = MockProvider::with_responses(vec![
-        // Consultant pass (iteration 1, no tools)
+        // Iteration 1 (tools available): intent gate classification + text response
         MockProvider::text_response("I'll check that for you."),
-        // Full agent loop (has tools)
+        // Execution loop: tool call
         MockProvider::tool_call_response("system_info", "{}"),
-        // Full agent loop final response
+        // Execution loop: final response
         MockProvider::text_response("System is running macOS."),
     ]);
 
@@ -30,28 +30,29 @@ async fn test_orchestrator_consultant_pass_has_no_tools() {
         .unwrap();
 
     let calls = harness.provider.call_log.lock().await;
-    assert!(calls.len() >= 2, "Expected at least 2 LLM calls");
+    assert!(!calls.is_empty(), "Expected at least 1 LLM call");
 
-    // First call (consultant pass): MUST have zero tools
+    // First call: MUST have tools (no tool-stripping for iteration 1 anymore)
     assert!(
-        calls[0].tools.is_empty(),
-        "Consultant pass must have empty tools, got {} tools",
-        calls[0].tools.len()
+        !calls[0].tools.is_empty(),
+        "First LLM call must have tools present, got 0 tools"
     );
 }
 
 #[tokio::test]
-async fn test_orchestrator_drops_tool_calls_for_action_requests() {
-    // Even for action requests (non-questions), if the consultant LLM hallucinates
-    // tool calls, they must be dropped. The orchestrator never executes tools.
+async fn test_orchestrator_executes_tool_calls_in_first_iteration() {
+    // With default+fallback routing, tools are always present. If the LLM
+    // returns a tool call in iteration 1, it is executed (not dropped).
+    // Previously, the consultant pass had no tools and tool calls were
+    // considered "hallucinated" and dropped. Now they are legitimate.
     use crate::traits::ToolCall;
 
     let provider = MockProvider::with_responses(vec![
-        // Consultant returns text + hallucinated tool call for an action request
+        // Iteration 1 (tools present): LLM returns text + tool call
         ProviderResponse {
             content: Some("I'll look into the system details.".to_string()),
             tool_calls: vec![ToolCall {
-                id: "call_hallucinated".to_string(),
+                id: "call_system_info".to_string(),
                 name: "system_info".to_string(),
                 arguments: "{}".to_string(),
                 extra_content: None,
@@ -64,9 +65,7 @@ async fn test_orchestrator_drops_tool_calls_for_action_requests() {
             thinking: None,
             response_note: None,
         },
-        // Lightweight executor: tool call
-        MockProvider::tool_call_response("system_info", "{}"),
-        // Lightweight executor: final response
+        // After tool execution: final text response
         MockProvider::text_response("System is running macOS."),
     ]);
 
@@ -85,22 +84,30 @@ async fn test_orchestrator_drops_tool_calls_for_action_requests() {
         .await
         .unwrap();
 
-    // The response should come from the lightweight executor, not from the
-    // orchestrator directly executing the hallucinated tool call
+    // The tool call from iteration 1 is executed, and the final response
+    // comes from the subsequent LLM call after tool execution.
     assert_eq!(response, "System is running macOS.");
 
     let calls = harness.provider.call_log.lock().await;
-    // First call is consultant (no tools), subsequent are lightweight executor
+    // First call has tools (no tool-stripping anymore)
     assert!(
-        calls[0].tools.is_empty(),
-        "Orchestrator must not pass tools to LLM"
+        !calls[0].tools.is_empty(),
+        "First LLM call must have tools present"
+    );
+    // At least 2 calls: initial (with tool call) + post-execution
+    assert!(
+        calls.len() >= 2,
+        "Expected at least 2 LLM calls (tool call + final), got {}",
+        calls.len()
     );
 }
 
 #[tokio::test]
-async fn test_orchestrator_knowledge_no_tool_execution() {
-    // Classifier-only flow: consultant emits INTENT_GATE, then executor answers.
-    // The model should still avoid tool execution for simple knowledge answers.
+async fn test_orchestrator_knowledge_flow() {
+    // Knowledge flow: iteration 1 emits INTENT_GATE with can_answer_now=true,
+    // then the execution loop answers without tool use. With default+fallback
+    // routing, tools ARE present in the first call (no tool-stripping), but
+    // the model chooses not to use them for simple knowledge answers.
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "I can answer this from memory.\n[INTENT_GATE]\n{\"complexity\": \"knowledge\", \"can_answer_now\": true, \"needs_tools\": false}",
@@ -126,12 +133,13 @@ async fn test_orchestrator_knowledge_no_tool_execution() {
     assert_eq!(response, "The capital of France is Paris.");
 
     let call_count = harness.provider.call_count().await;
-    assert_eq!(call_count, 2, "Expected consultant classifier + executor answer");
+    assert_eq!(call_count, 2, "Expected intent gate classifier + executor answer");
 
+    // Tools are present in the first call (no tool-stripping in the new architecture)
     let calls = harness.provider.call_log.lock().await;
     assert!(
-        calls[0].tools.is_empty(),
-        "Knowledge LLM call must have zero tools"
+        !calls[0].tools.is_empty(),
+        "First LLM call should have tools present (default+fallback routing)"
     );
 }
 

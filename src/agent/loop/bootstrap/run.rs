@@ -146,11 +146,23 @@ impl Agent {
         // Deterministic critical-fact resolver for high-trust identity/profile recall.
         // This avoids model drift when context is compressed or the fast model is selected.
         let critical_fact_query = detect_critical_fact_query(user_text);
+        // Only fetch identity/profile categories — NOT get_facts(None) which returned
+        // every fact in the DB, causing unrelated facts (Ecuador travel, WiFi router
+        // tips, etc.) to bleed into prompts for unrelated queries.
         let owner_dm_fact_cache = if self.depth == 0
             && user_role == UserRole::Owner
             && channel_ctx.should_inject_personal_memory()
         {
-            Some(self.state.get_facts(None).await.unwrap_or_default())
+            let mut identity_facts = Vec::new();
+            for cat in &[
+                "identity", "personal", "profile", "user", "assistant", "bot",
+                "relationship", "preference", "family",
+            ] {
+                if let Ok(mut facts) = self.state.get_facts(Some(cat)).await {
+                    identity_facts.append(&mut facts);
+                }
+            }
+            Some(identity_facts)
         } else {
             None
         };

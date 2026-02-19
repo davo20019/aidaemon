@@ -51,17 +51,20 @@ pub fn validate_path(path: &str) -> anyhow::Result<PathBuf> {
     let p = PathBuf::from(&expanded);
 
     // Check for path traversal
-    let normalized = if p.is_absolute() {
+    let joined = if p.is_absolute() {
         p.clone()
     } else {
         std::env::current_dir()?.join(&p)
     };
 
     // Reject paths that try to traverse with ..
-    let path_str = normalized.to_string_lossy();
-    if path_str.contains("/../") || path_str.ends_with("/..") {
+    let joined_str = joined.to_string_lossy();
+    if joined_str.contains("/../") || joined_str.ends_with("/..") {
         anyhow::bail!("Path traversal detected: {}", path);
     }
+
+    // Normalize path components to remove `.` entries (e.g., "/foo/bar/." -> "/foo/bar")
+    let normalized: PathBuf = joined.components().collect();
 
     Ok(normalized)
 }
@@ -228,6 +231,31 @@ mod tests {
     fn test_validate_path_absolute() {
         let result = validate_path("/tmp/test.txt");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_dot_normalized() {
+        // Passing "." should resolve to cwd without trailing "/."
+        let result = validate_path(".").unwrap();
+        let result_str = result.to_string_lossy();
+        assert!(
+            !result_str.ends_with("/."),
+            "validate_path(\".\") should not end with trailing dot, got: {}",
+            result_str
+        );
+        assert_eq!(result, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn test_validate_path_subdir_dot_normalized() {
+        // "src/." should normalize to just "cwd/src"
+        let result = validate_path("src/.").unwrap();
+        let result_str = result.to_string_lossy();
+        assert!(
+            !result_str.ends_with("/."),
+            "validate_path(\"src/.\") should not end with trailing dot, got: {}",
+            result_str
+        );
     }
 
     #[test]

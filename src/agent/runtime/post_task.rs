@@ -444,7 +444,7 @@ pub(super) fn is_productive(
 ///
 /// Parses entries like `"read_file(Hero.jsx)"` and `"terminal(\`pip install fpdf\`)"` into
 /// grouped categories so the next interaction can understand what was already done.
-fn categorize_tool_calls(tool_calls: &[String]) -> String {
+pub(in crate::agent) fn categorize_tool_calls(tool_calls: &[String]) -> String {
     let mut files_read: Vec<&str> = Vec::new();
     let mut files_written: Vec<&str> = Vec::new();
     let mut commands_run: Vec<&str> = Vec::new();

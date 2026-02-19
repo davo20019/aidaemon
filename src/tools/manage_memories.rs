@@ -336,15 +336,67 @@ impl Tool for ManageMemoriesTool {
                 let key = args.key.as_deref().ok_or_else(|| anyhow::anyhow!("'key' is required for forget action"))?;
                 let category = args.category.as_deref().ok_or_else(|| anyhow::anyhow!("'category' is required for forget action"))?;
 
-                let facts = self.state.get_facts(Some(category)).await?;
-                let fact = facts.iter().find(|f| f.key == key && f.superseded_at.is_none());
-
-                match fact {
-                    Some(f) => {
-                        self.state.delete_fact(f.id).await?;
-                        Ok(format!("Forgotten: [{}] {}", category, key))
+                // Canonicalize the requested key for fuzzy matching
+                let canon = |k: &str| -> String {
+                    let mut out = String::with_capacity(k.len());
+                    let mut last_sep = false;
+                    for ch in k.trim().chars() {
+                        if ch.is_ascii_alphanumeric() {
+                            out.push(ch.to_ascii_lowercase());
+                            last_sep = false;
+                        } else if !last_sep {
+                            out.push('_');
+                            last_sep = true;
+                        }
                     }
-                    None => Ok(format!("No active fact found: [{}] {}", category, key)),
+                    out.trim_matches('_').to_string()
+                };
+
+                let key_canonical = canon(key);
+
+                // Try matching: exact → canonical → substring
+                let facts = self.state.get_facts(Some(category)).await?;
+                let fact = facts
+                    .iter()
+                    .find(|f| f.key == key && f.superseded_at.is_none())
+                    .or_else(|| {
+                        facts.iter().find(|f| {
+                            f.superseded_at.is_none() && canon(&f.key) == key_canonical
+                        })
+                    })
+                    .or_else(|| {
+                        // Substring match: key contains the search term or vice versa
+                        let key_lower = key.to_lowercase();
+                        facts.iter().find(|f| {
+                            f.superseded_at.is_none() && {
+                                let fk = f.key.to_lowercase();
+                                fk.contains(&key_lower) || key_lower.contains(&fk)
+                            }
+                        })
+                    });
+
+                // If no match in the specified category, try all categories
+                let found = if let Some(f) = fact {
+                    Some((f.id, f.category.clone(), f.key.clone()))
+                } else {
+                    let all_facts = self.state.get_facts(None).await?;
+                    all_facts.iter().find(|f| {
+                        f.superseded_at.is_none() && {
+                            let fk = canon(&f.key);
+                            fk == key_canonical
+                                || f.key == key
+                                || f.key.to_lowercase().contains(&key.to_lowercase())
+                                || key.to_lowercase().contains(&f.key.to_lowercase())
+                        }
+                    }).map(|f| (f.id, f.category.clone(), f.key.clone()))
+                };
+
+                match found {
+                    Some((id, cat, k)) => {
+                        self.state.delete_fact(id).await?;
+                        Ok(format!("Forgotten: [{}] {}", cat, k))
+                    }
+                    None => Ok(format!("No active fact found matching key '{}' in any category. Use manage_memories(action='list') to see stored facts and their exact keys.", key)),
                 }
             }
             "set_privacy" => {

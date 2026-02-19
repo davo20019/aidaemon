@@ -59,7 +59,7 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
                         episode.recall_count,
                         episode.last_recalled_at,
                     );
-                    if score > 0.5 {
+                    if score > 0.3 {
                         scored.push((episode, score));
                     }
                 }

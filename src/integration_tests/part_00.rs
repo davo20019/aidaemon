@@ -43,26 +43,15 @@ async fn test_basic_message_response() {
 
 #[tokio::test]
 async fn test_empty_llm_response_retried_then_fallback() {
-    // Script: consultant pass empty -> execution empty -> execution empty -> fallback.
-    // Assert that the retry iteration includes the empty-response nudge as a system message
-    // (not a tool message that gets dropped by message ordering fixups).
+    // With consultant pass disabled (default+fallback routing), the first empty
+    // response IS the first iteration. Flow: empty -> retry with nudge -> empty -> fallback.
+    // That's 2 LLM calls total.
     let provider = MockProvider::with_responses(vec![
         ProviderResponse {
             content: Some(String::new()),
             tool_calls: vec![],
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 10,
-                output_tokens: 0,
-                model: "mock".to_string(),
-            }),
-            thinking: None,
-            response_note: None,
-        },
-        ProviderResponse {
-            content: Some(String::new()),
-            tool_calls: vec![],
-            usage: Some(crate::traits::TokenUsage {
-                input_tokens: 20,
                 output_tokens: 0,
                 model: "mock".to_string(),
             }),
@@ -99,13 +88,13 @@ async fn test_empty_llm_response_retried_then_fallback() {
         .unwrap();
 
     let expected = "I wasn't able to process that request. Could you try rephrasing?";
-    assert_eq!(harness.provider.call_count().await, 3);
+    assert_eq!(harness.provider.call_count().await, 2);
     assert_eq!(response, expected);
 
     // Verify the retry iteration included a system nudge for the LLM.
     let calls = harness.provider.call_log.lock().await.clone();
-    assert!(calls.len() >= 3, "expected at least 3 LLM calls");
-    let retry_messages = &calls[2].messages;
+    assert!(calls.len() >= 2, "expected at least 2 LLM calls");
+    let retry_messages = &calls[1].messages;
     let saw_retry_nudge = retry_messages.iter().any(|m| {
         m.get("role").and_then(|r| r.as_str()) == Some("system")
             && m.get("content")

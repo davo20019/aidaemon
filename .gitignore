@@ -61,3 +61,6 @@ docs/
 
 # Local git worktrees (dev helper)
 .worktrees/
+
+# Runtime logs
+*.caffeinate.log

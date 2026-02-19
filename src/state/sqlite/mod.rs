@@ -327,8 +327,9 @@ impl SqliteStateStore {
         };
 
         // Score by similarity with memory decay
-        // Threshold increased to 0.5 to avoid cross-session contamination from marginally related episodes
-        const EPISODE_SIMILARITY_THRESHOLD: f32 = 0.5;
+        // Lowered from 0.5 to 0.3 to match fact retrieval threshold — 0.5 was too
+        // aggressive and caused useful episodes to be filtered out.
+        const EPISODE_SIMILARITY_THRESHOLD: f32 = 0.3;
 
         let mut scored: Vec<(Episode, f32)> = Vec::new();
         for row in rows {
@@ -474,7 +475,7 @@ impl SqliteStateStore {
             let category: String = row.get("category");
             let key: String = row.get("key");
             let value: String = row.get("value");
-            let fact_text = format!("[{}] {}: {}", category, key, value);
+            let fact_text = super::sqlite::facts::build_fact_embedding_text(&category, &key, &value);
 
             match self.embedding_service.embed(fact_text).await {
                 Ok(embedding) => {

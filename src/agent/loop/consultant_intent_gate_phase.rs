@@ -80,15 +80,43 @@ fn evaluate_consultant_routing_contract(
     needs_clarification: bool,
 ) -> ConsultantRoutingContractDecision {
     if needs_clarification {
-        let clarification = intent_gate
-            .clarifying_question
-            .clone()
-            .filter(|q| q.contains('?'))
-            .unwrap_or_else(|| default_clarifying_question(user_text, &intent_gate.missing_info));
-        return ConsultantRoutingContractDecision {
-            reason: ConsultantRouteReason::ClarificationRequired,
-            outcome: ConsultantRoutingContractOutcome::AskClarification(clarification),
-        };
+        // Override: if the user is clearly asking about code/files and tools are
+        // needed, skip clarification and just proceed. The consultant sometimes
+        // over-asks for read-only exploration like "search for TODOs" or
+        // "how many lines does router.rs have?".
+        let lower = user_text.to_ascii_lowercase();
+        let is_exploration = needs_tools
+            && (lower.contains("how many")
+                || lower.contains("count")
+                || lower.contains("search")
+                || lower.contains("find")
+                || lower.contains("grep")
+                || lower.contains("list")
+                || lower.contains("show me")
+                || lower.contains("what's in")
+                || lower.contains("read ")
+                || lower.contains("look at")
+                || lower.contains("check ")
+                || lower.contains("todo")
+                || lower.ends_with(".rs")
+                || lower.ends_with(".py")
+                || lower.ends_with(".js")
+                || lower.ends_with(".ts")
+                || lower.ends_with(".go"));
+        if !is_exploration {
+            let clarification = intent_gate
+                .clarifying_question
+                .clone()
+                .filter(|q| q.contains('?'))
+                .unwrap_or_else(|| {
+                    default_clarifying_question(user_text, &intent_gate.missing_info)
+                });
+            return ConsultantRoutingContractDecision {
+                reason: ConsultantRouteReason::ClarificationRequired,
+                outcome: ConsultantRoutingContractOutcome::AskClarification(clarification),
+            };
+        }
+        // Fall through to tools-required path for exploration requests
     }
 
     // Hard invariant: direct replies are never valid when tools are required.

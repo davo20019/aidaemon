@@ -57,6 +57,30 @@ static INTERNAL_CONTROL_MARKERS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
+/// Patterns that match entire diagnostic/control blocks (tag + content) for
+/// aggressive stripping from user-facing final replies. Unlike
+/// `INTERNAL_CONTROL_MARKERS` which only removes the bracket tags, these
+/// consume the tag **and** all following text on the same line, plus any
+/// continuation lines that look like sub-items (indented or starting with `-`).
+static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        // [DIAGNOSTIC] ... plus continuation lines starting with whitespace or `-`
+        Regex::new(r"(?m)\[DIAGNOSTIC\][^\n]*(?:\n(?:[ \t]|-)[^\n]*)*").unwrap(),
+        // [TOOL STATS] ... plus indented sub-lines (e.g. "  - 2x: ...")
+        Regex::new(r"(?m)\[TOOL STATS\][^\n]*(?:\n[ \t]+[^\n]*)*").unwrap(),
+        // [SYSTEM] ... single line (no continuation)
+        Regex::new(r"(?m)\[SYSTEM\][^\n]*").unwrap(),
+        // [UNTRUSTED EXTERNAL DATA ...] block through [END UNTRUSTED ...]
+        Regex::new(r"(?si)\[UNTRUSTED EXTERNAL DATA[^\]]*\].*?\[END UNTRUSTED EXTERNAL DATA\][^\n]*").unwrap(),
+        // Standalone [UNTRUSTED EXTERNAL DATA ...] without closing tag
+        Regex::new(r"(?m)\[UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
+        Regex::new(r"(?m)\[END UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
+        // Echoed diagnostic content without the bracket tag prefix — catch the
+        // most common phrases the LLM copies verbatim from injected diagnostics.
+        Regex::new(r"(?m)Similar errors resolved before:\n(?:[ \t-][^\n]*\n?)*").unwrap(),
+    ]
+});
+
 /// Patterns that indicate the underlying LLM is leaking its training identity.
 static MODEL_IDENTITY_LEAKS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
@@ -153,6 +177,24 @@ pub fn strip_internal_control_markers(content: &str) -> String {
         result = marker.replace_all(&result, "").to_string();
     }
     result
+}
+
+/// Aggressively strip entire diagnostic/control blocks from a user-facing
+/// final reply. This removes the marker tags **and** their associated content
+/// (continuation lines, sub-items, etc.) so internal debug information never
+/// reaches the end user.
+///
+/// Only call this on **final user-facing replies** — not on internal tool
+/// results or agent-to-agent messages where the LLM needs the diagnostics.
+pub fn strip_diagnostic_blocks(content: &str) -> String {
+    let mut result = content.to_string();
+    for pattern in DIAGNOSTIC_BLOCK_PATTERNS.iter() {
+        result = pattern.replace_all(&result, "").to_string();
+    }
+    // Collapse runs of 3+ newlines left by removed blocks into double newlines.
+    static EXCESS_NEWLINES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
+    result = EXCESS_NEWLINES.replace_all(&result, "\n\n").to_string();
+    result.trim().to_string()
 }
 
 /// Sanitize output for public channels by redacting secret patterns.
@@ -616,6 +658,80 @@ mod tests {
         let once = strip_tool_name_references(input);
         let twice = strip_tool_name_references(&once);
         assert_eq!(once, twice, "not idempotent: first={once}, second={twice}");
+    }
+
+    // ── strip_diagnostic_blocks tests ────────────────────────────────
+
+    #[test]
+    fn test_strip_diagnostic_block_with_continuation_lines() {
+        let input = "I encountered an error.\n\n[DIAGNOSTIC] Similar errors resolved before:\n- Used terminal to resolve\n  Steps: run cargo build -> fix errors\n\nHere is what I found.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(!result.contains("[DIAGNOSTIC]"), "DIAGNOSTIC tag leaked: {result}");
+        assert!(
+            !result.contains("Similar errors resolved before"),
+            "diagnostic content leaked: {result}"
+        );
+        assert!(!result.contains("Used terminal"), "solution leaked: {result}");
+        assert!(!result.contains("Steps:"), "steps leaked: {result}");
+        assert!(result.contains("I encountered an error."));
+        assert!(result.contains("Here is what I found."));
+    }
+
+    #[test]
+    fn test_strip_tool_stats_block() {
+        let input = "The search failed.\n\n[TOOL STATS] search_files (24h): 8 calls, 0 failed (0%), avg 296ms\n  - 2x: pattern not found\n\nPlease try again.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(!result.contains("[TOOL STATS]"), "TOOL STATS tag leaked: {result}");
+        assert!(!result.contains("8 calls"), "stats content leaked: {result}");
+        assert!(!result.contains("296ms"), "stats content leaked: {result}");
+        assert!(result.contains("The search failed."));
+        assert!(result.contains("Please try again."));
+    }
+
+    #[test]
+    fn test_strip_system_block() {
+        let input = "Done.\n\n[SYSTEM] This tool has errored 2 semantic times. Do NOT retry it.\n\nI will try another approach.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(!result.contains("[SYSTEM]"), "SYSTEM tag leaked: {result}");
+        assert!(
+            !result.contains("errored 2 semantic times"),
+            "system content leaked: {result}"
+        );
+        assert!(result.contains("Done."));
+        assert!(result.contains("I will try another approach."));
+    }
+
+    #[test]
+    fn test_strip_diagnostic_blocks_preserves_normal_text() {
+        let input = "Here is the answer to your question: 42.";
+        let result = strip_diagnostic_blocks(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_strip_echoed_diagnostic_without_tag() {
+        let input = "I found an error. Similar errors resolved before:\n- Used terminal to fix it\n  Steps: run build -> check output\n\nLet me try something else.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(
+            !result.contains("Similar errors resolved before"),
+            "echoed diagnostic leaked: {result}"
+        );
+        assert!(result.contains("I found an error."));
+        assert!(result.contains("Let me try something else."));
+    }
+
+    #[test]
+    fn test_strip_multiple_diagnostic_blocks() {
+        let input = "Error occurred.\n\n[DIAGNOSTIC] Similar errors resolved before:\n- Fix via terminal\n\n[TOOL STATS] search_files (24h): 5 calls, 1 failed (20%), avg 100ms\n\n[SYSTEM] Do NOT retry. Use a different approach.\n\nI will search differently.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(!result.contains("[DIAGNOSTIC]"));
+        assert!(!result.contains("[TOOL STATS]"));
+        assert!(!result.contains("[SYSTEM]"));
+        assert!(!result.contains("Similar errors"));
+        assert!(!result.contains("5 calls"));
+        assert!(!result.contains("Do NOT retry"));
+        assert!(result.contains("Error occurred."));
+        assert!(result.contains("I will search differently."));
     }
 
     mod proptest_sanitize {

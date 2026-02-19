@@ -1617,5 +1617,12 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await;
 
+    // Migration: allow multiple episodes per session (for mid-session episode
+    // creation in long-running conversations). The non-unique index on session_id
+    // (idx_episodes_session) already exists for lookups.
+    let _ = sqlx::query("DROP INDEX IF EXISTS idx_episodes_session_unique")
+        .execute(pool)
+        .await;
+
     Ok(())
 }

@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
+use crate::providers::error::ProviderErrorKind;
 use crate::providers::ProviderError;
 use crate::traits::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
@@ -81,6 +82,7 @@ fn is_cloudflare_ai_gateway_base(base_url: &str) -> bool {
 }
 
 impl OpenAiCompatibleProvider {
+    #[allow(dead_code)]
     pub fn new(base_url: &str, api_key: &str) -> Result<Self, String> {
         Self::new_with_gateway_token(base_url, api_key, None)
     }
@@ -278,7 +280,15 @@ impl ModelProvider for OpenAiCompatibleProvider {
         };
         debug!("Provider response: {}", truncated);
 
-        let data: Value = serde_json::from_str(&text)?;
+        let data: Value = serde_json::from_str(&text).map_err(|e| {
+            error!("Failed to parse provider response JSON: {}", e);
+            ProviderError {
+                kind: ProviderErrorKind::ServerError,
+                status: Some(200),
+                message: format!("Malformed response from LLM provider (JSON parse error: {})", e),
+                retry_after_secs: None,
+            }
+        })?;
         let choice = data["choices"]
             .get(0)
             .ok_or_else(|| anyhow::anyhow!("No choices in response"))?;

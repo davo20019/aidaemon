@@ -795,8 +795,7 @@ pub fn build_system_prompt_with_memory(
         }
         if profile.asks_before_acting {
             prompt.push_str(
-                "- User prefers to be asked before significant actions are taken. \
-                For multi-step tasks, briefly state your plan and confirm before executing.\n",
+                "- User prefers confirmation before destructive or system-modifying actions (file deletion, deployment, config changes). For read-only exploration (searching files, listing directories, reading code), proceed directly without asking. For multi-step modification tasks, briefly state your plan and confirm before executing.\n",
             );
         }
     }

@@ -309,7 +309,7 @@ impl HeartbeatCoordinator {
     }
 
     /// Run one tick: 5-phase cycle.
-    async fn tick(&mut self) -> anyhow::Result<()> {
+    pub(crate) async fn tick(&mut self) -> anyhow::Result<()> {
         // Phase 0: Health check
         if let Err(e) = self.state.health_check().await {
             if self.db_healthy {

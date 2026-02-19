@@ -1616,6 +1616,7 @@ pub fn spawn_background_task_lead(
             let mut interval_count = 0u32;
             let mut last_progress_key: Option<String> = None;
             let mut repeated_progress = 0u32;
+            let mut planning_msg_count = 0u32;
             loop {
                 // First update after 15s, then every 30s
                 let wait_secs = if interval_count == 0 { 15 } else { 30 };
@@ -1631,15 +1632,21 @@ pub fn spawn_background_task_lead(
                     .await
                     .unwrap_or_default();
                 if tasks.is_empty() {
-                    // Tasks not yet created — generic message
-                    if let Some(hub_weak) = &heartbeat_hub {
-                        if let Some(hub_arc) = hub_weak.upgrade() {
-                            let _ = hub_arc
-                                .send_text(
-                                    &heartbeat_session,
-                                    "⏳ Still working on your request — planning the steps...",
-                                )
-                                .await;
+                    // Tasks not yet created — send one planning message only.
+                    // Previously sent at count 1 and 5, causing repeated spam.
+                    // Now: send only on the first empty-tasks heartbeat, then
+                    // stay silent until tasks are actually created.
+                    planning_msg_count += 1;
+                    if planning_msg_count == 1 {
+                        if let Some(hub_weak) = &heartbeat_hub {
+                            if let Some(hub_arc) = hub_weak.upgrade() {
+                                let _ = hub_arc
+                                    .send_text(
+                                        &heartbeat_session,
+                                        "⏳ Still working on your request — planning the steps...",
+                                    )
+                                    .await;
+                            }
                         }
                     }
                 } else {
@@ -2740,8 +2747,12 @@ impl Agent {
             .replace(" [prior turn]", "")
             .replace("[prior turn, truncated]", "")
             .replace("[prior turn]", "");
+        // First pass: strip entire diagnostic/control blocks (tag + content).
+        let blocks_cleaned =
+            crate::tools::sanitize::strip_diagnostic_blocks(&prior_turn_cleaned);
+        // Second pass: catch any remaining bare marker tags the block pass missed.
         let control_cleaned =
-            crate::tools::sanitize::strip_internal_control_markers(&prior_turn_cleaned);
+            crate::tools::sanitize::strip_internal_control_markers(&blocks_cleaned);
         let identity_cleaned =
             crate::tools::sanitize::strip_model_identity_leaks(&control_cleaned);
         crate::tools::sanitize::strip_tool_name_references(&identity_cleaned)
@@ -2849,9 +2860,38 @@ mod final_reply_marker_tests {
         let sanitized = Agent::sanitize_final_reply_markers(reply);
         assert!(!sanitized.contains("[SYSTEM]"));
         assert!(!sanitized.contains("[DIAGNOSTIC]"));
+        assert!(!sanitized.contains("internal note"), "SYSTEM content leaked: {sanitized}");
         assert!(!sanitized.contains("UNTRUSTED EXTERNAL DATA"));
         assert!(sanitized.contains("Done."));
-        assert!(sanitized.contains("payload"));
+    }
+
+    #[test]
+    fn strips_diagnostic_blocks_with_content_from_final_reply() {
+        let reply = "I encountered an error with the search.\n\n\
+            [DIAGNOSTIC] Similar errors resolved before:\n\
+            - Used terminal to resolve the issue\n\
+              Steps: run cargo build -> fix errors\n\n\
+            [TOOL STATS] search_files (24h): 8 calls, 0 failed (0%), avg 296ms\n\
+              - 2x: pattern not found\n\n\
+            [SYSTEM] This tool has errored 2 semantic times. Do NOT retry it.\n\n\
+            I will try a different approach.";
+        let sanitized = Agent::sanitize_final_reply_markers(reply);
+        assert!(!sanitized.contains("[DIAGNOSTIC]"), "DIAGNOSTIC tag leaked: {sanitized}");
+        assert!(
+            !sanitized.contains("Similar errors resolved before"),
+            "diagnostic content leaked: {sanitized}"
+        );
+        assert!(!sanitized.contains("Used terminal"), "solution leaked: {sanitized}");
+        assert!(!sanitized.contains("[TOOL STATS]"), "TOOL STATS tag leaked: {sanitized}");
+        assert!(!sanitized.contains("8 calls"), "stats content leaked: {sanitized}");
+        assert!(!sanitized.contains("296ms"), "stats duration leaked: {sanitized}");
+        assert!(!sanitized.contains("[SYSTEM]"), "SYSTEM tag leaked: {sanitized}");
+        assert!(
+            !sanitized.contains("errored 2 semantic times"),
+            "system content leaked: {sanitized}"
+        );
+        assert!(sanitized.contains("I encountered an error with the search."));
+        assert!(sanitized.contains("I will try a different approach."));
     }
 
     #[test]

@@ -488,7 +488,9 @@ impl TelegramChannel {
             ),
         };
 
-        let _ = bot.send_message(msg.chat.id, reply).await;
+        for chunk in split_message(&reply, 4096) {
+            let _ = bot.send_message(msg.chat.id, chunk).await;
+        }
     }
 
     /// Handle an incoming file/photo/audio/video/voice message.

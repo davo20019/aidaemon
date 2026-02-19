@@ -126,18 +126,22 @@ async fn test_cross_channel_fact_blocked() {
     );
 }
 
-/// DM conversations should recall ALL facts regardless of privacy level.
+/// DM conversations use semantic relevance filtering — only facts related to
+/// the current query are recalled, regardless of privacy level.  All privacy
+/// levels (Channel, Private, Global) are eligible; the filter is relevance,
+/// not privacy.
 #[tokio::test]
 async fn test_dm_recalls_all_facts() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
-    // Store facts with different privacy levels
+    // Store facts with different privacy levels — all guitar-related so a
+    // single query can match them via semantic/lexical relevance.
     harness
         .state
         .upsert_fact(
             "personal",
             "hobby",
-            "Plays guitar",
+            "Plays guitar in a jazz band",
             "user",
             Some("slack:C_MUSIC"),
             crate::types::FactPrivacy::Channel,
@@ -148,8 +152,8 @@ async fn test_dm_recalls_all_facts() {
         .state
         .upsert_fact(
             "personal",
-            "salary",
-            "Confidential info",
+            "guitar_brand",
+            "Owns a Fender Stratocaster guitar",
             "user",
             None,
             crate::types::FactPrivacy::Private,
@@ -160,8 +164,8 @@ async fn test_dm_recalls_all_facts() {
         .state
         .upsert_fact(
             "personal",
-            "timezone",
-            "EST",
+            "guitar_practice",
+            "Practices guitar every evening",
             "user",
             None,
             crate::types::FactPrivacy::Global,
@@ -169,12 +173,12 @@ async fn test_dm_recalls_all_facts() {
         .await
         .unwrap();
 
-    // Query from a DM (Private visibility)
+    // Query from a DM (Private visibility) — specifically about guitar
     harness
         .agent
         .handle_message(
             "dm_all_facts",
-            "tell me everything you know about me",
+            "what do you know about my guitar hobby",
             None,
             UserRole::Owner,
             ChannelContext::private("telegram"),
@@ -191,18 +195,18 @@ async fn test_dm_recalls_all_facts() {
         .unwrap();
     let content = sys["content"].as_str().unwrap();
 
-    // DM should see all facts
+    // DM should see relevant facts from all privacy levels
     assert!(
-        content.contains("guitar") || content.contains("Plays"),
-        "DM should see channel-scoped facts"
+        content.contains("jazz band") || content.contains("guitar"),
+        "DM should see channel-scoped facts when relevant"
     );
     assert!(
-        content.contains("Confidential") || content.contains("salary"),
-        "DM should see private facts"
+        content.contains("Fender") || content.contains("guitar_brand"),
+        "DM should see private facts when relevant"
     );
     assert!(
-        content.contains("EST") || content.contains("timezone"),
-        "DM should see global facts"
+        content.contains("Practices") || content.contains("guitar_practice"),
+        "DM should see global facts when relevant"
     );
 }
 

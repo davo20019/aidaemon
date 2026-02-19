@@ -27,3 +27,6 @@ pub fn derive_channel_id_from_session(session_id: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod comprehensive_tests;

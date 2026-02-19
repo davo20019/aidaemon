@@ -409,13 +409,14 @@ async fn test_memory_user_profile_affects_prompt() {
 async fn test_full_memory_stack_in_system_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
-    // 1. Facts
+    // 1. Facts — value must have lexical overlap with the test query
+    //    ("deploy and release") so channel-scoped semantic retrieval can match it.
     harness
         .state
         .upsert_fact(
             "project",
-            "language",
-            "Rust with Tokio async runtime",
+            "deploy_stack",
+            "Deploy and release pipeline uses Rust with Tokio async runtime",
             "agent",
             None,
             crate::types::FactPrivacy::Global,

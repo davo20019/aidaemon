@@ -21,80 +21,6 @@ fn infer_assistant_name_from_prompt(prompt: &str) -> Option<String> {
     None
 }
 
-fn fact_query_tokens(query: &str) -> Vec<String> {
-    query
-        .to_ascii_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|token| token.len() >= 2)
-        .map(|token| token.to_string())
-        .collect()
-}
-
-fn cached_fact_score(fact: &crate::traits::Fact, query_lower: &str, tokens: &[String]) -> f32 {
-    let haystack = format!(
-        "{} {} {}",
-        fact.category.to_ascii_lowercase(),
-        fact.key.to_ascii_lowercase(),
-        fact.value.to_ascii_lowercase()
-    );
-    let mut score = 0.0f32;
-
-    if !query_lower.trim().is_empty() && haystack.contains(query_lower) {
-        score += 1.0;
-    }
-    for token in tokens {
-        if haystack.contains(token) {
-            score += 0.2;
-        }
-    }
-
-    // Small freshness boost to prefer recently-updated facts when lexical scores tie.
-    let age_days = (Utc::now() - fact.updated_at).num_days().max(0) as f32;
-    let freshness = (1.0 / (1.0 + age_days / 30.0)) * 0.1;
-    score + freshness
-}
-
-fn select_cached_facts_for_prompt(
-    all_facts: &[crate::traits::Fact],
-    query: &str,
-    max: usize,
-) -> Vec<crate::traits::Fact> {
-    if all_facts.is_empty() || max == 0 {
-        return vec![];
-    }
-
-    let query_lower = query.to_ascii_lowercase();
-    let tokens = fact_query_tokens(&query_lower);
-    let has_query_signal = !query_lower.trim().is_empty() && !tokens.is_empty();
-
-    let mut ranked: Vec<(crate::traits::Fact, f32)> = all_facts
-        .iter()
-        .cloned()
-        .map(|fact| {
-            let score = if has_query_signal {
-                cached_fact_score(&fact, &query_lower, &tokens)
-            } else {
-                0.0
-            };
-            (fact, score)
-        })
-        .collect();
-
-    ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.0.updated_at.cmp(&a.0.updated_at))
-    });
-
-    if has_query_signal && ranked.iter().any(|(_, score)| *score > 0.0) {
-        ranked.into_iter().take(max).map(|(fact, _)| fact).collect()
-    } else {
-        let mut facts: Vec<crate::traits::Fact> = all_facts.to_vec();
-        facts.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        facts.into_iter().take(max).collect()
-    }
-}
-
 /// Remove a top-level markdown section and its body (until next "## " heading).
 pub(super) fn strip_markdown_section(prompt: &str, heading: &str) -> String {
     let mut out = String::with_capacity(prompt.len());
@@ -155,7 +81,13 @@ Guidelines:
 - complexity: "knowledge" = fully answerable now without tools (greetings, jokes, translations, general knowledge, conversational chat); "simple" = needs tools but doable now; "complex" = multi-session project.
 - When complexity is "knowledge", ALWAYS set can_answer_now=true and needs_tools=false.
 - Only include schedule fields if the user explicitly asks for deferred/recurring execution.
-- domains is optional; if set, use: rust, python, javascript, go, docker, kubernetes, infrastructure, web-frontend, web-backend, databases, git, system-admin, general."#
+- domains is optional; if set, use: rust, python, javascript, go, docker, kubernetes, infrastructure, web-frontend, web-backend, databases, git, system-admin, general.
+
+Clarification rules (IMPORTANT):
+- NEVER ask for clarification on read-only exploration tasks: searching files, counting lines, listing directories, reading code, running grep/find. Just set needs_tools=true.
+- Only set needs_clarification=true when there are genuinely MULTIPLE valid interpretations and the wrong choice would cause harm or wasted effort (e.g., which of 3 databases to modify, which branch to deploy).
+- If the user mentions a specific file, directory, or code entity, proceed with tools — do NOT ask "would you like me to search for that?".
+- When in doubt between asking and acting, prefer acting with tools. The user can always correct course."#
         }
         ConsultantPromptStyle::Lite => {
             r#"[IMPORTANT: CONSULTATION MODE]
@@ -388,38 +320,39 @@ impl Agent {
 
         // Fetch memory components — channel-scoped retrieval
         let inject_personal = channel_ctx.should_inject_personal_memory();
-        let owner_dm_cached_facts = if self.depth == 0
-            && user_role == UserRole::Owner
-            && matches!(
-                channel_ctx.visibility,
-                ChannelVisibility::Private | ChannelVisibility::Internal
-            ) {
-            owner_dm_fact_cache
-        } else {
-            None
-        };
 
-        // Facts: channel-scoped retrieval (replaces binary gate)
-        let facts = if let Some(all_facts) = owner_dm_cached_facts {
-            select_cached_facts_for_prompt(all_facts, user_text, self.max_facts)
-        } else {
-            self.state
-                .get_relevant_facts_for_channel(
-                    user_text,
-                    self.max_facts,
-                    channel_ctx.channel_id.as_deref(),
-                    channel_ctx.visibility,
-                )
-                .await?
-        };
-        // Critical facts are loaded from canonical storage (not just query relevance)
-        // so identity/profile recall remains stable under tight context budgets.
+        // Facts: always use channel-scoped semantic retrieval.
+        // Previously the owner_dm_fact_cache (all facts) was used here, but
+        // that caused unrelated facts (Ecuador travel, WiFi router tips, etc.)
+        // to bleed into prompts for unrelated queries like "count lines in router.rs".
+        let facts = self
+            .state
+            .get_relevant_facts_for_channel(
+                user_text,
+                self.max_facts,
+                channel_ctx.channel_id.as_deref(),
+                channel_ctx.visibility,
+            )
+            .await?;
+
+        // Critical facts (identity/profile) use the pre-fetched identity-only
+        // cache from bootstrap, NOT get_facts(None) which returns ALL facts.
         let mut critical_fact_summary = if inject_personal && user_role == UserRole::Owner {
-            if let Some(all_facts) = owner_dm_cached_facts {
-                extract_critical_fact_summary(all_facts)
+            if let Some(identity_facts) = owner_dm_fact_cache {
+                extract_critical_fact_summary(identity_facts)
             } else {
-                let all_facts = self.state.get_facts(None).await.unwrap_or_default();
-                extract_critical_fact_summary(&all_facts)
+                // No cache available (non-bootstrap path) — fetch identity
+                // categories directly instead of get_facts(None) which returns all.
+                let mut identity_facts = Vec::new();
+                for cat in &[
+                    "identity", "personal", "profile", "user", "assistant", "bot",
+                    "relationship", "preference", "family",
+                ] {
+                    if let Ok(mut facts) = self.state.get_facts(Some(cat)).await {
+                        identity_facts.append(&mut facts);
+                    }
+                }
+                extract_critical_fact_summary(&identity_facts)
             }
         } else {
             Default::default()

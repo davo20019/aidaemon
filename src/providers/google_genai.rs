@@ -7,6 +7,7 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 use crate::llm_markers::CONSULTANT_TEXT_ONLY_MARKER;
+use crate::providers::error::ProviderErrorKind;
 use crate::providers::ProviderError;
 use crate::traits::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
@@ -732,7 +733,15 @@ impl ModelProvider for GoogleGenAiProvider {
                     let retry_status = retry_resp.status();
                     let retry_text = retry_resp.text().await?;
                     if retry_status.is_success() {
-                        let data: Value = serde_json::from_str(&retry_text)?;
+                        let data: Value = serde_json::from_str(&retry_text).map_err(|e| {
+                            error!("Failed to parse Google GenAI retry response JSON: {}", e);
+                            ProviderError {
+                                kind: ProviderErrorKind::ServerError,
+                                status: Some(200),
+                                message: format!("Malformed response from LLM provider (JSON parse error: {})", e),
+                                retry_after_secs: None,
+                            }
+                        })?;
                         return self.parse_response(&data, model);
                     }
                     error!(
@@ -749,7 +758,15 @@ impl ModelProvider for GoogleGenAiProvider {
             return Err(ProviderError::from_status(status.as_u16(), &text).into());
         }
 
-        let data: Value = serde_json::from_str(&text)?;
+        let data: Value = serde_json::from_str(&text).map_err(|e| {
+            error!("Failed to parse Google GenAI response JSON: {}", e);
+            ProviderError {
+                kind: ProviderErrorKind::ServerError,
+                status: Some(200),
+                message: format!("Malformed response from LLM provider (JSON parse error: {})", e),
+                retry_after_secs: None,
+            }
+        })?;
         self.parse_response(&data, model)
     }
 

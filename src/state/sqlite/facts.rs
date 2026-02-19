@@ -1,11 +1,65 @@
 use super::*;
 
-const FACT_SEMANTIC_MIN_SCORE: f32 = 0.5;
-const FACT_LEXICAL_MIN_SCORE: f32 = 0.35;
+const FACT_SEMANTIC_MIN_SCORE: f32 = 0.3;
+const FACT_LEXICAL_MIN_SCORE: f32 = 0.3;
 const FACT_LEXICAL_MAX_SCORE: f32 = 0.55;
 const FACT_FRESHNESS_MAX_BOOST: f32 = 0.15;
 const FACT_FRESHNESS_DECAY_HOURS: f32 = 168.0; // 7 days
-const FACT_PAD_LOW_CONFIDENCE_RESULTS: bool = false;
+const FACT_PAD_LOW_CONFIDENCE_RESULTS: bool = true;
+
+/// Keywords that signal the user wants ALL facts, not a filtered subset.
+const EXHAUSTIVE_QUERY_MARKERS: &[&str] = &[
+    "everything you know",
+    "everything about me",
+    "all about me",
+    "all you know",
+    "tell me everything",
+    "complete list",
+    "full list",
+    "what do you know about me",
+    "what do you remember",
+    "list all",
+    "list everything",
+    "verify your memory",
+    "memory check",
+    "memory test",
+    "dump all",
+];
+
+fn is_exhaustive_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    EXHAUSTIVE_QUERY_MARKERS.iter().any(|m| q.contains(m))
+}
+
+/// Build a key-only embedding text for semantic dedup comparison.
+///
+/// Focuses on category + readable key (no value) so that dedup detects
+/// keys referring to the same concept regardless of their values.
+fn build_dedup_key_text(category: &str, key: &str) -> String {
+    let readable_key = key.replace('_', " ").replace('-', " ");
+    format!(
+        "The user's {} {}. {} attribute: {}",
+        category, readable_key, category, readable_key
+    )
+}
+
+/// Build a natural-language embedding text for a fact.
+///
+/// Instead of `[project] inter_service: gRPC`, this produces something like:
+/// `"Project: inter-service communication technology is gRPC"`
+///
+/// Natural language embeds much better against natural language queries
+/// like "What tech stack does my project use?".
+pub(crate) fn build_fact_embedding_text(category: &str, key: &str, value: &str) -> String {
+    // Convert underscore/hyphen keys to readable form
+    let readable_key = key.replace('_', " ").replace('-', " ");
+
+    // Build a natural-language sentence
+    format!(
+        "{} - {}: {}. The user's {} is {}.",
+        category, readable_key, value, readable_key, value
+    )
+}
 
 async fn bump_fact_recall(pool: &SqlitePool, facts: &[Fact]) {
     if facts.is_empty() {
@@ -215,6 +269,124 @@ impl crate::traits::FactStore for SqliteStateStore {
             }
         }
 
+        // Semantic dedup: if key-based matching found nothing, check if any active
+        // fact in the same category is semantically equivalent (different key, same
+        // concept). Catches synonym keys like "editor" vs "preferred_editor".
+        //
+        // We compare key-only embeddings (category + readable key) rather than
+        // full fact embeddings (which include value), because dedup should detect
+        // that two keys refer to the same concept regardless of their values.
+        if existing.is_none() {
+            let new_key_text = build_dedup_key_text(category_clean, key_clean);
+            if let Ok(new_vec) = self.embedding_service.embed(new_key_text).await {
+                let category_facts = sqlx::query(
+                    "SELECT id, key, value FROM facts
+                     WHERE category = ? AND superseded_at IS NULL",
+                )
+                .bind(category_clean)
+                .fetch_all(&self.pool)
+                .await?;
+
+                let new_tokens: std::collections::HashSet<&str> = canonical_key
+                    .split('_')
+                    .filter(|t| !t.is_empty())
+                    .collect();
+
+                let mut best_match: Option<(i64, String, String, f32)> = None;
+                for row in &category_facts {
+                    let existing_key: String = row.get("key");
+                    let existing_canonical = canonicalize_fact_key(&existing_key);
+
+                    // Guard against false semantic matches for keys that are
+                    // structurally similar but intentionally distinct.
+                    //
+                    // If keys share SOME tokens, have the same token count, but
+                    // differ in at least one token, they're variants of the same
+                    // base concept (e.g., "dog_name_old" vs "dog_name_new") — skip.
+                    //
+                    // But allow through:
+                    // - Keys that are a subset/superset (modifier pattern):
+                    //   "editor" vs "preferred_editor" — different count, proceed.
+                    // - Keys that are just reordered (same tokens, same count):
+                    //   "company_previous" vs "previous_company" — all shared, proceed.
+                    // - Keys with zero overlap: completely different concepts.
+                    let existing_tokens: std::collections::HashSet<&str> =
+                        existing_canonical
+                            .split('_')
+                            .filter(|t| !t.is_empty())
+                            .collect();
+                    let shared = new_tokens.intersection(&existing_tokens).count();
+                    let new_count = new_tokens.len();
+                    let existing_count = existing_tokens.len();
+
+                    // Skip when both keys are single-token — short keys embed
+                    // too similarly in MiniLM (e.g., "sem0" vs "sem1", "age"
+                    // vs "name"). Canonical scan already handles single-word
+                    // matches. Semantic dedup is for multi-word synonym patterns.
+                    if new_count <= 1 && existing_count <= 1 {
+                        continue;
+                    }
+
+                    // Skip when keys have partial overlap that indicates
+                    // intentionally distinct variants rather than synonyms.
+                    //
+                    // Allow through (don't skip):
+                    // - Zero overlap: different concept names that might be
+                    //   synonyms (e.g., no shared tokens at all).
+                    // - Subset/superset: one key's tokens are fully contained
+                    //   in the other (modifier pattern: "editor" ⊂
+                    //   "preferred_editor"). The extra token is a qualifier.
+                    // - Full overlap with reordering: same tokens, different
+                    //   order (e.g., "company_previous" vs "previous_company").
+                    //
+                    // Skip (continue):
+                    // - Partial overlap where neither is a subset of the other:
+                    //   keys share a base but differ in distinguishing tokens
+                    //   (e.g., "dog_name_old" vs "dog_name_new" — shared
+                    //   {"dog","name"} but "old" vs "new" differ).
+                    let is_subset = new_tokens.is_subset(&existing_tokens)
+                        || existing_tokens.is_subset(&new_tokens);
+                    if shared > 0 && !is_subset {
+                        continue;
+                    }
+
+                    let existing_key_text =
+                        build_dedup_key_text(category_clean, &existing_key);
+                    if let Ok(existing_vec) =
+                        self.embedding_service.embed(existing_key_text).await
+                    {
+                        let sim = crate::memory::math::cosine_similarity(
+                            &new_vec,
+                            &existing_vec,
+                        );
+                        if sim > 0.85 {
+                            let score =
+                                best_match.as_ref().map(|m| m.3).unwrap_or(0.0);
+                            if sim > score {
+                                best_match = Some((
+                                    row.get("id"),
+                                    existing_key.clone(),
+                                    row.get::<String, _>("value"),
+                                    sim,
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                if let Some((id, matched_key, matched_value, sim)) = best_match {
+                    tracing::info!(
+                        category = category_clean,
+                        new_key = key_clean,
+                        matched_key = matched_key.as_str(),
+                        similarity = sim,
+                        "Semantic dedup: matched existing fact by embedding similarity"
+                    );
+                    existing = Some((id, matched_key, matched_value));
+                }
+            }
+        }
+
         let key_for_write = existing
             .as_ref()
             .map(|(_, k, _)| k.clone())
@@ -227,7 +399,7 @@ impl crate::traits::FactStore for SqliteStateStore {
             });
 
         // Pre-compute embedding for the fact text (best-effort).
-        let fact_text = format!("[{}] {}: {}", category_clean, key_for_write, value);
+        let fact_text = build_fact_embedding_text(category_clean, &key_for_write, value);
         let embedding_blob = self
             .embedding_service
             .embed(fact_text)
@@ -443,6 +615,20 @@ impl crate::traits::FactStore for SqliteStateStore {
             return Ok(facts);
         }
 
+        // Exhaustive queries ("tell me everything", "what do you know about me")
+        // bypass semantic search and return all facts to avoid retrieval gaps.
+        if is_exhaustive_query(query) {
+            tracing::info!(
+                query = query,
+                total_facts = all_facts.len(),
+                "Exhaustive query detected — returning all facts without scoring"
+            );
+            let mut facts = all_facts;
+            facts.truncate(max);
+            bump_fact_recall(&self.pool, &facts).await;
+            return Ok(facts);
+        }
+
         // Embed the query
         let query_vec = match self.embedding_service.embed(query.to_string()).await {
             Ok(v) => v,
@@ -553,16 +739,15 @@ impl crate::traits::FactStore for SqliteStateStore {
         channel_id: Option<&str>,
         visibility: ChannelVisibility,
     ) -> anyhow::Result<Vec<Fact>> {
-        // In DM/Internal contexts, prioritize complete personal recall and keep
-        // the result capped by `max` for prompt budget safety.
+        // In DM/Internal contexts, use semantic relevance search so that only
+        // facts related to the current query are injected into the prompt.
+        // Previously this called get_facts(None) which returned ALL facts
+        // without filtering, causing unrelated facts to bleed into context.
         if matches!(
             visibility,
             ChannelVisibility::Private | ChannelVisibility::Internal
         ) {
-            let mut facts = self.get_facts(None).await?;
-            facts.truncate(max);
-            bump_fact_recall(&self.pool, &facts).await;
-            return Ok(facts);
+            return self.get_relevant_facts(query, max).await;
         }
 
         // PublicExternal: do NOT inject any stored facts (treat as untrusted).

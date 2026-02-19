@@ -60,7 +60,25 @@ impl Agent {
         max_chars: usize,
     ) -> Option<String> {
         let history = self.state.get_history(session_id, 80).await.ok()?;
-        history.iter().rev().find_map(|msg| {
+
+        // Predicate: is this line internal metadata that shouldn't be shown to users?
+        let is_metadata_line = |line: &str| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("[SYSTEM]") || trimmed.starts_with("[UNTRUSTED EXTERNAL DATA")
+        };
+
+        // Low-information tool names whose output is rarely useful as a user-facing
+        // summary (e.g., "File written to /path, 200 bytes").  We still fall back to
+        // them if nothing better is available.
+        const LOW_INFO_TOOLS: &[&str] = &[
+            "write_file",
+            "edit_file",
+            "manage_memories",
+            "manage_people",
+            "remember_fact",
+        ];
+
+        let clean_tool_content = |msg: &crate::traits::Message| -> Option<String> {
             if msg.role != "tool" {
                 return None;
             }
@@ -70,7 +88,7 @@ impl Agent {
             }
             let cleaned = content
                 .lines()
-                .filter(|line| !line.trim_start().starts_with("[SYSTEM]"))
+                .filter(|line| !is_metadata_line(line))
                 .collect::<Vec<_>>()
                 .join("\n");
             let cleaned = cleaned.trim();
@@ -78,6 +96,20 @@ impl Agent {
                 return None;
             }
             Some(truncate_with_note(cleaned, max_chars))
+        };
+
+        // Only return output from informative tools (terminal, search, etc.).
+        // State-changing tools (remember_fact, manage_memories, write_file, etc.)
+        // produce confirmations ("Remembered: ...", "Forgotten: ...") that are
+        // self-documenting.  Wrapping them with "Here is the latest tool output:"
+        // creates confusing debugging-style messages.  When only low-info tools
+        // ran, return None so the LLM's natural response passes through instead.
+        history.iter().rev().find_map(|msg| {
+            let tool_name = msg.tool_name.as_deref().unwrap_or("");
+            if LOW_INFO_TOOLS.contains(&tool_name) {
+                return None;
+            }
+            clean_tool_content(msg)
         })
     }
 
@@ -993,6 +1025,64 @@ impl Agent {
                     }),
                 )
                 .await;
+
+                // Prefer surfacing the latest tool output directly when the work
+                // was done but the model failed to compose a summary. This gives
+                // the user concrete results instead of a generic canned message.
+                if unrecovered_errors == 0 {
+                    if let Some(tool_output) = self
+                        .latest_non_system_tool_output_excerpt(session_id, 2500)
+                        .await
+                    {
+                        let activity =
+                            post_task::categorize_tool_calls(&learning_ctx.tool_calls);
+                        let mut reply = String::from(
+                            "I completed the requested work but the loop stalled before \
+                             composing a final summary. Here's what was done:\n\n",
+                        );
+                        if !activity.is_empty() {
+                            reply.push_str(&activity);
+                        }
+                        reply.push_str("Latest output:\n\n");
+                        reply.push_str(&tool_output);
+
+                        let assistant_msg = Message {
+                            id: Uuid::new_v4().to_string(),
+                            session_id: session_id.to_string(),
+                            role: "assistant".to_string(),
+                            content: Some(reply.clone()),
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_calls_json: None,
+                            created_at: Utc::now(),
+                            importance: 0.5,
+                            embedding: None,
+                        };
+                        self.append_assistant_message_with_event(
+                            emitter,
+                            &assistant_msg,
+                            &model,
+                            None,
+                            None,
+                        )
+                        .await?;
+
+                        self.emit_task_end(
+                            emitter,
+                            task_id,
+                            TaskStatus::Completed,
+                            task_start,
+                            iteration,
+                            learning_ctx.tool_calls.len(),
+                            None,
+                            Some(reply.chars().take(200).collect()),
+                        )
+                        .await;
+                        commit_state!();
+                        return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
+                    }
+                }
+
                 let result = self
                     .graceful_partial_stall_response(
                         emitter,
@@ -1112,6 +1202,48 @@ Here is the latest tool output:\n\n{}",
                 }),
             )
             .await;
+            // Before giving up, try a knowledge-only fallback (no tools).
+            // If the model can answer from training knowledge, return that
+            // instead of the unhelpful "I wasn't able to complete" message.
+            let error_summary = if learning_ctx.errors.is_empty() {
+                "tools produced no results".to_string()
+            } else {
+                learning_ctx
+                    .errors
+                    .iter()
+                    .take(2)
+                    .map(|(msg, _)| msg.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            if let Some(result) = self
+                .graceful_knowledge_fallback(
+                    emitter,
+                    session_id,
+                    &learning_ctx.user_text,
+                    &error_summary,
+                )
+                .await
+            {
+                info!(session_id, "Knowledge fallback succeeded after tool stall");
+                self.emit_task_end(
+                    emitter,
+                    task_id,
+                    TaskStatus::Completed,
+                    task_start,
+                    iteration,
+                    learning_ctx.tool_calls.len(),
+                    None,
+                    result
+                        .as_ref()
+                        .ok()
+                        .map(|r| r.chars().take(200).collect::<String>()),
+                )
+                .await;
+                commit_state!();
+                return Ok(StoppingPhaseOutcome::Return(result));
+            }
+
             let result = self
                 .graceful_stall_response(
                     emitter,

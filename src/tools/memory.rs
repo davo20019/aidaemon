@@ -25,9 +25,56 @@ impl RememberFactTool {
 
 #[derive(Deserialize)]
 struct RememberArgs {
+    category: Option<String>,
+    key: Option<String>,
+    value: Option<String>,
+    #[serde(default)]
+    facts: Option<Vec<FactEntry>>,
+}
+
+#[derive(Deserialize)]
+struct FactEntry {
     category: String,
     key: String,
     value: String,
+}
+
+const PERSONA_PATTERNS: &[&str] = &[
+    "talk like",
+    "speak like",
+    "act like",
+    "act as",
+    "pretend to be",
+    "roleplay",
+    "persona",
+    "character voice",
+    "pirate",
+    "accent",
+    "from now on",
+    "new identity",
+    "speak in character",
+    "respond as",
+];
+
+fn is_persona_manipulation(category: &str, key: &str, value: &str) -> bool {
+    let combined = format!("{} {} {}", category, key, value).to_ascii_lowercase();
+    PERSONA_PATTERNS.iter().any(|p| combined.contains(p))
+}
+
+fn is_goal_fact(category: &str, key: &str, value: &str) -> bool {
+    let category_lower = category.trim().to_ascii_lowercase();
+    let key_lower = key.trim().to_ascii_lowercase();
+    let value_lower = value.trim().to_ascii_lowercase();
+    let looks_like_personal_goal_key =
+        key_lower.starts_with("personal_goal") || key_lower.contains("personal_goal");
+    let looks_like_user_goal_key =
+        key_lower.starts_with("goal_") && matches!(category_lower.as_str(), "user" | "preference");
+    let looks_like_goal_value = matches!(category_lower.as_str(), "user" | "preference")
+        && (value_lower.contains("my goal")
+            || value_lower.contains("personal goal")
+            || value_lower.contains("goal is to")
+            || value_lower.starts_with("goal:"));
+    looks_like_personal_goal_key || looks_like_user_goal_key || looks_like_goal_value
 }
 
 #[async_trait]
@@ -37,30 +84,52 @@ impl Tool for RememberFactTool {
     }
 
     fn description(&self) -> &str {
-        "Store a long-lived fact (not goals or schedules) for long-term memory"
+        "Store one or more long-lived facts (not goals or schedules) for long-term memory"
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "remember_fact",
-            "description": "Store a stable, long-term fact about the user or their environment. Facts are injected into your system prompt on every request, so only store things that are persistently useful — user preferences, personal info, environment details, communication patterns. Do NOT store task-scoped research, reference data gathered for a specific project, or content being built (e.g., product prices, API docs, website copy). Do NOT use this for personal goals or scheduled work; use the manage_memories tool (create_personal_goal / create_scheduled_goal) for goals.",
+            "description": "Store one or more stable, long-term facts about the user or their environment. Facts are injected into your system prompt on every request, so only store things that are persistently useful — user preferences, personal info, environment details, communication patterns. Do NOT store task-scoped research, reference data gathered for a specific project, or content being built (e.g., product prices, API docs, website copy). Do NOT use this for personal goals or scheduled work; use the manage_memories tool (create_personal_goal / create_scheduled_goal) for goals. For multiple facts, use the 'facts' array parameter instead of making separate calls.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "category": {
                         "type": "string",
-                        "description": "Category for the fact (e.g. 'user', 'preference', 'project')"
+                        "description": "Category for a single fact (e.g. 'user', 'preference', 'project')"
                     },
                     "key": {
                         "type": "string",
-                        "description": "A unique key for this fact within the category"
+                        "description": "A unique key for a single fact within the category"
                     },
                     "value": {
                         "type": "string",
-                        "description": "The fact to remember"
+                        "description": "The single fact to remember"
+                    },
+                    "facts": {
+                        "type": "array",
+                        "description": "Batch mode: an array of facts to store at once. Use this when the user mentions multiple facts in one message.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "category": {
+                                    "type": "string",
+                                    "description": "Category for this fact"
+                                },
+                                "key": {
+                                    "type": "string",
+                                    "description": "A unique key for this fact"
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": "The fact to remember"
+                                }
+                            },
+                            "required": ["category", "key", "value"]
+                        }
                     }
                 },
-                "required": ["category", "key", "value"]
+                "additionalProperties": false
             }
         })
     }
@@ -72,69 +141,68 @@ impl Tool for RememberFactTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: RememberArgs = serde_json::from_str(arguments)?;
 
-        // Reject persona/identity manipulation saves
-        let combined =
-            format!("{} {} {}", args.category, args.key, args.value).to_ascii_lowercase();
-        let persona_patterns = [
-            "talk like",
-            "speak like",
-            "act like",
-            "act as",
-            "pretend to be",
-            "roleplay",
-            "persona",
-            "character voice",
-            "pirate",
-            "accent",
-            "from now on",
-            "new identity",
-            "speak in character",
-            "respond as",
-        ];
-        if persona_patterns.iter().any(|p| combined.contains(p)) {
-            return Ok(
-                "Rejected: Cannot save persona or identity changes as facts. \
-                 I maintain a consistent identity across all interactions."
-                    .to_string(),
-            );
-        }
-
-        // Reject personal goal tracking in facts. The goal registry is the source of truth.
-        let category_lower = args.category.trim().to_ascii_lowercase();
-        let key_lower = args.key.trim().to_ascii_lowercase();
-        let value_lower = args.value.trim().to_ascii_lowercase();
-        let looks_like_personal_goal_key =
-            key_lower.starts_with("personal_goal") || key_lower.contains("personal_goal");
-        let looks_like_user_goal_key = key_lower.starts_with("goal_")
-            && matches!(category_lower.as_str(), "user" | "preference");
-        let looks_like_goal_value = matches!(category_lower.as_str(), "user" | "preference")
-            && (value_lower.contains("my goal")
-                || value_lower.contains("personal goal")
-                || value_lower.contains("goal is to")
-                || value_lower.starts_with("goal:"));
-        if looks_like_personal_goal_key || looks_like_user_goal_key || looks_like_goal_value {
-            return Ok(
-                "Rejected: Personal goals should be tracked in the goal registry (not facts). \
-                 Use manage_memories(action='create_personal_goal', goal='...') instead."
-                    .to_string(),
-            );
-        }
+        // Build the list of facts to store (batch or single)
+        let entries: Vec<FactEntry> = if let Some(facts) = args.facts {
+            if facts.is_empty() {
+                anyhow::bail!("'facts' array is empty — provide at least one fact");
+            }
+            facts
+        } else {
+            // Single-fact mode: require all three fields
+            let category = args
+                .category
+                .ok_or_else(|| anyhow::anyhow!("'category' is required (or use 'facts' array)"))?;
+            let key = args
+                .key
+                .ok_or_else(|| anyhow::anyhow!("'key' is required (or use 'facts' array)"))?;
+            let value = args
+                .value
+                .ok_or_else(|| anyhow::anyhow!("'value' is required (or use 'facts' array)"))?;
+            vec![FactEntry {
+                category,
+                key,
+                value,
+            }]
+        };
 
         let channel_id = self.current_channel_id.read().await.clone();
-        // When explicitly remembered by the agent, default to global privacy
-        self.state
-            .upsert_fact(
-                &args.category,
-                &args.key,
-                &args.value,
-                "agent",
-                channel_id.as_deref(),
-                FactPrivacy::Global,
-            )
-            .await?;
-        Ok(format!(
-            "Remembered: [{}] {} = {}",
-            args.category, args.key, args.value
-        ))
+        let mut results = Vec::new();
+
+        for entry in &entries {
+            // Reject persona/identity manipulation saves
+            if is_persona_manipulation(&entry.category, &entry.key, &entry.value) {
+                results.push(format!(
+                    "Rejected [{}] {}: cannot save persona/identity changes",
+                    entry.category, entry.key
+                ));
+                continue;
+            }
+
+            // Reject personal goal tracking in facts
+            if is_goal_fact(&entry.category, &entry.key, &entry.value) {
+                results.push(format!(
+                    "Rejected [{}] {}: use manage_memories(create_personal_goal) for goals",
+                    entry.category, entry.key
+                ));
+                continue;
+            }
+
+            self.state
+                .upsert_fact(
+                    &entry.category,
+                    &entry.key,
+                    &entry.value,
+                    "agent",
+                    channel_id.as_deref(),
+                    FactPrivacy::Global,
+                )
+                .await?;
+            results.push(format!(
+                "Remembered: [{}] {} = {}",
+                entry.category, entry.key, entry.value
+            ));
+        }
+
+        Ok(results.join("\n"))
     }
 }

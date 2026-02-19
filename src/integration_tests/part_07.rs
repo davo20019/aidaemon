@@ -66,23 +66,24 @@ async fn test_orchestration_simple_falls_through_to_full_loop() {
 
 #[tokio::test]
 async fn test_orchestration_complex_creates_goal() {
-    // Orchestration always-on, complex request → goal created, task lead spawned.
-    // No plan generation pre-loop call (removed).
+    // Deterministic pre-routing classifies the request as complex based on
+    // keyword heuristics (action markers + compound keywords), creates a goal,
+    // and spawns a task lead synchronously (no self_ref in tests).
+    // No consultant LLM call — routing is purely deterministic.
     let provider = MockProvider::with_responses(vec![
-        // 1st call: consultant pass — analysis (complex request detected)
-        MockProvider::text_response(
-            "This is a complex multi-step task requiring setup and deployment.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
-        ),
-        // 2nd+ calls: task lead (after orchestration creates goal and spawns task lead)
+        // Task lead's LLM call — deterministic routing creates the goal
+        // without an LLM call, then the task lead runs the agent loop.
         MockProvider::text_response("I'll start working on building your website."),
     ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
+    // User text must trigger looks_like_complex_request_fallback():
+    // >=3 action markers (analyze, compare, identify, find, summarize) + compound ("and"/"then")
     let response = harness
         .agent
         .handle_message(
             "test_session",
-            "Build me a full-stack website with user authentication, role-based access control, a PostgreSQL database with migrations, comprehensive API documentation, integration and unit tests, and deploy the whole stack to production with CI/CD pipeline configuration",
+            "Analyze the requirements and compare authentication libraries, then identify the best frameworks, find suitable database solutions, and summarize the deployment options for a full-stack website with CI/CD pipeline",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -105,23 +106,26 @@ async fn test_orchestration_complex_creates_goal() {
     assert_eq!(goals[0].status, "completed");
     assert!(goals[0]
         .description
-        .contains("Build me a full-stack website"));
+        .contains("Analyze the requirements"));
 }
 
 #[tokio::test]
 async fn test_orchestration_complex_internal_maintenance_does_not_create_goal() {
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            "This is a complex maintenance request.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
-        ),
-    ]);
+    // Deterministic routing classifies this as complex (action markers trigger
+    // looks_like_complex_request_fallback), but handle_complex_intent detects
+    // maintenance keywords and returns a canned response without creating a goal.
+    // No LLM calls needed — both routing and maintenance detection are deterministic.
+    let provider = MockProvider::new(); // No scripted responses needed
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
+    // User text triggers complex classification (analyze, identify, find, report = 4 action
+    // markers + "and"/"then") AND matches is_internal_maintenance_intent (process embeddings
+    // + consolidate memories + decay old facts).
     let response = harness
         .agent
         .handle_message(
             "test_session",
-            "Maintain knowledge base: process embeddings, consolidate memories, decay old facts",
+            "Analyze the knowledge base and identify stale entries, then process embeddings, consolidate memories, find outdated data, and report on decay old facts",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -290,18 +294,14 @@ async fn test_personal_recall_challenge_scopes_tools_and_reaffirms() {
 
 #[tokio::test]
 async fn test_personal_recall_challenge_inherits_previous_turn_context() {
+    // With deterministic routing (no consultant LLM pass), each turn makes a
+    // single LLM call through the normal agent loop. The deterministic routing
+    // classifies both messages as Simple (no action markers, no schedule) and
+    // falls through to the execution loop.
     let provider = MockProvider::with_responses(vec![
-        // Turn 1 classifier: can answer directly
-        MockProvider::text_response(
-            "I can answer this from memory.\n[INTENT_GATE] {\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
-        ),
-        // Turn 1 executor: direct answer
+        // Turn 1: execution loop — direct answer
         MockProvider::text_response("I don't have information about pets."),
-        // Turn 2 classifier: challenge inherits context, can still answer directly
-        MockProvider::text_response(
-            "I can answer this from memory.\n[INTENT_GATE] {\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
-        ),
-        // Turn 2 executor: reaffirms with inherited context
+        // Turn 2: execution loop — reaffirmation
         MockProvider::text_response("I still do not have that information saved in memory."),
     ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
@@ -320,7 +320,7 @@ async fn test_personal_recall_challenge_inherits_previous_turn_context() {
         .unwrap();
     assert!(
         first.contains("don't have information about pets"),
-        "Expected inherited personal-recall context, got: {}",
+        "Expected personal-recall context, got: {}",
         first
     );
 
@@ -336,17 +336,14 @@ async fn test_personal_recall_challenge_inherits_previous_turn_context() {
         )
         .await
         .unwrap();
-    // Reaffirmation challenge forces needs_tools=true (for memory re-check),
-    // but no personal memory tools are available in the test setup, so the
-    // agent returns a "no tools available" message instead of a recall answer.
     assert!(
         second.contains("do not have") || second.contains("requires running tools"),
         "Expected no-information reaffirmation or tools-unavailable message, got: {}",
         second
     );
-    // Consultant flow: 2 calls per turn (classifier + executor) × 2 turns = 4
+    // No consultant pass: 1 LLM call per turn x 2 turns = 2
     assert!(
-        harness.provider.call_count().await <= 5,
+        harness.provider.call_count().await <= 3,
         "Follow-up challenge should stay bounded and not spiral"
     );
 }
@@ -482,9 +479,10 @@ async fn test_orchestration_scheduled_recurring_creates_pending_confirmation() {
 
 #[tokio::test]
 async fn test_orchestration_schedule_confirm_activates_goal() {
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
-    )]);
+    // Deterministic routing detects "in 2 hours" via schedule heuristic (no LLM call).
+    // "confirm" is handled by the confirmation gate (also no LLM call).
+    // Total LLM calls across both messages = 0.
+    let provider = MockProvider::new(); // No scripted responses needed
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let _ = harness
@@ -523,8 +521,8 @@ async fn test_orchestration_schedule_confirm_activates_goal() {
     assert_eq!(goals[0].status, "active");
     assert_eq!(
         harness.provider.call_count().await,
-        1,
-        "confirm should be handled by confirmation gate without LLM call"
+        0,
+        "Both schedule creation (deterministic) and confirm (gate) should work without LLM calls"
     );
 }
 

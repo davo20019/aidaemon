@@ -98,11 +98,16 @@ impl MemoryManager {
             },
         );
 
-        // Episode creation (every 30 minutes)
+        // Episode creation (every 30 minutes) — idle sessions + long-running active sessions
         let mgr = self.clone();
         heartbeat.register_job("episodes", Duration::from_secs(30 * 60), move || {
             let m = mgr.clone();
-            async move { m.create_episodes_for_idle_sessions().await }
+            async move {
+                if let Err(e) = m.create_episodes_for_idle_sessions().await {
+                    tracing::warn!(error = %e, "Failed to create episodes for idle sessions");
+                }
+                m.create_episodes_for_active_long_sessions().await
+            }
         });
 
         // Pattern detection and style analysis (every 6 hours)
@@ -1024,10 +1029,11 @@ impl MemoryManager {
             .unwrap_or_else(Utc::now);
         let now = Utc::now();
 
-        // Insert episode (OR IGNORE to handle concurrent creation for same session)
+        // Insert episode. Multiple episodes per session are allowed (mid-session
+        // episodes for long-running conversations + final idle-session episode).
         let topics_json = serde_json::to_string(&analysis.topics).ok();
         let result = sqlx::query(
-            "INSERT OR IGNORE INTO episodes (session_id, summary, topics, emotional_tone, outcome, importance, recall_count, message_count, start_time, end_time, created_at)
+            "INSERT INTO episodes (session_id, summary, topics, emotional_tone, outcome, importance, recall_count, message_count, start_time, end_time, created_at)
              VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)"
         )
         .bind(session_id)
@@ -1044,14 +1050,13 @@ impl MemoryManager {
         .await?;
 
         if result.rows_affected() == 0 {
-            // Race condition: another consolidation cycle already created an episode for this session.
-            // Fetch the existing episode ID and return it.
+            // Shouldn't happen now that unique constraint is removed, but handle gracefully.
             info!(
                 session_id,
-                "Episode already exists for session, using existing"
+                "Episode insert returned 0 rows affected"
             );
             let existing: Option<(i64,)> =
-                sqlx::query_as("SELECT id FROM episodes WHERE session_id = ? LIMIT 1")
+                sqlx::query_as("SELECT id FROM episodes WHERE session_id = ? ORDER BY created_at DESC LIMIT 1")
                     .bind(session_id)
                     .fetch_optional(&self.pool)
                     .await?;
@@ -1356,7 +1361,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                 typical_session_length: None,
                 active_hours: None,
                 common_workflows: None,
-                asks_before_acting: true,
+                asks_before_acting: false,
                 prefers_explanations: true,
                 likes_suggestions: false,
                 updated_at: Utc::now(),
@@ -1558,15 +1563,20 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
     async fn create_episodes_for_idle_sessions(&self) -> anyhow::Result<()> {
         let thirty_mins_ago = (Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
 
-        // Find sessions with conversation events older than 30 mins that don't
-        // have episodes yet and have at least 5 events (meaningful sessions).
+        // Find sessions with conversation events older than 30 mins that have
+        // uncaptured events (events newer than the latest episode, or no episode
+        // at all) and at least 5 such events.
         let idle_sessions: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT ev.session_id
+            "SELECT ev.session_id
              FROM events ev
-             LEFT JOIN episodes e ON e.session_id = ev.session_id
+             LEFT JOIN (
+                 SELECT session_id, MAX(end_time) AS latest_end
+                 FROM episodes
+                 GROUP BY session_id
+             ) ep ON ep.session_id = ev.session_id
              WHERE ev.event_type IN ('user_message', 'assistant_response', 'tool_result')
+               AND (ep.latest_end IS NULL OR ev.created_at > ep.latest_end)
                AND ev.created_at < ?
-               AND e.id IS NULL
              GROUP BY ev.session_id
              HAVING COUNT(ev.id) >= 5
                AND MAX(ev.created_at) < ?",
@@ -1586,7 +1596,10 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         );
 
         for session_id in idle_sessions {
-            let messages = self.fetch_session_messages(&session_id, 100).await?;
+            // Fetch messages since the latest episode (or all if none)
+            let messages = self
+                .fetch_session_messages_since_last_episode(&session_id, 100)
+                .await?;
             if messages.len() >= 5 {
                 match self.create_episode(&session_id, &messages).await {
                     Ok(episode_id) => {
@@ -1600,6 +1613,131 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         }
 
         Ok(())
+    }
+
+    /// Create episodes for active sessions that have accumulated many events
+    /// without an episode. This captures context from long-running sessions
+    /// before messages rotate out of the context window.
+    async fn create_episodes_for_active_long_sessions(&self) -> anyhow::Result<()> {
+        // Find sessions with 20+ events since their last episode (or no episode
+        // at all). These sessions risk losing context as the message window rotates.
+        let session_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT ev.session_id
+             FROM events ev
+             LEFT JOIN (
+                 SELECT session_id, MAX(end_time) AS latest_end
+                 FROM episodes
+                 GROUP BY session_id
+             ) ep ON ep.session_id = ev.session_id
+             WHERE ev.event_type IN ('user_message', 'assistant_response', 'tool_result')
+               AND (ep.latest_end IS NULL OR ev.created_at > ep.latest_end)
+             GROUP BY ev.session_id
+             HAVING COUNT(ev.id) >= 20",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        for session_id in session_ids {
+            let messages = self
+                .fetch_session_messages_since_last_episode(&session_id, 100)
+                .await?;
+            if messages.len() >= 10 {
+                match self.create_episode(&session_id, &messages).await {
+                    Ok(episode_id) => {
+                        info!(
+                            session_id,
+                            episode_id,
+                            "Created mid-session episode for long-running session"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            session_id,
+                            error = %e,
+                            "Failed to create mid-session episode"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fetch messages for a session since its last episode's end_time.
+    /// If no episode exists, returns all session messages up to `limit`.
+    async fn fetch_session_messages_since_last_episode(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
+        let last_episode_end: Option<String> = sqlx::query_scalar(
+            "SELECT MAX(end_time) FROM episodes WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+
+        let rows = if let Some(ref since) = last_episode_end {
+            sqlx::query(
+                "SELECT id, session_id, event_type, data, created_at
+                 FROM events
+                 WHERE session_id = ?
+                   AND event_type IN ('user_message', 'assistant_response', 'tool_result')
+                   AND created_at > ?
+                 ORDER BY created_at ASC
+                 LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(since)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, session_id, event_type, data, created_at
+                 FROM events
+                 WHERE session_id = ?
+                   AND event_type IN ('user_message', 'assistant_response', 'tool_result')
+                 ORDER BY created_at ASC
+                 LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_id: i64 = row.get("id");
+            let row_session_id: String = row.get("session_id");
+            let event_type: String = row.get("event_type");
+            let created_str: String = row.get("created_at");
+            let created_at = DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let data_raw: String = row.get("data");
+            let data: serde_json::Value = match serde_json::from_str(&data_raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if let Some(turn) = crate::events::turn_from_event(
+                event_id,
+                &row_session_id,
+                &event_type,
+                &data,
+                created_at,
+            ) {
+                let mut msg = turn.clone().into_message();
+                msg.importance = crate::memory::scoring::score_turn(&turn);
+                messages.push(msg);
+            }
+        }
+
+        Ok(messages)
     }
 
     /// Analyze recent activity for pattern detection and style updates.
@@ -1627,6 +1765,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
     }
 
     /// Fetch messages for a specific session.
+    #[allow(dead_code)]
     async fn fetch_session_messages(
         &self,
         session_id: &str,

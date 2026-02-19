@@ -4,14 +4,11 @@
 
 #[tokio::test]
 async fn test_orchestration_task_lead_flag_off_uses_agent_loop() {
-    // Orchestration is always-on with task leads always-on. Complex request → goal created,
-    // task lead spawned. No plan generation pre-loop call (removed).
+    // Deterministic pre-routing classifies the request as complex based on action
+    // markers (analyze, compare, identify, find, summarize) + compound keywords.
+    // No consultant LLM call. Goal created, task lead spawned synchronously.
     let provider = MockProvider::with_responses(vec![
-        // 1st call: consultant pass
-        MockProvider::text_response(
-            "This is a complex request.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
-        ),
-        // 2nd call: task lead response
+        // Task lead's LLM call (deterministic routing creates goal without LLM call)
         MockProvider::text_response("I'll start building the website."),
     ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
@@ -20,7 +17,7 @@ async fn test_orchestration_task_lead_flag_off_uses_agent_loop() {
         .agent
         .handle_message(
             "test_session",
-            "Build me a full-stack website with user authentication, role-based access control, a PostgreSQL database with migrations, comprehensive API documentation, integration and unit tests, and deploy the whole stack to production with CI/CD pipeline configuration",
+            "Analyze the requirements, compare authentication approaches, identify security gaps, find the best database solutions, and summarize a deployment plan for a full-stack website with CI/CD",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -45,15 +42,10 @@ async fn test_orchestration_task_lead_flag_off_uses_agent_loop() {
 
 #[tokio::test]
 async fn test_orchestration_task_lead_spawns_for_complex() {
-    // Orchestration always-on, complex request → task lead spawned, goal updated.
-    // No plan generation pre-loop call (removed).
+    // Deterministic pre-routing classifies the request as complex, creates a goal,
+    // and spawns a task lead synchronously (no self_ref in tests).
     let provider = MockProvider::with_responses(vec![
-        // 1st call: consultant pass (orchestrator)
-        MockProvider::text_response(
-            "This is a complex multi-step task.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
-        ),
-        // 2nd call: task lead's first LLM call — it responds with a final answer
-        // (In a real scenario it would use manage_goal_tasks, but here we test the flow)
+        // Task lead's LLM call (no consultant pass — deterministic routing)
         MockProvider::text_response("I've planned and completed all the tasks for your website."),
     ]);
     let harness = setup_test_agent_orchestrator_task_leads(provider)
@@ -64,7 +56,7 @@ async fn test_orchestration_task_lead_spawns_for_complex() {
         .agent
         .handle_message(
             "test_session",
-            "Build me a full-stack website with user authentication, role-based access control, a PostgreSQL database with migrations, comprehensive API documentation, integration and unit tests, and deploy the whole stack to production with CI/CD pipeline configuration",
+            "Analyze the requirements, compare authentication approaches, identify security gaps, find the best database solutions, and summarize a deployment plan for a full-stack website with CI/CD",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -95,24 +87,20 @@ async fn test_orchestration_task_lead_spawns_for_complex() {
 
 #[tokio::test]
 async fn test_orchestration_task_lead_creates_tasks_via_tool() {
-    // Orchestration always-on, task lead uses manage_goal_tasks to create tasks.
-    // No plan generation pre-loop call (removed).
+    // Deterministic pre-routing classifies as complex, creates a goal, spawns
+    // task lead. The task lead uses manage_goal_tasks to create tasks.
     let provider = MockProvider::with_responses(vec![
-        // 1st: consultant pass
-        MockProvider::text_response(
-            "Complex task.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
-        ),
-        // 2nd: task lead calls manage_goal_tasks(create_task)
+        // Task lead calls manage_goal_tasks(create_task)
         MockProvider::tool_call_response(
             "manage_goal_tasks",
             r#"{"action":"create_task","description":"Build the frontend","task_order":1,"priority":"high"}"#,
         ),
-        // 3rd: task lead calls manage_goal_tasks(complete_goal) after seeing the result
+        // Task lead calls manage_goal_tasks(complete_goal) after seeing the result
         MockProvider::tool_call_response(
             "manage_goal_tasks",
             r#"{"action":"complete_goal","summary":"Frontend task created successfully"}"#,
         ),
-        // 4th: task lead's final text response
+        // Task lead's final text response
         MockProvider::text_response("All tasks have been created and the goal is complete."),
     ]);
     let harness = setup_test_agent_orchestrator_task_leads(provider)
@@ -123,7 +111,7 @@ async fn test_orchestration_task_lead_creates_tasks_via_tool() {
         .agent
         .handle_message(
             "test_session",
-            "Build me a full-stack website with user authentication, role-based access control, a PostgreSQL database with migrations, comprehensive API documentation, integration and unit tests, and deploy the whole stack to production with CI/CD pipeline configuration",
+            "Analyze the requirements, compare authentication approaches, identify security gaps, find the best database solutions, and summarize a deployment plan for a full-stack website with CI/CD",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -155,40 +143,38 @@ async fn test_orchestration_task_lead_creates_tasks_via_tool() {
 
 #[tokio::test]
 async fn test_orchestration_task_lead_claims_before_dispatch() {
-    // Orchestration always-on, task lead creates tasks with idempotent and dependency features.
-    // No plan generation pre-loop call (removed).
+    // Deterministic pre-routing classifies as complex, creates a goal, spawns
+    // task lead. The task lead creates tasks with idempotent and dependency features.
     let provider = MockProvider::with_responses(vec![
-        // 1st: consultant pass
-        MockProvider::text_response(
-            "Complex task.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"complex\"}",
-        ),
-        // 2nd: task lead creates task with idempotent=true
+        // Task lead creates task with idempotent=true
         MockProvider::tool_call_response(
             "manage_goal_tasks",
             r#"{"action":"create_task","description":"Research the topic","task_order":1,"idempotent":true}"#,
         ),
-        // 3rd: task lead lists tasks to check state
+        // Task lead lists tasks to check state
         MockProvider::tool_call_response(
             "manage_goal_tasks",
             r#"{"action":"list_tasks"}"#,
         ),
-        // 4th: task lead completes goal
+        // Task lead completes goal
         MockProvider::tool_call_response(
             "manage_goal_tasks",
             r#"{"action":"complete_goal","summary":"Research task created and listed"}"#,
         ),
-        // 5th: task lead final text
+        // Task lead final text
         MockProvider::text_response("Goal complete. Research task has been created."),
     ]);
     let harness = setup_test_agent_orchestrator_task_leads(provider)
         .await
         .unwrap();
 
+    // User text triggers complex classification: analyze, compare, identify, find,
+    // report = 5 action markers + "and"/"then" compound keywords.
     let response = harness
         .agent
         .handle_message(
             "test_session",
-            "Build a quantum computing research tool with visualization dashboard, deploy it to production with full API documentation, set up monitoring and alerting, create integration tests, and prepare a comprehensive README with architecture diagrams for the team",
+            "Analyze the quantum computing landscape, compare visualization frameworks, identify performance bottlenecks, find optimal algorithms, and report on production deployment strategies with monitoring and documentation",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),

@@ -264,6 +264,63 @@ impl Agent {
             .await
     }
 
+    /// Attempt a knowledge-only fallback when tools have failed.
+    ///
+    /// Makes one LLM call WITHOUT tools, asking the model to answer from
+    /// its training knowledge. Returns `Some(answer)` if the model gives a
+    /// substantive response (>30 chars), `None` otherwise.
+    pub(super) async fn try_knowledge_fallback(
+        &self,
+        user_text: &str,
+        error_summary: &str,
+    ) -> Option<String> {
+        let system = format!(
+            "The user asked a question but all tool-based approaches failed ({}).\n\
+             Answer the question from your training knowledge if possible.\n\
+             If you genuinely cannot answer without tools, say so briefly.\n\
+             Do NOT mention tool failures or activity summaries.",
+            error_summary
+        );
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": system}),
+            serde_json::json!({"role": "user", "content": user_text}),
+        ];
+        let provider = self.llm_runtime.provider();
+        let model = self.model.read().await.clone();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.chat(&model, &messages, &[]),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                let text = resp.content.unwrap_or_default();
+                if text.trim().len() > 30 {
+                    Some(text.trim().to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Attempt a knowledge-only fallback and, if successful, append the
+    /// answer as an assistant message.  Returns `Some(answer)` on success.
+    pub(super) async fn graceful_knowledge_fallback(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        session_id: &str,
+        user_text: &str,
+        error_summary: &str,
+    ) -> Option<anyhow::Result<String>> {
+        let answer = self.try_knowledge_fallback(user_text, error_summary).await?;
+        Some(
+            self.append_graceful_assistant_summary(emitter, session_id, answer)
+                .await,
+        )
+    }
+
     /// Graceful response when repetitive tool calls are detected.
     pub(super) async fn graceful_repetitive_response(
         &self,
