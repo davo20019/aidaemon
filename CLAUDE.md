@@ -31,11 +31,19 @@ No `rustfmt.toml` — uses default Rust formatting conventions.
 
 ## Releasing & Publishing
 
+**Pre-commit checklist (MUST pass before committing):**
+1. `cargo fmt` — auto-format all code
+2. `cargo clippy --all-features -- -D warnings` — zero warnings
+3. `cargo test` — all tests pass
+
+**Release steps:**
 1. Bump version in `Cargo.toml`
-2. Commit all changes and push to `master`
-3. Tag with `git tag vX.Y.Z` and push the tag
-4. Create a GitHub release via `gh release create`
-5. Publish to crates.io via `cargo publish`
+2. Run the pre-commit checklist above
+3. Stage all changes including `Cargo.lock` and commit
+4. Push to `master`
+5. Tag with `git tag vX.Y.Z` and push the tag — **only after the commit passes fmt + clippy + tests**
+6. Create a GitHub release via `gh release create`
+7. CI handles `cargo publish` and Homebrew tap update automatically
 
 **IMPORTANT**: `cargo publish` packages only git-tracked files. Before publishing:
 - Ensure all changes are committed and pushed — do NOT use `--allow-dirty`
