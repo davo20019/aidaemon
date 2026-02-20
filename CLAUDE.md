@@ -38,12 +38,13 @@ No `rustfmt.toml` — uses default Rust formatting conventions.
 
 **Release steps:**
 1. Bump version in `Cargo.toml`
-2. Run the pre-commit checklist above
-3. Stage all changes including `Cargo.lock` and commit
-4. Push to `master`
-5. Tag with `git tag vX.Y.Z` and push the tag — **only after the commit passes fmt + clippy + tests**
-6. Create a GitHub release via `gh release create`
-7. CI handles `cargo publish` and Homebrew tap update automatically
+2. Add a changelog entry to `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com/) format (Added/Changed/Fixed/Security sections)
+3. Run the pre-commit checklist above
+4. Stage all changes including `Cargo.lock` and commit
+5. Push to `master`
+6. Tag with `git tag vX.Y.Z` and push the tag — **only after the commit passes fmt + clippy + tests**
+7. Create a GitHub release via `gh release create`
+8. CI handles `cargo publish` and Homebrew tap update automatically
 
 **IMPORTANT**: `cargo publish` packages only git-tracked files. Before publishing:
 - Ensure all changes are committed and pushed — do NOT use `--allow-dirty`
