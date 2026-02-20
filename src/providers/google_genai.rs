@@ -7,7 +7,6 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 use crate::llm_markers::CONSULTANT_TEXT_ONLY_MARKER;
-use crate::providers::error::ProviderErrorKind;
 use crate::providers::ProviderError;
 use crate::traits::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
@@ -700,7 +699,10 @@ impl ModelProvider for GoogleGenAiProvider {
         };
 
         let status = resp.status();
-        let text = resp.text().await?;
+        let text = resp.text().await.map_err(|e| {
+            error!("Failed to read response body: {}", e);
+            ProviderError::network(&e)
+        })?;
 
         if !status.is_success() {
             if status.as_u16() == 400 && is_missing_thought_signature_error(&text) {
@@ -731,19 +733,17 @@ impl ModelProvider for GoogleGenAiProvider {
                     };
 
                     let retry_status = retry_resp.status();
-                    let retry_text = retry_resp.text().await?;
+                    let retry_text = retry_resp.text().await.map_err(|e| {
+                        error!("Failed to read retry response body: {}", e);
+                        ProviderError::network(&e)
+                    })?;
                     if retry_status.is_success() {
                         let data: Value = serde_json::from_str(&retry_text).map_err(|e| {
                             error!("Failed to parse Google GenAI retry response JSON: {}", e);
-                            ProviderError {
-                                kind: ProviderErrorKind::ServerError,
-                                status: Some(200),
-                                message: format!(
-                                    "Malformed response from LLM provider (JSON parse error: {})",
-                                    e
-                                ),
-                                retry_after_secs: None,
-                            }
+                            ProviderError::malformed_parse(format!(
+                                "Malformed response from LLM provider (JSON parse error: {})",
+                                e
+                            ))
                         })?;
                         return self.parse_response(&data, model);
                     }
@@ -763,15 +763,10 @@ impl ModelProvider for GoogleGenAiProvider {
 
         let data: Value = serde_json::from_str(&text).map_err(|e| {
             error!("Failed to parse Google GenAI response JSON: {}", e);
-            ProviderError {
-                kind: ProviderErrorKind::ServerError,
-                status: Some(200),
-                message: format!(
-                    "Malformed response from LLM provider (JSON parse error: {})",
-                    e
-                ),
-                retry_after_secs: None,
-            }
+            ProviderError::malformed_parse(format!(
+                "Malformed response from LLM provider (JSON parse error: {})",
+                e
+            ))
         })?;
         self.parse_response(&data, model)
     }

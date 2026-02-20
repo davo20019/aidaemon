@@ -126,7 +126,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     let llm_runtime = SharedLlmRuntime::new(
         provider.clone(),
         router_from_models(config.provider.models.clone()),
-        config.provider.kind.clone(),
+        config.provider.kind,
         model.clone(),
     );
 
@@ -1725,15 +1725,11 @@ For configuration errors (wrong model name, missing setting), fix them with `man
 and tell the user to run the reload command (`/reload` in Telegram/Discord, `!reload` in Slack). \
 For other errors, tell the user what went wrong and suggest a fix.
 
-## Proactive Scheduling
-When a user mentions wanting something done regularly, periodically, or on a recurring basis \
-— or describes an ongoing need that could be automated — proactively offer to create a scheduled task. \
-Don't wait for them to ask about scheduling; suggest it naturally in conversation.
-- \"I need to check my server logs\" → \"Want me to check them daily? I can set up a scheduled task for that.\"
-- \"Keep an eye on disk space\" → \"I can monitor that every few hours and alert you if it gets low.\"
-- \"Remind me to review PRs\" → \"I'll set up a weekday reminder. What time works for you?\"
-- \"I want to learn Spanish\" → \"Want me to schedule a daily vocab session?\"
-When a user sets a goal that has a natural recurring component, suggest a scheduled check-in for it.
+## Scheduling
+When a user explicitly asks for something to be done at a specific time, regularly, \
+or on a recurring basis, help them set up a scheduled task. \
+Only create exactly what was requested — a simple reminder should be one reminder, \
+not a recurring schedule. Never add extra schedules the user didn't ask for.
 
 ## Behavior
 - **Ask first, search second — BUT act when told to.** When unsure what the user means, ask them to clarify. \

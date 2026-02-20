@@ -26,6 +26,104 @@ const _: () = {
 const EVIDENCE_MIN_SUCCESS: i32 = 7;
 const EVIDENCE_MIN_RATE: f32 = 0.9;
 const EVIDENCE_MIN_MARGIN: i32 = 3;
+const MIN_PROCEDURE_STEPS: usize = 2;
+const MIN_PROCEDURE_STEP_WORDS: usize = 8;
+const MIN_DESCRIPTION_WORDS: usize = 4;
+const MIN_BODY_LINES: usize = 2;
+const MIN_BODY_WORDS: usize = 20;
+const GENERIC_LOW_VALUE_TRIGGERS: &[&str] = &[
+    "yes",
+    "yeah",
+    "yep",
+    "yup",
+    "ok",
+    "okay",
+    "sure",
+    "indeed",
+    "affirmative",
+    "correct",
+    "true",
+    "totally",
+    "absolutely",
+    "no",
+    "nope",
+    "nah",
+    "thanks",
+    "thank you",
+    "hello",
+    "hi",
+];
+
+fn word_count(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
+fn normalize_phrase(text: &str) -> String {
+    let mut normalized = String::new();
+    for raw in text.split_whitespace() {
+        let token = raw
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\'')
+            .to_lowercase();
+        if token.is_empty() {
+            continue;
+        }
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.push_str(&token);
+    }
+    normalized
+}
+
+fn is_generic_low_value_trigger(text: &str) -> bool {
+    let normalized = normalize_phrase(text);
+    if normalized.is_empty() {
+        return true;
+    }
+    GENERIC_LOW_VALUE_TRIGGERS
+        .iter()
+        .any(|trigger| *trigger == normalized)
+}
+
+fn procedure_has_minimum_substance(procedure: &Procedure) -> bool {
+    if procedure.steps.len() < MIN_PROCEDURE_STEPS {
+        return false;
+    }
+    let total_step_words: usize = procedure.steps.iter().map(|step| word_count(step)).sum();
+    total_step_words >= MIN_PROCEDURE_STEP_WORDS
+}
+
+fn skill_is_valuable(skill: &Skill) -> bool {
+    if skill.triggers.is_empty() {
+        return false;
+    }
+    if word_count(&skill.description) < MIN_DESCRIPTION_WORDS {
+        return false;
+    }
+
+    let body_lines = skill
+        .body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    if body_lines < MIN_BODY_LINES {
+        return false;
+    }
+    if word_count(&skill.body) < MIN_BODY_WORDS {
+        return false;
+    }
+
+    let non_generic_trigger_count = skill
+        .triggers
+        .iter()
+        .filter(|trigger| !is_generic_low_value_trigger(trigger))
+        .count();
+    if non_generic_trigger_count == 0 {
+        return false;
+    }
+
+    true
+}
 
 pub struct SkillPromoter {
     state: Arc<dyn StateStore>,
@@ -62,6 +160,14 @@ impl SkillPromoter {
 
         let mut drafted = 0;
         for procedure in &promotable {
+            if !procedure_has_minimum_substance(procedure) {
+                info!(
+                    procedure = %procedure.name,
+                    steps = procedure.steps.len(),
+                    "Skipping promotion: low-substance procedure"
+                );
+                continue;
+            }
             if self.evidence_gate_enforce
                 && procedure.success_count - procedure.failure_count < EVIDENCE_MIN_MARGIN
             {
@@ -83,7 +189,7 @@ impl SkillPromoter {
                 continue;
             }
 
-            // Skip if a draft already exists for this procedure
+            // Skip if this procedure has already been reviewed as a draft before
             if self
                 .state
                 .skill_draft_exists_for_procedure(&procedure.name)
@@ -94,6 +200,19 @@ impl SkillPromoter {
 
             match self.promote_procedure(procedure).await {
                 Ok(Some(skill)) => {
+                    let normalized_skill_name = skills::sanitize_skill_filename(&skill.name);
+                    if existing_names
+                        .iter()
+                        .any(|name| skills::sanitize_skill_filename(name) == normalized_skill_name)
+                    {
+                        info!(
+                            skill = %skill.name,
+                            procedure = %procedure.name,
+                            "Skipping promotion: generated skill name conflicts with installed skill"
+                        );
+                        continue;
+                    }
+
                     // Insert as draft, not directly to filesystem
                     let triggers_json = serde_json::to_string(&skill.triggers)?;
                     let draft = SkillDraft {
@@ -166,7 +285,8 @@ impl SkillPromoter {
         let prompt = format!(
             "Convert this learned procedure into a skill definition. \
              Return ONLY the skill markdown (with --- frontmatter and body) or 'SKIP' if this \
-             procedure is too specific or context-dependent to be a reusable skill.\n\n\
+             procedure is too specific, context-dependent, or too trivial/generic to be a reusable skill \
+             (for example: simple confirmations, greetings, or one-line acknowledgements).\n\n\
              Procedure name: {}\n\
              Trigger pattern: {}\n\
              Success rate: {:.0}% ({} successes, {} failures)\n\
@@ -178,6 +298,8 @@ impl SkillPromoter {
              triggers: keyword1, keyword2, keyword3\n\
              ---\n\
              Step-by-step instructions for the AI to follow when this skill is activated.\n\n\
+             Only return a skill when it provides meaningful user value and reusable workflow guidance. \
+             Skip conversational filler behaviors.\n\
              Make the triggers broad enough to match relevant user messages but specific enough \
              to avoid false positives. The body should be clear, actionable instructions.",
             procedure.name,
@@ -189,7 +311,7 @@ impl SkillPromoter {
         );
 
         let messages = vec![
-            json!({"role": "system", "content": "You are a skill generator. Convert proven procedures into reusable skill definitions. Respond with ONLY the skill markdown or SKIP."}),
+            json!({"role": "system", "content": "You are a skill generator. Convert proven procedures into reusable, high-value skill definitions. Skip trivial/generic conversational behaviors. Respond with ONLY the skill markdown or SKIP."}),
             json!({"role": "user", "content": prompt}),
         ];
 
@@ -220,6 +342,14 @@ impl SkillPromoter {
         // Parse the generated markdown
         match Skill::parse(trimmed) {
             Some(mut skill) => {
+                if !skill_is_valuable(&skill) {
+                    info!(
+                        procedure = %procedure.name,
+                        skill = %skill.name,
+                        "Skipping low-value auto-generated skill draft"
+                    );
+                    return Ok(None);
+                }
                 skill.source = Some("auto".to_string());
                 Ok(Some(skill))
             }
@@ -257,5 +387,66 @@ mod tests {
     fn skip_response_handled() {
         // Simulating SKIP response - just verify parsing returns None
         assert!(Skill::parse("SKIP").is_none());
+    }
+
+    #[test]
+    fn low_value_affirmation_skill_rejected() {
+        let skill = Skill {
+            name: "respond-yes".to_string(),
+            description: "Acknowledge and affirm a user's statement.".to_string(),
+            triggers: vec![
+                "yes".to_string(),
+                "yeah".to_string(),
+                "indeed".to_string(),
+                "affirmative".to_string(),
+            ],
+            body: "1. Respond with an affirmative and encouraging statement.".to_string(),
+            origin: None,
+            source: Some("auto".to_string()),
+            source_url: None,
+            dir_path: None,
+            resources: vec![],
+        };
+
+        assert!(!skill_is_valuable(&skill));
+    }
+
+    #[test]
+    fn substantive_skill_accepted() {
+        let skill = Skill {
+            name: "deploy-rust-service".to_string(),
+            description: "Build, validate, and deploy a Rust service safely.".to_string(),
+            triggers: vec![
+                "deploy service".to_string(),
+                "release rust app".to_string(),
+            ],
+            body: "1. Run `cargo fmt`, `cargo clippy --all-features -- -D warnings`, and `cargo test`.\n2. Build the release artifact with `cargo build --release` and verify config values.\n3. Deploy the artifact, restart the service, and check health endpoints/logs before reporting completion."
+                .to_string(),
+            origin: None,
+            source: Some("auto".to_string()),
+            source_url: None,
+            dir_path: None,
+            resources: vec![],
+        };
+
+        assert!(skill_is_valuable(&skill));
+    }
+
+    #[test]
+    fn low_substance_procedure_rejected() {
+        let proc = Procedure {
+            id: 0,
+            name: "confirm".to_string(),
+            trigger_pattern: "say yes".to_string(),
+            steps: vec!["reply yes".to_string()],
+            success_count: 5,
+            failure_count: 0,
+            avg_duration_secs: None,
+            last_used_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        assert!(!procedure_has_minimum_substance(&proc));
     }
 }

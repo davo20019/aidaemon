@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon"
-version = "0.9.4"
+version = "0.9.5"
 edition = "2021"
 description = "A personal AI agent that runs as a background daemon, accessible via Telegram, Slack, or Discord, with tool use, MCP integration, and persistent memory"
 license = "MIT"

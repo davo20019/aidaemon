@@ -102,10 +102,11 @@ impl ManageSkillsTool {
     /// Write a skill to the filesystem, checking for duplicate names.
     async fn persist_to_filesystem(&self, skill: Skill) -> anyhow::Result<String> {
         let existing = skills::load_skills(&self.skills_dir);
-        if skills::find_skill_by_name(&existing, &skill.name).is_some() {
+        if let Some(conflicting_name) = Self::find_conflicting_skill(&existing, &skill.name) {
             return Ok(format!(
-                "A skill named '{}' already exists. Remove it first or choose a different name.",
-                skill.name
+                "Skill '{}' conflicts with existing skill '{}' (same canonical filename). Remove or rename the existing skill first.",
+                skill.name,
+                conflicting_name
             ));
         }
 
@@ -209,6 +210,14 @@ impl ManageSkillsTool {
             }
         }
         Ok(output)
+    }
+
+    fn find_conflicting_skill<'a>(all_skills: &'a [Skill], name: &str) -> Option<&'a str> {
+        let normalized_target = skills::sanitize_skill_filename(name);
+        all_skills
+            .iter()
+            .find(|skill| skills::sanitize_skill_filename(&skill.name) == normalized_target)
+            .map(|skill| skill.name.as_str())
     }
 
     fn resolve_skill_name<'a>(
@@ -683,7 +692,17 @@ impl ManageSkillsTool {
                 ));
             }
 
-            if approve == Some(true) {
+            let approve = match approve {
+                Some(value) => value,
+                None => {
+                    return Ok(format!(
+                        "Skill draft #{} requires `approve: true` to approve or `approve: false` to dismiss.",
+                        id
+                    ));
+                }
+            };
+
+            if approve {
                 // Parse draft into Skill and write to filesystem
                 let triggers: Vec<String> =
                     serde_json::from_str(&draft.triggers_json).unwrap_or_default();
@@ -701,10 +720,12 @@ impl ManageSkillsTool {
 
                 // Check for duplicates
                 let existing = skills::load_skills(&self.skills_dir);
-                if skills::find_skill_by_name(&existing, &skill.name).is_some() {
+                if let Some(conflicting_name) = Self::find_conflicting_skill(&existing, &skill.name)
+                {
                     return Ok(format!(
-                        "A skill named '{}' already exists on disk. Dismiss this draft or remove the existing skill first.",
-                        skill.name
+                        "Skill draft '{}' conflicts with existing skill '{}' (same canonical filename). Dismiss this draft or remove/rename the existing skill first.",
+                        skill.name,
+                        conflicting_name
                     ));
                 }
 
@@ -1093,6 +1114,59 @@ mod tests {
         assert!(result.contains("Would remove 1: send-resume"));
         assert!(result.contains("Would dismiss pending draft(s): #"));
         assert_eq!(skills::load_skills(skills_dir.path()).len(), 1);
+        assert_eq!(state.get_pending_skill_drafts().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn review_requires_explicit_approve_flag() {
+        let (tool, state, _skills_dir) = setup_tool().await;
+        let draft = SkillDraft {
+            id: 0,
+            name: "deploy-helper".to_string(),
+            description: "Draft replacement".to_string(),
+            triggers_json: r#"["deploy helper"]"#.to_string(),
+            body: "1. Validate prerequisites.\n2. Deploy and verify.".to_string(),
+            source_procedure: "deploy-proc".to_string(),
+            status: "pending".to_string(),
+            created_at: String::new(),
+        };
+        let draft_id = state.add_skill_draft(&draft).await.unwrap();
+
+        let result = tool
+            .call(&format!(r#"{{"action":"review","draft_id":{}}}"#, draft_id))
+            .await
+            .unwrap();
+
+        assert!(result.contains("requires `approve: true`"));
+        assert_eq!(state.get_pending_skill_drafts().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn review_approve_blocks_canonical_filename_collision() {
+        let (tool, state, skills_dir) = setup_tool().await;
+        skills::write_skill_to_file(skills_dir.path(), &make_skill("send-resume")).unwrap();
+
+        let draft = SkillDraft {
+            id: 0,
+            name: "send resume".to_string(),
+            description: "Draft replacement".to_string(),
+            triggers_json: r#"["resume send"]"#.to_string(),
+            body: "1. Gather inputs.\n2. Send the resume.".to_string(),
+            source_procedure: "resume-proc".to_string(),
+            status: "pending".to_string(),
+            created_at: String::new(),
+        };
+        let draft_id = state.add_skill_draft(&draft).await.unwrap();
+
+        let result = tool
+            .call(&format!(
+                r#"{{"action":"review","draft_id":{},"approve":true}}"#,
+                draft_id
+            ))
+            .await
+            .unwrap();
+
+        assert!(result.contains("conflicts with existing skill"));
         assert_eq!(state.get_pending_skill_drafts().await.unwrap().len(), 1);
     }
 }

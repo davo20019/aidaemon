@@ -8,6 +8,133 @@ use crate::agent::recall_guardrails::{
 use crate::agent::*;
 
 impl Agent {
+    fn extract_labeled_block(text: &str, label: &str, end_labels: &[&str]) -> Option<String> {
+        let start = text.find(label)?;
+        let after = &text[start + label.len()..];
+        let mut end = after.len();
+        for end_label in end_labels {
+            if let Some(idx) = after.find(end_label) {
+                end = end.min(idx);
+            }
+        }
+        let block = after[..end].trim();
+        if block.is_empty() {
+            None
+        } else {
+            Some(block.to_string())
+        }
+    }
+
+    fn build_scheduled_goal_description(current_user_text: &str, goal_user_text: &str) -> String {
+        let current = current_user_text.trim();
+        let composed = goal_user_text.trim();
+        if composed.is_empty() {
+            return current.to_string();
+        }
+        if !composed.contains("Original request:") && !composed.contains("Follow-up:") {
+            return composed.to_string();
+        }
+
+        let original = Self::extract_labeled_block(
+            composed,
+            "Original request:",
+            &["Assistant asked:", "Follow-up:"],
+        );
+        let followup = Self::extract_labeled_block(composed, "Follow-up:", &[]);
+        let mut pieces = Vec::new();
+        if let Some(original_text) = original {
+            pieces.push(original_text);
+        }
+        if let Some(followup_text) = followup {
+            let duplicate = pieces
+                .iter()
+                .any(|piece| piece.eq_ignore_ascii_case(&followup_text));
+            if !duplicate {
+                pieces.push(followup_text);
+            }
+        }
+        if !pieces.is_empty() {
+            return pieces.join(" | ");
+        }
+
+        let flattened = composed
+            .replace("Original request:", "")
+            .replace("Assistant asked:", "")
+            .replace("Follow-up:", "")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !flattened.is_empty() {
+            flattened
+        } else {
+            current.to_string()
+        }
+    }
+
+    async fn confirm_scheduled_goal_activation(
+        &self,
+        ctx: &mut ConsultantOrchestrationCtx<'_>,
+        goal: &Goal,
+        schedule: &crate::traits::GoalSchedule,
+        tz_label: &str,
+        completion_note: &str,
+    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+        let activation_msg = match self.state.activate_goal(&goal.id).await {
+            Ok(true) => {
+                if let Some(ref registry) = self.goal_token_registry {
+                    registry.register(&goal.id).await;
+                }
+                let next_run = chrono::DateTime::parse_from_rfc3339(&schedule.next_run_at)
+                    .ok()
+                    .map(|dt| {
+                        dt.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M %Z")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "n/a".to_string());
+                format!(
+                    "Scheduled: {} (next: {}). I'll execute it when the time comes. System timezone: {}.",
+                    goal.description, next_run, tz_label
+                )
+            }
+            Ok(false) => {
+                "I couldn't activate that scheduled goal because it is no longer pending confirmation."
+                    .to_string()
+            }
+            Err(e) => {
+                format!("I couldn't activate the scheduled goal: {}", e)
+            }
+        };
+        let assistant_msg = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: ctx.session_id.to_string(),
+            role: "assistant".to_string(),
+            content: Some(activation_msg.clone()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.5,
+            embedding: None,
+        };
+        self.append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
+            .await?;
+        self.emit_task_end(
+            ctx.emitter,
+            ctx.task_id,
+            TaskStatus::Completed,
+            ctx.task_start,
+            ctx.iteration,
+            0,
+            None,
+            Some(completion_note.to_string()),
+        )
+        .await;
+        Ok(consultant_direct_return_ok(activation_msg))
+    }
+
     async fn ensure_orchestrator_tools_loaded(
         &self,
         ctx: &mut ConsultantOrchestrationCtx<'_>,
@@ -277,11 +404,13 @@ impl Agent {
         }
 
         let goal_user_text = ctx.turn_context.goal_user_text.clone();
+        let goal_description =
+            Self::build_scheduled_goal_description(ctx.user_text, &goal_user_text);
 
         let mut goal = if actually_one_shot {
-            Goal::new_deferred_finite(&goal_user_text, ctx.session_id)
+            Goal::new_deferred_finite(&goal_description, ctx.session_id)
         } else {
-            Goal::new_continuous_pending(&goal_user_text, ctx.session_id, None, None)
+            Goal::new_continuous_pending(&goal_description, ctx.session_id, None, None)
         };
 
         if let Some(goal_context) = self
@@ -329,6 +458,22 @@ impl Agent {
             "recurring"
         };
 
+        let already_approved = {
+            let approved = self.schedule_approved_sessions.read().await;
+            approved.contains(ctx.session_id)
+        };
+        if already_approved {
+            return self
+                .confirm_scheduled_goal_activation(
+                    ctx,
+                    &goal,
+                    &schedule,
+                    &tz_label,
+                    "Scheduled goal auto-confirmed from prior session approval.",
+                )
+                .await;
+        }
+
         // Prefer inline approval buttons for schedule confirmation
         // (Telegram/Discord/Slack). Non-inline channels keep the
         // existing text confirm/cancel fallback.
@@ -365,67 +510,25 @@ impl Agent {
 
         if let Some(approval_result) = inline_approval {
             match approval_result {
-                Ok(ApprovalResponse::AllowOnce)
+                response @ (Ok(ApprovalResponse::AllowOnce)
                 | Ok(ApprovalResponse::AllowSession)
-                | Ok(ApprovalResponse::AllowAlways) => {
-                    let activation_msg = match self.state.activate_goal(&goal.id).await {
-                        Ok(true) => {
-                            if let Some(ref registry) = self.goal_token_registry {
-                                registry.register(&goal.id).await;
-                            }
-                            let next_run = chrono::DateTime::parse_from_rfc3339(&schedule.next_run_at)
-                                .ok()
-                                .map(|dt| {
-                                    dt.with_timezone(&chrono::Local)
-                                        .format("%Y-%m-%d %H:%M %Z")
-                                        .to_string()
-                                })
-                                .unwrap_or_else(|| "n/a".to_string());
-                            format!(
-                                "Scheduled: {} (next: {}). I'll execute it when the time comes. System timezone: {}.",
-                                goal.description, next_run, tz_label
-                            )
-                        }
-                        Ok(false) => {
-                            "I couldn't activate that scheduled goal because it is no longer pending confirmation."
-                                .to_string()
-                        }
-                        Err(e) => {
-                            format!("I couldn't activate the scheduled goal: {}", e)
-                        }
-                    };
-                    let assistant_msg = Message {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: ctx.session_id.to_string(),
-                        role: "assistant".to_string(),
-                        content: Some(activation_msg.clone()),
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_calls_json: None,
-                        created_at: Utc::now(),
-                        importance: 0.5,
-                        embedding: None,
-                    };
-                    self.append_assistant_message_with_event(
-                        ctx.emitter,
-                        &assistant_msg,
-                        "system",
-                        None,
-                        None,
-                    )
-                    .await?;
-                    self.emit_task_end(
-                        ctx.emitter,
-                        ctx.task_id,
-                        TaskStatus::Completed,
-                        ctx.task_start,
-                        ctx.iteration,
-                        0,
-                        None,
-                        Some("Scheduled goal confirmed via inline approval.".to_string()),
-                    )
-                    .await;
-                    return Ok(consultant_direct_return_ok(activation_msg));
+                | Ok(ApprovalResponse::AllowAlways)) => {
+                    if matches!(
+                        response,
+                        Ok(ApprovalResponse::AllowSession) | Ok(ApprovalResponse::AllowAlways)
+                    ) {
+                        let mut approved = self.schedule_approved_sessions.write().await;
+                        approved.insert(ctx.session_id.to_string());
+                    }
+                    return self
+                        .confirm_scheduled_goal_activation(
+                            ctx,
+                            &goal,
+                            &schedule,
+                            &tz_label,
+                            "Scheduled goal confirmed via inline approval.",
+                        )
+                        .await;
                 }
                 Ok(ApprovalResponse::Deny) => {
                     let now = chrono::Utc::now().to_rfc3339();
@@ -859,5 +962,67 @@ impl Agent {
             IntentComplexity::Simple => self.handle_simple_intent(ctx).await,
             IntentComplexity::Complex => self.handle_complex_intent(ctx).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_scheduled_goal_description_empty_composed_returns_current() {
+        let result = Agent::build_scheduled_goal_description("current task", "");
+        assert_eq!(result, "current task");
+    }
+
+    #[test]
+    fn build_scheduled_goal_description_plain_text_returns_composed() {
+        let result =
+            Agent::build_scheduled_goal_description("current task", "say hello every morning");
+        assert_eq!(result, "say hello every morning");
+    }
+
+    #[test]
+    fn build_scheduled_goal_description_original_request_only() {
+        let composed = "Original request: send a daily weather update";
+        let result = Agent::build_scheduled_goal_description("ignored", composed);
+        assert_eq!(result, "send a daily weather update");
+    }
+
+    #[test]
+    fn build_scheduled_goal_description_original_and_followup() {
+        let composed =
+            "Original request: check server health\nAssistant asked: which server?\nFollow-up: the production server";
+        let result = Agent::build_scheduled_goal_description("ignored", composed);
+        assert_eq!(result, "check server health | the production server");
+    }
+
+    #[test]
+    fn build_scheduled_goal_description_deduplicates_followup() {
+        let composed = "Original request: say hello\nFollow-up: say hello";
+        let result = Agent::build_scheduled_goal_description("ignored", composed);
+        assert_eq!(result, "say hello");
+    }
+
+    #[test]
+    fn build_scheduled_goal_description_deduplicates_case_insensitive() {
+        let composed = "Original request: Say Hello\nFollow-up: say hello";
+        let result = Agent::build_scheduled_goal_description("ignored", composed);
+        assert_eq!(result, "Say Hello");
+    }
+
+    #[test]
+    fn build_scheduled_goal_description_fallback_strips_labels() {
+        // Labels present but blocks are empty — should fall through to flattened path
+        let composed = "Original request:\nAssistant asked:\nFollow-up:\nsome leftover text";
+        let result = Agent::build_scheduled_goal_description("ignored", composed);
+        assert_eq!(result, "some leftover text");
+    }
+
+    #[test]
+    fn build_scheduled_goal_description_trims_whitespace() {
+        let composed = "  Original request:   remind me to stretch   ";
+        let result = Agent::build_scheduled_goal_description("ignored", composed);
+        assert_eq!(result, "remind me to stretch");
     }
 }

@@ -204,12 +204,11 @@ impl crate::traits::SkillStore for SqliteStateStore {
     }
 
     async fn skill_draft_exists_for_procedure(&self, procedure_name: &str) -> anyhow::Result<bool> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) as cnt FROM skill_drafts WHERE source_procedure = ? AND status = 'pending'",
-        )
-        .bind(procedure_name)
-        .fetch_one(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT COUNT(*) as cnt FROM skill_drafts WHERE source_procedure = ?")
+                .bind(procedure_name)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(row.get::<i64, _>("cnt") > 0)
     }
 }

@@ -6,7 +6,6 @@ use serde_json::{json, Value};
 use tracing::{error, info, warn};
 use zeroize::Zeroize;
 
-use crate::providers::error::ProviderErrorKind;
 use crate::providers::ProviderError;
 use crate::traits::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
@@ -308,7 +307,10 @@ impl ModelProvider for AnthropicNativeProvider {
         };
 
         let status = resp.status();
-        let text = resp.text().await?;
+        let text = resp.text().await.map_err(|e| {
+            error!("Failed to read response body: {}", e);
+            ProviderError::network(&e)
+        })?;
 
         if !status.is_success() {
             error!(status = %status, "Anthropic API error: {}", text);
@@ -317,15 +319,10 @@ impl ModelProvider for AnthropicNativeProvider {
 
         let data: Value = serde_json::from_str(&text).map_err(|e| {
             error!("Failed to parse Anthropic response JSON: {}", e);
-            ProviderError {
-                kind: ProviderErrorKind::ServerError,
-                status: Some(200),
-                message: format!(
-                    "Malformed response from LLM provider (JSON parse error: {})",
-                    e
-                ),
-                retry_after_secs: None,
-            }
+            ProviderError::malformed_parse(format!(
+                "Malformed response from LLM provider (JSON parse error: {})",
+                e
+            ))
         })?;
 
         let mut final_text = String::new();

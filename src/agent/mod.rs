@@ -18,8 +18,9 @@ use crate::channels::ChannelHub;
 use crate::config::{IterationLimitConfig, PathAliasConfig, PolicyConfig};
 use crate::events::{
     AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
-    PolicyMetricsData, SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData,
-    TaskStatus, ThinkingStartData, ToolCallData, ToolCallInfo, ToolResultData,
+    LlmPayloadInvalidMetric, PolicyMetricsData, SubAgentCompleteData, SubAgentSpawnData,
+    TaskEndData, TaskStartData, TaskStatus, ThinkingStartData, ToolCallData, ToolCallInfo,
+    ToolResultData,
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::GoalTokenRegistry;
@@ -199,11 +200,18 @@ struct PolicyRuntimeMetrics {
     route_drift_failsafe_activation_total: AtomicU64,
     route_failsafe_active_turn_total: AtomicU64,
     tokens_failed_tasks_total: AtomicU64,
+    est_input_token_samples: AtomicU64,
+    est_input_tokens_total: AtomicU64,
+    est_msg_tokens_total: AtomicU64,
+    est_tool_tokens_total: AtomicU64,
+    est_tool_tokens_high_share_total: AtomicU64,
+    est_tool_tokens_high_abs_total: AtomicU64,
     no_progress_iterations_total: AtomicU64,
     deferred_no_tool_forced_required_total: AtomicU64,
     deferred_no_tool_deferral_detected_total: AtomicU64,
     deferred_no_tool_model_switch_total: AtomicU64,
     deferred_no_tool_error_marker_total: AtomicU64,
+    llm_payload_invalid_total: AtomicU64,
 }
 
 impl PolicyRuntimeMetrics {
@@ -233,16 +241,98 @@ impl PolicyRuntimeMetrics {
             route_drift_failsafe_activation_total: AtomicU64::new(0),
             route_failsafe_active_turn_total: AtomicU64::new(0),
             tokens_failed_tasks_total: AtomicU64::new(0),
+            est_input_token_samples: AtomicU64::new(0),
+            est_input_tokens_total: AtomicU64::new(0),
+            est_msg_tokens_total: AtomicU64::new(0),
+            est_tool_tokens_total: AtomicU64::new(0),
+            est_tool_tokens_high_share_total: AtomicU64::new(0),
+            est_tool_tokens_high_abs_total: AtomicU64::new(0),
             no_progress_iterations_total: AtomicU64::new(0),
             deferred_no_tool_forced_required_total: AtomicU64::new(0),
             deferred_no_tool_deferral_detected_total: AtomicU64::new(0),
             deferred_no_tool_model_switch_total: AtomicU64::new(0),
             deferred_no_tool_error_marker_total: AtomicU64::new(0),
+            llm_payload_invalid_total: AtomicU64::new(0),
         }
     }
 }
 
 static POLICY_METRICS: Lazy<PolicyRuntimeMetrics> = Lazy::new(PolicyRuntimeMetrics::new);
+const MAX_LLM_PAYLOAD_INVALID_METRIC_KEYS: usize = 512;
+const LLM_PAYLOAD_INVALID_OVERFLOW_PROVIDER: &str = "__other__";
+const LLM_PAYLOAD_INVALID_OVERFLOW_MODEL: &str = "__other__";
+const LLM_PAYLOAD_INVALID_OVERFLOW_REASON: &str = "__other__";
+type PayloadInvalidMetricKey = (String, String, String);
+type PayloadInvalidMetricMap = HashMap<PayloadInvalidMetricKey, u64>;
+static LLM_PAYLOAD_INVALID_BREAKDOWN: Lazy<std::sync::Mutex<PayloadInvalidMetricMap>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+pub(in crate::agent) fn provider_kind_metric_label(
+    kind: crate::config::ProviderKind,
+) -> &'static str {
+    match kind {
+        crate::config::ProviderKind::OpenaiCompatible => "openai_compatible",
+        crate::config::ProviderKind::GoogleGenai => "google_genai",
+        crate::config::ProviderKind::Anthropic => "anthropic",
+    }
+}
+
+pub(in crate::agent) fn record_llm_payload_invalid_metric(
+    provider: &str,
+    model: &str,
+    reason: &str,
+) {
+    POLICY_METRICS
+        .llm_payload_invalid_total
+        .fetch_add(1, Ordering::Relaxed);
+
+    let Ok(mut breakdown) = LLM_PAYLOAD_INVALID_BREAKDOWN.lock() else {
+        return;
+    };
+    let key = (provider.to_string(), model.to_string(), reason.to_string());
+    if let Some(count) = breakdown.get_mut(&key) {
+        *count = count.saturating_add(1);
+        return;
+    }
+
+    if breakdown.len() >= MAX_LLM_PAYLOAD_INVALID_METRIC_KEYS {
+        let overflow_key = (
+            LLM_PAYLOAD_INVALID_OVERFLOW_PROVIDER.to_string(),
+            LLM_PAYLOAD_INVALID_OVERFLOW_MODEL.to_string(),
+            LLM_PAYLOAD_INVALID_OVERFLOW_REASON.to_string(),
+        );
+        let count = breakdown.entry(overflow_key).or_insert(0);
+        *count = count.saturating_add(1);
+        return;
+    }
+
+    breakdown.insert(key, 1);
+}
+
+fn llm_payload_invalid_breakdown_snapshot() -> Vec<LlmPayloadInvalidMetric> {
+    let Ok(breakdown) = LLM_PAYLOAD_INVALID_BREAKDOWN.lock() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<LlmPayloadInvalidMetric> = breakdown
+        .iter()
+        .map(
+            |((provider, model, reason), count)| LlmPayloadInvalidMetric {
+                provider: provider.clone(),
+                model: model.clone(),
+                reason: reason.clone(),
+                count: *count,
+            },
+        )
+        .collect();
+    rows.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.provider.cmp(&b.provider))
+            .then_with(|| a.model.cmp(&b.model))
+            .then_with(|| a.reason.cmp(&b.reason))
+    });
+    rows
+}
 
 #[derive(Debug, Clone, Copy)]
 struct RouteDriftSample {
@@ -568,6 +658,20 @@ pub fn policy_metrics_snapshot() -> PolicyMetricsData {
         tokens_failed_tasks_total: POLICY_METRICS
             .tokens_failed_tasks_total
             .load(Ordering::Relaxed),
+        est_input_token_samples: POLICY_METRICS
+            .est_input_token_samples
+            .load(Ordering::Relaxed),
+        est_input_tokens_total: POLICY_METRICS
+            .est_input_tokens_total
+            .load(Ordering::Relaxed),
+        est_msg_tokens_total: POLICY_METRICS.est_msg_tokens_total.load(Ordering::Relaxed),
+        est_tool_tokens_total: POLICY_METRICS.est_tool_tokens_total.load(Ordering::Relaxed),
+        est_tool_tokens_high_share_total: POLICY_METRICS
+            .est_tool_tokens_high_share_total
+            .load(Ordering::Relaxed),
+        est_tool_tokens_high_abs_total: POLICY_METRICS
+            .est_tool_tokens_high_abs_total
+            .load(Ordering::Relaxed),
         no_progress_iterations_total: POLICY_METRICS
             .no_progress_iterations_total
             .load(Ordering::Relaxed),
@@ -583,6 +687,10 @@ pub fn policy_metrics_snapshot() -> PolicyMetricsData {
         deferred_no_tool_error_marker_total: POLICY_METRICS
             .deferred_no_tool_error_marker_total
             .load(Ordering::Relaxed),
+        llm_payload_invalid_total: POLICY_METRICS
+            .llm_payload_invalid_total
+            .load(Ordering::Relaxed),
+        llm_payload_invalid_breakdown: llm_payload_invalid_breakdown_snapshot(),
     }
 }
 
@@ -1253,6 +1361,9 @@ pub struct Agent {
     /// Weak reference to the ChannelHub for background notifications.
     /// Uses RwLock because hub is created after Agent (core.rs ordering).
     hub: RwLock<Option<Weak<ChannelHub>>>,
+    /// Session IDs that have granted schedule confirmation for this process lifetime.
+    /// Allows schedule creation to auto-confirm after an explicit AllowSession/AllowAlways.
+    schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Weak self-reference for background task spawning.
     /// Set after Arc creation via `set_self_ref()`.
     self_ref: RwLock<Option<Weak<Agent>>>,
@@ -2530,6 +2641,7 @@ impl Agent {
             cancel_token: None,
             goal_token_registry,
             hub: RwLock::new(hub),
+            schedule_approved_sessions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             self_ref: RwLock::new(None),
             context_window_config,
             policy_config,
@@ -2596,6 +2708,7 @@ impl Agent {
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         goal_token_registry: Option<GoalTokenRegistry>,
         hub: Option<Weak<ChannelHub>>,
+        schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
         record_decision_points: bool,
         context_window_config: crate::config::ContextWindowConfig,
         policy_config: PolicyConfig,
@@ -2638,6 +2751,7 @@ impl Agent {
             cancel_token,
             goal_token_registry,
             hub: RwLock::new(hub),
+            schedule_approved_sessions,
             self_ref: RwLock::new(None),
             context_window_config,
             policy_config,
@@ -2733,6 +2847,11 @@ impl Agent {
     const MAX_LLM_RETRIES: u32 = 3;
     /// Base delay for exponential backoff on transient errors (seconds).
     const RETRY_BASE_DELAY_SECS: u64 = 2;
+    /// Single retry budget for malformed payloads that are likely deterministic
+    /// (shape/unknown). Parse errors use transient retry + fallback recovery.
+    const MAX_MALFORMED_PAYLOAD_RETRIES: u32 = 1;
+    /// Small delay before malformed-payload retry to smooth transient gateway glitches.
+    const MALFORMED_PAYLOAD_RETRY_DELAY_SECS: u64 = 1;
 
     // ==================== Orchestration Methods ====================
 

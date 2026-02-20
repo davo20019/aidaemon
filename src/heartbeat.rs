@@ -1022,9 +1022,15 @@ impl HeartbeatCoordinator {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
             description: if schedule.is_one_shot || goal.goal_type == "finite" {
-                format!("Execute scheduled goal: {}", goal.description)
+                format!(
+                    "Execute scheduled goal: {} [SYSTEM: already scheduled and firing now; do not reschedule.]",
+                    goal.description
+                )
             } else {
-                format!("Scheduled check: {}", goal.description)
+                format!(
+                    "Scheduled check: {} [SYSTEM: already scheduled and firing now; do not reschedule.]",
+                    goal.description
+                )
             },
             status: "pending".to_string(),
             priority: if goal.goal_type == "continuous" {

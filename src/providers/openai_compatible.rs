@@ -6,7 +6,6 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
-use crate::providers::error::ProviderErrorKind;
 use crate::providers::ProviderError;
 use crate::traits::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
@@ -257,7 +256,10 @@ impl ModelProvider for OpenAiCompatibleProvider {
         };
 
         let status = resp.status();
-        let text = resp.text().await?;
+        let text = resp.text().await.map_err(|e| {
+            error!("Failed to read response body: {}", e);
+            ProviderError::network(&e)
+        })?;
 
         if !status.is_success() {
             error!(status = %status, "Provider API error: {}", text);
@@ -282,20 +284,23 @@ impl ModelProvider for OpenAiCompatibleProvider {
 
         let data: Value = serde_json::from_str(&text).map_err(|e| {
             error!("Failed to parse provider response JSON: {}", e);
-            ProviderError {
-                kind: ProviderErrorKind::ServerError,
-                status: Some(200),
-                message: format!(
-                    "Malformed response from LLM provider (JSON parse error: {})",
-                    e
-                ),
-                retry_after_secs: None,
-            }
+            ProviderError::malformed_parse(format!(
+                "Malformed response from LLM provider (JSON parse error: {})",
+                e
+            ))
         })?;
-        let choice = data["choices"]
-            .get(0)
-            .ok_or_else(|| anyhow::anyhow!("No choices in response"))?;
-        let message = &choice["message"];
+        let choice = data["choices"].get(0).ok_or_else(|| {
+            error!("Provider response missing choices[0]");
+            ProviderError::malformed_shape(
+                "Malformed response from LLM provider (missing choices[0])",
+            )
+        })?;
+        let message = choice.get("message").ok_or_else(|| {
+            error!("Provider response missing choices[0].message");
+            ProviderError::malformed_shape(
+                "Malformed response from LLM provider (missing choices[0].message)",
+            )
+        })?;
 
         let content = message["content"].as_str().map(|s| s.to_string());
 

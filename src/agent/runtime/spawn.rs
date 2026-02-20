@@ -286,6 +286,7 @@ impl Agent {
                 child_cancel,
                 self.goal_token_registry.clone(),
                 self.hub.read().await.clone(),
+                self.schedule_approved_sessions.clone(),
                 self.record_decision_points,
                 self.context_window_config.clone(),
                 self.policy_config.clone(),
@@ -338,6 +339,7 @@ impl Agent {
                 child_cancel,
                 self.goal_token_registry.clone(),
                 self.hub.read().await.clone(),
+                self.schedule_approved_sessions.clone(),
                 self.record_decision_points,
                 self.context_window_config.clone(),
                 self.policy_config.clone(),
@@ -575,6 +577,7 @@ impl Agent {
                 child_cancel_token,               // cancel_token (derived from goal token)
                 self.goal_token_registry.clone(), // goal_token_registry
                 self.hub.read().await.clone(),    // hub
+                self.schedule_approved_sessions.clone(),
                 self.record_decision_points,
                 self.context_window_config.clone(),
                 self.policy_config.clone(),

@@ -315,7 +315,8 @@ pub trait SkillStore: Send + Sync {
         Ok(())
     }
 
-    /// Check if a draft already exists for a given procedure name.
+    /// Check if any draft record already exists for a given procedure name
+    /// (pending, approved, or dismissed).
     async fn skill_draft_exists_for_procedure(
         &self,
         _procedure_name: &str,

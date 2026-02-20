@@ -30,7 +30,7 @@ impl Agent {
     ) -> anyhow::Result<String> {
         let bundle = crate::startup::provider_router::build_provider_router(config)?;
         let new_router = crate::llm_runtime::router_from_models(config.provider.models.clone());
-        let new_kind = config.provider.kind.clone();
+        let new_kind = config.provider.kind;
         let new_primary = bundle.primary_model.clone();
         let new_fallback = config
             .provider
@@ -42,12 +42,9 @@ impl Agent {
             .unwrap_or_else(|| new_primary.clone());
         let old_model = self.model.read().await.clone();
 
-        let old_runtime = self.llm_runtime.swap(
-            bundle.provider,
-            new_router,
-            new_kind.clone(),
-            new_primary.clone(),
-        );
+        let old_runtime =
+            self.llm_runtime
+                .swap(bundle.provider, new_router, new_kind, new_primary.clone());
 
         {
             let mut model = self.model.write().await;

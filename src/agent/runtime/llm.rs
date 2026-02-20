@@ -1,5 +1,15 @@
 use super::*;
 
+fn malformed_reason_label(
+    reason: Option<crate::providers::MalformedResponseReason>,
+) -> &'static str {
+    match reason {
+        Some(crate::providers::MalformedResponseReason::Parse) => "parse",
+        Some(crate::providers::MalformedResponseReason::Shape) => "shape",
+        None => "unknown",
+    }
+}
+
 impl Agent {
     /// Pick a fallback model, skipping `failed_model` and any models in the `exclude` list.
     /// Tries stored fallback first, then cycles through router ordered models
@@ -70,9 +80,64 @@ impl Agent {
         Err(anyhow::anyhow!("{}", last_err.user_message()))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn retry_malformed_response<F>(
+        &self,
+        provider: &Arc<dyn ModelProvider>,
+        model: &str,
+        messages: &[Value],
+        tool_defs: &[Value],
+        options: &ChatOptions,
+        provider_label: &str,
+        max_retries: u32,
+        wait_for_attempt: F,
+        retry_strategy: &str,
+    ) -> anyhow::Result<Option<crate::traits::ProviderResponse>>
+    where
+        F: Fn(u32) -> u64,
+    {
+        for attempt in 0..max_retries {
+            let wait = wait_for_attempt(attempt);
+            info!(
+                wait_secs = wait,
+                attempt = attempt + 1,
+                max = max_retries,
+                strategy = retry_strategy,
+                "Retrying after malformed provider response"
+            );
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            match provider
+                .chat_with_options(model, messages, tool_defs, options)
+                .await
+            {
+                Ok(resp) => {
+                    self.stamp_lastgood().await;
+                    return Ok(Some(resp));
+                }
+                Err(retry_err) => {
+                    let retry_provider_err = match retry_err.downcast::<ProviderError>() {
+                        Ok(pe) => pe,
+                        Err(other) => return Err(other),
+                    };
+                    if retry_provider_err.kind == ProviderErrorKind::MalformedResponse {
+                        let retry_reason =
+                            malformed_reason_label(retry_provider_err.malformed_reason);
+                        record_llm_payload_invalid_metric(provider_label, model, retry_reason);
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!("{}", retry_provider_err.user_message()));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Attempt an LLM call with error-classified recovery:
     /// - RateLimit → exponential backoff retries, then cascade fallback
     /// - Timeout/Network/ServerError → exponential backoff retries, then cascade fallback
+    /// - MalformedResponse(Parse) → exponential backoff retries, then cascade fallback
+    /// - MalformedResponse(Shape/Unknown) → single retry (no cascade fallback)
     /// - NotFound → cascade fallback immediately
     /// - Auth/Billing → return user-facing error immediately
     pub(super) async fn call_llm_with_recovery(
@@ -106,6 +171,8 @@ impl Agent {
                     "LLM call failed: {}",
                     provider_err
                 );
+                let provider_label =
+                    provider_kind_metric_label(self.llm_runtime.snapshot().provider_kind());
 
                 match provider_err.kind {
                     // --- Non-retryable: tell the user, stop ---
@@ -210,6 +277,68 @@ impl Agent {
                             &provider_err,
                         )
                         .await
+                    }
+
+                    // --- Malformed payload: reason-aware recovery ---
+                    ProviderErrorKind::MalformedResponse => {
+                        let reason = malformed_reason_label(provider_err.malformed_reason);
+                        record_llm_payload_invalid_metric(provider_label, model, reason);
+
+                        if provider_err.malformed_reason
+                            == Some(crate::providers::MalformedResponseReason::Parse)
+                        {
+                            // Parse failures can be transient (gateway/proxy/body corruption).
+                            // Use the same resilient policy as other transient provider failures.
+                            let retry_result = self
+                                .retry_malformed_response(
+                                    &provider,
+                                    model,
+                                    messages,
+                                    tool_defs,
+                                    options,
+                                    provider_label,
+                                    Self::MAX_LLM_RETRIES,
+                                    |attempt| Self::RETRY_BASE_DELAY_SECS * 2u64.pow(attempt),
+                                    "parse_exponential_backoff",
+                                )
+                                .await?;
+                            if let Some(resp) = retry_result {
+                                return Ok(resp);
+                            }
+                            warn!("Malformed parse retries exhausted, trying cascade fallback");
+                            return self
+                                .cascade_fallback(
+                                    &provider,
+                                    router.as_ref(),
+                                    model,
+                                    messages,
+                                    tool_defs,
+                                    options,
+                                    &provider_err,
+                                )
+                                .await;
+                        }
+
+                        // Shape/unknown malformed responses are likely deterministic schema issues.
+                        // Retry once quickly, then fail fast without model cascade.
+                        let retry_result = self
+                            .retry_malformed_response(
+                                &provider,
+                                model,
+                                messages,
+                                tool_defs,
+                                options,
+                                provider_label,
+                                Self::MAX_MALFORMED_PAYLOAD_RETRIES,
+                                |_| Self::MALFORMED_PAYLOAD_RETRY_DELAY_SECS,
+                                "shape_or_unknown_single_retry",
+                            )
+                            .await?;
+                        if let Some(resp) = retry_result {
+                            return Ok(resp);
+                        }
+
+                        Err(anyhow::anyhow!("{}", provider_err.user_message()))
                     }
 
                     // --- NotFound (bad model name): cascade fallback immediately ---

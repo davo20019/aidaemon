@@ -193,7 +193,7 @@ impl fmt::Debug for ProviderConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     #[default]

@@ -7,8 +7,15 @@ pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub status: Option<u16>,
     pub message: String,
+    pub malformed_reason: Option<MalformedResponseReason>,
     /// Seconds to wait before retrying (from 429 Retry-After header or body).
     pub retry_after_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedResponseReason {
+    Parse,
+    Shape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +36,9 @@ pub enum ProviderErrorKind {
     Network,
     /// 500/502/503/504 — provider-side outage.
     ServerError,
+    /// Provider returned a malformed success payload.
+    /// Recovery is reason-aware (parse may be transient; shape is often deterministic).
+    MalformedResponse,
     /// Anything else.
     Unknown,
 }
@@ -57,6 +67,7 @@ impl ProviderError {
             kind,
             status: Some(status),
             message: truncate_body(body),
+            malformed_reason: None,
             retry_after_secs,
         }
     }
@@ -71,6 +82,27 @@ impl ProviderError {
             kind,
             status: None,
             message: err.to_string(),
+            malformed_reason: None,
+            retry_after_secs: None,
+        }
+    }
+
+    pub fn malformed_parse(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProviderErrorKind::MalformedResponse,
+            status: Some(200),
+            message: message.into(),
+            malformed_reason: Some(MalformedResponseReason::Parse),
+            retry_after_secs: None,
+        }
+    }
+
+    pub fn malformed_shape(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProviderErrorKind::MalformedResponse,
+            status: Some(200),
+            message: message.into(),
+            malformed_reason: Some(MalformedResponseReason::Shape),
             retry_after_secs: None,
         }
     }
@@ -100,6 +132,12 @@ impl ProviderError {
             }
             ProviderErrorKind::ServerError => {
                 "LLM provider is experiencing issues (server error). Will retry.".to_string()
+            }
+            ProviderErrorKind::MalformedResponse => {
+                format!(
+                    "LLM provider returned a malformed response. This may be a provider bug. Details: {}",
+                    self.message
+                )
             }
             ProviderErrorKind::BadRequest => {
                 format!("LLM request was malformed (400). This may be a bug — please report it. Details: {}", self.message)

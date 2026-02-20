@@ -946,11 +946,7 @@ impl MemoryManager {
                     // Include text content if present
                     if let Some(content) = &msg.content {
                         if !content.trim().is_empty() {
-                            let truncated = if content.len() > 500 {
-                                format!("{}...", &content[..500])
-                            } else {
-                                content.clone()
-                            };
+                            let truncated = crate::utils::truncate_str(content, 500);
                             transcript.push_str(&format!("Assistant: {}\n\n", truncated));
                         }
                     }

@@ -22,7 +22,7 @@ impl LlmRuntimeSnapshot {
     }
 
     pub fn provider_kind(&self) -> ProviderKind {
-        self.provider_kind.clone()
+        self.provider_kind
     }
 
     pub fn primary_model(&self) -> String {
@@ -68,7 +68,7 @@ impl SharedLlmRuntime {
         LlmRuntimeSnapshot {
             provider: guard.provider.clone(),
             router: guard.router.clone(),
-            provider_kind: guard.provider_kind.clone(),
+            provider_kind: guard.provider_kind,
             primary_model: guard.primary_model.clone(),
         }
     }
@@ -92,7 +92,7 @@ impl SharedLlmRuntime {
         let old = LlmRuntimeSnapshot {
             provider: guard.provider.clone(),
             router: guard.router.clone(),
-            provider_kind: guard.provider_kind.clone(),
+            provider_kind: guard.provider_kind,
             primary_model: guard.primary_model.clone(),
         };
         guard.provider = provider;

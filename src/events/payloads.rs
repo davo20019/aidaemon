@@ -223,11 +223,27 @@ pub struct PolicyMetricsData {
     pub route_drift_failsafe_activation_total: u64,
     pub route_failsafe_active_turn_total: u64,
     pub tokens_failed_tasks_total: u64,
+    pub est_input_token_samples: u64,
+    pub est_input_tokens_total: u64,
+    pub est_msg_tokens_total: u64,
+    pub est_tool_tokens_total: u64,
+    pub est_tool_tokens_high_share_total: u64,
+    pub est_tool_tokens_high_abs_total: u64,
     pub no_progress_iterations_total: u64,
     pub deferred_no_tool_forced_required_total: u64,
     pub deferred_no_tool_deferral_detected_total: u64,
     pub deferred_no_tool_model_switch_total: u64,
     pub deferred_no_tool_error_marker_total: u64,
+    pub llm_payload_invalid_total: u64,
+    pub llm_payload_invalid_breakdown: Vec<LlmPayloadInvalidMetric>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmPayloadInvalidMetric {
+    pub provider: String,
+    pub model: String,
+    pub reason: String,
+    pub count: u64,
 }
 
 /// Data for DecisionPoint event (flight recorder).

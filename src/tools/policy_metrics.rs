@@ -95,6 +95,32 @@ impl Tool for PolicyMetricsTool {
         } else {
             0.0
         };
+        let est_input_token_samples = metrics.est_input_token_samples;
+        let avg_est_input_tokens_per_call = if est_input_token_samples > 0 {
+            metrics.est_input_tokens_total as f64 / est_input_token_samples as f64
+        } else {
+            0.0
+        };
+        let avg_est_tool_tokens_per_call = if est_input_token_samples > 0 {
+            metrics.est_tool_tokens_total as f64 / est_input_token_samples as f64
+        } else {
+            0.0
+        };
+        let est_tool_token_share_rate = if metrics.est_input_tokens_total > 0 {
+            metrics.est_tool_tokens_total as f64 / metrics.est_input_tokens_total as f64
+        } else {
+            0.0
+        };
+        let est_tool_tokens_high_share_rate = if est_input_token_samples > 0 {
+            metrics.est_tool_tokens_high_share_total as f64 / est_input_token_samples as f64
+        } else {
+            0.0
+        };
+        let est_tool_tokens_high_abs_rate = if est_input_token_samples > 0 {
+            metrics.est_tool_tokens_high_abs_total as f64 / est_input_token_samples as f64
+        } else {
+            0.0
+        };
 
         if args
             .format
@@ -123,11 +149,23 @@ impl Tool for PolicyMetricsTool {
                  - route_drift_failsafe_activation_total: {}\n\
                  - route_failsafe_active_turn_total: {}\n\
                  - tokens_failed_tasks_total: {}\n\
+                 - est_input_token_samples: {}\n\
+                 - est_input_tokens_total: {}\n\
+                 - est_tool_tokens_total: {}\n\
+                 - avg_est_input_tokens_per_call: {:.1}\n\
+                 - avg_est_tool_tokens_per_call: {:.1}\n\
+                 - est_tool_token_share_rate: {:.3}\n\
+                 - est_tool_tokens_high_share_total: {}\n\
+                 - est_tool_tokens_high_share_rate: {:.3}\n\
+                 - est_tool_tokens_high_abs_total: {}\n\
+                 - est_tool_tokens_high_abs_rate: {:.3}\n\
                  - no_progress_iterations_total: {}\n\
                  - deferred_no_tool_forced_required_total: {}\n\
                  - deferred_no_tool_deferral_detected_total: {}\n\
                  - deferred_no_tool_model_switch_total: {}\n\
-                 - deferred_no_tool_error_marker_total: {}",
+                 - deferred_no_tool_error_marker_total: {}\n\
+                 - llm_payload_invalid_total: {}\n\
+                 - llm_payload_invalid_breakdown_entries: {}",
                 metrics.consultant_direct_return_total,
                 metrics.consultant_fallthrough_total,
                 consultant_direct_return_rate,
@@ -148,11 +186,23 @@ impl Tool for PolicyMetricsTool {
                 metrics.route_drift_failsafe_activation_total,
                 metrics.route_failsafe_active_turn_total,
                 metrics.tokens_failed_tasks_total,
+                metrics.est_input_token_samples,
+                metrics.est_input_tokens_total,
+                metrics.est_tool_tokens_total,
+                avg_est_input_tokens_per_call,
+                avg_est_tool_tokens_per_call,
+                est_tool_token_share_rate,
+                metrics.est_tool_tokens_high_share_total,
+                est_tool_tokens_high_share_rate,
+                metrics.est_tool_tokens_high_abs_total,
+                est_tool_tokens_high_abs_rate,
                 metrics.no_progress_iterations_total,
                 metrics.deferred_no_tool_forced_required_total,
                 metrics.deferred_no_tool_deferral_detected_total,
                 metrics.deferred_no_tool_model_switch_total,
                 metrics.deferred_no_tool_error_marker_total,
+                metrics.llm_payload_invalid_total,
+                metrics.llm_payload_invalid_breakdown.len(),
             ));
         }
 
@@ -170,6 +220,11 @@ impl Tool for PolicyMetricsTool {
                     + metrics.context_mismatch_preflight_drop_total
                     + metrics.followup_mode_overrides_total
                     + metrics.cross_scope_blocked_total,
+                "avg_est_input_tokens_per_call": avg_est_input_tokens_per_call,
+                "avg_est_tool_tokens_per_call": avg_est_tool_tokens_per_call,
+                "est_tool_token_share_rate": est_tool_token_share_rate,
+                "est_tool_tokens_high_share_rate": est_tool_tokens_high_share_rate,
+                "est_tool_tokens_high_abs_rate": est_tool_tokens_high_abs_rate,
                 "deferred_no_tool_recovery_effectiveness_rate": if metrics.deferred_no_tool_forced_required_total > 0 {
                     metrics
                         .deferred_no_tool_forced_required_total
@@ -211,6 +266,14 @@ mod tests {
         assert!(parsed
             .get("metrics")
             .and_then(|m| m.get("tokens_failed_tasks_total"))
+            .is_some());
+        assert!(parsed
+            .get("metrics")
+            .and_then(|m| m.get("est_input_token_samples"))
+            .is_some());
+        assert!(parsed
+            .get("metrics")
+            .and_then(|m| m.get("est_tool_tokens_total"))
             .is_some());
         assert!(parsed
             .get("metrics")

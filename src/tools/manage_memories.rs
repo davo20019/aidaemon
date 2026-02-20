@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -148,6 +149,24 @@ impl ManageMemoriesTool {
             || goal.description.to_ascii_lowercase().contains(&q)
     }
 
+    fn canonicalize_schedule_goal_description(input: &str) -> String {
+        let mut normalized = input.trim().to_ascii_lowercase();
+        let system_suffix = "[system: already scheduled and firing now; do not reschedule.]";
+        if let Some(idx) = normalized.find(system_suffix) {
+            normalized.truncate(idx);
+        }
+        normalized = normalized.trim().to_string();
+
+        for prefix in ["execute scheduled goal:", "scheduled check:"] {
+            if let Some(rest) = normalized.strip_prefix(prefix) {
+                normalized = rest.trim().to_string();
+                break;
+            }
+        }
+
+        normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     fn truncate_chars(s: &str, max: usize) -> String {
         s.chars().take(max).collect()
     }
@@ -206,6 +225,8 @@ struct ManageArgs {
     _session_id: Option<String>,
     #[serde(default)]
     _user_role: Option<String>,
+    #[serde(default)]
+    _channel_visibility: Option<String>,
 }
 
 #[async_trait]
@@ -258,7 +279,7 @@ impl Tool for ManageMemoriesTool {
                     },
                     "goal_id": {
                         "type": "string",
-                        "description": "Goal ID for goal/schedule actions. Retrieve via list_goals/list_scheduled first."
+                        "description": "Goal ID for goal/schedule actions. Retrieve via list_goals/list_scheduled first. For action='cancel_scheduled', use 'all' or '*' to cancel all cancellable scheduled goals in the current session."
                     },
                     "schedule_id": {
                         "type": "string",
@@ -534,6 +555,13 @@ impl Tool for ManageMemoriesTool {
                 if session_id.trim().is_empty() {
                     return Ok("Internal error: create_scheduled_goal requires _session_id.".to_string());
                 }
+                let is_internal_visibility = args
+                    ._channel_visibility
+                    .as_deref()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("internal"));
+                if is_internal_visibility || session_id.starts_with("sub-") {
+                    return Ok("Cannot create scheduled goals from within internal scheduled-task execution. Execute the task directly instead.".to_string());
+                }
 
                 let desc = args
                     .goal
@@ -598,12 +626,56 @@ impl Tool for ManageMemoriesTool {
                     });
                 }
 
-	                let has_recurring = parsed.iter().any(|p| !p.is_one_shot);
-	                let mut goal = if has_recurring {
-	                    crate::traits::Goal::new_continuous_pending(desc, session_id, None, None)
-	                } else {
-	                    crate::traits::Goal::new_deferred_finite(desc, session_id)
-	                };
+                // Prevent duplicate schedules when the model repeats the same create request.
+                let target_desc = Self::canonicalize_schedule_goal_description(desc);
+                let target_crons: BTreeSet<String> = parsed
+                    .iter()
+                    .map(|p| p.cron.trim().to_ascii_lowercase())
+                    .collect();
+                let existing_goals = self.state.get_scheduled_goals().await.unwrap_or_default();
+                let mut duplicate_goal_id: Option<String> = None;
+                for existing in existing_goals {
+                    if existing.session_id != session_id {
+                        continue;
+                    }
+                    if !matches!(
+                        existing.status.as_str(),
+                        "active" | "pending_confirmation" | "paused"
+                    ) {
+                        continue;
+                    }
+                    if Self::canonicalize_schedule_goal_description(&existing.description)
+                        != target_desc
+                    {
+                        continue;
+                    }
+                    let existing_schedules = self
+                        .state
+                        .get_schedules_for_goal(&existing.id)
+                        .await
+                        .unwrap_or_default();
+                    let existing_crons: BTreeSet<String> = existing_schedules
+                        .iter()
+                        .map(|s| s.cron_expr.trim().to_ascii_lowercase())
+                        .collect();
+                    if !existing_crons.is_empty() && existing_crons == target_crons {
+                        duplicate_goal_id = Some(existing.id.clone());
+                        break;
+                    }
+                }
+                if let Some(existing_id) = duplicate_goal_id {
+                    return Ok(format!(
+                        "A similar scheduled goal already exists ({}). Use list_scheduled to inspect existing goals.",
+                        existing_id
+                    ));
+                }
+
+                let has_recurring = parsed.iter().any(|p| !p.is_one_shot);
+                let mut goal = if has_recurring {
+                    crate::traits::Goal::new_continuous_pending(desc, session_id, None, None)
+                } else {
+                    crate::traits::Goal::new_deferred_finite(desc, session_id)
+                };
                 goal.domain = "orchestration".to_string();
 
                 self.state.create_goal(&goal).await?;
@@ -890,11 +962,71 @@ impl Tool for ManageMemoriesTool {
                 ))
             }
             "cancel_scheduled" => {
-                let goal_id = args
+                let goal_id_input = args
                     .goal_id
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for cancel_scheduled action"))?;
-                let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
+                let goal_id_trimmed = goal_id_input.trim();
+
+                if goal_id_trimmed.eq_ignore_ascii_case("all") || goal_id_trimmed == "*" {
+                    let session_id = args._session_id.as_deref().unwrap_or("").trim();
+                    if session_id.is_empty() {
+                        return Ok(
+                            "Internal error: cancel_scheduled with goal_id='all' requires _session_id."
+                                .to_string(),
+                        );
+                    }
+                    let goals = self.state.get_scheduled_goals().await?;
+                    let mut cancelled = 0usize;
+                    let mut protected = 0usize;
+                    let mut skipped = 0usize;
+                    let mut errors = 0usize;
+
+                    for mut goal in goals {
+                        if goal.session_id != session_id {
+                            continue;
+                        }
+                        if !matches!(
+                            goal.status.as_str(),
+                            "active" | "pending_confirmation" | "paused"
+                        ) {
+                            skipped += 1;
+                            continue;
+                        }
+                        if Self::is_protected_system_maintenance_goal(&goal) {
+                            protected += 1;
+                            continue;
+                        }
+
+                        let schedules = self
+                            .state
+                            .get_schedules_for_goal(&goal.id)
+                            .await
+                            .unwrap_or_default();
+                        goal.status = "cancelled".to_string();
+                        goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        goal.updated_at = chrono::Utc::now().to_rfc3339();
+                        if self.state.update_goal(&goal).await.is_ok() {
+                            for s in &schedules {
+                                let _ = self.state.delete_goal_schedule(&s.id).await;
+                            }
+                            cancelled += 1;
+                        } else {
+                            errors += 1;
+                        }
+                    }
+
+                    let mut msg = format!("Cancelled {} scheduled goals.", cancelled);
+                    if protected > 0 || skipped > 0 || errors > 0 {
+                        msg.push_str(&format!(
+                            " Skipped protected: {}. Skipped non-active: {}. Errors: {}.",
+                            protected, skipped, errors
+                        ));
+                    }
+                    return Ok(msg);
+                }
+
+                let resolved_goal_id = match self.resolve_goal_id(goal_id_trimmed).await {
                     Ok(id) => id,
                     Err(e) => return Ok(e.to_string()),
                 };
@@ -1466,6 +1598,20 @@ mod tests {
         state.create_goal_schedule(&schedule).await.unwrap();
     }
 
+    #[test]
+    fn canonicalize_schedule_goal_description_strips_execution_wrappers() {
+        let wrapped = "Scheduled check: Check API health [SYSTEM: already scheduled and firing now; do not reschedule.]";
+        let execute_wrapped = "Execute scheduled goal:   Check   API health  ";
+        assert_eq!(
+            ManageMemoriesTool::canonicalize_schedule_goal_description(wrapped),
+            "check api health"
+        );
+        assert_eq!(
+            ManageMemoriesTool::canonicalize_schedule_goal_description(execute_wrapped),
+            "check api health"
+        );
+    }
+
     #[tokio::test]
     async fn add_schedule_creates_schedule_row() {
         let state = setup_state().await;
@@ -1585,6 +1731,114 @@ mod tests {
         assert!(result.contains("Cancelled scheduled goal"));
         let fetched = state.get_goal(&goal.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_scheduled_all_keyword_cancels_cancellable_goals() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let g1 = Goal::new_continuous("Recurring A", "user-session", Some(1000), Some(5000));
+        let g2 = Goal::new_continuous("Recurring B", "user-session", Some(1000), Some(5000));
+        let protected = Goal::new_continuous(
+            "Maintain memory health: prune old events, clean up retention, remove stale data",
+            "system",
+            Some(1000),
+            Some(5000),
+        );
+        state.create_goal(&g1).await.unwrap();
+        state.create_goal(&g2).await.unwrap();
+        state.create_goal(&protected).await.unwrap();
+        add_schedule(&state, &g1.id, "0 6 * * *").await;
+        add_schedule(&state, &g2.id, "0 12 * * *").await;
+        add_schedule(&state, &protected.id, "0 3 * * *").await;
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "cancel_scheduled",
+                    "goal_id": "all",
+                    "_session_id": "user-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Cancelled 2 scheduled goals."));
+        let g1_after = state.get_goal(&g1.id).await.unwrap().unwrap();
+        let g2_after = state.get_goal(&g2.id).await.unwrap().unwrap();
+        let protected_after = state.get_goal(&protected.id).await.unwrap().unwrap();
+        assert_eq!(g1_after.status, "cancelled");
+        assert_eq!(g2_after.status, "cancelled");
+        assert_eq!(protected_after.status, "active");
+        assert_eq!(state.get_schedules_for_goal(&g1.id).await.unwrap().len(), 0);
+        assert_eq!(state.get_schedules_for_goal(&g2.id).await.unwrap().len(), 0);
+        assert_eq!(
+            state
+                .get_schedules_for_goal(&protected.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_scheduled_all_keyword_scoped_to_session() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let same_session = Goal::new_continuous(
+            "Recurring Same Session",
+            "session-a",
+            Some(1000),
+            Some(5000),
+        );
+        let other_session = Goal::new_continuous(
+            "Recurring Other Session",
+            "session-b",
+            Some(1000),
+            Some(5000),
+        );
+        state.create_goal(&same_session).await.unwrap();
+        state.create_goal(&other_session).await.unwrap();
+        add_schedule(&state, &same_session.id, "0 6 * * *").await;
+        add_schedule(&state, &other_session.id, "0 12 * * *").await;
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "cancel_scheduled",
+                    "goal_id": "all",
+                    "_session_id": "session-a"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Cancelled 1 scheduled goals."));
+        let same_after = state.get_goal(&same_session.id).await.unwrap().unwrap();
+        let other_after = state.get_goal(&other_session.id).await.unwrap().unwrap();
+        assert_eq!(same_after.status, "cancelled");
+        assert_eq!(other_after.status, "active");
+        assert_eq!(
+            state
+                .get_schedules_for_goal(&same_session.id)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            state
+                .get_schedules_for_goal(&other_session.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2138,6 +2392,76 @@ mod tests {
             .unwrap();
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         assert!(schedules[0].is_paused);
+    }
+
+    #[tokio::test]
+    async fn create_scheduled_goal_rejects_internal_execution_context() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Nested schedule",
+                    "schedule": "in 1 minute",
+                    "_user_role": "owner",
+                    "_session_id": "sub-1-abc123",
+                    "_channel_visibility": "internal"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains(
+            "Cannot create scheduled goals from within internal scheduled-task execution"
+        ));
+        let goals = state.get_scheduled_goals().await.unwrap();
+        assert!(goals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_scheduled_goal_deduplicates_same_description_and_schedule() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let first = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Check API health",
+                    "schedule": "every 6h",
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(first.contains("Created scheduled goal"));
+
+        let second = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "  check   api HEALTH ",
+                    "schedule": "every 6h",
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(second.contains("A similar scheduled goal already exists"));
+
+        let goals = state.get_scheduled_goals().await.unwrap();
+        let matching = goals
+            .iter()
+            .filter(|g| g.description == "Check API health")
+            .count();
+        assert_eq!(matching, 1);
     }
 
     #[tokio::test]

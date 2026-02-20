@@ -9,7 +9,7 @@ use reqwest::Client;
 use tracing::warn;
 
 pub use anthropic_native::AnthropicNativeProvider;
-pub use error::{ProviderError, ProviderErrorKind};
+pub use error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
 pub use google_genai::GoogleGenAiProvider;
 pub use openai_compatible::OpenAiCompatibleProvider;
 

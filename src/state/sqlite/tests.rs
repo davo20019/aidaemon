@@ -3,7 +3,7 @@ use crate::memory::embeddings::EmbeddingService;
 use crate::traits::store_prelude::*;
 use crate::traits::{
     BehaviorPattern, DynamicBot, DynamicMcpServer, DynamicSkill, Episode, ErrorSolution, Goal,
-    GoalSchedule, Message, Procedure, TokenUsage,
+    GoalSchedule, Message, Procedure, SkillDraft, TokenUsage,
 };
 use crate::types::FactPrivacy;
 use std::sync::Arc;
@@ -1864,6 +1864,36 @@ async fn test_dynamic_skills_crud() {
     store.delete_dynamic_skill(skill_id).await.unwrap();
     let skills = store.get_dynamic_skills().await.unwrap();
     assert_eq!(skills.len(), 0);
+}
+
+#[tokio::test]
+async fn test_skill_draft_exists_for_procedure_after_dismissal() {
+    let (store, _db) = setup_test_store().await;
+    let draft = SkillDraft {
+        id: 0,
+        name: "deploy-helper".to_string(),
+        description: "Draft replacement".to_string(),
+        triggers_json: r#"["deploy"]"#.to_string(),
+        body: "1. Build.\n2. Deploy.".to_string(),
+        source_procedure: "deploy-proc".to_string(),
+        status: "pending".to_string(),
+        created_at: String::new(),
+    };
+
+    let draft_id = store.add_skill_draft(&draft).await.unwrap();
+    assert!(store
+        .skill_draft_exists_for_procedure("deploy-proc")
+        .await
+        .unwrap());
+
+    store
+        .update_skill_draft_status(draft_id, "dismissed")
+        .await
+        .unwrap();
+    assert!(store
+        .skill_draft_exists_for_procedure("deploy-proc")
+        .await
+        .unwrap());
 }
 
 // ==================== Dynamic MCP Server Tests ====================

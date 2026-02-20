@@ -416,6 +416,41 @@ impl Agent {
             let est_msg_tokens = messages_json.len() / 4;
             let est_tool_tokens = tools_json.len() / 4;
             let est_total_tokens = est_msg_tokens + est_tool_tokens;
+            let est_msg_tokens_u64 = est_msg_tokens as u64;
+            let est_tool_tokens_u64 = est_tool_tokens as u64;
+            let est_total_tokens_u64 = est_total_tokens as u64;
+            let est_tool_share_bps = if est_total_tokens_u64 > 0 {
+                est_tool_tokens_u64.saturating_mul(10_000) / est_total_tokens_u64
+            } else {
+                0
+            };
+
+            // Runtime signal: quantify prompt overhead from tool schemas before each LLM call.
+            POLICY_METRICS
+                .est_input_token_samples
+                .fetch_add(1, Ordering::Relaxed);
+            POLICY_METRICS
+                .est_input_tokens_total
+                .fetch_add(est_total_tokens_u64, Ordering::Relaxed);
+            POLICY_METRICS
+                .est_msg_tokens_total
+                .fetch_add(est_msg_tokens_u64, Ordering::Relaxed);
+            POLICY_METRICS
+                .est_tool_tokens_total
+                .fetch_add(est_tool_tokens_u64, Ordering::Relaxed);
+
+            const HIGH_TOOL_SHARE_BPS: u64 = 3500; // >=35% of input estimate
+            const HIGH_TOOL_TOKENS_ABS: u64 = 1_500; // large absolute tool-schema cost
+            if est_tool_share_bps >= HIGH_TOOL_SHARE_BPS {
+                POLICY_METRICS
+                    .est_tool_tokens_high_share_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if est_tool_tokens_u64 >= HIGH_TOOL_TOKENS_ABS {
+                POLICY_METRICS
+                    .est_tool_tokens_high_abs_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
 
             info!(
                 session_id,
@@ -423,6 +458,7 @@ impl Agent {
                 est_input_tokens = est_total_tokens,
                 est_msg_tokens,
                 est_tool_tokens,
+                est_tool_share_pct = est_tool_share_bps as f64 / 100.0,
                 msg_count = messages.len(),
                 msgs = ?summary,
                 "Context before LLM call"
