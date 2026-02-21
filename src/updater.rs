@@ -199,6 +199,7 @@ impl Updater {
                 ],
                 permission_mode: PermissionMode::Default,
                 response_tx,
+                kind: Default::default(),
             })
             .await;
 

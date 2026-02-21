@@ -474,29 +474,28 @@ impl Agent {
                 .await;
         }
 
-        // Prefer inline approval buttons for schedule confirmation
-        // (Telegram/Discord/Slack). Non-inline channels keep the
-        // existing text confirm/cancel fallback.
-        let inline_approval = {
+        // Prefer inline goal confirmation buttons for schedule confirmation
+        // (Telegram/Discord/Slack). Shows Confirm ✅ / Cancel ❌ buttons.
+        // Non-inline channels keep the existing text confirm/cancel fallback.
+        let inline_confirmation = {
             let hub_weak = self.hub.read().await.clone();
             if let Some(hub_weak) = hub_weak {
                 if let Some(hub_arc) = hub_weak.upgrade() {
-                    let approval_desc = format!(
+                    let confirmation_desc = format!(
                         "Schedule {} goal ({}): {}",
                         schedule_kind, schedule_desc, goal.description
                     );
-                    let warnings = vec![
-                        "This creates a scheduled goal.".to_string(),
-                        "The goal will execute automatically when due.".to_string(),
+                    let details = vec![
+                        format!("{} schedule", schedule_kind),
+                        format!("Next: {}", schedule_desc),
+                        format!("System timezone: {}", tz_label),
                     ];
                     Some(
                         hub_arc
-                            .request_inline_approval(
+                            .request_inline_goal_confirmation(
                                 ctx.session_id,
-                                &approval_desc,
-                                RiskLevel::Medium,
-                                &warnings,
-                                PermissionMode::Cautious,
+                                &confirmation_desc,
+                                &details,
                             )
                             .await,
                     )
@@ -508,18 +507,9 @@ impl Agent {
             }
         };
 
-        if let Some(approval_result) = inline_approval {
-            match approval_result {
-                response @ (Ok(ApprovalResponse::AllowOnce)
-                | Ok(ApprovalResponse::AllowSession)
-                | Ok(ApprovalResponse::AllowAlways)) => {
-                    if matches!(
-                        response,
-                        Ok(ApprovalResponse::AllowSession) | Ok(ApprovalResponse::AllowAlways)
-                    ) {
-                        let mut approved = self.schedule_approved_sessions.write().await;
-                        approved.insert(ctx.session_id.to_string());
-                    }
+        if let Some(confirmation_result) = inline_confirmation {
+            match confirmation_result {
+                Ok(true) => {
                     return self
                         .confirm_scheduled_goal_activation(
                             ctx,
@@ -530,7 +520,7 @@ impl Agent {
                         )
                         .await;
                 }
-                Ok(ApprovalResponse::Deny) => {
+                Ok(false) => {
                     let now = chrono::Utc::now().to_rfc3339();
                     goal.status = "cancelled".to_string();
                     goal.completed_at = Some(now.clone());
@@ -581,7 +571,7 @@ impl Agent {
                     warn!(
                         ctx.session_id,
                         error = %e,
-                        "Inline schedule approval unavailable; falling back to text confirmation"
+                        "Inline goal confirmation unavailable; falling back to text confirmation"
                     );
                 }
             }

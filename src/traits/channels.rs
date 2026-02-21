@@ -53,4 +53,18 @@ pub trait Channel: Send + Sync {
         warnings: &[String],
         permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse>;
+
+    /// Request user confirmation for a scheduled goal. Blocks until the user
+    /// responds. Returns `true` for confirm, `false` for cancel.
+    ///
+    /// Channels with inline buttons should show [Confirm ✅ | Cancel ❌].
+    /// Default implementation auto-confirms (for channels without button support).
+    async fn request_goal_confirmation(
+        &self,
+        _session_id: &str,
+        _goal_description: &str,
+        _details: &[String],
+    ) -> anyhow::Result<bool> {
+        Ok(true)
+    }
 }

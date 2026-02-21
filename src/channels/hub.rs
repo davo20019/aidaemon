@@ -10,7 +10,7 @@ use crate::queue_telemetry::{QueuePressure, QueueTelemetry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::traits::Channel;
-use crate::types::{ApprovalResponse, MediaMessage};
+use crate::types::{ApprovalKind, ApprovalResponse, MediaMessage};
 
 /// Shared map of session_id → channel name.
 /// Written by channels when they receive incoming messages,
@@ -112,6 +112,31 @@ impl ChannelHub {
             .await
     }
 
+    /// Request goal confirmation through a channel that supports inline buttons.
+    ///
+    /// Shows Confirm ✅ / Cancel ❌ buttons instead of the standard
+    /// Allow Once / Allow Session / Deny buttons.
+    pub async fn request_inline_goal_confirmation(
+        &self,
+        session_id: &str,
+        goal_description: &str,
+        details: &[String],
+    ) -> anyhow::Result<bool> {
+        let channel = self
+            .channel_for_session(session_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No channel found for session {}", session_id))?;
+        if !channel.capabilities().inline_buttons {
+            anyhow::bail!(
+                "Channel {} does not support inline goal confirmation buttons",
+                channel.name()
+            );
+        }
+        channel
+            .request_goal_confirmation(session_id, goal_description, details)
+            .await
+    }
+
     /// Route approval requests from tools to the appropriate channel.
     ///
     /// Each approval is handled in its own task so the listener doesn't
@@ -185,25 +210,45 @@ impl ChannelHub {
                 let channel = hub.channel_for_session(&request.session_id).await;
                 let mut had_error = false;
                 let response = match channel {
-                    Some(ch) => {
-                        match ch
-                            .request_approval(
-                                &request.session_id,
-                                &request.command,
-                                request.risk_level,
-                                &request.warnings,
-                                request.permission_mode,
-                            )
-                            .await
-                        {
-                            Ok(resp) => resp,
-                            Err(e) => {
-                                warn!("Approval request failed on {}: {}", ch.name(), e);
-                                had_error = true;
-                                ApprovalResponse::Deny
+                    Some(ch) => match request.kind {
+                        ApprovalKind::GoalConfirmation => {
+                            match ch
+                                .request_goal_confirmation(
+                                    &request.session_id,
+                                    &request.command,
+                                    &request.warnings,
+                                )
+                                .await
+                            {
+                                Ok(true) => ApprovalResponse::AllowOnce,
+                                Ok(false) => ApprovalResponse::Deny,
+                                Err(e) => {
+                                    warn!("Goal confirmation failed on {}: {}", ch.name(), e);
+                                    had_error = true;
+                                    ApprovalResponse::Deny
+                                }
                             }
                         }
-                    }
+                        ApprovalKind::Command => {
+                            match ch
+                                .request_approval(
+                                    &request.session_id,
+                                    &request.command,
+                                    request.risk_level,
+                                    &request.warnings,
+                                    request.permission_mode,
+                                )
+                                .await
+                            {
+                                Ok(resp) => resp,
+                                Err(e) => {
+                                    warn!("Approval request failed on {}: {}", ch.name(), e);
+                                    had_error = true;
+                                    ApprovalResponse::Deny
+                                }
+                            }
+                        }
+                    },
                     None => {
                         warn!(
                             "No channel found for session {}, denying",

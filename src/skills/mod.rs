@@ -1046,7 +1046,7 @@ pub fn build_system_prompt_with_memory(
         if person.interaction_count == 0 {
             prompt.push_str(&format!(
                 "\nThis is your first interaction with {}. Naturally mention early in the conversation: \
-                 \"I learn from our conversations and adapt my communication style over time. \
+                 \"I adapt my communication style over time based on our conversations. \
                  If you have any preferences, just let me know!\"\n",
                 person.name
             ));

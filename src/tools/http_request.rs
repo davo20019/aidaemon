@@ -290,6 +290,7 @@ impl HttpRequestTool {
                 warnings,
                 permission_mode: PermissionMode::Cautious,
                 response_tx,
+                kind: Default::default(),
             })
             .await
             .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;

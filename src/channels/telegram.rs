@@ -311,27 +311,37 @@ impl TelegramChannel {
         };
 
         // Parse callback data: "approve:{once|session|always|deny}:{id}"
+        // or "goal:{confirm|cancel}:{id}"
         let parts: Vec<&str> = data.splitn(3, ':').collect();
-        if parts.len() != 3 || parts[0] != "approve" {
+        if parts.len() != 3 || (parts[0] != "approve" && parts[0] != "goal") {
             return;
         }
 
+        let prefix = parts[0];
         let action = parts[1];
         let approval_id = parts[2];
 
-        let response = match action {
-            "once" => ApprovalResponse::AllowOnce,
-            "session" => ApprovalResponse::AllowSession,
-            "always" => ApprovalResponse::AllowAlways,
-            "deny" => ApprovalResponse::Deny,
-            _ => return,
-        };
-
-        let label = match &response {
-            ApprovalResponse::AllowOnce => "Allowed (once)",
-            ApprovalResponse::AllowSession => "Allowed (this session)",
-            ApprovalResponse::AllowAlways => "Allowed (always)",
-            ApprovalResponse::Deny => "Denied",
+        let (response, label) = if prefix == "goal" {
+            match action {
+                "confirm" => (ApprovalResponse::AllowOnce, "Confirmed ✅"),
+                "cancel" => (ApprovalResponse::Deny, "Cancelled ❌"),
+                _ => return,
+            }
+        } else {
+            let response = match action {
+                "once" => ApprovalResponse::AllowOnce,
+                "session" => ApprovalResponse::AllowSession,
+                "always" => ApprovalResponse::AllowAlways,
+                "deny" => ApprovalResponse::Deny,
+                _ => return,
+            };
+            let label = match &response {
+                ApprovalResponse::AllowOnce => "Allowed (once)",
+                ApprovalResponse::AllowSession => "Allowed (this session)",
+                ApprovalResponse::AllowAlways => "Allowed (always)",
+                ApprovalResponse::Deny => "Denied",
+            };
+            (response, label)
         };
 
         // Send the response
@@ -2271,6 +2281,88 @@ impl Channel for TelegramChannel {
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
                 Ok(ApprovalResponse::Deny)
+            }
+        }
+    }
+
+    async fn request_goal_confirmation(
+        &self,
+        session_id: &str,
+        goal_description: &str,
+        details: &[String],
+    ) -> anyhow::Result<bool> {
+        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
+            .unwrap_or_else(|| {
+                self.allowed_user_ids
+                    .read()
+                    .unwrap()
+                    .first()
+                    .copied()
+                    .unwrap_or(0) as i64
+            });
+
+        let approval_id = uuid::Uuid::new_v4().to_string();
+        let short_id = &approval_id[..8];
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        {
+            let mut pending = self.pending_approvals.lock().await;
+            pending.insert(approval_id.clone(), response_tx);
+        }
+
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback("Confirm ✅", format!("goal:confirm:{}", approval_id)),
+            InlineKeyboardButton::callback("Cancel ❌", format!("goal:cancel:{}", approval_id)),
+        ]]);
+
+        let escaped_desc = html_escape(goal_description);
+        let mut text = format!(
+            "📅 <b>Confirm scheduled goal</b>\n\n<code>{}</code>",
+            escaped_desc
+        );
+
+        for detail in details {
+            text.push_str(&format!("\n• {}", html_escape(detail)));
+        }
+
+        text.push_str(&format!("\n\n<i>[{}]</i>", short_id));
+
+        match self
+            .bot
+            .send_message(ChatId(chat_id), &text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
+            .await
+        {
+            Ok(_) => {
+                info!(approval_id = %short_id, "Goal confirmation message sent");
+            }
+            Err(e) => {
+                warn!("Failed to send goal confirmation: {}", e);
+                let mut pending = self.pending_approvals.lock().await;
+                pending.remove(&approval_id);
+                return Ok(false);
+            }
+        }
+
+        // Wait with 5-minute timeout
+        match tokio::time::timeout(Duration::from_secs(300), response_rx).await {
+            Ok(Ok(response)) => Ok(matches!(
+                response,
+                ApprovalResponse::AllowOnce
+                    | ApprovalResponse::AllowSession
+                    | ApprovalResponse::AllowAlways
+            )),
+            Ok(Err(_)) => {
+                warn!(approval_id = %short_id, "Goal confirmation channel closed");
+                Ok(false)
+            }
+            Err(_) => {
+                warn!(approval_id = %short_id, "Goal confirmation timed out");
+                let mut pending = self.pending_approvals.lock().await;
+                pending.remove(&approval_id);
+                Ok(false)
             }
         }
     }

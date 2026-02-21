@@ -57,6 +57,38 @@ fn cli_result_is_substantive(result_text: &str) -> bool {
         && !cleaned.to_ascii_lowercase().contains("failed")
 }
 
+fn looks_like_missing_goal_id_error(tool_name: &str, error_text: &str) -> bool {
+    if !matches!(
+        tool_name,
+        "scheduled_goal_runs" | "manage_memories" | "goal_trace" | "tool_trace"
+    ) {
+        return false;
+    }
+    let lower = error_text.to_ascii_lowercase();
+    lower.contains("'goal_id' is required")
+        || lower.contains("\"goal_id\" is required")
+        || lower.contains("goal_id is required")
+}
+
+fn user_looks_like_fact_storage_request(user_text: &str) -> bool {
+    let lower = user_text.to_ascii_lowercase();
+    contains_keyword_as_words(&lower, "learn this")
+        || contains_keyword_as_words(&lower, "learn these")
+        || contains_keyword_as_words(&lower, "remember this")
+        || contains_keyword_as_words(&lower, "remember these")
+        || contains_keyword_as_words(&lower, "remember the following")
+        || contains_keyword_as_words(&lower, "remember this for later")
+        || contains_keyword_as_words(&lower, "remember these for later")
+        || contains_keyword_as_words(&lower, "store this")
+        || contains_keyword_as_words(&lower, "store these")
+        || contains_keyword_as_words(&lower, "save this")
+        || contains_keyword_as_words(&lower, "save these")
+        || contains_keyword_as_words(&lower, "note this down")
+        || contains_keyword_as_words(&lower, "note these down")
+        || contains_keyword_as_words(&lower, "keep in mind")
+        || contains_keyword_as_words(&lower, "i need you to know")
+}
+
 impl Agent {
     pub(super) async fn apply_result_learning(
         &self,
@@ -100,6 +132,25 @@ Only report attempts that were actually executed; do not describe retries that w
                 let count = state.tool_failure_count.entry(tc.name.clone()).or_insert(0);
                 *count += 1;
                 let semantic_count = *count;
+
+                if semantic_count == 1 && looks_like_missing_goal_id_error(&tc.name, &base_error) {
+                    let likely_fact_storage =
+                        user_looks_like_fact_storage_request(&state.learning_ctx.user_text);
+                    let coach = if likely_fact_storage {
+                        "[SYSTEM] The previous tool call was off-target for this request. \
+The user appears to be asking you to learn/remember/save facts. Use `remember_fact` (batch with `facts` when needed) and do NOT call scheduled-goal tools."
+                    } else if tc.name == "manage_memories" {
+                        "[SYSTEM] The previous `manage_memories` call was underspecified (`goal_id` missing). \
+Do NOT retry the same action blindly. Switch to `manage_memories(action='list_scheduled')` \
+to retrieve exact IDs (or ask the user for the goal ID), then retry the intended action with `goal_id`."
+                    } else {
+                        "[SYSTEM] The previous tool call was underspecified (`goal_id` missing). \
+Do NOT retry the same call. If this is scheduled-goal run forensics, first call \
+`manage_memories(action='list_scheduled')` to get a concrete `goal_id`, then retry. \
+If the user is asking to store facts, use `remember_fact` instead."
+                    };
+                    *result_text = format!("{}\n\n{}", result_text, coach);
+                }
 
                 if tc.name == "edit_file" {
                     let edit_path = serde_json::from_str::<serde_json::Value>(&tc.arguments)
@@ -517,5 +568,32 @@ mod tests {
         assert!(cli_result_is_substantive(&payload));
         assert!(!cli_result_is_substantive("ERROR: agent failed to run"));
         assert!(!cli_result_is_substantive("short output"));
+    }
+
+    #[test]
+    fn missing_goal_id_error_detection_is_tool_scoped() {
+        assert!(looks_like_missing_goal_id_error(
+            "scheduled_goal_runs",
+            "'goal_id' is required for run_history"
+        ));
+        assert!(!looks_like_missing_goal_id_error(
+            "remember_fact",
+            "'goal_id' is required for run_history"
+        ));
+    }
+
+    #[test]
+    fn detects_fact_storage_language() {
+        assert!(user_looks_like_fact_storage_request(
+            "Please remember these for later"
+        ));
+        assert!(user_looks_like_fact_storage_request("learn this about me"));
+        assert!(user_looks_like_fact_storage_request("note this down"));
+        assert!(user_looks_like_fact_storage_request(
+            "I need you to know this"
+        ));
+        assert!(!user_looks_like_fact_storage_request(
+            "run scheduled goals now"
+        ));
     }
 }

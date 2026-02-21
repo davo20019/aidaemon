@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] - 2026-02-20
+
+### Added
+
+- **Inline goal confirmation buttons**: Scheduled goals now show Confirm ✅ / Cancel ❌ buttons (Telegram) instead of reusing the command approval flow. New `ApprovalKind` enum distinguishes goal confirmations from command approvals. `Channel` trait gains `request_goal_confirmation()` with auto-confirm default for channels without button support.
+- **Deterministic tool contract violations**: Pre-execution guard blocks `scheduled_goal_runs` calls missing `goal_id` before they reach the tool, with coaching messages redirecting the LLM to the correct tool (`remember_fact` for fact storage, `manage_memories(list_scheduled)` for ID lookup).
+- **Result learning for goal_id errors**: Post-execution coaching when `scheduled_goal_runs`, `manage_memories`, `goal_trace`, or `tool_trace` fail with missing `goal_id`, with special detection for fact-storage requests mistakenly routed to goal tools.
+- **`ManageMemoriesTool` button-based confirmation**: `create_scheduled_goal` action uses inline approval buttons (via approval channel) when available, with automatic activation on confirm and cleanup (cancel goal + delete schedules) on deny.
+
+### Changed
+
+- **`scheduled_goal_runs` schema requires `goal_id`**: Previously optional, now required in the tool schema to prevent underspecified calls.
+- **Tool descriptions clarify scope**: `scheduled_goal_runs` and `remember_fact` descriptions explicitly state their purpose boundaries — `scheduled_goal_runs` is not for fact storage, `remember_fact` is the tool for "learn/remember/save" requests.
+- **System prompt tool routing**: Added explicit routing row for "User says learn/remember/save these" → `remember_fact` (not `manage_memories` or `scheduled_goal_runs`). Added fact-storage guidance to memory rules.
+- **First-interaction message**: Changed from "I learn from our conversations" to "I adapt my communication style over time based on our conversations" for clarity.
+
 ## [0.9.5] - 2026-02-19
 
 ### Added

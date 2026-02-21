@@ -648,20 +648,20 @@ impl Tool for ScheduledGoalRunsTool {
     }
 
     fn description(&self) -> &str {
-        "Run scheduled goals now and inspect run history/failures without terminal/sqlite access"
+        "Run scheduled goals now and inspect run history/failures without terminal/sqlite access (not for storing facts)"
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "scheduled_goal_runs",
-            "description": "Run scheduled goals now and inspect execution diagnostics. Use this instead of terminal/sqlite for scheduled-goal run forensics.",
+            "description": "Run scheduled goals now and inspect execution diagnostics. Use this instead of terminal/sqlite for scheduled-goal run forensics. ONLY for recurring/scheduled goals; NOT for learning or storing facts.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["run_now", "run_history", "last_failure", "unblock_hints", "set_budget"],
-                        "description": "Action to perform"
+                        "description": "Action to perform. All actions require goal_id."
                     },
                     "goal_id": {
                         "type": "string",
@@ -684,7 +684,7 @@ impl Tool for ScheduledGoalRunsTool {
                         "description": "New daily budget (tokens). Only used for set_budget."
                     }
                 },
-                "required": ["action"],
+                "required": ["action", "goal_id"],
                 "additionalProperties": false
             }
         })
@@ -763,6 +763,21 @@ mod tests {
         );
         std::mem::forget(db_file);
         state as Arc<dyn StateStore>
+    }
+
+    #[tokio::test]
+    async fn schema_marks_goal_id_required() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state);
+        let schema = tool.schema();
+        let required = schema
+            .get("parameters")
+            .and_then(|p| p.get("required"))
+            .and_then(|r| r.as_array())
+            .expect("required array exists");
+        let required_values: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(required_values.contains(&"action"));
+        assert!(required_values.contains(&"goal_id"));
     }
 
     #[tokio::test]

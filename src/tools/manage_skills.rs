@@ -80,6 +80,7 @@ impl ManageSkillsTool {
                 ],
                 permission_mode: PermissionMode::Default,
                 response_tx,
+                kind: Default::default(),
             })
             .await
             .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;

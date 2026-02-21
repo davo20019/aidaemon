@@ -178,6 +178,18 @@ impl std::fmt::Display for UserRole {
     }
 }
 
+/// Distinguishes different kinds of approval requests so channels can render
+/// appropriate buttons (e.g., Allow Once / Deny for commands vs Confirm / Cancel
+/// for scheduled-goal confirmations).
+#[derive(Debug, Clone, Default)]
+pub enum ApprovalKind {
+    /// Standard command approval (Allow Once / Allow Session / Allow Always / Deny).
+    #[default]
+    Command,
+    /// Scheduled-goal confirmation (Confirm / Cancel).
+    GoalConfirmation,
+}
+
 /// Response to an approval request from the user.
 #[derive(Debug, Clone)]
 pub enum ApprovalResponse {

@@ -634,7 +634,7 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ManageMemories => BuiltBaseTool {
-            tool: Arc::new(ManageMemoriesTool::new(state)),
+            tool: Arc::new(ManageMemoriesTool::new(state).with_approval_tx(approval_tx.clone())),
             terminal_tool: None,
         },
         BaseToolId::ScheduledGoalRuns => BuiltBaseTool {

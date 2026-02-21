@@ -4,17 +4,28 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 
+use crate::tools::terminal::ApprovalRequest;
 use crate::traits::{StateStore, Tool};
-use crate::types::FactPrivacy;
+use crate::types::{ApprovalKind, FactPrivacy};
 
 pub struct ManageMemoriesTool {
     state: Arc<dyn StateStore>,
+    approval_tx: Option<mpsc::Sender<ApprovalRequest>>,
 }
 
 impl ManageMemoriesTool {
     pub fn new(state: Arc<dyn StateStore>) -> Self {
-        Self { state }
+        Self {
+            state,
+            approval_tx: None,
+        }
+    }
+
+    pub fn with_approval_tx(mut self, tx: mpsc::Sender<ApprovalRequest>) -> Self {
+        self.approval_tx = Some(tx);
+        self
     }
 
     /// Resolve a goal identifier provided by the model/user.
@@ -721,13 +732,74 @@ impl Tool for ManageMemoriesTool {
                     .map(|dt| dt.format("%Y-%m-%d %H:%M %Z").to_string())
                     .unwrap_or_else(|| "n/a".to_string());
 
-                Ok(format!(
-                    "Created scheduled goal {} (pending confirmation) with {} schedule(s). Next: {}. System timezone: {}. Reply **confirm** to activate or **cancel** to discard.",
-                    goal.id,
-                    parsed.len(),
-                    next_run,
-                    tz_label
-                ))
+                // Button-based confirmation via approval channel
+                if let Some(ref tx) = self.approval_tx {
+                    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                    let details = vec![
+                        format!("{} schedule(s)", parsed.len()),
+                        format!("Next: {}", next_run),
+                        format!("System timezone: {}", tz_label),
+                    ];
+                    let _ = tx
+                        .send(ApprovalRequest {
+                            command: desc.to_string(),
+                            session_id: session_id.to_string(),
+                            risk_level: crate::tools::command_risk::RiskLevel::Medium,
+                            warnings: details,
+                            permission_mode:
+                                crate::tools::command_risk::PermissionMode::Default,
+                            response_tx,
+                            kind: ApprovalKind::GoalConfirmation,
+                        })
+                        .await;
+
+                    let confirmed = matches!(
+                        response_rx.await,
+                        Ok(crate::types::ApprovalResponse::AllowOnce)
+                            | Ok(crate::types::ApprovalResponse::AllowSession)
+                            | Ok(crate::types::ApprovalResponse::AllowAlways)
+                    );
+
+                    if confirmed {
+                        let _ = self.state.activate_goal(&goal.id).await;
+                        Ok(format!(
+                            "Confirmed and activated scheduled goal {}. {} schedule(s). Next: {}. System timezone: {}.",
+                            goal.id,
+                            parsed.len(),
+                            next_run,
+                            tz_label
+                        ))
+                    } else {
+                        // Cancel the goal and clean up schedules
+                        let mut cancelled_goal = goal.clone();
+                        cancelled_goal.status = "cancelled".to_string();
+                        cancelled_goal.completed_at =
+                            Some(chrono::Utc::now().to_rfc3339());
+                        cancelled_goal.updated_at = chrono::Utc::now().to_rfc3339();
+                        let _ = self.state.update_goal(&cancelled_goal).await;
+                        if let Ok(schedules) =
+                            self.state.get_schedules_for_goal(&goal.id).await
+                        {
+                            for s in &schedules {
+                                let _ =
+                                    self.state.delete_goal_schedule(&s.id).await;
+                            }
+                        }
+                        Ok(format!(
+                            "Cancelled scheduled goal {}. The user declined confirmation.",
+                            goal.id
+                        ))
+                    }
+                } else {
+                    // Fallback: text-based confirmation when no approval channel
+                    Ok(format!(
+                        "Created scheduled goal {} (pending confirmation) with {} schedule(s). Next: {}. System timezone: {}. Reply **confirm** to activate or **cancel** to discard.",
+                        goal.id,
+                        parsed.len(),
+                        next_run,
+                        tz_label
+                    ))
+                }
             }
             "list_scheduled" => {
                 let goals = self.state.get_scheduled_goals().await?;

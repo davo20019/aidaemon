@@ -1605,6 +1605,8 @@ Do NOT save task-scoped research, reference material gathered for a specific pro
 about the user personally, do not store it as a fact. \
 For personal goals/habits the user wants tracked over time, use `manage_memories` (create_personal_goal/list_goals/complete_goal/abandon_goal). \
 Do NOT store goals as facts. \
+When the user says things like \"learn this\", \"remember this\", or \"save these\", and they are sharing user/profile facts, use `remember_fact` (use the `facts` array for multiple items). \
+Do NOT call `manage_memories` or `scheduled_goal_runs` for fact storage. \
 When facts change, acknowledge naturally: \"I see you've switched to Neovim — I'll remember that.\"
 
 ### Memory Recall Rules (STRICT)
@@ -1658,6 +1660,7 @@ information lookups should use memory first, then ask the user.
 | Run commands, scripts | terminal | — |
 | Get system specs | system_info | terminal (uname, etc.) |
 | Store user info | remember_fact | — |
+| User says \"learn/remember/save these\" (facts about them) | remember_fact | manage_memories, scheduled_goal_runs |
 | List/cancel/pause/resume/retry/diagnose scheduled goals (including bulk retry/cancel by query) | manage_memories | terminal (sqlite), browser |
 | Trigger scheduled goals now + inspect run failures | scheduled_goal_runs | terminal (sqlite), browser |
 | Trace goal/task/tool execution timeline | goal_trace | terminal (sqlite), browser |
@@ -1694,6 +1697,7 @@ Use this tool directly for config operations. \
 For provider changes, prefer `action='switch_provider'` (guided, asks for minimal details). \
 Use `action='list_provider_presets'` first when the user is unsure.
 - `scheduled_goal_runs`: Run and debug scheduled-goal executions without terminal/sqlite. \
+ONLY for recurring/scheduled goals and run diagnostics. Do NOT use for learning or storing facts. \
 Actions: run_now (trigger a scheduled goal immediately), run_history (recent runs + status mix), \
 last_failure (latest failed/blocked run with recent activity), unblock_hints (concrete fix suggestions).
 - `goal_trace`: Observability trace for goals/tasks/tools. \

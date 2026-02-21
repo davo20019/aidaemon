@@ -49,6 +49,50 @@ fn raw_internal_scope_violation(
     None
 }
 
+struct DeterministicToolContractViolation {
+    reason: String,
+    coaching: String,
+}
+
+fn scheduled_goal_runs_missing_goal_id_violation(
+    raw_arguments: &str,
+) -> Option<DeterministicToolContractViolation> {
+    let parsed = serde_json::from_str::<Value>(raw_arguments).ok()?;
+    let map = parsed.as_object()?;
+    let has_goal_id = map
+        .get("goal_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| !v.trim().is_empty());
+    if has_goal_id {
+        None
+    } else {
+        let action = map
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<missing>");
+        Some(DeterministicToolContractViolation {
+            reason: format!(
+                "action `{}` requires `goal_id` for `scheduled_goal_runs`",
+                action
+            ),
+            coaching: "If the user asked to learn/remember/save facts, use `remember_fact`. \
+If they asked about scheduled-goal runs, first get IDs with \
+`manage_memories(action='list_scheduled')`, then call `scheduled_goal_runs` with `goal_id`."
+                .to_string(),
+        })
+    }
+}
+
+fn deterministic_tool_contract_violation(
+    tool_name: &str,
+    raw_arguments: &str,
+) -> Option<DeterministicToolContractViolation> {
+    match tool_name {
+        "scheduled_goal_runs" => scheduled_goal_runs_missing_goal_id_violation(raw_arguments),
+        _ => None,
+    }
+}
+
 fn project_scope_violation_for_tool_call(
     tool_name: &str,
     effective_arguments: &str,
@@ -501,6 +545,43 @@ impl Agent {
                 continue;
             }
 
+            if let Some(contract_violation) =
+                deterministic_tool_contract_violation(&tc.name, &effective_arguments)
+            {
+                *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+                let result_text = format!(
+                    "[SYSTEM] Blocked `{}` by deterministic argument contract: {}. \
+Continue with tools that directly match the user request.",
+                    tc.name, contract_violation.reason
+                );
+                let tool_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "tool".to_string(),
+                    content: Some(result_text.clone()),
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_name: Some(tc.name.clone()),
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.2,
+                    embedding: None,
+                };
+                self.append_tool_message_with_result_event(
+                    emitter,
+                    &tool_msg,
+                    true,
+                    0,
+                    None,
+                    Some(task_id),
+                )
+                .await?;
+                pending_system_messages.push(format!(
+                    "[SYSTEM] The previous `{}` tool call was blocked ({}). {}",
+                    tc.name, contract_violation.reason, contract_violation.coaching
+                ));
+                continue;
+            }
+
             if self
                 .maybe_block_tool_by_budget(
                     tc,
@@ -837,6 +918,23 @@ mod tests {
         assert!(violation.is_some());
         let message = violation.unwrap_or_default();
         assert!(message.contains("_goal_id mismatch"));
+    }
+
+    #[test]
+    fn deterministic_tool_contract_violation_blocks_scheduled_goal_runs_without_goal_id() {
+        let args = r#"{"action":"run_history"}"#;
+        let violation = deterministic_tool_contract_violation("scheduled_goal_runs", args);
+        assert!(violation.is_some());
+        let violation = violation.expect("violation expected");
+        assert!(violation.reason.contains("requires `goal_id`"));
+        assert!(violation.coaching.contains("remember_fact"));
+    }
+
+    #[test]
+    fn deterministic_tool_contract_violation_allows_scheduled_goal_runs_with_goal_id() {
+        let args = r#"{"action":"run_history","goal_id":"goal-123"}"#;
+        let violation = deterministic_tool_contract_violation("scheduled_goal_runs", args);
+        assert!(violation.is_none());
     }
 
     #[test]

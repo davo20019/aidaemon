@@ -42,6 +42,8 @@ pub struct ApprovalRequest {
     pub warnings: Vec<String>,
     pub permission_mode: PermissionMode,
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
+    /// What kind of approval this is (command vs goal confirmation).
+    pub kind: crate::types::ApprovalKind,
 }
 
 /// A background process being tracked after it exceeded the initial timeout.
@@ -406,6 +408,7 @@ impl TerminalTool {
                 warnings,
                 permission_mode: self.permission_mode,
                 response_tx,
+                kind: Default::default(),
             })
             .await
         {
