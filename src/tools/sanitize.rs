@@ -81,6 +81,10 @@ static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         // Echoed diagnostic content without the bracket tag prefix — catch the
         // most common phrases the LLM copies verbatim from injected diagnostics.
         Regex::new(r"(?m)Similar errors resolved before:\n(?:[ \t-][^\n]*\n?)*").unwrap(),
+        // Raw LLM tool-call formatting tokens leaked into user-facing text.
+        Regex::new(r"(?m)^[^\S\n]*<\|tool_call[^|]*\|>?[^\n]*$").unwrap(),
+        // Raw function call markers (e.g. "functions.terminal:0 {...}").
+        Regex::new(r"(?m)^[^\S\n]*functions\.\w+:\d+[^\n]*$").unwrap(),
     ]
 });
 
@@ -773,6 +777,18 @@ mod tests {
         assert!(!result.contains("Do NOT retry"));
         assert!(result.contains("Error occurred."));
         assert!(result.contains("I will search differently."));
+    }
+
+    #[test]
+    fn test_strip_raw_tool_call_tokens() {
+        let input = "I investigated the issue.\n<|tool_calls_section_begin|\n<|tool_call_end|>\nfunctions.terminal:0 {\"command\":\"pwd\"}\nHere's what went wrong.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(!result.contains("<|tool_calls_section_begin|"));
+        assert!(!result.contains("<|tool_calls_section_begin|>"));
+        assert!(!result.contains("<|tool_call_end|>"));
+        assert!(!result.contains("functions.terminal:0"));
+        assert!(result.contains("I investigated the issue."));
+        assert!(result.contains("Here's what went wrong."));
     }
 
     mod proptest_sanitize {

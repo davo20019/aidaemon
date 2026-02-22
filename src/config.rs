@@ -178,6 +178,10 @@ pub struct ProviderConfig {
     #[serde(default = "default_base_url")]
     pub base_url: String,
     #[serde(default)]
+    pub extra_headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
     pub models: ModelsConfig,
 }
 
@@ -188,6 +192,14 @@ impl fmt::Debug for ProviderConfig {
             .field("api_key", &redact(&self.api_key))
             .field("gateway_token", &redact_option(&self.gateway_token))
             .field("base_url", &self.base_url)
+            .field(
+                "extra_headers",
+                &self
+                    .extra_headers
+                    .as_ref()
+                    .map(|h| h.keys().map(String::as_str).collect::<Vec<_>>()),
+            )
+            .field("max_tokens", &self.max_tokens)
             .field("models", &self.models)
             .finish()
     }
@@ -1833,6 +1845,20 @@ impl AppConfig {
         if self.provider.gateway_token.as_deref() == Some("keychain") {
             self.provider.gateway_token = Some(resolve_from_keychain("gateway_token")?);
         }
+        if let Some(headers) = self.provider.extra_headers.as_mut() {
+            for (name, value) in headers.iter_mut() {
+                if value == "keychain" {
+                    let key = format!(
+                        "provider_header_{}",
+                        name.to_ascii_lowercase()
+                            .chars()
+                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                            .collect::<String>()
+                    );
+                    *value = resolve_from_keychain(&key)?;
+                }
+            }
+        }
 
         // Legacy telegram config
         if let Some(ref mut telegram) = self.telegram {
@@ -2028,6 +2054,38 @@ primary = "gpt-4o"
 "#;
         let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
         assert_eq!(cfg.provider.gateway_token.as_deref(), Some("cf-gw-token"));
+    }
+
+    #[test]
+    fn provider_extra_headers_parse_when_set() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+extra_headers = { "x-app" = "aidaemon", "x-env" = "dev" }
+
+[provider.models]
+primary = "gpt-4o"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        let headers = cfg.provider.extra_headers.expect("extra headers");
+        assert_eq!(headers.get("x-app"), Some(&"aidaemon".to_string()));
+        assert_eq!(headers.get("x-env"), Some(&"dev".to_string()));
+    }
+
+    #[test]
+    fn provider_max_tokens_parses_when_set() {
+        let toml = r#"
+[provider]
+kind = "anthropic"
+api_key = "test-key"
+max_tokens = 32768
+
+[provider.models]
+primary = "claude-sonnet-4-20250514"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        assert_eq!(cfg.provider.max_tokens, Some(32768));
     }
 
     #[test]

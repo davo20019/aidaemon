@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,6 +18,7 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     api_key: String,
     gateway_token: Option<String>,
+    extra_headers: HashMap<String, String>,
     is_cloudflare_gateway: bool,
 }
 
@@ -80,6 +82,10 @@ fn is_cloudflare_ai_gateway_base(base_url: &str) -> bool {
     )
 }
 
+fn normalize_tool_name(name: &str) -> String {
+    name.trim().to_string()
+}
+
 impl OpenAiCompatibleProvider {
     #[allow(dead_code)]
     pub fn new(base_url: &str, api_key: &str) -> Result<Self, String> {
@@ -90,6 +96,15 @@ impl OpenAiCompatibleProvider {
         base_url: &str,
         api_key: &str,
         gateway_token: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::new_with_gateway_token_and_headers(base_url, api_key, gateway_token, None)
+    }
+
+    pub fn new_with_gateway_token_and_headers(
+        base_url: &str,
+        api_key: &str,
+        gateway_token: Option<&str>,
+        extra_headers: Option<HashMap<String, String>>,
     ) -> Result<Self, String> {
         // Validate URL security before creating provider
         validate_base_url(base_url)?;
@@ -103,19 +118,26 @@ impl OpenAiCompatibleProvider {
             base_url: normalized_base_url,
             api_key: api_key.to_string(),
             gateway_token: gateway_token.map(|s| s.to_string()),
+            extra_headers: extra_headers.unwrap_or_default(),
         })
     }
 
     fn with_auth_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let request = request.header("Authorization", format!("Bearer {}", self.api_key));
+        let mut request = request.header("Authorization", format!("Bearer {}", self.api_key));
         if let Some(token) = self.gateway_token.as_deref() {
             if token.is_empty() {
+                for (k, v) in &self.extra_headers {
+                    request = request.header(k, v);
+                }
                 return request;
             }
-            request.header("cf-aig-authorization", format!("Bearer {}", token))
-        } else {
-            request
+            request = request.header("cf-aig-authorization", format!("Bearer {}", token));
         }
+
+        for (k, v) in &self.extra_headers {
+            request = request.header(k, v);
+        }
+        request
     }
 
     fn parse_models_response(text: &str) -> anyhow::Result<Vec<String>> {
@@ -315,7 +337,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
 
                 tool_calls.push(ToolCall {
                     id: tc["id"].as_str().unwrap_or("").to_string(),
-                    name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
+                    name: normalize_tool_name(tc["function"]["name"].as_str().unwrap_or("")),
                     arguments: tc["function"]["arguments"]
                         .as_str()
                         .unwrap_or("{}")
@@ -591,11 +613,36 @@ mod tests {
     }
 
     #[test]
+    fn test_with_auth_headers_includes_extra_headers() {
+        let provider = OpenAiCompatibleProvider::new_with_gateway_token_and_headers(
+            "https://api.openai.com/v1",
+            "test-key",
+            None,
+            Some(HashMap::from([(
+                "x-team".to_string(),
+                "agents".to_string(),
+            )])),
+        )
+        .expect("provider should initialize");
+        let request = provider
+            .with_auth_headers(provider.client.get("https://example.com/models"))
+            .build()
+            .expect("request should build");
+
+        assert_eq!(request.headers().get("x-team").unwrap(), "agents");
+    }
+
+    #[test]
     fn test_parse_models_response_parses_openai_shape() {
         let models = OpenAiCompatibleProvider::parse_models_response(
             r#"{"data":[{"id":"gpt-4o-mini"},{"id":"gpt-4.1"}]}"#,
         )
         .expect("models should parse");
         assert_eq!(models, vec!["gpt-4o-mini", "gpt-4.1"]);
+    }
+
+    #[test]
+    fn test_normalize_tool_name_trims_whitespace() {
+        assert_eq!(normalize_tool_name(" terminal "), "terminal");
     }
 }

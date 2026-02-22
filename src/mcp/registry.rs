@@ -30,6 +30,7 @@ pub struct ServerInfo {
     pub env_keys: Vec<String>,
     pub triggers: Vec<String>,
     pub db_id: Option<i64>,
+    pub enabled: bool,
 }
 
 /// Runtime registry of MCP servers. Clone is cheap (Arc-based).
@@ -118,6 +119,8 @@ impl McpRegistry {
                 prefixed_name,
                 tool_schema,
                 Arc::clone(&client),
+                name.to_string(),
+                self.clone(),
             )));
         }
 
@@ -279,6 +282,132 @@ impl McpRegistry {
         Ok(tool_names)
     }
 
+    async fn find_dynamic_server_by_name(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<DynamicMcpServer>> {
+        let db_servers = self.state.list_dynamic_mcp_servers().await?;
+        Ok(db_servers.into_iter().find(|s| s.name == name))
+    }
+
+    async fn spawn_dynamic_server_from_record(
+        &self,
+        server: &DynamicMcpServer,
+    ) -> anyhow::Result<Vec<String>> {
+        let args: Vec<String> = serde_json::from_str(&server.args_json).unwrap_or_default();
+        let env_keys: Vec<String> = serde_json::from_str(&server.env_keys_json).unwrap_or_default();
+
+        // Resolve env values from keychain
+        let mut env = HashMap::new();
+        for key in &env_keys {
+            let keychain_key = format!("mcp_{}_{}", server.name, key);
+            match resolve_from_keychain(&keychain_key) {
+                Ok(val) => {
+                    env.insert(key.clone(), val);
+                }
+                Err(e) => {
+                    warn!(
+                        server = %server.name,
+                        key = %keychain_key,
+                        error = %e,
+                        "Failed to resolve env from keychain, server may fail"
+                    );
+                }
+            }
+        }
+
+        let config = McpServerConfig {
+            command: server.command.clone(),
+            args,
+            env,
+        };
+
+        let tools = self.add_server(&server.name, config, false).await?;
+
+        // Restore db_id/triggers from DB record.
+        if let Some(entry) = self.servers.write().await.get_mut(&server.name) {
+            entry.db_id = Some(server.id);
+            let db_triggers: Vec<String> =
+                serde_json::from_str(&server.triggers_json).unwrap_or_default();
+            if !db_triggers.is_empty() {
+                entry.triggers = db_triggers;
+            }
+        }
+
+        Ok(tools)
+    }
+
+    /// Disable a dynamic MCP server (persisted) and stop it if currently running.
+    pub async fn disable_server(&self, name: &str) -> anyhow::Result<()> {
+        Self::validate_server_name(name)?;
+
+        let dynamic = self.find_dynamic_server_by_name(name).await?;
+        let mut dynamic = match dynamic {
+            Some(server) => server,
+            None => {
+                if self
+                    .servers
+                    .read()
+                    .await
+                    .get(name)
+                    .is_some_and(|entry| entry.db_id.is_none())
+                {
+                    anyhow::bail!(
+                        "MCP server '{}' is statically configured and cannot be disabled dynamically",
+                        name
+                    );
+                }
+                anyhow::bail!("Dynamic MCP server '{}' not found", name);
+            }
+        };
+
+        if dynamic.enabled {
+            dynamic.enabled = false;
+            self.state.update_dynamic_mcp_server(&dynamic).await?;
+        }
+
+        if let Some(entry) = self.servers.write().await.remove(name) {
+            entry.client.shutdown().await;
+        }
+
+        info!(server = name, "Dynamic MCP server disabled");
+        Ok(())
+    }
+
+    /// Enable a dynamic MCP server (persisted) and ensure it is running.
+    pub async fn enable_server(&self, name: &str) -> anyhow::Result<Vec<String>> {
+        Self::validate_server_name(name)?;
+
+        let mut dynamic = match self.find_dynamic_server_by_name(name).await? {
+            Some(server) => server,
+            None => anyhow::bail!("Dynamic MCP server '{}' not found", name),
+        };
+
+        // Already running and enabled: return current tool list.
+        if dynamic.enabled {
+            let servers = self.servers.read().await;
+            if let Some(entry) = servers.get(name) {
+                let tool_names = entry.tools.iter().map(|t| t.name().to_string()).collect();
+                return Ok(tool_names);
+            }
+        }
+
+        // Replace any stale runtime instance before re-spawning.
+        if let Some(entry) = self.servers.write().await.remove(name) {
+            entry.client.shutdown().await;
+        }
+
+        let tools = self.spawn_dynamic_server_from_record(&dynamic).await?;
+
+        if !dynamic.enabled {
+            dynamic.enabled = true;
+            self.state.update_dynamic_mcp_server(&dynamic).await?;
+        }
+
+        info!(server = name, "Dynamic MCP server enabled");
+        Ok(tools)
+    }
+
     /// List all registered servers.
     pub async fn list_servers(&self) -> Vec<ServerInfo> {
         let servers = self.servers.read().await;
@@ -292,8 +421,55 @@ impl McpRegistry {
                 env_keys: e.config.env.keys().cloned().collect(),
                 triggers: e.triggers.clone(),
                 db_id: e.db_id,
+                enabled: true,
             })
             .collect()
+    }
+
+    /// List known MCP servers with enabled status, including disabled dynamic servers.
+    pub async fn list_servers_with_status(&self) -> anyhow::Result<Vec<ServerInfo>> {
+        let mut merged: HashMap<String, ServerInfo> = self
+            .list_servers()
+            .await
+            .into_iter()
+            .map(|server| (server.name.clone(), server))
+            .collect();
+
+        let dynamic_servers = self.state.list_dynamic_mcp_servers().await?;
+        for dynamic in dynamic_servers {
+            let args: Vec<String> = serde_json::from_str(&dynamic.args_json).unwrap_or_default();
+            let env_keys: Vec<String> =
+                serde_json::from_str(&dynamic.env_keys_json).unwrap_or_default();
+            let triggers: Vec<String> =
+                serde_json::from_str(&dynamic.triggers_json).unwrap_or_default();
+
+            if let Some(existing) = merged.get_mut(&dynamic.name) {
+                existing.enabled = dynamic.enabled;
+                existing.db_id = Some(dynamic.id);
+                if existing.triggers.is_empty() && !triggers.is_empty() {
+                    existing.triggers = triggers.clone();
+                }
+                continue;
+            }
+
+            merged.insert(
+                dynamic.name.clone(),
+                ServerInfo {
+                    name: dynamic.name,
+                    command: dynamic.command,
+                    args,
+                    tool_names: Vec::new(),
+                    env_keys,
+                    triggers,
+                    db_id: Some(dynamic.id),
+                    enabled: dynamic.enabled,
+                },
+            );
+        }
+
+        let mut list: Vec<ServerInfo> = merged.into_values().collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(list)
     }
 
     /// Load enabled dynamic MCP servers from the database and spawn them.
@@ -305,47 +481,8 @@ impl McpRegistry {
                 continue;
             }
 
-            let args: Vec<String> = serde_json::from_str(&server.args_json).unwrap_or_default();
-            let env_keys: Vec<String> =
-                serde_json::from_str(&server.env_keys_json).unwrap_or_default();
-
-            // Resolve env values from keychain
-            let mut env = HashMap::new();
-            for key in &env_keys {
-                let keychain_key = format!("mcp_{}_{}", server.name, key);
-                match resolve_from_keychain(&keychain_key) {
-                    Ok(val) => {
-                        env.insert(key.clone(), val);
-                    }
-                    Err(e) => {
-                        warn!(
-                            server = %server.name,
-                            key = %keychain_key,
-                            error = %e,
-                            "Failed to resolve env from keychain, server may fail"
-                        );
-                    }
-                }
-            }
-
-            let config = McpServerConfig {
-                command: server.command.clone(),
-                args,
-                env,
-            };
-
-            match self.add_server(&server.name, config, false).await {
+            match self.spawn_dynamic_server_from_record(&server).await {
                 Ok(tools) => {
-                    // Restore db_id
-                    if let Some(entry) = self.servers.write().await.get_mut(&server.name) {
-                        entry.db_id = Some(server.id);
-                        // Restore triggers from DB if present
-                        let db_triggers: Vec<String> =
-                            serde_json::from_str(&server.triggers_json).unwrap_or_default();
-                        if !db_triggers.is_empty() {
-                            entry.triggers = db_triggers;
-                        }
-                    }
                     info!(
                         server = %server.name,
                         tools = ?tools,
@@ -417,6 +554,24 @@ impl McpRegistry {
             }
         }
         None
+    }
+
+    /// Call a specific raw MCP tool on a named server.
+    pub async fn call_server_tool(
+        &self,
+        server_name: &str,
+        raw_tool_name: &str,
+        arguments: Value,
+    ) -> anyhow::Result<String> {
+        let client = {
+            let servers = self.servers.read().await;
+            let entry = servers
+                .get(server_name)
+                .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", server_name))?;
+            entry.client.clone()
+        };
+
+        client.call_tool(raw_tool_name, arguments).await
     }
 
     /// Return all MCP tool definitions (for listing purposes).

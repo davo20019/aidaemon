@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,11 @@ pub struct ResourceEntry {
 pub trait ResourceResolver: Send + Sync {
     /// Read the content of a resource file. Returns the file content as a string.
     async fn read_resource(&self, skill_name: &str, resource_path: &str) -> anyhow::Result<String>;
+
+    /// Register (or refresh) a directory-based skill location for future reads.
+    async fn register_skill_directory(&self, _skill_name: &str, _dir: &Path) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Filesystem-based resolver — reads resources from skill directories on disk.
@@ -75,6 +80,11 @@ impl ResourceResolver for FileSystemResolver {
         } else {
             Ok(content)
         }
+    }
+
+    async fn register_skill_directory(&self, skill_name: &str, dir: &Path) -> anyhow::Result<()> {
+        self.register(skill_name, dir.to_path_buf()).await;
+        Ok(())
     }
 }
 

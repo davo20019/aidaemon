@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 pub mod resources;
@@ -42,16 +43,38 @@ pub struct Skill {
 impl Skill {
     /// Parse a skill from markdown content with `---` frontmatter.
     pub fn parse(content: &str) -> Option<Skill> {
-        let trimmed = content.trim();
+        let trimmed = content.trim().trim_start_matches('\u{feff}');
         if !trimmed.starts_with("---") {
             return None;
         }
 
-        // Split on the closing `---`
-        let after_opening = &trimmed[3..];
-        let end_idx = after_opening.find("---")?;
-        let frontmatter = &after_opening[..end_idx];
-        let body = after_opening[end_idx + 3..].trim().to_string();
+        let mut lines = trimmed.lines();
+        if lines.next()?.trim() != "---" {
+            return None;
+        }
+
+        let mut frontmatter_lines = Vec::new();
+        let mut body_lines = Vec::new();
+        let mut found_closing = false;
+
+        for line in lines {
+            if !found_closing {
+                if line.trim() == "---" {
+                    found_closing = true;
+                } else {
+                    frontmatter_lines.push(line);
+                }
+            } else {
+                body_lines.push(line);
+            }
+        }
+
+        if !found_closing {
+            return None;
+        }
+
+        let frontmatter = frontmatter_lines.join("\n");
+        let body = body_lines.join("\n").trim().to_string();
 
         let mut name = None;
         let mut description = None;
@@ -213,6 +236,18 @@ pub fn write_skill_to_file(dir: &Path, skill: &Skill) -> anyhow::Result<PathBuf>
     Ok(target)
 }
 
+const SKILL_DISABLED_MARKER: &str = ".disabled";
+
+fn single_file_disabled_marker(path: &Path) -> PathBuf {
+    let mut marker_name = path.as_os_str().to_os_string();
+    marker_name.push(SKILL_DISABLED_MARKER);
+    PathBuf::from(marker_name)
+}
+
+fn directory_disabled_marker(path: &Path) -> PathBuf {
+    path.join(SKILL_DISABLED_MARKER)
+}
+
 /// Remove a skill file from the directory. Handles both single `.md` files and
 /// directory-based skills. Returns true if something was removed.
 pub fn remove_skill_file(dir: &Path, skill_name: &str) -> anyhow::Result<bool> {
@@ -221,6 +256,10 @@ pub fn remove_skill_file(dir: &Path, skill_name: &str) -> anyhow::Result<bool> {
     let md_path = dir.join(format!("{}.md", sanitized));
     if md_path.exists() {
         std::fs::remove_file(&md_path)?;
+        let marker = single_file_disabled_marker(&md_path);
+        if marker.exists() {
+            std::fs::remove_file(marker)?;
+        }
         return Ok(true);
     }
 
@@ -252,6 +291,10 @@ pub fn remove_skill_file(dir: &Path, skill_name: &str) -> anyhow::Result<bool> {
                     if let Some(parsed) = Skill::parse(&content) {
                         if parsed.name == skill_name {
                             std::fs::remove_file(&path)?;
+                            let marker = single_file_disabled_marker(&path);
+                            if marker.exists() {
+                                std::fs::remove_file(marker)?;
+                            }
                             return Ok(true);
                         }
                     }
@@ -324,10 +367,26 @@ fn load_directory_skill(dir: &Path) -> Option<Skill> {
     Some(skill)
 }
 
-/// Load skills from a directory. Supports both:
-/// - Legacy single `.md` files (e.g. `skills/deploy.md`)
-/// - Directory-based skills with `SKILL.md` (e.g. `skills/deploy/SKILL.md`)
-pub fn load_skills(dir: &Path) -> Vec<Skill> {
+#[derive(Debug, Clone)]
+pub struct SkillWithStatus {
+    pub skill: Skill,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+enum SkillStorage {
+    SingleFile(PathBuf),
+    Directory(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+struct SkillScanEntry {
+    skill: Skill,
+    enabled: bool,
+    storage: SkillStorage,
+}
+
+fn scan_skills(dir: &Path) -> Vec<SkillScanEntry> {
     let mut skills = Vec::new();
 
     let entries = match std::fs::read_dir(dir) {
@@ -344,21 +403,37 @@ pub fn load_skills(dir: &Path) -> Vec<Skill> {
         if path.is_dir() {
             // Directory-based skill: look for SKILL.md
             if let Some(skill) = load_directory_skill(&path) {
+                let enabled = !directory_disabled_marker(&path).exists();
                 info!(
                     name = %skill.name,
+                    enabled,
                     triggers = ?skill.triggers,
                     resources = skill.resources.len(),
                     "Loaded directory skill"
                 );
-                skills.push(skill);
+                skills.push(SkillScanEntry {
+                    skill,
+                    enabled,
+                    storage: SkillStorage::Directory(path),
+                });
             }
         } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
             // Legacy single-file skill
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     if let Some(skill) = Skill::parse(&content) {
-                        info!(name = %skill.name, triggers = ?skill.triggers, "Loaded skill");
-                        skills.push(skill);
+                        let enabled = !single_file_disabled_marker(&path).exists();
+                        info!(
+                            name = %skill.name,
+                            enabled,
+                            triggers = ?skill.triggers,
+                            "Loaded skill"
+                        );
+                        skills.push(SkillScanEntry {
+                            skill,
+                            enabled,
+                            storage: SkillStorage::SingleFile(path),
+                        });
                     } else {
                         warn!(path = %path.display(), "Failed to parse skill file");
                     }
@@ -373,6 +448,78 @@ pub fn load_skills(dir: &Path) -> Vec<Skill> {
     skills
 }
 
+/// Load all skills including disabled ones, with status metadata.
+pub fn load_skills_with_status(dir: &Path) -> Vec<SkillWithStatus> {
+    scan_skills(dir)
+        .into_iter()
+        .map(|entry| SkillWithStatus {
+            skill: entry.skill,
+            enabled: entry.enabled,
+        })
+        .collect()
+}
+
+/// Enable or disable a skill by exact skill name.
+///
+/// Returns:
+/// - `Ok(None)` when the skill is not found
+/// - `Ok(Some(false))` when the skill is already in the requested state
+/// - `Ok(Some(true))` when the state changed
+pub fn set_skill_enabled(
+    dir: &Path,
+    skill_name: &str,
+    enabled: bool,
+) -> anyhow::Result<Option<bool>> {
+    let entries = scan_skills(dir);
+    let target = entries
+        .into_iter()
+        .find(|entry| entry.skill.name == skill_name);
+
+    let Some(entry) = target else {
+        return Ok(None);
+    };
+
+    if entry.enabled == enabled {
+        return Ok(Some(false));
+    }
+
+    match entry.storage {
+        SkillStorage::SingleFile(path) => {
+            let marker = single_file_disabled_marker(&path);
+            if enabled {
+                if marker.exists() {
+                    std::fs::remove_file(marker)?;
+                }
+            } else {
+                std::fs::write(marker, b"disabled\n")?;
+            }
+        }
+        SkillStorage::Directory(path) => {
+            let marker = directory_disabled_marker(&path);
+            if enabled {
+                if marker.exists() {
+                    std::fs::remove_file(marker)?;
+                }
+            } else {
+                std::fs::write(marker, b"disabled\n")?;
+            }
+        }
+    }
+
+    Ok(Some(true))
+}
+
+/// Load skills from a directory. Supports both:
+/// - Legacy single `.md` files (e.g. `skills/deploy.md`)
+/// - Directory-based skills with `SKILL.md` (e.g. `skills/deploy/SKILL.md`)
+pub fn load_skills(dir: &Path) -> Vec<Skill> {
+    scan_skills(dir)
+        .into_iter()
+        .filter(|entry| entry.enabled)
+        .map(|entry| entry.skill)
+        .collect()
+}
+
 /// Cached skill loader that avoids re-reading files on every message.
 /// Checks directory modification time and only reloads when files change.
 #[derive(Clone)]
@@ -384,7 +531,7 @@ pub struct SkillCache {
 struct SkillCacheInner {
     skills: Vec<Skill>,
     last_checked: SystemTime,
-    dir_mtime: Option<SystemTime>,
+    tree_fingerprint: Option<u64>,
 }
 
 impl SkillCache {
@@ -394,21 +541,61 @@ impl SkillCache {
             inner: Arc::new(Mutex::new(SkillCacheInner {
                 skills: Vec::new(),
                 last_checked: SystemTime::UNIX_EPOCH,
-                dir_mtime: None,
+                tree_fingerprint: None,
             })),
         }
     }
 
-    /// Returns cached skills, reloading only if the directory has been modified.
+    fn compute_tree_fingerprint(dir: &Path) -> Option<u64> {
+        if !dir.exists() {
+            return None;
+        }
+
+        fn hash_path(path: &Path, hasher: &mut DefaultHasher) {
+            let metadata = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+
+            let path_repr = path.to_string_lossy();
+            path_repr.hash(hasher);
+            metadata.is_file().hash(hasher);
+            metadata.len().hash(hasher);
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+                    dur.as_secs().hash(hasher);
+                    dur.subsec_nanos().hash(hasher);
+                }
+            }
+
+            if metadata.is_dir() {
+                let mut children: Vec<PathBuf> = std::fs::read_dir(path)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|entries| entries.flatten().map(|e| e.path()))
+                    .collect();
+                children.sort();
+                for child in children {
+                    hash_path(&child, hasher);
+                }
+            }
+        }
+
+        let mut hasher = DefaultHasher::new();
+        hash_path(dir, &mut hasher);
+        Some(hasher.finish())
+    }
+
+    /// Returns cached skills, reloading only if the skill tree fingerprint changes.
     pub fn get(&self) -> Vec<Skill> {
-        let current_mtime = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
+        let current_fingerprint = Self::compute_tree_fingerprint(&self.dir);
 
         let mut inner = self.inner.lock().unwrap();
 
-        // Reload if directory mtime changed or cache is empty
-        if inner.dir_mtime != current_mtime || inner.skills.is_empty() {
+        // Reload if any skill file/directory metadata changed or cache is empty.
+        if inner.tree_fingerprint != current_fingerprint || inner.skills.is_empty() {
             inner.skills = load_skills(&self.dir);
-            inner.dir_mtime = current_mtime;
+            inner.tree_fingerprint = current_fingerprint;
             inner.last_checked = SystemTime::now();
         }
 
@@ -419,7 +606,7 @@ impl SkillCache {
     #[allow(dead_code)]
     pub fn invalidate(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.dir_mtime = None;
+        inner.tree_fingerprint = None;
     }
 }
 
@@ -1331,6 +1518,36 @@ mod tests {
     }
 
     #[test]
+    fn skill_cache_detects_nested_skill_md_edits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skill_dir = dir.path().join("nested");
+        std::fs::create_dir(&skill_dir).unwrap();
+
+        let skill_md = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &skill_md,
+            "---\nname: nested\ndescription: Initial\ntriggers: test\n---\nFirst body.",
+        )
+        .unwrap();
+
+        let cache = SkillCache::new(dir.path().to_path_buf());
+        let first = cache.get();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].body, "First body.");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &skill_md,
+            "---\nname: nested\ndescription: Updated\ntriggers: test\n---\nSecond body.",
+        )
+        .unwrap();
+
+        let second = cache.get();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].body, "Second body.");
+    }
+
+    #[test]
     fn test_parse_anthropic_format() {
         // Anthropic format: name + description, no explicit triggers.
         // Trigger inference is intentionally disabled to avoid keyword guessing.
@@ -1339,6 +1556,29 @@ mod tests {
         let skill = Skill::parse(content).unwrap();
         assert_eq!(skill.name, "code-review");
         assert!(skill.triggers.is_empty());
+    }
+
+    #[test]
+    fn parse_frontmatter_does_not_split_on_inline_delimiter_sequences() {
+        let content = "---\nname: parser-test\ndescription: keeps --- inside value\ntriggers: parse\n---\nBody content.";
+        let skill = Skill::parse(content).unwrap();
+        assert_eq!(skill.name, "parser-test");
+        assert_eq!(skill.description, "keeps --- inside value");
+        assert_eq!(skill.body, "Body content.");
+    }
+
+    #[test]
+    fn parse_frontmatter_requires_closing_delimiter_line() {
+        let content =
+            "---\nname: parser-test\ndescription: missing closing delimiter\nBody content with ---";
+        assert!(Skill::parse(content).is_none());
+    }
+
+    #[test]
+    fn parse_frontmatter_preserves_body_horizontal_rules() {
+        let content = "---\nname: parser-test\ndescription: body rules\ntriggers: parse\n---\nLine one\n---\nLine two";
+        let skill = Skill::parse(content).unwrap();
+        assert_eq!(skill.body, "Line one\n---\nLine two");
     }
 
     // --- to_markdown roundtrip tests ---
@@ -1486,6 +1726,69 @@ mod tests {
     fn remove_not_found() {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(!remove_skill_file(dir.path(), "nonexistent").unwrap());
+    }
+
+    #[test]
+    fn disable_and_enable_single_file_skill() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skill = Skill {
+            name: "toggle-me".to_string(),
+            description: "Toggle me".to_string(),
+            triggers: vec!["toggle".to_string()],
+            body: "Body.".to_string(),
+            origin: None,
+            source: None,
+            source_url: None,
+            dir_path: None,
+            resources: vec![],
+        };
+        write_skill_to_file(dir.path(), &skill).unwrap();
+
+        assert_eq!(load_skills(dir.path()).len(), 1);
+        assert_eq!(
+            set_skill_enabled(dir.path(), "toggle-me", false).unwrap(),
+            Some(true)
+        );
+        assert!(load_skills(dir.path()).is_empty());
+
+        let statuses = load_skills_with_status(dir.path());
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].enabled);
+
+        assert_eq!(
+            set_skill_enabled(dir.path(), "toggle-me", true).unwrap(),
+            Some(true)
+        );
+        assert_eq!(load_skills(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn disable_and_enable_directory_skill() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skill_dir = dir.path().join("deploy");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: deploy\ndescription: Deploy\ntriggers: deploy\n---\nDo deploy.",
+        )
+        .unwrap();
+
+        assert_eq!(load_skills(dir.path()).len(), 1);
+        assert_eq!(
+            set_skill_enabled(dir.path(), "deploy", false).unwrap(),
+            Some(true)
+        );
+        assert!(load_skills(dir.path()).is_empty());
+
+        let statuses = load_skills_with_status(dir.path());
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].enabled);
+
+        assert_eq!(
+            set_skill_enabled(dir.path(), "deploy", true).unwrap(),
+            Some(true)
+        );
+        assert_eq!(load_skills(dir.path()).len(), 1);
     }
 
     // --- find_skill_by_name tests ---

@@ -1072,7 +1072,7 @@ impl MemoryManager {
 
         // Extract goals
         for goal_text in &analysis.goals_mentioned {
-            if let Err(e) = self.extract_goal(goal_text, episode_id).await {
+            if let Err(e) = self.extract_goal(goal_text, episode_id, session_id).await {
                 warn!("Failed to extract goal '{}': {}", goal_text, e);
             }
         }
@@ -1160,7 +1160,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
     }
 
     /// Extract or update a goal from episode analysis.
-    async fn extract_goal(&self, goal_text: &str, source_episode_id: i64) -> anyhow::Result<()> {
+    async fn extract_goal(
+        &self,
+        goal_text: &str,
+        source_episode_id: i64,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
         // Check for similar existing goal (including abandoned/completed to prevent resurrection)
         let existing = sqlx::query(
             "SELECT id, description, status FROM goals WHERE status IN ('active', 'abandoned', 'completed')"
@@ -1171,7 +1176,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         // Simple text similarity check
         let goal_lower = goal_text.to_lowercase();
         for row in existing {
-            let id: i64 = row.get("id");
+            let id: String = row.get("id");
             let description: String = row.get("description");
             let status: String = row.get("status");
             let desc_lower = description.to_lowercase();
@@ -1195,7 +1200,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                 let note = format!("Referenced in episode {}", source_episode_id);
 
                 let notes_row = sqlx::query("SELECT progress_notes FROM goals WHERE id = ?")
-                    .bind(id)
+                    .bind(&id)
                     .fetch_one(&self.pool)
                     .await?;
                 let notes_json: Option<String> = notes_row.get("progress_notes");
@@ -1208,7 +1213,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                 sqlx::query("UPDATE goals SET progress_notes = ?, updated_at = ? WHERE id = ?")
                     .bind(&notes_json)
                     .bind(&now)
-                    .bind(id)
+                    .bind(&id)
                     .execute(&self.pool)
                     .await?;
 
@@ -1218,12 +1223,15 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
 
         // No similar goal - create new
         let now = Utc::now().to_rfc3339();
+        let goal_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO goals (description, status, priority, source_episode_id, created_at, updated_at)
-             VALUES (?, 'active', 'medium', ?, ?, ?)"
+            "INSERT INTO goals (id, description, status, priority, source_episode_id, session_id, created_at, updated_at)
+             VALUES (?, ?, 'active', 'medium', ?, ?, ?, ?)"
         )
+        .bind(&goal_id)
         .bind(goal_text)
         .bind(source_episode_id)
+        .bind(session_id)
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
@@ -1540,10 +1548,10 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         .await?;
 
         for row in stale_goals {
-            let id: i64 = row.get("id");
+            let id: String = row.get("id");
             let description: String = row.get("description");
             info!(
-                goal_id = id,
+                goal_id = %id,
                 description, "Stale goal detected - may need user input"
             );
         }

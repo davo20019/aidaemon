@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] - 2026-02-21
+
+### Added
+
+- **Signature-based semantic failure tracking**: Tool failure lockout now tracks error *signatures* (normalized fingerprints) rather than raw failure counts. Different errors from the same tool no longer pile up toward the lockout limit — only repeated identical failure patterns trigger lockout. Error signatures normalize file paths, line numbers, PIDs, and exit codes so the same root cause is detected even when surface details change.
+- **Error coaching in tool failure feedback**: First-time tool failures now extract the key error line (via pattern-priority heuristics) and quote it back to the LLM with explicit coaching to try a different approach. Subsequent failures include the specific error context.
+- **User-facing error explanations in graceful stop messages**: When the agent stalls or times out, the graceful response now includes an "Issues encountered" section listing actual errors (deduplicated, recent-error priority, resolved ones marked) plus a "Blocked capabilities" section showing which tool categories hit the lockout limit.
+- **"Tool Locked Out" stall classification**: `classify_stall()` returns a new category with actionable user guidance when any tool has hit its semantic failure limit.
+- **File lookup miss as transient failure**: File-not-found errors from file-oriented tools are classified as transient rather than semantic, so missing-file errors during project exploration do not consume the semantic lockout budget or trigger cooldown periods.
+- **Provider `extra_headers` configuration**: All three provider backends (OpenAI-compatible, Anthropic, Google GenAI) support an `extra_headers` map in `config.toml` for injecting custom HTTP headers on every API request, with `"keychain"` resolution for secrets.
+- **Anthropic `max_tokens` configuration**: The Anthropic provider accepts an optional `max_tokens` setting (default: 16384, previously hardcoded to 4096).
+- **Anthropic dynamic model listing**: `list_models()` now queries the `/models` API endpoint instead of returning a hardcoded list, with fallback to known models if the API call fails.
+- **MCP protocol version negotiation**: MCP client initialization tries multiple protocol versions (`2025-06-18`, `2025-03-26`, `2024-11-05`) with automatic fallback — if a version fails, the server is restarted with the next version.
+- **MCP rich content block rendering**: MCP tool results now render non-text content blocks (images, resources, structured content) as descriptive placeholders instead of raw JSON. The `isError` flag is respected and converted to an error.
+- **MCP automatic server restart on transport failure**: When an MCP tool call fails with a transport-level error (broken pipe, closed stdout, connection reset, timeout), the system automatically restarts the server and retries the call once. Application-level errors are not retried.
+- **MCP server enable/disable**: Dynamic MCP servers can be enabled and disabled without deletion. `manage_mcp` tool gains `enable` and `disable` actions; `list` shows enabled/disabled status and source type (static vs. dynamic).
+- **Skill enable/disable via filesystem markers**: Skills can be disabled/enabled using `.disabled` marker files. Disabled skills appear in listings with status metadata but are excluded from matching and activation.
+- **Skill management approval flow**: `manage_skills` now requires user approval for `add` (from URL), `install` (from registry), and `update` actions.
+- **Skill body sanitization on activation**: `UseSkillTool` runs skill body content through `sanitize_external_content()` before returning it to the LLM, filtering prompt injection attempts.
+- **Skill resource auto-registration**: `SkillResourcesTool` automatically registers a skill's directory path with the `FileSystemResolver` on first access, so directory-based skills loaded at runtime work without prior manual registration.
+- **Raw tool-call token sanitization**: The sanitization pipeline now strips leaked LLM tool-calling protocol tokens (`<|tool_calls_section_begin|>`, `functions.terminal:0 {...}`, etc.) from user-facing output.
+
+### Changed
+
+- **ExecutionPolicy tool budgets increased**: Cheap 6→15, Balanced 12→35, Strong 20→60 — previous values caused hard stops before the force-text escalation system could engage.
+- **Empty-response recovery preserves parent context**: When the LLM returns an empty response and the agent retries, the immediate parent user+assistant exchange is now preserved (truncated to 800 chars each), giving the LLM enough conversational context to produce a meaningful reply.
+- **Background task lead deduplication**: When executor task results are already sent inline during goal execution, the completion notification sends only a brief signal instead of repeating the full results summary.
+- **Telegram session ID stability**: Session IDs are derived from a stable namespace locked for the process lifetime, preventing mid-run session ID drift when the bot username is resolved asynchronously.
+- **Telegram typing indicator improvements**: Interval reduced from 4s to 3s; typing action is re-sent immediately after status/thinking messages (Telegram clears typing indicators when a message is sent).
+- **Tool name trimming across all providers**: All three providers now trim whitespace from tool names returned by LLMs, preventing spurious "unknown tool" errors from models that occasionally add leading/trailing spaces.
+- **Anthropic and Google provider constructors accept `base_url`**: Both providers now accept optional custom `base_url` parameters, enabling use with proxy endpoints and alternative API-compatible services.
+- **Skill frontmatter parser rewritten**: Line-based parsing replaces `find("---")` which could split on `---` sequences embedded in description values. Body content can now contain horizontal rules without corruption.
+- **Skill cache uses tree fingerprinting**: `SkillCache` computes a recursive filesystem fingerprint instead of relying on top-level directory mtime, correctly detecting changes to nested `SKILL.md` files inside directory-based skills.
+- **Skill and MCP listings enriched with status**: `manage_skills list` and `manage_mcp list` now display enabled/disabled counts and per-item status tags.
+- **Dependencies trimmed**: Removed `thiserror` and `insta` crate dependencies.
+
+### Fixed
+
+- **Goals table schema mismatch**: `extract_goal()` used `let id: i64` on a `TEXT PRIMARY KEY` column (UUIDs), causing sqlx panics. Fixed to `let id: String`. INSERT was also missing the `id` and `session_id` columns.
+- **Stale goal detection type mismatch**: `detect_stale_goals()` also used `let id: i64` for the TEXT id column; fixed to `let id: String`.
+
 ## [0.9.6] - 2026-02-20
 
 ### Added

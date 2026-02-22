@@ -45,7 +45,7 @@ impl ExecutionPolicy {
                 verify_level: VerifyLevel::Quick,
                 approval_mode: ApprovalMode::Auto,
                 context_budget: 6000,
-                tool_budget: 6,
+                tool_budget: 15,
                 policy_rev: 1,
                 escalation_reasons: Vec::new(),
             },
@@ -54,7 +54,7 @@ impl ExecutionPolicy {
                 verify_level: VerifyLevel::Quick,
                 approval_mode: ApprovalMode::AskOnce,
                 context_budget: 12_000,
-                tool_budget: 12,
+                tool_budget: 35,
                 policy_rev: 1,
                 escalation_reasons: Vec::new(),
             },
@@ -63,7 +63,7 @@ impl ExecutionPolicy {
                 verify_level: VerifyLevel::Full,
                 approval_mode: ApprovalMode::AskAlways,
                 context_budget: 20_000,
-                tool_budget: 20,
+                tool_budget: 60,
                 policy_rev: 1,
                 escalation_reasons: Vec::new(),
             },
@@ -208,19 +208,19 @@ mod tests {
     fn policy_profile_defaults_match_plan() {
         let cheap = ExecutionPolicy::for_profile(ModelProfile::Cheap);
         assert_eq!(cheap.context_budget, 6000);
-        assert_eq!(cheap.tool_budget, 6);
+        assert_eq!(cheap.tool_budget, 15);
         assert_eq!(cheap.verify_level, VerifyLevel::Quick);
         assert_eq!(cheap.approval_mode, ApprovalMode::Auto);
 
         let balanced = ExecutionPolicy::for_profile(ModelProfile::Balanced);
         assert_eq!(balanced.context_budget, 12_000);
-        assert_eq!(balanced.tool_budget, 12);
+        assert_eq!(balanced.tool_budget, 35);
         assert_eq!(balanced.verify_level, VerifyLevel::Quick);
         assert_eq!(balanced.approval_mode, ApprovalMode::AskOnce);
 
         let strong = ExecutionPolicy::for_profile(ModelProfile::Strong);
         assert_eq!(strong.context_budget, 20_000);
-        assert_eq!(strong.tool_budget, 20);
+        assert_eq!(strong.tool_budget, 60);
         assert_eq!(strong.verify_level, VerifyLevel::Full);
         assert_eq!(strong.approval_mode, ApprovalMode::AskAlways);
     }

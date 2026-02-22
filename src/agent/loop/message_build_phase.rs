@@ -23,6 +23,74 @@ pub(super) struct MessageBuildData {
     pub messages: Vec<Value>,
 }
 
+const EMPTY_RETRY_MAX_PARENT_CHARS: usize = 800;
+
+fn trimmed_message_content(message: &Value) -> Option<String> {
+    message
+        .get("content")
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn truncate_parent_for_empty_retry(content: &str) -> String {
+    let mut out: String = content.chars().take(EMPTY_RETRY_MAX_PARENT_CHARS).collect();
+    if content.chars().count() > EMPTY_RETRY_MAX_PARENT_CHARS {
+        out.push_str("...");
+    }
+    out
+}
+
+fn build_empty_response_retry_messages(existing: &[Value], user_text: &str) -> Vec<Value> {
+    let current_idx = existing.iter().rposition(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("user")
+            && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
+    });
+    let search_end = current_idx.unwrap_or(existing.len());
+
+    let prev_assistant = existing
+        .iter()
+        .take(search_end)
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        .and_then(trimmed_message_content);
+
+    let prev_user = existing
+        .iter()
+        .take(search_end)
+        .rev()
+        .find(|m| {
+            if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+                return false;
+            }
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|content| content != user_text && !content.trim().is_empty())
+        })
+        .and_then(trimmed_message_content);
+
+    let mut recovered = Vec::new();
+    if let Some(prev_user) = prev_user {
+        recovered.push(json!({
+            "role": "user",
+            "content": truncate_parent_for_empty_retry(&prev_user),
+        }));
+    }
+    if let Some(prev_assistant) = prev_assistant {
+        recovered.push(json!({
+            "role": "assistant",
+            "content": truncate_parent_for_empty_retry(&prev_assistant),
+        }));
+    }
+    recovered.push(json!({
+        "role": "user",
+        "content": user_text,
+    }));
+
+    recovered
+}
+
 impl Agent {
     pub(super) async fn run_message_build_phase(
         &self,
@@ -327,17 +395,13 @@ impl Agent {
         // can get "stuck" returning empty candidates for a given session history).
         if empty_response_retry_pending && !is_trigger_session(session_id) {
             let before = messages.len();
-            messages.clear();
-            messages.push(json!({
-                "role": "user",
-                "content": user_text,
-            }));
+            messages = build_empty_response_retry_messages(&messages, user_text);
             info!(
                 session_id,
                 iteration,
                 before,
                 after = messages.len(),
-                "Empty-response recovery: cleared history context for retry"
+                "Empty-response recovery: reduced history while preserving immediate parent context"
             );
         }
 
@@ -466,5 +530,34 @@ impl Agent {
         }
 
         Ok(MessageBuildData { messages })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_retry_preserves_parent_pair_and_current_user() {
+        let messages = vec![
+            json!({"role": "user", "content": "can you clear cache using drush?"}),
+            json!({"role": "assistant", "content": "I can see updates available. Should I proceed with updating these?"}),
+            json!({"role": "user", "content": "yes, update them"}),
+        ];
+        let recovered = build_empty_response_retry_messages(&messages, "yes, update them");
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(recovered[0]["role"], "user");
+        assert_eq!(recovered[1]["role"], "assistant");
+        assert_eq!(recovered[2]["role"], "user");
+        assert_eq!(recovered[2]["content"].as_str(), Some("yes, update them"));
+    }
+
+    #[test]
+    fn empty_retry_falls_back_to_current_user_when_no_history() {
+        let messages = vec![json!({"role": "user", "content": "help"})];
+        let recovered = build_empty_response_retry_messages(&messages, "help");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0]["role"], "user");
+        assert_eq!(recovered[0]["content"].as_str(), Some("help"));
     }
 }

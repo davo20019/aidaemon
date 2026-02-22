@@ -224,10 +224,18 @@ impl Agent {
         }
     }
 
-    /// Classify the stall cause from recent errors for actionable guidance.
+    /// Test-only wrapper around `post_task::classify_stall`.
+    ///
+    /// Production flow should call the `post_task` function with the real
+    /// `tool_failure_count` map so lockout classification remains available.
     #[allow(dead_code)] // Used in tests; production path delegates through post_task.
     pub(super) fn classify_stall(learning_ctx: &LearningContext) -> (&'static str, &'static str) {
-        post_task::classify_stall(learning_ctx, DEFERRED_NO_TOOL_ERROR_MARKER)
+        let empty_tool_failure_count: HashMap<String, usize> = HashMap::new();
+        post_task::classify_stall(
+            learning_ctx,
+            DEFERRED_NO_TOOL_ERROR_MARKER,
+            &empty_tool_failure_count,
+        )
     }
 
     /// Graceful response when agent is stalled (no progress).
@@ -237,11 +245,13 @@ impl Agent {
         session_id: &str,
         learning_ctx: &LearningContext,
         sent_file_successfully: bool,
+        tool_failure_count: &HashMap<String, usize>,
     ) -> anyhow::Result<String> {
         let summary = post_task::graceful_stall_response(
             learning_ctx,
             sent_file_successfully,
             DEFERRED_NO_TOOL_ERROR_MARKER,
+            tool_failure_count,
         );
         self.append_graceful_assistant_summary(emitter, session_id, summary)
             .await
@@ -254,11 +264,13 @@ impl Agent {
         session_id: &str,
         learning_ctx: &LearningContext,
         sent_file_successfully: bool,
+        tool_failure_count: &HashMap<String, usize>,
     ) -> anyhow::Result<String> {
         let summary = post_task::graceful_partial_stall_response(
             learning_ctx,
             sent_file_successfully,
             DEFERRED_NO_TOOL_ERROR_MARKER,
+            tool_failure_count,
         );
         self.append_graceful_assistant_summary(emitter, session_id, summary)
             .await

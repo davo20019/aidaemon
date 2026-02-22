@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon"
-version = "0.9.6"
+version = "0.9.7"
 edition = "2021"
 description = "A personal AI agent that runs as a background daemon, accessible via Telegram, Slack, or Discord, with tool use, MCP integration, and persistent memory"
 license = "MIT"
@@ -26,7 +26,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 anyhow = "1"
-thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-imap = "0.10"
@@ -84,7 +83,6 @@ strip = true
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
-insta = { version = "1", features = ["yaml"] }
 assert_cmd = "2"
 
 [package.metadata.binstall]

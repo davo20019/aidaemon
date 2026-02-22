@@ -1,12 +1,15 @@
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use tracing::warn;
 
 use crate::traits::StateStore;
 
-use super::MAX_CONSECUTIVE_SAME_TOOL;
+use super::{extract_key_error_line, semantic_failure_limit, MAX_CONSECUTIVE_SAME_TOOL};
 
 /// Context accumulated during handle_message for post-task learning.
 #[derive(Clone)]
@@ -97,7 +100,18 @@ pub(super) async fn process_learning(
 pub(super) fn classify_stall(
     learning_ctx: &LearningContext,
     deferred_no_tool_error_marker: &str,
+    tool_failure_count: &HashMap<String, usize>,
 ) -> (&'static str, &'static str) {
+    let any_locked = tool_failure_count
+        .iter()
+        .any(|(name, count)| *count >= semantic_failure_limit(name));
+    if any_locked {
+        return (
+            "Tool Locked Out",
+            "I ran into repeated errors with a command and got locked out. Try rephrasing or specifying the exact command to use.",
+        );
+    }
+
     let recent_errors: String = learning_ctx
         .errors
         .iter()
@@ -211,6 +225,38 @@ fn looks_like_provider_server_error(recent_errors: &str) -> bool {
     mentions_provider && recent_errors.contains("server error")
 }
 
+fn user_friendly_tool_description(tool_name: &str) -> &'static str {
+    match tool_name {
+        "terminal" => "command execution",
+        "web_search" | "web_fetch" => "web access",
+        "cli_agent" => "external agent",
+        "edit_file" | "write_file" | "read_file" => "file operations",
+        "browser" => "browser interaction",
+        _ => "other capability",
+    }
+}
+
+pub(super) fn format_tool_failure_summary(tool_failure_count: &HashMap<String, usize>) -> String {
+    let blocked_labels: BTreeSet<&'static str> = tool_failure_count
+        .iter()
+        .filter(|(name, count)| **count >= semantic_failure_limit(name))
+        .map(|(name, _)| user_friendly_tool_description(name))
+        .collect();
+
+    if blocked_labels.is_empty() {
+        return String::new();
+    }
+
+    let mut summary = String::from("Blocked capabilities due to repeated errors:\n");
+    for label in blocked_labels {
+        summary.push_str("- ");
+        summary.push_str(label);
+        summary.push('\n');
+    }
+    summary.push('\n');
+    summary
+}
+
 /// Graceful response when task timeout is reached.
 pub(super) fn graceful_timeout_response(
     learning_ctx: &LearningContext,
@@ -287,15 +333,28 @@ pub(super) fn graceful_stall_response(
     learning_ctx: &LearningContext,
     sent_file_successfully: bool,
     deferred_no_tool_error_marker: &str,
+    tool_failure_count: &HashMap<String, usize>,
 ) -> String {
-    let (_label, suggestion) = classify_stall(learning_ctx, deferred_no_tool_error_marker);
+    let (_label, suggestion) = classify_stall(
+        learning_ctx,
+        deferred_no_tool_error_marker,
+        tool_failure_count,
+    );
     let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let error_explanation = format_error_explanation(&learning_ctx.errors);
+    let failure_summary = format_tool_failure_summary(tool_failure_count);
     if sent_file_successfully {
         let mut msg = String::from(
             "I sent the requested file(s), but ran into issues with the remaining steps.\n\n",
         );
         if !activity.is_empty() {
             msg.push_str(&activity);
+        }
+        if !error_explanation.is_empty() {
+            msg.push_str(&error_explanation);
+        }
+        if !failure_summary.is_empty() {
+            msg.push_str(&failure_summary);
         }
         msg.push_str(suggestion);
         msg
@@ -304,6 +363,12 @@ pub(super) fn graceful_stall_response(
         if !activity.is_empty() {
             msg.push_str(&activity);
             msg.push('\n');
+        }
+        if !error_explanation.is_empty() {
+            msg.push_str(&error_explanation);
+        }
+        if !failure_summary.is_empty() {
+            msg.push_str(&failure_summary);
         }
         msg.push_str(suggestion);
         msg
@@ -315,15 +380,28 @@ pub(super) fn graceful_partial_stall_response(
     learning_ctx: &LearningContext,
     sent_file_successfully: bool,
     deferred_no_tool_error_marker: &str,
+    tool_failure_count: &HashMap<String, usize>,
 ) -> String {
-    let (_label, suggestion) = classify_stall(learning_ctx, deferred_no_tool_error_marker);
+    let (_label, suggestion) = classify_stall(
+        learning_ctx,
+        deferred_no_tool_error_marker,
+        tool_failure_count,
+    );
     let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let error_explanation = format_error_explanation(&learning_ctx.errors);
+    let failure_summary = format_tool_failure_summary(tool_failure_count);
     if sent_file_successfully {
         let mut msg = String::from(
             "I completed the main deliverable but wasn't able to finish everything.\n\n",
         );
         if !activity.is_empty() {
             msg.push_str(&activity);
+        }
+        if !error_explanation.is_empty() {
+            msg.push_str(&error_explanation);
+        }
+        if !failure_summary.is_empty() {
+            msg.push_str(&failure_summary);
         }
         msg.push_str(suggestion);
         msg
@@ -333,6 +411,12 @@ pub(super) fn graceful_partial_stall_response(
         if !activity.is_empty() {
             msg.push_str(&activity);
             msg.push('\n');
+        }
+        if !error_explanation.is_empty() {
+            msg.push_str(&error_explanation);
+        }
+        if !failure_summary.is_empty() {
+            msg.push_str(&failure_summary);
         }
         msg.push_str(suggestion);
         msg
@@ -345,11 +429,15 @@ pub(super) fn graceful_repetitive_response(
     _tool_name: &str,
 ) -> String {
     let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let error_explanation = format_error_explanation(&learning_ctx.errors);
     let mut msg = String::from("I seem to be stuck on this task.\n\n");
     if !activity.is_empty() {
         msg.push_str("Here's what I've done so far:\n");
         msg.push_str(&activity);
         msg.push('\n');
+    }
+    if !error_explanation.is_empty() {
+        msg.push_str(&error_explanation);
     }
     msg.push_str("Could you try a different approach or provide more specific instructions?");
     msg
@@ -434,6 +522,91 @@ pub(super) fn is_productive(
     }
 
     true
+}
+
+/// Format a user-facing explanation of what went wrong, from the error list.
+fn format_error_explanation(errors: &[(String, bool)]) -> String {
+    if errors.is_empty() {
+        return String::new();
+    }
+
+    // Build deduped list from the most recent errors (the final blocker is most
+    // relevant). We take the last 5 to avoid processing the entire history, but
+    // prioritize recency over first-seen order.
+    // If same line appears both recovered and unrecovered, prefer unrecovered (worse case).
+    let recent_start = errors.len().saturating_sub(5);
+    let mut seen: Vec<(String, bool)> = Vec::new();
+    for (error_text, recovered) in errors[recent_start..].iter() {
+        let key_line = extract_key_error_line(error_text);
+        if key_line.is_empty() {
+            continue;
+        }
+        let redacted = redact_error_line_for_summary(&key_line);
+        if let Some(existing) = seen.iter_mut().find(|(line, _)| *line == redacted) {
+            // If new occurrence is unrecovered, upgrade to unrecovered
+            if !recovered {
+                existing.1 = false;
+            }
+        } else {
+            seen.push((redacted, *recovered));
+        }
+    }
+
+    if seen.is_empty() {
+        return String::new();
+    }
+
+    let mut result = String::from("Issues encountered:\n");
+    for (line, recovered) in seen.iter().take(3) {
+        result.push_str("- ");
+        result.push_str(line);
+        if *recovered {
+            result.push_str(" (resolved)");
+        }
+        result.push('\n');
+    }
+    result.push('\n');
+    result
+}
+
+static ABS_UNIX_PATH_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"/(?:Users|home|etc)/[^\s]+").expect("unix path regex must compile"));
+static ABS_WINDOWS_PATH_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"[A-Z]:[\\/][^\s]+").expect("windows path regex must compile"));
+
+fn split_trailing_path_punctuation(raw: &str) -> (&str, &str) {
+    let mut idx = raw.len();
+    for (i, ch) in raw.char_indices().rev() {
+        if matches!(ch, ')' | ']' | '}' | ',' | ';' | ':' | '.' | '"' | '\'') {
+            idx = i;
+            continue;
+        }
+        break;
+    }
+    (&raw[..idx], &raw[idx..])
+}
+
+fn abbreviate_absolute_path(path: &str) -> String {
+    let (core, suffix) = split_trailing_path_punctuation(path);
+    let tail = core
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(core);
+    format!("[path:.../{}]{}", tail, suffix)
+}
+
+fn redact_error_line_for_summary(key_line: &str) -> String {
+    let unix_summarized = ABS_UNIX_PATH_RE
+        .replace_all(key_line, |caps: &regex::Captures<'_>| {
+            abbreviate_absolute_path(caps.get(0).map(|m| m.as_str()).unwrap_or_default())
+        })
+        .to_string();
+    let windows_summarized = ABS_WINDOWS_PATH_RE
+        .replace_all(&unix_summarized, |caps: &regex::Captures<'_>| {
+            abbreviate_absolute_path(caps.get(0).map(|m| m.as_str()).unwrap_or_default())
+        })
+        .to_string();
+    crate::tools::sanitize::redact_secrets(&windows_summarized)
 }
 
 /// Categorize tool calls into a human-readable activity summary.
@@ -630,13 +803,27 @@ mod tests {
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
         };
-        let result = graceful_partial_stall_response(&ctx, false, "deferred");
+        let result = graceful_partial_stall_response(&ctx, false, "deferred", &HashMap::new());
         assert!(result.contains("some progress"));
         assert!(result.contains("Activity summary:"));
+        // Error explanation should appear since ctx has an error
+        assert!(result.contains("Issues encountered:"));
+        assert!(result.contains("not found"));
         // Should NOT contain internal details
         assert!(!result.contains("tool calls executed"));
         assert!(!result.contains("errors encountered"));
         assert!(!result.contains("Stopping reason"));
+    }
+
+    #[test]
+    fn test_graceful_stall_response_includes_failure_summary() {
+        let ctx = make_learning_ctx();
+        let mut tool_failure_count = HashMap::new();
+        tool_failure_count.insert("terminal".to_string(), semantic_failure_limit("terminal"));
+        let result = graceful_stall_response(&ctx, false, "deferred-no-tool", &tool_failure_count);
+        assert!(result.contains("Blocked capabilities due to repeated errors:"));
+        assert!(result.contains("command execution"));
+        assert!(!result.contains("terminal"));
     }
 
     fn make_learning_ctx() -> LearningContext {
@@ -744,7 +931,7 @@ mod tests {
         let ctx = ctx_with_single_error(
             "Command 'npm install tailwindcss' is not in the safe command list. Use 'terminal' for this command.",
         );
-        let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool");
+        let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool", &HashMap::new());
         assert_eq!(label, "Tool Policy Block");
         assert!(suggestion.contains("safety policy"));
     }
@@ -754,7 +941,7 @@ mod tests {
         let ctx = ctx_with_single_error(
             "Text not found in ~/projects/oaxaca-mezcal-tours/src/components/ContactForm.jsx. The old_text did not match.",
         );
-        let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool");
+        let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool", &HashMap::new());
         assert_eq!(label, "Edit Target Drift");
         assert!(suggestion.contains("re-read"));
     }
@@ -762,14 +949,166 @@ mod tests {
     #[test]
     fn test_classify_stall_ignores_generic_5000_values() {
         let ctx = ctx_with_single_error("Exceeded 5000 characters while building summary.");
-        let (label, _) = classify_stall(&ctx, "deferred-no-tool");
+        let (label, _) = classify_stall(&ctx, "deferred-no-tool", &HashMap::new());
         assert_eq!(label, "Stuck");
     }
 
     #[test]
     fn test_classify_stall_detects_provider_server_status_codes() {
         let ctx = ctx_with_single_error("OpenAI API returned status code 503 Service Unavailable.");
-        let (label, _) = classify_stall(&ctx, "deferred-no-tool");
+        let (label, _) = classify_stall(&ctx, "deferred-no-tool", &HashMap::new());
         assert_eq!(label, "Server Error");
+    }
+
+    #[test]
+    fn test_classify_stall_detects_tool_lockout_from_counts() {
+        let ctx = make_learning_ctx();
+        let mut tool_failure_count = HashMap::new();
+        tool_failure_count.insert("terminal".to_string(), semantic_failure_limit("terminal"));
+        let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool", &tool_failure_count);
+        assert_eq!(label, "Tool Locked Out");
+        assert!(suggestion.contains("locked out"));
+    }
+
+    #[test]
+    fn test_tool_failure_summary_format() {
+        let mut tool_failure_count = HashMap::new();
+        tool_failure_count.insert("terminal".to_string(), semantic_failure_limit("terminal"));
+        tool_failure_count.insert(
+            "web_search".to_string(),
+            semantic_failure_limit("web_search"),
+        );
+        tool_failure_count.insert("web_fetch".to_string(), semantic_failure_limit("web_fetch"));
+        let summary = format_tool_failure_summary(&tool_failure_count);
+        assert!(summary.contains("Blocked capabilities due to repeated errors:"));
+        assert!(summary.contains("- command execution"));
+        assert!(summary.contains("- web access"));
+        let web_access_mentions = summary.matches("web access").count();
+        assert_eq!(web_access_mentions, 1, "web access should be deduplicated");
+    }
+
+    #[test]
+    fn test_format_error_explanation_empty_on_no_errors() {
+        let result = format_error_explanation(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_error_explanation_marks_recovered() {
+        let errors = vec![
+            ("command not found: drush".to_string(), true),
+            (
+                "Unable to install modules entity_reference".to_string(),
+                false,
+            ),
+        ];
+        let result = format_error_explanation(&errors);
+        assert!(result.contains("Issues encountered:"));
+        assert!(result.contains("command not found: drush (resolved)"));
+        assert!(result.contains("Unable to install modules entity_reference"));
+        // The unrecovered error should NOT have "(resolved)"
+        assert!(!result.contains("entity_reference (resolved)"));
+    }
+
+    #[test]
+    fn test_format_error_explanation_dedup_prefers_unrecovered() {
+        let errors = vec![
+            ("Error: command not found: drush".to_string(), true),
+            ("Error: command not found: drush".to_string(), false),
+        ];
+        let result = format_error_explanation(&errors);
+        // Same error appears twice — once recovered, once not. Should show as unrecovered.
+        assert!(result.contains("command not found: drush"));
+        assert!(!result.contains("(resolved)"));
+        // Should only appear once (deduped)
+        assert_eq!(result.matches("command not found: drush").count(), 1);
+    }
+
+    #[test]
+    fn test_format_error_explanation_preserves_order() {
+        let errors = vec![
+            ("Error: first problem".to_string(), false),
+            ("Error: second problem".to_string(), false),
+            ("Error: third problem".to_string(), false),
+        ];
+        let result = format_error_explanation(&errors);
+        let first_pos = result.find("first problem").unwrap();
+        let second_pos = result.find("second problem").unwrap();
+        let third_pos = result.find("third problem").unwrap();
+        assert!(first_pos < second_pos);
+        assert!(second_pos < third_pos);
+    }
+
+    #[test]
+    fn test_format_error_explanation_redacts_secrets() {
+        // sk- followed by 20+ alphanumeric chars matches the API key pattern
+        let errors = vec![(
+            "Error: Invalid API key sk-abcdefghijklmnopqrstuvwxyz1234567890ABCDEF".to_string(),
+            false,
+        )];
+        let result = format_error_explanation(&errors);
+        assert!(result.contains("Issues encountered:"));
+        assert!(!result.contains("sk-abcdef"));
+        assert!(result.contains("[REDACTED:"));
+    }
+
+    #[test]
+    fn test_format_error_explanation_keeps_safe_path_tail() {
+        let errors = vec![(
+            "Error: Text not found in /Users/alice/projects/plants-site/src/main.rs.".to_string(),
+            false,
+        )];
+        let result = format_error_explanation(&errors);
+        assert!(result.contains("[path:.../main.rs]."));
+        assert!(!result.contains("/Users/alice/projects/plants-site/src/main.rs"));
+        assert!(!result.contains("[REDACTED:File path]"));
+    }
+
+    #[test]
+    fn test_format_error_explanation_prefers_recent_errors() {
+        // When more than 5 errors exist, only the last 5 should be considered.
+        // This ensures the user sees the final blocker, not stale resolved issues.
+        let errors: Vec<(String, bool)> = (1..=8)
+            .map(|i| (format!("Error: problem number {}", i), i <= 3))
+            .collect();
+        let result = format_error_explanation(&errors);
+        // Errors 1-3 are old (indices 0-2) and should be skipped (recent_start=3).
+        assert!(
+            !result.contains("problem number 1"),
+            "Stale error 1 should not appear"
+        );
+        assert!(
+            !result.contains("problem number 2"),
+            "Stale error 2 should not appear"
+        );
+        assert!(
+            !result.contains("problem number 3"),
+            "Stale error 3 should not appear"
+        );
+        // Recent errors (4-8) should be represented (display capped at 3 deduped).
+        // At minimum, the most recent errors should appear.
+        assert!(
+            result.contains("problem number"),
+            "Recent errors should appear"
+        );
+    }
+
+    #[test]
+    fn test_graceful_stall_includes_error_explanation() {
+        let mut ctx = make_learning_ctx();
+        ctx.errors = vec![(
+            "Unable to install modules entity_reference due to missing modules".to_string(),
+            false,
+        )];
+        let result = graceful_stall_response(&ctx, false, "deferred-no-tool", &HashMap::new());
+        assert!(result.contains("Issues encountered:"));
+        assert!(result.contains("Unable to install modules entity_reference"));
+    }
+
+    #[test]
+    fn test_graceful_stall_no_error_section_when_clean() {
+        let ctx = make_learning_ctx(); // no errors
+        let result = graceful_stall_response(&ctx, false, "deferred-no-tool", &HashMap::new());
+        assert!(!result.contains("Issues encountered:"));
     }
 }

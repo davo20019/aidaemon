@@ -121,19 +121,30 @@ impl ManageMcpTool {
     }
 
     async fn handle_list(&self) -> anyhow::Result<String> {
-        let servers = self.registry.list_servers().await;
+        let servers = self.registry.list_servers_with_status().await?;
         if servers.is_empty() {
             return Ok("No MCP servers registered.".to_string());
         }
 
         let mut output = String::from("Registered MCP servers:\n\n");
         for server in &servers {
+            let status = if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let source = if server.db_id.is_some() {
+                "dynamic"
+            } else {
+                "static"
+            };
             output.push_str(&format!(
                 "**{}** (`{} {}`)\n",
                 server.name,
                 server.command,
                 server.args.join(" ")
             ));
+            output.push_str(&format!("  Status: {} ({})\n", status, source));
             output.push_str(&format!("  Tools: {}\n", server.tool_names.join(", ")));
             if !server.env_keys.is_empty() {
                 output.push_str(&format!("  Env keys: {}\n", server.env_keys.join(", ")));
@@ -175,6 +186,24 @@ impl ManageMcpTool {
             Err(e) => Ok(format!("Failed to restart MCP server '{}': {}", name, e)),
         }
     }
+
+    async fn handle_enable(&self, name: &str) -> anyhow::Result<String> {
+        match self.registry.enable_server(name).await {
+            Ok(tool_names) => Ok(format!(
+                "MCP server '{}' enabled successfully.\nTools: {}",
+                name,
+                tool_names.join(", ")
+            )),
+            Err(e) => Ok(format!("Failed to enable MCP server '{}': {}", name, e)),
+        }
+    }
+
+    async fn handle_disable(&self, name: &str) -> anyhow::Result<String> {
+        match self.registry.disable_server(name).await {
+            Ok(()) => Ok(format!("MCP server '{}' disabled successfully.", name)),
+            Err(e) => Ok(format!("Failed to disable MCP server '{}': {}", name, e)),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -197,7 +226,7 @@ impl Tool for ManageMcpTool {
     }
 
     fn description(&self) -> &str {
-        "Add, remove, list, and configure MCP (Model Context Protocol) servers at runtime"
+        "Add, remove, list, configure, and enable/disable MCP (Model Context Protocol) servers at runtime"
     }
 
     fn schema(&self) -> Value {
@@ -208,18 +237,20 @@ impl Tool for ManageMcpTool {
                 - list: List all registered MCP servers and their tools\n\
                 - remove: Remove an MCP server (requires name)\n\
                 - set_env: Store an API key or env var for a server in the OS keychain (requires name, key, value)\n\
-                - restart: Restart a server with fresh env from keychain (requires name)",
+                - restart: Restart a server with fresh env from keychain (requires name)\n\
+                - enable: Enable a disabled dynamic MCP server (requires name)\n\
+                - disable: Disable a dynamic MCP server without deleting it (requires name)",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "list", "remove", "set_env", "restart"],
+                        "enum": ["add", "list", "remove", "set_env", "restart", "enable", "disable"],
                         "description": "The action to perform"
                     },
                     "name": {
                         "type": "string",
-                        "description": "Server name (required for add, remove, set_env, restart)"
+                        "description": "Server name (required for add, remove, set_env, restart, enable, disable)"
                     },
                     "command": {
                         "type": "string",
@@ -291,8 +322,22 @@ impl Tool for ManageMcpTool {
                     .ok_or_else(|| anyhow::anyhow!("'name' is required for restart action"))?;
                 self.handle_restart(name).await
             }
+            "enable" => {
+                let name = args
+                    .name
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'name' is required for enable action"))?;
+                self.handle_enable(name).await
+            }
+            "disable" => {
+                let name = args
+                    .name
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'name' is required for disable action"))?;
+                self.handle_disable(name).await
+            }
             other => Ok(format!(
-                "Unknown action '{}'. Valid actions: add, list, remove, set_env, restart",
+                "Unknown action '{}'. Valid actions: add, list, remove, set_env, restart, enable, disable",
                 other
             )),
         }

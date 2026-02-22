@@ -34,8 +34,9 @@ impl Agent {
         tc: &ToolCall,
         ctx: &mut ToolBudgetBlockCtx<'_>,
     ) -> anyhow::Result<bool> {
-        // Check if this tool has been called too many times or failed too often
-        let prior_semantic_failures = ctx.tool_failure_count.get(&tc.name).copied().unwrap_or(0);
+        // `tool_failure_count` tracks the highest repeated semantic failure signature
+        // count for this tool in the current task (not aggregate misses).
+        let prior_signature_failures = ctx.tool_failure_count.get(&tc.name).copied().unwrap_or(0);
         let prior_transient_failures = ctx
             .tool_transient_failure_count
             .get(&tc.name)
@@ -82,7 +83,7 @@ impl Agent {
         let web_fetch_calls = ctx.tool_call_count.get("web_fetch").copied().unwrap_or(0);
         let combined_web_calls = web_search_calls + web_fetch_calls;
 
-        let failure_limit = if tc.name == "cli_agent" { 2 } else { 3 };
+        let failure_limit = semantic_failure_limit(&tc.name);
         let blocked = if ctx.unknown_tools.contains(&tc.name) {
             // Tool doesn't exist — block immediately, no retries.
             Some(format!(
@@ -91,13 +92,13 @@ impl Agent {
                  Do NOT invent tool names.",
                 tc.name
             ))
-        } else if prior_semantic_failures >= failure_limit {
+        } else if prior_signature_failures >= failure_limit {
             Some(format!(
-                "[SYSTEM] Tool '{}' has encountered {} semantic errors \
+                "[SYSTEM] Tool '{}' has hit the repeated semantic error limit ({}x same failure signature) \
                  (and {} transient failures). \
                  Do not call it again. Use a different approach or \
                  answer the user with what you have.",
-                tc.name, prior_semantic_failures, prior_transient_failures
+                tc.name, prior_signature_failures, prior_transient_failures
             ))
         } else if tc.name == "web_search" && prior_calls >= 3 {
             Some(format!(
@@ -140,7 +141,7 @@ impl Agent {
             && !tc.name.contains("__")
         // MCP tools (prefix__name)
         {
-            if tc.name == "web_search" && prior_semantic_failures == 0 {
+            if tc.name == "web_search" && prior_signature_failures == 0 {
                 Some(format!(
                     "[SYSTEM] web_search returned no useful results {} times. \
                      The DuckDuckGo backend is likely blocked.\n\n\
@@ -183,7 +184,7 @@ impl Agent {
 
         warn!(
             tool = %tc.name,
-            semantic_failures = prior_semantic_failures,
+            semantic_failures = prior_signature_failures,
             transient_failures = prior_transient_failures,
             calls = prior_calls,
             "Blocking repeated tool call"
@@ -196,7 +197,7 @@ impl Agent {
             format!("Blocked tool {} due to repeated failures/calls", tc.name),
             json!({
                 "tool": tc.name,
-                "prior_semantic_failures": prior_semantic_failures,
+                "prior_semantic_failures": prior_signature_failures,
                 "prior_transient_failures": prior_transient_failures,
                 "prior_calls": prior_calls
             }),

@@ -391,9 +391,10 @@ mod tests {
 
         sqlx::query(
             "CREATE TABLE goals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT PRIMARY KEY,
                 description TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
+                session_id TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )",
         )
@@ -578,11 +579,11 @@ mod tests {
         let old_date = "2020-01-01T00:00:00+00:00";
 
         // Active goal (should survive)
-        sqlx::query("INSERT INTO goals (description, status, updated_at) VALUES ('learn rust', 'active', ?)")
+        sqlx::query("INSERT INTO goals (id, description, status, session_id, updated_at) VALUES ('g1', 'learn rust', 'active', 'test-session', ?)")
             .bind(old_date).execute(&pool).await.unwrap();
 
         // Completed old goal (should be deleted)
-        sqlx::query("INSERT INTO goals (description, status, updated_at) VALUES ('done task', 'completed', ?)")
+        sqlx::query("INSERT INTO goals (id, description, status, session_id, updated_at) VALUES ('g2', 'done task', 'completed', 'test-session', ?)")
             .bind(old_date).execute(&pool).await.unwrap();
 
         let mgr = RetentionManager::new(pool.clone(), RetentionConfig::default());

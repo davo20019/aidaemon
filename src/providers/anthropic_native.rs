@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,10 +13,18 @@ use crate::traits::{
     ToolChoiceMode,
 };
 
+const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 16_384;
+
 pub struct AnthropicNativeProvider {
     client: Client,
     base_url: String,
     api_key: String,
+    max_tokens: u32,
+    extra_headers: HashMap<String, String>,
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    name.trim().to_string()
 }
 
 impl Drop for AnthropicNativeProvider {
@@ -25,14 +34,34 @@ impl Drop for AnthropicNativeProvider {
 }
 
 impl AnthropicNativeProvider {
-    pub fn new(api_key: &str) -> Self {
+    pub fn new_with_options(
+        api_key: &str,
+        base_url: Option<&str>,
+        max_tokens: Option<u32>,
+        extra_headers: Option<HashMap<String, String>>,
+    ) -> Self {
         let client = crate::providers::build_http_client(Duration::from_secs(120))
             .unwrap_or_else(|e| panic!("failed to build HTTP client: {e}"));
+        let normalized_base_url = base_url
+            .unwrap_or("https://api.anthropic.com/v1")
+            .trim_end_matches('/')
+            .to_string();
         Self {
             client,
-            base_url: "https://api.anthropic.com/v1".to_string(),
+            base_url: normalized_base_url,
             api_key: api_key.to_string(),
+            max_tokens: max_tokens
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_ANTHROPIC_MAX_TOKENS),
+            extra_headers: extra_headers.unwrap_or_default(),
         }
+    }
+
+    fn with_extra_headers(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (k, v) in &self.extra_headers {
+            request = request.header(k, v);
+        }
+        request
     }
 
     /// Convert OpenAI-format messages to Anthropic format
@@ -215,7 +244,7 @@ impl AnthropicNativeProvider {
 
         let mut body = json!({
             "model": model,
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
             "messages": converted_msgs,
         });
 
@@ -289,16 +318,16 @@ impl ModelProvider for AnthropicNativeProvider {
             "Calling Anthropic Native"
         );
 
-        let resp = match self
-            .client
-            .post(format!("{}/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-        {
+        let request = self
+            .with_extra_headers(
+                self.client
+                    .post(format!("{}/messages", self.base_url))
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json"),
+            )
+            .json(&body);
+        let resp = match request.send().await {
             Ok(r) => r,
             Err(e) => {
                 error!("Anthropic HTTP request failed: {}", e);
@@ -336,7 +365,7 @@ impl ModelProvider for AnthropicNativeProvider {
                         final_text.push_str(t);
                     }
                 } else if btype == "tool_use" {
-                    let name = block["name"].as_str().unwrap_or("").to_string();
+                    let name = normalize_tool_name(block["name"].as_str().unwrap_or(""));
                     let id = block["id"].as_str().unwrap_or("").to_string();
                     let input = &block["input"];
                     let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
@@ -373,14 +402,62 @@ impl ModelProvider for AnthropicNativeProvider {
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        // Anthropic doesn't have a public list_models endpoint yet (AFAIK).
-        // return a hardcoded list of known models
-        Ok(vec![
-            "claude-3-5-sonnet-20240620".to_string(),
+        let known_models = vec![
+            "claude-sonnet-4-5-20250514".to_string(),
+            "claude-3-5-sonnet-20241022".to_string(),
+            "claude-3-5-haiku-20241022".to_string(),
             "claude-3-opus-20240229".to_string(),
-            "claude-3-sonnet-20240229".to_string(),
             "claude-3-haiku-20240307".to_string(),
-        ])
+        ];
+
+        let url = format!("{}/models", self.base_url);
+        let resp = match self
+            .with_extra_headers(
+                self.client
+                    .get(&url)
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01"),
+            )
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Failed to fetch Anthropic model list, using known models: {e}");
+                return Ok(known_models);
+            }
+        };
+
+        if !resp.status().is_success() {
+            warn!(
+                "Anthropic /models returned {}, using known models",
+                resp.status()
+            );
+            return Ok(known_models);
+        }
+
+        let data: Value = resp.json().await?;
+        let models: Vec<String> = data["data"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if models.is_empty() {
+            return Ok(known_models);
+        }
+
+        Ok(models)
+    }
+}
+
+#[cfg(test)]
+impl AnthropicNativeProvider {
+    pub fn new(api_key: &str) -> Self {
+        Self::new_with_options(api_key, None, None, None)
     }
 }
 
@@ -671,5 +748,49 @@ mod tests {
             body.get("tool_choice").is_none(),
             "tool_choice should stay omitted when no tools are provided"
         );
+    }
+
+    #[test]
+    fn test_build_request_body_uses_provider_max_tokens_default() {
+        let p = provider();
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = p.build_request_body(
+            "claude-3-5-sonnet-20241022",
+            &messages,
+            &[],
+            &ChatOptions::default(),
+        );
+        assert_eq!(body["max_tokens"], DEFAULT_ANTHROPIC_MAX_TOKENS);
+    }
+
+    #[test]
+    fn test_build_request_body_uses_configured_max_tokens() {
+        let p = AnthropicNativeProvider::new_with_options("test-key", None, Some(32768), None);
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = p.build_request_body(
+            "claude-3-5-sonnet-20241022",
+            &messages,
+            &[],
+            &ChatOptions::default(),
+        );
+        assert_eq!(body["max_tokens"], 32768);
+    }
+
+    #[test]
+    fn test_new_with_options_applies_base_url_and_headers() {
+        let p = AnthropicNativeProvider::new_with_options(
+            "test-key",
+            Some("https://example.com/v1/"),
+            Some(2048),
+            Some(HashMap::from([("x-test".to_string(), "1".to_string())])),
+        );
+        assert_eq!(p.base_url, "https://example.com/v1");
+        assert_eq!(p.max_tokens, 2048);
+        assert_eq!(p.extra_headers.get("x-test"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_tool_name_trims_whitespace() {
+        assert_eq!(normalize_tool_name(" terminal "), "terminal");
     }
 }

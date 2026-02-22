@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -91,6 +92,10 @@ fn build_gemini_response_note(
     }
 }
 
+fn normalize_tool_name(name: &str) -> String {
+    name.trim().to_string()
+}
+
 fn part_has_thought_signature(part: &Value) -> bool {
     part.get("thought_signature").is_some() || part.get("thoughtSignature").is_some()
 }
@@ -172,6 +177,7 @@ pub struct GoogleGenAiProvider {
     client: Client,
     base_url: String,
     api_key: String,
+    extra_headers: HashMap<String, String>,
 }
 
 impl Drop for GoogleGenAiProvider {
@@ -181,14 +187,30 @@ impl Drop for GoogleGenAiProvider {
 }
 
 impl GoogleGenAiProvider {
-    pub fn new(api_key: &str) -> Self {
+    pub fn new_with_base_url_and_headers(
+        api_key: &str,
+        base_url: Option<&str>,
+        extra_headers: Option<HashMap<String, String>>,
+    ) -> Self {
         let client = crate::providers::build_http_client(Duration::from_secs(120))
             .unwrap_or_else(|e| panic!("failed to build HTTP client: {e}"));
+        let normalized_base_url = base_url
+            .unwrap_or("https://generativelanguage.googleapis.com/v1beta")
+            .trim_end_matches('/')
+            .to_string();
         Self {
             client,
-            base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+            base_url: normalized_base_url,
             api_key: api_key.to_string(),
+            extra_headers: extra_headers.unwrap_or_default(),
         }
+    }
+
+    fn with_extra_headers(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (k, v) in &self.extra_headers {
+            request = request.header(k, v);
+        }
+        request
     }
 
     /// Convert OpenAI-format messages to Gemini "contents" + "system_instruction"
@@ -532,7 +554,7 @@ impl GoogleGenAiProvider {
                 final_text.push_str(text);
             }
             if let Some(fc) = part.get("functionCall") {
-                let name = fc["name"].as_str().unwrap_or("").to_string();
+                let name = normalize_tool_name(fc["name"].as_str().unwrap_or(""));
                 let args = fc["args"].clone();
                 let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
 
@@ -683,14 +705,14 @@ impl ModelProvider for GoogleGenAiProvider {
             );
         }
 
-        let resp = match self
-            .client
-            .post(&url)
-            .header("x-goog-api-key", &self.api_key)
-            .json(&body)
-            .send()
-            .await
-        {
+        let request = self
+            .with_extra_headers(
+                self.client
+                    .post(&url)
+                    .header("x-goog-api-key", &self.api_key),
+            )
+            .json(&body);
+        let resp = match request.send().await {
             Ok(r) => r,
             Err(e) => {
                 error!("Google GenAI HTTP request failed: {}", e);
@@ -717,14 +739,14 @@ impl ModelProvider for GoogleGenAiProvider {
                         dropped_responses,
                         "Google GenAI rejected missing thought signatures; retrying with unsigned function-call history stripped"
                     );
-                    let retry_resp = match self
-                        .client
-                        .post(&url)
-                        .header("x-goog-api-key", &self.api_key)
-                        .json(&retry_body)
-                        .send()
-                        .await
-                    {
+                    let retry_request = self
+                        .with_extra_headers(
+                            self.client
+                                .post(&url)
+                                .header("x-goog-api-key", &self.api_key),
+                        )
+                        .json(&retry_body);
+                    let retry_resp = match retry_request.send().await {
                         Ok(r) => r,
                         Err(e) => {
                             error!("Google GenAI retry HTTP request failed: {}", e);
@@ -775,9 +797,11 @@ impl ModelProvider for GoogleGenAiProvider {
         // Use header-based authentication instead of URL query parameter
         let url = format!("{}/models?page_size=50", self.base_url);
         let resp = self
-            .client
-            .get(&url)
-            .header("x-goog-api-key", &self.api_key)
+            .with_extra_headers(
+                self.client
+                    .get(&url)
+                    .header("x-goog-api-key", &self.api_key),
+            )
             .send()
             .await?;
 
@@ -804,6 +828,13 @@ impl ModelProvider for GoogleGenAiProvider {
 }
 
 #[cfg(test)]
+impl GoogleGenAiProvider {
+    pub fn new(api_key: &str) -> Self {
+        Self::new_with_base_url_and_headers(api_key, None, None)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -818,6 +849,7 @@ mod tests {
             client,
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             api_key: "fake-key".to_string(),
+            extra_headers: HashMap::new(),
         }
     }
 
@@ -1364,6 +1396,11 @@ mod tests {
             .expect("expected response note");
         assert!(note.contains("prompt blocked (SAFETY)"));
         assert!(note.contains("HARM_CATEGORY_HATE_SPEECH"));
+    }
+
+    #[test]
+    fn test_normalize_tool_name_trims_whitespace() {
+        assert_eq!(normalize_tool_name(" terminal "), "terminal");
     }
 
     /// Recursively check that no object in `value` contains an `additionalProperties` key.

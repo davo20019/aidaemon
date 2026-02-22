@@ -42,6 +42,7 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub total_tool_calls_attempted: &'a mut usize,
     pub total_successful_tool_calls: &'a mut usize,
     pub tool_failure_count: &'a mut HashMap<String, usize>,
+    pub tool_failure_signatures: &'a mut HashMap<(String, String), usize>,
     pub tool_transient_failure_count: &'a mut HashMap<String, usize>,
     pub tool_cooldown_until_iteration: &'a mut HashMap<String, usize>,
     pub tool_call_count: &'a mut HashMap<String, usize>,

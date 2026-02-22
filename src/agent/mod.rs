@@ -109,8 +109,9 @@ mod loop_utils;
 mod recall_guardrails;
 use loop_utils::{
     build_task_boundary_hint, classify_tool_result_failure_with_args, extract_command_from_args,
-    extract_file_path_from_args, extract_send_file_dedupe_key_from_args, fixup_message_ordering,
-    hash_tool_call, is_trigger_session, strip_appended_diagnostics, ToolFailureClass,
+    extract_file_path_from_args, extract_key_error_line, extract_send_file_dedupe_key_from_args,
+    fixup_message_ordering, hash_tool_call, is_trigger_session, semantic_failure_limit,
+    strip_appended_diagnostics, ToolFailureClass,
 };
 #[path = "runtime/post_task.rs"]
 mod post_task;
@@ -1919,6 +1920,10 @@ pub fn spawn_background_task_lead(
             .map(|response| response.trim().to_string())
             .filter(|response| !response.is_empty());
 
+        // Track whether any executor results were already sent inline to the user.
+        // Used to avoid duplicate content in the completion notification.
+        let mut any_executor_results_sent = false;
+
         // Auto-dispatch: dispatch remaining pending tasks after task lead returns.
         // This handles both cases: LLMs that create tasks but don't spawn executors,
         // AND task leads that completed some tasks but left others pending.
@@ -2062,6 +2067,7 @@ pub fn spawn_background_task_lead(
                                 if let Some(hub_weak) = &hub {
                                     if let Some(hub_arc) = hub_weak.upgrade() {
                                         let _ = hub_arc.send_text(&session_id, &response).await;
+                                        any_executor_results_sent = true;
                                     }
                                 }
                             }
@@ -2302,12 +2308,16 @@ pub fn spawn_background_task_lead(
             .unwrap_or("unknown");
         // Only notify for terminal states — "active" means it's still in progress
         if status == "active" || status == "pending" {
-            // Goal still in progress: optionally relay substantive task-lead text.
-            if let Some(response) = task_lead_response.as_ref() {
-                if !is_low_signal_task_lead_reply(response) {
-                    if let Some(hub_weak) = &hub {
-                        if let Some(hub_arc) = hub_weak.upgrade() {
-                            let _ = hub_arc.send_text(&session_id, response).await;
+            // Goal still in progress: optionally relay substantive task-lead text,
+            // but only if executor results haven't already been sent inline
+            // (which would cover the same content).
+            if !any_executor_results_sent {
+                if let Some(response) = task_lead_response.as_ref() {
+                    if !is_low_signal_task_lead_reply(response) {
+                        if let Some(hub_weak) = &hub {
+                            if let Some(hub_arc) = hub_weak.upgrade() {
+                                let _ = hub_arc.send_text(&session_id, response).await;
+                            }
                         }
                     }
                 }
@@ -2424,58 +2434,70 @@ pub fn spawn_background_task_lead(
         } else {
             match status {
                 "completed" => {
-                    // Build notification from actual task results, not the task lead's
-                    // planning message. The task lead response is just a plan outline;
-                    // the real outputs come from the executor tasks.
-                    let completed_tasks =
-                        state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
-                    let fallback_summary = match &result {
-                        Ok(r) => r.as_str(),
-                        Err(_) => "All tasks completed.",
-                    };
-                    let task_results_summary =
-                        build_goal_task_results_summary(&completed_tasks, fallback_summary);
-
-                    // Check for partial success metadata in the goal context
-                    let partial_info = final_goal
-                        .as_ref()
-                        .ok()
-                        .and_then(|g| g.as_ref())
-                        .and_then(|g| g.context.as_deref())
-                        .and_then(|ctx| serde_json::from_str::<serde_json::Value>(ctx).ok())
-                        .filter(|v| {
-                            v.get("partial_success")
-                                .and_then(|p| p.as_bool())
-                                .unwrap_or(false)
-                        });
-
-                    if let Some(summary) = partial_info {
-                        let completed = summary
-                            .get("completed")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let failed = summary.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let blocked = summary.get("blocked").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let total = summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                        (
-                            "completed",
-                            format!(
-                                "Goal partially completed ({}/{} tasks succeeded, {} failed, {} blocked):\n\n{}",
-                                completed,
-                                total,
-                                failed,
-                                blocked,
-                                task_results_summary.chars().take(3500).collect::<String>()
-                            ),
-                        )
+                    if any_executor_results_sent {
+                        // Executor results were already sent inline — don't repeat them.
+                        // Send a brief completion signal instead.
+                        let desc_preview: String = final_goal
+                            .as_ref()
+                            .ok()
+                            .and_then(|g| g.as_ref())
+                            .map(|g| g.description.chars().take(100).collect::<String>())
+                            .unwrap_or_default();
+                        ("completed", format!("Goal completed: {}", desc_preview))
                     } else {
-                        (
-                            "completed",
-                            format!(
-                                "Goal completed:\n\n{}",
-                                task_results_summary.chars().take(4000).collect::<String>()
-                            ),
-                        )
+                        // No inline results sent — include full task results in notification.
+                        let completed_tasks =
+                            state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
+                        let fallback_summary = match &result {
+                            Ok(r) => r.as_str(),
+                            Err(_) => "All tasks completed.",
+                        };
+                        let task_results_summary =
+                            build_goal_task_results_summary(&completed_tasks, fallback_summary);
+
+                        // Check for partial success metadata in the goal context
+                        let partial_info = final_goal
+                            .as_ref()
+                            .ok()
+                            .and_then(|g| g.as_ref())
+                            .and_then(|g| g.context.as_deref())
+                            .and_then(|ctx| serde_json::from_str::<serde_json::Value>(ctx).ok())
+                            .filter(|v| {
+                                v.get("partial_success")
+                                    .and_then(|p| p.as_bool())
+                                    .unwrap_or(false)
+                            });
+
+                        if let Some(summary) = partial_info {
+                            let completed = summary
+                                .get("completed")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let failed =
+                                summary.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let blocked =
+                                summary.get("blocked").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let total = summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                            (
+                                "completed",
+                                format!(
+                                    "Goal partially completed ({}/{} tasks succeeded, {} failed, {} blocked):\n\n{}",
+                                    completed,
+                                    total,
+                                    failed,
+                                    blocked,
+                                    task_results_summary.chars().take(3500).collect::<String>()
+                                ),
+                            )
+                        } else {
+                            (
+                                "completed",
+                                format!(
+                                    "Goal completed:\n\n{}",
+                                    task_results_summary.chars().take(4000).collect::<String>()
+                                ),
+                            )
+                        }
                     }
                 }
                 "cancelled" => ("completed", "Goal was cancelled.".to_string()),
@@ -2969,7 +2991,11 @@ impl Agent {
 
 #[cfg(test)]
 mod final_reply_marker_tests {
-    use super::Agent;
+    use std::collections::HashMap;
+
+    use chrono::Utc;
+
+    use super::{post_task, Agent, LearningContext};
 
     #[test]
     fn strips_control_markers_from_final_reply() {
@@ -3046,6 +3072,43 @@ mod final_reply_marker_tests {
         let sanitized = Agent::sanitize_final_reply_markers(reply);
         assert!(!sanitized.contains("trained by Google"));
         assert!(sanitized.contains("aidaemon"));
+    }
+
+    #[test]
+    fn strips_leaked_tool_protocol_tokens_after_graceful_summary() {
+        let learning_ctx = LearningContext {
+            user_text: "debug this failure".to_string(),
+            intent_domains: vec![],
+            tool_calls: vec!["terminal(`vendor/bin/drush status`)".to_string()],
+            errors: vec![],
+            first_error: None,
+            recovery_actions: vec![],
+            start_time: Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+        };
+        let mut tool_failure_count = HashMap::new();
+        tool_failure_count.insert(
+            "terminal".to_string(),
+            super::semantic_failure_limit("terminal"),
+        );
+        let graceful = post_task::graceful_stall_response(
+            &learning_ctx,
+            false,
+            "deferred-no-tool",
+            &tool_failure_count,
+        );
+        assert!(graceful.contains("command execution"));
+
+        let leaked = format!(
+            "{}\n<|tool_calls_section_begin|>\nfunctions.terminal:0 {{\"command\":\"pwd\"}}",
+            graceful
+        );
+        let sanitized = Agent::sanitize_final_reply_markers(&leaked);
+        assert!(!sanitized.contains("<|tool_calls_section_begin|>"));
+        assert!(!sanitized.contains("functions.terminal:0"));
+        assert!(sanitized.contains("command execution"));
     }
 }
 

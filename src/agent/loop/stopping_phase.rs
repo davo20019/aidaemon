@@ -1088,6 +1088,7 @@ impl Agent {
                         session_id,
                         learning_ctx,
                         !successful_send_file_keys.is_empty(),
+                        tool_failure_count,
                     )
                     .await;
                 let (status, error, summary) = match &result {
@@ -1249,6 +1250,7 @@ Here is the latest tool output:\n\n{}",
                     session_id,
                     learning_ctx,
                     !successful_send_file_keys.is_empty(),
+                    tool_failure_count,
                 )
                 .await;
             let (status, error, summary) = match &result {

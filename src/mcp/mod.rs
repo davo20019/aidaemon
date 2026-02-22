@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::McpServerConfig;
 use crate::traits::Tool;
@@ -19,8 +19,10 @@ pub struct McpTool {
     tool_name: String,
     /// The raw name used when calling the MCP server (always unprefixed).
     server_tool_name: String,
+    server_name: Option<String>,
     tool_schema: Value,
     client: Arc<McpClient>,
+    registry: Option<McpRegistry>,
 }
 
 impl McpTool {
@@ -30,8 +32,10 @@ impl McpTool {
         Self {
             tool_name,
             server_tool_name,
+            server_name: None,
             tool_schema,
             client,
+            registry: None,
         }
     }
 
@@ -41,14 +45,32 @@ impl McpTool {
         prefixed_name: String,
         tool_schema: Value,
         client: Arc<McpClient>,
+        server_name: String,
+        registry: McpRegistry,
     ) -> Self {
         Self {
             tool_name: prefixed_name,
             server_tool_name,
+            server_name: Some(server_name),
             tool_schema,
             client,
+            registry: Some(registry),
         }
     }
+}
+
+fn is_recoverable_transport_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    if msg.contains("mcp tool reported iserror=true") {
+        return false;
+    }
+
+    msg.contains("closed stdout")
+        || msg.contains("broken pipe")
+        || msg.contains("connection reset")
+        || msg.contains("connection refused")
+        || msg.contains("timed out")
+        || msg.contains("io error")
 }
 
 #[async_trait]
@@ -85,7 +107,63 @@ impl Tool for McpTool {
         info!(mcp_tool = %self.tool_name, args = %args_preview, "MCP tool call started");
 
         let start = std::time::Instant::now();
-        let result = self.client.call_tool(&self.server_tool_name, args).await;
+        let mut result = self
+            .client
+            .call_tool(&self.server_tool_name, args.clone())
+            .await;
+
+        let first_error_message = result.as_ref().err().map(ToString::to_string);
+        let should_attempt_recovery = result
+            .as_ref()
+            .err()
+            .is_some_and(is_recoverable_transport_error);
+
+        if should_attempt_recovery {
+            if let (Some(registry), Some(server_name)) = (&self.registry, &self.server_name) {
+                let first_msg = first_error_message
+                    .clone()
+                    .unwrap_or_else(|| "unknown MCP transport error".to_string());
+                if let Err(ref first_err) = result {
+                    warn!(
+                        mcp_tool = %self.tool_name,
+                        server = %server_name,
+                        error = %first_err,
+                        "MCP transport failure detected, attempting automatic server restart"
+                    );
+                }
+
+                match registry.restart_server(server_name).await {
+                    Ok(_) => {
+                        result = registry
+                            .call_server_tool(server_name, &self.server_tool_name, args.clone())
+                            .await;
+                        match &result {
+                            Ok(_) => {
+                                warn!(
+                                    mcp_tool = %self.tool_name,
+                                    server = %server_name,
+                                    "MCP server restart succeeded; tool call recovered"
+                                );
+                            }
+                            Err(retry_err) => {
+                                result = Err(anyhow::anyhow!(
+                                    "MCP transport failed and retry after auto-restart also failed. First error: {}. Retry error: {}",
+                                    first_msg,
+                                    retry_err
+                                ));
+                            }
+                        }
+                    }
+                    Err(restart_err) => {
+                        result = Err(anyhow::anyhow!(
+                            "MCP transport failed and automatic restart failed. First error: {}. Restart error: {}",
+                            first_msg,
+                            restart_err
+                        ));
+                    }
+                }
+            }
+        }
         let elapsed = start.elapsed();
 
         match &result {
@@ -232,5 +310,22 @@ fn detect_suspicious_output(tool_name: &str, output: &str) {
                 "SECURITY: suspicious pattern detected in MCP tool output"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_recoverable_transport_error;
+
+    #[test]
+    fn transport_error_classifier_ignores_tool_level_is_error() {
+        let err = anyhow::anyhow!("MCP tool reported isError=true: Not allowed");
+        assert!(!is_recoverable_transport_error(&err));
+    }
+
+    #[test]
+    fn transport_error_classifier_flags_dead_process_signals() {
+        let err = anyhow::anyhow!("MCP server closed stdout (empty response)");
+        assert!(is_recoverable_transport_error(&err));
     }
 }

@@ -69,6 +69,16 @@ impl Tool for SkillResourcesTool {
             None => return Ok(format!("Skill '{}' not found.", skill_name)),
         };
 
+        if let Some(ref dir_path) = skill.dir_path {
+            if let Err(e) = self
+                .resolver
+                .register_skill_directory(&skill.name, dir_path)
+                .await
+            {
+                return Ok(format!("Error registering skill resources: {}", e));
+            }
+        }
+
         match action {
             "list" => {
                 if skill.resources.is_empty() {
@@ -223,6 +233,27 @@ mod tests {
             .unwrap();
         assert!(result.contains("not found"));
         assert!(result.contains("action='list'"));
+    }
+
+    #[tokio::test]
+    async fn test_runtime_directory_skill_auto_registers_with_filesystem_resolver() {
+        let dir = tempfile::TempDir::new().unwrap();
+        setup_dir_skill(
+            dir.path(),
+            "deploy",
+            &[("references", "guide.md", "# Runtime Guide")],
+        );
+
+        // Intentionally do NOT pre-register the directory in resolver.
+        let resolver = Arc::new(crate::skills::FileSystemResolver::new());
+        let tool = SkillResourcesTool::new(dir.path().to_path_buf(), resolver);
+        let result = tool
+            .call(
+                r#"{"skill_name": "deploy", "action": "read", "resource_path": "references/guide.md"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Runtime Guide"));
     }
 
     #[tokio::test]

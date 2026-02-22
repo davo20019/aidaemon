@@ -128,6 +128,7 @@ impl Agent {
         let mut total_tool_calls_attempted: usize = 0;
         let mut task_tokens_used: u64 = 0;
         let mut tool_failure_count: HashMap<String, usize> = HashMap::new();
+        let mut tool_failure_signatures: HashMap<(String, String), usize> = HashMap::new();
         let mut tool_transient_failure_count: HashMap<String, usize> = HashMap::new();
         let mut tool_cooldown_until_iteration: HashMap<String, usize> = HashMap::new();
         let mut tool_call_count: HashMap<String, usize> = HashMap::new();
@@ -593,6 +594,7 @@ impl Agent {
                     total_tool_calls_attempted: &mut total_tool_calls_attempted,
                     total_successful_tool_calls: &mut total_successful_tool_calls,
                     tool_failure_count: &mut tool_failure_count,
+                    tool_failure_signatures: &mut tool_failure_signatures,
                     tool_transient_failure_count: &mut tool_transient_failure_count,
                     tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
                     tool_call_count: &mut tool_call_count,

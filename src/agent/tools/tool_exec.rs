@@ -17,6 +17,7 @@ impl Agent {
         arguments: &str,
         ctx: &ToolExecCtx<'_>,
     ) -> anyhow::Result<String> {
+        let name = name.trim();
         let session_id = ctx.session_id;
         // `cli_agent` can legitimately run longer than the generic watchdog
         // because it manages its own timeout/backgrounding behavior.
@@ -49,6 +50,7 @@ impl Agent {
         arguments: &str,
         ctx: &ToolExecCtx<'_>,
     ) -> anyhow::Result<String> {
+        let name = name.trim();
         let session_id = ctx.session_id;
         let task_id = ctx.task_id;
         let channel_visibility = ctx.channel_visibility;

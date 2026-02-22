@@ -40,6 +40,10 @@ pub struct TelegramChannel {
     bot_username: StdRwLock<String>,
     /// Cached channel name for the trait's name() method (e.g., "telegram" or "telegram:my_bot").
     cached_channel_name: StdRwLock<String>,
+    /// Stable namespace used when building session IDs.
+    /// Once set for a process lifetime, it must not change to avoid
+    /// splitting conversation history mid-run.
+    session_namespace: StdRwLock<Option<String>>,
     bot: Bot,
     bot_token: String,
     allowed_user_ids: StdRwLock<Vec<u64>>,
@@ -90,6 +94,7 @@ impl TelegramChannel {
         Self {
             bot_username: StdRwLock::new("telegram".to_string()),
             cached_channel_name: StdRwLock::new("telegram".to_string()),
+            session_namespace: StdRwLock::new(None),
             bot,
             bot_token: bot_token.to_string(),
             allowed_user_ids: StdRwLock::new(allowed_user_ids),
@@ -196,14 +201,42 @@ impl TelegramChannel {
     }
 
     /// Build the session ID for a chat, prefixing with bot username.
-    /// Single bot setups use just the chat_id for backward compatibility.
+    /// Uses a stable namespace to avoid mid-run session ID drift.
     async fn session_id(&self, chat_id: i64) -> String {
-        let username = self.get_bot_username().await;
-        if username == "default" {
+        let namespace = self.session_namespace().await;
+        if namespace == "default" {
             chat_id.to_string()
         } else {
-            format!("{}:{}", username, chat_id)
+            format!("{}:{}", namespace, chat_id)
         }
+    }
+
+    async fn session_namespace(&self) -> String {
+        {
+            let guard = self
+                .session_namespace
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(existing) = guard.as_ref() {
+                return existing.clone();
+            }
+        }
+
+        let username = self.get_bot_username().await;
+        let namespace = if username == "telegram" || username == "default" {
+            fallback_session_namespace_from_token(&self.bot_token)
+        } else {
+            username
+        };
+
+        let mut guard = self
+            .session_namespace
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_none() {
+            *guard = Some(namespace.clone());
+        }
+        guard.as_ref().cloned().unwrap_or(namespace)
     }
 
     /// Get the channel identifier for the session map.
@@ -1585,8 +1618,9 @@ impl TelegramChannel {
                 .as_secs(),
         ));
 
-        // Send typing indicator immediately, then repeat every 4s while agent works.
-        // Telegram's typing indicator expires after ~5s, so 4s keeps it continuous.
+        // Send typing indicator immediately, then repeat every 3s while agent works.
+        // Telegram's typing indicator expires after ~5s, so 3s keeps it continuous
+        // even if the occasional send_chat_action call fails silently.
         // Also monitors the heartbeat: if it goes stale, notify user and stop typing.
         let typing_bot = bot.clone();
         let typing_chat_id = msg.chat.id;
@@ -1603,7 +1637,7 @@ impl TelegramChannel {
                     .send_chat_action(typing_chat_id, ChatAction::Typing)
                     .await;
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(4)) => {
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {
                         if stale_threshold_secs > 0 {
                             let last_hb = heartbeat_for_typing.load(Ordering::Relaxed);
                             let now = SystemTime::now().duration_since(UNIX_EPOCH)
@@ -1644,6 +1678,9 @@ impl TelegramChannel {
                             )
                         {
                             let _ = status_bot.send_message(status_chat_id, "Thinking...").await;
+                            let _ = status_bot
+                                .send_chat_action(status_chat_id, ChatAction::Typing)
+                                .await;
                             sent_thinking = true;
                             last_sent = tokio::time::Instant::now();
                         }
@@ -1791,6 +1828,13 @@ impl TelegramChannel {
                     }
                 };
                 let _ = status_bot.send_message(status_chat_id, text).await;
+                // Re-send typing indicator immediately after each status message.
+                // Telegram clears the typing indicator when a message is sent, so
+                // without this there's a visible gap until the typing loop's next
+                // 4-second tick.
+                let _ = status_bot
+                    .send_chat_action(status_chat_id, ChatAction::Typing)
+                    .await;
                 last_sent = tokio::time::Instant::now();
             }
         });
@@ -2042,7 +2086,7 @@ impl TelegramChannel {
                                 .send_chat_action(chat_id, ChatAction::Typing)
                                 .await;
                             tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(4)) => {
+                                _ = tokio::time::sleep(Duration::from_secs(3)) => {
                                     if stale_threshold_secs > 0 {
                                         let last_hb = heartbeat_for_queued.load(Ordering::Relaxed);
                                         let now = SystemTime::now().duration_since(UNIX_EPOCH)
@@ -2066,6 +2110,23 @@ impl TelegramChannel {
                 }
             }
         });
+    }
+}
+
+fn fallback_session_namespace_from_token(bot_token: &str) -> String {
+    let raw_id = bot_token
+        .split_once(':')
+        .map(|(id, _)| id)
+        .unwrap_or(bot_token)
+        .trim();
+    let sanitized_id: String = raw_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if sanitized_id.is_empty() {
+        "telegram".to_string()
+    } else {
+        format!("tg{}", sanitized_id)
     }
 }
 
@@ -2538,6 +2599,18 @@ mod tests {
             paths,
             vec!["/tmp/aidaemon/report.md", "/tmp/aidaemon/report.csv"]
         );
+    }
+
+    #[test]
+    fn fallback_session_namespace_uses_bot_id_prefix() {
+        let ns = fallback_session_namespace_from_token("123456789:ABCDEF");
+        assert_eq!(ns, "tg123456789");
+    }
+
+    #[test]
+    fn fallback_session_namespace_sanitizes_invalid_chars() {
+        let ns = fallback_session_namespace_from_token("12$34:^secret");
+        assert_eq!(ns, "tg1234");
     }
 
     // --- persist_allowed_user_ids (config file update) ---

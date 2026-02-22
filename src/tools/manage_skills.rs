@@ -18,7 +18,6 @@ use crate::types::ApprovalResponse;
 pub struct ManageSkillsTool {
     skills_dir: PathBuf,
     state: Arc<dyn StateStore>,
-    #[allow(dead_code)] // Available for future approval flow on add/install
     approval_tx: mpsc::Sender<ApprovalRequest>,
     client: reqwest::Client,
     /// Configured registry URLs for browse/install.
@@ -63,7 +62,6 @@ impl ManageSkillsTool {
         self
     }
 
-    #[allow(dead_code)] // Available for future approval flow on add/install
     async fn request_approval(
         &self,
         session_id: &str,
@@ -102,7 +100,7 @@ impl ManageSkillsTool {
 
     /// Write a skill to the filesystem, checking for duplicate names.
     async fn persist_to_filesystem(&self, skill: Skill) -> anyhow::Result<String> {
-        let existing = skills::load_skills(&self.skills_dir);
+        let existing = skills::load_skills_with_status(&self.skills_dir);
         if let Some(conflicting_name) = Self::find_conflicting_skill(&existing, &skill.name) {
             return Ok(format!(
                 "Skill '{}' conflicts with existing skill '{}' (same canonical filename). Remove or rename the existing skill first.",
@@ -162,45 +160,63 @@ impl ManageSkillsTool {
     }
 
     async fn handle_list(&self) -> anyhow::Result<String> {
-        let mut all_skills = skills::load_skills(&self.skills_dir);
+        let mut all_skills = skills::load_skills_with_status(&self.skills_dir);
         if all_skills.is_empty() {
             return Ok("No skills loaded.".to_string());
         }
 
-        all_skills.sort_by(|a, b| a.name.cmp(&b.name));
+        all_skills.sort_by(|a, b| a.skill.name.cmp(&b.skill.name));
 
         let mut custom_count = 0usize;
         let mut contrib_count = 0usize;
+        let mut enabled_count = 0usize;
+        let mut disabled_count = 0usize;
         for skill in &all_skills {
-            match skills::infer_skill_origin(skill.origin.as_deref(), skill.source.as_deref()) {
+            match skills::infer_skill_origin(
+                skill.skill.origin.as_deref(),
+                skill.skill.source.as_deref(),
+            ) {
                 skills::SKILL_ORIGIN_CONTRIB => contrib_count += 1,
                 _ => custom_count += 1,
+            }
+            if skill.enabled {
+                enabled_count += 1;
+            } else {
+                disabled_count += 1;
             }
         }
 
         let mut output = format!(
-            "**{} skills:** ({}: {}, {}: {})\n",
+            "**{} skills:** (enabled: {}, disabled: {}, {}: {}, {}: {})\n",
             all_skills.len(),
+            enabled_count,
+            disabled_count,
             skills::SKILL_ORIGIN_CUSTOM,
             custom_count,
             skills::SKILL_ORIGIN_CONTRIB,
             contrib_count
         );
         for skill in &all_skills {
-            let origin =
-                skills::infer_skill_origin(skill.origin.as_deref(), skill.source.as_deref());
-            let source = skill.source.as_deref().unwrap_or("filesystem");
+            let origin = skills::infer_skill_origin(
+                skill.skill.origin.as_deref(),
+                skill.skill.source.as_deref(),
+            );
+            let source = skill.skill.source.as_deref().unwrap_or("filesystem");
+            let status = if skill.enabled { "enabled" } else { "disabled" };
             output.push_str(&format!(
-                "- **{}**: {} [origin: {}] [source: {}]\n",
-                skill.name, skill.description, origin, source
+                "- **{}**: {} [origin: {}] [source: {}] [status: {}]\n",
+                skill.skill.name, skill.skill.description, origin, source, status
             ));
-            if !skill.triggers.is_empty() {
-                output.push_str(&format!("  triggers: {}\n", skill.triggers.join(", ")));
+            if !skill.skill.triggers.is_empty() {
+                output.push_str(&format!(
+                    "  triggers: {}\n",
+                    skill.skill.triggers.join(", ")
+                ));
             }
-            if !skill.resources.is_empty() {
+            if !skill.skill.resources.is_empty() {
                 let mut by_category: std::collections::HashMap<&str, usize> =
                     std::collections::HashMap::new();
-                for r in &skill.resources {
+                for r in &skill.skill.resources {
                     *by_category.entry(r.category.as_str()).or_insert(0) += 1;
                 }
                 let summary: Vec<String> = by_category
@@ -213,34 +229,37 @@ impl ManageSkillsTool {
         Ok(output)
     }
 
-    fn find_conflicting_skill<'a>(all_skills: &'a [Skill], name: &str) -> Option<&'a str> {
+    fn find_conflicting_skill<'a>(
+        all_skills: &'a [skills::SkillWithStatus],
+        name: &str,
+    ) -> Option<&'a str> {
         let normalized_target = skills::sanitize_skill_filename(name);
         all_skills
             .iter()
-            .find(|skill| skills::sanitize_skill_filename(&skill.name) == normalized_target)
-            .map(|skill| skill.name.as_str())
+            .find(|skill| skills::sanitize_skill_filename(&skill.skill.name) == normalized_target)
+            .map(|skill| skill.skill.name.as_str())
     }
 
     fn resolve_skill_name<'a>(
-        all_skills: &'a [Skill],
+        all_skills: &'a [skills::SkillWithStatus],
         name: &str,
-    ) -> Result<Option<&'a Skill>, Vec<String>> {
+    ) -> Result<Option<&'a skills::SkillWithStatus>, Vec<String>> {
         if all_skills.is_empty() {
             return Ok(None);
         }
 
         // Exact case-sensitive match first.
-        if let Some(found) = skills::find_skill_by_name(all_skills, name) {
+        if let Some(found) = all_skills.iter().find(|s| s.skill.name == name) {
             return Ok(Some(found));
         }
 
         // Case-insensitive fallback.
-        let mut matches: Vec<&Skill> = all_skills
+        let mut matches: Vec<&skills::SkillWithStatus> = all_skills
             .iter()
-            .filter(|s| s.name.eq_ignore_ascii_case(name))
+            .filter(|s| s.skill.name.eq_ignore_ascii_case(name))
             .collect();
         if matches.len() > 1 {
-            return Err(matches.into_iter().map(|s| s.name.clone()).collect());
+            return Err(matches.into_iter().map(|s| s.skill.name.clone()).collect());
         }
         if let Some(found) = matches.pop() {
             return Ok(Some(found));
@@ -248,14 +267,14 @@ impl ManageSkillsTool {
 
         // Canonical filename-based fallback (handles spaces/underscores/hyphen variants).
         let normalized_query = skills::sanitize_skill_filename(name);
-        let mut normalized_matches: Vec<&Skill> = all_skills
+        let mut normalized_matches: Vec<&skills::SkillWithStatus> = all_skills
             .iter()
-            .filter(|s| skills::sanitize_skill_filename(&s.name) == normalized_query)
+            .filter(|s| skills::sanitize_skill_filename(&s.skill.name) == normalized_query)
             .collect();
         if normalized_matches.len() > 1 {
             return Err(normalized_matches
                 .into_iter()
-                .map(|s| s.name.clone())
+                .map(|s| s.skill.name.clone())
                 .collect());
         }
         if let Some(found) = normalized_matches.pop() {
@@ -298,8 +317,8 @@ impl ManageSkillsTool {
         name: &str,
         dry_run: bool,
     ) -> anyhow::Result<RemoveOutcome> {
-        let all_skills = skills::load_skills(&self.skills_dir);
-        let mut available: Vec<String> = all_skills.iter().map(|s| s.name.clone()).collect();
+        let all_skills = skills::load_skills_with_status(&self.skills_dir);
+        let mut available: Vec<String> = all_skills.iter().map(|s| s.skill.name.clone()).collect();
         available.sort();
 
         let resolved_skill = match Self::resolve_skill_name(&all_skills, name) {
@@ -317,7 +336,7 @@ impl ManageSkillsTool {
         };
 
         let target_name = resolved_skill
-            .map(|s| s.name.clone())
+            .map(|s| s.skill.name.clone())
             .unwrap_or_else(|| name.to_string());
         let dismissed_draft_ids = self.matching_pending_draft_ids(&target_name).await?;
 
@@ -620,20 +639,25 @@ impl ManageSkillsTool {
 
     async fn handle_update(&self, name: &str) -> anyhow::Result<String> {
         // Find the existing skill on disk
-        let all_skills = skills::load_skills(&self.skills_dir);
-        let existing = skills::find_skill_by_name(&all_skills, name);
-
-        let existing = match existing {
-            Some(s) => s,
-            None => return Ok(format!("Skill '{}' not found.", name)),
+        let all_skills = skills::load_skills_with_status(&self.skills_dir);
+        let existing = match Self::resolve_skill_name(&all_skills, name) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(format!("Skill '{}' not found.", name)),
+            Err(candidates) => {
+                return Ok(format!(
+                    "Skill name '{}' is ambiguous. Matches: {}. Use the exact skill name from `manage_skills list`.",
+                    name,
+                    candidates.join(", ")
+                ));
+            }
         };
 
-        let source_url = match &existing.source_url {
+        let source_url = match &existing.skill.source_url {
             Some(url) => url.clone(),
             None => {
                 return Ok(format!(
                     "Skill '{}' has no source URL and cannot be updated.",
-                    name
+                    existing.skill.name
                 ))
             }
         };
@@ -655,16 +679,22 @@ impl ManageSkillsTool {
         };
 
         // Remove old file and write new one
-        skills::remove_skill_file(&self.skills_dir, name)?;
+        skills::remove_skill_file(&self.skills_dir, &existing.skill.name)?;
 
         let mut skill = new_skill;
         skill.origin = Some(
-            skills::infer_skill_origin(existing.origin.as_deref(), existing.source.as_deref())
-                .to_string(),
+            skills::infer_skill_origin(
+                existing.skill.origin.as_deref(),
+                existing.skill.source.as_deref(),
+            )
+            .to_string(),
         );
-        skill.source = existing.source.clone();
+        skill.source = existing.skill.source.clone();
         skill.source_url = Some(source_url);
         let path = skills::write_skill_to_file(&self.skills_dir, &skill)?;
+        if !existing.enabled {
+            let _ = skills::set_skill_enabled(&self.skills_dir, &skill.name, false)?;
+        }
 
         info!(name = %name, path = %path.display(), "Skill updated from source");
         Ok(format!(
@@ -672,6 +702,51 @@ impl ManageSkillsTool {
             name,
             path.display()
         ))
+    }
+
+    async fn handle_enable(&self, name: &str) -> anyhow::Result<String> {
+        let all_skills = skills::load_skills_with_status(&self.skills_dir);
+        let target = match Self::resolve_skill_name(&all_skills, name) {
+            Ok(Some(skill)) => skill,
+            Ok(None) => return Ok(format!("Skill '{}' not found.", name)),
+            Err(candidates) => {
+                return Ok(format!(
+                    "Skill name '{}' is ambiguous. Matches: {}. Use the exact skill name from `manage_skills list`.",
+                    name,
+                    candidates.join(", ")
+                ));
+            }
+        };
+
+        match skills::set_skill_enabled(&self.skills_dir, &target.skill.name, true)? {
+            None => Ok(format!("Skill '{}' not found.", name)),
+            Some(false) => Ok(format!("Skill '{}' is already enabled.", target.skill.name)),
+            Some(true) => Ok(format!("Skill '{}' enabled.", target.skill.name)),
+        }
+    }
+
+    async fn handle_disable(&self, name: &str) -> anyhow::Result<String> {
+        let all_skills = skills::load_skills_with_status(&self.skills_dir);
+        let target = match Self::resolve_skill_name(&all_skills, name) {
+            Ok(Some(skill)) => skill,
+            Ok(None) => return Ok(format!("Skill '{}' not found.", name)),
+            Err(candidates) => {
+                return Ok(format!(
+                    "Skill name '{}' is ambiguous. Matches: {}. Use the exact skill name from `manage_skills list`.",
+                    name,
+                    candidates.join(", ")
+                ));
+            }
+        };
+
+        match skills::set_skill_enabled(&self.skills_dir, &target.skill.name, false)? {
+            None => Ok(format!("Skill '{}' not found.", name)),
+            Some(false) => Ok(format!(
+                "Skill '{}' is already disabled.",
+                target.skill.name
+            )),
+            Some(true) => Ok(format!("Skill '{}' disabled.", target.skill.name)),
+        }
     }
 
     async fn handle_review(
@@ -720,7 +795,7 @@ impl ManageSkillsTool {
                 };
 
                 // Check for duplicates
-                let existing = skills::load_skills(&self.skills_dir);
+                let existing = skills::load_skills_with_status(&self.skills_dir);
                 if let Some(conflicting_name) = Self::find_conflicting_skill(&existing, &skill.name)
                 {
                     return Ok(format!(
@@ -788,6 +863,8 @@ struct ManageSkillsArgs {
     draft_id: Option<i64>,
     approve: Option<bool>,
     dry_run: Option<bool>,
+    #[serde(default)]
+    _session_id: Option<String>,
 }
 
 #[async_trait]
@@ -797,7 +874,7 @@ impl Tool for ManageSkillsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage skills at runtime. Actions: add (from URL), add_inline (raw markdown), list, remove (also dismiss matching pending drafts), remove_all (bulk remove with optional dry_run), browse (search registries), install (from registry), update (re-fetch from source), review (approve/dismiss auto-promoted skill drafts)."
+        "Manage skills at runtime. Actions: add (from URL), add_inline (raw markdown), list, remove (also dismiss matching pending drafts), remove_all (bulk remove with optional dry_run), enable, disable, browse (search registries), install (from registry), update (re-fetch from source), review (approve/dismiss auto-promoted skill drafts)."
     }
 
     fn schema(&self) -> Value {
@@ -809,7 +886,7 @@ impl Tool for ManageSkillsTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "add_inline", "list", "remove", "remove_all", "browse", "install", "update", "review"],
+                        "enum": ["add", "add_inline", "list", "remove", "remove_all", "enable", "disable", "browse", "install", "update", "review"],
                         "description": "The action to perform"
                     },
                     "url": {
@@ -822,7 +899,7 @@ impl Tool for ManageSkillsTool {
                     },
                     "name": {
                         "type": "string",
-                        "description": "Skill name (for 'remove', 'install', 'update' actions)"
+                        "description": "Skill name (for 'remove', 'enable', 'disable', 'install', 'update' actions)"
                     },
                     "names": {
                         "type": "array",
@@ -859,6 +936,22 @@ impl Tool for ManageSkillsTool {
             "add" => {
                 let url = args.url.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'url' parameter required for 'add' action"))?;
+                let session_id = args._session_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("Missing session context for approval on 'add' action")
+                })?;
+                let approval = self
+                    .request_approval(
+                        session_id,
+                        &format!(
+                            "Add skill from URL '{}'\n\
+                             WARNING: This will fetch external instructions that can influence AI behavior.",
+                            url
+                        ),
+                    )
+                    .await?;
+                if matches!(approval, ApprovalResponse::Deny) {
+                    return Ok("Skill add from URL denied by user.".to_string());
+                }
                 self.handle_add_url(url).await
             }
             "add_inline" => {
@@ -879,23 +972,67 @@ impl Tool for ManageSkillsTool {
                     .ok_or_else(|| anyhow::anyhow!("'names' parameter required for 'remove_all' action"))?;
                 self.handle_remove_all(names, args.dry_run.unwrap_or(false)).await
             }
+            "enable" => {
+                let name = args.name.as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'enable' action"))?;
+                self.handle_enable(name).await
+            }
+            "disable" => {
+                let name = args.name.as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'disable' action"))?;
+                self.handle_disable(name).await
+            }
             "browse" => {
                 self.handle_browse(args.query.as_deref()).await
             }
             "install" => {
                 let name = args.name.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'install' action"))?;
+                if !self.registry_urls.is_empty() {
+                    let session_id = args._session_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("Missing session context for approval on 'install' action")
+                    })?;
+                    let approval = self
+                        .request_approval(
+                            session_id,
+                            &format!(
+                                "Install registry skill '{}'\n\
+                                 WARNING: This will fetch external instructions from a registry URL.",
+                                name
+                            ),
+                        )
+                        .await?;
+                    if matches!(approval, ApprovalResponse::Deny) {
+                        return Ok("Skill installation denied by user.".to_string());
+                    }
+                }
                 self.handle_install(name).await
             }
             "update" => {
                 let name = args.name.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("'name' parameter required for 'update' action"))?;
+                let session_id = args._session_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("Missing session context for approval on 'update' action")
+                })?;
+                let approval = self
+                    .request_approval(
+                        session_id,
+                        &format!(
+                            "Update skill '{}'\n\
+                             WARNING: This will re-fetch external skill content from its source URL.",
+                            name
+                        ),
+                    )
+                    .await?;
+                if matches!(approval, ApprovalResponse::Deny) {
+                    return Ok("Skill update denied by user.".to_string());
+                }
                 self.handle_update(name).await
             }
             "review" => {
                 self.handle_review(args.draft_id, args.approve).await
             }
-            other => Ok(format!("Unknown action '{}'. Valid actions: add, add_inline, list, remove, remove_all, browse, install, update, review", other)),
+            other => Ok(format!("Unknown action '{}'. Valid actions: add, add_inline, list, remove, remove_all, enable, disable, browse, install, update, review", other)),
         }
     }
 }
@@ -907,6 +1044,7 @@ mod tests {
 
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::tools::terminal::ApprovalRequest;
     use crate::traits::store_prelude::*;
     use crate::traits::SkillDraft;
 
@@ -930,6 +1068,38 @@ mod tests {
         );
 
         (tool, sqlite_state as Arc<dyn StateStore>, skills_dir)
+    }
+
+    async fn setup_tool_with_approval_channel() -> (
+        ManageSkillsTool,
+        Arc<dyn StateStore>,
+        tempfile::TempDir,
+        tokio::sync::mpsc::Receiver<ApprovalRequest>,
+    ) {
+        let skills_dir = tempfile::TempDir::new().unwrap();
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let sqlite_state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        std::mem::forget(db_file);
+
+        let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(4);
+        let tool = ManageSkillsTool::new(
+            skills_dir.path().to_path_buf(),
+            sqlite_state.clone() as Arc<dyn StateStore>,
+            approval_tx,
+        );
+
+        (
+            tool,
+            sqlite_state as Arc<dyn StateStore>,
+            skills_dir,
+            approval_rx,
+        )
     }
 
     fn make_skill(name: &str) -> Skill {
@@ -977,6 +1147,69 @@ mod tests {
                 .is_ok()
         );
         assert!(validate_url_for_ssrf("https://example.com/skills/deploy.md").is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_url_requires_approval_and_respects_denial() {
+        let (tool, _state, _skills_dir, mut approval_rx) = setup_tool_with_approval_channel().await;
+
+        let approval_task = tokio::spawn(async move {
+            let req = approval_rx.recv().await.expect("approval request");
+            assert!(req.command.contains("Add skill from URL"));
+            let _ = req.response_tx.send(crate::types::ApprovalResponse::Deny);
+        });
+
+        let result = tool
+            .call(
+                r#"{
+                    "action":"add",
+                    "url":"https://example.com/skill.md",
+                    "_session_id":"test:owner"
+                }"#,
+            )
+            .await
+            .unwrap();
+        approval_task.await.unwrap();
+
+        assert!(result.contains("denied by user"));
+    }
+
+    #[tokio::test]
+    async fn update_requires_approval_and_respects_denial() {
+        let (tool, _state, skills_dir, mut approval_rx) = setup_tool_with_approval_channel().await;
+
+        let skill = Skill {
+            name: "updatable".to_string(),
+            description: "Update me".to_string(),
+            triggers: vec!["update".to_string()],
+            body: "body".to_string(),
+            origin: Some(skills::SKILL_ORIGIN_CUSTOM.to_string()),
+            source: Some("url".to_string()),
+            source_url: Some("https://example.com/updatable.md".to_string()),
+            dir_path: None,
+            resources: vec![],
+        };
+        skills::write_skill_to_file(skills_dir.path(), &skill).unwrap();
+
+        let approval_task = tokio::spawn(async move {
+            let req = approval_rx.recv().await.expect("approval request");
+            assert!(req.command.contains("Update skill 'updatable'"));
+            let _ = req.response_tx.send(crate::types::ApprovalResponse::Deny);
+        });
+
+        let result = tool
+            .call(
+                r#"{
+                    "action":"update",
+                    "name":"updatable",
+                    "_session_id":"test:owner"
+                }"#,
+            )
+            .await
+            .unwrap();
+        approval_task.await.unwrap();
+
+        assert!(result.contains("denied by user"));
     }
 
     #[tokio::test]
@@ -1169,5 +1402,29 @@ mod tests {
 
         assert!(result.contains("conflicts with existing skill"));
         assert_eq!(state.get_pending_skill_drafts().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disable_and_enable_actions_toggle_skill_state() {
+        let (tool, _state, skills_dir) = setup_tool().await;
+        skills::write_skill_to_file(skills_dir.path(), &make_skill("toggle-skill")).unwrap();
+        assert_eq!(skills::load_skills(skills_dir.path()).len(), 1);
+
+        let disable_result = tool
+            .call(r#"{"action":"disable","name":"toggle skill"}"#)
+            .await
+            .unwrap();
+        assert!(disable_result.contains("disabled"));
+        assert!(skills::load_skills(skills_dir.path()).is_empty());
+
+        let list_result = tool.call(r#"{"action":"list"}"#).await.unwrap();
+        assert!(list_result.contains("status: disabled"));
+
+        let enable_result = tool
+            .call(r#"{"action":"enable","name":"toggle-skill"}"#)
+            .await
+            .unwrap();
+        assert!(enable_result.contains("enabled"));
+        assert_eq!(skills::load_skills(skills_dir.path()).len(), 1);
     }
 }

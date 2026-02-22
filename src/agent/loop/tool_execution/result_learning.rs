@@ -3,8 +3,11 @@ use super::project_dir::{
     project_inspect_reports_file_entries, search_files_result_no_matches,
 };
 use super::types::ToolExecutionOutcome;
+use crate::agent::loop_utils;
 use crate::agent::recall_guardrails::tool_result_indicates_no_evidence;
 use crate::agent::*;
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 pub(super) struct ResultLearningEnv<'a> {
     pub attempted_required_file_recheck: bool,
@@ -27,6 +30,7 @@ pub(super) struct ResultLearningState<'a> {
     pub evidence_gain_count: &'a mut usize,
     pub unknown_tools: &'a mut HashSet<String>,
     pub tool_failure_count: &'a mut HashMap<String, usize>,
+    pub tool_failure_signatures: &'a mut HashMap<(String, String), usize>,
     pub tool_transient_failure_count: &'a mut HashMap<String, usize>,
     pub tool_cooldown_until_iteration: &'a mut HashMap<String, usize>,
     pub pending_error_solution_ids: &'a mut Vec<i64>,
@@ -89,6 +93,96 @@ fn user_looks_like_fact_storage_request(user_text: &str) -> bool {
         || contains_keyword_as_words(&lower, "i need you to know")
 }
 
+static ABS_UNIX_PATH_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"/[^\s"'`)\]}\{:,;]+"#).expect("absolute unix path regex must compile")
+});
+static ABS_WINDOWS_PATH_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"[A-Z]:[\\/][^\s"'`)\]}\{:,;]+"#)
+        .expect("absolute windows path regex must compile")
+});
+static LINE_COL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r":\d+:\d+").expect("line:column regex must compile"));
+static ATTEMPT_NUM_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\battempt\s+\d+\b").expect("attempt regex must compile"));
+static PID_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bpid\s*[=:]\s*\d+\b").expect("pid regex must compile"));
+static EXIT_CODE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\bexit(?:\s+code)?\s*[:=]?\s*-?\d+\b").expect("exit code regex must compile")
+});
+static WHITESPACE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\s+").expect("whitespace regex must compile"));
+
+fn path_tail_for_signature(path: &str) -> String {
+    let tail = path
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path);
+    format!("<path:{}>", tail)
+}
+
+fn normalize_error_line_for_signature(line: &str) -> String {
+    let mut normalized = line.to_ascii_lowercase();
+    normalized = LINE_COL_RE.replace_all(&normalized, ":<line>").to_string();
+    normalized = ATTEMPT_NUM_RE
+        .replace_all(&normalized, "attempt <n>")
+        .to_string();
+    normalized = PID_RE.replace_all(&normalized, "pid=<n>").to_string();
+    normalized = EXIT_CODE_RE
+        .replace_all(&normalized, "exit <n>")
+        .to_string();
+    normalized = ABS_UNIX_PATH_RE
+        .replace_all(&normalized, |caps: &regex::Captures<'_>| {
+            path_tail_for_signature(caps.get(0).map(|m| m.as_str()).unwrap_or_default())
+        })
+        .to_string();
+    normalized = ABS_WINDOWS_PATH_RE
+        .replace_all(&normalized, |caps: &regex::Captures<'_>| {
+            path_tail_for_signature(caps.get(0).map(|m| m.as_str()).unwrap_or_default())
+        })
+        .to_string();
+    WHITESPACE_RE
+        .replace_all(&normalized, " ")
+        .trim()
+        .to_string()
+}
+
+fn should_skip_transient_cooldown(tool_name: &str, error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    loop_utils::is_file_lookup_miss_for_tool(tool_name, &lower)
+}
+
+fn derive_failure_signature(error_text: &str) -> String {
+    let key_line = extract_key_error_line(error_text);
+    let normalized = normalize_error_line_for_signature(&key_line);
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return "unclassified error".to_string();
+    }
+    trimmed.chars().take(160).collect()
+}
+
+fn record_semantic_failure_signature(
+    tool_failure_count: &mut HashMap<String, usize>,
+    tool_failure_signatures: &mut HashMap<(String, String), usize>,
+    tool_name: &str,
+    error_text: &str,
+) -> usize {
+    let signature = derive_failure_signature(error_text);
+    let count = tool_failure_signatures
+        .entry((tool_name.to_string(), signature))
+        .or_insert(0);
+    *count += 1;
+    let repeated_count = *count;
+    let per_tool = tool_failure_count
+        .entry(tool_name.to_string())
+        .or_insert(repeated_count);
+    if repeated_count > *per_tool {
+        *per_tool = repeated_count;
+    }
+    repeated_count
+}
+
 impl Agent {
     pub(super) async fn apply_result_learning(
         &self,
@@ -117,21 +211,34 @@ impl Agent {
                     .entry(tc.name.clone())
                     .or_insert(0);
                 *transient_count += 1;
-                let cooldown_iters = 2usize;
-                let cooldown_until = env.iteration.saturating_add(cooldown_iters);
-                state
-                    .tool_cooldown_until_iteration
-                    .insert(tc.name.clone(), cooldown_until);
-                *result_text = format!(
-                    "{}\n\n[SYSTEM] Detected transient failure for `{}` (timeouts/network/rate limits). \
+                if should_skip_transient_cooldown(&tc.name, &base_error) {
+                    state.tool_cooldown_until_iteration.remove(&tc.name);
+                    *result_text = format!(
+                        "{}\n\n[SYSTEM] Recoverable file/path miss for `{}`. \
+This did NOT consume semantic lockout budget. Recheck the target path first \
+(project_inspect/search_files/read_file) and retry with the exact path.",
+                        result_text, tc.name
+                    );
+                } else {
+                    let cooldown_iters = 2usize;
+                    let cooldown_until = env.iteration.saturating_add(cooldown_iters);
+                    state
+                        .tool_cooldown_until_iteration
+                        .insert(tc.name.clone(), cooldown_until);
+                    *result_text = format!(
+                        "{}\n\n[SYSTEM] Detected transient failure for `{}` (timeouts/network/rate limits). \
 Avoid retrying this tool until iteration {} (cooldown {} iterations). Use another approach for now. \
 Only report attempts that were actually executed; do not describe retries that were blocked or skipped.",
-                    result_text, tc.name, cooldown_until, cooldown_iters
-                );
+                        result_text, tc.name, cooldown_until, cooldown_iters
+                    );
+                }
             } else {
-                let count = state.tool_failure_count.entry(tc.name.clone()).or_insert(0);
-                *count += 1;
-                let semantic_count = *count;
+                let semantic_count = record_semantic_failure_signature(
+                    state.tool_failure_count,
+                    state.tool_failure_signatures,
+                    &tc.name,
+                    &base_error,
+                );
 
                 if semantic_count == 1 && looks_like_missing_goal_id_error(&tc.name, &base_error) {
                     let likely_fact_storage =
@@ -286,6 +393,13 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
                             *result_text = format!("{}\n\n{}", result_text, lines.join("\n"));
                         }
                     }
+
+                    // Explicit error-reading coaching: quote the key error back to the LLM
+                    // so it can't miss it, and tell it to adapt.
+                    let key_line = extract_key_error_line(&base_error);
+                    if let Some(coaching) = format_error_coaching(&key_line) {
+                        *result_text = format!("{}\n\n{}", result_text, coaching);
+                    }
                 }
 
                 if semantic_count >= 2 {
@@ -307,11 +421,9 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
                         });
                     }
 
-                    *result_text = format!(
-                        "{}\n\n[SYSTEM] This tool has errored {} semantic times. Do NOT retry it. \
-Use a different approach or respond with what you have.",
-                        result_text, semantic_count
-                    );
+                    let key_line = extract_key_error_line(&base_error);
+                    let coaching = format_semantic_failure_coaching(semantic_count, &key_line);
+                    *result_text = format!("{}\n\n{}", result_text, coaching);
                 }
             }
 
@@ -558,6 +670,37 @@ Present those results to the user directly now. Do NOT claim you cannot complete
     }
 }
 
+/// Build the first-failure coaching message that quotes the key error line.
+/// Returns `None` if key_line is empty (no extractable error).
+fn format_error_coaching(key_line: &str) -> Option<String> {
+    if key_line.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[SYSTEM] IMPORTANT — The error says: \"{}\"\n\
+         Do NOT repeat the same command. Analyze what this error means and use a DIFFERENT approach.\n\
+         If the error indicates something doesn't exist or isn't available, \
+         research alternatives before trying again.",
+        key_line
+    ))
+}
+
+/// Build the semantic-failure coaching message (tool errored N times).
+/// Includes the error context when key_line is non-empty.
+fn format_semantic_failure_coaching(semantic_count: usize, key_line: &str) -> String {
+    let error_context = if key_line.is_empty() {
+        String::new()
+    } else {
+        format!(" The error was: \"{}\".", key_line)
+    };
+    format!(
+        "[SYSTEM] This tool has errored {} semantic times.{} \
+         Do NOT retry this tool. Use a DIFFERENT tool or approach, \
+         or respond to the user with what you know.",
+        semantic_count, error_context
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +738,125 @@ mod tests {
         assert!(!user_looks_like_fact_storage_request(
             "run scheduled goals now"
         ));
+    }
+
+    #[test]
+    fn test_repeated_signature_persists_without_reset() {
+        let mut counts = HashMap::new();
+        let mut signatures = HashMap::new();
+        let first = record_semantic_failure_signature(
+            &mut counts,
+            &mut signatures,
+            "read_file",
+            "Error: missing required field `path`",
+        );
+        // Simulate an unrelated success path by intentionally not mutating the
+        // signature maps between repeated errors.
+        let second = record_semantic_failure_signature(
+            &mut counts,
+            &mut signatures,
+            "read_file",
+            "Error: missing required field `path`",
+        );
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(counts.get("read_file").copied(), Some(2));
+    }
+
+    #[test]
+    fn test_signature_counter_only_rises_on_repeated_same_error() {
+        let mut counts = HashMap::new();
+        let mut signatures = HashMap::new();
+
+        let first = record_semantic_failure_signature(
+            &mut counts,
+            &mut signatures,
+            "read_file",
+            "Error: missing required field `path`",
+        );
+        let second_unique = record_semantic_failure_signature(
+            &mut counts,
+            &mut signatures,
+            "read_file",
+            "Error: permission denied",
+        );
+        let third_repeat = record_semantic_failure_signature(
+            &mut counts,
+            &mut signatures,
+            "read_file",
+            "Error: missing required field `path`",
+        );
+
+        assert_eq!(first, 1);
+        assert_eq!(second_unique, 1);
+        assert_eq!(third_repeat, 2);
+    }
+
+    #[test]
+    fn test_signature_distinguishes_different_paths() {
+        let left =
+            derive_failure_signature("Error: Text not found in /Users/alice/project/src/a.rs:12:8");
+        let right =
+            derive_failure_signature("Error: Text not found in /Users/alice/project/src/b.rs:59:2");
+        assert_ne!(left, right);
+        assert!(left.contains("<path:a.rs>"));
+        assert!(right.contains("<path:b.rs>"));
+    }
+
+    #[test]
+    fn test_signature_normalizes_line_numbers_and_attempt_ids() {
+        let a = derive_failure_signature(
+            "Attempt 1: Error: command failed in /tmp/test/main.rs:10:2 (exit code: 1, pid=923)",
+        );
+        let b = derive_failure_signature(
+            "Attempt 7: Error: command failed in /tmp/test/main.rs:999:88 (exit code: 42, pid=11)",
+        );
+        assert_eq!(a, b);
+        assert!(a.contains("attempt <n>"));
+        assert!(a.contains(":<line>"));
+        assert!(a.contains("exit <n>"));
+        assert!(a.contains("pid=<n>"));
+    }
+
+    #[test]
+    fn test_file_lookup_miss_skips_transient_cooldown() {
+        assert!(should_skip_transient_cooldown(
+            "read_file",
+            "Error: ENOENT: no such file or directory, open '/tmp/missing.txt'",
+        ));
+        assert!(!should_skip_transient_cooldown(
+            "terminal",
+            "Error: ENOENT: no such file or directory, open '/tmp/missing.txt'",
+        ));
+    }
+
+    #[test]
+    fn test_error_coaching_quotes_key_line() {
+        let coaching = format_error_coaching("command not found: drush");
+        assert!(coaching.is_some());
+        let msg = coaching.unwrap();
+        assert!(msg.contains("[SYSTEM] IMPORTANT"));
+        assert!(msg.contains("command not found: drush"));
+        assert!(msg.contains("DIFFERENT approach"));
+    }
+
+    #[test]
+    fn test_error_coaching_returns_none_for_empty_key_line() {
+        assert!(format_error_coaching("").is_none());
+    }
+
+    #[test]
+    fn test_semantic_failure_coaching_includes_error_context() {
+        let msg = format_semantic_failure_coaching(3, "Error: ENOENT");
+        assert!(msg.contains("errored 3 semantic times"));
+        assert!(msg.contains("The error was: \"Error: ENOENT\"."));
+        assert!(msg.contains("DIFFERENT tool"));
+    }
+
+    #[test]
+    fn test_semantic_failure_coaching_omits_context_when_empty() {
+        let msg = format_semantic_failure_coaching(2, "");
+        assert!(msg.contains("errored 2 semantic times"));
+        assert!(!msg.contains("The error was"));
     }
 }

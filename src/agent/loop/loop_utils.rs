@@ -29,6 +29,14 @@ pub(super) enum ToolFailureClass {
     Transient,
 }
 
+pub(super) fn semantic_failure_limit(tool_name: &str) -> usize {
+    if tool_name == "cli_agent" {
+        2
+    } else {
+        3
+    }
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
@@ -97,6 +105,30 @@ fn classify_text_error(lower: &str) -> ToolFailureClass {
         return ToolFailureClass::Transient;
     }
     ToolFailureClass::Semantic
+}
+
+fn is_file_lookup_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file" | "write_file" | "edit_file" | "search_files" | "project_inspect" | "send_file"
+    )
+}
+
+fn looks_like_file_lookup_miss(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "file not found",
+            "no such file",
+            "no such file or directory",
+            "does not exist",
+            "enoent",
+        ],
+    )
+}
+
+pub(super) fn is_file_lookup_miss_for_tool(tool_name: &str, lower_text: &str) -> bool {
+    is_file_lookup_tool(tool_name) && looks_like_file_lookup_miss(lower_text)
 }
 
 fn looks_like_error_signal(lower: &str) -> bool {
@@ -319,7 +351,7 @@ fn extract_nonzero_exit_code(text: &str) -> Option<i32> {
 }
 
 pub(super) fn classify_tool_result_failure(
-    _tool_name: &str,
+    tool_name: &str,
     result_text: &str,
 ) -> Option<ToolFailureClass> {
     let cleaned = strip_appended_diagnostics(result_text).trim();
@@ -328,6 +360,11 @@ pub(super) fn classify_tool_result_failure(
     }
 
     let lower = cleaned.to_ascii_lowercase();
+    if is_file_lookup_miss_for_tool(tool_name, &lower) {
+        // Missing file/path while exploring a project is usually recoverable and
+        // should not consume semantic lockout budget.
+        return Some(ToolFailureClass::Transient);
+    }
 
     if cleaned.starts_with("ERROR:")
         || cleaned.starts_with("Error:")
@@ -389,6 +426,85 @@ pub(super) fn classify_tool_result_failure_with_args(
     let command = tool_arguments.and_then(extract_command_from_args)?;
     let hinted_status = extract_httpbin_status_hint_from_command(&command)?;
     classify_http_status(hinted_status)
+}
+
+/// Extract the most informative error line from a tool error result.
+/// Strips coaching/diagnostic messages appended by the system and
+/// returns the first line that looks like an actual error message.
+pub(super) fn extract_key_error_line(error_text: &str) -> String {
+    let cleaned = strip_appended_diagnostics(error_text);
+    if cleaned.is_empty() {
+        return String::new();
+    }
+
+    // Ordered by signal strength (high-signal first)
+    const PATTERNS: &[&str] = &[
+        "error:",
+        "Error:",
+        "ERROR:",
+        "fatal",
+        "FATAL",
+        "unable to",
+        "Unable to",
+        "command not found",
+        "not found",
+        "does not exist",
+        "No such",
+        "cannot",
+        "Cannot",
+        "denied",
+        "Denied",
+        "failed",
+        "Failed",
+    ];
+
+    for line in cleaned.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        for pattern in PATTERNS {
+            if trimmed.contains(pattern) {
+                let truncated: String = trimmed.chars().take(200).collect();
+                return truncated;
+            }
+        }
+    }
+
+    // "missing"/"Missing" — only when followed by a word boundary (space) or colon
+    // to avoid matching prose uses of "missing"
+    for line in cleaned.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        for prefix in &["missing", "Missing"] {
+            if let Some(idx) = trimmed.find(prefix) {
+                let after = idx + prefix.len();
+                if after >= trimmed.len() {
+                    // "missing" at end of line — matches
+                    let truncated: String = trimmed.chars().take(200).collect();
+                    return truncated;
+                }
+                let next_char = trimmed.as_bytes()[after];
+                if next_char == b' ' || next_char == b':' || next_char == b',' {
+                    let truncated: String = trimmed.chars().take(200).collect();
+                    return truncated;
+                }
+            }
+        }
+    }
+
+    // Fallback: first non-empty line
+    for line in cleaned.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let truncated: String = trimmed.chars().take(200).collect();
+            return truncated;
+        }
+    }
+
+    String::new()
 }
 
 pub(super) fn build_task_boundary_hint(user_text: &str, max_chars: usize) -> String {
@@ -544,6 +660,24 @@ mod tool_error_detection_tests {
 
         let semantic_attempt = classify_tool_result_failure("terminal", "Attempt 1: 404");
         assert_eq!(semantic_attempt, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn treats_file_lookup_miss_as_transient_for_file_tools() {
+        let classified = classify_tool_result_failure(
+            "read_file",
+            "Error: ENOENT: no such file or directory, open '/tmp/missing.txt'",
+        );
+        assert_eq!(classified, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn keeps_non_file_tool_enoent_as_semantic() {
+        let classified = classify_tool_result_failure(
+            "terminal",
+            "Error: ENOENT: no such file or directory, open '/tmp/missing.txt'",
+        );
+        assert_eq!(classified, Some(ToolFailureClass::Semantic));
     }
 
     #[test]
@@ -940,6 +1074,67 @@ pub(super) fn hash_tool_call(name: &str, arguments: &str) -> u64 {
     name.hash(&mut hasher);
     arguments.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod extract_key_error_line_tests {
+    use super::extract_key_error_line;
+
+    #[test]
+    fn finds_error_patterns() {
+        let drupal_error = "$ ddev drush en entity_reference (exit: 1, 3.2s)\n\n\
+             Unable to install modules entity_reference due to missing modules entity_reference.";
+        let result = extract_key_error_line(drupal_error);
+        assert!(result.contains("Unable to install modules entity_reference"));
+
+        let not_found = "bash: drush: command not found";
+        assert!(extract_key_error_line(not_found).contains("command not found"));
+
+        let error_prefix = "Error: ENOENT: no such file or directory, open '/app/config.json'";
+        assert!(extract_key_error_line(error_prefix).contains("Error: ENOENT"));
+    }
+
+    #[test]
+    fn strips_coaching_markers() {
+        let with_coaching = "Unable to install modules entity_reference\n\n\
+             [SYSTEM] This tool has errored 2 semantic times. Do NOT retry it.\n\n\
+             [DIAGNOSTIC] Similar errors resolved before:\n- Try another approach";
+        let result = extract_key_error_line(with_coaching);
+        assert!(result.contains("Unable to install modules"));
+        assert!(!result.contains("[SYSTEM]"));
+        assert!(!result.contains("[DIAGNOSTIC]"));
+    }
+
+    #[test]
+    fn fallback_first_line() {
+        let no_pattern = "Some unexpected output that doesn't match patterns";
+        let result = extract_key_error_line(no_pattern);
+        assert_eq!(result, "Some unexpected output that doesn't match patterns");
+    }
+
+    #[test]
+    fn empty_input() {
+        assert!(extract_key_error_line("").is_empty());
+        assert!(extract_key_error_line("   ").is_empty());
+        // Only coaching markers, no real content
+        assert!(extract_key_error_line("\n\n[SYSTEM] coaching message only").is_empty());
+    }
+
+    #[test]
+    fn missing_pattern_matches_with_boundary() {
+        let with_colon = "missing: required field 'name'";
+        assert!(extract_key_error_line(with_colon).contains("missing:"));
+
+        let with_space = "missing modules entity_reference";
+        assert!(extract_key_error_line(with_space).contains("missing modules"));
+    }
+
+    #[test]
+    fn truncates_long_lines() {
+        let long_error = format!("Error: {}", "x".repeat(300));
+        let result = extract_key_error_line(&long_error);
+        assert!(result.len() <= 200);
+    }
 }
 
 #[cfg(test)]

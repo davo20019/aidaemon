@@ -260,6 +260,7 @@ impl Agent {
         let mut total_tool_calls_attempted = *ctx.total_tool_calls_attempted;
         let mut total_successful_tool_calls = *ctx.total_successful_tool_calls;
         let mut tool_failure_count = std::mem::take(ctx.tool_failure_count);
+        let mut tool_failure_signatures = std::mem::take(ctx.tool_failure_signatures);
         let mut tool_transient_failure_count = std::mem::take(ctx.tool_transient_failure_count);
         let mut tool_cooldown_until_iteration = std::mem::take(ctx.tool_cooldown_until_iteration);
         let mut tool_call_count = std::mem::take(ctx.tool_call_count);
@@ -298,6 +299,7 @@ impl Agent {
                 *ctx.total_tool_calls_attempted = total_tool_calls_attempted;
                 *ctx.total_successful_tool_calls = total_successful_tool_calls;
                 *ctx.tool_failure_count = tool_failure_count;
+                *ctx.tool_failure_signatures = tool_failure_signatures;
                 *ctx.tool_transient_failure_count = tool_transient_failure_count;
                 *ctx.tool_cooldown_until_iteration = tool_cooldown_until_iteration;
                 *ctx.tool_call_count = tool_call_count;
@@ -766,6 +768,7 @@ Do NOT call additional tools or poll status in this turn. Reply to the user now 
                 evidence_gain_count: &mut evidence_gain_count,
                 unknown_tools: &mut unknown_tools,
                 tool_failure_count: &mut tool_failure_count,
+                tool_failure_signatures: &mut tool_failure_signatures,
                 tool_transient_failure_count: &mut tool_transient_failure_count,
                 tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
                 pending_error_solution_ids: &mut pending_error_solution_ids,

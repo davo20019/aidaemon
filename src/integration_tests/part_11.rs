@@ -559,7 +559,7 @@ async fn test_reload_provider_switches_backend_and_models_endpoint() {
 
     let after_models = harness.agent.list_models().await.unwrap();
     assert!(
-        after_models.iter().any(|m| m.starts_with("claude-3")),
+        after_models.iter().any(|m| m.starts_with("claude")),
         "expected Anthropic known models, got {:?}",
         after_models
     );
