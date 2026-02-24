@@ -425,6 +425,28 @@ impl Agent {
             }),
         );
 
+        // Fresh-context isolation: when history is empty or only contains the current
+        // user message (e.g. first message after /clear), inject a boundary marker to
+        // prevent the LLM from drifting toward stale tool-call patterns from pinned
+        // memories or prior context.
+        {
+            let non_system_non_user_count = messages
+                .iter()
+                .filter(|m| {
+                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    role != "system" && role != "user"
+                })
+                .count();
+            if non_system_non_user_count == 0 {
+                pending_system_messages.push(
+                    "This is a fresh conversation context. There are no previous tasks. \
+                     Focus exclusively on the current user request. Do not reference \
+                     or repeat tool calls from any prior context."
+                        .to_string(),
+                );
+            }
+        }
+
         // System nudges (budget warnings, loop-stop reminders, etc.): inject for a single
         // LLM call so they influence the model without polluting stored history.
         for content in pending_system_messages.drain(..) {

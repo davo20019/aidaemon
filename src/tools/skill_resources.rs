@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::skills::{self, ResourceResolver};
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities};
 
 pub struct SkillResourcesTool {
     skills_dir: PathBuf,
@@ -49,9 +49,20 @@ impl Tool for SkillResourcesTool {
                         "description": "Relative path of resource to read (e.g. 'references/guide.md'). Required for 'read' action."
                     }
                 },
-                "required": ["skill_name", "action"]
+                "required": ["skill_name", "action"],
+                "additionalProperties": false
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

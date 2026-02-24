@@ -12,7 +12,7 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::skill_registry;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::{build_browser_client, validate_url_for_ssrf};
-use crate::traits::{StateStore, Tool};
+use crate::traits::{StateStore, Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 pub struct ManageSkillsTool {
@@ -923,9 +923,20 @@ impl Tool for ManageSkillsTool {
                         "description": "If true, preview `remove_all` changes without removing/dismissing anything."
                     }
                 },
-                "required": ["action"]
+                "required": ["action"],
+                "additionalProperties": false
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

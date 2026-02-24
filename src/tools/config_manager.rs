@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::config::AppConfig;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 /// Key names that contain secrets and must be redacted before showing to the LLM.
@@ -732,9 +732,20 @@ impl Tool for ConfigManagerTool {
                         "description": "When true (default), API keys are stored in OS keychain and config uses \"keychain\" sentinel."
                     }
                 },
-                "required": ["action"]
+                "required": ["action"],
+                "additionalProperties": false
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

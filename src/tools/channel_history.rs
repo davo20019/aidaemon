@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities};
 
 /// Tool that reads Slack channel conversation history via the Slack API.
 /// Provides rich message data (text, sender, timestamps, threads, reactions, mentions)
@@ -335,8 +335,18 @@ impl Tool for ReadChannelHistoryTool {
         })
     }
 
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+        let args: Value = serde_json::from_str(arguments)?;
 
         // Determine channel ID: explicit arg > _channel_id injection
         let channel_id = if let Some(cid) = args["channel_id"].as_str() {

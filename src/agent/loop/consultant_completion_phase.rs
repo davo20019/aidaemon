@@ -653,6 +653,21 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
                 _ => reply,
             };
 
+            // Diagnostic: warn when completing with zero tool calls and deferred-action
+            // text. This catches cases where the agent promises future work ("I'll search
+            // for TODOs...") but never actually executes any tools (G2 stall pattern).
+            if total_successful_tool_calls == 0
+                && !reply.trim().is_empty()
+                && looks_like_deferred_action_response(&reply)
+            {
+                warn!(
+                    session_id,
+                    iteration,
+                    reply_preview = &reply.chars().take(200).collect::<String>() as &str,
+                    "Zero-tool completion with deferred-action text detected — possible stall pattern"
+                );
+            }
+
             info!(
                 session_id,
                 iteration,

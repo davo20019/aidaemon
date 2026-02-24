@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::agent::{Agent, StatusUpdate};
 use crate::channels::ChannelHub;
-use crate::traits::{AgentRole, StateStore, Tool};
+use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 
 /// A tool that allows the LLM to spawn a sub-agent for a focused task.
@@ -293,9 +293,20 @@ impl Tool for SpawnAgentTool {
                         "description": "Task ID to associate with this executor (used by task leads to connect executor work to task tracking)"
                     }
                 },
-                "required": ["mission", "task"]
+                "required": ["mission", "task"],
+                "additionalProperties": false
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: true,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

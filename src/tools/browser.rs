@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
 use crate::config::BrowserConfig;
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities};
 use crate::types::{MediaKind, MediaMessage};
 
 pub struct BrowserTool {
@@ -515,15 +515,29 @@ impl Tool for BrowserTool {
                         "description": "Timeout in seconds for 'wait' action (default: 10)"
                     }
                 },
-                "required": ["action"]
+                "required": ["action"],
+                "additionalProperties": false
             }
         })
     }
 
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
 
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: Value = serde_json::from_str(arguments)?;
+
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: action"))?;
 
         let session_id = args
             .get("_session_id")

@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use crate::skills;
 use crate::tools::sanitize::sanitize_external_content;
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities};
 
 pub struct UseSkillTool {
     skills_dir: PathBuf,
@@ -39,13 +39,24 @@ impl Tool for UseSkillTool {
                         "description": "Name of the skill to activate"
                     }
                 },
-                "required": ["skill_name"]
+                "required": ["skill_name"],
+                "additionalProperties": false
             }
         })
     }
 
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+        let args: Value = serde_json::from_str(arguments)?;
         let skill_name = args["skill_name"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: skill_name"))?;

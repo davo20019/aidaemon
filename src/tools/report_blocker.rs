@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
 
-use crate::traits::{StateStore, Tool, ToolRole};
+use crate::traits::{StateStore, Tool, ToolCapabilities, ToolRole};
 
 /// Tool for executors to report they are blocked and cannot proceed.
 ///
@@ -72,6 +72,16 @@ impl Tool for ReportBlockerTool {
 
     fn tool_role(&self) -> ToolRole {
         ToolRole::Action
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

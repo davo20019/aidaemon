@@ -302,13 +302,48 @@ impl Agent {
                 .as_deref()
                 .is_some_and(|c| c == "knowledge" || c == "simple")
         {
-            info!(
-                session_id,
-                complexity = intent_gate.complexity.as_deref().unwrap_or("unknown"),
-                "Consultant pass: simple/knowledge complexity overrides needs_tools — allowing direct answer"
-            );
-            can_answer_now = true;
-            needs_tools = false;
+            // Don't override if user text contains verbs that require tool execution.
+            // Queries like "Find all TODO comments" or "Search for X in the codebase"
+            // may be classified as simple/knowledge but genuinely need tools.
+            let lower = user_text.to_ascii_lowercase();
+            let requires_action = [
+                "search",
+                "find",
+                "grep",
+                "scan",
+                "check ",
+                "run ",
+                "execute",
+                "create ",
+                "write ",
+                "deploy",
+                "build",
+                "compile",
+                "install",
+                "todo",
+                "fixme",
+                "list all",
+                "count all",
+                "show me",
+            ]
+            .iter()
+            .any(|kw| lower.contains(kw));
+
+            if !requires_action {
+                info!(
+                    session_id,
+                    complexity = intent_gate.complexity.as_deref().unwrap_or("unknown"),
+                    "Consultant pass: simple/knowledge complexity overrides needs_tools — allowing direct answer"
+                );
+                can_answer_now = true;
+                needs_tools = false;
+            } else {
+                info!(
+                    session_id,
+                    complexity = intent_gate.complexity.as_deref().unwrap_or("unknown"),
+                    "Consultant pass: knowledge-complexity override BLOCKED by action verb in user text"
+                );
+            }
         }
 
         intent_gate.can_answer_now = Some(can_answer_now);
@@ -741,6 +776,72 @@ mod tests {
                 short_correction
             );
             assert_eq!(decision.reason, ConsultantRouteReason::ToolsRequired);
+        }
+    }
+
+    /// Verify that the action-verb keywords used in the knowledge-complexity
+    /// override guard correctly detect user text that requires tool execution.
+    #[test]
+    fn action_verb_guard_detects_tool_requiring_text() {
+        let action_keywords: &[&str] = &[
+            "search",
+            "find",
+            "grep",
+            "scan",
+            "check ",
+            "run ",
+            "execute",
+            "create ",
+            "write ",
+            "deploy",
+            "build",
+            "compile",
+            "install",
+            "todo",
+            "fixme",
+            "list all",
+            "count all",
+            "show me",
+        ];
+
+        let should_block = [
+            "Find all TODO or FIXME comments in the aidaemon codebase",
+            "search for unused imports",
+            "grep for async fn across all files",
+            "Show me the deployment config",
+            "Run cargo test",
+            "check if the server is running",
+            "create a new config file",
+            "build the project with release flags",
+            "List all endpoints in the API",
+            "count all lines of Rust code",
+        ];
+        for text in should_block {
+            let lower = text.to_ascii_lowercase();
+            let detected = action_keywords.iter().any(|kw| lower.contains(kw));
+            assert!(
+                detected,
+                "expected action verb guard to block '{}', but it didn't",
+                text
+            );
+        }
+
+        let should_allow = [
+            "Tell me a joke in Spanish",
+            "What is the capital of France?",
+            "Explain how HTTP works",
+            "How old is the universe?",
+            "thanks",
+            "yes",
+        ];
+        for text in should_allow {
+            let lower = text.to_ascii_lowercase();
+            let detected = action_keywords.iter().any(|kw| lower.contains(kw));
+            assert!(
+                !detected,
+                "expected action verb guard to allow '{}', but it blocked it",
+                text
+            );
         }
     }
 

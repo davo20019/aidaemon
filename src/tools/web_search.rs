@@ -3,9 +3,12 @@ use reqwest::Client;
 use serde_json::{json, Value};
 
 use crate::config::{SearchBackendKind, SearchConfig};
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities};
 
 use super::web_fetch::build_browser_client;
+
+const DEFAULT_MAX_RESULTS: usize = 5;
+const MAX_MAX_RESULTS: usize = 10;
 
 // ---------------------------------------------------------------------------
 // SearchBackend trait + result type
@@ -272,20 +275,35 @@ impl Tool for WebSearchTool {
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum number of results (default 5)"
+                        "description": "Maximum number of results (default 5, max 10)"
                     }
                 },
-                "required": ["query"]
+                "required": ["query"],
+                "additionalProperties": false
             }
         })
     }
 
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+        let args: Value = serde_json::from_str(arguments)?;
         let query = args["query"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: query"))?;
-        let max_results = args["max_results"].as_u64().unwrap_or(5) as usize;
+        let max_results = args["max_results"]
+            .as_u64()
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(1, MAX_MAX_RESULTS);
 
         let results = self.backend.search(query, max_results).await?;
 

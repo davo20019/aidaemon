@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::tools::terminal::ApprovalRequest;
-use crate::traits::{StateStore, Tool};
+use crate::traits::{StateStore, Tool, ToolCapabilities};
 use crate::types::{ApprovalKind, FactPrivacy};
 
 pub struct ManageMemoriesTool {
@@ -219,6 +219,7 @@ impl ManageMemoriesTool {
 #[derive(Deserialize)]
 struct ManageArgs {
     action: String,
+    limit: Option<usize>,
     category: Option<String>,
     key: Option<String>,
     privacy: Option<String>,
@@ -261,6 +262,10 @@ impl Tool for ManageMemoriesTool {
                         "type": "string",
                         "enum": ["list", "forget", "set_privacy", "search", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled"],
                         "description": "Action to perform. For schedule operations: use list_scheduled or list_scheduled_matching first, then add_schedule/cancel_scheduled/pause_scheduled/resume_scheduled/retry_scheduled/diagnose_scheduled with exact goal_id (and optionally schedule_id). For bulk operations, use retry_failed_scheduled (all failed, optionally filtered), cancel_scheduled_matching, or retry_scheduled_matching with query."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional max items for list/search/list_goals/list_scheduled/list_scheduled_matching (default varies by action, max 200)."
                     },
                     "category": {
                         "type": "string",
@@ -319,9 +324,20 @@ impl Tool for ManageMemoriesTool {
                         "description": "Optional. When true, the new schedule starts paused."
                     }
                 },
-                "required": ["action"]
+                "required": ["action"],
+                "additionalProperties": false
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -340,9 +356,17 @@ impl Tool for ManageMemoriesTool {
                     facts
                 };
 
-                let mut output = format!("**Stored Memories** ({} facts)\n\n", filtered.len());
+                let limit = args.limit.unwrap_or(100).clamp(1, 200);
+                let total = filtered.len();
+                let shown = filtered.into_iter().take(limit).collect::<Vec<_>>();
+
+                let mut output = format!(
+                    "**Stored Memories** (showing {} of {} facts)\n\n",
+                    shown.len(),
+                    total
+                );
                 let mut current_cat = String::new();
-                for f in &filtered {
+                for f in &shown {
                     if f.category != current_cat {
                         current_cat = f.category.clone();
                         output.push_str(&format!("### {}\n", current_cat));
@@ -360,6 +384,12 @@ impl Tool for ManageMemoriesTool {
                     output.push_str(&format!(
                         "- **{}**: {} (privacy: {}, from: {}, updated: {})\n",
                         f.key, f.value, privacy_label, channel_label, age_str
+                    ));
+                }
+                if total > shown.len() {
+                    output.push_str(&format!(
+                        "\n(Results truncated to {}. Provide a higher `limit` to see more.)",
+                        shown.len()
                     ));
                 }
                 Ok(output)
@@ -469,8 +499,14 @@ impl Tool for ManageMemoriesTool {
                     return Ok(format!("No memories matching '{}'.", query));
                 }
 
-                let mut output = format!("**Search results for '{}'** ({} matches)\n\n", query, matches.len());
-                for f in matches.iter().take(20) {
+                let limit = args.limit.unwrap_or(20).clamp(1, 200);
+                let mut output = format!(
+                    "**Search results for '{}'** (showing {} of {} matches)\n\n",
+                    query,
+                    matches.len().min(limit),
+                    matches.len()
+                );
+                for f in matches.iter().take(limit) {
                     let privacy_label = f.privacy.to_string();
                     let channel_label = f.channel_id.as_deref().unwrap_or("global");
                     output.push_str(&format!(
@@ -481,7 +517,8 @@ impl Tool for ManageMemoriesTool {
                 Ok(output)
             }
             "list_goals" => {
-                let goals = self.state.get_active_personal_goals(50).await?;
+                let limit = args.limit.unwrap_or(50).clamp(1, 200) as i64;
+                let goals = self.state.get_active_personal_goals(limit).await?;
                 if goals.is_empty() {
                     return Ok("No active personal goals.".to_string());
                 }
@@ -802,10 +839,14 @@ impl Tool for ManageMemoriesTool {
                 }
             }
             "list_scheduled" => {
-                let goals = self.state.get_scheduled_goals().await?;
-                if goals.is_empty() {
+                let all_goals = self.state.get_scheduled_goals().await?;
+                if all_goals.is_empty() {
                     return Ok("No scheduled goals.".to_string());
                 }
+                let limit = args.limit.unwrap_or(50).clamp(1, 200);
+                let mut goals = all_goals;
+                let total_goals = goals.len();
+                goals.truncate(limit);
 
                 let mut active = Vec::new();
                 let mut paused = Vec::new();
@@ -828,7 +869,11 @@ impl Tool for ManageMemoriesTool {
                 }
 
                 let active_count = active.len() + paused.len() + pending_confirmation.len();
-                let mut output = format!("**Scheduled Goals** ({} total)\n\n", goals.len());
+                let mut output = format!(
+                    "**Scheduled Goals** (showing {} of {} total)\n\n",
+                    goals.len(),
+                    total_goals
+                );
                 if active_count == 0 {
                     output.push_str("No active scheduled tasks.\n\n");
                 }
@@ -894,6 +939,12 @@ impl Tool for ManageMemoriesTool {
                     }
                     output.push('\n');
                 }
+                if total_goals > goals.len() {
+                    output.push_str(&format!(
+                        "(Results truncated to {} goals. Provide a higher `limit` to see more.)\n",
+                        goals.len()
+                    ));
+                }
                 Ok(output)
             }
             "list_scheduled_matching" => {
@@ -912,13 +963,15 @@ impl Tool for ManageMemoriesTool {
                     return Ok(format!("No scheduled goals matched query '{}'.", query));
                 }
                 matched.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                let limit = args.limit.unwrap_or(50).clamp(1, 200);
 
                 let mut output = format!(
-                    "**Matching Scheduled Goals** for '{}' ({} matches)\n\n",
+                    "**Matching Scheduled Goals** for '{}' (showing {} of {} matches)\n\n",
                     query,
+                    matched.len().min(limit),
                     matched.len()
                 );
-                for g in matched {
+                for g in matched.into_iter().take(limit) {
                     let desc: String = g.description.chars().take(80).collect();
                     let schedules = self
                         .state

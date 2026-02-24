@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8] - 2026-02-23
+
+### Added
+
+- **ToolCapabilities metadata for all tools**: Every tool now declares structured capabilities (`read_only`, `external_side_effect`, `needs_approval`, `idempotent`, `high_impact_write`) giving the agent loop metadata for smarter execution decisions.
+- **Schema lint test suite**: Four compile-time tests enforce schema hygiene — `additionalProperties: false` in all schemas, explicit `capabilities()` on all tools, no silent argument parse error swallowing, and schema size limits (6,500 chars per tool, 90,000 total).
+- **Action-verb guard for intent gate**: The consultant intent gate previously let "simple/knowledge" classifications override `needs_tools`, causing tool-requiring queries like "Find all TODO comments" to short-circuit into fabricated answers. A new guard scans for 18 action verbs and blocks the override when detected.
+- **G2 stall pattern diagnostic**: Warns when the agent completes with zero tool calls but produces deferred-action text (e.g., "I'll search for TODOs..."), catching promise-without-execution patterns.
+- **Fresh-context isolation marker**: When message history has no prior assistant/tool messages (e.g., after `/clear`), a system message tells the LLM this is a fresh conversation, preventing stale tool-call pattern drift from pinned memories.
+- **Daemon command early return in terminal**: Commands detected as daemon/background launches (`nohup`, `&`, `disown`) now return immediately after timeout with a success message and pid, instead of entering an infinite background tracking loop.
+- **Large heredoc soft-block in terminal**: Terminal commands containing `<<` (heredoc) exceeding 500 characters are soft-blocked with a message redirecting the LLM to `write_file`.
+- **`limit` parameter for ManageMemoriesTool**: `list`, `search`, `list_goals`, `list_scheduled`, and `list_scheduled_matching` actions accept an optional `limit` parameter (max 200) with "showing X of Y" counts and truncation notices.
+
+### Changed
+
+- **`additionalProperties: false` added to all tool schemas**: Prevents the LLM from inventing nonexistent parameters across all tools.
+- **Stricter conditional `required` fields via `anyOf`**: `TerminalTool` and `CliAgentTool` schemas now enforce action-specific required fields (e.g., `command` for `run`, `pid` for `check`/`kill`).
+- **Strong model profile tool surface capped at 28**: Previously unlimited, now capped to prevent unbounded tool surfaces that confuse the LLM.
+- **Argument parsing errors propagated, not swallowed**: Multiple tools previously used `.unwrap_or(json!({}))` which silently accepted malformed JSON. Now properly returns errors. Affected: `BrowserTool`, `ReadChannelHistoryTool`, `HttpRequestTool`, `ManageOAuthTool`, `UseSkillTool`, `WebFetchTool`, `WebSearchTool`.
+- **`web_fetch` max_chars clamped**: Now clamped to `[1, 50_000]` (previously unbounded, default 20,000).
+- **`web_search` max_results clamped**: Now clamped to `[1, 10]` (previously unbounded, default 5).
+- **Terminal tool description warns against heredoc/echo patterns**: Directs the LLM to use `write_file` instead.
+
+### Fixed
+
+- **Knowledge-complexity override bypassing tool execution**: Queries like "Find all TODO comments" were classified as simple/knowledge, causing fabricated answers without running any tools. The action-verb guard now prevents this.
+- **Daemon commands causing infinite background tracking**: Commands spawning background processes would timeout and enter a tracking loop that never finished. Now detected and returned immediately.
+- **BrowserTool missing required parameter validation**: The `action` parameter was silently accepting missing values via `.unwrap_or("")`; now returns a proper error.
+
 ## [0.9.7] - 2026-02-21
 
 ### Added

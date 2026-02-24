@@ -724,7 +724,34 @@ impl TerminalTool {
                 Ok(output)
             }
             Err(_) => {
-                // Timeout — move process to background.
+                // Timeout — check if this is a daemon/background command where the
+                // parent shell exited but pipes are held open by the detached child.
+                // In that case the reader task will never finish naturally, so capture
+                // partial output and return immediately instead of entering the
+                // infinite background tracking loop.
+                let daemon_hits = detect_daemonization_primitives(command);
+                if !daemon_hits.is_empty() {
+                    let partial_stdout = {
+                        let b = stdout_buf.lock().await;
+                        String::from_utf8_lossy(&b).to_string()
+                    };
+                    let partial_stderr = {
+                        let b = stderr_buf.lock().await;
+                        String::from_utf8_lossy(&b).to_string()
+                    };
+                    let output =
+                        format_output(&partial_stdout, &partial_stderr, self.max_output_chars);
+                    reader_handle.abort();
+                    return Ok(format!(
+                        "Background command launched successfully (pid={}).\n\
+                         The process is running independently.\n\n\
+                         Initial output:\n{}\n\n\
+                         Use action=\"check\" pid={} to see output, or action=\"kill\" pid={} to stop it.",
+                        pid, output, pid, pid
+                    ));
+                }
+
+                // Non-daemon command: move process to background tracking.
                 let elapsed = self.initial_timeout.as_secs();
                 let partial_stdout = {
                     let b = stdout_buf.lock().await;
@@ -1189,7 +1216,7 @@ impl Tool for TerminalTool {
     fn schema(&self) -> Value {
         json!({
             "name": "terminal",
-            "description": "Execute any command available on this system — shell commands, CLI tools (python, node, claude, gemini, cargo, docker, git, etc.), scripts, and anything else installed. If the command is not pre-approved, the user will be asked to authorize it in real time via an inline button. Never assume a command is unavailable — try it.\n\nLong-running commands are handled automatically: if a command exceeds the timeout, it moves to the background and you get a pid. Use action=\"check\" to see progress or action=\"kill\" to stop it.",
+            "description": "Execute any command available on this system — shell commands, CLI tools (python, node, claude, gemini, cargo, docker, git, etc.), scripts, and anything else installed. If the command is not pre-approved, the user will be asked to authorize it in real time via an inline button. Never assume a command is unavailable — try it.\n\nLong-running commands are handled automatically: if a command exceeds the timeout, it moves to the background and you get a pid. Use action=\"check\" to see progress or action=\"kill\" to stop it.\n\nIMPORTANT: Do not use heredoc (cat <<EOF), echo-redirect, or printf patterns to create files. Always use the `write_file` tool for file creation — it handles content atomically without shell quoting issues.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1207,7 +1234,34 @@ impl Tool for TerminalTool {
                         "description": "Process ID for check/kill actions (returned when a command moves to background)"
                     }
                 },
-                "required": ["command"]
+                "required": ["action"],
+                "additionalProperties": false,
+                "anyOf": [
+                    {
+                        "required": ["action", "command"],
+                        "properties": {
+                            "action": {
+                                "enum": ["run"]
+                            }
+                        }
+                    },
+                    {
+                        "required": ["action", "pid"],
+                        "properties": {
+                            "action": {
+                                "enum": ["check", "kill"]
+                            }
+                        }
+                    },
+                    {
+                        "required": ["action"],
+                        "properties": {
+                            "action": {
+                                "enum": ["trust_all"]
+                            }
+                        }
+                    }
+                ]
             }
         })
     }
@@ -1271,6 +1325,17 @@ impl Tool for TerminalTool {
 
                 if let Some((pattern, path)) = detect_unscoped_recursive_grep(command) {
                     return Ok(recursive_grep_block_message(&pattern, &path));
+                }
+
+                // Soft-block large heredoc file creation: redirects to write_file
+                // which writes atomically without shell quoting issues.
+                if command.contains("<<") && command.len() > 500 {
+                    return Ok(
+                        "Large heredoc file creation is unreliable through the terminal. \
+                         Use the `write_file` tool instead — it writes files atomically \
+                         and avoids shell quoting issues."
+                            .to_string(),
+                    );
                 }
 
                 let daemon_hits = detect_daemonization_primitives(command);
@@ -1898,5 +1963,95 @@ mod tests {
             .unwrap();
         assert!(check.contains("post-reap-ok"));
         assert!(check.contains(&format!("pid={}", pid)));
+    }
+
+    #[tokio::test]
+    async fn test_daemon_command_returns_immediately_without_background_tracking() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            2, // 2 second timeout
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        // Auto-approve the daemonization approval request
+        tokio::spawn(async move {
+            if let Some(req) = approval_rx.recv().await {
+                let _ = req.response_tx.send(ApprovalResponse::AllowOnce);
+            }
+        });
+
+        let start = Instant::now();
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"nohup sleep 5 & echo $!","_session_id":"s1","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // Should return promptly (within the timeout + small margin) rather than
+        // entering the infinite background tracking loop.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "daemon command should return within timeout, not stall; took {:?}",
+            elapsed
+        );
+        assert!(
+            response.contains("Background command launched successfully"),
+            "expected daemon early-return message, got: {}",
+            response
+        );
+        assert!(
+            response.contains("pid="),
+            "expected pid in response, got: {}",
+            response
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_heredoc_soft_blocked() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            1000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        // Build a command >500 chars with heredoc
+        let large_content = "x".repeat(600);
+        let command = format!(r#"cat > /tmp/test.html << 'EOF'\n{}\nEOF"#, large_content);
+        let args = serde_json::json!({
+            "action": "run",
+            "command": command,
+            "_session_id": "s1",
+            "_user_role": "Owner"
+        });
+
+        let response = tool.call(&args.to_string()).await.unwrap();
+        assert!(
+            response.contains("write_file"),
+            "expected heredoc soft-block to recommend write_file, got: {}",
+            response
+        );
+        assert!(
+            response.contains("unreliable"),
+            "expected heredoc soft-block message, got: {}",
+            response
+        );
     }
 }

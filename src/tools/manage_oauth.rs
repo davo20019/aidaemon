@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::oauth::OAuthGateway;
-use crate::traits::{StateStore, Tool};
+use crate::traits::{StateStore, Tool, ToolCapabilities};
 use crate::types::StatusUpdate;
 
 use std::sync::Arc;
@@ -64,6 +64,16 @@ impl Tool for ManageOAuthTool {
         })
     }
 
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         // Default call without status — connect won't work well here
         self.call_with_status(arguments, None).await
@@ -74,7 +84,7 @@ impl Tool for ManageOAuthTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+        let args: Value = serde_json::from_str(arguments)?;
         let action = args["action"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: action"))?;

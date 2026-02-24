@@ -9,7 +9,7 @@ use tracing::info;
 use crate::tools::cli_agent::CliAgentTool;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
-use crate::traits::{StateStore, Tool};
+use crate::traits::{StateStore, Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 pub struct ManageCliAgentsTool {
@@ -239,6 +239,16 @@ impl Tool for ManageCliAgentsTool {
                 "additionalProperties": false
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

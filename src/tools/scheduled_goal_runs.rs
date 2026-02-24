@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::traits::{Goal, StateStore, Task, TaskActivity, Tool};
+use crate::traits::{Goal, StateStore, Task, TaskActivity, Tool, ToolCapabilities};
 
 pub struct ScheduledGoalRunsTool {
     state: Arc<dyn StateStore>,
@@ -688,6 +688,16 @@ impl Tool for ScheduledGoalRunsTool {
                 "additionalProperties": false
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

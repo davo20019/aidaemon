@@ -9,7 +9,7 @@ use tracing::info;
 
 use crate::cron_utils::{compute_next_run, parse_schedule};
 use crate::health::{HealthProbe, HealthProbeStore, ProbeConfig, ProbeExecutor, ProbeType};
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities};
 
 pub struct HealthProbeTool {
     store: Arc<HealthProbeStore>,
@@ -121,7 +121,8 @@ impl Tool for HealthProbeTool {
                                 "type": "integer",
                                 "description": "For command: expected exit code (default: 0)"
                             }
-                        }
+                        },
+                        "additionalProperties": false
                     },
                     "consecutive_failures_alert": {
                         "type": "integer",
@@ -140,9 +141,20 @@ impl Tool for HealthProbeTool {
                         "description": "For status action: hours of history to include (default: 24)"
                     }
                 },
-                "required": ["action"]
+                "required": ["action"],
+                "additionalProperties": false
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: false,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

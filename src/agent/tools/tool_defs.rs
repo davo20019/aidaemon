@@ -206,7 +206,10 @@ impl Agent {
                 }
                 filtered.truncate(20);
             }
-            ModelProfile::Strong => {}
+            ModelProfile::Strong => {
+                // Keep strong turns capable, but avoid exposing an unbounded tool surface.
+                filtered.truncate(28);
+            }
         }
 
         if matches!(policy.approval_mode, ApprovalMode::Auto) {

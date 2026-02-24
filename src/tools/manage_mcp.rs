@@ -7,7 +7,7 @@ use tracing::info;
 use crate::mcp::McpRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 /// Allowed commands for MCP server spawning.
@@ -270,9 +270,20 @@ impl Tool for ManageMcpTool {
                         "description": "Environment variable value (for set_env). Stored in OS keychain, never in chat."
                     }
                 },
-                "required": ["action"]
+                "required": ["action"],
+                "additionalProperties": false
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

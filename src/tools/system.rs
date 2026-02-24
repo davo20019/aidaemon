@@ -22,7 +22,8 @@ impl Tool for SystemInfoTool {
             "parameters": {
                 "type": "object",
                 "properties": {},
-                "required": []
+                "required": [],
+                "additionalProperties": false
             }
         })
     }

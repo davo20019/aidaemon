@@ -6,7 +6,10 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities};
+
+const DEFAULT_MAX_CHARS: usize = 20_000;
+const MAX_MAX_CHARS: usize = 50_000;
 
 /// Validates a URL for SSRF vulnerabilities.
 /// Returns Ok(()) if the URL is safe to fetch, Err with a message otherwise.
@@ -258,20 +261,35 @@ impl Tool for WebFetchTool {
                     },
                     "max_chars": {
                         "type": "integer",
-                        "description": "Maximum characters to return (default 20000)"
+                        "description": "Maximum characters to return (default 20000, max 50000)"
                     }
                 },
-                "required": ["url"]
+                "required": ["url"],
+                "additionalProperties": false
             }
         })
     }
 
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+        let args: Value = serde_json::from_str(arguments)?;
         let url = args["url"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: url"))?;
-        let max_chars = args["max_chars"].as_u64().unwrap_or(20000) as usize;
+        let max_chars = args["max_chars"]
+            .as_u64()
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_MAX_CHARS)
+            .clamp(1, MAX_MAX_CHARS);
 
         // SSRF protection: validate URL before fetching
         if let Err(reason) = validate_url_for_ssrf(url) {

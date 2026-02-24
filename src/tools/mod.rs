@@ -93,3 +93,6 @@ mod check_environment;
 pub use check_environment::CheckEnvironmentTool;
 mod service_status;
 pub use service_status::ServiceStatusTool;
+
+#[cfg(test)]
+mod schema_lint_tests;

@@ -6,7 +6,7 @@ use chrono::Datelike;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::traits::{Person, PersonFact, StateStore, Tool};
+use crate::traits::{Person, PersonFact, StateStore, Tool, ToolCapabilities};
 
 pub struct ManagePeopleTool {
     state: Arc<dyn StateStore>,
@@ -140,6 +140,16 @@ impl Tool for ManagePeopleTool {
                 "additionalProperties": false
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: false,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

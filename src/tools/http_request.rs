@@ -428,7 +428,7 @@ impl Tool for HttpRequestTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+        let args: Value = serde_json::from_str(arguments)?;
 
         // Parse parameters
         let method = args["method"]

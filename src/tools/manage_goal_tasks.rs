@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
 
-use crate::traits::{StateStore, Task, Tool, ToolRole};
+use crate::traits::{StateStore, Task, Tool, ToolCapabilities, ToolRole};
 
 /// Tool for task leads to manage tasks within their assigned goal.
 pub struct ManageGoalTasksTool {
@@ -234,6 +234,16 @@ impl Tool for ManageGoalTasksTool {
 
     fn tool_role(&self) -> ToolRole {
         ToolRole::Management
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

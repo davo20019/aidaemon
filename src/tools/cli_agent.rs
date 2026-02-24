@@ -2382,7 +2382,34 @@ impl Tool for CliAgentTool {
                         "description": "If true, starts the task in background immediately and returns a task_id. Use for parallel dispatch of multiple CLI agents."
                     }
                 },
-                "required": []
+                "required": ["action"],
+                "additionalProperties": false,
+                "anyOf": [
+                    {
+                        "required": ["action", "prompt"],
+                        "properties": {
+                            "action": {
+                                "enum": ["run"]
+                            }
+                        }
+                    },
+                    {
+                        "required": ["action", "task_id"],
+                        "properties": {
+                            "action": {
+                                "enum": ["check", "cancel"]
+                            }
+                        }
+                    },
+                    {
+                        "required": ["action"],
+                        "properties": {
+                            "action": {
+                                "enum": ["list"]
+                            }
+                        }
+                    }
+                ]
             }
         })
     }

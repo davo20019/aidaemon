@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
-use crate::traits::{StateStore, Tool};
+use crate::traits::{StateStore, Tool, ToolCapabilities};
 use crate::types::{ApprovalResponse, FactPrivacy};
 
 /// Timeout for approval requests (5 minutes).
@@ -96,9 +96,20 @@ impl Tool for ShareMemoryTool {
                         "description": "The key of the fact to share"
                     }
                 },
-                "required": ["category", "key"]
+                "required": ["category", "key"],
+                "additionalProperties": false
             }
         })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
