@@ -1,6 +1,20 @@
 use super::*;
 
 impl Agent {
+    pub(super) async fn run_task_end_tool_hooks(&self, task_id: &str, session_id: &str) {
+        for tool in &self.tools {
+            if let Err(e) = tool.on_task_end(task_id, session_id).await {
+                warn!(
+                    task_id,
+                    session_id,
+                    tool = tool.name(),
+                    error = %e,
+                    "Task-end cleanup hook failed"
+                );
+            }
+        }
+    }
+
     /// Ask the owner to approve a one-time budget extension for the current run.
     ///
     /// Returns true only when the owner explicitly approves.
@@ -387,6 +401,8 @@ impl Agent {
                     summary,
                 },
             )
+            .await;
+        self.run_task_end_tool_hooks(task_id, emitter.session_id())
             .await;
     }
 

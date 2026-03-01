@@ -611,7 +611,7 @@ impl Tool for ManageMemoriesTool {
                     return Ok("Cannot create scheduled goals from within internal scheduled-task execution. Execute the task directly instead.".to_string());
                 }
 
-                let desc = args
+                let raw_desc = args
                     .goal
                     .as_deref()
                     .map(str::trim)
@@ -634,6 +634,17 @@ impl Tool for ManageMemoriesTool {
                 };
                 if schedule_inputs.is_empty() {
                     return Ok("At least one schedule is required.".to_string());
+                }
+
+                // Keep tool-path descriptions aligned with fast-path scheduling:
+                // remove explicit schedule phrases and leading filler prompts.
+                let mut desc = raw_desc.to_string();
+                for schedule_raw in &schedule_inputs {
+                    desc = crate::cron_utils::clean_task_description(&desc, schedule_raw);
+                }
+                desc = crate::cron_utils::clean_task_description(&desc, "");
+                if desc.trim().is_empty() {
+                    desc = raw_desc.to_string();
                 }
 
                 // Parse schedules first so we don't create partial goals on failure.
@@ -675,7 +686,7 @@ impl Tool for ManageMemoriesTool {
                 }
 
                 // Prevent duplicate schedules when the model repeats the same create request.
-                let target_desc = Self::canonicalize_schedule_goal_description(desc);
+                let target_desc = Self::canonicalize_schedule_goal_description(&desc);
                 let target_crons: BTreeSet<String> = parsed
                     .iter()
                     .map(|p| p.cron.trim().to_ascii_lowercase())
@@ -720,9 +731,9 @@ impl Tool for ManageMemoriesTool {
 
                 let has_recurring = parsed.iter().any(|p| !p.is_one_shot);
                 let mut goal = if has_recurring {
-                    crate::traits::Goal::new_continuous_pending(desc, session_id, None, None)
+                    crate::traits::Goal::new_continuous_pending(&desc, session_id, None, None)
                 } else {
-                    crate::traits::Goal::new_deferred_finite(desc, session_id)
+                    crate::traits::Goal::new_deferred_finite(&desc, session_id)
                 };
                 goal.domain = "orchestration".to_string();
 
@@ -2358,6 +2369,35 @@ mod tests {
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         assert_eq!(schedules.len(), 1);
         assert!(schedules[0].is_one_shot);
+    }
+
+    #[tokio::test]
+    async fn create_scheduled_goal_cleans_filler_and_schedule_from_goal_text() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "in 2 hours remind me to send release notes",
+                    "schedule": "in 2 hours",
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Created scheduled goal"));
+
+        let goals = state.get_scheduled_goals().await.unwrap();
+        let goal = goals
+            .iter()
+            .find(|g| g.description == "Send release notes")
+            .unwrap();
+        assert_eq!(goal.goal_type, "finite");
     }
 
     #[tokio::test]

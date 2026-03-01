@@ -136,6 +136,8 @@ impl Agent {
                 },
             )
             .await;
+        self.run_task_end_tool_hooks(&checkpoint.task_id, session_id)
+            .await;
     }
 }
 

@@ -71,6 +71,13 @@ pub trait Tool: Send + Sync {
         self.call(arguments).await
     }
 
+    /// Task lifecycle callback fired after the agent emits `TaskEnd`.
+    /// Tools that spawn background activity can use this to clean up
+    /// task-scoped resources.
+    async fn on_task_end(&self, _task_id: &str, _session_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Categorize this tool for role-based scoping.
     /// Default: Action (most tools are action tools).
     fn tool_role(&self) -> ToolRole {

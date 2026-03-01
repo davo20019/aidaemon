@@ -2699,6 +2699,16 @@ impl Agent {
         self.goal_id = goal_id;
     }
 
+    #[cfg(test)]
+    pub async fn set_test_schedule_approval_for_session(&self, session_id: &str, approved: bool) {
+        let mut sessions = self.schedule_approved_sessions.write().await;
+        if approved {
+            sessions.insert(session_id.to_string());
+        } else {
+            sessions.remove(session_id);
+        }
+    }
+
     /// Create an Agent with explicit depth/max_depth (used internally for sub-agents).
     /// Sub-agents don't auto-route — they use whatever model was selected by the parent.
     #[allow(clippy::too_many_arguments)]

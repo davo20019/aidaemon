@@ -478,6 +478,374 @@ async fn test_orchestration_scheduled_recurring_creates_pending_confirmation() {
 }
 
 #[tokio::test]
+async fn test_orchestration_scheduled_multi_segment_creates_two_pending_goals() {
+    let provider = MockProvider::new(); // Deterministic schedule heuristics path
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "1) every day at 9am remind me to check server health. 2) in 2 hours send status report",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("Reply **confirm**"),
+        "Expected confirmation prompt for multi-schedule request"
+    );
+    assert!(
+        response.contains("2 goals"),
+        "Expected batch confirmation text, got: {response}"
+    );
+
+    let goals = harness
+        .state
+        .get_goals_for_session("test_session")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 2);
+    assert!(
+        goals.iter().all(|goal| goal.status == "pending_confirmation"),
+        "All goals should await confirmation"
+    );
+    assert!(
+        goals.iter().any(|goal| goal.description == "Check server health"),
+        "Expected cleaned recurring description"
+    );
+    assert!(
+        goals.iter().any(|goal| goal.description == "Send status report"),
+        "Expected cleaned one-shot description"
+    );
+}
+
+#[tokio::test]
+async fn test_orchestration_scheduled_multi_segment_confirm_and_cancel() {
+    let provider = MockProvider::new(); // Deterministic schedule heuristics path
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "test_session_confirm",
+            "1) every day at 9am check server health. 2) in 2 hours send status report",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    let confirm_response = harness
+        .agent
+        .handle_message(
+            "test_session_confirm",
+            "confirm",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        confirm_response.contains("Scheduled 2 goals"),
+        "Expected batch activation, got: {confirm_response}"
+    );
+    let confirm_goals = harness
+        .state
+        .get_goals_for_session("test_session_confirm")
+        .await
+        .unwrap();
+    assert_eq!(confirm_goals.len(), 2);
+    assert!(confirm_goals.iter().all(|goal| goal.status == "active"));
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "test_session_cancel",
+            "1) every day at 9am check server health. 2) in 2 hours send status report",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    let cancel_response = harness
+        .agent
+        .handle_message(
+            "test_session_cancel",
+            "cancel",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        cancel_response.contains("cancelled 2 goals"),
+        "Expected batch cancellation, got: {cancel_response}"
+    );
+    let cancel_goals = harness
+        .state
+        .get_goals_for_session("test_session_cancel")
+        .await
+        .unwrap();
+    assert_eq!(cancel_goals.len(), 2);
+    assert!(
+        cancel_goals
+            .iter()
+            .all(|goal| goal.status == "cancelled")
+    );
+}
+
+#[tokio::test]
+async fn test_orchestration_scheduled_multi_segment_auto_confirms_when_session_preapproved() {
+    let provider = MockProvider::new(); // Deterministic schedule heuristics path
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
+    harness
+        .agent
+        .set_test_schedule_approval_for_session("test_session_preapproved_multi", true)
+        .await;
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session_preapproved_multi",
+            "1) every day at 9am check server health. 2) in 2 hours send status report",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("Scheduled 2 goals"),
+        "Expected auto-confirmed batch activation, got: {response}"
+    );
+
+    let goals = harness
+        .state
+        .get_goals_for_session("test_session_preapproved_multi")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 2);
+    assert!(goals.iter().all(|goal| goal.status == "active"));
+    assert_eq!(
+        harness.provider.call_count().await,
+        0,
+        "Auto-approved scheduling should not require LLM calls"
+    );
+}
+
+#[tokio::test]
+async fn test_orchestration_scheduled_multi_segment_rejects_too_many_segments() {
+    let provider = MockProvider::new(); // Deterministic schedule heuristics path
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
+
+    let request = (1..=11)
+        .map(|n| format!("{n}) in {n}h run task {n}"))
+        .collect::<Vec<_>>()
+        .join(". ");
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session_too_many_segments",
+            &request,
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("up to 10 goals per message"),
+        "Expected segment-limit guidance, got: {response}"
+    );
+
+    let goals = harness
+        .state
+        .get_goals_for_session("test_session_too_many_segments")
+        .await
+        .unwrap();
+    assert!(
+        goals.is_empty(),
+        "Segment-limit rejection should not create any goals"
+    );
+}
+
+#[tokio::test]
+async fn test_orchestration_scheduled_multi_segment_invalid_segment_rejected_without_partial_goal_creation(
+) {
+    let provider = MockProvider::new(); // Deterministic scheduling path should reject directly
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session_invalid_multi",
+            "1) every day at 9am check server health. 2) every 0m send status report",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("couldn't parse one of the schedules"),
+        "Expected direct invalid-segment response, got: {response}"
+    );
+
+    let goals = harness
+        .state
+        .get_goals_for_session("test_session_invalid_multi")
+        .await
+        .unwrap();
+    assert!(
+        goals.is_empty(),
+        "Invalid multi-schedule input should not create partial goals"
+    );
+    assert!(
+        harness.provider.call_count().await == 0,
+        "Invalid multi-schedule input should not enter the LLM fallback loop"
+    );
+}
+
+#[tokio::test]
+async fn test_orchestration_scheduled_multi_segment_invalid_first_segment_creates_no_goals() {
+    let provider = MockProvider::new(); // Deterministic scheduling path should reject directly
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session_invalid_first_multi",
+            "1) every 0m check server health. 2) in 2 hours send status report",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("couldn't parse one of the schedules"),
+        "Expected direct invalid-segment response, got: {response}"
+    );
+    let goals = harness
+        .state
+        .get_goals_for_session("test_session_invalid_first_multi")
+        .await
+        .unwrap();
+    assert!(
+        goals.is_empty(),
+        "Invalid first segment should prevent all goal creation"
+    );
+    assert_eq!(
+        harness.provider.call_count().await,
+        0,
+        "Invalid first segment should not trigger the LLM fallback loop"
+    );
+}
+
+#[tokio::test]
+async fn test_orchestration_scheduled_multi_segment_invalid_middle_segment_creates_no_goals() {
+    let provider = MockProvider::new(); // Deterministic scheduling path should reject directly
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session_invalid_middle_multi",
+            "1) every day at 9am check server health. 2) every 0m send status report. 3) in 3 hours check alerts",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("couldn't parse one of the schedules"),
+        "Expected direct invalid-segment response, got: {response}"
+    );
+    let goals = harness
+        .state
+        .get_goals_for_session("test_session_invalid_middle_multi")
+        .await
+        .unwrap();
+    assert!(
+        goals.is_empty(),
+        "Invalid middle segment should prevent all goal creation"
+    );
+    assert_eq!(
+        harness.provider.call_count().await,
+        0,
+        "Invalid middle segment should not trigger the LLM fallback loop"
+    );
+}
+
+#[tokio::test]
+async fn test_orchestration_scheduled_single_description_uses_current_turn_task_text() {
+    let provider = MockProvider::new();
+    let harness = setup_test_agent_orchestrator(provider).await.unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "test_session_description_contamination",
+            "What is my daily budget?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "test_session_description_contamination",
+            "today at 11:09pm EST remind me to check logs",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let goals = harness
+        .state
+        .get_goals_for_session("test_session_description_contamination")
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].description, "Check logs");
+    assert!(
+        !goals[0].description.contains("daily budget"),
+        "Description should not include unrelated prior turn text"
+    );
+}
+
+#[tokio::test]
 async fn test_orchestration_schedule_confirm_activates_goal() {
     // Deterministic routing detects "in 2 hours" via schedule heuristic (no LLM call).
     // "confirm" is handled by the confirmation gate (also no LLM call).

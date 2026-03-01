@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.9] - 2026-02-28
+
+### Added
+
+- **Multi-segment schedule parsing**: Users can create multiple scheduled goals in a single message (e.g., "1) every day at 9am check server health. 2) in 2 hours send status report"). The scheduler splits, parses, and confirms all segments as a batch with a single confirmation prompt.
+- **Named-month date scheduling**: Schedule expressions now support calendar dates like "on March 5th at 3pm" or "March 15" with automatic year rollover for past dates.
+- **Specific day-of-week scheduling**: Support for "every Monday and Friday at 3pm" and similar multi-day expressions, parsed into correct cron day-of-week fields.
+- **Task-scoped terminal process lifecycle**: Background terminal processes are now task-owned by default — auto-killed when the owning agent task ends. New `detach=true` parameter opts into long-lived execution that survives task boundaries.
+- **`on_task_end` tool lifecycle hook**: New `Tool` trait method called after `TaskEnd` events, enabling tools to clean up task-scoped resources. Terminal tool uses this for automatic background process cleanup.
+- **Duplicate background command suppression**: Within the same goal/task scope, re-running an equivalent command that is already tracked in the background returns a reference to the existing process instead of spawning a duplicate.
+- **Internal maintenance intent guard**: Scheduling requests for built-in maintenance operations (memory consolidation, embeddings, decay) are intercepted with a message explaining these run automatically.
+- **Schedule-only description detection**: When a user's message is purely a schedule expression with no task description, the system detects this and prompts for a task description rather than creating an empty goal.
+
+### Changed
+
+- **Schedule detection refactored to `cron_utils`**: All schedule extraction regex patterns moved from `intent_routing.rs` to `cron_utils.rs` as `LazyLock` statics, improving startup performance and enabling reuse across the codebase.
+- **Task descriptions auto-cleaned**: Schedule phrases and filler prefixes ("remind me to", "schedule a task to") are stripped from goal descriptions in both the fast-path and tool-path, producing cleaner goal text (e.g., "Send release notes" instead of "in 2 hours remind me to send release notes").
+- **Goal confirmation timeout extended**: Telegram approval timeout increased from 5 minutes to 30 minutes, preventing race conditions when users confirm near the boundary.
+- **Daemon commands require explicit `detach=true`**: Daemonization primitives (`nohup`, `&`, `disown`) are now blocked unless `detach=true` is set, preventing accidental long-lived orphaned processes.
+- **Detached execution blocked in trusted sessions**: Scheduled/trusted sessions cannot use `detach=true`, preventing unattended creation of long-lived background processes.
+
+### Fixed
+
+- **Batch schedule confirmation/cancellation**: Multi-segment schedule requests now confirm or cancel all goals atomically instead of handling only the first one.
+- **Empty command validation**: Terminal tool now rejects empty/whitespace-only commands with a clear error instead of passing them to the shell.
+
 ## [0.9.8] - 2026-02-23
 
 ### Added

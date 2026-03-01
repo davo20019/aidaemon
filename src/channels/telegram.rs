@@ -2407,8 +2407,9 @@ impl Channel for TelegramChannel {
             }
         }
 
-        // Wait with 5-minute timeout
-        match tokio::time::timeout(Duration::from_secs(300), response_rx).await {
+        // Wait with 30-minute timeout (generous window to avoid race conditions
+        // when users confirm near the timeout boundary).
+        match tokio::time::timeout(Duration::from_secs(1800), response_rx).await {
             Ok(Ok(response)) => Ok(matches!(
                 response,
                 ApprovalResponse::AllowOnce
@@ -2420,7 +2421,7 @@ impl Channel for TelegramChannel {
                 Ok(false)
             }
             Err(_) => {
-                warn!(approval_id = %short_id, "Goal confirmation timed out");
+                warn!(approval_id = %short_id, "Goal confirmation timed out after 30 minutes");
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
                 Ok(false)

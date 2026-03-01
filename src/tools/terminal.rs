@@ -49,6 +49,9 @@ pub struct ApprovalRequest {
 /// A background process being tracked after it exceeded the initial timeout.
 struct RunningProcess {
     command: String,
+    dedupe_key: Option<String>,
+    owner_task_id: Option<String>,
+    detached: bool,
     started_at: Instant,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
@@ -73,6 +76,8 @@ pub struct TerminalTool {
     permission_mode: PermissionMode,
     approval_tx: mpsc::Sender<ApprovalRequest>,
     running: Arc<Mutex<HashMap<u32, RunningProcess>>>,
+    running_by_dedupe_key: Arc<Mutex<HashMap<String, u32>>>,
+    task_processes: Arc<Mutex<HashMap<String, HashSet<u32>>>>,
     completed: Arc<Mutex<HashMap<u32, CompletedProcess>>>,
     initial_timeout: Duration,
     max_output_chars: usize,
@@ -206,6 +211,10 @@ Use one of these instead:\n\
     )
 }
 
+fn normalize_command_for_dedupe(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Drain an async reader into a capped buffer.
 async fn drain_to_buffer<R: tokio::io::AsyncRead + Unpin>(mut reader: R, buf: Arc<Mutex<Vec<u8>>>) {
     let mut tmp = [0u8; 8192];
@@ -304,6 +313,8 @@ impl TerminalTool {
             permission_mode,
             approval_tx,
             running: Arc::new(Mutex::new(HashMap::new())),
+            running_by_dedupe_key: Arc::new(Mutex::new(HashMap::new())),
+            task_processes: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             initial_timeout: Duration::from_secs(initial_timeout_secs),
             max_output_chars,
@@ -523,6 +534,203 @@ impl TerminalTool {
         }
     }
 
+    fn dedupe_scope_key(
+        notify_session_id: &str,
+        notify_goal_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> String {
+        if let Some(goal_id) = notify_goal_id.filter(|value| !value.trim().is_empty()) {
+            return format!("goal:{}", goal_id.trim());
+        }
+        if let Some(task_id) = task_id.filter(|value| !value.trim().is_empty()) {
+            return format!("task:{}", task_id.trim());
+        }
+        format!("session:{}", notify_session_id.trim())
+    }
+
+    fn dedupe_key_for_run(
+        command: &str,
+        notify_session_id: &str,
+        notify_goal_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> String {
+        let scope = Self::dedupe_scope_key(notify_session_id, notify_goal_id, task_id);
+        let normalized = normalize_command_for_dedupe(command);
+        format!("{}|{}", scope, normalized)
+    }
+
+    async fn insert_indexes_for_process(
+        &self,
+        pid: u32,
+        dedupe_key: Option<&str>,
+        owner_task_id: Option<&str>,
+        detached: bool,
+    ) {
+        if let Some(key) = dedupe_key {
+            self.running_by_dedupe_key
+                .lock()
+                .await
+                .insert(key.to_string(), pid);
+        }
+
+        if !detached {
+            if let Some(task_id) = owner_task_id {
+                let mut task_map = self.task_processes.lock().await;
+                task_map.entry(task_id.to_string()).or_default().insert(pid);
+            }
+        }
+    }
+
+    async fn remove_indexes_for_process(&self, pid: u32, proc: &RunningProcess) {
+        if let Some(key) = proc.dedupe_key.as_ref() {
+            let mut dedupe = self.running_by_dedupe_key.lock().await;
+            if dedupe.get(key).copied() == Some(pid) {
+                dedupe.remove(key);
+            }
+        }
+
+        if !proc.detached {
+            if let Some(task_id) = proc.owner_task_id.as_ref() {
+                let mut task_map = self.task_processes.lock().await;
+                let mut remove_task_key = false;
+                if let Some(pids) = task_map.get_mut(task_id) {
+                    pids.remove(&pid);
+                    remove_task_key = pids.is_empty();
+                }
+                if remove_task_key {
+                    task_map.remove(task_id);
+                }
+            }
+        }
+    }
+
+    async fn resolve_duplicate_running_pid(&self, dedupe_key: &str) -> Option<u32> {
+        let tracked_pid = {
+            let dedupe = self.running_by_dedupe_key.lock().await;
+            dedupe.get(dedupe_key).copied()
+        }?;
+
+        let is_live = {
+            let running = self.running.lock().await;
+            running
+                .get(&tracked_pid)
+                .is_some_and(|proc| !proc.reader_handle.is_finished())
+        };
+        if is_live {
+            return Some(tracked_pid);
+        }
+
+        // Stale index entry from a process that's already finished/reaped.
+        let mut dedupe = self.running_by_dedupe_key.lock().await;
+        if dedupe.get(dedupe_key).copied() == Some(tracked_pid) {
+            dedupe.remove(dedupe_key);
+        }
+        None
+    }
+
+    async fn terminate_running_process(
+        &self,
+        pid: u32,
+        proc: RunningProcess,
+        reason: &str,
+    ) -> anyhow::Result<String> {
+        proc.notify_on_completion.store(false, Ordering::Relaxed);
+        let child_pid = proc.child_id;
+        let started_at = proc.started_at;
+        let command = proc.command.clone();
+        let stdout_buf = proc.stdout_buf.clone();
+        let stderr_buf = proc.stderr_buf.clone();
+        let reader_handle = proc.reader_handle;
+
+        if !reader_handle.is_finished() {
+            let term_sent = send_sigterm(child_pid);
+            if term_sent {
+                let finished = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if reader_handle.is_finished() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await;
+
+                if finished.is_err() && !reader_handle.is_finished() {
+                    send_sigkill(child_pid);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            } else {
+                send_sigkill(child_pid);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+
+        if !reader_handle.is_finished() {
+            reader_handle.abort();
+        }
+        let _ = reader_handle.await;
+
+        let stdout = String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
+        let stderr = String::from_utf8_lossy(&stderr_buf.lock().await).to_string();
+        let mut output = format!(
+            "[Process pid={} stopped after {:.0}s (reason: {}, command: `{}`)]\n",
+            pid,
+            started_at.elapsed().as_secs_f64(),
+            reason,
+            command
+        );
+        output.push_str(&format_output(&stdout, &stderr, self.max_output_chars));
+        Ok(output)
+    }
+
+    async fn cleanup_task_processes(&self, task_id: &str) -> anyhow::Result<usize> {
+        self.reap_finished().await;
+        let cleaned_pids = {
+            let mut task_map = self.task_processes.lock().await;
+            task_map.remove(task_id).unwrap_or_default()
+        };
+        if cleaned_pids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut to_cleanup = Vec::new();
+        {
+            let mut running = self.running.lock().await;
+            for pid in cleaned_pids {
+                if let Some(proc) = running.remove(&pid) {
+                    to_cleanup.push((pid, proc));
+                }
+            }
+        }
+
+        // Lock-order discipline: do not hold `running` while mutating secondary
+        // indexes. Index helpers acquire their own locks (`running_by_dedupe_key`,
+        // `task_processes`) after the primary `running` lock is dropped.
+        for (pid, proc) in &to_cleanup {
+            self.remove_indexes_for_process(*pid, proc).await;
+            self.completed.lock().await.remove(pid);
+        }
+
+        let mut cleaned = 0usize;
+        for (pid, proc) in to_cleanup {
+            match self
+                .terminate_running_process(pid, proc, "task ended")
+                .await
+            {
+                Ok(_) => cleaned += 1,
+                Err(e) => {
+                    warn!(
+                        pid,
+                        task_id,
+                        error = %e,
+                        "Failed to stop task-owned background process"
+                    );
+                }
+            }
+        }
+        Ok(cleaned)
+    }
+
     /// Enable trust-all mode: auto-approve all commands without prompting.
     /// Requires user approval since this is a security-sensitive action.
     async fn handle_trust_all(&self, session_id: &str) -> anyhow::Result<String> {
@@ -631,6 +839,7 @@ impl TerminalTool {
         }
 
         for (pid, proc) in finished {
+            self.remove_indexes_for_process(pid, &proc).await;
             let exit_code = proc.reader_handle.await.ok().flatten();
             let stdout = String::from_utf8_lossy(&proc.stdout_buf.lock().await).to_string();
             let stderr = String::from_utf8_lossy(&proc.stderr_buf.lock().await).to_string();
@@ -665,8 +874,20 @@ impl TerminalTool {
         command: &str,
         notify_session_id: &str,
         notify_goal_id: Option<&str>,
+        task_id: Option<&str>,
+        detach: bool,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
+        let dedupe_key =
+            Self::dedupe_key_for_run(command, notify_session_id, notify_goal_id, task_id);
+        if let Some(existing_pid) = self.resolve_duplicate_running_pid(&dedupe_key).await {
+            return Ok(format!(
+                "Equivalent command is already running in this scope (pid={}). \
+                 Use action=\"check\" pid={} to inspect progress or action=\"kill\" pid={} to stop it.",
+                existing_pid, existing_pid, existing_pid
+            ));
+        }
+
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")
             .arg(command)
@@ -743,11 +964,11 @@ impl TerminalTool {
                         format_output(&partial_stdout, &partial_stderr, self.max_output_chars);
                     reader_handle.abort();
                     return Ok(format!(
-                        "Background command launched successfully (pid={}).\n\
-                         The process is running independently.\n\n\
-                         Initial output:\n{}\n\n\
-                         Use action=\"check\" pid={} to see output, or action=\"kill\" pid={} to stop it.",
-                        pid, output, pid, pid
+                        "Detached background command launched (pid={}).\n\
+                         The process is running independently and is not task-owned.\n\
+                         This detached daemonized process is not tracked by action=\"check\"/\"kill\".\n\n\
+                         Initial output:\n{}",
+                        pid, output
                     ));
                 }
 
@@ -763,9 +984,15 @@ impl TerminalTool {
                     String::from_utf8_lossy(tail).to_string()
                 };
                 let notify_on_completion = Arc::new(AtomicBool::new(true));
+                let owner_task_id = task_id
+                    .map(str::to_string)
+                    .filter(|id| !id.trim().is_empty());
 
                 let proc = RunningProcess {
                     command: command.to_string(),
+                    dedupe_key: Some(dedupe_key.clone()),
+                    owner_task_id: owner_task_id.clone(),
+                    detached: detach,
                     started_at: Instant::now() - self.initial_timeout,
                     stdout_buf,
                     stderr_buf,
@@ -775,6 +1002,13 @@ impl TerminalTool {
                 };
 
                 self.running.lock().await.insert(pid, proc);
+                self.insert_indexes_for_process(
+                    pid,
+                    Some(&dedupe_key),
+                    owner_task_id.as_deref(),
+                    detach,
+                )
+                .await;
 
                 // Deterministic completion delivery: notify user when background command finishes
                 // even if the agent loop ends before an explicit `action="check"` call.
@@ -1038,6 +1272,15 @@ impl TerminalTool {
                      Use action=\"check\" with pid={} to see partial output, or action=\"kill\" with pid={} to stop it.",
                     elapsed, pid, pid, pid
                 );
+                if detach {
+                    msg.push_str(
+                        "\n\nDetached mode is enabled: this process will not be auto-killed at task end.",
+                    );
+                } else {
+                    msg.push_str(
+                        "\n\nThis process is task-owned and will be auto-killed when the current task ends.",
+                    );
+                }
                 if !partial_stdout.is_empty() {
                     msg.push_str(&format!("\n\nPartial output so far:\n{}", partial_stdout));
                 }
@@ -1065,6 +1308,7 @@ impl TerminalTool {
         if proc.reader_handle.is_finished() {
             // Process done — collect final output and remove from map.
             let proc = running.remove(&pid).unwrap();
+            self.remove_indexes_for_process(pid, &proc).await;
             proc.notify_on_completion.store(false, Ordering::Relaxed);
             let exit_code = proc.reader_handle.await.ok().flatten();
             let stdout = String::from_utf8_lossy(&proc.stdout_buf.lock().await).to_string();
@@ -1098,6 +1342,11 @@ impl TerminalTool {
                 "[Process pid={} still running ({} seconds elapsed, command: `{}`)]",
                 pid, elapsed, proc.command
             );
+            if proc.detached {
+                output.push_str("\n[mode: detached]");
+            } else if let Some(task_id) = proc.owner_task_id.as_deref() {
+                output.push_str(&format!("\n[mode: task-owned, task_id={}]", task_id));
+            }
             if !stdout_tail.is_empty() {
                 output.push_str(&format!("\n\nRecent stdout:\n{}", stdout_tail));
             }
@@ -1122,44 +1371,12 @@ impl TerminalTool {
                 pid
             ));
         };
-        proc.notify_on_completion.store(false, Ordering::Relaxed);
         drop(running);
+        self.remove_indexes_for_process(pid, &proc).await;
         self.completed.lock().await.remove(&pid);
 
-        // Send SIGTERM
-        let term_sent = send_sigterm(proc.child_id);
-
-        if term_sent {
-            // Wait up to 2 seconds for graceful shutdown
-            let finished = tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    if proc.reader_handle.is_finished() {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            })
-            .await;
-
-            if finished.is_err() && !proc.reader_handle.is_finished() {
-                // Still alive — SIGKILL
-                send_sigkill(proc.child_id);
-                // Give it a moment
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-
-        // Collect whatever output we have
-        let stdout = String::from_utf8_lossy(&proc.stdout_buf.lock().await).to_string();
-        let stderr = String::from_utf8_lossy(&proc.stderr_buf.lock().await).to_string();
-        let mut output = format!(
-            "[Process pid={} killed after {:.0}s (command: `{}`)]\n",
-            pid,
-            proc.started_at.elapsed().as_secs_f64(),
-            proc.command
-        );
-        output.push_str(&format_output(&stdout, &stderr, self.max_output_chars));
-        Ok(output)
+        self.terminate_running_process(pid, proc, "manual kill")
+            .await
     }
 }
 
@@ -1181,6 +1398,11 @@ struct TerminalArgs {
     #[serde(default = "default_action")]
     action: String,
     pid: Option<u32>,
+    /// If true, allow a timed-out command to outlive task boundaries.
+    /// Default false: timed-out background commands are task-owned and auto-cleaned
+    /// when the task ends.
+    #[serde(default, alias = "background")]
+    detach: bool,
     #[serde(default)]
     _untrusted_source: bool,
     #[serde(default)]
@@ -1216,7 +1438,7 @@ impl Tool for TerminalTool {
     fn schema(&self) -> Value {
         json!({
             "name": "terminal",
-            "description": "Execute any command available on this system — shell commands, CLI tools (python, node, claude, gemini, cargo, docker, git, etc.), scripts, and anything else installed. If the command is not pre-approved, the user will be asked to authorize it in real time via an inline button. Never assume a command is unavailable — try it.\n\nLong-running commands are handled automatically: if a command exceeds the timeout, it moves to the background and you get a pid. Use action=\"check\" to see progress or action=\"kill\" to stop it.\n\nIMPORTANT: Do not use heredoc (cat <<EOF), echo-redirect, or printf patterns to create files. Always use the `write_file` tool for file creation — it handles content atomically without shell quoting issues.",
+            "description": "Execute any command available on this system — shell commands, CLI tools (python, node, claude, gemini, cargo, docker, git, etc.), scripts, and anything else installed. If a command is not pre-approved, the user may be asked to authorize it in real time.\n\nLong-running commands: if execution exceeds the timeout, it is tracked in background with a pid. By default (`detach=false`), that background process is task-owned and is auto-killed when the task ends. Set `detach=true` only when intentional long-lived execution is required.\n\nIMPORTANT: Do not use heredoc (cat <<EOF), echo-redirect, or printf patterns to create files. Always use the `write_file` tool for file creation — it handles content atomically without shell quoting issues.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1228,6 +1450,10 @@ impl Tool for TerminalTool {
                         "type": "string",
                         "enum": ["run", "check", "kill", "trust_all"],
                         "description": "Action to perform: \"run\" (default) executes a command, \"check\" shows output of a background process, \"kill\" stops a background process, \"trust_all\" enables auto-approval for all commands (requires user confirmation)"
+                    },
+                    "detach": {
+                        "type": "boolean",
+                        "description": "For action=\"run\": if true, allows a timed-out command to keep running beyond task end. Default false."
                     },
                     "pid": {
                         "type": "integer",
@@ -1322,6 +1548,10 @@ impl Tool for TerminalTool {
                     .command
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("command is required for action=\"run\""))?;
+                let command = command.trim();
+                if command.is_empty() {
+                    anyhow::bail!("command must not be empty for action=\"run\"");
+                }
 
                 if let Some((pattern, path)) = detect_unscoped_recursive_grep(command) {
                     return Ok(recursive_grep_block_message(&pattern, &path));
@@ -1348,6 +1578,14 @@ impl Tool for TerminalTool {
                     if !is_owner {
                         return Ok(format!(
                             "Blocked: daemonization primitives detected ({}) and only owners can approve detached/background process commands.",
+                            daemon_hits.join(", ")
+                        ));
+                    }
+
+                    if !args.detach {
+                        return Ok(format!(
+                            "Blocked: daemonization primitives detected ({}). \
+                             Set `detach=true` explicitly for intentional long-lived background execution.",
                             daemon_hits.join(", ")
                         ));
                     }
@@ -1449,12 +1687,30 @@ impl Tool for TerminalTool {
                 // Check if this is a trusted session (explicitly set by ChannelContext,
                 // not derived from session ID strings — prevents session ID spoofing).
                 let is_trusted_session = args._trusted_session;
+                if args.detach && is_trusted_session {
+                    // Intentional: trusted scheduled sessions are auto-approved, so
+                    // disallow detached long-lived processes in that mode.
+                    return Ok(
+                        "Blocked: detach=true is not allowed for trusted scheduled sessions."
+                            .to_string(),
+                    );
+                }
+
+                if args.detach && !daemonization_approved {
+                    assessment.warnings.push(
+                        "Detached execution requested (process may outlive task boundaries)."
+                            .to_string(),
+                    );
+                }
 
                 // Determine if approval is needed
                 // Note: is_allowed() checks both permanent AND session-approved prefixes
                 let is_allowed = self.is_allowed(command).await;
                 let needs_approval = if daemonization_approved {
                     false
+                } else if args.detach {
+                    info!(command = %command, "Forcing approval: detach=true");
+                    true
                 } else if args._untrusted_source {
                     // External triggers always need approval regardless of mode
                     info!(command = %command, risk = %assessment.level, "Forcing approval: untrusted source");
@@ -1523,11 +1779,24 @@ impl Tool for TerminalTool {
                     command,
                     &notify_session_id,
                     args._goal_id.as_deref(),
+                    args._task_id.as_deref(),
+                    args.detach,
                     status_tx,
                 )
                 .await
             }
         }
+    }
+
+    async fn on_task_end(&self, task_id: &str, _session_id: &str) -> anyhow::Result<()> {
+        let cleaned = self.cleanup_task_processes(task_id).await?;
+        if cleaned > 0 {
+            info!(
+                task_id,
+                cleaned, "Cleaned up task-owned terminal background process(es)"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1536,7 +1805,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::{NotificationStore, StateStore};
+    use crate::traits::{NotificationStore, StateStore, Tool};
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1914,7 +2183,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(kill_response.contains("killed"));
+        assert!(kill_response.contains("stopped"));
 
         tokio::time::sleep(Duration::from_millis(500)).await;
         let pending = state.get_pending_notifications(20).await.unwrap();
@@ -1966,6 +2235,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_task_end_cleanup_kills_task_owned_background_processes() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            2000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"sleep 10","_session_id":"s1","_task_id":"task-clean","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(response.contains("Moved to background (pid="));
+        let pid = extract_pid_from_background_message(&response);
+
+        tool.on_task_end("task-clean", "s1").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let check = tool
+            .call(&format!(
+                r#"{{"action":"check","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
+                pid
+            ))
+            .await
+            .unwrap();
+        assert!(
+            check.contains("No tracked process"),
+            "expected task-end cleanup to remove process tracking, got: {}",
+            check
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_background_run_is_suppressed_within_goal_scope() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            2000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let first = tool
+            .call(
+                r#"{"action":"run","command":"sleep 5","_session_id":"sub-a","_task_id":"task-a","_goal_id":"goal-1","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        let pid = extract_pid_from_background_message(&first);
+
+        let second = tool
+            .call(
+                r#"{"action":"run","command":"sleep   5","_session_id":"sub-b","_task_id":"task-b","_goal_id":"goal-1","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            second.contains("Equivalent command is already running"),
+            "expected duplicate suppression, got: {}",
+            second
+        );
+        assert!(
+            second.contains(&format!("pid={}", pid)),
+            "expected duplicate response to reference original pid {}, got: {}",
+            pid,
+            second
+        );
+
+        tool.on_task_end("task-a", "sub-a").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_detached_background_process_survives_task_end_cleanup() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            2000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        tokio::spawn(async move {
+            while let Some(req) = approval_rx.recv().await {
+                let _ = req.response_tx.send(ApprovalResponse::AllowOnce);
+            }
+        });
+
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"sleep 3","detach":true,"_session_id":"s1","_task_id":"task-detach","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        let pid = extract_pid_from_background_message(&response);
+        assert!(response.contains("Moved to background (pid="));
+        assert!(response.contains("Detached mode is enabled"));
+
+        tool.on_task_end("task-detach", "s1").await.unwrap();
+        let check = tool
+            .call(&format!(
+                r#"{{"action":"check","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
+                pid
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !check.contains("No tracked process"),
+            "detached process should not be cleaned by task-end hook"
+        );
+
+        let _ = tool
+            .call(&format!(
+                r#"{{"action":"kill","pid":{},"_session_id":"s1","_user_role":"Owner"}}"#,
+                pid
+            ))
+            .await;
+    }
+
+    #[tokio::test]
     async fn test_daemon_command_returns_immediately_without_background_tracking() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
@@ -1991,7 +2400,7 @@ mod tests {
         let start = Instant::now();
         let response = tool
             .call(
-                r#"{"action":"run","command":"nohup sleep 5 & echo $!","_session_id":"s1","_user_role":"Owner"}"#,
+                r#"{"action":"run","command":"nohup sleep 5 & echo $!","detach":true,"_session_id":"s1","_user_role":"Owner"}"#,
             )
             .await
             .unwrap();
@@ -2005,7 +2414,7 @@ mod tests {
             elapsed
         );
         assert!(
-            response.contains("Background command launched successfully"),
+            response.contains("Detached background command launched"),
             "expected daemon early-return message, got: {}",
             response
         );

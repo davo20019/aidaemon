@@ -7,6 +7,8 @@ use crate::agent::recall_guardrails::{
 };
 use crate::agent::*;
 
+const MAX_SCHEDULE_SEGMENTS_PER_MESSAGE: usize = 10;
+
 impl Agent {
     fn extract_labeled_block(text: &str, label: &str, end_labels: &[&str]) -> Option<String> {
         let start = text.find(label)?;
@@ -73,6 +75,54 @@ impl Agent {
         }
     }
 
+    fn looks_like_schedule_only_description(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+        if crate::cron_utils::parse_schedule(trimmed).is_ok() {
+            return true;
+        }
+        if let Some((detected, _)) = crate::cron_utils::extract_schedule_from_text(trimmed) {
+            return detected.trim().eq_ignore_ascii_case(trimmed);
+        }
+        false
+    }
+
+    async fn emit_consultant_direct_reply(
+        &self,
+        ctx: &ConsultantOrchestrationCtx<'_>,
+        message: String,
+        completion_note: &str,
+    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+        let assistant_msg = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: ctx.session_id.to_string(),
+            role: "assistant".to_string(),
+            content: Some(message.clone()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.5,
+            embedding: None,
+        };
+        self.append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
+            .await?;
+        self.emit_task_end(
+            ctx.emitter,
+            ctx.task_id,
+            TaskStatus::Completed,
+            ctx.task_start,
+            ctx.iteration,
+            0,
+            None,
+            Some(completion_note.to_string()),
+        )
+        .await;
+        Ok(consultant_direct_return_ok(message))
+    }
+
     async fn confirm_scheduled_goal_activation(
         &self,
         ctx: &mut ConsultantOrchestrationCtx<'_>,
@@ -133,6 +183,117 @@ impl Agent {
         )
         .await;
         Ok(consultant_direct_return_ok(activation_msg))
+    }
+
+    async fn confirm_scheduled_goal_activation_batch(
+        &self,
+        ctx: &mut ConsultantOrchestrationCtx<'_>,
+        goals_and_schedules: &[(Goal, crate::traits::GoalSchedule)],
+        tz_label: &str,
+        completion_note: &str,
+    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+        let mut activated = Vec::new();
+        let mut activation_errors = Vec::new();
+
+        for (goal, schedule) in goals_and_schedules {
+            match self.state.activate_goal(&goal.id).await {
+                Ok(true) => {
+                    if let Some(ref registry) = self.goal_token_registry {
+                        registry.register(&goal.id).await;
+                    }
+                    let next_run = chrono::DateTime::parse_from_rfc3339(&schedule.next_run_at)
+                        .ok()
+                        .map(|dt| {
+                            dt.with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d %H:%M %Z")
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| "n/a".to_string());
+                    activated.push(format!("{} (next: {})", goal.description, next_run));
+                }
+                Ok(false) => {}
+                Err(e) => activation_errors.push(e.to_string()),
+            }
+        }
+
+        let activation_msg = if !activated.is_empty() && activation_errors.is_empty() {
+            if activated.len() == 1 {
+                format!(
+                    "Scheduled: {}. I'll execute it when the time comes. System timezone: {}.",
+                    activated[0], tz_label
+                )
+            } else {
+                format!(
+                    "Scheduled {} goals:\n- {}\nSystem timezone: {}.",
+                    activated.len(),
+                    activated.join("\n- "),
+                    tz_label
+                )
+            }
+        } else if !activated.is_empty() {
+            format!(
+                "Scheduled {} goals:\n- {}\nBut {} could not be activated: {}",
+                activated.len(),
+                activated.join("\n- "),
+                activation_errors.len(),
+                activation_errors.join("; ")
+            )
+        } else {
+            format!(
+                "I couldn't activate scheduled goals: {}",
+                activation_errors.join("; ")
+            )
+        };
+
+        let assistant_msg = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: ctx.session_id.to_string(),
+            role: "assistant".to_string(),
+            content: Some(activation_msg.clone()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.5,
+            embedding: None,
+        };
+        self.append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
+            .await?;
+        self.emit_task_end(
+            ctx.emitter,
+            ctx.task_id,
+            TaskStatus::Completed,
+            ctx.task_start,
+            ctx.iteration,
+            0,
+            None,
+            Some(completion_note.to_string()),
+        )
+        .await;
+        Ok(consultant_direct_return_ok(activation_msg))
+    }
+
+    async fn cancel_scheduled_goals_before_confirmation(
+        &self,
+        goals: &[Goal],
+    ) -> anyhow::Result<usize> {
+        let mut cancelled = 0usize;
+        for goal in goals {
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut updated = goal.clone();
+            updated.status = "cancelled".to_string();
+            updated.completed_at = Some(now.clone());
+            updated.updated_at = now;
+            if self.state.update_goal(&updated).await.is_ok() {
+                cancelled += 1;
+            }
+            if let Ok(schedules) = self.state.get_schedules_for_goal(&goal.id).await {
+                for schedule in &schedules {
+                    let _ = self.state.delete_goal_schedule(&schedule.id).await;
+                }
+            }
+        }
+        Ok(cancelled)
     }
 
     async fn ensure_orchestrator_tools_loaded(
@@ -304,6 +465,327 @@ impl Agent {
             return Ok(consultant_fallthrough());
         }
 
+        if is_internal_maintenance_intent(ctx.user_text) {
+            let msg = "Memory maintenance already runs via built-in background jobs (embeddings, consolidation, decay, retention). I won't create a scheduled goal for that.".to_string();
+            let assistant_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: ctx.session_id.to_string(),
+                role: "assistant".to_string(),
+                content: Some(msg.clone()),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.5,
+                embedding: None,
+            };
+            self.append_assistant_message_with_event(
+                ctx.emitter,
+                &assistant_msg,
+                "system",
+                None,
+                None,
+            )
+            .await?;
+            self.emit_task_end(
+                ctx.emitter,
+                ctx.task_id,
+                TaskStatus::Completed,
+                ctx.task_start,
+                ctx.iteration,
+                0,
+                None,
+                Some(msg.chars().take(200).collect()),
+            )
+            .await;
+            return Ok(consultant_direct_return_ok(msg));
+        }
+
+        let goal_user_text = ctx.turn_context.goal_user_text.clone();
+
+        // Multi-schedule path: parse all segments before creating any DB rows.
+        let extracted_segments = crate::cron_utils::extract_schedule_segments(ctx.user_text);
+        if extracted_segments.len() > MAX_SCHEDULE_SEGMENTS_PER_MESSAGE {
+            let msg = format!(
+                "I can schedule up to {} goals per message. Please split this into smaller batches and try again.",
+                MAX_SCHEDULE_SEGMENTS_PER_MESSAGE
+            );
+            return self
+                .emit_consultant_direct_reply(
+                    ctx,
+                    msg,
+                    "Rejected oversized multi-schedule request.",
+                )
+                .await;
+        }
+        if extracted_segments.len() > 1 {
+            let mut prepared_segments: Vec<(
+                String,
+                String,
+                String,
+                bool,
+                chrono::DateTime<chrono::Local>,
+            )> = Vec::new();
+            for segment in extracted_segments {
+                let cron_expr = match crate::cron_utils::parse_schedule(&segment.schedule_raw) {
+                    Ok(expr) => expr,
+                    Err(e) => {
+                        warn!(
+                            ctx.session_id,
+                            schedule_raw = %segment.schedule_raw,
+                            error = %e,
+                            "Multi-schedule parse failed — rejecting batch"
+                        );
+                        let msg = format!(
+                            "I couldn't parse one of the schedules ({}). Please resend with valid schedules so I can create them together.",
+                            segment.schedule_raw
+                        );
+                        return self
+                            .emit_consultant_direct_reply(
+                                ctx,
+                                msg,
+                                "Rejected multi-schedule request with invalid segment.",
+                            )
+                            .await;
+                    }
+                };
+                let cron_looks_one_shot = crate::cron_utils::is_one_shot_schedule(&cron_expr);
+                let actually_one_shot = cron_looks_one_shot || segment.is_one_shot;
+                let next_run_local = match crate::cron_utils::compute_next_run_local(&cron_expr) {
+                    Ok(next) => next,
+                    Err(e) => {
+                        warn!(
+                            ctx.session_id,
+                            schedule_raw = %segment.schedule_raw,
+                            error = %e,
+                            "Multi-schedule next-run computation failed — rejecting batch"
+                        );
+                        let msg = format!(
+                            "I couldn't compute the next run for one schedule ({}). Please resend with valid schedules so I can create them together.",
+                            segment.schedule_raw
+                        );
+                        return self
+                            .emit_consultant_direct_reply(
+                                ctx,
+                                msg,
+                                "Rejected multi-schedule request with invalid segment.",
+                            )
+                            .await;
+                    }
+                };
+                prepared_segments.push((
+                    segment.description,
+                    segment.schedule_raw,
+                    cron_expr,
+                    actually_one_shot,
+                    next_run_local,
+                ));
+            }
+
+            let goal_context = self
+                .build_goal_feed_forward_context(
+                    ctx.session_id,
+                    &goal_user_text,
+                    &ctx.turn_context.recent_messages,
+                    &ctx.turn_context.project_hints,
+                )
+                .await;
+
+            let mut created = Vec::<(Goal, crate::traits::GoalSchedule, String, String)>::new();
+            let mut created_goals_for_cleanup = Vec::<Goal>::new();
+            for (description, segment_schedule_raw, cron_expr, actually_one_shot, next_run_local) in
+                prepared_segments
+            {
+                let mut goal = if actually_one_shot {
+                    Goal::new_deferred_finite(&description, ctx.session_id)
+                } else {
+                    Goal::new_continuous_pending(&description, ctx.session_id, None, None)
+                };
+                if let Some(ref context) = goal_context {
+                    goal.context = Some(context.clone());
+                }
+
+                if let Err(e) = self.state.create_goal(&goal).await {
+                    let _ = self
+                        .cancel_scheduled_goals_before_confirmation(&created_goals_for_cleanup)
+                        .await;
+                    return Err(e);
+                }
+                created_goals_for_cleanup.push(goal.clone());
+
+                let now = chrono::Utc::now().to_rfc3339();
+                let schedule = crate::traits::GoalSchedule {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    goal_id: goal.id.clone(),
+                    cron_expr: cron_expr.clone(),
+                    tz: "local".to_string(),
+                    original_schedule: Some(segment_schedule_raw.clone()),
+                    fire_policy: "coalesce".to_string(),
+                    is_one_shot: actually_one_shot,
+                    is_paused: false,
+                    last_run_at: None,
+                    next_run_at: next_run_local.with_timezone(&chrono::Utc).to_rfc3339(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                if let Err(e) = self.state.create_goal_schedule(&schedule).await {
+                    let _ = self
+                        .cancel_scheduled_goals_before_confirmation(&created_goals_for_cleanup)
+                        .await;
+                    return Err(e);
+                }
+
+                let schedule_kind = if actually_one_shot {
+                    "one-time".to_string()
+                } else {
+                    "recurring".to_string()
+                };
+                let schedule_desc = if actually_one_shot {
+                    next_run_local.format("%Y-%m-%d %H:%M %Z").to_string()
+                } else {
+                    format!(
+                        "{} (next: {})",
+                        segment_schedule_raw,
+                        next_run_local.format("%Y-%m-%d %H:%M %Z")
+                    )
+                };
+                created.push((goal, schedule, schedule_kind, schedule_desc));
+            }
+
+            let tz_label = crate::cron_utils::system_timezone_display();
+            let goals_and_schedules = created
+                .iter()
+                .map(|(goal, schedule, _, _)| (goal.clone(), schedule.clone()))
+                .collect::<Vec<_>>();
+
+            let already_approved = {
+                let approved = self.schedule_approved_sessions.read().await;
+                approved.contains(ctx.session_id)
+            };
+            if already_approved {
+                return self
+                    .confirm_scheduled_goal_activation_batch(
+                        ctx,
+                        &goals_and_schedules,
+                        &tz_label,
+                        "Scheduled goals auto-confirmed from prior session approval.",
+                    )
+                    .await;
+            }
+
+            let inline_confirmation = {
+                let hub_weak = self.hub.read().await.clone();
+                if let Some(hub_weak) = hub_weak {
+                    if let Some(hub_arc) = hub_weak.upgrade() {
+                        let confirmation_desc =
+                            format!("Confirm {} scheduled goals", goals_and_schedules.len());
+                        let mut details = created
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, (goal, _, kind, schedule_desc))| {
+                                format!(
+                                    "{}. [{}] {} ({})",
+                                    idx + 1,
+                                    kind,
+                                    goal.description,
+                                    schedule_desc
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        details.push(format!("System timezone: {}", tz_label));
+                        Some(
+                            hub_arc
+                                .request_inline_goal_confirmation(
+                                    ctx.session_id,
+                                    &confirmation_desc,
+                                    &details,
+                                )
+                                .await,
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(confirmation_result) = inline_confirmation {
+                match confirmation_result {
+                    Ok(true) => {
+                        return self
+                            .confirm_scheduled_goal_activation_batch(
+                                ctx,
+                                &goals_and_schedules,
+                                &tz_label,
+                                "Scheduled goals confirmed via inline approval.",
+                            )
+                            .await;
+                    }
+                    Ok(false) => {
+                        let goals = created
+                            .iter()
+                            .map(|(goal, _, _, _)| goal.clone())
+                            .collect::<Vec<_>>();
+                        let cancelled = self
+                            .cancel_scheduled_goals_before_confirmation(&goals)
+                            .await
+                            .unwrap_or(0);
+                        let cancel_msg = if cancelled == 1 {
+                            "OK, cancelled the scheduled goal.".to_string()
+                        } else {
+                            format!(
+                                "OK, cancelled {} scheduled goals.",
+                                cancelled.max(goals.len())
+                            )
+                        };
+                        return self
+                            .emit_consultant_direct_reply(
+                                ctx,
+                                cancel_msg,
+                                "Scheduled goals cancelled via inline approval.",
+                            )
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            ctx.session_id,
+                            error = %e,
+                            "Inline goal confirmation unavailable; falling back to text confirmation"
+                        );
+                    }
+                }
+            }
+
+            let summary_lines = created
+                .iter()
+                .enumerate()
+                .map(|(idx, (goal, _, kind, schedule_desc))| {
+                    format!(
+                        "{}. [{}] {} ({})",
+                        idx + 1,
+                        kind,
+                        goal.description,
+                        schedule_desc
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let confirmation = format!(
+                "I'll schedule these {} goals:\n{}\nSystem timezone: {}.\nReply **confirm** to proceed or **cancel** to discard.",
+                created.len(),
+                summary_lines,
+                tz_label
+            );
+            return self
+                .emit_consultant_direct_reply(
+                    ctx,
+                    confirmation,
+                    "Scheduled goals awaiting text confirmation.",
+                )
+                .await;
+        }
+
         let mut cron_expr = schedule_cron
             .as_ref()
             .filter(|candidate| {
@@ -348,9 +830,6 @@ impl Agent {
         let cron_expr = match cron_expr {
             Some(expr) => expr,
             None => {
-                // Schedule parse failed — fall through to the
-                // full agent loop instead of giving up. The LLM
-                // with tools can handle the request directly.
                 warn!(
                     ctx.session_id,
                     schedule_raw = %schedule_raw,
@@ -361,51 +840,78 @@ impl Agent {
             }
         };
 
-        // Cron-shape heuristic override: if the cron pins a specific
-        // day+month it is clearly one-shot regardless of what the LLM
-        // classified (LLMs often return "recurring" for "in 2 minutes").
         let cron_looks_one_shot = crate::cron_utils::is_one_shot_schedule(&cron_expr);
         let actually_one_shot = cron_looks_one_shot || is_one_shot;
 
-        if is_internal_maintenance_intent(ctx.user_text) {
-            let msg = "Memory maintenance already runs via built-in background jobs (embeddings, consolidation, decay, retention). I won't create a scheduled goal for that.".to_string();
-            let assistant_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: ctx.session_id.to_string(),
-                role: "assistant".to_string(),
-                content: Some(msg.clone()),
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls_json: None,
-                created_at: Utc::now(),
-                importance: 0.5,
-                embedding: None,
+        let current_turn_description =
+            crate::cron_utils::clean_task_description(ctx.user_text, &schedule_raw);
+        let mut goal_description =
+            if !Self::looks_like_schedule_only_description(&current_turn_description) {
+                current_turn_description
+            } else {
+                let composed =
+                    Self::build_scheduled_goal_description(ctx.user_text, &goal_user_text);
+                let cleaned_composed =
+                    crate::cron_utils::clean_task_description(&composed, &schedule_raw);
+                if Self::looks_like_schedule_only_description(&cleaned_composed) {
+                    composed
+                } else {
+                    cleaned_composed
+                }
             };
-            self.append_assistant_message_with_event(
-                ctx.emitter,
-                &assistant_msg,
-                "system",
-                None,
-                None,
-            )
-            .await?;
-            self.emit_task_end(
-                ctx.emitter,
-                ctx.task_id,
-                TaskStatus::Completed,
-                ctx.task_start,
-                ctx.iteration,
-                0,
-                None,
-                Some(msg.chars().take(200).collect()),
-            )
-            .await;
-            return Ok(consultant_direct_return_ok(msg));
+        if goal_description.trim().is_empty() {
+            goal_description = ctx.user_text.trim().to_string();
         }
 
-        let goal_user_text = ctx.turn_context.goal_user_text.clone();
-        let goal_description =
-            Self::build_scheduled_goal_description(ctx.user_text, &goal_user_text);
+        // Duplicate detection: check for existing goals with matching description + schedule.
+        let target_desc_canonical = goal_description
+            .trim()
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let target_cron = cron_expr.trim().to_ascii_lowercase();
+        if let Ok(existing_goals) = self.state.get_scheduled_goals().await {
+            for existing in &existing_goals {
+                if existing.session_id != ctx.session_id {
+                    continue;
+                }
+                if !matches!(
+                    existing.status.as_str(),
+                    "active" | "pending_confirmation" | "paused"
+                ) {
+                    continue;
+                }
+                let existing_desc = existing
+                    .description
+                    .trim()
+                    .to_ascii_lowercase()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if existing_desc != target_desc_canonical {
+                    continue;
+                }
+                if let Ok(schedules) = self.state.get_schedules_for_goal(&existing.id).await {
+                    let has_matching_cron = schedules
+                        .iter()
+                        .any(|s| s.cron_expr.trim().to_ascii_lowercase() == target_cron);
+                    if has_matching_cron {
+                        let msg = format!(
+                            "A similar scheduled goal already exists ({}). Use \"list my scheduled goals\" to inspect existing goals.",
+                            &existing.id[..8]
+                        );
+                        return self
+                            .emit_consultant_direct_reply(
+                                ctx,
+                                msg,
+                                "Duplicate scheduled goal detected in fast-path.",
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
 
         let mut goal = if actually_one_shot {
             Goal::new_deferred_finite(&goal_description, ctx.session_id)
@@ -521,51 +1027,18 @@ impl Agent {
                         .await;
                 }
                 Ok(false) => {
-                    let now = chrono::Utc::now().to_rfc3339();
-                    goal.status = "cancelled".to_string();
-                    goal.completed_at = Some(now.clone());
-                    goal.updated_at = now;
-                    let _ = self.state.update_goal(&goal).await;
-                    // Best-effort cleanup: schedules were created pre-confirmation.
-                    if let Ok(schedules) = self.state.get_schedules_for_goal(&goal.id).await {
-                        for s in &schedules {
-                            let _ = self.state.delete_goal_schedule(&s.id).await;
-                        }
-                    }
+                    let _ = self
+                        .cancel_scheduled_goals_before_confirmation(&[goal.clone()])
+                        .await;
 
                     let cancel_msg = "OK, cancelled the scheduled goal.".to_string();
-                    let assistant_msg = Message {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: ctx.session_id.to_string(),
-                        role: "assistant".to_string(),
-                        content: Some(cancel_msg.clone()),
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_calls_json: None,
-                        created_at: Utc::now(),
-                        importance: 0.5,
-                        embedding: None,
-                    };
-                    self.append_assistant_message_with_event(
-                        ctx.emitter,
-                        &assistant_msg,
-                        "system",
-                        None,
-                        None,
-                    )
-                    .await?;
-                    self.emit_task_end(
-                        ctx.emitter,
-                        ctx.task_id,
-                        TaskStatus::Completed,
-                        ctx.task_start,
-                        ctx.iteration,
-                        0,
-                        None,
-                        Some("Scheduled goal cancelled via inline approval.".to_string()),
-                    )
-                    .await;
-                    return Ok(consultant_direct_return_ok(cancel_msg));
+                    return self
+                        .emit_consultant_direct_reply(
+                            ctx,
+                            cancel_msg,
+                            "Scheduled goal cancelled via inline approval.",
+                        )
+                        .await;
                 }
                 Err(e) => {
                     warn!(
@@ -582,32 +1055,12 @@ impl Agent {
             schedule_kind, schedule_desc, goal.description, tz_label
         );
 
-        let assistant_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: ctx.session_id.to_string(),
-            role: "assistant".to_string(),
-            content: Some(confirmation.clone()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.5,
-            embedding: None,
-        };
-        self.append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
-            .await?;
-        self.emit_task_end(
-            ctx.emitter,
-            ctx.task_id,
-            TaskStatus::Completed,
-            ctx.task_start,
-            ctx.iteration,
-            0,
-            None,
-            Some("Scheduled goal awaiting text confirmation.".to_string()),
+        self.emit_consultant_direct_reply(
+            ctx,
+            confirmation,
+            "Scheduled goal awaiting text confirmation.",
         )
-        .await;
-        Ok(consultant_direct_return_ok(confirmation))
+        .await
     }
 
     async fn handle_knowledge_intent(
