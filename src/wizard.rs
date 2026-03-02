@@ -565,6 +565,13 @@ working_memory_cap = 50
 
 [terminal]
 allowed_prefixes = ["ls", "cat", "echo", "date", "whoami", "uname", "df", "du", "ps"]
+web_app_url = "https://terminal.aidaemon.ai"
+bridge_enabled = true
+daemon_ws_url = "wss://terminal.aidaemon.ai/v1/ws/daemon"
+# Optional static daemon connector token; leave unset for secure auto-bootstrap.
+# daemon_connect_token = "keychain"
+# Optional insecure fallback; keep disabled unless you intentionally need break-glass recovery.
+# allow_static_token_fallback = false
 
 [daemon]
 health_port = 8080

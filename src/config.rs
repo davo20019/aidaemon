@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Helper to format a redacted secret field for Debug output.
 /// Shows "[REDACTED]" if the value is non-empty, "\"\"" if empty.
@@ -53,17 +53,246 @@ fn keychain_disabled() -> bool {
     std::env::var("AIDAEMON_NO_KEYCHAIN").is_ok_and(|v| v == "1" || v == "true")
 }
 
-pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
-    // Try env var first (uppercased key name, e.g. oauth_google_access_token → OAUTH_GOOGLE_ACCESS_TOKEN).
-    // This allows .env-based credential storage for headless/remote operation.
+fn resolve_env_file_path() -> PathBuf {
+    if let Ok(path) = std::env::var("AIDAEMON_ENV_FILE") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    PathBuf::from(".env")
+}
+
+fn env_file_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn is_env_key_assignment(line: &str, env_key: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    let Some((k, _)) = trimmed.split_once('=') else {
+        return false;
+    };
+    k.trim() == env_key
+}
+
+fn encode_env_value(value: &str) -> String {
+    let is_simple = value.bytes().all(|b| {
+        matches!(
+            b,
+            b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'_'
+                | b'-'
+                | b'.'
+                | b'/'
+                | b':'
+                | b'@'
+                | b'+'
+                | b'='
+        )
+    });
+    if is_simple {
+        return value.to_string();
+    }
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '$' => escaped.push_str("\\$"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(ch),
+        }
+    }
+    format!("\"{}\"", escaped)
+}
+
+#[cfg(unix)]
+fn set_file_mode_0600(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_file_mode_0600(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn upsert_env_secret(field_name: &str, value: &str) -> anyhow::Result<()> {
+    let _guard = env_file_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Failed to lock env file writer"))?;
+    let env_path = resolve_env_file_path();
     let env_key = field_name.to_uppercase();
-    if let Ok(val) = std::env::var(&env_key) {
-        if !val.is_empty() {
-            return Ok(val);
+    let assignment = format!("{}={}", env_key, encode_env_value(value));
+
+    let mut lines: Vec<String> = if env_path.exists() {
+        std::fs::read_to_string(&env_path)?
+            .lines()
+            .map(|l| l.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut replaced = false;
+    for line in &mut lines {
+        if is_env_key_assignment(line, &env_key) {
+            *line = assignment.clone();
+            replaced = true;
+        }
+    }
+    if !replaced {
+        lines.push(assignment);
+    }
+
+    if let Some(parent) = env_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
         }
     }
 
+    let mut body = lines.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    std::fs::write(&env_path, body)?;
+    set_file_mode_0600(&env_path)?;
+    Ok(())
+}
+
+fn remove_env_secret(field_name: &str) -> anyhow::Result<()> {
+    let _guard = env_file_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Failed to lock env file writer"))?;
+    let env_path = resolve_env_file_path();
+    if !env_path.exists() {
+        return Ok(());
+    }
+
+    let env_key = field_name.to_uppercase();
+    let mut lines: Vec<String> = std::fs::read_to_string(&env_path)?
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+    let original_len = lines.len();
+    lines.retain(|line| !is_env_key_assignment(line, &env_key));
+
+    if lines.len() == original_len {
+        return Ok(());
+    }
+
+    let mut body = lines.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    std::fs::write(&env_path, body)?;
+    set_file_mode_0600(&env_path)?;
+    Ok(())
+}
+
+fn decode_env_value_loose(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let inner = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        &trimmed[1..trimmed.len().saturating_sub(1)]
+    } else {
+        trimmed
+    };
+
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('$') => out.push('$'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn read_env_secret_from_file(env_path: &Path, env_key: &str) -> anyhow::Result<Option<String>> {
+    if !env_path.exists() {
+        return Ok(None);
+    }
+
+    let mut found_via_dotenv: Option<String> = None;
+    if let Ok(iter) = dotenvy::from_path_iter(env_path) {
+        for entry in iter {
+            match entry {
+                Ok((key, value)) => {
+                    if key == env_key {
+                        found_via_dotenv = Some(value);
+                    }
+                }
+                Err(_) => {
+                    // Ignore malformed lines and continue parsing other entries.
+                    continue;
+                }
+            }
+        }
+    }
+    if found_via_dotenv.is_some() {
+        return Ok(found_via_dotenv);
+    }
+
+    let content = std::fs::read_to_string(env_path)?;
+    let mut found_via_loose_scan: Option<String> = None;
+    for line in content.lines() {
+        if is_env_key_assignment(line, env_key) {
+            if let Some((_, raw_value)) = line.split_once('=') {
+                found_via_loose_scan = Some(decode_env_value_loose(raw_value));
+            }
+        }
+    }
+    Ok(found_via_loose_scan)
+}
+
+pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
+    let env_key = field_name.to_uppercase();
+
     if keychain_disabled() {
+        let env_path = resolve_env_file_path();
+        if env_path.exists() {
+            if let Some(val) = read_env_secret_from_file(&env_path, &env_key)? {
+                if !val.is_empty() {
+                    return Ok(val);
+                }
+            }
+            anyhow::bail!(
+                "Keychain disabled and env var '{}' not found in '{}'",
+                env_key,
+                env_path.display()
+            );
+        }
+
+        if let Ok(val) = std::env::var(&env_key) {
+            if !val.is_empty() {
+                return Ok(val);
+            }
+        }
+
         anyhow::bail!(
             "Keychain disabled and env var '{}' not set for '{}'",
             env_key,
@@ -79,11 +308,7 @@ pub fn resolve_from_keychain(field_name: &str) -> anyhow::Result<String> {
 /// Store a secret in the OS keychain under the `aidaemon` service.
 pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
     if keychain_disabled() {
-        anyhow::bail!(
-            "Keychain disabled — set env var {}={} to persist this credential",
-            field_name.to_uppercase(),
-            "[REDACTED]"
-        );
+        return upsert_env_secret(field_name, value);
     }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
     entry.set_password(value)?;
@@ -93,7 +318,7 @@ pub fn store_in_keychain(field_name: &str, value: &str) -> anyhow::Result<()> {
 /// Delete a secret from the OS keychain.
 pub fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
     if keychain_disabled() {
-        return Ok(());
+        return remove_env_secret(field_name);
     }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, field_name)?;
     entry
@@ -583,10 +808,26 @@ fn default_max_facts() -> usize {
 /// Permission mode re-exported for config deserialization.
 pub use crate::tools::command_risk::PermissionMode;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct TerminalConfig {
     #[serde(default = "default_allowed_prefixes")]
     pub allowed_prefixes: Vec<String>,
+    #[serde(default = "default_terminal_web_app_url")]
+    pub web_app_url: String,
+    #[serde(default = "default_terminal_bridge_enabled")]
+    pub bridge_enabled: bool,
+    #[serde(default = "default_terminal_bridge_ws_url")]
+    pub daemon_ws_url: String,
+    #[serde(default)]
+    pub daemon_connect_token: Option<String>,
+    #[serde(default)]
+    pub allow_static_token_fallback: bool,
+    #[serde(default)]
+    pub daemon_user_id: Option<u64>,
+    #[serde(default)]
+    pub daemon_device_id: Option<String>,
+    #[serde(default)]
+    pub daemon_shell: Option<String>,
     #[serde(default = "default_initial_timeout_secs")]
     pub initial_timeout_secs: u64,
     #[serde(default = "default_max_output_chars")]
@@ -603,10 +844,129 @@ impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             allowed_prefixes: default_allowed_prefixes(),
+            web_app_url: default_terminal_web_app_url(),
+            bridge_enabled: default_terminal_bridge_enabled(),
+            daemon_ws_url: default_terminal_bridge_ws_url(),
+            daemon_connect_token: None,
+            allow_static_token_fallback: false,
+            daemon_user_id: None,
+            daemon_device_id: None,
+            daemon_shell: None,
             initial_timeout_secs: default_initial_timeout_secs(),
             max_output_chars: default_max_output_chars(),
             permission_mode: PermissionMode::default(),
         }
+    }
+}
+
+impl fmt::Debug for TerminalConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TerminalConfig")
+            .field("allowed_prefixes", &self.allowed_prefixes)
+            .field("web_app_url", &self.web_app_url)
+            .field("bridge_enabled", &self.bridge_enabled)
+            .field("daemon_ws_url", &self.daemon_ws_url)
+            .field(
+                "daemon_connect_token",
+                &self.daemon_connect_token.as_ref().map(|v| {
+                    if v.is_empty() {
+                        "\"\""
+                    } else {
+                        "[REDACTED]"
+                    }
+                }),
+            )
+            .field(
+                "allow_static_token_fallback",
+                &self.allow_static_token_fallback,
+            )
+            .field("daemon_user_id", &self.daemon_user_id)
+            .field("daemon_device_id", &self.daemon_device_id)
+            .field("daemon_shell", &self.daemon_shell)
+            .field("initial_timeout_secs", &self.initial_timeout_secs)
+            .field("max_output_chars", &self.max_output_chars)
+            .field("permission_mode", &self.permission_mode)
+            .finish()
+    }
+}
+
+impl TerminalConfig {
+    /// Returns the effective Telegram terminal web app URL.
+    /// Environment variable override is useful for local/staging validation.
+    pub fn effective_web_app_url(&self) -> String {
+        let from_env = std::env::var("AIDAEMON_TERMINAL_WEB_APP_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        from_env.unwrap_or_else(|| self.web_app_url.trim().to_string())
+    }
+
+    pub fn effective_bridge_enabled(&self) -> bool {
+        let from_env = std::env::var("AIDAEMON_TERMINAL_BRIDGE_ENABLED")
+            .ok()
+            .and_then(|v| parse_bool_like(&v));
+        from_env.unwrap_or(self.bridge_enabled)
+    }
+
+    pub fn effective_daemon_ws_url(&self) -> String {
+        let from_env = std::env::var("AIDAEMON_TERMINAL_BROKER_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        from_env.unwrap_or_else(|| self.daemon_ws_url.trim().to_string())
+    }
+
+    pub fn effective_daemon_connect_token(&self) -> Option<String> {
+        let from_env = std::env::var("AIDAEMON_TERMINAL_DAEMON_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        from_env.or_else(|| {
+            self.daemon_connect_token
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+    }
+
+    pub fn effective_allow_static_token_fallback(&self) -> bool {
+        let from_env = std::env::var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK")
+            .ok()
+            .and_then(|v| parse_bool_like(&v));
+        from_env.unwrap_or(self.allow_static_token_fallback)
+    }
+
+    pub fn effective_daemon_user_id(&self) -> Option<u64> {
+        let from_env = std::env::var("AIDAEMON_TERMINAL_USER_ID")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        from_env.or(self.daemon_user_id)
+    }
+
+    pub fn effective_daemon_device_id(&self) -> Option<String> {
+        let from_env = std::env::var("AIDAEMON_TERMINAL_DEVICE_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        from_env.or_else(|| {
+            self.daemon_device_id
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+    }
+
+    pub fn effective_daemon_shell(&self) -> Option<String> {
+        let from_env = std::env::var("AIDAEMON_TERMINAL_SHELL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        from_env.or_else(|| {
+            self.daemon_shell
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
     }
 }
 
@@ -625,6 +985,23 @@ fn default_initial_timeout_secs() -> u64 {
 }
 fn default_max_output_chars() -> usize {
     4000
+}
+fn parse_bool_like(value: &str) -> Option<bool> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+fn default_terminal_web_app_url() -> String {
+    "https://terminal.aidaemon.ai".to_string()
+}
+fn default_terminal_bridge_enabled() -> bool {
+    true
+}
+fn default_terminal_bridge_ws_url() -> String {
+    "wss://terminal.aidaemon.ai/v1/ws/daemon".to_string()
 }
 
 fn default_allowed_prefixes() -> Vec<String> {
@@ -1895,6 +2272,10 @@ impl AppConfig {
         if self.search.api_key == "keychain" {
             self.search.api_key = resolve_from_keychain("search_api_key")?;
         }
+        if self.terminal.daemon_connect_token.as_deref() == Some("keychain") {
+            self.terminal.daemon_connect_token =
+                Some(resolve_from_keychain("terminal_daemon_connect_token")?);
+        }
 
         #[cfg(feature = "discord")]
         {
@@ -1973,9 +2354,30 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use once_cell::sync::Lazy;
+
+    static ENV_EXPANSION_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
+    static TERMINAL_WEB_APP_URL_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
+        Lazy::new(|| std::sync::Mutex::new(()));
+    static TERMINAL_BRIDGE_ENABLED_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
+        Lazy::new(|| std::sync::Mutex::new(()));
+    static TERMINAL_STATIC_FALLBACK_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
+        Lazy::new(|| std::sync::Mutex::new(()));
+    static KEYCHAIN_ENV_FILE_LOCK: Lazy<std::sync::Mutex<()>> =
+        Lazy::new(|| std::sync::Mutex::new(()));
+
+    fn restore_env_var(name: &str, old_value: Option<String>) {
+        if let Some(old) = old_value {
+            std::env::set_var(name, old);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
 
     #[test]
+    #[serial_test::serial(env_vars)]
     fn expand_env_vars_replaces_set_variable() {
+        let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
         std::env::set_var("AIDAEMON_TEST_VAR", "hello");
         let result = expand_env_vars("key = \"${AIDAEMON_TEST_VAR}\"").unwrap();
         assert_eq!(result, "key = \"hello\"");
@@ -1983,7 +2385,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env_vars)]
     fn expand_env_vars_errors_on_missing() {
+        let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
         std::env::remove_var("AIDAEMON_MISSING_VAR");
         let result = expand_env_vars("key = \"${AIDAEMON_MISSING_VAR}\"");
         assert!(result.is_err());
@@ -1999,7 +2403,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env_vars)]
     fn expand_env_vars_handles_multiple() {
+        let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
         std::env::set_var("AIDAEMON_TEST_A", "aaa");
         std::env::set_var("AIDAEMON_TEST_B", "bbb");
         let result =
@@ -2017,7 +2423,112 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env_vars)]
+    fn store_in_keychain_writes_env_file_when_keychain_disabled() {
+        let _guard = KEYCHAIN_ENV_FILE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join(".env.test");
+        std::fs::write(&env_path, "EXISTING=1\n").unwrap();
+
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_env_file = std::env::var("AIDAEMON_ENV_FILE").ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var("AIDAEMON_ENV_FILE", env_path.to_string_lossy().to_string());
+
+        store_in_keychain("oauth_twitter_access_token", "new token$1")
+            .expect("write oauth token to env");
+
+        let content = std::fs::read_to_string(&env_path).expect("read env file");
+        assert!(content.contains("EXISTING=1"));
+        assert!(content.contains("OAUTH_TWITTER_ACCESS_TOKEN=\"new token\\$1\""));
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var("AIDAEMON_ENV_FILE", old_env_file);
+    }
+
+    #[test]
+    #[serial_test::serial(env_vars)]
+    fn delete_from_keychain_removes_env_file_key_when_keychain_disabled() {
+        let _guard = KEYCHAIN_ENV_FILE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join(".env.test");
+        std::fs::write(
+            &env_path,
+            "KEEP=1\nOAUTH_TWITTER_ACCESS_TOKEN=oldtoken\nANOTHER=2\n",
+        )
+        .unwrap();
+
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_env_file = std::env::var("AIDAEMON_ENV_FILE").ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var("AIDAEMON_ENV_FILE", env_path.to_string_lossy().to_string());
+
+        delete_from_keychain("oauth_twitter_access_token").expect("delete oauth token from env");
+
+        let content = std::fs::read_to_string(&env_path).expect("read env file");
+        assert!(content.contains("KEEP=1"));
+        assert!(content.contains("ANOTHER=2"));
+        assert!(!content.contains("OAUTH_TWITTER_ACCESS_TOKEN"));
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var("AIDAEMON_ENV_FILE", old_env_file);
+    }
+
+    #[test]
+    #[serial_test::serial(env_vars)]
+    fn resolve_from_keychain_reads_env_file_when_keychain_disabled() {
+        let _guard = KEYCHAIN_ENV_FILE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join(".env.test");
+        std::fs::write(&env_path, "OAUTH_TWITTER_CLIENT_ID=client123\n").unwrap();
+
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_env_file = std::env::var("AIDAEMON_ENV_FILE").ok();
+        let old_client_id = std::env::var("OAUTH_TWITTER_CLIENT_ID").ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var("AIDAEMON_ENV_FILE", env_path.to_string_lossy().to_string());
+        std::env::remove_var("OAUTH_TWITTER_CLIENT_ID");
+
+        let value = resolve_from_keychain("oauth_twitter_client_id").expect("resolve client id");
+        assert_eq!(value, "client123");
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var("AIDAEMON_ENV_FILE", old_env_file);
+        restore_env_var("OAUTH_TWITTER_CLIENT_ID", old_client_id);
+    }
+
+    #[test]
+    #[serial_test::serial(env_vars)]
+    fn resolve_from_keychain_tolerates_malformed_env_lines() {
+        let _guard = KEYCHAIN_ENV_FILE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join(".env.test");
+        std::fs::write(
+            &env_path,
+            "BROKEN=\"unterminated\nOAUTH_TWITTER_CLIENT_ID=client123\n",
+        )
+        .unwrap();
+
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_env_file = std::env::var("AIDAEMON_ENV_FILE").ok();
+        let old_client_id = std::env::var("OAUTH_TWITTER_CLIENT_ID").ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var("AIDAEMON_ENV_FILE", env_path.to_string_lossy().to_string());
+        std::env::remove_var("OAUTH_TWITTER_CLIENT_ID");
+
+        let value = resolve_from_keychain("oauth_twitter_client_id")
+            .expect("resolve client id despite malformed env line");
+        assert_eq!(value, "client123");
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var("AIDAEMON_ENV_FILE", old_env_file);
+        restore_env_var("OAUTH_TWITTER_CLIENT_ID", old_client_id);
+    }
+
+    #[test]
+    #[serial_test::serial(env_vars)]
     fn expand_env_vars_reports_all_missing() {
+        let _guard = ENV_EXPANSION_LOCK.lock().unwrap();
         std::env::remove_var("AIDAEMON_MISS_X");
         std::env::remove_var("AIDAEMON_MISS_Y");
         let result = expand_env_vars("a = \"${AIDAEMON_MISS_X}\"\nb = \"${AIDAEMON_MISS_Y}\"");
@@ -2025,6 +2536,105 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("AIDAEMON_MISS_X"));
         assert!(msg.contains("AIDAEMON_MISS_Y"));
+    }
+
+    #[test]
+    #[serial_test::serial(env_vars)]
+    fn terminal_web_app_url_defaults_to_hosted_terminal() {
+        let _guard = TERMINAL_WEB_APP_URL_ENV_LOCK.lock().unwrap();
+        let old = std::env::var("AIDAEMON_TERMINAL_WEB_APP_URL").ok();
+        std::env::remove_var("AIDAEMON_TERMINAL_WEB_APP_URL");
+        let cfg = TerminalConfig::default();
+        assert_eq!(cfg.effective_web_app_url(), "https://terminal.aidaemon.ai");
+        if let Some(old) = old {
+            std::env::set_var("AIDAEMON_TERMINAL_WEB_APP_URL", old);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(env_vars)]
+    fn terminal_web_app_url_env_override_wins() {
+        let _guard = TERMINAL_WEB_APP_URL_ENV_LOCK.lock().unwrap();
+        let old = std::env::var("AIDAEMON_TERMINAL_WEB_APP_URL").ok();
+        std::env::set_var(
+            "AIDAEMON_TERMINAL_WEB_APP_URL",
+            "https://terminal.dev.aidaemon.ai",
+        );
+        let cfg = TerminalConfig {
+            web_app_url: "https://terminal.aidaemon.ai".to_string(),
+            ..TerminalConfig::default()
+        };
+        assert_eq!(
+            cfg.effective_web_app_url(),
+            "https://terminal.dev.aidaemon.ai"
+        );
+        if let Some(old) = old {
+            std::env::set_var("AIDAEMON_TERMINAL_WEB_APP_URL", old);
+        } else {
+            std::env::remove_var("AIDAEMON_TERMINAL_WEB_APP_URL");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(env_vars)]
+    fn terminal_bridge_enabled_defaults_to_true() {
+        let _guard = TERMINAL_BRIDGE_ENABLED_ENV_LOCK.lock().unwrap();
+        let old = std::env::var("AIDAEMON_TERMINAL_BRIDGE_ENABLED").ok();
+        std::env::remove_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED");
+        let cfg = TerminalConfig::default();
+        assert!(cfg.effective_bridge_enabled());
+        if let Some(old) = old {
+            std::env::set_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED", old);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(env_vars)]
+    fn terminal_bridge_enabled_env_override_wins() {
+        let _guard = TERMINAL_BRIDGE_ENABLED_ENV_LOCK.lock().unwrap();
+        let old = std::env::var("AIDAEMON_TERMINAL_BRIDGE_ENABLED").ok();
+        std::env::set_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED", "false");
+        let cfg = TerminalConfig {
+            bridge_enabled: true,
+            ..TerminalConfig::default()
+        };
+        assert!(!cfg.effective_bridge_enabled());
+        if let Some(old) = old {
+            std::env::set_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED", old);
+        } else {
+            std::env::remove_var("AIDAEMON_TERMINAL_BRIDGE_ENABLED");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(env_vars)]
+    fn terminal_static_fallback_defaults_to_disabled() {
+        let _guard = TERMINAL_STATIC_FALLBACK_ENV_LOCK.lock().unwrap();
+        let old = std::env::var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK").ok();
+        std::env::remove_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK");
+        let cfg = TerminalConfig::default();
+        assert!(!cfg.effective_allow_static_token_fallback());
+        if let Some(old) = old {
+            std::env::set_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK", old);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(env_vars)]
+    fn terminal_static_fallback_env_override_wins() {
+        let _guard = TERMINAL_STATIC_FALLBACK_ENV_LOCK.lock().unwrap();
+        let old = std::env::var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK").ok();
+        std::env::set_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK", "true");
+        let cfg = TerminalConfig {
+            allow_static_token_fallback: false,
+            ..TerminalConfig::default()
+        };
+        assert!(cfg.effective_allow_static_token_fallback());
+        if let Some(old) = old {
+            std::env::set_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK", old);
+        } else {
+            std::env::remove_var("AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK");
+        }
     }
 
     #[test]

@@ -141,6 +141,8 @@ pub async fn build_channels(
     let inbox_dir = PathBuf::from(inbox_dir);
     let files_enabled = config.files.enabled;
     let max_file_size_mb = config.files.max_file_size_mb;
+    let terminal_web_app_url = config.terminal.effective_web_app_url();
+    let terminal_allowed_prefixes = config.terminal.allowed_prefixes.clone();
 
     let make_telegram = |bot_token: &str, allowed_user_ids: Vec<u64>| -> Arc<TelegramChannel> {
         Arc::new(TelegramChannel::new(
@@ -156,6 +158,8 @@ pub async fn build_channels(
             max_file_size_mb,
             state.clone(),
             watchdog_stale_threshold_secs,
+            terminal_web_app_url.clone(),
+            terminal_allowed_prefixes.clone(),
         ))
     };
 

@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.10] - 2026-03-01
+
+### Added
+
+- **Terminal bridge daemon**: New WebSocket-based daemon (`terminal_bridge.rs`) connects to the terminal.aidaemon.ai broker, enabling Telegram Mini App terminal sessions from anywhere. Secure P-256 ECDH key exchange with AES-256-GCM encrypted message tunnel. Supports PTY-based interactive shell sessions with real-time output streaming, sequence-numbered frames for replay, and session isolation.
+- **Terminal Lite (chat-based shell)**: `/terminal lite [agent] [working_dir]` starts an interactive shell session directly in Telegram chat without the Mini App. Supports `cd`, command prefix validation, TUI app detection, and 90-second execution timeout.
+- **Agent launcher commands**: `/agent [agent] [working_dir]` launches the full Mini App terminal. `/agent flags [agent]` discovers available CLI flags with 24-hour caching. `/agent defaults [action] [agent] [flags...]` persists default flags per agent per chat.
+- **Code review workflow**: Structured review payloads with git diff capture, file change context collection, multiple review profiles, and streaming review output. Max 220K chars context with smart filtering of binary/generated files.
+- **File upload support**: Chunked uploads (32 KiB per chunk) with TTL-based cleanup, concurrent upload tracking (max 4 pending per session), and mime type validation.
+- **New Telegram commands**: `/models` lists available models with active marker, `/auto` re-enables automatic model routing, `/reload` hot-reloads config with `.toml.bak` auto-restore, `/restart` performs graceful daemon restart, `/tasks` lists active tasks with elapsed time, `/cancel <task-id>` cancels a running task.
+- **Expandable message formatting**: Long Telegram replies (>1800 chars) use `<blockquote expandable>` HTML tags for collapsible display, with fallback to chunked delivery.
+- **`[terminal]` configuration section**: 8 new config fields (`web_app_url`, `bridge_enabled`, `daemon_ws_url`, `daemon_connect_token`, `allow_static_token_fallback`, `daemon_user_id`, `daemon_device_id`, `daemon_shell`) with environment variable overrides and keychain support.
+- **`terminal-bridge` feature flag**: Enabled by default. Activates the full WebSocket bridge and secure daemon pairing system. New dependencies: `p256`, `aes-gcm`, `hkdf`, `portable-pty`.
+
+### Changed
+
+- **Help text includes terminal commands**: Telegram help now shows `/agent` and `/terminal lite` documentation. Discord and Slack omit terminal-specific commands.
+- **CLI agent output format**: Updated example configs from `--output-format stream-json` to `--output-format json`.
+
+### Fixed
+
+- **Clippy warnings resolved**: Fixed `div_ceil` reimplementation, manual char comparison, manual `RangeInclusive::contains`, and suppressed `too_many_arguments` for internal async helpers.
+
 ## [0.9.9] - 2026-02-28
 
 ### Added

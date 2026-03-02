@@ -6,6 +6,9 @@
 #   3. "plain-value" → used as-is (not recommended for production)
 #
 # The setup wizard stores secrets in the OS keychain automatically.
+# Set AIDAEMON_NO_KEYCHAIN=1 to use env-file-backed secrets instead of OS keychain.
+# Optional: set AIDAEMON_ENV_FILE=/absolute/path/.env to choose the env file path.
+# In no-keychain mode, secret updates (including OAuth token refresh rotation) are written to that env file.
 
 [provider]
 # Provider type: openai_compatible, google_genai, or anthropic
@@ -45,6 +48,28 @@ working_memory_cap = 50
 [terminal]
 # Set to ["*"] to allow all commands (only if you trust the LLM fully)
 allowed_prefixes = ["ls", "cat", "head", "tail", "echo", "date", "whoami", "pwd", "find", "wc", "grep", "tree", "file", "stat", "uname", "df", "du", "ps", "which", "env", "printenv"]
+# Telegram /terminal Mini App URL (must be HTTPS).
+# Runtime override: AIDAEMON_TERMINAL_WEB_APP_URL
+web_app_url = "https://terminal.aidaemon.ai"
+# Enable local terminal bridge websocket worker.
+# Runtime override: AIDAEMON_TERMINAL_BRIDGE_ENABLED
+bridge_enabled = true
+# Rust bridge endpoint for local daemon <-> broker websocket (must be WSS).
+# Runtime override: AIDAEMON_TERMINAL_BROKER_URL
+daemon_ws_url = "wss://terminal.aidaemon.ai/v1/ws/daemon"
+# Optional static daemon connector token.
+# If unset, aidaemon auto-mints short-lived connector tokens using your Telegram bot secret proof.
+# Runtime override: AIDAEMON_TERMINAL_DAEMON_TOKEN
+# daemon_connect_token = "keychain"
+# Optional insecure fallback: if true, static daemon_connect_token is used when secure minting fails.
+# Default false (recommended). Runtime override: AIDAEMON_TERMINAL_ALLOW_STATIC_FALLBACK
+# allow_static_token_fallback = false
+# Optional explicit Telegram user ID; defaults to first telegram owner.
+# Runtime override: AIDAEMON_TERMINAL_USER_ID
+# daemon_user_id = 123456789
+# Optional overrides for bridge device id / shell.
+# daemon_device_id = "macbook-pro"
+# daemon_shell = "/bin/zsh"
 
 # Optional path alias roots for relative "projects/..." requests.
 # Precedence for scoped path resolution:
@@ -137,11 +162,11 @@ health_port = 8080
 # # Override or add your own:
 # [cli_agents.tools.claude]
 # command = "claude"
-# args = ["-p", "--output-format", "stream-json"]
+# args = ["-p", "--output-format", "json"]
 #
 # [cli_agents.tools.gemini]
 # command = "gemini"
-# args = ["--sandbox=false", "--yolo", "--output-format", "stream-json"]
+# args = ["--sandbox=false", "--yolo", "--output-format", "json"]
 #
 # [cli_agents.tools.codex]
 # command = "codex"

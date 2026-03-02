@@ -600,10 +600,12 @@ fn convert_slack_inline(s: &str) -> String {
 ///
 /// `include_restart`: whether to show the /restart command (Telegram, Slack)
 /// `include_connect`: whether to show /connect and /bots (Telegram only)
+/// `include_terminal`: whether to show /terminal command (Telegram only)
 /// `prefix`: command prefix character ("/" for Telegram, "!" for Slack)
 pub(crate) fn build_help_text(
     include_restart: bool,
     include_connect: bool,
+    include_terminal: bool,
     prefix: &str,
 ) -> String {
     let p = prefix;
@@ -666,6 +668,12 @@ pub(crate) fn build_help_text(
          `{p}clear` — Start fresh conversation\n\
          `{p}cost` — Show token usage stats",
     ));
+
+    if include_terminal {
+        text.push_str(&format!(
+            "\n`{p}agent` — Start Codex/Claude/Gemini/OpenCode session\n`{p}agent flags` — Discover available flags for an agent\n`{p}agent defaults` — Manage saved agent flags\n`{p}terminal lite` — Chat-based shell mode"
+        ));
+    }
 
     if include_connect {
         text.push_str(&format!(

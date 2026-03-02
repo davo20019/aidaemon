@@ -30,6 +30,8 @@ mod skills;
 mod startup;
 mod state;
 mod tasks;
+#[cfg(feature = "terminal-bridge")]
+mod terminal_bridge;
 mod token_alerts;
 mod tools;
 mod traits;

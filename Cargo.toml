@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon"
-version = "0.9.9"
+version = "0.9.10"
 edition = "2021"
 description = "A personal AI agent that runs as a background daemon, accessible via Telegram, Slack, or Discord, with tool use, MCP integration, and persistent memory"
 license = "MIT"
@@ -56,6 +56,10 @@ sha1 = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+hkdf = { version = "0.12", optional = true }
+p256 = { version = "0.13", features = ["ecdh"], optional = true }
+aes-gcm = { version = "0.10", optional = true }
+portable-pty = { version = "0.8", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
@@ -69,10 +73,17 @@ tikv-jemallocator = "0.6"
 keyring = { version = "3", features = ["windows-native"] }
 
 [features]
-default = ["discord", "slack", "encryption", "browser"]
+default = ["discord", "slack", "encryption", "browser", "terminal-bridge"]
 browser = ["dep:chromiumoxide"]
 discord = ["dep:serenity"]
 slack = ["dep:tokio-tungstenite"]
+terminal-bridge = [
+    "dep:tokio-tungstenite",
+    "dep:hkdf",
+    "dep:p256",
+    "dep:aes-gcm",
+    "dep:portable-pty",
+]
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
 
 [profile.release]
@@ -84,6 +95,7 @@ strip = true
 tempfile = "3"
 proptest = "1"
 assert_cmd = "2"
+serial_test = "3"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/aidaemon-{ target }{ archive-suffix }"

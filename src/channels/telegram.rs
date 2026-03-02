@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -10,8 +11,9 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode,
+    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode, WebAppInfo,
 };
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -70,9 +72,58 @@ pub struct TelegramChannel {
     channel_hub: StdRwLock<Option<Weak<ChannelHub>>>,
     /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
     watchdog_stale_threshold_secs: u64,
+    /// URL for the Telegram Mini App terminal frontend.
+    terminal_web_app_url: String,
+    /// Chat-only terminal-lite sessions keyed by Telegram chat id.
+    terminal_lite_sessions: Mutex<HashMap<i64, TerminalLiteSession>>,
+    /// Commands allowed in `/terminal lite`, derived from `[terminal].allowed_prefixes`.
+    terminal_allowed_prefixes: HashSet<String>,
     /// Daemon start time used for post-restart UX guardrails.
     started_at: Instant,
 }
+
+#[derive(Debug, Clone)]
+struct TerminalLiteSession {
+    owner_user_id: u64,
+    cwd: PathBuf,
+    shell: String,
+    preferred_agent: Option<String>,
+    started_at: Instant,
+    busy: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AgentFlagDoc {
+    flag: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AgentFlagsCacheEntry {
+    updated_at_unix: i64,
+    #[serde(default)]
+    flags: Vec<String>,
+    #[serde(default)]
+    docs: Vec<AgentFlagDoc>,
+}
+
+const TERMINAL_LITE_MAX_OUTPUT_CHARS: usize = 12_000;
+const TERMINAL_LITE_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_TERMINAL_AGENT: &str = "codex";
+const SUPPORTED_TERMINAL_AGENTS: &[&str] = &["codex", "claude", "gemini", "opencode"];
+const MAX_TERMINAL_AGENT_ARGS: usize = 24;
+const MAX_TERMINAL_AGENT_ARG_CHARS: usize = 256;
+const AGENT_FLAGS_CACHE_TTL_SECS: i64 = 24 * 60 * 60;
+const MAX_DISCOVERED_AGENT_FLAGS: usize = 512;
+const MAX_DISCOVERED_AGENT_FLAG_CHARS: usize = 96;
+const MAX_DISCOVERED_AGENT_FLAG_DESC_CHARS: usize = 240;
+const AGENT_FLAGS_PAGE_SIZE: usize = 12;
+const TELEGRAM_EXPANDABLE_TRIGGER_CHARS: usize = 1_800;
+const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
+const TELEGRAM_EXPANDABLE_WRAPPER_LEN: usize = "<blockquote expandable></blockquote>".len();
+const TELEGRAM_EXPANDABLE_MAX_ESCAPED_CHARS: usize =
+    TELEGRAM_MAX_MESSAGE_LEN - TELEGRAM_EXPANDABLE_WRAPPER_LEN;
 
 impl TelegramChannel {
     #[allow(clippy::too_many_arguments)]
@@ -89,8 +140,15 @@ impl TelegramChannel {
         max_file_size_mb: u64,
         state: Arc<dyn StateStore>,
         watchdog_stale_threshold_secs: u64,
+        terminal_web_app_url: String,
+        terminal_allowed_prefixes: Vec<String>,
     ) -> Self {
         let bot = Bot::new(bot_token);
+        let terminal_allowed_prefixes = terminal_allowed_prefixes
+            .into_iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>();
         Self {
             bot_username: StdRwLock::new("telegram".to_string()),
             cached_channel_name: StdRwLock::new("telegram".to_string()),
@@ -110,6 +168,9 @@ impl TelegramChannel {
             state,
             channel_hub: StdRwLock::new(None),
             watchdog_stale_threshold_secs,
+            terminal_web_app_url,
+            terminal_lite_sessions: Mutex::new(HashMap::new()),
+            terminal_allowed_prefixes,
             started_at: Instant::now(),
         }
     }
@@ -120,6 +181,15 @@ impl TelegramChannel {
         if let Ok(mut guard) = self.channel_hub.write() {
             *guard = Some(hub);
         }
+    }
+
+    async fn send_compact_or_full_reply(
+        &self,
+        bot: &Bot,
+        chat_id: ChatId,
+        markdown: &str,
+    ) -> anyhow::Result<()> {
+        send_full_or_expandable_reply(bot, chat_id, markdown).await
     }
 
     /// Persist the current allowed_user_ids list to config.toml.
@@ -398,14 +468,23 @@ impl TelegramChannel {
 
     async fn handle_command(&self, text: &str, msg: &teloxide::types::Message, bot: &Bot) {
         let parts: Vec<&str> = text.splitn(2, ' ').collect();
-        let cmd = parts[0];
+        let cmd_raw = parts[0];
+        let cmd = cmd_raw.split('@').next().unwrap_or(cmd_raw);
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+        if cmd == "/terminal" || cmd == "/agent" {
+            self.handle_terminal_command(arg, msg, bot, cmd).await;
+            return;
+        }
 
         let reply = match cmd {
             "/model" => {
                 if arg.is_empty() {
                     let current = self.agent.current_model().await;
-                    format!("Current model: {}\n\nUsage: /model <model-name>\nExample: /model gemini-3-pro-preview", current)
+                    format!(
+                        "Current model: {}\n\nUsage: /model <model-name>\nExample: /model gemini-3-pro-preview",
+                        current
+                    )
                 } else {
                     self.agent.set_model(arg.to_string()).await;
                     format!(
@@ -439,30 +518,31 @@ impl TelegramChannel {
                 self.agent.clear_model_override().await;
                 "Auto-routing re-enabled. Model will be selected automatically based on query complexity.".to_string()
             }
-            "/reload" => {
-                match AppConfig::load(&self.config_path) {
-                    Ok(new_config) => match self.agent.reload_provider(&new_config).await {
-                        Ok(status) => format!("Config reloaded. {}", status),
-                        Err(e) => format!("Provider reload failed: {}", e),
-                    },
-                    Err(e) => {
-                        // Config is broken — try to auto-restore from backup
-                        let backup = self.config_path.with_extension("toml.bak");
-                        if backup.exists() {
-                            if tokio::fs::copy(&backup, &self.config_path).await.is_ok() {
-                                format!(
-                                    "Config reload failed: {}\n\nAuto-restored from backup. Config is back to the previous working state.",
-                                    e
-                                )
-                            } else {
-                                format!("Config reload failed: {}\n\nBackup restore also failed. Manual intervention needed.", e)
-                            }
+            "/reload" => match AppConfig::load(&self.config_path) {
+                Ok(new_config) => match self.agent.reload_provider(&new_config).await {
+                    Ok(status) => format!("Config reloaded. {}", status),
+                    Err(e) => format!("Provider reload failed: {}", e),
+                },
+                Err(e) => {
+                    // Config is broken — try to auto-restore from backup
+                    let backup = self.config_path.with_extension("toml.bak");
+                    if backup.exists() {
+                        if tokio::fs::copy(&backup, &self.config_path).await.is_ok() {
+                            format!(
+                                "Config reload failed: {}\n\nAuto-restored from backup. Config is back to the previous working state.",
+                                e
+                            )
                         } else {
-                            format!("Config reload failed: {}\n\nNo backup available.", e)
+                            format!(
+                                "Config reload failed: {}\n\nBackup restore also failed. Manual intervention needed.",
+                                e
+                            )
                         }
+                    } else {
+                        format!("Config reload failed: {}\n\nNo backup available.", e)
                     }
                 }
-            }
+            },
             "/restart" => {
                 let _ = bot.send_message(msg.chat.id, "Restarting...").await;
                 info!("Restart requested via Telegram");
@@ -524,15 +604,1544 @@ impl TelegramChannel {
                     .await
             }
             "/bots" => self.handle_bots_command().await,
-            "/help" | "/start" => build_help_text(true, true, "/"),
+            "/help" | "/start" => build_help_text(true, true, true, "/"),
             _ => format!(
                 "Unknown command: {}\nType /help for available commands.",
-                cmd
+                cmd_raw
             ),
         };
 
         for chunk in split_message(&reply, 4096) {
             let _ = bot.send_message(msg.chat.id, chunk).await;
+        }
+    }
+
+    fn terminal_help_text() -> String {
+        "Terminal mode (owner only)\n\n\
+         Usage:\n\
+         /terminal\n\
+         /terminal <codex|claude|gemini|opencode> [working_dir]\n\
+         /terminal <codex|claude|gemini|opencode> [working_dir] [agent_flags...]\n\
+         /terminal <codex|claude|gemini|opencode> [working_dir] -- [agent_flags...]\n\
+         /terminal start <agent> [working_dir]\n\
+         /terminal start <agent> [working_dir] [agent_flags...]\n\
+         /terminal start <agent> [working_dir] -- [agent_flags...]\n\
+         /terminal lite [start] [working_dir]\n\
+         /terminal lite status\n\
+         /terminal lite stop\n\
+         /terminal open\n\
+         /terminal help\n\n\
+         Examples:\n\
+         /terminal codex\n\
+         /terminal codex --chrome\n\
+         /terminal codex ~/projects/aidaemon --chrome --dangerously-skip-permissions\n\
+         /terminal codex ~/projects/aidaemon -- --chrome --dangerously-skip-permissions\n\
+         /terminal opencode ~/projects/aidaemon\n\
+         /terminal lite ~/projects/aidaemon\n\
+         /terminal claude ~/projects/aidaemon\n\
+         /terminal codex \"~/projects/my app\""
+            .to_string()
+    }
+
+    fn agent_help_text() -> String {
+        "Agent session mode (owner only)\n\n\
+         Usage:\n\
+         /agent\n\
+         /agent <codex|claude|gemini|opencode> [working_dir]\n\
+         /agent <codex|claude|gemini|opencode> [working_dir] [agent_flags...]\n\
+         /agent <codex|claude|gemini|opencode> [working_dir] -- [agent_flags...]\n\
+         /agent start <agent> [working_dir]\n\
+         /agent start <agent> [working_dir] [agent_flags...]\n\
+         /agent flags <agent> [refresh]\n\
+         /agent defaults\n\
+         /agent defaults set <agent> [agent_flags...]\n\
+         /agent defaults clear [agent|all]\n\
+         /agent open\n\
+         /agent help\n\n\
+         Examples:\n\
+         /agent codex\n\
+         /agent codex --chrome\n\
+         /agent codex ~/projects/aidaemon --chrome --dangerously-skip-permissions\n\
+         /agent claude ~/projects/aidaemon\n\
+         /agent opencode ~/projects/aidaemon\n\
+         /agent flags codex\n\
+         /agent flags codex refresh\n\
+         /agent defaults set codex --chrome --dangerously-skip-permissions\n\n\
+         Tip: add `--no-default-flags` to bypass saved flags once.\n\n\
+         For chat-based shell mode, use:\n\
+         /terminal lite [working_dir]"
+            .to_string()
+    }
+
+    fn terminal_lite_help_text() -> String {
+        "Terminal lite mode (owner only, chat-based)\n\n\
+         Commands:\n\
+         /terminal lite start [working_dir]\n\
+         /terminal lite start <codex|claude|gemini|opencode> [working_dir]\n\
+         /terminal lite [working_dir]\n\
+         /terminal lite <codex|claude|gemini|opencode> [working_dir]\n\
+         /terminal lite status\n\
+         /terminal lite stop\n\n\
+         After start, every non-slash message in this chat is treated as a shell command.\n\
+         Built-ins: cd <path>, exit, quit\n\
+         Note: interactive agent TUIs (codex/claude/gemini/opencode) require full /terminal Mini App mode.\n\
+         Timeout: 90s per command."
+            .to_string()
+    }
+
+    fn normalize_terminal_agent_name(value: &str) -> Option<String> {
+        let v = value.trim().to_ascii_lowercase();
+        if SUPPORTED_TERMINAL_AGENTS.contains(&v.as_str()) {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    fn normalize_terminal_agent_args(values: Vec<String>) -> Vec<String> {
+        values
+            .into_iter()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && !v.contains('\0'))
+            .map(|v| {
+                v.chars()
+                    .take(MAX_TERMINAL_AGENT_ARG_CHARS)
+                    .collect::<String>()
+            })
+            .take(MAX_TERMINAL_AGENT_ARGS)
+            .collect()
+    }
+
+    fn normalize_discovered_agent_flags(values: Vec<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for value in values {
+            let cleaned = value.trim().to_string();
+            if cleaned.is_empty() || !cleaned.starts_with("--") || cleaned.contains('\0') {
+                continue;
+            }
+            let clipped = cleaned
+                .chars()
+                .take(MAX_DISCOVERED_AGENT_FLAG_CHARS)
+                .collect::<String>();
+            if seen.insert(clipped.clone()) {
+                out.push(clipped);
+            }
+            if out.len() >= MAX_DISCOVERED_AGENT_FLAGS {
+                break;
+            }
+        }
+        out
+    }
+
+    fn normalize_agent_flag_docs(values: Vec<AgentFlagDoc>) -> Vec<AgentFlagDoc> {
+        let mut out: Vec<AgentFlagDoc> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+
+        for value in values {
+            let normalized_flags = Self::normalize_discovered_agent_flags(vec![value.flag]);
+            let Some(flag) = normalized_flags.first().cloned() else {
+                continue;
+            };
+
+            let description = value
+                .description
+                .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty())
+                .map(|d| {
+                    d.chars()
+                        .take(MAX_DISCOVERED_AGENT_FLAG_DESC_CHARS)
+                        .collect::<String>()
+                });
+
+            if let Some(idx) = seen.get(&flag).copied() {
+                let existing = out.get_mut(idx).expect("index from seen must exist");
+                let replace = match (&existing.description, &description) {
+                    (None, Some(_)) => true,
+                    (Some(old), Some(new)) => new.len() > old.len(),
+                    _ => false,
+                };
+                if replace {
+                    existing.description = description;
+                }
+            } else {
+                seen.insert(flag.clone(), out.len());
+                out.push(AgentFlagDoc { flag, description });
+                if out.len() >= MAX_DISCOVERED_AGENT_FLAGS {
+                    break;
+                }
+            }
+        }
+
+        out
+    }
+
+    fn format_agent_flag_docs(agent: &str, docs: &[AgentFlagDoc], cached: bool) -> Vec<String> {
+        if docs.is_empty() {
+            return vec![format!(
+                "### No flags found for `{}`{}\nTry `/agent flags {} refresh`.",
+                agent,
+                if cached { " (cached)" } else { "" },
+                agent
+            )];
+        }
+
+        let page_size = AGENT_FLAGS_PAGE_SIZE.max(1);
+        let total = docs.len();
+        let total_pages = total.div_ceil(page_size);
+        let mut pages = Vec::new();
+
+        for (idx, chunk) in docs.chunks(page_size).enumerate() {
+            let mut lines = Vec::new();
+            lines.push(format!(
+                "### Flags for `{}`{}",
+                agent,
+                if cached { " (cached)" } else { "" }
+            ));
+            lines.push(format!("**{} total**", total));
+            if total_pages > 1 {
+                let start = idx * page_size + 1;
+                let end = start + chunk.len() - 1;
+                lines.push(format!(
+                    "**Showing {}-{} of {} (page {}/{})**",
+                    start,
+                    end,
+                    total,
+                    idx + 1,
+                    total_pages
+                ));
+            }
+            lines.push(String::new());
+
+            for doc in chunk {
+                lines.push(format!("- `{}`", doc.flag));
+                if let Some(desc) = doc.description.as_deref() {
+                    lines.push(format!("Description: {}", desc));
+                }
+                lines.push(String::new());
+            }
+
+            if idx + 1 == total_pages {
+                lines.push(
+                    "Set defaults with `/agent defaults set <agent> [flags...]`.".to_string(),
+                );
+                lines.push("Bypass once with `--no-default-flags`.".to_string());
+                lines.push("Refresh with `/agent flags <agent> refresh`.".to_string());
+            }
+
+            while lines.last().map(|line| line.is_empty()).unwrap_or(false) {
+                lines.pop();
+            }
+            pages.push(lines.join("\n"));
+        }
+
+        pages
+    }
+
+    fn strip_no_default_flag(agent_args: &mut Vec<String>) -> bool {
+        let before = agent_args.len();
+        agent_args.retain(|arg| arg != "--no-default-flags");
+        before != agent_args.len()
+    }
+
+    async fn terminal_agent_defaults_key(&self, chat_id: i64, user_id: u64) -> String {
+        let scope = self.session_namespace().await;
+        format!("telegram:agent_defaults:{}:{}:{}", scope, user_id, chat_id)
+    }
+
+    async fn load_terminal_agent_defaults(
+        &self,
+        chat_id: i64,
+        user_id: u64,
+    ) -> HashMap<String, Vec<String>> {
+        let key = self.terminal_agent_defaults_key(chat_id, user_id).await;
+        let raw = match self.state.get_setting(&key).await {
+            Ok(Some(v)) => v,
+            _ => return HashMap::new(),
+        };
+        let parsed: HashMap<String, Vec<String>> =
+            serde_json::from_str(&raw).unwrap_or_else(|_| HashMap::new());
+        let mut sanitized = HashMap::new();
+        for (agent, args) in parsed {
+            let Some(agent_name) = Self::normalize_terminal_agent_name(&agent) else {
+                continue;
+            };
+            let cleaned = Self::normalize_terminal_agent_args(args);
+            if cleaned.is_empty() {
+                continue;
+            }
+            sanitized.insert(agent_name, cleaned);
+        }
+        sanitized
+    }
+
+    async fn save_terminal_agent_defaults(
+        &self,
+        chat_id: i64,
+        user_id: u64,
+        defaults: &HashMap<String, Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let key = self.terminal_agent_defaults_key(chat_id, user_id).await;
+        let serialized = serde_json::to_string(defaults)?;
+        self.state.set_setting(&key, &serialized).await
+    }
+
+    async fn agent_flags_cache_key(&self, user_id: u64, agent: &str) -> String {
+        let scope = self.session_namespace().await;
+        format!(
+            "telegram:agent_flags_cache:{}:{}:{}",
+            scope,
+            user_id,
+            agent.to_ascii_lowercase()
+        )
+    }
+
+    async fn load_agent_flags_cache(
+        &self,
+        user_id: u64,
+        agent: &str,
+    ) -> Option<AgentFlagsCacheEntry> {
+        let key = self.agent_flags_cache_key(user_id, agent).await;
+        let raw = self.state.get_setting(&key).await.ok().flatten()?;
+        let mut parsed: AgentFlagsCacheEntry = serde_json::from_str(&raw).ok()?;
+        let mut docs = Self::normalize_agent_flag_docs(parsed.docs.clone());
+        if docs.is_empty() && !parsed.flags.is_empty() {
+            docs = Self::normalize_discovered_agent_flags(parsed.flags.clone())
+                .into_iter()
+                .map(|flag| AgentFlagDoc {
+                    flag,
+                    description: None,
+                })
+                .collect();
+        }
+        if docs.is_empty() {
+            return None;
+        }
+        parsed.docs = docs.clone();
+        parsed.flags = docs.iter().map(|d| d.flag.clone()).collect();
+        Some(parsed)
+    }
+
+    async fn save_agent_flags_cache(
+        &self,
+        user_id: u64,
+        agent: &str,
+        docs: &[AgentFlagDoc],
+    ) -> anyhow::Result<()> {
+        let key = self.agent_flags_cache_key(user_id, agent).await;
+        let normalized_docs = Self::normalize_agent_flag_docs(docs.to_vec());
+        let payload = AgentFlagsCacheEntry {
+            updated_at_unix: chrono::Utc::now().timestamp(),
+            flags: normalized_docs.iter().map(|d| d.flag.clone()).collect(),
+            docs: normalized_docs,
+        };
+        let serialized = serde_json::to_string(&payload)?;
+        self.state.set_setting(&key, &serialized).await
+    }
+
+    fn extract_long_flags_from_help(help_text: &str) -> Vec<String> {
+        static LONG_FLAG_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"--[a-zA-Z0-9][a-zA-Z0-9\-]*").expect("valid long flag regex")
+        });
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for cap in LONG_FLAG_RE.find_iter(help_text) {
+            let flag = cap.as_str().to_string();
+            if seen.insert(flag.clone()) {
+                out.push(flag);
+            }
+        }
+        out
+    }
+
+    fn extract_flag_docs_from_help(help_text: &str) -> Vec<AgentFlagDoc> {
+        static LONG_FLAG_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"--[a-zA-Z0-9][a-zA-Z0-9\-]*").expect("valid long flag regex")
+        });
+        let mut docs = Vec::new();
+        for raw_line in help_text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let matches = LONG_FLAG_RE.find_iter(line).collect::<Vec<_>>();
+            if matches.is_empty() {
+                continue;
+            }
+            let first_end = matches[0].end();
+            let desc_raw = line
+                .get(first_end..)
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches([':', ';', ',', '|', '-', ' ']);
+            let description = if desc_raw.is_empty() {
+                None
+            } else {
+                Some(desc_raw.to_string())
+            };
+            for m in matches {
+                docs.push(AgentFlagDoc {
+                    flag: m.as_str().to_string(),
+                    description: description.clone(),
+                });
+            }
+        }
+        Self::normalize_agent_flag_docs(docs)
+    }
+
+    async fn discover_agent_flags(agent: &str) -> anyhow::Result<Vec<AgentFlagDoc>> {
+        let run_help_cmd = |help_arg: &str| {
+            let mut cmd = Command::new(agent);
+            cmd.arg(help_arg);
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            cmd.kill_on_drop(true);
+            cmd.env_remove("CLAUDECODE");
+            cmd.env_remove("CLAUDE_CODE");
+            cmd
+        };
+
+        let output =
+            match tokio::time::timeout(Duration::from_secs(10), run_help_cmd("--help").output())
+                .await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(err)) => {
+                    if err.kind() == std::io::ErrorKind::NotFound {
+                        anyhow::bail!(
+                            "`{}` is not installed or not in PATH on this machine.",
+                            agent
+                        );
+                    }
+                    match tokio::time::timeout(Duration::from_secs(10), run_help_cmd("-h").output())
+                        .await
+                    {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(second_err)) => {
+                            anyhow::bail!("Failed to run `{}` help: {}", agent, second_err)
+                        }
+                        Err(_) => {
+                            anyhow::bail!("`{} -h` timed out while fetching help output.", agent)
+                        }
+                    }
+                }
+                Err(_) => anyhow::bail!("`{} --help` timed out while fetching help output.", agent),
+            };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = if stdout.is_empty() {
+            stderr.clone()
+        } else if stderr.is_empty() {
+            stdout.clone()
+        } else {
+            format!("{}\n{}", stdout, stderr)
+        };
+
+        let flags = Self::extract_long_flags_from_help(&combined);
+        if flags.is_empty() {
+            anyhow::bail!(
+                "No long-form flags were detected in `{}` help output. Try running `{}` manually.",
+                agent,
+                agent
+            );
+        }
+        let docs = Self::extract_flag_docs_from_help(&combined);
+        if docs.is_empty() {
+            let fallback = Self::normalize_discovered_agent_flags(flags)
+                .into_iter()
+                .map(|flag| AgentFlagDoc {
+                    flag,
+                    description: None,
+                })
+                .collect::<Vec<_>>();
+            return Ok(fallback);
+        }
+        Ok(docs)
+    }
+
+    async fn handle_agent_flags_command(
+        &self,
+        args: Vec<String>,
+        msg: &teloxide::types::Message,
+        bot: &Bot,
+        user_id: u64,
+    ) {
+        if args.is_empty() {
+            let _ = bot
+                .send_message(
+                    msg.chat.id,
+                    "Usage: /agent flags <agent> [refresh]\nExamples:\n/agent flags codex\n/agent flags codex refresh\n\nSupported agents: codex, claude, gemini, opencode",
+                )
+                .await;
+            return;
+        }
+
+        let (agent_raw, refresh) = if args
+            .first()
+            .map(|v| v.eq_ignore_ascii_case("refresh"))
+            .unwrap_or(false)
+        {
+            (args.get(1).cloned().unwrap_or_default(), true)
+        } else {
+            let refresh = args
+                .get(1)
+                .map(|v| v.eq_ignore_ascii_case("refresh"))
+                .unwrap_or(false);
+            (args[0].clone(), refresh)
+        };
+
+        let Some(agent) = Self::normalize_terminal_agent_name(&agent_raw) else {
+            let _ = bot
+                .send_message(
+                    msg.chat.id,
+                    "Unknown agent. Use codex/claude/gemini/opencode.",
+                )
+                .await;
+            return;
+        };
+
+        if !refresh {
+            if let Some(cached) = self.load_agent_flags_cache(user_id, &agent).await {
+                let age = chrono::Utc::now().timestamp() - cached.updated_at_unix;
+                if (0..=AGENT_FLAGS_CACHE_TTL_SECS).contains(&age) {
+                    let pages = Self::format_agent_flag_docs(&agent, &cached.docs, true);
+                    for page in pages {
+                        send_markdown_chunks_or_fallback(bot, msg.chat.id, &page).await;
+                    }
+                    return;
+                }
+            }
+        }
+
+        let _ = bot
+            .send_message(msg.chat.id, format!("Discovering flags for {}...", agent))
+            .await;
+
+        match Self::discover_agent_flags(&agent).await {
+            Ok(docs) => {
+                let _ = self.save_agent_flags_cache(user_id, &agent, &docs).await;
+                let pages = Self::format_agent_flag_docs(&agent, &docs, false);
+                for page in pages {
+                    send_markdown_chunks_or_fallback(bot, msg.chat.id, &page).await;
+                }
+            }
+            Err(err) => {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        format!("Failed to discover flags for {}: {}", agent, err),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_agent_defaults_command(
+        &self,
+        mut args: Vec<String>,
+        msg: &teloxide::types::Message,
+        bot: &Bot,
+        user_id: u64,
+    ) {
+        let subcommand = args
+            .first()
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| "show".to_string());
+
+        if !args.is_empty() {
+            args.remove(0);
+        }
+
+        if subcommand == "set" {
+            let Some(agent_raw) = args.first() else {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        "Usage: /agent defaults set <agent> [agent_flags...]",
+                    )
+                    .await;
+                return;
+            };
+            let Some(agent) = Self::normalize_terminal_agent_name(agent_raw) else {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        "Unknown agent. Use codex/claude/gemini/opencode.",
+                    )
+                    .await;
+                return;
+            };
+            let cleaned =
+                Self::normalize_terminal_agent_args(args.into_iter().skip(1).collect::<Vec<_>>());
+            if cleaned.is_empty() {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        "No flags provided. Example: /agent defaults set codex --chrome",
+                    )
+                    .await;
+                return;
+            }
+            let mut defaults = self
+                .load_terminal_agent_defaults(msg.chat.id.0, user_id)
+                .await;
+            defaults.insert(agent.clone(), cleaned.clone());
+            match self
+                .save_terminal_agent_defaults(msg.chat.id.0, user_id, &defaults)
+                .await
+            {
+                Ok(_) => {
+                    let _ = bot
+                        .send_message(
+                            msg.chat.id,
+                            format!(
+                                "Saved default flags for {}:\n`{}`",
+                                agent,
+                                cleaned.join(" ")
+                            ),
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    warn!(error = %err, "Failed to save /agent defaults");
+                    let _ = bot
+                        .send_message(msg.chat.id, "Failed to save defaults.")
+                        .await;
+                }
+            }
+            return;
+        }
+
+        if subcommand == "clear" {
+            let mut defaults = self
+                .load_terminal_agent_defaults(msg.chat.id.0, user_id)
+                .await;
+            if defaults.is_empty() {
+                let _ = bot.send_message(msg.chat.id, "No saved defaults.").await;
+                return;
+            }
+
+            let target = args
+                .first()
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_else(|| "all".to_string());
+            if target == "all" {
+                defaults.clear();
+                if self
+                    .save_terminal_agent_defaults(msg.chat.id.0, user_id, &defaults)
+                    .await
+                    .is_ok()
+                {
+                    let _ = bot
+                        .send_message(msg.chat.id, "Cleared all agent defaults.")
+                        .await;
+                } else {
+                    let _ = bot
+                        .send_message(msg.chat.id, "Failed to clear defaults.")
+                        .await;
+                }
+                return;
+            }
+
+            let Some(agent) = Self::normalize_terminal_agent_name(&target) else {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        "Usage: /agent defaults clear [agent|all]\nAgents: codex/claude/gemini/opencode",
+                    )
+                    .await;
+                return;
+            };
+            if defaults.remove(&agent).is_none() {
+                let _ = bot
+                    .send_message(msg.chat.id, format!("No saved defaults for {}.", agent))
+                    .await;
+                return;
+            }
+            if self
+                .save_terminal_agent_defaults(msg.chat.id.0, user_id, &defaults)
+                .await
+                .is_ok()
+            {
+                let _ = bot
+                    .send_message(msg.chat.id, format!("Cleared defaults for {}.", agent))
+                    .await;
+            } else {
+                let _ = bot
+                    .send_message(msg.chat.id, "Failed to clear defaults.")
+                    .await;
+            }
+            return;
+        }
+
+        let defaults = self
+            .load_terminal_agent_defaults(msg.chat.id.0, user_id)
+            .await;
+        if defaults.is_empty() {
+            let _ = bot
+                .send_message(
+                    msg.chat.id,
+                    "No saved agent defaults yet.\nUse `/agent defaults set <agent> [flags...]`.",
+                )
+                .await;
+            return;
+        }
+        let mut lines = vec!["Saved agent defaults for this chat:".to_string()];
+        for agent in SUPPORTED_TERMINAL_AGENTS {
+            if let Some(args) = defaults.get(*agent) {
+                lines.push(format!("- {}: `{}`", agent, args.join(" ")));
+            }
+        }
+        lines.push("Clear with `/agent defaults clear [agent|all]`.".to_string());
+        let _ = bot.send_message(msg.chat.id, lines.join("\n")).await;
+    }
+
+    fn is_terminal_lite_interactive_agent_command(text: &str) -> Option<String> {
+        let parts = shell_words::split(text).unwrap_or_else(|_| {
+            text.split_whitespace()
+                .map(std::string::ToString::to_string)
+                .collect()
+        });
+        parts
+            .first()
+            .and_then(|v| Self::normalize_terminal_agent_name(v))
+    }
+
+    fn default_terminal_lite_shell(&self) -> String {
+        std::env::var("SHELL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "/bin/bash".to_string())
+    }
+
+    fn is_shell_env_assignment(token: &str) -> bool {
+        let Some((name, _)) = token.split_once('=') else {
+            return false;
+        };
+        if name.is_empty() {
+            return false;
+        }
+        for (idx, ch) in name.chars().enumerate() {
+            let is_valid = if idx == 0 {
+                ch.is_ascii_alphabetic() || ch == '_'
+            } else {
+                ch.is_ascii_alphanumeric() || ch == '_'
+            };
+            if !is_valid {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn extract_terminal_lite_command_name(text: &str) -> Option<String> {
+        let parts = shell_words::split(text).unwrap_or_else(|_| {
+            text.split_whitespace()
+                .map(std::string::ToString::to_string)
+                .collect()
+        });
+        for token in parts {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if Self::is_shell_env_assignment(trimmed) {
+                continue;
+            }
+            return Some(trimmed.to_string());
+        }
+        None
+    }
+
+    fn contains_shell_control_operators(text: &str) -> bool {
+        let mut chars = text.chars().peekable();
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        while let Some(ch) = chars.next() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+
+            if ch == '\\' && !in_single {
+                escaped = true;
+                continue;
+            }
+
+            if ch == '\'' && !in_double {
+                in_single = !in_single;
+                continue;
+            }
+
+            if ch == '"' && !in_single {
+                in_double = !in_double;
+                continue;
+            }
+
+            // Command substitution works inside double quotes, so block it
+            // unless we're inside single quotes.
+            if ch == '$' && !in_single && matches!(chars.peek(), Some('(')) {
+                return true;
+            }
+            if ch == '`' && !in_single {
+                return true;
+            }
+
+            if in_single || in_double {
+                continue;
+            }
+
+            if matches!(ch, ';' | '|' | '&' | '>' | '<' | '\n' | '\r') {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn validate_terminal_lite_command(&self, text: &str) -> Result<(), String> {
+        if self.terminal_allowed_prefixes.contains("*") {
+            return Ok(());
+        }
+        if self.terminal_allowed_prefixes.is_empty() {
+            return Err(
+                "Terminal lite is disabled because `[terminal].allowed_prefixes` is empty."
+                    .to_string(),
+            );
+        }
+
+        let raw = Self::extract_terminal_lite_command_name(text)
+            .ok_or_else(|| "Could not determine command name.".to_string())?;
+        let command_name = Path::new(&raw)
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or(raw.as_str())
+            .trim()
+            .to_ascii_lowercase();
+
+        if command_name.is_empty() {
+            return Err("Could not determine command name.".to_string());
+        }
+        if Self::contains_shell_control_operators(text) {
+            return Err(
+                "Shell operators are not allowed in `/terminal lite` commands (use `/terminal` full mode)."
+                    .to_string(),
+            );
+        }
+        if self.terminal_allowed_prefixes.contains(&command_name) {
+            return Ok(());
+        }
+
+        let mut allowed = self
+            .terminal_allowed_prefixes
+            .iter()
+            .filter(|value| value.as_str() != "*")
+            .cloned()
+            .collect::<Vec<_>>();
+        allowed.sort();
+        Err(format!(
+            "Command `{}` is not allowed in `/terminal lite`.\nAllowed commands: {}",
+            command_name,
+            allowed.join(", ")
+        ))
+    }
+
+    fn resolve_terminal_lite_cwd(raw: Option<&str>) -> anyhow::Result<PathBuf> {
+        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::resolve_terminal_lite_cwd_from_base(&base, raw.unwrap_or("").trim())
+    }
+
+    fn resolve_terminal_lite_cwd_from_base(base: &Path, raw: &str) -> anyhow::Result<PathBuf> {
+        let resolved = if raw.is_empty() || raw == "~" {
+            dirs::home_dir().unwrap_or_else(|| base.to_path_buf())
+        } else if let Some(rest) = raw.strip_prefix("~/") {
+            dirs::home_dir()
+                .map(|home| home.join(rest))
+                .unwrap_or_else(|| base.join(rest))
+        } else {
+            let p = PathBuf::from(raw);
+            if p.is_absolute() {
+                p
+            } else {
+                base.join(p)
+            }
+        };
+        let canonical = resolved
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("invalid working dir '{}': {}", resolved.display(), e))?;
+        if !canonical.is_dir() {
+            anyhow::bail!("'{}' is not a directory", canonical.display());
+        }
+        Ok(canonical)
+    }
+
+    async fn handle_terminal_lite_command(
+        &self,
+        mut args: Vec<String>,
+        msg: &teloxide::types::Message,
+        bot: &Bot,
+        user_id: u64,
+    ) {
+        let subcommand = args
+            .first()
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| "start".to_string());
+
+        if subcommand == "help" {
+            let _ = bot
+                .send_message(msg.chat.id, Self::terminal_lite_help_text())
+                .await;
+            return;
+        }
+
+        if subcommand == "status" {
+            let sessions = self.terminal_lite_sessions.lock().await;
+            if let Some(session) = sessions.get(&msg.chat.id.0) {
+                let elapsed = session.started_at.elapsed().as_secs();
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        format!(
+                            "Terminal lite is active.\nOwner: {}\nWorking dir: {}\nShell: {}\nPreferred agent: {}\nBusy: {}\nUptime: {}s",
+                            session.owner_user_id,
+                            session.cwd.display(),
+                            session.shell,
+                            session.preferred_agent.as_deref().unwrap_or("none"),
+                            if session.busy { "yes" } else { "no" },
+                            elapsed
+                        ),
+                    )
+                    .await;
+            } else {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        "Terminal lite is not active. Start with `/terminal lite start`.",
+                    )
+                    .await;
+            }
+            return;
+        }
+
+        if subcommand == "stop" {
+            let mut sessions = self.terminal_lite_sessions.lock().await;
+            if sessions.remove(&msg.chat.id.0).is_some() {
+                let _ = bot
+                    .send_message(msg.chat.id, "Terminal lite stopped for this chat.")
+                    .await;
+            } else {
+                let _ = bot
+                    .send_message(msg.chat.id, "Terminal lite is not active.")
+                    .await;
+            }
+            return;
+        }
+
+        if subcommand == "start" {
+            args.remove(0);
+        }
+
+        let preferred_agent = args
+            .first()
+            .and_then(|value| Self::normalize_terminal_agent_name(value));
+        if preferred_agent.is_some() && !args.is_empty() {
+            args.remove(0);
+        }
+
+        let cwd_arg = if args.is_empty() {
+            None
+        } else {
+            Some(args.join(" "))
+        };
+        let cwd = match Self::resolve_terminal_lite_cwd(cwd_arg.as_deref()) {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        format!("Failed to start terminal lite: {}", err),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        let shell = self.default_terminal_lite_shell();
+        let session = TerminalLiteSession {
+            owner_user_id: user_id,
+            cwd: cwd.clone(),
+            shell: shell.clone(),
+            preferred_agent: preferred_agent.clone(),
+            started_at: Instant::now(),
+            busy: false,
+        };
+
+        {
+            let mut sessions = self.terminal_lite_sessions.lock().await;
+            sessions.insert(msg.chat.id.0, session);
+        }
+
+        let _ = bot
+            .send_message(
+                msg.chat.id,
+                format!(
+                    "Terminal lite started.\nWorking dir: {}\nShell: {}\nPreferred agent: {}\n\nSend commands as chat messages.\nUse `/terminal lite stop` to stop.",
+                    cwd.display(),
+                    shell,
+                    preferred_agent.as_deref().unwrap_or("none")
+                ),
+            )
+            .await;
+    }
+
+    async fn handle_terminal_lite_input(
+        &self,
+        chat_id: i64,
+        user_id: u64,
+        user_role: UserRole,
+        text: &str,
+    ) -> Option<String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let mut sessions = self.terminal_lite_sessions.lock().await;
+        let session = sessions.get_mut(&chat_id)?;
+
+        if user_role != UserRole::Owner || session.owner_user_id != user_id {
+            return Some("Only the owner can use terminal lite in this chat.".to_string());
+        }
+
+        if session.busy {
+            return Some(
+                "Terminal lite is busy with the previous command. Wait or run `/terminal lite stop`."
+                    .to_string(),
+            );
+        }
+
+        if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
+            sessions.remove(&chat_id);
+            return Some("Terminal lite stopped.".to_string());
+        }
+
+        if let Some(reply) = Self::terminal_lite_try_handle_cd(session, trimmed) {
+            return Some(reply);
+        }
+
+        if let Some(agent) = Self::is_terminal_lite_interactive_agent_command(trimmed) {
+            return Some(format!(
+                    "`{}` is an interactive TUI and is not supported in `/terminal lite`.\nUse full mode instead: `/terminal {} {}`",
+                agent,
+                agent,
+                session.cwd.display()
+            ));
+        }
+
+        if let Err(err) = self.validate_terminal_lite_command(trimmed) {
+            return Some(err);
+        }
+
+        let snapshot = session.clone();
+        session.busy = true;
+        drop(sessions);
+
+        let reply = Self::run_terminal_lite_command(&snapshot, trimmed).await;
+
+        let mut sessions = self.terminal_lite_sessions.lock().await;
+        if let Some(active) = sessions.get_mut(&chat_id) {
+            active.busy = false;
+        }
+        Some(reply)
+    }
+
+    fn terminal_lite_try_handle_cd(
+        session: &mut TerminalLiteSession,
+        text: &str,
+    ) -> Option<String> {
+        let parts = shell_words::split(text).unwrap_or_else(|_| {
+            text.split_whitespace()
+                .map(std::string::ToString::to_string)
+                .collect()
+        });
+        if parts.is_empty() || parts[0] != "cd" {
+            return None;
+        }
+        let target = if parts.len() <= 1 {
+            "~".to_string()
+        } else {
+            parts[1].clone()
+        };
+        match Self::resolve_terminal_lite_cwd_from_base(&session.cwd, target.trim()) {
+            Ok(path) => {
+                session.cwd = path.clone();
+                Some(format!("cwd -> {}", path.display()))
+            }
+            Err(err) => Some(format!("cd: {}", err)),
+        }
+    }
+
+    async fn run_terminal_lite_command(
+        session: &TerminalLiteSession,
+        command_text: &str,
+    ) -> String {
+        let mut cmd = Command::new(&session.shell);
+        if cfg!(windows) {
+            cmd.arg("-NoLogo").arg("-Command").arg(command_text);
+        } else {
+            cmd.arg("-lc").arg(command_text);
+        }
+        cmd.current_dir(&session.cwd);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+        cmd.env_remove("CLAUDECODE");
+        cmd.env_remove("CLAUDE_CODE");
+        if !cfg!(windows) {
+            cmd.env("TERM", "xterm-256color");
+        }
+
+        let output = match tokio::time::timeout(
+            Duration::from_secs(TERMINAL_LITE_TIMEOUT_SECS),
+            cmd.output(),
+        )
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(err)) => {
+                return format!("Failed to run command: {}", err);
+            }
+            Err(_) => {
+                return format!(
+                    "⏱️ Command timed out after {}s: {}",
+                    TERMINAL_LITE_TIMEOUT_SECS, command_text
+                );
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let mut body = String::new();
+        body.push_str("$ ");
+        body.push_str(command_text);
+        body.push_str("\n\n");
+
+        if stdout.trim().is_empty() && stderr.trim().is_empty() {
+            body.push_str("(no output)\n");
+        } else {
+            if !stdout.is_empty() {
+                body.push_str(&stdout);
+            }
+            if !stderr.is_empty() {
+                if !stdout.ends_with('\n') && !stdout.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(&stderr);
+            }
+        }
+
+        if body.chars().count() > TERMINAL_LITE_MAX_OUTPUT_CHARS {
+            let clipped: String = body.chars().take(TERMINAL_LITE_MAX_OUTPUT_CHARS).collect();
+            body = format!(
+                "{}\n\n[output truncated to {} chars]",
+                clipped, TERMINAL_LITE_MAX_OUTPUT_CHARS
+            );
+        }
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        body.push_str(&format!("\n[exit {}]", exit_code));
+        body
+    }
+
+    async fn handle_terminal_command(
+        &self,
+        arg: &str,
+        msg: &teloxide::types::Message,
+        bot: &Bot,
+        invoked_cmd: &str,
+    ) {
+        let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
+        if determine_role(&self.owner_user_ids, user_id) != UserRole::Owner {
+            let _ = bot
+                .send_message(
+                    msg.chat.id,
+                    format!("Only the owner can use {} in this chat.", invoked_cmd),
+                )
+                .await;
+            return;
+        }
+
+        let trimmed = arg.trim();
+        let mut tokens = if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            shell_words::split(trimmed).unwrap_or_else(|_| {
+                trimmed
+                    .split_whitespace()
+                    .map(std::string::ToString::to_string)
+                    .collect()
+            })
+        };
+
+        if invoked_cmd == "/agent"
+            && matches!(
+                tokens.first().map(|s| s.to_ascii_lowercase()).as_deref(),
+                Some("defaults")
+            )
+        {
+            tokens.remove(0);
+            self.handle_agent_defaults_command(tokens, msg, bot, user_id)
+                .await;
+            return;
+        }
+
+        if invoked_cmd == "/agent"
+            && matches!(
+                tokens.first().map(|s| s.to_ascii_lowercase()).as_deref(),
+                Some("flags")
+            )
+        {
+            tokens.remove(0);
+            self.handle_agent_flags_command(tokens, msg, bot, user_id)
+                .await;
+            return;
+        }
+
+        if matches!(
+            tokens.first().map(|s| s.to_ascii_lowercase()).as_deref(),
+            Some("lite")
+        ) {
+            if invoked_cmd == "/agent" {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        "Lite mode stays under `/terminal lite`.\nUse `/agent ...` for full Codex/Claude/Gemini sessions.",
+                    )
+                    .await;
+                return;
+            }
+            tokens.remove(0);
+            self.handle_terminal_lite_command(tokens, msg, bot, user_id)
+                .await;
+            return;
+        }
+
+        if let Some(first) = tokens.first() {
+            let first = first.to_ascii_lowercase();
+            if first == "help" {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        if invoked_cmd == "/agent" {
+                            Self::agent_help_text()
+                        } else {
+                            Self::terminal_help_text()
+                        },
+                    )
+                    .await;
+                return;
+            }
+            if matches!(first.as_str(), "status" | "interrupt" | "stop") {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        format!(
+                            "Use the Mini App toolbar for status/interrupt/stop in v1.\nRun {} open to reconnect.",
+                            invoked_cmd
+                        ),
+                    )
+                    .await;
+                return;
+            }
+        }
+
+        let mut start_requested = false;
+        if let Some(first) = tokens.first() {
+            let first = first.to_ascii_lowercase();
+            if first == "open" || first == "start" {
+                start_requested = first == "start";
+                tokens.remove(0);
+            }
+        }
+
+        let mut agent: Option<String> = None;
+        let mut cwd_parts: Vec<String> = Vec::new();
+        let mut agent_args: Vec<String> = Vec::new();
+        let mut had_explicit_arg_delimiter = false;
+        let mut used_saved_args = false;
+        let mut saved_args_updated = false;
+
+        // Backward-compat: `/terminal ... -- [flags...]`
+        if let Some(idx) = tokens.iter().position(|t| t == "--") {
+            had_explicit_arg_delimiter = true;
+            if idx + 1 < tokens.len() {
+                agent_args.extend(
+                    tokens[(idx + 1)..]
+                        .iter()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty() && !value.contains('\0')),
+                );
+            }
+            tokens.truncate(idx);
+        }
+
+        if let Some(first) = tokens.first() {
+            let candidate = first.to_ascii_lowercase();
+            if SUPPORTED_TERMINAL_AGENTS.contains(&candidate.as_str()) {
+                agent = Some(candidate);
+                tokens.remove(0);
+            } else if first.starts_with('/')
+                || first.starts_with('~')
+                || first.starts_with('.')
+                || first.contains('/')
+            {
+                agent = Some(DEFAULT_TERMINAL_AGENT.to_string());
+            } else if first.starts_with('-') {
+                // Flags-only launch defaults to codex.
+                agent = Some(DEFAULT_TERMINAL_AGENT.to_string());
+            } else {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        format!(
+                            "Unknown terminal agent: `{}`\n\n{}",
+                            first,
+                            if invoked_cmd == "/agent" {
+                                Self::agent_help_text()
+                            } else {
+                                Self::terminal_help_text()
+                            }
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            if had_explicit_arg_delimiter {
+                for token in tokens {
+                    let trimmed = token.trim();
+                    if trimmed.is_empty() || trimmed.contains('\0') {
+                        continue;
+                    }
+                    cwd_parts.push(trimmed.to_string());
+                }
+            } else if let Some(flag_idx) = tokens.iter().position(|token| token.starts_with('-')) {
+                for token in &tokens[..flag_idx] {
+                    let trimmed = token.trim();
+                    if trimmed.is_empty() || trimmed.contains('\0') {
+                        continue;
+                    }
+                    cwd_parts.push(trimmed.to_string());
+                }
+                for token in &tokens[flag_idx..] {
+                    let trimmed = token.trim();
+                    if trimmed.is_empty() || trimmed.contains('\0') {
+                        continue;
+                    }
+                    agent_args.push(trimmed.to_string());
+                }
+            } else {
+                for token in tokens {
+                    let trimmed = token.trim();
+                    if trimmed.is_empty() || trimmed.contains('\0') {
+                        continue;
+                    }
+                    cwd_parts.push(trimmed.to_string());
+                }
+            }
+        } else if start_requested {
+            agent = Some(DEFAULT_TERMINAL_AGENT.to_string());
+        } else if !agent_args.is_empty() {
+            // Flags imply a terminal launch context; default agent to codex.
+            agent = Some(DEFAULT_TERMINAL_AGENT.to_string());
+        }
+        agent_args = Self::normalize_terminal_agent_args(agent_args);
+        let skip_saved_defaults = Self::strip_no_default_flag(&mut agent_args);
+
+        if invoked_cmd == "/agent" && agent_args.is_empty() && !skip_saved_defaults {
+            if let Some(agent_name) = agent.as_deref() {
+                let defaults = self
+                    .load_terminal_agent_defaults(msg.chat.id.0, user_id)
+                    .await;
+                if let Some(saved) = defaults.get(agent_name) {
+                    agent_args = Self::normalize_terminal_agent_args(saved.clone());
+                    used_saved_args = !agent_args.is_empty();
+                }
+            }
+        } else if invoked_cmd == "/agent" && !agent_args.is_empty() {
+            if let Some(agent_name) = agent.as_deref() {
+                let mut defaults = self
+                    .load_terminal_agent_defaults(msg.chat.id.0, user_id)
+                    .await;
+                let changed = defaults.get(agent_name) != Some(&agent_args);
+                if changed {
+                    defaults.insert(agent_name.to_string(), agent_args.clone());
+                    if let Err(err) = self
+                        .save_terminal_agent_defaults(msg.chat.id.0, user_id, &defaults)
+                        .await
+                    {
+                        warn!(error = %err, "Failed to persist /agent default flags");
+                    } else {
+                        saved_args_updated = true;
+                    }
+                }
+            }
+        }
+
+        let cwd = if cwd_parts.is_empty() {
+            None
+        } else {
+            Some(cwd_parts.join(" "))
+        };
+
+        let mut web_app_url = match reqwest::Url::parse(self.terminal_web_app_url.trim()) {
+            Ok(url) => url,
+            Err(err) => {
+                let _ = bot
+                    .send_message(
+                        msg.chat.id,
+                        format!(
+                            "Terminal web app URL is invalid in config: {}\nCurrent value: {}",
+                            err, self.terminal_web_app_url
+                        ),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        if web_app_url.scheme() != "https" {
+            let _ = bot
+                .send_message(
+                    msg.chat.id,
+                    format!(
+                        "Terminal web app URL must use HTTPS. Current value: {}",
+                        self.terminal_web_app_url
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        {
+            let mut query = web_app_url.query_pairs_mut();
+            if let Some(agent) = agent.as_deref() {
+                query.append_pair("agent", agent);
+            }
+            if let Some(cwd) = cwd.as_deref() {
+                if !cwd.trim().is_empty() {
+                    query.append_pair("cwd", cwd);
+                }
+            }
+            for arg in &agent_args {
+                query.append_pair("arg", arg);
+            }
+            if start_requested {
+                query.append_pair("autostart", "1");
+            }
+        }
+
+        let mini_app_host = web_app_url.host_str().unwrap_or("unknown");
+        let mini_app_base = if let Some(port) = web_app_url.port() {
+            format!("{}://{}:{}", web_app_url.scheme(), mini_app_host, port)
+        } else {
+            format!("{}://{}", web_app_url.scheme(), mini_app_host)
+        };
+
+        let mut summary_lines = vec![
+            if invoked_cmd == "/agent" {
+                "🤖 <b>Agent Session</b>".to_string()
+            } else {
+                "🖥️ <b>Terminal Mode</b>".to_string()
+            },
+            String::new(),
+            format!(
+                "Mini App host: <code>{}</code>",
+                html_escape(&mini_app_base)
+            ),
+        ];
+        if let Some(agent) = agent.as_deref() {
+            summary_lines.push(format!("Agent: <code>{}</code>", html_escape(agent)));
+        } else {
+            summary_lines.push(format!(
+                "Agent: choose in app (default {})",
+                DEFAULT_TERMINAL_AGENT
+            ));
+        }
+        if let Some(cwd) = cwd.as_deref() {
+            let folder_name = Path::new(cwd)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("custom");
+            summary_lines.push(format!(
+                "Working dir: <code>{}</code> (full path sent only to Mini App)",
+                html_escape(folder_name)
+            ));
+        }
+        if !agent_args.is_empty() {
+            summary_lines.push(format!(
+                "Agent args: <code>{}</code> (values sent only to Mini App)",
+                agent_args.len()
+            ));
+            if used_saved_args {
+                summary_lines.push(
+                    "Using saved defaults for this chat. Add <code>--no-default-flags</code> to bypass once."
+                        .to_string(),
+                );
+            } else if saved_args_updated {
+                summary_lines.push("Saved as new defaults for this chat and agent.".to_string());
+            }
+        }
+        summary_lines.push(String::new());
+        summary_lines.push(
+            if invoked_cmd == "/agent" {
+                "Tap Open Session to launch the encrypted agent UI."
+            } else {
+                "Tap Open Terminal to launch the encrypted session UI."
+            }
+            .to_string(),
+        );
+
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::web_app(
+            if invoked_cmd == "/agent" {
+                "Open Session"
+            } else {
+                "Open Terminal"
+            },
+            WebAppInfo {
+                url: web_app_url.clone(),
+            },
+        )]]);
+
+        let html_message = summary_lines.join("\n");
+        let plain_message = format!(
+            "{}\nMini App host: {}\n\nUse the Open button to launch.",
+            if invoked_cmd == "/agent" {
+                "Agent session"
+            } else {
+                "Terminal mode"
+            },
+            mini_app_base
+        );
+
+        if bot
+            .send_message(msg.chat.id, html_message)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard.clone())
+            .await
+            .is_err()
+        {
+            let _ = bot
+                .send_message(msg.chat.id, plain_message)
+                .reply_markup(keyboard)
+                .await;
         }
     }
 
@@ -980,6 +2589,8 @@ impl TelegramChannel {
                     self.max_file_size_mb,
                     Arc::clone(&self.state),
                     self.watchdog_stale_threshold_secs,
+                    self.terminal_web_app_url.clone(),
+                    self.terminal_allowed_prefixes.iter().cloned().collect(),
                 ));
 
                 // Give the new channel a reference to the hub too
@@ -1441,6 +3052,16 @@ impl TelegramChannel {
         // Handle slash commands
         if text.starts_with('/') {
             self.handle_command(&text, &msg, &bot).await;
+            return;
+        }
+
+        if let Some(lite_reply) = self
+            .handle_terminal_lite_input(msg.chat.id.0, user_id, user_role, &text)
+            .await
+        {
+            for chunk in split_message(&lite_reply, 4096) {
+                let _ = bot.send_message(msg.chat.id, chunk).await;
+            }
             return;
         }
 
@@ -1907,21 +3528,10 @@ impl TelegramChannel {
                         // skip the queue, and spawn concurrent tasks — silently
                         // dropping themselves. Finalized below before queue check.
                         if !reply.trim().is_empty() {
-                            let html = markdown_to_telegram_html(&reply);
-                            // Split long messages (Telegram limit is 4096 chars)
-                            let html_chunks = split_message(&html, 4096);
-                            let plain_chunks = split_message(&strip_latex(&reply), 4096);
-                            for (i, html_chunk) in html_chunks.iter().enumerate() {
-                                let plain_chunk = plain_chunks
-                                    .get(i)
-                                    .map(|s| s.as_str())
-                                    .unwrap_or(html_chunk.as_str());
-                                if let Err(e) =
-                                    send_html_or_fallback(&bot, chat_id, html_chunk, plain_chunk)
-                                        .await
-                                {
-                                    warn!("Failed to send Telegram message: {}", e);
-                                }
+                            if let Err(e) =
+                                send_full_or_expandable_reply(&bot, chat_id, &reply).await
+                            {
+                                warn!("Failed to send Telegram message: {}", e);
                             }
                             TelegramChannel::send_referenced_files_from_reply(
                                 &bot,
@@ -2158,22 +3768,8 @@ impl Channel for TelegramChannel {
                     .copied()
                     .unwrap_or(0) as i64
             });
-        let html = markdown_to_telegram_html(text);
-        let plain = strip_latex(text);
-        let mut first_err: Option<anyhow::Error> = None;
-        for chunk in split_message(&html, 4096) {
-            if let Err(e) = send_html_or_fallback(&self.bot, ChatId(chat_id), &chunk, &plain).await
-            {
-                warn!("Failed to send message: {}", e);
-                if first_err.is_none() {
-                    first_err = Some(anyhow::anyhow!("Failed to send Telegram message: {}", e));
-                }
-            }
-        }
-        if let Some(err) = first_err {
-            return Err(err);
-        }
-        Ok(())
+        self.send_compact_or_full_reply(&self.bot, ChatId(chat_id), text)
+            .await
     }
 
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
@@ -2471,6 +4067,108 @@ async fn send_html_or_fallback(
     }
 }
 
+async fn send_markdown_chunks_or_fallback_result(
+    bot: &Bot,
+    chat_id: ChatId,
+    markdown: &str,
+) -> anyhow::Result<()> {
+    let html = markdown_to_telegram_html(markdown);
+    let html_chunks = split_message(&html, 4096);
+    let plain_chunks = split_message(&strip_latex(markdown), 4096);
+    let mut first_err: Option<anyhow::Error> = None;
+
+    for (i, html_chunk) in html_chunks.iter().enumerate() {
+        let plain_chunk = plain_chunks
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or(html_chunk.as_str());
+        if let Err(e) = send_html_or_fallback(bot, chat_id, html_chunk, plain_chunk).await {
+            warn!("Failed to send Telegram message: {}", e);
+            if first_err.is_none() {
+                first_err = Some(anyhow::anyhow!("Failed to send Telegram message: {}", e));
+            }
+        }
+    }
+
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Convert markdown to Telegram HTML and send with plain-text fallback.
+async fn send_markdown_chunks_or_fallback(bot: &Bot, chat_id: ChatId, markdown: &str) {
+    if let Err(e) = send_markdown_chunks_or_fallback_result(bot, chat_id, markdown).await {
+        warn!("Failed to send Telegram message: {}", e);
+    }
+}
+
+async fn send_full_or_expandable_reply(
+    bot: &Bot,
+    chat_id: ChatId,
+    markdown: &str,
+) -> anyhow::Result<()> {
+    let plain = strip_latex(markdown);
+    if plain.chars().count() > TELEGRAM_EXPANDABLE_TRIGGER_CHARS {
+        return send_expandable_blockquote_reply(bot, chat_id, &plain).await;
+    }
+    send_markdown_chunks_or_fallback_result(bot, chat_id, markdown).await
+}
+
+async fn send_expandable_blockquote_reply(
+    bot: &Bot,
+    chat_id: ChatId,
+    plain: &str,
+) -> anyhow::Result<()> {
+    let chunks = split_for_expandable_blockquote(plain, TELEGRAM_EXPANDABLE_MAX_ESCAPED_CHARS);
+    let mut first_err: Option<anyhow::Error> = None;
+    for chunk in chunks {
+        let escaped = html_escape(&chunk);
+        let html = format!("<blockquote expandable>{}</blockquote>", escaped);
+        if let Err(e) = send_html_or_fallback(bot, chat_id, &html, &chunk).await {
+            warn!("Failed to send expandable Telegram message: {}", e);
+            if first_err.is_none() {
+                first_err = Some(anyhow::anyhow!("Failed to send Telegram message: {}", e));
+            }
+        }
+    }
+
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn split_for_expandable_blockquote(text: &str, max_escaped_chars: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut current_escaped_len = 0usize;
+
+    for ch in text.chars() {
+        let add = match ch {
+            '&' => 5,       // "&amp;"
+            '<' | '>' => 4, // "&lt;" / "&gt;"
+            _ => 1,
+        };
+        if current_escaped_len + add > max_escaped_chars && !current.is_empty() {
+            out.push(current);
+            current = String::new();
+            current_escaped_len = 0;
+        }
+        current.push(ch);
+        current_escaped_len += add;
+    }
+
+    if !current.is_empty() {
+        out.push(current);
+    }
+
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// Spawn a TelegramChannel in a background task.
 /// This is a separate function to avoid async type inference cycles.
 pub fn spawn_telegram_channel(channel: Arc<TelegramChannel>) {
@@ -2530,6 +4228,84 @@ fn extract_candidate_file_paths(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_lite_detects_shell_control_operators() {
+        assert!(TelegramChannel::contains_shell_control_operators(
+            "ls && rm -rf /tmp/demo"
+        ));
+        assert!(TelegramChannel::contains_shell_control_operators(
+            "echo $(whoami)"
+        ));
+        assert!(TelegramChannel::contains_shell_control_operators(
+            "echo `whoami`"
+        ));
+    }
+
+    #[test]
+    fn terminal_lite_allows_simple_commands_without_operators() {
+        assert!(!TelegramChannel::contains_shell_control_operators(
+            "ls -la /tmp"
+        ));
+        assert!(!TelegramChannel::contains_shell_control_operators(
+            "FOO=bar env"
+        ));
+        assert!(!TelegramChannel::contains_shell_control_operators(
+            "echo ';' '|' '>'"
+        ));
+    }
+
+    #[test]
+    fn format_agent_flag_docs_paginates_and_keeps_footer_actions() {
+        let docs = (1..=13)
+            .map(|n| AgentFlagDoc {
+                flag: format!("--flag-{}", n),
+                description: Some(format!("Description {}", n)),
+            })
+            .collect::<Vec<_>>();
+
+        let pages = TelegramChannel::format_agent_flag_docs("claude", &docs, false);
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].contains("Showing 1-12 of 13 (page 1/2)"));
+        assert!(pages[1].contains("Showing 13-13 of 13 (page 2/2)"));
+        assert!(pages[1].contains("Set defaults with `/agent defaults set <agent> [flags...]`."));
+        assert!(pages[1].contains("Bypass once with `--no-default-flags`."));
+        assert!(pages[1].contains("Refresh with `/agent flags <agent> refresh`."));
+    }
+
+    #[test]
+    fn format_agent_flag_docs_includes_cached_badge() {
+        let docs = vec![AgentFlagDoc {
+            flag: "--print".to_string(),
+            description: Some("Output format.".to_string()),
+        }];
+        let pages = TelegramChannel::format_agent_flag_docs("claude", &docs, true);
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].contains("Flags for `claude` (cached)"));
+    }
+
+    #[test]
+    fn split_for_expandable_blockquote_keeps_short_text_in_one_chunk() {
+        let chunks = split_for_expandable_blockquote("short reply", 100);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "short reply");
+    }
+
+    #[test]
+    fn split_for_expandable_blockquote_respects_escaped_limit() {
+        let text = "A&B<C>D";
+        // Escaped length is 1 + 5 + 1 + 4 + 1 + 4 + 1 = 17
+        let chunks = split_for_expandable_blockquote(text, 10);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], "A&B");
+        assert_eq!(chunks[1], "<C>D");
+    }
+
+    #[test]
+    fn split_for_expandable_blockquote_handles_empty_text() {
+        let chunks = split_for_expandable_blockquote("", 10);
+        assert_eq!(chunks, vec![String::new()]);
+    }
 
     // --- check_auth ---
 

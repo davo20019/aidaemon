@@ -1040,7 +1040,7 @@ impl DiscordChannel {
                 Err(e) => format!("Failed to clear context: {}", e),
             },
             "/cost" => self.handle_cost_command().await,
-            "/help" | "/start" => build_help_text(false, false, "/"),
+            "/help" | "/start" => build_help_text(false, false, false, "/"),
             _ => format!(
                 "Unknown command: {}\nType /help for available commands.",
                 cmd

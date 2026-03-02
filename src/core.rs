@@ -415,6 +415,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // 16. Start channels
     info!("Starting aidaemon v0.1.0");
     channel_bundle.spawn_all();
+    #[cfg(feature = "terminal-bridge")]
+    crate::terminal_bridge::spawn_if_configured(&config);
 
     // Wait for shutdown signal (ctrl+c), then gracefully pause plans
     info!("All subsystems started, waiting for shutdown signal (ctrl+c)");
