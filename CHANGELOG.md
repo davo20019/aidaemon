@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.11] - 2026-03-02
+
+### Added
+
+- **Native terminal handoff ("Continue on Computer")**: Seamlessly transfer an `/agent` session between Telegram Mini App and your native terminal. One-time, time-limited (5 min TTL) handoff codes allow secure session resumption across devices. New `aidaemon attach <code>` CLI command connects to the running daemon's local attach endpoint.
+- **Local attach endpoint**: Terminal bridge opens a loopback TCP listener on startup, writing connection details to `~/.aidaemon-terminal/attach-endpoint.json`. Enables CLI commands (`attach`, `start`, `share`) to communicate with the running daemon without going through the broker.
+- **`aidaemon agent share` command**: Generate a Telegram resume code from the command line for sharing active terminal sessions.
+- **`aidaemon agent start` command**: Launch terminal agents (`codex`, `claude`, `gemini`, `opencode`) through the bridge with working directory and flag pass-through support.
+- **CLI agent shortcuts**: `aidaemon codex`, `aidaemon claude`, `aidaemon gemini`, `aidaemon opencode` as thin aliases for `agent start` with optional `[cwd] [-- flags...]`.
+- **Telegram Mini App handoff commands**: `/agent share`, `/agent resume <code>`, and "Continue on Computer" inline button on `/agent open`.
+- **Web App data action parsing**: Structured action types from the Mini App (`agent_message.v1`, `open_on_computer.v1`, `continue_on_computer.v1`) with flexible field-name support.
+- **Terminal bridge hot-start**: Auto-starts terminal bridge on owner auto-claim without requiring `/restart`.
+
+### Changed
+
+- **Outbound message queue**: Replaced direct write-per-event with a two-priority queue (High for control, Low for bulk stdout). Flushes up to 24 frames per tick, preventing large PTY bursts from starving control messages.
+- **Biased select loop**: WS read arm is now prioritized first, ensuring incoming broker messages are never starved by shell output.
+- **Smarter re-attach replay**: Decides whether to replay buffered stdout based on frame count, byte size, and interactive content detection. Skips replay for large/interactive sessions to avoid terminal rendering artifacts.
+- **PTY UTF-8 streaming**: Replaced `from_utf8_lossy` with a carry-buffer approach that flushes only complete UTF-8 sequences. C1 control bytes normalized to ESC-prefixed equivalents.
+- **Duplicate bridge startup guard**: `AtomicBool` prevents racing hot-start and normal startup from spawning two bridge tasks.
+
+### Fixed
+
+- **Session map lock scope** (Discord, Slack, Telegram): Write lock guard is now dropped before `save_session_channel` async call, preventing potential lock ordering issues across await points.
+- **Clippy warnings**: Removed needless `return` statements in CLI argument handling.
+
 ## [0.9.10] - 2026-03-01
 
 ### Added

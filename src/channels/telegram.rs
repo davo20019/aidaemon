@@ -11,7 +11,8 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode, WebAppInfo,
+    ButtonRequest, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+    KeyboardButton, KeyboardMarkup, ParseMode, WebAppInfo,
 };
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -124,6 +125,14 @@ const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 const TELEGRAM_EXPANDABLE_WRAPPER_LEN: usize = "<blockquote expandable></blockquote>".len();
 const TELEGRAM_EXPANDABLE_MAX_ESCAPED_CHARS: usize =
     TELEGRAM_MAX_MESSAGE_LEN - TELEGRAM_EXPANDABLE_WRAPPER_LEN;
+const TELEGRAM_WEBAPP_TYPE_AGENT_MESSAGE: &str = "aidaemon.telegram.agent_message.v1";
+const TELEGRAM_WEBAPP_TYPE_CONTINUE_COMPUTER: &str = "aidaemon.telegram.open_on_computer.v1";
+const TELEGRAM_WEBAPP_MAX_TEXT_CHARS: usize = 2_000;
+
+enum TelegramWebAppAction {
+    AgentMessage(String),
+    ContinueOnComputer { relay_session_id: Option<String> },
+}
 
 impl TelegramChannel {
     #[allow(clippy::too_many_arguments)]
@@ -413,6 +422,29 @@ impl TelegramChannel {
             None => return,
         };
 
+        if data == "agent:share" || data.starts_with("agent:share:") {
+            let explicit_relay_session_id = data
+                .strip_prefix("agent:share:")
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string());
+            let _ = bot
+                .answer_callback_query(q.id.clone())
+                .text("Generating share code...")
+                .await;
+            if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) = q.message {
+                self.send_agent_share_code(&bot, m.chat.id, user_id, explicit_relay_session_id)
+                    .await;
+            } else {
+                let _ = bot
+                    .answer_callback_query(q.id)
+                    .text("Open the chat and run /agent share.")
+                    .show_alert(true)
+                    .await;
+            }
+            return;
+        }
+
         // Parse callback data: "approve:{once|session|always|deny}:{id}"
         // or "goal:{confirm|cancel}:{id}"
         let parts: Vec<&str> = data.splitn(3, ':').collect();
@@ -656,6 +688,8 @@ impl TelegramChannel {
          /agent defaults\n\
          /agent defaults set <agent> [agent_flags...]\n\
          /agent defaults clear [agent|all]\n\
+         /agent share [relay_session_id]\n\
+         /agent resume <code>\n\
          /agent open\n\
          /agent help\n\n\
          Examples:\n\
@@ -666,6 +700,8 @@ impl TelegramChannel {
          /agent opencode ~/projects/aidaemon\n\
          /agent flags codex\n\
          /agent flags codex refresh\n\
+         /agent share\n\
+         /agent resume ABCDEFGHJKLM\n\
          /agent defaults set codex --chrome --dangerously-skip-permissions\n\n\
          Tip: add `--no-default-flags` to bypass saved flags once.\n\n\
          For chat-based shell mode, use:\n\
@@ -1862,6 +1898,40 @@ impl TelegramChannel {
             }
         }
 
+        if invoked_cmd == "/agent"
+            && matches!(
+                tokens.first().map(|s| s.to_ascii_lowercase()).as_deref(),
+                Some("resume")
+            )
+        {
+            tokens.remove(0);
+            let code = tokens
+                .first()
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string());
+            self.send_agent_resume_prompt(bot, msg.chat.id, user_id, code)
+                .await;
+            return;
+        }
+
+        if invoked_cmd == "/agent"
+            && matches!(
+                tokens.first().map(|s| s.to_ascii_lowercase()).as_deref(),
+                Some("share")
+            )
+        {
+            tokens.remove(0);
+            let relay_session_id = tokens
+                .first()
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string());
+            self.send_agent_share_code(bot, msg.chat.id, user_id, relay_session_id)
+                .await;
+            return;
+        }
+
         let mut start_requested = false;
         if let Some(first) = tokens.first() {
             let first = first.to_ascii_lowercase();
@@ -2029,8 +2099,10 @@ impl TelegramChannel {
             return;
         }
 
+        let telegram_session_id = self.session_id(msg.chat.id.0).await;
         {
             let mut query = web_app_url.query_pairs_mut();
+            query.append_pair("telegram_session_id", &telegram_session_id);
             if let Some(agent) = agent.as_deref() {
                 query.append_pair("agent", agent);
             }
@@ -2102,27 +2174,41 @@ impl TelegramChannel {
         summary_lines.push(String::new());
         summary_lines.push(
             if invoked_cmd == "/agent" {
-                "Tap Open Session to launch the encrypted agent UI."
+                "Tap 📱 Open in Mini App to launch the encrypted agent UI."
             } else {
-                "Tap Open Terminal to launch the encrypted session UI."
+                "Tap 🖥️ Open Terminal to launch the encrypted session UI."
             }
             .to_string(),
         );
+        if invoked_cmd == "/agent" {
+            summary_lines.push(
+                "💻 Continue on Computer sends a one-time resume code (expires in about 5 minutes)."
+                    .to_string(),
+            );
+        }
 
-        let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::web_app(
+        let open_button = InlineKeyboardButton::web_app(
             if invoked_cmd == "/agent" {
-                "Open Session"
+                "📱 Open in Mini App"
             } else {
-                "Open Terminal"
+                "🖥️ Open Terminal"
             },
             WebAppInfo {
                 url: web_app_url.clone(),
             },
-        )]]);
+        );
+        let keyboard = if invoked_cmd == "/agent" {
+            InlineKeyboardMarkup::new(vec![vec![
+                open_button,
+                InlineKeyboardButton::callback("💻 Continue on Computer", "agent:share"),
+            ]])
+        } else {
+            InlineKeyboardMarkup::new(vec![vec![open_button]])
+        };
 
         let html_message = summary_lines.join("\n");
         let plain_message = format!(
-            "{}\nMini App host: {}\n\nUse the Open button to launch.",
+            "{}\nMini App host: {}\n\nUse the Open button to launch. Continue on Computer generates a one-time code that expires in about 5 minutes.",
             if invoked_cmd == "/agent" {
                 "Agent session"
             } else {
@@ -2141,6 +2227,24 @@ impl TelegramChannel {
             let _ = bot
                 .send_message(msg.chat.id, plain_message)
                 .reply_markup(keyboard)
+                .await;
+        }
+
+        if invoked_cmd == "/agent" {
+            let reply_keyboard =
+                KeyboardMarkup::new(vec![vec![KeyboardButton::new("📱 Open in Mini App")
+                    .request(ButtonRequest::WebApp(WebAppInfo {
+                        url: web_app_url.clone(),
+                    }))]])
+                .resize_keyboard()
+                .one_time_keyboard();
+
+            let _ = bot
+                .send_message(
+                    msg.chat.id,
+                    "Tip: if in-app handoff buttons look disabled, open from this keyboard button. Telegram only enables Mini App send-back in keyboard launch mode.",
+                )
+                .reply_markup(reply_keyboard)
                 .await;
         }
     }
@@ -2950,6 +3054,412 @@ impl TelegramChannel {
         }
     }
 
+    fn parse_web_app_action(raw: &str) -> Option<TelegramWebAppAction> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+        Self::parse_web_app_action_value(&parsed)
+    }
+
+    fn parse_web_app_action_value(value: &serde_json::Value) -> Option<TelegramWebAppAction> {
+        match value {
+            serde_json::Value::String(inner) => {
+                let trimmed = inner.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                let nested: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+                Self::parse_web_app_action_value(&nested)
+            }
+            serde_json::Value::Array(items) => {
+                items.iter().find_map(Self::parse_web_app_action_value)
+            }
+            serde_json::Value::Object(map) => {
+                let action_type = map
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .unwrap_or("");
+
+                let relay_session_id = map
+                    .get("relay_session_id")
+                    .or_else(|| map.get("relaySessionId"))
+                    .or_else(|| map.get("relay_session"))
+                    .or_else(|| map.get("relaySession"))
+                    .or_else(|| map.get("session"))
+                    .or_else(|| map.get("session_id"))
+                    .or_else(|| map.get("sessionId"))
+                    .or_else(|| map.get("sid"))
+                    .and_then(|v| {
+                        if let Some(raw) = v.as_str() {
+                            let trimmed = raw.trim();
+                            if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(trimmed.to_string())
+                            }
+                        } else if let Some(obj) = v.as_object() {
+                            obj.get("id")
+                                .or_else(|| obj.get("session_id"))
+                                .or_else(|| obj.get("sessionId"))
+                                .and_then(|inner| inner.as_str())
+                                .map(str::trim)
+                                .filter(|inner| !inner.is_empty())
+                                .map(|inner| inner.to_string())
+                        } else {
+                            None
+                        }
+                    });
+
+                if action_type == TELEGRAM_WEBAPP_TYPE_CONTINUE_COMPUTER
+                    || action_type == "aidaemon.telegram.continue_on_computer.v1"
+                {
+                    return Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id });
+                }
+                if action_type == TELEGRAM_WEBAPP_TYPE_AGENT_MESSAGE {
+                    let text = map
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let clipped = text.chars().take(TELEGRAM_WEBAPP_MAX_TEXT_CHARS).collect();
+                    return Some(TelegramWebAppAction::AgentMessage(clipped));
+                }
+
+                // Some Telegram clients/wrappers may nest the actual payload under another key.
+                for key in ["data", "payload", "message", "web_app_data", "webAppData"] {
+                    if let Some(nested) = map.get(key) {
+                        if let Some(action) = Self::parse_web_app_action_value(nested) {
+                            return Some(action);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    async fn build_terminal_attach_handoff_message(
+        &self,
+        relay_session_id: &str,
+        user_id: u64,
+    ) -> anyhow::Result<String> {
+        let handoff = crate::agent_handoff::create_handoff_code(
+            self.state.as_ref(),
+            relay_session_id,
+            user_id,
+        )
+        .await?;
+        let command = format!("aidaemon attach {}", handoff.code);
+        let shell_token = |value: &str| -> String {
+            if !value.is_empty()
+                && value.chars().all(|ch| {
+                    ch.is_ascii_alphanumeric()
+                        || matches!(ch, '_' | '-' | '.' | '/' | ':' | '=' | '+' | ',' | '@')
+                })
+            {
+                value.to_string()
+            } else {
+                format!("'{}'", value.replace('\'', r"'\''"))
+            }
+        };
+        let exact_command = std::env::current_exe().ok().and_then(|exe| {
+            let exe_text = exe.to_string_lossy().trim().to_string();
+            if exe_text.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "{} attach {}",
+                    shell_token(&exe_text),
+                    handoff.code
+                ))
+            }
+        });
+        let command_section = if let Some(exact) = exact_command {
+            format!(
+                "Run this on your computer:\n\
+                 <pre>{}</pre>\n\n\
+                 If <code>aidaemon</code> points to an older install, run:\n\
+                 <pre>{}</pre>\n\n",
+                html_escape(&command),
+                html_escape(&exact)
+            )
+        } else {
+            format!(
+                "Run this on your computer:\n\
+                 <pre>{}</pre>\n\n",
+                html_escape(&command)
+            )
+        };
+        Ok(format!(
+            "🖥️ <b>Continue In Native Terminal</b>\n\n\
+             {}\
+             Session: <code>{}</code>\n\
+             Expires in about 5 minutes. Code is one-time use.",
+            command_section,
+            html_escape(relay_session_id)
+        ))
+    }
+
+    async fn resolve_continue_relay_session_id(
+        &self,
+        chat_id: i64,
+        relay_session_id: Option<String>,
+    ) -> Option<String> {
+        if let Some(value) = relay_session_id
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            return Some(value);
+        }
+
+        let telegram_session_id = self.session_id(chat_id).await;
+        match crate::agent_handoff::resolve_relay_for_telegram_session(
+            self.state.as_ref(),
+            &telegram_session_id,
+        )
+        .await
+        {
+            Ok(Some(value)) => Some(value),
+            Ok(None) => None,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    telegram_session_id = %telegram_session_id,
+                    "Failed to resolve relay mapping for continue-on-computer"
+                );
+                None
+            }
+        }
+    }
+
+    async fn handle_continue_on_computer_action(
+        &self,
+        bot: &Bot,
+        msg: &teloxide::types::Message,
+        user_id: u64,
+        relay_session_id: Option<String>,
+    ) {
+        self.send_agent_share_code(bot, msg.chat.id, user_id, relay_session_id)
+            .await;
+    }
+
+    async fn send_agent_share_code(
+        &self,
+        bot: &Bot,
+        chat_id: ChatId,
+        user_id: u64,
+        relay_session_id: Option<String>,
+    ) {
+        let resolved_relay = if let Some(value) = relay_session_id
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(value)
+        } else {
+            let mapped = self
+                .resolve_continue_relay_session_id(chat_id.0, None)
+                .await;
+            if mapped.is_some() {
+                mapped
+            } else {
+                match crate::agent_handoff::get_last_active_relay_session_id(
+                    self.state.as_ref(),
+                    user_id,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "Failed to load last active relay session id for /agent share"
+                        );
+                        None
+                    }
+                }
+            }
+        };
+
+        let Some(relay_session_id) = resolved_relay else {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    "Could not identify the active terminal session. Keep the Mini App session open and try Continue on Computer again.",
+                )
+                .await;
+            return;
+        };
+
+        match self
+            .build_terminal_attach_handoff_message(&relay_session_id, user_id)
+            .await
+        {
+            Ok(reply) => {
+                let _ = bot
+                    .send_message(chat_id, reply)
+                    .parse_mode(ParseMode::Html)
+                    .await;
+            }
+            Err(err) => {
+                warn!(error = %err, "Failed to create terminal attach handoff code");
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "Failed to create continue-on-computer code. Please try again.",
+                    )
+                    .await;
+            }
+        }
+    }
+
+    async fn send_agent_resume_prompt(
+        &self,
+        bot: &Bot,
+        chat_id: ChatId,
+        user_id: u64,
+        code: Option<String>,
+    ) {
+        let Some(code) = code.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+            let _ = bot
+                .send_message(chat_id, "Usage: /agent resume <code>")
+                .await;
+            return;
+        };
+
+        let handoff = match crate::agent_handoff::resolve_handoff_code(self.state.as_ref(), &code)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = bot
+                        .send_message(
+                            chat_id,
+                            format!(
+                                "Resume code is invalid or expired: {}. Generate a fresh code from your computer with `aidaemon share`.",
+                                err
+                            ),
+                        )
+                        .await;
+                return;
+            }
+        };
+
+        if handoff.owner_user_id != user_id {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    "That resume code belongs to a different Telegram user.",
+                )
+                .await;
+            return;
+        }
+
+        if let Err(err) =
+            crate::agent_handoff::consume_handoff_code(self.state.as_ref(), &code).await
+        {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    format!("Resume code could not be consumed: {}.", err),
+                )
+                .await;
+            return;
+        }
+
+        let relay_session_id = handoff.relay_session_id.trim().to_string();
+        let telegram_session_id = self.session_id(chat_id.0).await;
+        if let Err(err) = crate::agent_handoff::bind_telegram_session_to_relay(
+            self.state.as_ref(),
+            &telegram_session_id,
+            &relay_session_id,
+        )
+        .await
+        {
+            warn!(
+                error = %err,
+                relay_session_id = %relay_session_id,
+                telegram_session_id = %telegram_session_id,
+                "Failed to bind relay session from /agent resume"
+            );
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    "Failed to bind the resume session. Please generate a new code and retry.",
+                )
+                .await;
+            return;
+        }
+
+        let mut web_app_url = match reqwest::Url::parse(&self.terminal_web_app_url) {
+            Ok(url) => url,
+            Err(err) => {
+                warn!(error = %err, "Invalid terminal_web_app_url during /agent resume");
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "Resume code accepted. Run `/agent open` to continue in Mini App.",
+                    )
+                    .await;
+                return;
+            }
+        };
+        {
+            let mut query = web_app_url.query_pairs_mut();
+            query.append_pair("telegram_session_id", &telegram_session_id);
+            query.append_pair("relay_session_id", &relay_session_id);
+            query.append_pair("autostart", "1");
+        }
+
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::web_app(
+                "📱 Open in Mini App",
+                WebAppInfo {
+                    url: web_app_url.clone(),
+                },
+            ),
+            InlineKeyboardButton::callback(
+                "💻 Continue on Computer",
+                format!("agent:share:{}", relay_session_id),
+            ),
+        ]]);
+
+        let _ = bot
+            .send_message(
+                chat_id,
+                format!(
+                    "✅ <b>Resume Code Accepted</b>\n\nSession: <code>{}</code>\nTap Open in Mini App to continue on your phone.",
+                    html_escape(&relay_session_id)
+                ),
+            )
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
+            .await;
+
+        let reply_keyboard =
+            KeyboardMarkup::new(vec![vec![KeyboardButton::new("📱 Open in Mini App")
+                .request(ButtonRequest::WebApp(WebAppInfo {
+                    url: web_app_url.clone(),
+                }))]])
+            .resize_keyboard()
+            .one_time_keyboard();
+
+        let _ = bot
+            .send_message(
+                chat_id,
+                "Tip: use this keyboard launch if Mini App send-back actions are unavailable in inline mode.",
+            )
+            .reply_markup(reply_keyboard)
+            .await;
+    }
+
     async fn handle_message(&self, msg: teloxide::types::Message, bot: Bot) {
         let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
 
@@ -3001,12 +3511,42 @@ impl TelegramChannel {
                         "Failed to persist auto-claimed user ID to config: {}", e
                     );
                 }
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        "Hey! You're now set as the owner. Ask me anything, give me tasks, or just chat.",
-                    )
-                    .await;
+                #[cfg(feature = "terminal-bridge")]
+                let mut bridge_hotstart_failed = false;
+                #[cfg(feature = "terminal-bridge")]
+                match AppConfig::load(&self.config_path) {
+                    Ok(config) => {
+                        if config.terminal.effective_bridge_enabled()
+                            && !crate::terminal_bridge::spawn_if_configured(
+                                &config,
+                                self.state.clone(),
+                            )
+                        {
+                            bridge_hotstart_failed = true;
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            user_id,
+                            error = %err,
+                            "Failed to reload config for terminal bridge hot-start after auto-claim"
+                        );
+                        bridge_hotstart_failed = true;
+                    }
+                }
+                #[cfg(feature = "terminal-bridge")]
+                let mut welcome = "Hey! You're now set as the owner. Ask me anything, give me tasks, or just chat."
+                    .to_string();
+                #[cfg(not(feature = "terminal-bridge"))]
+                let welcome = "Hey! You're now set as the owner. Ask me anything, give me tasks, or just chat."
+                    .to_string();
+                #[cfg(feature = "terminal-bridge")]
+                if bridge_hotstart_failed {
+                    welcome.push_str(
+                        "\n\nI couldn't auto-enable the /agent bridge right now. If /agent doesn't open, run /restart.",
+                    );
+                }
+                let _ = bot.send_message(msg.chat.id, welcome).await;
                 // Fall through to process the message normally
             }
             AuthResult::Unauthorized => {
@@ -3030,8 +3570,42 @@ impl TelegramChannel {
 
         let user_role = determine_role(&self.owner_user_ids, user_id);
 
-        let text = if let Some(t) = msg.text() {
-            t.to_string()
+        let text = if let Some(web_app_data) = msg.web_app_data() {
+            match Self::parse_web_app_action(&web_app_data.data) {
+                Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
+                    self.handle_continue_on_computer_action(&bot, &msg, user_id, relay_session_id)
+                        .await;
+                    return;
+                }
+                Some(TelegramWebAppAction::AgentMessage(text)) => text,
+                None => {
+                    let _ = bot
+                        .send_message(
+                            msg.chat.id,
+                            "Mini App payload was not recognized. Try opening a new terminal session with /agent open.",
+                        )
+                        .await;
+                    return;
+                }
+            }
+        } else if let Some(t) = msg.text() {
+            if let Some(action) = Self::parse_web_app_action(t) {
+                match action {
+                    TelegramWebAppAction::ContinueOnComputer { relay_session_id } => {
+                        self.handle_continue_on_computer_action(
+                            &bot,
+                            &msg,
+                            user_id,
+                            relay_session_id,
+                        )
+                        .await;
+                        return;
+                    }
+                    TelegramWebAppAction::AgentMessage(text) => text,
+                }
+            } else {
+                t.to_string()
+            }
         } else if self.files_enabled {
             match self.handle_file_message(&msg, &bot).await {
                 Ok(file_text) => file_text,
@@ -3072,8 +3646,10 @@ impl TelegramChannel {
         // (approvals, media, notifications) route back to this Telegram bot.
         {
             let channel_name = self.channel_name().await;
-            let mut map = self.session_map.write().await;
-            map.insert(session_id.clone(), channel_name.clone());
+            {
+                let mut map = self.session_map.write().await;
+                map.insert(session_id.clone(), channel_name.clone());
+            }
             let _ = self
                 .state
                 .save_session_channel(&session_id, &channel_name)
@@ -4359,6 +4935,93 @@ mod tests {
     #[test]
     fn role_user_not_in_owner_ids_is_guest() {
         assert_eq!(determine_role(&[111], 222), UserRole::Guest);
+    }
+
+    #[test]
+    fn parse_web_app_action_handles_continue_on_computer() {
+        let payload = r#"{"type":"aidaemon.telegram.open_on_computer.v1"}"#;
+        match TelegramChannel::parse_web_app_action(payload) {
+            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
+                assert!(relay_session_id.is_none());
+            }
+            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
+        }
+    }
+
+    #[test]
+    fn parse_web_app_action_extracts_agent_message() {
+        let payload = r#"{"type":"aidaemon.telegram.agent_message.v1","text":"Continue fixing the failing tests."}"#;
+        match TelegramChannel::parse_web_app_action(payload) {
+            Some(TelegramWebAppAction::AgentMessage(text)) => {
+                assert_eq!(text, "Continue fixing the failing tests.");
+            }
+            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
+        }
+    }
+
+    #[test]
+    fn parse_web_app_action_extracts_continue_session_id() {
+        let payload =
+            r#"{"type":"aidaemon.telegram.open_on_computer.v1","relay_session_id":"sess_123"}"#;
+        match TelegramChannel::parse_web_app_action(payload) {
+            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
+                assert_eq!(relay_session_id.as_deref(), Some("sess_123"));
+            }
+            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
+        }
+    }
+
+    #[test]
+    fn parse_web_app_action_extracts_continue_session_id_camel_case() {
+        let payload =
+            r#"{"type":"aidaemon.telegram.open_on_computer.v1","relaySessionId":"sess_camel"}"#;
+        match TelegramChannel::parse_web_app_action(payload) {
+            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
+                assert_eq!(relay_session_id.as_deref(), Some("sess_camel"));
+            }
+            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
+        }
+    }
+
+    #[test]
+    fn parse_web_app_action_extracts_continue_session_id_from_object() {
+        let payload =
+            r#"{"type":"aidaemon.telegram.open_on_computer.v1","session":{"id":"sess_obj"}}"#;
+        match TelegramChannel::parse_web_app_action(payload) {
+            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
+                assert_eq!(relay_session_id.as_deref(), Some("sess_obj"));
+            }
+            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
+        }
+    }
+
+    #[test]
+    fn parse_web_app_action_accepts_legacy_session_id_key() {
+        let payload =
+            r#"{"type":"aidaemon.telegram.open_on_computer.v1","session_id":"sess_legacy"}"#;
+        match TelegramChannel::parse_web_app_action(payload) {
+            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
+                assert_eq!(relay_session_id.as_deref(), Some("sess_legacy"));
+            }
+            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
+        }
+    }
+
+    #[test]
+    fn parse_web_app_action_accepts_nested_payload_string() {
+        let payload = r#"{"data":"{\"type\":\"aidaemon.telegram.open_on_computer.v1\",\"relay_session_id\":\"sess_nested\"}"}"#;
+        match TelegramChannel::parse_web_app_action(payload) {
+            Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
+                assert_eq!(relay_session_id.as_deref(), Some("sess_nested"));
+            }
+            other => panic!("unexpected parsed action: {:?}", other.map(|_| "unknown")),
+        }
+    }
+
+    #[test]
+    fn parse_web_app_action_rejects_unknown_payload() {
+        let payload = r#"{"type":"unknown","text":"hello"}"#;
+        assert!(TelegramChannel::parse_web_app_action(payload).is_none());
     }
 
     #[test]

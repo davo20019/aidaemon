@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -30,9 +33,13 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{resolve_from_keychain, store_in_keychain, AppConfig};
+use crate::traits::StateStore;
 
 const HEARTBEAT_MS: u64 = 25_000;
 const RECONNECT_MS: u64 = 3_000;
+const OUTBOUND_HIGH_QUEUE_CAP: usize = 128;
+const OUTBOUND_LOW_QUEUE_CAP: usize = 1024;
+const OUTBOUND_FLUSH_BURST: usize = 24;
 // Keep encrypted payloads comfortably below the broker's 64 KiB WS frame cap.
 // JSON envelope + AES-GCM overhead + base64 expansion can otherwise exceed 64 KiB
 // and force daemon socket disconnects under high-output workloads.
@@ -57,6 +64,11 @@ const REVIEW_STREAM_REPLAY_MAX_FRAMES: usize = 1024;
 const REVIEW_STREAM_REPLAY_MAX_BYTES: usize = 2 * 1024 * 1024;
 const REPLAY_MAX_FRAMES: usize = 256;
 const REPLAY_MAX_BYTES: usize = 4 * 1024 * 1024;
+const REATTACH_REPLAY_HARD_CAP_FRAMES: usize = 128;
+const REATTACH_REPLAY_HARD_CAP_BYTES: usize = 512 * 1024;
+const REATTACH_REPLAY_INTERACTIVE_CAP_FRAMES: usize = 16;
+const REATTACH_REPLAY_INTERACTIVE_CAP_BYTES: usize = 96 * 1024;
+const REATTACH_REVIEW_REPLAY_CAP_FRAMES: usize = 192;
 const PTY_DEFAULT_ROWS: u16 = 36;
 const PTY_DEFAULT_COLS: u16 = 120;
 const KEY_INFO: &[u8] = b"aidaemon-terminal-v1";
@@ -64,7 +76,12 @@ const DAEMON_BOOTSTRAP_SIGNING_SALT: &[u8] = b"aidaemon-daemon-bootstrap-v1";
 const DAEMON_BOOTSTRAP_SIGNING_INFO: &[u8] = b"hmac-signing-key";
 const TERMINAL_DAEMON_KEYCHAIN_FIELD: &str = "terminal_daemon_private_key_v1";
 const SUPPORTED_TERMINAL_AGENTS: &[&str] = &["codex", "claude", "gemini", "opencode"];
+const LOCAL_ATTACH_ENDPOINT_FILENAME: &str = "attach-endpoint.json";
+const LOCAL_ATTACH_SECRET_BYTES: usize = 24;
+const LOCAL_ATTACH_MAX_FRAME_BYTES: usize = 128 * 1024;
 type HmacSha256 = Hmac<Sha256>;
+static NEXT_LOCAL_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+static TERMINAL_BRIDGE_TASK_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize)]
 struct StoredDaemonKey {
@@ -170,6 +187,61 @@ struct ActiveSession {
     review_job: Option<ReviewJob>,
     last_review_progress: Option<Value>,
     last_review_result: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundPriority {
+    High,
+    Low,
+}
+
+struct QueuedOutboundPayload {
+    session_id: String,
+    payload: Value,
+}
+
+#[derive(Default)]
+struct OutboundQueue {
+    // High-priority control/result frames are drained before bulk stdout/review stream frames.
+    high: VecDeque<QueuedOutboundPayload>,
+    low: VecDeque<QueuedOutboundPayload>,
+}
+
+impl OutboundQueue {
+    fn is_empty(&self) -> bool {
+        self.high.is_empty() && self.low.is_empty()
+    }
+
+    fn enqueue(
+        &mut self,
+        priority: OutboundPriority,
+        entry: QueuedOutboundPayload,
+    ) -> Option<QueuedOutboundPayload> {
+        match priority {
+            OutboundPriority::High => {
+                let dropped = if self.high.len() >= OUTBOUND_HIGH_QUEUE_CAP {
+                    self.high.pop_front()
+                } else {
+                    None
+                };
+                self.high.push_back(entry);
+                dropped
+            }
+            OutboundPriority::Low => {
+                let dropped = if self.low.len() >= OUTBOUND_LOW_QUEUE_CAP {
+                    self.low.pop_front()
+                } else {
+                    None
+                };
+                self.low.push_back(entry);
+                dropped
+            }
+        }
+    }
+
+    fn pop_next(&mut self) -> Option<QueuedOutboundPayload> {
+        self.high.pop_front().or_else(|| self.low.pop_front())
+    }
 }
 
 struct ReviewJob {
@@ -402,14 +474,19 @@ impl ShellProcess {
             .name("terminal-bridge-pty-reader".to_string())
             .spawn(move || {
                 let mut buf = [0u8; 4096];
+                let mut utf8_carry = Vec::<u8>::new();
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            let decoded = decode_utf8_stream_chunk(&mut utf8_carry, &buf[..n]);
+                            if decoded.is_empty() {
+                                continue;
+                            }
                             if events_tx
                                 .send(ShellEvent::Output {
                                     session_id: read_session_id.clone(),
-                                    data: String::from_utf8_lossy(&buf[..n]).to_string(),
+                                    data: decoded,
                                 })
                                 .is_err()
                             {
@@ -417,6 +494,15 @@ impl ShellProcess {
                             }
                         }
                         Err(_) => break,
+                    }
+                }
+                if !utf8_carry.is_empty() {
+                    let tail = String::from_utf8_lossy(&utf8_carry).to_string();
+                    if !tail.is_empty() {
+                        let _ = events_tx.send(ShellEvent::Output {
+                            session_id: read_session_id.clone(),
+                            data: tail,
+                        });
                     }
                 }
             })?;
@@ -479,6 +565,58 @@ impl ShellProcess {
     }
 }
 
+fn decode_utf8_stream_chunk(carry: &mut Vec<u8>, incoming: &[u8]) -> String {
+    if incoming.is_empty() {
+        return String::new();
+    }
+    carry.extend_from_slice(incoming);
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(carry.as_slice()) {
+            Ok(valid) => {
+                out.push_str(valid);
+                carry.clear();
+                break;
+            }
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                if valid_up_to > 0 {
+                    if let Ok(prefix) = std::str::from_utf8(&carry[..valid_up_to]) {
+                        out.push_str(prefix);
+                    }
+                }
+                if let Some(error_len) = err.error_len() {
+                    let drain_to = valid_up_to.saturating_add(error_len).min(carry.len());
+                    let invalid = &carry[valid_up_to..drain_to];
+                    if invalid.len() == 1 {
+                        match invalid[0] {
+                            // C1 controls can appear in terminal streams (not UTF-8 text).
+                            // Normalize the common ones instead of printing replacement glyphs.
+                            0x9B => out.push_str("\u{001b}["),
+                            0x9D => out.push_str("\u{001b}]"),
+                            0x90 => out.push_str("\u{001b}P"),
+                            0x9C => out.push_str("\u{001b}\\"),
+                            b if (0x80..=0x9F).contains(&b) => {}
+                            _ => out.push('\u{FFFD}'),
+                        }
+                    } else {
+                        out.push('\u{FFFD}');
+                    }
+                    carry.drain(..drain_to);
+                    if carry.is_empty() {
+                        break;
+                    }
+                } else {
+                    // Incomplete UTF-8 sequence at the end. Keep trailing bytes for next read.
+                    carry.drain(..valid_up_to);
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn exit_status_code(status: ExitStatus) -> i32 {
     status.exit_code() as i32
 }
@@ -507,16 +645,16 @@ fn set_owner_only_permissions(_path: &Path, _mode: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn spawn_if_configured(config: &AppConfig) {
+pub fn spawn_if_configured(config: &AppConfig, state: std::sync::Arc<dyn StateStore>) -> bool {
     if !config.terminal.effective_bridge_enabled() {
         info!("Terminal bridge disabled by config ([terminal].bridge_enabled = false)");
-        return;
+        return false;
     }
 
     let user_id = resolve_daemon_user_id(config, config.terminal.effective_daemon_user_id());
     let Some(user_id) = user_id else {
         warn!("Terminal bridge disabled: unable to resolve Telegram owner user_id");
-        return;
+        return false;
     };
 
     let ws_url = config.terminal.effective_daemon_ws_url();
@@ -526,7 +664,7 @@ pub fn spawn_if_configured(config: &AppConfig) {
             ws_url = %ws_url,
             "Terminal bridge disabled: insecure or invalid daemon websocket URL"
         );
-        return;
+        return false;
     }
 
     let shell = config
@@ -560,7 +698,7 @@ pub fn spawn_if_configured(config: &AppConfig) {
                     error = %err,
                     "Terminal bridge disabled: invalid daemon websocket URL for token minting"
                 );
-                return;
+                return false;
             }
         };
         let fallback_static_token = if allow_static_fallback {
@@ -591,7 +729,7 @@ pub fn spawn_if_configured(config: &AppConfig) {
         info!(
             "Terminal bridge disabled: no daemon token configured and no Telegram bot token available for secure auto-bootstrap"
         );
-        return;
+        return false;
     };
 
     let review_profiles = build_review_profiles(config);
@@ -608,12 +746,22 @@ pub fn spawn_if_configured(config: &AppConfig) {
         auth,
     };
 
+    if TERMINAL_BRIDGE_TASK_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        info!("Terminal bridge already running; skipping duplicate startup");
+        return true;
+    }
+
     tokio::spawn(async move {
-        match TerminalBridge::new(runtime).await {
+        match TerminalBridge::new(runtime, state).await {
             Ok(mut bridge) => bridge.run_forever().await,
             Err(err) => error!(error = %err, "Failed to initialize terminal bridge"),
         }
+        TERMINAL_BRIDGE_TASK_RUNNING.store(false, Ordering::Release);
     });
+    true
 }
 
 fn default_review_profiles() -> HashMap<String, ReviewProfile> {
@@ -781,6 +929,20 @@ fn normalize_agent(value: Option<&str>) -> Option<String> {
     }
 }
 
+fn normalize_relay_session_id(raw: Option<&str>) -> Option<String> {
+    let value = raw.unwrap_or("").trim();
+    if value.is_empty() || value.len() > 128 {
+        return None;
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 fn normalize_review_profile_args(reviewer: &str, args: &[String]) -> Vec<String> {
     // Review runs should prefer a single structured terminal payload.
     // Streaming/verbose modes create noisy output that is harder to parse and display.
@@ -812,17 +974,120 @@ fn normalize_review_profile_args(reviewer: &str, args: &[String]) -> Vec<String>
 }
 
 fn normalize_agent_args(value: Option<&Value>) -> Vec<String> {
-    let Some(Value::Array(raw)) = value else {
+    let Some(value) = value else {
         return Vec::new();
     };
-    raw.iter()
-        .filter_map(|item| item.as_str())
-        .map(str::trim)
+    let mut raw_values: Vec<String> = Vec::new();
+    match value {
+        Value::Array(raw) => {
+            for item in raw {
+                if let Some(text) = item.as_str() {
+                    raw_values.push(text.to_string());
+                }
+            }
+        }
+        Value::String(text) => {
+            if let Ok(parsed) = shell_words::split(text) {
+                raw_values.extend(parsed);
+            } else {
+                raw_values.push(text.clone());
+            }
+        }
+        _ => return Vec::new(),
+    }
+    raw_values
+        .into_iter()
+        .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && !v.contains('\0'))
         .filter(|v| is_safe_agent_bootstrap_arg(v))
         .map(|v| v.chars().take(MAX_AGENT_ARG_CHARS).collect::<String>())
         .take(MAX_AGENT_ARGS)
         .collect()
+}
+
+fn requested_agent_args_from_client_hello(frame: &Value) -> Vec<String> {
+    // Accept multiple key shapes to remain compatible with older/newer Mini App builds.
+    let key_order = ["agent_args", "agentArgs", "args", "argv", "arg"];
+    for key in key_order {
+        if let Some(raw) = frame.get(key) {
+            return normalize_agent_args(Some(raw));
+        }
+    }
+    Vec::new()
+}
+
+fn normalize_telegram_session_id(raw: Option<&str>) -> Option<String> {
+    let session_id = raw?.trim();
+    if session_id.is_empty() || session_id.len() > 128 {
+        return None;
+    }
+    if !session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(session_id.to_string())
+}
+
+fn requested_telegram_session_id_from_client_hello(frame: &Value) -> Option<String> {
+    let key_order = [
+        "telegram_session_id",
+        "telegramSessionId",
+        "chat_session_id",
+        "chatSessionId",
+    ];
+    for key in key_order {
+        if let Some(value) = normalize_telegram_session_id(frame.get(key).and_then(Value::as_str)) {
+            return Some(value);
+        }
+    }
+    if let Some(telegram_obj) = frame.get("telegram").and_then(Value::as_object) {
+        for key in key_order {
+            if let Some(value) =
+                normalize_telegram_session_id(telegram_obj.get(key).and_then(Value::as_str))
+            {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn requested_relay_session_id_from_client_hello(frame: &Value) -> Option<String> {
+    let key_order = [
+        "relay_session_id",
+        "relaySessionId",
+        "requested_relay_session_id",
+        "requestedRelaySessionId",
+        "target_relay_session_id",
+        "targetRelaySessionId",
+    ];
+    for key in key_order {
+        if let Some(value) = normalize_relay_session_id(frame.get(key).and_then(Value::as_str)) {
+            return Some(value);
+        }
+    }
+    if let Some(relay_obj) = frame.get("relay").and_then(Value::as_object) {
+        for key in key_order {
+            if let Some(value) =
+                normalize_relay_session_id(relay_obj.get(key).and_then(Value::as_str))
+            {
+                return Some(value);
+            }
+        }
+        if let Some(value) =
+            normalize_relay_session_id(relay_obj.get("session_id").and_then(Value::as_str))
+        {
+            return Some(value);
+        }
+        if let Some(value) =
+            normalize_relay_session_id(relay_obj.get("sessionId").and_then(Value::as_str))
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn is_safe_agent_bootstrap_arg(value: &str) -> bool {
@@ -834,9 +1099,17 @@ fn is_safe_agent_bootstrap_arg(value: &str) -> bool {
         .any(|ch| matches!(ch, ';' | '|' | '&' | '>' | '<' | '`'))
 }
 
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
+fn should_quote_shell_token(value: &str) -> bool {
+    value.is_empty()
+        || value.chars().any(|ch| {
+            !(ch.is_ascii_alphanumeric()
+                || matches!(ch, '_' | '-' | '.' | '/' | ':' | '=' | '+' | ',' | '@'))
+        })
+}
+
+fn shell_token(value: &str) -> String {
+    if !should_quote_shell_token(value) {
+        return value.to_string();
     }
     format!("'{}'", value.replace('\'', r"'\''"))
 }
@@ -936,6 +1209,59 @@ fn split_utf8_chunks(s: &str, max_bytes: usize) -> Vec<String> {
         out.push(current);
     }
     out
+}
+
+fn replay_frames_total_bytes(frames: &[(u64, String)]) -> usize {
+    frames.iter().map(|(_, chunk)| chunk.len()).sum()
+}
+
+fn replay_frames_look_interactive(frames: &[(u64, String)]) -> bool {
+    frames
+        .iter()
+        .any(|(_, chunk)| chunk.contains('\r') || chunk.contains('\u{001b}'))
+}
+
+fn should_skip_stdout_replay(
+    resume_from_seq: u64,
+    oldest_seq: u64,
+    frames: &[(u64, String)],
+) -> bool {
+    if frames.is_empty() {
+        return false;
+    }
+    if resume_from_seq.saturating_add(1) < oldest_seq {
+        // We already lost continuity; replay from an arbitrary tail often renders as
+        // visual garbage for interactive CLIs, so prefer a clean live resume.
+        return true;
+    }
+    if resume_from_seq != 0 {
+        return false;
+    }
+
+    let total_bytes = replay_frames_total_bytes(frames);
+    if frames.len() > REATTACH_REPLAY_HARD_CAP_FRAMES
+        || total_bytes > REATTACH_REPLAY_HARD_CAP_BYTES
+    {
+        return true;
+    }
+
+    replay_frames_look_interactive(frames)
+        && (frames.len() > REATTACH_REPLAY_INTERACTIVE_CAP_FRAMES
+            || total_bytes > REATTACH_REPLAY_INTERACTIVE_CAP_BYTES)
+}
+
+fn should_skip_review_stream_replay(
+    resume_from_review_stream_seq: u64,
+    oldest_review_stream_seq: u64,
+    replay_len: usize,
+) -> bool {
+    if replay_len == 0 {
+        return false;
+    }
+    if resume_from_review_stream_seq.saturating_add(1) < oldest_review_stream_seq {
+        return true;
+    }
+    resume_from_review_stream_seq == 0 && replay_len > REATTACH_REVIEW_REPLAY_CAP_FRAMES
 }
 
 fn escaped_control_token_len(data: &str) -> Option<usize> {
@@ -2390,9 +2716,7 @@ async fn load_or_create_key_material() -> anyhow::Result<KeyMaterial> {
         Generated,
     }
 
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".aidaemon-terminal");
+    let dir = terminal_bridge_state_dir();
     tokio::fs::create_dir_all(&dir).await?;
     set_owner_only_permissions(&dir, 0o700)?;
     let key_path = dir.join("daemon-key.json");
@@ -2647,17 +2971,453 @@ async fn mint_connect_token_from_bot_proof(
     }))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalAttachEndpoint {
+    version: u8,
+    host: String,
+    port: u16,
+    secret: String,
+    pid: u32,
+    updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone)]
+struct LocalAttachClient {
+    session_id: String,
+    tx: tokio::sync::mpsc::UnboundedSender<Value>,
+}
+
+#[derive(Debug)]
+struct LocalAttachAccepted {
+    session_id: String,
+    #[allow(dead_code)]
+    resume_code: Option<String>,
+    #[allow(dead_code)]
+    resume_expires_at_unix: Option<i64>,
+}
+
+#[derive(Debug)]
+struct LocalShareCreated {
+    session_id: String,
+    code: String,
+    expires_at_unix: i64,
+}
+
+enum LocalAttachEvent {
+    AttachRequest {
+        client_id: u64,
+        code: String,
+        secret: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Value>,
+        response_tx: tokio::sync::oneshot::Sender<anyhow::Result<LocalAttachAccepted>>,
+    },
+    StartRequest {
+        client_id: u64,
+        secret: String,
+        agent: String,
+        cwd: Option<String>,
+        agent_args: Vec<String>,
+        tx: tokio::sync::mpsc::UnboundedSender<Value>,
+        response_tx: tokio::sync::oneshot::Sender<anyhow::Result<LocalAttachAccepted>>,
+    },
+    ShareRequest {
+        secret: String,
+        session_id: Option<String>,
+        response_tx: tokio::sync::oneshot::Sender<anyhow::Result<LocalShareCreated>>,
+    },
+    Input {
+        client_id: u64,
+        data_b64: String,
+    },
+    Resize {
+        client_id: u64,
+        cols: u16,
+        rows: u16,
+    },
+    Redraw {
+        client_id: u64,
+    },
+    Close {
+        client_id: u64,
+    },
+}
+
+fn terminal_bridge_state_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".aidaemon-terminal")
+}
+
+fn local_attach_endpoint_path() -> PathBuf {
+    terminal_bridge_state_dir().join(LOCAL_ATTACH_ENDPOINT_FILENAME)
+}
+
+async fn persist_local_attach_endpoint(port: u16, secret: &str) -> anyhow::Result<()> {
+    let dir = terminal_bridge_state_dir();
+    tokio::fs::create_dir_all(&dir).await?;
+    set_owner_only_permissions(&dir, 0o700)?;
+
+    let endpoint = LocalAttachEndpoint {
+        version: 1,
+        host: "127.0.0.1".to_string(),
+        port,
+        secret: secret.to_string(),
+        pid: std::process::id(),
+        updated_at_unix: chrono::Utc::now().timestamp(),
+    };
+    let path = local_attach_endpoint_path();
+    let raw = serde_json::to_string_pretty(&endpoint)?;
+    tokio::fs::write(&path, raw).await?;
+    set_owner_only_permissions(&path, 0o600)?;
+    Ok(())
+}
+
+async fn write_json_line<W>(writer: &mut W, value: &Value) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut line = serde_json::to_string(value)?;
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn spawn_local_attach_listener(
+    events_tx: tokio::sync::mpsc::UnboundedSender<LocalAttachEvent>,
+    secret: String,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = listener.local_addr()?.port();
+    persist_local_attach_endpoint(port, &secret).await?;
+    info!(port, "Local terminal attach endpoint ready");
+
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((socket, _)) => {
+                    let events_tx = events_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = handle_local_attach_socket(socket, events_tx).await {
+                            debug!(error = %err, "Local attach socket closed with error");
+                        }
+                    });
+                }
+                Err(err) => {
+                    warn!(error = %err, "Local attach listener accept failed");
+                    break;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn handle_local_attach_socket(
+    socket: TcpStream,
+    events_tx: tokio::sync::mpsc::UnboundedSender<LocalAttachEvent>,
+) -> anyhow::Result<()> {
+    let client_id = NEXT_LOCAL_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+    let (read_half, mut write_half) = socket.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    let mut first_line = String::new();
+    let first_read = reader.read_line(&mut first_line).await?;
+    if first_read == 0 || first_line.len() > LOCAL_ATTACH_MAX_FRAME_BYTES {
+        anyhow::bail!("missing or oversized attach frame");
+    }
+    let first_value: Value = serde_json::from_str(first_line.trim())
+        .map_err(|e| anyhow::anyhow!("invalid attach frame: {}", e))?;
+    let frame_type = first_value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match frame_type {
+        "attach" | "start" => {
+            let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+            if frame_type == "attach" {
+                let code = first_value
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_string();
+                let secret = first_value
+                    .get("secret")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_string();
+                if code.is_empty() || secret.is_empty() {
+                    write_json_line(
+                        &mut write_half,
+                        &json!({
+                            "type":"error",
+                            "message":"attach requires code and secret.",
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                events_tx
+                    .send(LocalAttachEvent::AttachRequest {
+                        client_id,
+                        code,
+                        secret,
+                        tx: outbound_tx.clone(),
+                        response_tx,
+                    })
+                    .map_err(|_| anyhow::anyhow!("local attach service unavailable"))?;
+            } else {
+                let secret = first_value
+                    .get("secret")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_string();
+                let agent = normalize_agent(first_value.get("agent").and_then(Value::as_str))
+                    .unwrap_or_else(|| "codex".to_string());
+                let agent_args = requested_agent_args_from_client_hello(&first_value);
+                let cwd = first_value
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_string());
+                if secret.is_empty() {
+                    write_json_line(
+                        &mut write_half,
+                        &json!({
+                            "type":"error",
+                            "message":"start requires secret.",
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                events_tx
+                    .send(LocalAttachEvent::StartRequest {
+                        client_id,
+                        secret,
+                        agent,
+                        cwd,
+                        agent_args,
+                        tx: outbound_tx.clone(),
+                        response_tx,
+                    })
+                    .map_err(|_| anyhow::anyhow!("local attach service unavailable"))?;
+            }
+
+            let accepted = match response_rx.await {
+                Ok(Ok(ok)) => ok,
+                Ok(Err(err)) => {
+                    write_json_line(
+                        &mut write_half,
+                        &json!({
+                            "type":"error",
+                            "message": err.to_string(),
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    write_json_line(
+                        &mut write_half,
+                        &json!({
+                            "type":"error",
+                            "message":"local attach service did not respond.",
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            write_json_line(
+                &mut write_half,
+                &json!({
+                    "type":"attached",
+                    "session_id": accepted.session_id,
+                    "resume_code": accepted.resume_code,
+                    "resume_expires_at_unix": accepted.resume_expires_at_unix,
+                }),
+            )
+            .await?;
+
+            let writer_task = tokio::spawn(async move {
+                while let Some(payload) = outbound_rx.recv().await {
+                    if write_json_line(&mut write_half, &payload).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    break;
+                }
+                if line.len() > LOCAL_ATTACH_MAX_FRAME_BYTES {
+                    break;
+                }
+                let value: Value = match serde_json::from_str(line.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                match value.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                    "stdin" => {
+                        let data_b64 = value
+                            .get("data")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if data_b64.is_empty() {
+                            continue;
+                        }
+                        let _ = events_tx.send(LocalAttachEvent::Input {
+                            client_id,
+                            data_b64,
+                        });
+                    }
+                    "resize" => {
+                        let cols = value
+                            .get("cols")
+                            .or_else(|| value.get("width"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(PTY_DEFAULT_COLS as u64)
+                            .clamp(20, 400) as u16;
+                        let rows = value
+                            .get("rows")
+                            .or_else(|| value.get("height"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(PTY_DEFAULT_ROWS as u64)
+                            .clamp(5, 200) as u16;
+                        let _ = events_tx.send(LocalAttachEvent::Resize {
+                            client_id,
+                            cols,
+                            rows,
+                        });
+                    }
+                    "redraw" => {
+                        let _ = events_tx.send(LocalAttachEvent::Redraw { client_id });
+                    }
+                    "detach" => break,
+                    _ => {}
+                }
+            }
+
+            let _ = events_tx.send(LocalAttachEvent::Close { client_id });
+            writer_task.abort();
+            Ok(())
+        }
+        "share" => {
+            let secret = first_value
+                .get("secret")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            let session_id = normalize_relay_session_id(
+                first_value
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| first_value.get("sessionId").and_then(Value::as_str)),
+            );
+            if secret.is_empty() {
+                write_json_line(
+                    &mut write_half,
+                    &json!({
+                        "type":"error",
+                        "message":"share requires secret.",
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            events_tx
+                .send(LocalAttachEvent::ShareRequest {
+                    secret,
+                    session_id,
+                    response_tx,
+                })
+                .map_err(|_| anyhow::anyhow!("local attach service unavailable"))?;
+            match response_rx.await {
+                Ok(Ok(shared)) => {
+                    write_json_line(
+                        &mut write_half,
+                        &json!({
+                            "type":"shared",
+                            "session_id": shared.session_id,
+                            "code": shared.code,
+                            "expires_at_unix": shared.expires_at_unix,
+                        }),
+                    )
+                    .await?;
+                    Ok(())
+                }
+                Ok(Err(err)) => {
+                    write_json_line(
+                        &mut write_half,
+                        &json!({
+                            "type":"error",
+                            "message": err.to_string(),
+                        }),
+                    )
+                    .await?;
+                    Ok(())
+                }
+                Err(_) => {
+                    write_json_line(
+                        &mut write_half,
+                        &json!({
+                            "type":"error",
+                            "message":"local share service did not respond.",
+                        }),
+                    )
+                    .await?;
+                    Ok(())
+                }
+            }
+        }
+        _ => {
+            write_json_line(
+                &mut write_half,
+                &json!({
+                    "type":"error",
+                    "message":"First frame must be type=attach, type=start, or type=share.",
+                }),
+            )
+            .await?;
+            Ok(())
+        }
+    }
+}
+
 struct TerminalBridge {
     cfg: RuntimeConfig,
     key_material: KeyMaterial,
     sessions: HashMap<String, ActiveSession>,
+    state: std::sync::Arc<dyn StateStore>,
     http_client: reqwest::Client,
     shell_events_tx: tokio::sync::mpsc::UnboundedSender<ShellEvent>,
     shell_events_rx: tokio::sync::mpsc::UnboundedReceiver<ShellEvent>,
+    local_attach_secret: String,
+    local_clients: HashMap<u64, LocalAttachClient>,
+    local_events_rx: tokio::sync::mpsc::UnboundedReceiver<LocalAttachEvent>,
 }
 
 impl TerminalBridge {
-    async fn new(cfg: RuntimeConfig) -> anyhow::Result<Self> {
+    async fn new(
+        cfg: RuntimeConfig,
+        state: std::sync::Arc<dyn StateStore>,
+    ) -> anyhow::Result<Self> {
         let key_material = load_or_create_key_material().await?;
         let http_client = reqwest::Client::builder()
             .user_agent("aidaemon-terminal-bridge/1.0")
@@ -2665,6 +3425,17 @@ impl TerminalBridge {
             .build()?;
         let (shell_events_tx, shell_events_rx) =
             tokio::sync::mpsc::unbounded_channel::<ShellEvent>();
+        let (local_events_tx, local_events_rx) =
+            tokio::sync::mpsc::unbounded_channel::<LocalAttachEvent>();
+        let local_attach_secret = random_nonce_hex(LOCAL_ATTACH_SECRET_BYTES);
+        if let Err(err) =
+            spawn_local_attach_listener(local_events_tx.clone(), local_attach_secret.clone()).await
+        {
+            warn!(
+                error = %err,
+                "Failed to start local attach endpoint; agent attach from native terminal will be unavailable"
+            );
+        }
         info!(
             fingerprint = %key_material.fingerprint,
             user_id = %cfg.user_id,
@@ -2674,19 +3445,25 @@ impl TerminalBridge {
             cfg,
             key_material,
             sessions: HashMap::new(),
+            state,
             http_client,
             shell_events_tx,
             shell_events_rx,
+            local_attach_secret,
+            local_clients: HashMap::new(),
+            local_events_rx,
         })
     }
 
     async fn run_forever(&mut self) {
         loop {
             self.drain_shell_events(512);
+            self.drain_local_events(256).await;
             if let Err(err) = self.connect_once().await {
                 error!(error = %err, "Terminal bridge connection failed");
             }
             self.drain_shell_events(2048);
+            self.drain_local_events(512).await;
             tokio::time::sleep(Duration::from_millis(RECONNECT_MS)).await;
         }
     }
@@ -2721,6 +3498,7 @@ impl TerminalBridge {
         info!("Terminal bridge connected");
 
         let (mut ws_write, mut ws_read) = ws_stream.split();
+        let mut outbound_queue = OutboundQueue::default();
         let mut heartbeat = tokio::time::interval(Duration::from_millis(HEARTBEAT_MS));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -2737,6 +3515,26 @@ impl TerminalBridge {
 
         loop {
             tokio::select! {
+                biased;
+                maybe_msg = ws_read.next() => {
+                    match maybe_msg {
+                        Some(Ok(msg)) => {
+                            if let Err(err) = self.handle_ws_message(msg, &mut ws_write).await {
+                                warn!(error=%err, "Terminal bridge message handling error");
+                            }
+                        }
+                        Some(Err(err)) => return Err(anyhow::anyhow!(err)),
+                        None => return Ok(()),
+                    }
+                }
+                maybe_local_event = self.local_events_rx.recv() => {
+                    let Some(event) = maybe_local_event else {
+                        continue;
+                    };
+                    if let Err(err) = self.handle_local_attach_event(event).await {
+                        warn!(error = %err, "Local attach event handling failed");
+                    }
+                }
                 _ = heartbeat.tick() => {
                     let _ = Self::send_plain_json(&mut ws_write, json!({"type":"heartbeat"})).await;
                     let mut exited = Vec::new();
@@ -2760,23 +3558,13 @@ impl TerminalBridge {
                     let Some(event) = maybe_event else {
                         continue;
                     };
-                    if let Err(err) = self
-                        .handle_shell_event(event, Some(&mut ws_write))
-                        .await
-                    {
+                    if let Err(err) = self.handle_shell_event(event, Some(&mut outbound_queue)) {
                         warn!(error = %err, "Failed to relay shell output event");
                     }
                 }
-                maybe_msg = ws_read.next() => {
-                    match maybe_msg {
-                        Some(Ok(msg)) => {
-                            if let Err(err) = self.handle_ws_message(msg, &mut ws_write).await {
-                                warn!(error=%err, "Terminal bridge message handling error");
-                            }
-                        }
-                        Some(Err(err)) => return Err(anyhow::anyhow!(err)),
-                        None => return Ok(()),
-                    }
+                _ = std::future::ready(()), if !outbound_queue.is_empty() => {
+                    self.flush_outbound_queue(&mut outbound_queue, &mut ws_write, OUTBOUND_FLUSH_BURST)
+                        .await?;
                 }
             }
         }
@@ -2953,50 +3741,10 @@ impl TerminalBridge {
                 break;
             }
             match self.shell_events_rx.try_recv() {
-                Ok(ShellEvent::Output { session_id, data }) => {
-                    let _ = self.record_stdout_chunks(&session_id, &data);
-                    drained += 1;
-                }
-                Ok(ShellEvent::ReviewProgress {
-                    session_id,
-                    request_id,
-                    stage,
-                    message,
-                }) => {
-                    let _ = self.record_review_progress_payload(
-                        &session_id,
-                        &request_id,
-                        &stage,
-                        &message,
-                    );
-                    drained += 1;
-                }
-                Ok(ShellEvent::ReviewResult {
-                    session_id,
-                    request_id,
-                    payload,
-                }) => {
-                    let _ = self.record_review_result_payload(&session_id, &request_id, payload);
-                    drained += 1;
-                }
-                Ok(ShellEvent::ReviewError {
-                    session_id,
-                    request_id,
-                    code,
-                    message,
-                }) => {
-                    let _ =
-                        self.record_review_error_payload(&session_id, &request_id, &code, &message);
-                    drained += 1;
-                }
-                Ok(ShellEvent::ReviewStream {
-                    session_id,
-                    request_id,
-                    stream,
-                    data,
-                }) => {
-                    let _ =
-                        self.record_review_stream_chunks(&session_id, &request_id, &stream, &data);
+                Ok(event) => {
+                    if let Err(err) = self.handle_shell_event(event, None) {
+                        warn!(error = %err, "Failed to process buffered PTY event");
+                    }
                     drained += 1;
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -3011,27 +3759,462 @@ impl TerminalBridge {
         }
     }
 
-    async fn handle_shell_event<S>(
+    async fn drain_local_events(&mut self, max_events: usize) {
+        let mut drained = 0usize;
+        while drained < max_events {
+            match self.local_events_rx.try_recv() {
+                Ok(event) => {
+                    if let Err(err) = self.handle_local_attach_event(event).await {
+                        warn!(error = %err, "Local attach event handling failed");
+                    }
+                    drained = drained.saturating_add(1);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn broadcast_local_payload(&mut self, session_id: &str, payload: Value) {
+        let mut stale = Vec::new();
+        for (client_id, client) in &self.local_clients {
+            if client.session_id != session_id {
+                continue;
+            }
+            if client.tx.send(payload.clone()).is_err() {
+                stale.push(*client_id);
+            }
+        }
+        for client_id in stale {
+            self.local_clients.remove(&client_id);
+        }
+    }
+
+    fn owner_user_id(&self) -> Option<u64> {
+        self.cfg.user_id.parse::<u64>().ok()
+    }
+
+    fn allocate_local_relay_session_id(&self) -> String {
+        for _ in 0..16 {
+            let candidate = format!("native-{}", random_nonce_hex(8));
+            if !self.sessions.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+        format!("native-{}", random_nonce_hex(12))
+    }
+
+    async fn start_local_bridge_session(
+        &mut self,
+        agent: String,
+        cwd_hint: Option<String>,
+        agent_args: Vec<String>,
+    ) -> anyhow::Result<String> {
+        let session_id = self.allocate_local_relay_session_id();
+        let cwd = resolve_session_cwd(cwd_hint.as_deref(), &self.cfg.default_cwd);
+        let shell = ShellProcess::spawn(
+            &self.cfg.shell,
+            &cwd,
+            &session_id,
+            self.shell_events_tx.clone(),
+        )
+        .await?;
+
+        let mut key = [0u8; 32];
+        OsRng.fill_bytes(&mut key);
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|_| anyhow::anyhow!("failed to initialize local relay cipher"))?;
+
+        self.sessions.insert(
+            session_id.clone(),
+            ActiveSession {
+                crypto: CryptoSession {
+                    session_id: session_id.clone(),
+                    cipher,
+                    send_counter: 0,
+                    recv_counter: 0,
+                    agent: Some(agent),
+                    agent_args: agent_args.clone(),
+                    bootstrapped_agent: false,
+                },
+                shell,
+                cwd,
+                replay: VecDeque::new(),
+                replay_bytes: 0,
+                next_stdout_seq: 1,
+                review_stream_replay: VecDeque::new(),
+                review_stream_replay_bytes: 0,
+                next_review_stream_seq: 1,
+                pending_uploads: HashMap::new(),
+                review_job: None,
+                last_review_progress: None,
+                last_review_result: None,
+            },
+        );
+
+        // Native-started sessions still run through the same shell bootstrap path.
+        if let Some(active) = self.sessions.get_mut(&session_id) {
+            if let Some(agent_name) = active.crypto.agent.clone() {
+                if active
+                    .crypto
+                    .agent_args
+                    .iter()
+                    .any(|arg| !is_safe_agent_bootstrap_arg(arg))
+                {
+                    anyhow::bail!("unsafe agent argument rejected for shell bootstrap");
+                }
+                let mut command_parts = Vec::with_capacity(1 + active.crypto.agent_args.len());
+                command_parts.push(shell_token(&agent_name));
+                command_parts.extend(active.crypto.agent_args.iter().map(|arg| shell_token(arg)));
+                active
+                    .shell
+                    .write_stdin(&format!("{}\n", command_parts.join(" ")))
+                    .await?;
+                active.crypto.bootstrapped_agent = true;
+            }
+        }
+
+        if let Some(owner_user_id) = self.owner_user_id() {
+            if let Err(err) = crate::agent_handoff::set_last_active_relay_session_id(
+                self.state.as_ref(),
+                owner_user_id,
+                &session_id,
+            )
+            .await
+            {
+                warn!(
+                    error = %err,
+                    session_id = %session_id,
+                    "Failed to persist last active relay session after native start"
+                );
+            }
+        }
+
+        Ok(session_id)
+    }
+
+    async fn handle_local_attach_event(&mut self, event: LocalAttachEvent) -> anyhow::Result<()> {
+        match event {
+            LocalAttachEvent::AttachRequest {
+                client_id,
+                code,
+                secret,
+                tx,
+                response_tx,
+            } => {
+                if secret != self.local_attach_secret {
+                    let _ =
+                        response_tx.send(Err(anyhow::anyhow!("local attach authorization failed")));
+                    return Ok(());
+                }
+                let handoff =
+                    match crate::agent_handoff::resolve_handoff_code(self.state.as_ref(), &code)
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let _ = response_tx.send(Err(err));
+                            return Ok(());
+                        }
+                    };
+                let session_id = handoff.relay_session_id.clone();
+                if !self.sessions.contains_key(&session_id) {
+                    let _ = response_tx.send(Err(anyhow::anyhow!(
+                        "Session is no longer active. Start /agent open again from Telegram."
+                    )));
+                    return Ok(());
+                }
+                if let Err(err) =
+                    crate::agent_handoff::consume_handoff_code(self.state.as_ref(), &code).await
+                {
+                    let _ = response_tx.send(Err(err));
+                    return Ok(());
+                }
+
+                self.local_clients.insert(
+                    client_id,
+                    LocalAttachClient {
+                        session_id: session_id.clone(),
+                        tx: tx.clone(),
+                    },
+                );
+
+                let replay = self
+                    .sessions
+                    .get(&session_id)
+                    .map(|active| {
+                        active
+                            .replay
+                            .iter()
+                            .rev()
+                            .take(64)
+                            .map(|frame| frame.data.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>();
+                for chunk in replay {
+                    let _ = tx.send(json!({"type":"stdout","data":chunk}));
+                }
+                let _ = tx.send(json!({
+                    "type":"status",
+                    "message":"Attached to active session. Native terminal is now live.",
+                }));
+                let _ = response_tx.send(Ok(LocalAttachAccepted {
+                    session_id,
+                    resume_code: None,
+                    resume_expires_at_unix: None,
+                }));
+            }
+            LocalAttachEvent::StartRequest {
+                client_id,
+                secret,
+                agent,
+                cwd,
+                agent_args,
+                tx,
+                response_tx,
+            } => {
+                if secret != self.local_attach_secret {
+                    let _ =
+                        response_tx.send(Err(anyhow::anyhow!("local start authorization failed")));
+                    return Ok(());
+                }
+
+                let session_id = match self
+                    .start_local_bridge_session(agent, cwd, agent_args)
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(err) => {
+                        let _ = response_tx.send(Err(err));
+                        return Ok(());
+                    }
+                };
+
+                self.local_clients.insert(
+                    client_id,
+                    LocalAttachClient {
+                        session_id: session_id.clone(),
+                        tx: tx.clone(),
+                    },
+                );
+                let replay = self
+                    .sessions
+                    .get(&session_id)
+                    .map(|active| {
+                        active
+                            .replay
+                            .iter()
+                            .rev()
+                            .take(64)
+                            .map(|frame| frame.data.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>();
+                for chunk in replay {
+                    let _ = tx.send(json!({"type":"stdout","data":chunk}));
+                }
+
+                let mut resume_code: Option<String> = None;
+                let mut resume_expires_at_unix: Option<i64> = None;
+                if let Some(owner_user_id) = self.owner_user_id() {
+                    match crate::agent_handoff::create_handoff_code(
+                        self.state.as_ref(),
+                        &session_id,
+                        owner_user_id,
+                    )
+                    .await
+                    {
+                        Ok(handoff) => {
+                            resume_code = Some(handoff.code);
+                            resume_expires_at_unix = Some(handoff.expires_at_unix);
+                        }
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                session_id = %session_id,
+                                "Failed to auto-create resume code for native-started session"
+                            );
+                        }
+                    }
+                }
+
+                let _ = tx.send(json!({
+                    "type":"status",
+                    "message":"Native terminal session started. Use `aidaemon share` to generate a new Telegram resume code any time.",
+                }));
+                let _ = response_tx.send(Ok(LocalAttachAccepted {
+                    session_id,
+                    resume_code,
+                    resume_expires_at_unix,
+                }));
+            }
+            LocalAttachEvent::ShareRequest {
+                secret,
+                session_id,
+                response_tx,
+            } => {
+                if secret != self.local_attach_secret {
+                    let _ =
+                        response_tx.send(Err(anyhow::anyhow!("local share authorization failed")));
+                    return Ok(());
+                }
+                let Some(owner_user_id) = self.owner_user_id() else {
+                    let _ = response_tx.send(Err(anyhow::anyhow!(
+                        "Configured user id is not numeric; cannot generate share code."
+                    )));
+                    return Ok(());
+                };
+
+                let resolved_session_id = if let Some(explicit) = session_id {
+                    explicit
+                } else if let Ok(Some(last)) =
+                    crate::agent_handoff::get_last_active_relay_session_id(
+                        self.state.as_ref(),
+                        owner_user_id,
+                    )
+                    .await
+                {
+                    last
+                } else if self.sessions.len() == 1 {
+                    self.sessions.keys().next().cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                if resolved_session_id.is_empty()
+                    || !self.sessions.contains_key(&resolved_session_id)
+                {
+                    let _ = response_tx.send(Err(anyhow::anyhow!(
+                        "No active native session found. Start one with `aidaemon codex` (or claude/gemini/opencode) first."
+                    )));
+                    return Ok(());
+                }
+
+                let created = match crate::agent_handoff::create_handoff_code(
+                    self.state.as_ref(),
+                    &resolved_session_id,
+                    owner_user_id,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let _ = response_tx.send(Err(err));
+                        return Ok(());
+                    }
+                };
+                let _ = response_tx.send(Ok(LocalShareCreated {
+                    session_id: resolved_session_id,
+                    code: created.code,
+                    expires_at_unix: created.expires_at_unix,
+                }));
+            }
+            LocalAttachEvent::Input {
+                client_id,
+                data_b64,
+            } => {
+                let Some(client) = self.local_clients.get(&client_id).cloned() else {
+                    return Ok(());
+                };
+                let bytes = match b64_decode_flexible(&data_b64) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(()),
+                };
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                let stdin = String::from_utf8_lossy(&bytes).to_string();
+                let Some(active) = self.sessions.get_mut(&client.session_id) else {
+                    let _ = client.tx.send(json!({
+                        "type":"error",
+                        "message":"Session is no longer active.",
+                    }));
+                    self.local_clients.remove(&client_id);
+                    return Ok(());
+                };
+                if let Err(err) = active.shell.write_stdin(&stdin).await {
+                    let _ = client.tx.send(json!({
+                        "type":"error",
+                        "message": format!("Failed to forward stdin: {}", err),
+                    }));
+                    self.local_clients.remove(&client_id);
+                }
+            }
+            LocalAttachEvent::Resize {
+                client_id,
+                cols,
+                rows,
+            } => {
+                let Some(client) = self.local_clients.get(&client_id).cloned() else {
+                    return Ok(());
+                };
+                if let Some(active) = self.sessions.get_mut(&client.session_id) {
+                    let _ = active.shell.resize(cols, rows);
+                } else {
+                    self.local_clients.remove(&client_id);
+                }
+            }
+            LocalAttachEvent::Redraw { client_id } => {
+                let Some(client) = self.local_clients.get(&client_id).cloned() else {
+                    return Ok(());
+                };
+                if let Some(active) = self.sessions.get_mut(&client.session_id) {
+                    let _ = active.shell.write_stdin("\u{000c}").await;
+                } else {
+                    self.local_clients.remove(&client_id);
+                }
+            }
+            LocalAttachEvent::Close { client_id } => {
+                self.local_clients.remove(&client_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_shell_event(
         &mut self,
         event: ShellEvent,
-        ws_write: Option<&mut S>,
-    ) -> anyhow::Result<()>
-    where
-        S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-    {
+        outbound_queue: Option<&mut OutboundQueue>,
+    ) -> anyhow::Result<()> {
         match event {
             ShellEvent::Output { session_id, data } => {
                 let frames = self.record_stdout_chunks(&session_id, &data);
-                let Some(ws_write) = ws_write else {
-                    return Ok(());
-                };
-                for (seq, chunk) in frames {
-                    self.send_encrypted_json_for_session(
+                for (_, chunk) in &frames {
+                    self.broadcast_local_payload(
                         &session_id,
-                        ws_write,
-                        json!({"kind":"stdout","seq":seq,"data":chunk}),
-                    )
-                    .await?;
+                        json!({"type":"stdout","data": chunk}),
+                    );
+                }
+                if let Some(queue) = outbound_queue {
+                    let mut dropped = 0usize;
+                    for (seq, chunk) in frames {
+                        if queue
+                            .enqueue(
+                                OutboundPriority::Low,
+                                QueuedOutboundPayload {
+                                    session_id: session_id.clone(),
+                                    payload: json!({"kind":"stdout","seq":seq,"data":chunk}),
+                                },
+                            )
+                            .is_some()
+                        {
+                            dropped = dropped.saturating_add(1);
+                        }
+                    }
+                    if dropped > 0 {
+                        warn!(
+                            session_id = %session_id,
+                            dropped,
+                            "Terminal bridge low-priority outbound queue saturated; dropped stale stdout frames"
+                        );
+                    }
                 }
             }
             ShellEvent::ReviewProgress {
@@ -3042,9 +4225,22 @@ impl TerminalBridge {
             } => {
                 let payload =
                     self.record_review_progress_payload(&session_id, &request_id, &stage, &message);
-                if let Some(ws_write) = ws_write {
-                    self.send_encrypted_json_for_session(&session_id, ws_write, payload)
-                        .await?;
+                if let Some(queue) = outbound_queue {
+                    if queue
+                        .enqueue(
+                            OutboundPriority::High,
+                            QueuedOutboundPayload {
+                                session_id: session_id.clone(),
+                                payload,
+                            },
+                        )
+                        .is_some()
+                    {
+                        warn!(
+                            session_id = %session_id,
+                            "Terminal bridge high-priority outbound queue saturated; dropped oldest progress frame"
+                        );
+                    }
                 }
             }
             ShellEvent::ReviewResult {
@@ -3053,9 +4249,22 @@ impl TerminalBridge {
                 payload,
             } => {
                 let payload = self.record_review_result_payload(&session_id, &request_id, payload);
-                if let Some(ws_write) = ws_write {
-                    self.send_encrypted_json_for_session(&session_id, ws_write, payload)
-                        .await?;
+                if let Some(queue) = outbound_queue {
+                    if queue
+                        .enqueue(
+                            OutboundPriority::High,
+                            QueuedOutboundPayload {
+                                session_id: session_id.clone(),
+                                payload,
+                            },
+                        )
+                        .is_some()
+                    {
+                        warn!(
+                            session_id = %session_id,
+                            "Terminal bridge high-priority outbound queue saturated; dropped oldest result frame"
+                        );
+                    }
                 }
             }
             ShellEvent::ReviewError {
@@ -3066,9 +4275,22 @@ impl TerminalBridge {
             } => {
                 let payload =
                     self.record_review_error_payload(&session_id, &request_id, &code, &message);
-                if let Some(ws_write) = ws_write {
-                    self.send_encrypted_json_for_session(&session_id, ws_write, payload)
-                        .await?;
+                if let Some(queue) = outbound_queue {
+                    if queue
+                        .enqueue(
+                            OutboundPriority::High,
+                            QueuedOutboundPayload {
+                                session_id: session_id.clone(),
+                                payload,
+                            },
+                        )
+                        .is_some()
+                    {
+                        warn!(
+                            session_id = %session_id,
+                            "Terminal bridge high-priority outbound queue saturated; dropped oldest error frame"
+                        );
+                    }
                 }
             }
             ShellEvent::ReviewStream {
@@ -3079,23 +4301,56 @@ impl TerminalBridge {
             } => {
                 let frames =
                     self.record_review_stream_chunks(&session_id, &request_id, &stream, &data);
-                if let Some(ws_write) = ws_write {
+                if let Some(queue) = outbound_queue {
+                    let mut dropped = 0usize;
                     for (seq, request_id, stream, data) in frames {
-                        self.send_encrypted_json_for_session(
-                            &session_id,
-                            ws_write,
-                            json!({
-                                "kind":"review_stream",
-                                "seq": seq,
-                                "request_id": request_id,
-                                "stream": stream,
-                                "data": data,
-                            }),
-                        )
-                        .await?;
+                        if queue
+                            .enqueue(
+                                OutboundPriority::Low,
+                                QueuedOutboundPayload {
+                                    session_id: session_id.clone(),
+                                    payload: json!({
+                                        "kind":"review_stream",
+                                        "seq": seq,
+                                        "request_id": request_id,
+                                        "stream": stream,
+                                        "data": data,
+                                    }),
+                                },
+                            )
+                            .is_some()
+                        {
+                            dropped = dropped.saturating_add(1);
+                        }
+                    }
+                    if dropped > 0 {
+                        warn!(
+                            session_id = %session_id,
+                            dropped,
+                            "Terminal bridge low-priority outbound queue saturated; dropped stale review stream frames"
+                        );
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    async fn flush_outbound_queue<S>(
+        &mut self,
+        outbound_queue: &mut OutboundQueue,
+        ws_write: &mut S,
+        max_batch: usize,
+    ) -> anyhow::Result<()>
+    where
+        S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        for _ in 0..max_batch {
+            let Some(queued) = outbound_queue.pop_next() else {
+                break;
+            };
+            self.send_encrypted_json_for_session(&queued.session_id, ws_write, queued.payload)
+                .await?;
         }
         Ok(())
     }
@@ -3168,93 +4423,113 @@ impl TerminalBridge {
             )
         };
 
+        let skipped_stdout_replay = should_skip_stdout_replay(resume_from_seq, oldest_seq, &frames);
         if !frames.is_empty() {
-            if resume_from_seq + 1 < oldest_seq {
+            if skipped_stdout_replay {
+                let reason = if resume_from_seq.saturating_add(1) < oldest_seq {
+                    "buffered history was unavailable"
+                } else {
+                    "buffered output was too noisy to replay cleanly"
+                };
                 self.send_encrypted_json_for_session(
                     session_id,
                     ws_write,
                     json!({
                         "kind":"status",
-                        "message":format!(
-                            "Reconnected after output gap; replay starts at seq {}.",
-                            oldest_seq
+                        "message": format!(
+                            "Connection recovered. Skipped replaying {} buffered output frame(s) because {}. Session is still running.",
+                            frames.len(),
+                            reason
+                        )
+                    }),
+                )
+                .await?;
+            } else {
+                for (seq, chunk) in &frames {
+                    self.send_encrypted_json_for_session(
+                        session_id,
+                        ws_write,
+                        json!({"kind":"stdout","seq":seq,"data":chunk}),
+                    )
+                    .await?;
+                }
+
+                self.send_encrypted_json_for_session(
+                    session_id,
+                    ws_write,
+                    json!({
+                        "kind":"status",
+                        "message": format!(
+                            "Replayed {} buffered output frame(s) (seq {}..{}).",
+                            frames.len(),
+                            frames.first().map(|(seq, _)| *seq).unwrap_or(oldest_seq),
+                            newest_seq
                         )
                     }),
                 )
                 .await?;
             }
-
-            for (seq, chunk) in &frames {
-                self.send_encrypted_json_for_session(
-                    session_id,
-                    ws_write,
-                    json!({"kind":"stdout","seq":seq,"data":chunk}),
-                )
-                .await?;
-            }
-
-            self.send_encrypted_json_for_session(
-                session_id,
-                ws_write,
-                json!({
-                    "kind":"status",
-                    "message": format!(
-                        "Replayed {} buffered output frame(s) (seq {}..{}).",
-                        frames.len(),
-                        frames.first().map(|(seq, _)| *seq).unwrap_or(oldest_seq),
-                        newest_seq
-                    )
-                }),
-            )
-            .await?;
         }
 
+        let skipped_review_stream_replay = should_skip_review_stream_replay(
+            resume_from_review_stream_seq,
+            oldest_review_stream_seq,
+            review_stream_frames.len(),
+        );
         if !review_stream_frames.is_empty() {
-            if resume_from_review_stream_seq + 1 < oldest_review_stream_seq {
+            if skipped_review_stream_replay {
+                let reason =
+                    if resume_from_review_stream_seq.saturating_add(1) < oldest_review_stream_seq {
+                        "buffered review history was unavailable"
+                    } else {
+                        "the buffered review stream was too large to replay cleanly"
+                    };
                 self.send_encrypted_json_for_session(
                     session_id,
                     ws_write,
                     json!({
                         "kind":"status",
-                        "message":format!(
-                            "Reconnected after review output gap; replay starts at review seq {}.",
-                            oldest_review_stream_seq
+                        "message": format!(
+                            "Connection recovered. Skipped replaying {} buffered review stream chunk(s) because {}.",
+                            review_stream_frames.len(),
+                            reason
+                        )
+                    }),
+                )
+                .await?;
+            } else {
+                for (seq, request_id, stream, data) in &review_stream_frames {
+                    self.send_encrypted_json_for_session(
+                        session_id,
+                        ws_write,
+                        json!({
+                            "kind":"review_stream",
+                            "seq": seq,
+                            "request_id": request_id,
+                            "stream": stream,
+                            "data": data,
+                        }),
+                    )
+                    .await?;
+                }
+                self.send_encrypted_json_for_session(
+                    session_id,
+                    ws_write,
+                    json!({
+                        "kind":"status",
+                        "message": format!(
+                            "Replayed {} buffered review stream chunk(s) (seq {}..{}).",
+                            review_stream_frames.len(),
+                            review_stream_frames
+                                .first()
+                                .map(|(seq, _, _, _)| *seq)
+                                .unwrap_or(oldest_review_stream_seq),
+                            newest_review_stream_seq
                         )
                     }),
                 )
                 .await?;
             }
-            for (seq, request_id, stream, data) in &review_stream_frames {
-                self.send_encrypted_json_for_session(
-                    session_id,
-                    ws_write,
-                    json!({
-                        "kind":"review_stream",
-                        "seq": seq,
-                        "request_id": request_id,
-                        "stream": stream,
-                        "data": data,
-                    }),
-                )
-                .await?;
-            }
-            self.send_encrypted_json_for_session(
-                session_id,
-                ws_write,
-                json!({
-                    "kind":"status",
-                    "message": format!(
-                        "Replayed {} buffered review stream chunk(s) (seq {}..{}).",
-                        review_stream_frames.len(),
-                        review_stream_frames
-                            .first()
-                            .map(|(seq, _, _, _)| *seq)
-                            .unwrap_or(oldest_review_stream_seq),
-                        newest_review_stream_seq
-                    )
-                }),
-            )
-            .await?;
         }
 
         let has_last_progress = last_review_progress.is_some();
@@ -3266,7 +4541,10 @@ impl TerminalBridge {
             self.send_encrypted_json_for_session(session_id, ws_write, payload)
                 .await?;
         }
-        if running_review_request_id.is_some() && frames.is_empty() && !has_last_progress {
+        if running_review_request_id.is_some()
+            && (frames.is_empty() || skipped_stdout_replay)
+            && !has_last_progress
+        {
             self.send_encrypted_json_for_session(
                 session_id,
                 ws_write,
@@ -3365,6 +4643,21 @@ impl TerminalBridge {
             .await?;
             return Ok(());
         }
+        if let Ok(owner_user_id) = self.cfg.user_id.parse::<u64>() {
+            if let Err(err) = crate::agent_handoff::set_last_active_relay_session_id(
+                self.state.as_ref(),
+                owner_user_id,
+                relay_session_id,
+            )
+            .await
+            {
+                warn!(
+                    error = %err,
+                    relay_session_id,
+                    "Failed to persist last active relay session id"
+                );
+            }
+        }
         let resume_from_seq = frame
             .get("resume_from_seq")
             .and_then(|v| v.as_u64())
@@ -3374,7 +4667,68 @@ impl TerminalBridge {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         let requested_agent = normalize_agent(frame.get("agent").and_then(|v| v.as_str()));
-        let requested_agent_args = normalize_agent_args(frame.get("agent_args"));
+        let requested_agent_args = requested_agent_args_from_client_hello(frame);
+        let requested_relay_session_id = requested_relay_session_id_from_client_hello(frame);
+        let telegram_session_id = requested_telegram_session_id_from_client_hello(frame);
+        let mut remap_source_session_id: Option<String> = None;
+        let mut remap_reason: Option<&'static str> = None;
+        if let Some(explicit_relay_session_id) = requested_relay_session_id.as_deref() {
+            if explicit_relay_session_id != relay_session_id
+                && self.sessions.contains_key(explicit_relay_session_id)
+            {
+                remap_source_session_id = Some(explicit_relay_session_id.to_string());
+                remap_reason = Some("explicit relay_session_id from client hello");
+            }
+        }
+        if remap_source_session_id.is_none() {
+            if let Some(telegram_session_id) = telegram_session_id.as_deref() {
+                match crate::agent_handoff::resolve_relay_for_telegram_session(
+                    self.state.as_ref(),
+                    telegram_session_id,
+                )
+                .await
+                {
+                    Ok(Some(mapped)) => {
+                        if mapped != relay_session_id && self.sessions.contains_key(&mapped) {
+                            remap_source_session_id = Some(mapped);
+                            remap_reason = Some("telegram session binding");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            telegram_session_id = %telegram_session_id,
+                            "Failed to resolve Telegram-to-relay mapping during client hello"
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(from_session_id) = remap_source_session_id.as_deref() {
+            if let Err(err) = self
+                .remap_active_session_id(from_session_id, relay_session_id)
+                .await
+            {
+                warn!(
+                    error = %err,
+                    from_session_id = %from_session_id,
+                    to_session_id = %relay_session_id,
+                    telegram_session_id = telegram_session_id.as_deref().unwrap_or(""),
+                    requested_relay_session_id = requested_relay_session_id.as_deref().unwrap_or(""),
+                    "Failed to remap native session during client hello"
+                );
+            } else {
+                info!(
+                    from_session_id = %from_session_id,
+                    to_session_id = %relay_session_id,
+                    remap_reason = remap_reason.unwrap_or("unknown"),
+                    telegram_session_id = telegram_session_id.as_deref().unwrap_or(""),
+                    requested_relay_session_id = requested_relay_session_id.as_deref().unwrap_or(""),
+                    "Remapped active native session to client relay session id"
+                );
+            }
+        }
         let cipher = Self::derive_relay_cipher(
             &self.key_material.private_key,
             relay_session_id,
@@ -3388,6 +4742,22 @@ impl TerminalBridge {
             if !active.crypto.bootstrapped_agent {
                 active.crypto.agent = requested_agent.clone();
                 active.crypto.agent_args = requested_agent_args.clone();
+            }
+            if let Some(telegram_session_id) = telegram_session_id.as_deref() {
+                if let Err(err) = crate::agent_handoff::bind_telegram_session_to_relay(
+                    self.state.as_ref(),
+                    telegram_session_id,
+                    relay_session_id,
+                )
+                .await
+                {
+                    warn!(
+                        error = %err,
+                        telegram_session_id = %telegram_session_id,
+                        relay_session_id = %relay_session_id,
+                        "Failed to persist Telegram-to-relay session mapping"
+                    );
+                }
             }
             Self::send_plain_json(
                 ws_write,
@@ -3468,6 +4838,22 @@ impl TerminalBridge {
                 last_review_result: None,
             },
         );
+        if let Some(telegram_session_id) = telegram_session_id.as_deref() {
+            if let Err(err) = crate::agent_handoff::bind_telegram_session_to_relay(
+                self.state.as_ref(),
+                telegram_session_id,
+                relay_session_id,
+            )
+            .await
+            {
+                warn!(
+                    error = %err,
+                    telegram_session_id = %telegram_session_id,
+                    relay_session_id = %relay_session_id,
+                    "Failed to persist Telegram-to-relay session mapping"
+                );
+            }
+        }
 
         Self::send_plain_json(
             ws_write,
@@ -3518,8 +4904,8 @@ impl TerminalBridge {
             anyhow::bail!("unsafe agent argument rejected for shell bootstrap");
         }
         let mut command_parts = Vec::with_capacity(1 + crypto.agent_args.len());
-        command_parts.push(shell_quote(&agent));
-        command_parts.extend(crypto.agent_args.iter().map(|arg| shell_quote(arg)));
+        command_parts.push(shell_token(&agent));
+        command_parts.extend(crypto.agent_args.iter().map(|arg| shell_token(arg)));
         let command = format!("{}\n", command_parts.join(" "));
         active.shell.write_stdin(&command).await?;
         crypto.bootstrapped_agent = true;
@@ -4076,6 +5462,58 @@ impl TerminalBridge {
         Ok(())
     }
 
+    async fn remap_active_session_id(
+        &mut self,
+        from_session_id: &str,
+        to_session_id: &str,
+    ) -> anyhow::Result<()> {
+        if from_session_id == to_session_id {
+            return Ok(());
+        }
+        if !self.sessions.contains_key(from_session_id) {
+            anyhow::bail!("source session does not exist");
+        }
+        if self.sessions.contains_key(to_session_id) {
+            // Telegram may resume an older scope-bound session id; when an explicit
+            // /agent resume mapping points to a different active native session,
+            // treat the mapping as authoritative and replace the stale target.
+            self.remove_session(to_session_id, "session replaced by /agent resume mapping")
+                .await;
+        }
+
+        let mut active = self
+            .sessions
+            .remove(from_session_id)
+            .ok_or_else(|| anyhow::anyhow!("source session disappeared"))?;
+        active.crypto.session_id = to_session_id.to_string();
+        self.sessions.insert(to_session_id.to_string(), active);
+
+        for client in self.local_clients.values_mut() {
+            if client.session_id == from_session_id {
+                client.session_id = to_session_id.to_string();
+            }
+        }
+
+        if let Some(owner_user_id) = self.owner_user_id() {
+            if let Err(err) = crate::agent_handoff::set_last_active_relay_session_id(
+                self.state.as_ref(),
+                owner_user_id,
+                to_session_id,
+            )
+            .await
+            {
+                warn!(
+                    error = %err,
+                    from_session_id = %from_session_id,
+                    to_session_id = %to_session_id,
+                    "Failed to persist remapped relay session id"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn send_plain_json<S>(ws_write: &mut S, value: Value) -> anyhow::Result<()>
     where
         S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
@@ -4134,6 +5572,15 @@ impl TerminalBridge {
     }
 
     async fn remove_session(&mut self, session_id: &str, reason: &str) {
+        self.broadcast_local_payload(
+            session_id,
+            json!({
+                "type":"exit",
+                "reason": reason,
+            }),
+        );
+        self.local_clients
+            .retain(|_, client| client.session_id != session_id);
         if let Some(mut active) = self.sessions.remove(session_id) {
             debug!(reason, session_id, "Stopping local shell process");
             if let Some(job) = active.review_job.take() {
@@ -4142,6 +5589,427 @@ impl TerminalBridge {
             active.shell.stop().await;
         }
     }
+}
+
+fn load_local_attach_endpoint() -> anyhow::Result<LocalAttachEndpoint> {
+    let path = local_attach_endpoint_path();
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read local attach endpoint at {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    let endpoint: LocalAttachEndpoint = serde_json::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "Invalid local attach endpoint JSON at {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    if endpoint.host.trim().is_empty() || endpoint.port == 0 || endpoint.secret.trim().is_empty() {
+        anyhow::bail!(
+            "Local attach endpoint is incomplete at {}. Restart aidaemon.",
+            path.display()
+        );
+    }
+    Ok(endpoint)
+}
+
+#[cfg(unix)]
+struct RawTerminalGuard {
+    fd: i32,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl RawTerminalGuard {
+    fn enable_if_tty() -> anyhow::Result<Option<Self>> {
+        let fd = libc::STDIN_FILENO;
+        // SAFETY: libc::isatty only reads fd metadata.
+        if unsafe { libc::isatty(fd) } != 1 {
+            return Ok(None);
+        }
+        // SAFETY: `termios` is plain old data and we initialize it via tcgetattr before use.
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        // SAFETY: tcgetattr/tcsetattr are called with a valid terminal fd and termios pointer.
+        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut raw = original;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+        raw.c_iflag &= !(libc::IXON | libc::ICRNL);
+        raw.c_oflag &= !(libc::OPOST);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Some(Self { fd, original }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawTerminalGuard {
+    fn drop(&mut self) {
+        // SAFETY: restoring previously captured termios back to the same fd.
+        let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
+    }
+}
+
+#[cfg(not(unix))]
+struct RawTerminalGuard;
+
+#[cfg(not(unix))]
+impl RawTerminalGuard {
+    fn enable_if_tty() -> anyhow::Result<Option<Self>> {
+        Ok(None)
+    }
+}
+
+fn send_local_attach_json_line(
+    writer: &mut std::net::TcpStream,
+    value: &Value,
+) -> anyhow::Result<()> {
+    let mut line = serde_json::to_string(value)?;
+    line.push('\n');
+    writer.write_all(line.as_bytes())?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn send_local_attach_resize_and_redraw(
+    writer: &mut std::net::TcpStream,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<()> {
+    send_local_attach_json_line(
+        writer,
+        &json!({
+            "type":"resize",
+            "cols": cols,
+            "rows": rows,
+        }),
+    )?;
+    send_local_attach_json_line(writer, &json!({"type":"redraw"}))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_local_attach_resize_watcher(mut writer: std::net::TcpStream) {
+    std::thread::spawn(move || {
+        let mut last_sent = local_terminal_size();
+        let mut warmup_resyncs_left = 2u8;
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            let Some((cols, rows)) = local_terminal_size() else {
+                continue;
+            };
+            let changed = last_sent != Some((cols, rows));
+            if !changed && warmup_resyncs_left == 0 {
+                continue;
+            }
+            if send_local_attach_resize_and_redraw(&mut writer, cols, rows).is_err() {
+                break;
+            }
+            last_sent = Some((cols, rows));
+            warmup_resyncs_left = warmup_resyncs_left.saturating_sub(1);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_local_attach_resize_watcher(_writer: std::net::TcpStream) {}
+
+fn run_local_attach_stdout_loop(
+    reader: &mut std::io::BufReader<std::net::TcpStream>,
+) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        if line.len() > LOCAL_ATTACH_MAX_FRAME_BYTES {
+            anyhow::bail!("received oversized frame from local attach endpoint");
+        }
+        let value: Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match value.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "stdout" => {
+                if let Some(data) = value.get("data").and_then(|v| v.as_str()) {
+                    stdout.write_all(data.as_bytes())?;
+                    stdout.flush()?;
+                }
+            }
+            "status" => {
+                if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
+                    eprintln!("\r\n[status] {}", message);
+                }
+            }
+            "error" => {
+                let message = value
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                anyhow::bail!("{}", message);
+            }
+            "exit" => {
+                let reason = value
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("session ended");
+                eprintln!("\r\n[session] {}", reason);
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn run_local_attach_stdin_pump(mut writer: std::net::TcpStream) -> anyhow::Result<()> {
+    let mut stdin = std::io::stdin();
+    let mut input = [0u8; 2048];
+    loop {
+        let n = stdin.read(&mut input)?;
+        if n == 0 {
+            let _ = send_local_attach_json_line(&mut writer, &json!({"type":"detach"}));
+            break;
+        }
+        let chunk = &input[..n];
+        if chunk.len() == 1 && chunk[0] == 0x1d {
+            // Ctrl+]
+            let _ = send_local_attach_json_line(&mut writer, &json!({"type":"detach"}));
+            break;
+        }
+        let payload = json!({
+            "type":"stdin",
+            "data": b64_encode(chunk),
+        });
+        send_local_attach_json_line(&mut writer, &payload)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn local_terminal_size() -> Option<(u16, u16)> {
+    // SAFETY: winsize is POD and ioctl fills it when fd is a terminal.
+    let mut winsize = unsafe { std::mem::zeroed::<libc::winsize>() };
+    // SAFETY: ioctl is called with valid fd and pointer to winsize.
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut winsize) };
+    if rc != 0 || winsize.ws_col == 0 || winsize.ws_row == 0 {
+        return None;
+    }
+    Some((winsize.ws_col, winsize.ws_row))
+}
+
+#[cfg(not(unix))]
+fn local_terminal_size() -> Option<(u16, u16)> {
+    None
+}
+
+pub fn run_local_attach_cli(code: &str) -> anyhow::Result<()> {
+    let code = code.trim();
+    if code.is_empty() {
+        anyhow::bail!("Usage: aidaemon attach <code>");
+    }
+    let endpoint = load_local_attach_endpoint()?;
+    let address = format!("{}:{}", endpoint.host, endpoint.port);
+    let stream = std::net::TcpStream::connect(&address).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to connect to local attach endpoint at {}: {}. Is aidaemon running?",
+            address,
+            e
+        )
+    })?;
+    stream.set_nodelay(true).ok();
+
+    let mut reader = std::io::BufReader::new(stream.try_clone()?);
+    let mut writer = stream.try_clone()?;
+    send_local_attach_json_line(
+        &mut writer,
+        &json!({
+            "type":"attach",
+            "code": code,
+            "secret": endpoint.secret,
+        }),
+    )?;
+
+    let mut first_line = String::new();
+    let first_read = reader.read_line(&mut first_line)?;
+    if first_read == 0 {
+        anyhow::bail!("Local attach endpoint closed before handshake completed");
+    }
+    let first_value: Value = serde_json::from_str(first_line.trim())
+        .map_err(|e| anyhow::anyhow!("invalid attach response: {}", e))?;
+    run_local_attach_interactive(reader, writer, first_value, "Attached")
+}
+
+pub fn run_local_start_cli(
+    agent: &str,
+    cwd: Option<&Path>,
+    agent_args: &[String],
+) -> anyhow::Result<()> {
+    let Some(agent) = normalize_agent(Some(agent)) else {
+        anyhow::bail!(
+            "Unknown agent `{}`. Supported: codex, claude, gemini, opencode.",
+            agent
+        );
+    };
+
+    let endpoint = load_local_attach_endpoint()?;
+    let address = format!("{}:{}", endpoint.host, endpoint.port);
+    let stream = std::net::TcpStream::connect(&address).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to connect to local attach endpoint at {}: {}. Is aidaemon running?",
+            address,
+            e
+        )
+    })?;
+    stream.set_nodelay(true).ok();
+
+    let mut reader = std::io::BufReader::new(stream.try_clone()?);
+    let mut writer = stream.try_clone()?;
+    send_local_attach_json_line(
+        &mut writer,
+        &json!({
+            "type":"start",
+            "secret": endpoint.secret,
+            "agent": agent,
+            "cwd": cwd.map(|value| value.to_string_lossy().to_string()).unwrap_or_default(),
+            "agent_args": agent_args,
+        }),
+    )?;
+
+    let mut first_line = String::new();
+    let first_read = reader.read_line(&mut first_line)?;
+    if first_read == 0 {
+        anyhow::bail!("Local attach endpoint closed before startup handshake completed");
+    }
+    let first_value: Value = serde_json::from_str(first_line.trim())
+        .map_err(|e| anyhow::anyhow!("invalid local start response: {}", e))?;
+    run_local_attach_interactive(reader, writer, first_value, "Started")
+}
+
+pub fn run_local_share_cli(session_id: Option<&str>) -> anyhow::Result<()> {
+    let endpoint = load_local_attach_endpoint()?;
+    let address = format!("{}:{}", endpoint.host, endpoint.port);
+    let stream = std::net::TcpStream::connect(&address).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to connect to local attach endpoint at {}: {}. Is aidaemon running?",
+            address,
+            e
+        )
+    })?;
+    stream.set_nodelay(true).ok();
+
+    let mut reader = std::io::BufReader::new(stream.try_clone()?);
+    let mut writer = stream.try_clone()?;
+    let normalized_session_id = normalize_relay_session_id(session_id);
+    send_local_attach_json_line(
+        &mut writer,
+        &json!({
+            "type":"share",
+            "secret": endpoint.secret,
+            "session_id": normalized_session_id,
+        }),
+    )?;
+
+    let mut line = String::new();
+    let n = reader.read_line(&mut line)?;
+    if n == 0 {
+        anyhow::bail!("Local attach endpoint closed before share response");
+    }
+    let payload: Value = serde_json::from_str(line.trim())
+        .map_err(|e| anyhow::anyhow!("invalid share response: {}", e))?;
+    match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "shared" => {
+            let code = payload.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            if code.is_empty() {
+                anyhow::bail!("Share response did not include a resume code");
+            }
+            let session_id = payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!("Session: {}", session_id);
+            println!("Telegram command: /agent resume {}", code);
+            if let Some(expires_at_unix) = payload.get("expires_at_unix").and_then(|v| v.as_i64()) {
+                let now = chrono::Utc::now().timestamp();
+                let secs_left = expires_at_unix.saturating_sub(now).max(0);
+                println!("Expires in about {} minutes.", (secs_left + 59) / 60);
+            } else {
+                println!("Expires in about 5 minutes.");
+            }
+            Ok(())
+        }
+        "error" => {
+            let message = payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("share failed");
+            anyhow::bail!("{}", message);
+        }
+        _ => anyhow::bail!("Unexpected share response from local endpoint"),
+    }
+}
+
+fn run_local_attach_interactive(
+    mut reader: std::io::BufReader<std::net::TcpStream>,
+    mut writer: std::net::TcpStream,
+    first_value: Value,
+    verb: &str,
+) -> anyhow::Result<()> {
+    match first_value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+    {
+        "attached" => {}
+        "error" => {
+            let message = first_value
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("attach failed");
+            anyhow::bail!("{}", message);
+        }
+        _ => anyhow::bail!("Unexpected attach response from local endpoint"),
+    }
+
+    let session_id = first_value
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    eprintln!("{} session {}. Press Ctrl+] to detach.", verb, session_id);
+    if let Some(code) = first_value.get("resume_code").and_then(|v| v.as_str()) {
+        if !code.trim().is_empty() {
+            eprintln!("Telegram command: /agent resume {}", code.trim());
+        }
+    }
+
+    if let Some((cols, rows)) = local_terminal_size() {
+        let _ = send_local_attach_resize_and_redraw(&mut writer, cols, rows);
+    } else {
+        let _ = send_local_attach_json_line(&mut writer, &json!({"type":"redraw"}));
+    }
+    if let Ok(resize_writer) = writer.try_clone() {
+        // Keep syncing local terminal dimensions while attached so full-screen TUIs
+        // (Codex/Claude/Gemini/OpenCode) can reflow after handoff and on window resize.
+        spawn_local_attach_resize_watcher(resize_writer);
+    }
+
+    let _raw_guard = RawTerminalGuard::enable_if_tty()?;
+    let stdin_writer = writer.try_clone()?;
+    std::thread::spawn(move || {
+        let _ = run_local_attach_stdin_pump(stdin_writer);
+    });
+
+    run_local_attach_stdout_loop(&mut reader)
 }
 
 #[cfg(test)]
@@ -4161,6 +6029,61 @@ mod tests {
     #[test]
     fn test_daemon_connect_token_mint_url_rejects_insecure_ws() {
         assert!(daemon_connect_token_mint_url("ws://terminal.aidaemon.ai/v1/ws/daemon").is_err());
+    }
+
+    #[test]
+    fn test_outbound_queue_prioritizes_high_frames() {
+        let mut queue = OutboundQueue::default();
+        let _ = queue.enqueue(
+            OutboundPriority::Low,
+            QueuedOutboundPayload {
+                session_id: "session-low-1".to_string(),
+                payload: json!({"kind":"stdout","seq":1}),
+            },
+        );
+        let _ = queue.enqueue(
+            OutboundPriority::High,
+            QueuedOutboundPayload {
+                session_id: "session-high".to_string(),
+                payload: json!({"kind":"review_result"}),
+            },
+        );
+        let _ = queue.enqueue(
+            OutboundPriority::Low,
+            QueuedOutboundPayload {
+                session_id: "session-low-2".to_string(),
+                payload: json!({"kind":"stdout","seq":2}),
+            },
+        );
+
+        let first = queue.pop_next().expect("first");
+        let second = queue.pop_next().expect("second");
+        let third = queue.pop_next().expect("third");
+
+        assert_eq!(first.session_id, "session-high");
+        assert_eq!(second.session_id, "session-low-1");
+        assert_eq!(third.session_id, "session-low-2");
+        assert!(queue.pop_next().is_none());
+    }
+
+    #[test]
+    fn test_outbound_queue_bounds_low_lane() {
+        let mut queue = OutboundQueue::default();
+        for idx in 0..=OUTBOUND_LOW_QUEUE_CAP {
+            let _ = queue.enqueue(
+                OutboundPriority::Low,
+                QueuedOutboundPayload {
+                    session_id: format!("s{idx}"),
+                    payload: json!({"kind":"stdout","seq": idx}),
+                },
+            );
+        }
+
+        assert_eq!(queue.low.len(), OUTBOUND_LOW_QUEUE_CAP);
+        let first = queue.pop_next().expect("first");
+        let last = queue.low.back().expect("last");
+        assert_eq!(first.session_id, "s1");
+        assert_eq!(last.session_id, format!("s{}", OUTBOUND_LOW_QUEUE_CAP));
     }
 
     #[test]
@@ -4480,10 +6403,172 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_utf8_stream_chunk_preserves_split_multibyte_chars() {
+        let mut carry = Vec::new();
+        let part1 = decode_utf8_stream_chunk(&mut carry, &[0xE2, 0x94]);
+        assert!(part1.is_empty());
+        let part2 = decode_utf8_stream_chunk(&mut carry, &[0x80, b'\n']);
+        assert_eq!(part2, "─\n");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn test_decode_utf8_stream_chunk_normalizes_c1_csi() {
+        let mut carry = Vec::new();
+        let out = decode_utf8_stream_chunk(&mut carry, &[0x9B, b'3', b'1', b'm']);
+        assert_eq!(out, "\u{001b}[31m");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn test_should_skip_stdout_replay_when_gap_detected() {
+        let frames = vec![(25, "partial output".to_string())];
+        assert!(should_skip_stdout_replay(3, 25, &frames));
+    }
+
+    #[test]
+    fn test_should_skip_stdout_replay_for_noisy_fresh_attach() {
+        let frames = (1..=20)
+            .map(|seq| (seq, format!("progress {}\r", seq)))
+            .collect::<Vec<_>>();
+        assert!(should_skip_stdout_replay(0, 1, &frames));
+    }
+
+    #[test]
+    fn test_should_not_skip_stdout_replay_for_small_clean_resume() {
+        let frames = vec![(8, "line one\n".to_string()), (9, "line two\n".to_string())];
+        assert!(!should_skip_stdout_replay(7, 8, &frames));
+    }
+
+    #[test]
+    fn test_should_skip_review_stream_replay_when_gap_detected() {
+        assert!(should_skip_review_stream_replay(4, 20, 3));
+    }
+
+    #[test]
+    fn test_should_not_skip_review_stream_replay_for_small_resume() {
+        assert!(!should_skip_review_stream_replay(12, 13, 4));
+    }
+
+    #[test]
     fn test_normalize_agent_args_drops_shell_metacharacters() {
         let payload = serde_json::json!(["--model", "gpt-5", "foo;bar", "$(whoami)", "--json"]);
         let args = normalize_agent_args(Some(&payload));
         assert_eq!(args, vec!["--model", "gpt-5", "--json"]);
+    }
+
+    #[test]
+    fn test_normalize_agent_args_splits_single_string_payload() {
+        let payload = serde_json::json!("--model gpt-5 --json");
+        let args = normalize_agent_args(Some(&payload));
+        assert_eq!(args, vec!["--model", "gpt-5", "--json"]);
+    }
+
+    #[test]
+    fn test_shell_token_keeps_plain_flags_unquoted() {
+        assert_eq!(shell_token("codex"), "codex");
+        assert_eq!(
+            shell_token("--dangerously-bypass-approvals-and-sandbox"),
+            "--dangerously-bypass-approvals-and-sandbox"
+        );
+    }
+
+    #[test]
+    fn test_shell_token_quotes_tokens_with_whitespace_or_quotes() {
+        assert_eq!(shell_token("--model gpt-5"), "'--model gpt-5'");
+        assert_eq!(shell_token("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn test_requested_agent_args_from_client_hello_accepts_legacy_args_key() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "agent": "codex",
+            "args": ["--model", "gpt-5", "bad;arg"],
+        });
+        let args = requested_agent_args_from_client_hello(&frame);
+        assert_eq!(args, vec!["--model", "gpt-5"]);
+    }
+
+    #[test]
+    fn test_requested_agent_args_from_client_hello_accepts_camel_case_key() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "agent": "codex",
+            "agentArgs": ["--json"],
+        });
+        let args = requested_agent_args_from_client_hello(&frame);
+        assert_eq!(args, vec!["--json"]);
+    }
+
+    #[test]
+    fn test_requested_telegram_session_id_from_client_hello_accepts_snake_case() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "telegram_session_id": "telegrambot:12345",
+        });
+        let value = requested_telegram_session_id_from_client_hello(&frame);
+        assert_eq!(value.as_deref(), Some("telegrambot:12345"));
+    }
+
+    #[test]
+    fn test_requested_telegram_session_id_from_client_hello_accepts_camel_case() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "telegramSessionId": "telegrambot:999",
+        });
+        let value = requested_telegram_session_id_from_client_hello(&frame);
+        assert_eq!(value.as_deref(), Some("telegrambot:999"));
+    }
+
+    #[test]
+    fn test_requested_telegram_session_id_from_client_hello_rejects_invalid_chars() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "telegram_session_id": "telegrambot:12345/../../etc/passwd",
+        });
+        assert!(requested_telegram_session_id_from_client_hello(&frame).is_none());
+    }
+
+    #[test]
+    fn test_requested_relay_session_id_from_client_hello_accepts_snake_case() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "relay_session_id": "native-1234abcd",
+        });
+        let value = requested_relay_session_id_from_client_hello(&frame);
+        assert_eq!(value.as_deref(), Some("native-1234abcd"));
+    }
+
+    #[test]
+    fn test_requested_relay_session_id_from_client_hello_accepts_camel_case() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "relaySessionId": "native-5678efgh",
+        });
+        let value = requested_relay_session_id_from_client_hello(&frame);
+        assert_eq!(value.as_deref(), Some("native-5678efgh"));
+    }
+
+    #[test]
+    fn test_requested_relay_session_id_from_client_hello_accepts_nested_relay() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "relay": {
+                "session_id": "native-zxyw9876"
+            },
+        });
+        let value = requested_relay_session_id_from_client_hello(&frame);
+        assert_eq!(value.as_deref(), Some("native-zxyw9876"));
+    }
+
+    #[test]
+    fn test_requested_relay_session_id_from_client_hello_rejects_invalid_chars() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "relay_session_id": "native-1234/../../etc/passwd",
+        });
+        assert!(requested_relay_session_id_from_client_hello(&frame).is_none());
     }
 
     #[test]

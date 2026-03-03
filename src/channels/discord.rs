@@ -557,8 +557,10 @@ impl DiscordChannel {
         // Register this session with the channel hub (in-memory + persistent)
         {
             let channel_name = self.channel_name();
-            let mut map = self.session_map.write().await;
-            map.insert(session_id.clone(), channel_name.clone());
+            {
+                let mut map = self.session_map.write().await;
+                map.insert(session_id.clone(), channel_name.clone());
+            }
             let _ = self
                 .state
                 .save_session_channel(&session_id, &channel_name)

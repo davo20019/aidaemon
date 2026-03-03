@@ -1,4 +1,5 @@
 mod agent;
+mod agent_handoff;
 mod channels;
 mod config;
 mod conversation;
@@ -49,8 +50,14 @@ mod live_e2e_tests;
 mod testing;
 
 use std::path::{Path, PathBuf};
+#[cfg(not(feature = "terminal-bridge"))]
+use std::process::Stdio;
 
 use tracing_subscriber::EnvFilter;
+
+const SUPPORTED_TERMINAL_AGENTS: &[&str] = &["codex", "claude", "gemini", "opencode"];
+const MAX_AGENT_LAUNCH_ARGS: usize = 24;
+const MAX_AGENT_LAUNCH_ARG_CHARS: usize = 256;
 
 pub fn run() -> anyhow::Result<()> {
     // Load environment file.
@@ -103,6 +110,18 @@ pub fn run() -> anyhow::Result<()> {
                 println!(
                     "  browser login          Launch Chrome to log into services for the agent"
                 );
+                println!("  attach <code>         Attach native terminal to /agent session");
+                println!("  agent attach <code>   Legacy alias for attach");
+                println!("  share [session_id]    Generate a Telegram /agent resume code");
+                println!(
+                    "  agent start <agent>   Launch codex/claude/gemini/opencode via aidaemon"
+                );
+                println!("  codex [cwd] [-- ...]  Shortcut for: aidaemon agent start codex ...");
+                println!("  claude [cwd] [-- ...] Shortcut for: aidaemon agent start claude ...");
+                println!("  gemini [cwd] [-- ...] Shortcut for: aidaemon agent start gemini ...");
+                println!(
+                    "  opencode [cwd] [-- ...] Shortcut for: aidaemon agent start opencode ..."
+                );
                 println!("  keychain set <key>    Store a secret in the OS keychain");
                 println!("  keychain get <key>    Retrieve a secret from the OS keychain");
                 println!("  keychain delete <key> Remove a secret from the OS keychain");
@@ -140,10 +159,30 @@ pub fn run() -> anyhow::Result<()> {
             "browser" => {
                 return crate::handle_browser_command(&args[2..], config_path.as_path());
             }
+            "agent" => {
+                return handle_agent_command(&args[2..]);
+            }
+            "attach" => {
+                return handle_agent_command(&args[1..]);
+            }
+            "share" => {
+                let mut forwarded = Vec::with_capacity(args.len().saturating_sub(1));
+                forwarded.push("share".to_string());
+                forwarded.extend(args.iter().skip(2).cloned());
+                return handle_agent_command(&forwarded);
+            }
             "keychain" => {
                 return handle_keychain_command(&args[2..]);
             }
-            _ => {}
+            other => {
+                if let Some(agent) = normalize_terminal_agent_name(other) {
+                    return launch_terminal_agent(agent, &args[2..]);
+                }
+                anyhow::bail!(
+                    "Unknown command: {}. Run `aidaemon --help` for available commands.",
+                    other
+                );
+            }
         }
     }
 
@@ -322,6 +361,217 @@ fn handle_migrate_command(args: &[String], default_config_path: &Path) -> anyhow
         config_path.display()
     );
     Ok(())
+}
+
+fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
+    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+    match action {
+        "attach" => {
+            let Some(code) = args.get(1).map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+                anyhow::bail!("Usage: aidaemon attach <code>");
+            };
+            #[cfg(feature = "terminal-bridge")]
+            {
+                crate::terminal_bridge::run_local_attach_cli(code)
+            }
+            #[cfg(not(feature = "terminal-bridge"))]
+            {
+                anyhow::bail!(
+                    "This binary was built without terminal bridge support. Rebuild with --features terminal-bridge."
+                );
+            }
+        }
+        "start" => {
+            let Some(raw_agent) = args.get(1).map(|v| v.as_str()) else {
+                anyhow::bail!(
+                    "Usage: aidaemon agent start <codex|claude|gemini|opencode> [cwd] [-- flags...]"
+                );
+            };
+            let Some(agent) = normalize_terminal_agent_name(raw_agent) else {
+                anyhow::bail!(
+                    "Unknown agent `{}`. Supported: codex, claude, gemini, opencode.",
+                    raw_agent
+                );
+            };
+            launch_terminal_agent(agent, &args[2..])
+        }
+        "share" => {
+            #[cfg(feature = "terminal-bridge")]
+            {
+                let explicit_session_id = args.get(1).map(|v| v.as_str());
+                crate::terminal_bridge::run_local_share_cli(explicit_session_id)
+            }
+            #[cfg(not(feature = "terminal-bridge"))]
+            {
+                anyhow::bail!(
+                    "This binary was built without terminal bridge support. Rebuild with --features terminal-bridge."
+                );
+            }
+        }
+        "-h" | "--help" | "" => {
+            println!("Usage:");
+            println!("  aidaemon attach <code>");
+            println!("  aidaemon agent attach <code>");
+            println!("  aidaemon agent start <codex|claude|gemini|opencode> [cwd] [-- flags...]");
+            println!("  aidaemon share [session_id]");
+            println!();
+            println!("Attach your native terminal to an active /agent session started from Telegram Mini App.");
+            println!(
+                "The one-time code is generated inside Telegram when you tap Continue on Computer."
+            );
+            println!();
+            println!("Shortcuts:");
+            println!("  aidaemon codex [cwd] [-- flags...]");
+            println!("  aidaemon claude [cwd] [-- flags...]");
+            println!("  aidaemon gemini [cwd] [-- flags...]");
+            println!("  aidaemon opencode [cwd] [-- flags...]");
+            Ok(())
+        }
+        other => anyhow::bail!("Unknown agent command: {other}"),
+    }
+}
+
+fn normalize_terminal_agent_name(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "codex" => Some("codex"),
+        "claude" => Some("claude"),
+        "gemini" => Some("gemini"),
+        "opencode" => Some("opencode"),
+        _ => None,
+    }
+}
+
+fn parse_terminal_agent_launch_args(
+    raw_args: &[String],
+) -> anyhow::Result<(Option<PathBuf>, Vec<String>)> {
+    let mut cwd: Option<PathBuf> = None;
+    let mut args_start = 0usize;
+
+    if let Some(first) = raw_args.first().map(|v| v.trim()) {
+        if first == "--" {
+            args_start = 1;
+        } else if !first.starts_with("--") {
+            if first.is_empty() || first.contains('\0') {
+                anyhow::bail!("Invalid working directory.");
+            }
+            cwd = Some(PathBuf::from(shellexpand::tilde(first).into_owned()));
+            args_start = 1;
+            if raw_args
+                .get(args_start)
+                .map(|v| v.as_str() == "--")
+                .unwrap_or(false)
+            {
+                args_start += 1;
+            }
+        }
+    }
+
+    let mut launch_args: Vec<String> = Vec::new();
+    for raw in raw_args.iter().skip(args_start) {
+        let value = raw.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if value.contains('\0') {
+            anyhow::bail!("Agent flag contains an invalid NUL byte.");
+        }
+        if value.len() > MAX_AGENT_LAUNCH_ARG_CHARS {
+            anyhow::bail!(
+                "Agent flag exceeds {} characters.",
+                MAX_AGENT_LAUNCH_ARG_CHARS
+            );
+        }
+        launch_args.push(value.to_string());
+        if launch_args.len() > MAX_AGENT_LAUNCH_ARGS {
+            anyhow::bail!("Too many agent flags (max {}).", MAX_AGENT_LAUNCH_ARGS);
+        }
+    }
+
+    Ok((cwd, launch_args))
+}
+
+fn launch_terminal_agent(agent: &str, raw_args: &[String]) -> anyhow::Result<()> {
+    if !SUPPORTED_TERMINAL_AGENTS.contains(&agent) {
+        anyhow::bail!("Unsupported terminal agent: {}", agent);
+    }
+
+    let (cwd, launch_args) = parse_terminal_agent_launch_args(raw_args)?;
+    #[cfg(feature = "terminal-bridge")]
+    {
+        crate::terminal_bridge::run_local_start_cli(agent, cwd.as_deref(), &launch_args)
+    }
+    #[cfg(not(feature = "terminal-bridge"))]
+    {
+        let mut cmd = std::process::Command::new(agent);
+        cmd.args(&launch_args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if let Some(dir) = cwd.as_ref() {
+            cmd.current_dir(dir);
+        }
+
+        let status = cmd.status().map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to launch `{}`: {}. Ensure the CLI is installed and on PATH.",
+                agent,
+                err
+            )
+        })?;
+
+        if status.success() {
+            return Ok(());
+        }
+        if let Some(code) = status.code() {
+            std::process::exit(code);
+        }
+        anyhow::bail!("`{}` terminated unexpectedly.", agent);
+    }
+}
+
+#[cfg(test)]
+mod cli_alias_tests {
+    use super::*;
+
+    #[test]
+    fn parse_terminal_agent_launch_args_accepts_cwd_and_flags_with_delimiter() {
+        let args = vec![
+            "~/projects/aidaemon".to_string(),
+            "--".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--chrome".to_string(),
+        ];
+        let (cwd, flags) = parse_terminal_agent_launch_args(&args).expect("parse");
+        assert_eq!(
+            cwd,
+            Some(PathBuf::from(
+                shellexpand::tilde("~/projects/aidaemon").into_owned()
+            ))
+        );
+        assert_eq!(
+            flags,
+            vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--chrome".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_terminal_agent_launch_args_accepts_flag_only_invocation() {
+        let args = vec!["--model".to_string(), "gpt-5".to_string()];
+        let (cwd, flags) = parse_terminal_agent_launch_args(&args).expect("parse");
+        assert_eq!(cwd, None);
+        assert_eq!(flags, vec!["--model".to_string(), "gpt-5".to_string()]);
+    }
+
+    #[test]
+    fn normalize_terminal_agent_name_is_case_insensitive() {
+        assert_eq!(normalize_terminal_agent_name("CoDeX"), Some("codex"));
+        assert_eq!(normalize_terminal_agent_name("claude"), Some("claude"));
+        assert_eq!(normalize_terminal_agent_name("nope"), None);
+    }
 }
 
 #[cfg(feature = "browser")]
