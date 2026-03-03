@@ -61,10 +61,14 @@ impl ChannelBundle {
         if let Some(first_tg) = self.telegram_bots.first() {
             if let Some(first_config) = config.all_telegram_bots().first() {
                 if !first_config.allowed_user_ids.is_empty() {
+                    let mode = if first_config.webhook.enabled {
+                        "webhook"
+                    } else {
+                        "polling"
+                    };
+                    let msg = format!("aidaemon is online ({})", mode);
                     for user_id in &first_config.allowed_user_ids {
-                        let _ = first_tg
-                            .send_text(&user_id.to_string(), "aidaemon is online.")
-                            .await;
+                        let _ = first_tg.send_text(&user_id.to_string(), &msg).await;
                     }
                 }
             }
@@ -126,6 +130,12 @@ fn parse_u64_ids(ids: &[String]) -> Vec<u64> {
     ids.iter().filter_map(|s| s.parse::<u64>().ok()).collect()
 }
 
+/// Extract a slug from a bot token (e.g. "123456:ABC..." → "bot-123456").
+fn slug_from_bot_token(token: &str) -> String {
+    let id_part = token.split(':').next().unwrap_or("unknown");
+    format!("bot-{}", id_part)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_channels(
     config: &AppConfig,
@@ -144,10 +154,14 @@ pub async fn build_channels(
     let terminal_web_app_url = config.terminal.effective_web_app_url();
     let terminal_allowed_prefixes = config.terminal.allowed_prefixes.clone();
 
-    let make_telegram = |bot_token: &str, allowed_user_ids: Vec<u64>| -> Arc<TelegramChannel> {
+    let make_telegram = |bot_token: &str,
+                         allowed_user_ids: Vec<u64>,
+                         webhook: crate::config::TelegramWebhookConfig|
+     -> Arc<TelegramChannel> {
         Arc::new(TelegramChannel::new(
             bot_token,
             allowed_user_ids,
+            webhook,
             telegram_owner_ids.clone(),
             Arc::clone(&agent),
             config_path.clone(),
@@ -163,12 +177,41 @@ pub async fn build_channels(
         ))
     };
 
+    // Collect occupied ports from config bots with explicit webhook
+    let defaults = &config.telegram_webhook_defaults;
+    let mut occupied_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    for bot_config in config.all_telegram_bots() {
+        if bot_config.webhook.enabled {
+            if let Some(addr) = &bot_config.webhook.listen_addr {
+                if let Some(port) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
+                    occupied_ports.insert(port);
+                }
+            }
+        }
+    }
+
     let telegram_bots: Vec<Arc<TelegramChannel>> = config
         .all_telegram_bots()
         .into_iter()
         .map(|bot_config| {
+            let webhook = if bot_config.webhook.enabled {
+                // Explicit webhook config takes precedence
+                bot_config.webhook.clone()
+            } else if defaults.enabled && defaults.base_domain.is_some() {
+                // Auto-derive from global defaults
+                let slug = slug_from_bot_token(&bot_config.bot_token);
+                let port = defaults.next_available_port(&mut occupied_ports);
+                info!(slug = %slug, port, "Auto-deriving webhook config from global defaults for config bot");
+                defaults.derive_webhook_config(&slug, port)
+            } else {
+                bot_config.webhook.clone()
+            };
             info!("Registering Telegram bot (username will be fetched from API)");
-            make_telegram(&bot_config.bot_token, bot_config.allowed_user_ids.clone())
+            make_telegram(
+                &bot_config.bot_token,
+                bot_config.allowed_user_ids.clone(),
+                webhook,
+            )
         })
         .collect();
 
@@ -258,8 +301,26 @@ pub async fn build_channels(
                 match bot.channel_type.as_str() {
                     "telegram" => {
                         let allowed_user_ids: Vec<u64> = parse_u64_ids(&bot.allowed_user_ids);
+                        let webhook = if defaults.enabled && defaults.base_domain.is_some() {
+                            let extra: serde_json::Value =
+                                serde_json::from_str(&bot.extra_config).unwrap_or_default();
+                            let slug = extra["username"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| slug_from_bot_token(&bot.bot_token));
+                            let port = defaults.next_available_port(&mut occupied_ports);
+                            info!(bot_id = bot.id, slug = %slug, port, "Auto-deriving webhook config from global defaults for dynamic bot");
+                            defaults.derive_webhook_config(&slug, port)
+                        } else {
+                            crate::config::TelegramWebhookConfig::default()
+                        };
                         info!(bot_id = bot.id, "Loading dynamic Telegram bot");
-                        dynamic_telegram_bots.push(make_telegram(&bot.bot_token, allowed_user_ids));
+                        dynamic_telegram_bots.push(make_telegram(
+                            &bot.bot_token,
+                            allowed_user_ids,
+                            webhook,
+                        ));
                     }
                     #[cfg(feature = "discord")]
                     "discord" => {

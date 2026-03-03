@@ -1,3 +1,5 @@
+pub(crate) mod commands;
+pub(crate) mod connect;
 #[cfg(feature = "discord")]
 mod discord;
 mod formatting;

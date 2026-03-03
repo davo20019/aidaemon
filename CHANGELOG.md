@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.12] - 2026-03-03
+
+### Added
+
+- **Telegram webhook low-latency mode**: Opt-in webhook support for Telegram bots, replacing polling with direct HTTPS push for significantly lower message latency. Per-bot or global defaults configuration with auto-port assignment.
+- **`aidaemon setup low-latency` command**: Interactive setup wizard for configuring webhook mode with Cloudflare tunnel integration, multi-bot hostname assignment, port conflict resolution, and config backup.
+- **Shared command dispatcher**: Unified `/model`, `/models`, `/auto`, `/reload`, `/tasks`, `/cancel`, `/clear`, `/cost` handling across Telegram, Discord, and Slack channels via new `channels::commands` module.
+- **Channel token validation helpers**: `channels::connect` module with `validate_telegram_token()`, `validate_discord_token()`, and `validate_slack_tokens()` for dynamic bot setup flows.
+- **Terminal agent permission aliases**: `normalize_terminal_agent_permission_aliases()` rewrites `--allow-dangerously-skip-permissions` to `--dangerously-skip-permissions` for Claude agent CLI compatibility.
+
+### Changed
+
+- **Terminal-lite extracted to reusable module**: `TerminalLiteManager` moved from Telegram-only internals to `src/terminal_lite.rs` for potential reuse by other channels.
+- **CLI agent flag discovery extracted**: Agent flag discovery, caching, pagination, and defaults management moved to `src/cli_agent_flags.rs`.
+- **Terminal bridge exponential backoff**: Replaced fixed 3-second reconnect delay with exponential backoff (1s → 30s) with jitter and 60-second stability reset.
+- **Webhook configuration in `config.toml.example`**: New `[telegram.webhook]` and `[telegram_webhook_defaults]` sections with documentation.
+
+### Fixed
+
+- **Terminal bridge stale session on fresh agent start**: When the Mini App's old session expires and requests a new agent, the daemon now tears down the stale session instead of reattaching to it with a dead agent process. Previously, `bootstrapped_agent` remained `true` from the old session, preventing the new agent command from being sent to the shell, resulting in a blank terminal.
+
 ## [0.9.11] - 2026-03-02
 
 ### Added

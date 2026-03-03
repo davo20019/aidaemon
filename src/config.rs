@@ -335,6 +335,10 @@ pub struct AppConfig {
     /// Array of named Telegram bots (preferred for multi-bot setups).
     #[serde(default)]
     pub telegram_bots: Vec<TelegramBotConfig>,
+    /// Global webhook defaults — auto-applied to any Telegram bot without
+    /// an explicit `[webhook]` section with `enabled = true`.
+    #[serde(default)]
+    pub telegram_webhook_defaults: TelegramWebhookDefaults,
     #[cfg(feature = "discord")]
     #[serde(default)]
     pub discord: Option<DiscordConfig>,
@@ -539,6 +543,8 @@ pub struct TelegramConfig {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_user_ids: Vec<u64>,
+    #[serde(default)]
+    pub webhook: TelegramWebhookConfig,
 }
 
 impl fmt::Debug for TelegramConfig {
@@ -546,8 +552,100 @@ impl fmt::Debug for TelegramConfig {
         f.debug_struct("TelegramConfig")
             .field("bot_token", &redact(&self.bot_token))
             .field("allowed_user_ids", &self.allowed_user_ids)
+            .field("webhook", &self.webhook)
             .finish()
     }
+}
+
+/// Global defaults for Telegram webhook mode. When `enabled = true`, any
+/// Telegram bot (config-based or dynamic) that does NOT have an explicit
+/// `[webhook]` section with `enabled = true` will auto-derive webhook
+/// settings from these defaults at startup.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TelegramWebhookDefaults {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_domain: Option<String>,
+    #[serde(default = "default_webhook_port_start")]
+    pub port_start: u16,
+    #[serde(default = "default_webhook_max_connections")]
+    pub max_connections: u8,
+    #[serde(default)]
+    pub drop_pending_updates: bool,
+    #[serde(default = "default_true")]
+    pub bind_local_only: bool,
+}
+
+fn default_webhook_port_start() -> u16 {
+    8443
+}
+
+fn default_webhook_max_connections() -> u8 {
+    40
+}
+
+impl Default for TelegramWebhookDefaults {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_domain: None,
+            port_start: 8443,
+            max_connections: 40,
+            drop_pending_updates: false,
+            bind_local_only: true,
+        }
+    }
+}
+
+impl TelegramWebhookDefaults {
+    /// Derive a full `TelegramWebhookConfig` for a bot given its slug and port.
+    pub fn derive_webhook_config(&self, slug: &str, port: u16) -> TelegramWebhookConfig {
+        let listen_host = if self.bind_local_only {
+            "127.0.0.1"
+        } else {
+            "0.0.0.0"
+        };
+        let path = format!("/telegram/{}", slug);
+        let public_url = self
+            .base_domain
+            .as_ref()
+            .map(|domain| format!("https://{}.{}{}", slug, domain, path));
+        TelegramWebhookConfig {
+            enabled: true,
+            public_url,
+            listen_addr: Some(format!("{}:{}", listen_host, port)),
+            path: Some(path),
+            max_connections: Some(self.max_connections),
+            drop_pending_updates: self.drop_pending_updates,
+        }
+    }
+
+    /// Find the next available port starting from `port_start`, skipping occupied ones.
+    pub fn next_available_port(&self, occupied: &mut std::collections::HashSet<u16>) -> u16 {
+        let mut port = self.port_start;
+        while occupied.contains(&port) {
+            port = port.saturating_add(1);
+        }
+        occupied.insert(port);
+        port
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TelegramWebhookConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub public_url: Option<String>,
+    #[serde(default)]
+    pub listen_addr: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub max_connections: Option<u8>,
+    #[serde(default)]
+    pub drop_pending_updates: bool,
 }
 
 /// Telegram bot configuration for multi-bot support.
@@ -557,6 +655,8 @@ pub struct TelegramBotConfig {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_user_ids: Vec<u64>,
+    #[serde(default)]
+    pub webhook: TelegramWebhookConfig,
 }
 
 impl fmt::Debug for TelegramBotConfig {
@@ -564,6 +664,7 @@ impl fmt::Debug for TelegramBotConfig {
         f.debug_struct("TelegramBotConfig")
             .field("bot_token", &redact(&self.bot_token))
             .field("allowed_user_ids", &self.allowed_user_ids)
+            .field("webhook", &self.webhook)
             .finish()
     }
 }
@@ -2168,6 +2269,7 @@ impl AppConfig {
                 bots.push(TelegramBotConfig {
                     bot_token: legacy.bot_token.clone(),
                     allowed_user_ids: legacy.allowed_user_ids.clone(),
+                    webhook: legacy.webhook.clone(),
                 });
             }
         }
@@ -2952,6 +3054,108 @@ fair_max_events_per_session = 2
         assert!(queue.lanes.media.adaptive_shedding);
         assert_eq!(queue.lanes.media.fair_session_window_secs, 20);
         assert_eq!(queue.lanes.media.fair_max_events_per_session, 2);
+    }
+
+    #[test]
+    fn all_telegram_bots_merges_legacy_and_preserves_webhook_config() {
+        let toml = r#"
+[provider]
+api_key = "test-key"
+kind = "openai_compatible"
+
+[provider.models]
+primary = "gpt-4o"
+fast = "gpt-4o-mini"
+smart = "gpt-4o"
+
+[terminal]
+allowed_prefixes = ["ls"]
+
+[[telegram_bots]]
+bot_token = "array-token"
+allowed_user_ids = [111]
+
+[telegram_bots.webhook]
+enabled = true
+public_url = "https://array.example.com/hook"
+listen_addr = "0.0.0.0:8443"
+path = "/array"
+max_connections = 42
+drop_pending_updates = true
+
+[telegram]
+bot_token = "legacy-token"
+allowed_user_ids = [222]
+
+[telegram.webhook]
+enabled = true
+public_url = "https://legacy.example.com/hook"
+listen_addr = "127.0.0.1:9443"
+path = "/legacy"
+max_connections = 21
+drop_pending_updates = false
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        let bots = cfg.all_telegram_bots();
+        assert_eq!(bots.len(), 2);
+
+        assert_eq!(bots[0].bot_token, "array-token");
+        assert_eq!(bots[0].allowed_user_ids, vec![111]);
+        assert!(bots[0].webhook.enabled);
+        assert_eq!(
+            bots[0].webhook.public_url.as_deref(),
+            Some("https://array.example.com/hook")
+        );
+        assert_eq!(bots[0].webhook.listen_addr.as_deref(), Some("0.0.0.0:8443"));
+        assert_eq!(bots[0].webhook.path.as_deref(), Some("/array"));
+        assert_eq!(bots[0].webhook.max_connections, Some(42));
+        assert!(bots[0].webhook.drop_pending_updates);
+
+        assert_eq!(bots[1].bot_token, "legacy-token");
+        assert_eq!(bots[1].allowed_user_ids, vec![222]);
+        assert!(bots[1].webhook.enabled);
+        assert_eq!(
+            bots[1].webhook.public_url.as_deref(),
+            Some("https://legacy.example.com/hook")
+        );
+        assert_eq!(
+            bots[1].webhook.listen_addr.as_deref(),
+            Some("127.0.0.1:9443")
+        );
+        assert_eq!(bots[1].webhook.path.as_deref(), Some("/legacy"));
+        assert_eq!(bots[1].webhook.max_connections, Some(21));
+        assert!(!bots[1].webhook.drop_pending_updates);
+    }
+
+    #[test]
+    fn telegram_webhook_defaults_to_disabled_when_omitted() {
+        let toml = r#"
+[provider]
+api_key = "test-key"
+kind = "openai_compatible"
+
+[provider.models]
+primary = "gpt-4o"
+fast = "gpt-4o-mini"
+smart = "gpt-4o"
+
+[terminal]
+allowed_prefixes = ["ls"]
+
+[telegram]
+bot_token = "legacy-token"
+allowed_user_ids = [333]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        let bots = cfg.all_telegram_bots();
+        assert_eq!(bots.len(), 1);
+        assert_eq!(bots[0].bot_token, "legacy-token");
+        assert!(!bots[0].webhook.enabled);
+        assert_eq!(bots[0].webhook.public_url, None);
+        assert_eq!(bots[0].webhook.listen_addr, None);
+        assert_eq!(bots[0].webhook.path, None);
+        assert_eq!(bots[0].webhook.max_connections, None);
+        assert!(!bots[0].webhook.drop_pending_updates);
     }
 
     #[cfg(feature = "slack")]

@@ -17,7 +17,7 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, NativePtySystem, PtySize, PtySystem};
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -36,7 +36,10 @@ use crate::config::{resolve_from_keychain, store_in_keychain, AppConfig};
 use crate::traits::StateStore;
 
 const HEARTBEAT_MS: u64 = 25_000;
-const RECONNECT_MS: u64 = 3_000;
+const RECONNECT_INITIAL_MS: u64 = 1_000;
+const RECONNECT_MAX_MS: u64 = 30_000;
+const RECONNECT_JITTER_MS: u64 = 500;
+const RECONNECT_STABLE_SECS: u64 = 60;
 const OUTBOUND_HIGH_QUEUE_CAP: usize = 128;
 const OUTBOUND_LOW_QUEUE_CAP: usize = 1024;
 const OUTBOUND_FLUSH_BURST: usize = 24;
@@ -973,7 +976,7 @@ fn normalize_review_profile_args(reviewer: &str, args: &[String]) -> Vec<String>
     out
 }
 
-fn normalize_agent_args(value: Option<&Value>) -> Vec<String> {
+fn normalize_agent_args(value: Option<&Value>, agent: Option<&str>) -> Vec<String> {
     let Some(value) = value else {
         return Vec::new();
     };
@@ -995,22 +998,25 @@ fn normalize_agent_args(value: Option<&Value>) -> Vec<String> {
         }
         _ => return Vec::new(),
     }
-    raw_values
+    let out = raw_values
         .into_iter()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && !v.contains('\0'))
         .filter(|v| is_safe_agent_bootstrap_arg(v))
         .map(|v| v.chars().take(MAX_AGENT_ARG_CHARS).collect::<String>())
         .take(MAX_AGENT_ARGS)
-        .collect()
+        .collect();
+    let (out, _) = crate::normalize_terminal_agent_permission_aliases(agent, out);
+    out
 }
 
 fn requested_agent_args_from_client_hello(frame: &Value) -> Vec<String> {
     // Accept multiple key shapes to remain compatible with older/newer Mini App builds.
+    let requested_agent = normalize_agent(frame.get("agent").and_then(|v| v.as_str()));
     let key_order = ["agent_args", "agentArgs", "args", "argv", "arg"];
     for key in key_order {
         if let Some(raw) = frame.get(key) {
-            return normalize_agent_args(Some(raw));
+            return normalize_agent_args(Some(raw), requested_agent.as_deref());
         }
     }
     Vec::new()
@@ -3456,16 +3462,55 @@ impl TerminalBridge {
     }
 
     async fn run_forever(&mut self) {
+        let stable_threshold = Duration::from_secs(RECONNECT_STABLE_SECS);
+        let mut reconnect_backoff_ms = RECONNECT_INITIAL_MS;
         loop {
             self.drain_shell_events(512);
             self.drain_local_events(256).await;
-            if let Err(err) = self.connect_once().await {
-                error!(error = %err, "Terminal bridge connection failed");
+            let started = Instant::now();
+            match self.connect_once().await {
+                Ok(()) => {
+                    info!(
+                        ran_for_secs = started.elapsed().as_secs(),
+                        "Terminal bridge disconnected, reconnecting"
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        ran_for_secs = started.elapsed().as_secs(),
+                        "Terminal bridge connection failed"
+                    );
+                }
             }
+            let ran_for = started.elapsed();
             self.drain_shell_events(2048);
             self.drain_local_events(512).await;
-            tokio::time::sleep(Duration::from_millis(RECONNECT_MS)).await;
+
+            if ran_for >= stable_threshold {
+                reconnect_backoff_ms = RECONNECT_INITIAL_MS;
+            }
+            let jitter_ms = if RECONNECT_JITTER_MS == 0 {
+                0
+            } else {
+                rand::thread_rng().gen_range(0..=RECONNECT_JITTER_MS)
+            };
+            let sleep_ms = reconnect_backoff_ms.saturating_add(jitter_ms);
+            debug!(
+                sleep_ms,
+                base_backoff_ms = reconnect_backoff_ms,
+                jitter_ms,
+                "Sleeping before terminal bridge reconnect"
+            );
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            reconnect_backoff_ms = Self::next_reconnect_backoff_ms(reconnect_backoff_ms);
         }
+    }
+
+    fn next_reconnect_backoff_ms(current: u64) -> u64 {
+        current
+            .saturating_mul(2)
+            .clamp(RECONNECT_INITIAL_MS, RECONNECT_MAX_MS)
     }
 
     async fn connect_once(&mut self) -> anyhow::Result<()> {
@@ -4424,6 +4469,8 @@ impl TerminalBridge {
         };
 
         let skipped_stdout_replay = should_skip_stdout_replay(resume_from_seq, oldest_seq, &frames);
+        let blank_terminal_hint =
+            "If the terminal appears blank, press Enter or send a command to refresh live output.";
         if !frames.is_empty() {
             if skipped_stdout_replay {
                 let reason = if resume_from_seq.saturating_add(1) < oldest_seq {
@@ -4437,9 +4484,10 @@ impl TerminalBridge {
                     json!({
                         "kind":"status",
                         "message": format!(
-                            "Connection recovered. Skipped replaying {} buffered output frame(s) because {}. Session is still running.",
+                            "Connection recovered. Skipped replaying {} buffered output frame(s) because {}. Session is still active. {}",
                             frames.len(),
-                            reason
+                            reason,
+                            blank_terminal_hint
                         )
                     }),
                 )
@@ -4469,6 +4517,19 @@ impl TerminalBridge {
                 )
                 .await?;
             }
+        } else if resume_from_seq > 0 {
+            self.send_encrypted_json_for_session(
+                session_id,
+                ws_write,
+                json!({
+                    "kind":"status",
+                    "message": format!(
+                        "Connection recovered. Session is still active. No buffered output needed replay. {}",
+                        blank_terminal_hint
+                    )
+                }),
+            )
+            .await?;
         }
 
         let skipped_review_stream_replay = should_skip_review_stream_replay(
@@ -4735,6 +4796,26 @@ impl TerminalBridge {
             &client_pub_b64,
         )?;
 
+        // If the client is requesting a fresh agent start (resume_from_seq == 0, agent
+        // requested) but the existing session already bootstrapped an agent, the old
+        // agent process is likely dead/stale (e.g., Mini App's "Resume failed" → start
+        // new session).  Tear down the stale session so we fall through to spawn a fresh
+        // shell + agent below.
+        if requested_agent.is_some() && resume_from_seq == 0 {
+            if let Some(active) = self.sessions.get(relay_session_id) {
+                if active.crypto.bootstrapped_agent {
+                    info!(
+                        relay_session_id,
+                        old_agent = active.crypto.agent.as_deref().unwrap_or("none"),
+                        new_agent = requested_agent.as_deref().unwrap_or("none"),
+                        "Tearing down stale session for fresh agent start (resume_from_seq=0)"
+                    );
+                    self.remove_session(relay_session_id, "fresh agent start")
+                        .await;
+                }
+            }
+        }
+
         if let Some(active) = self.sessions.get_mut(relay_session_id) {
             active.crypto.cipher = cipher;
             active.crypto.send_counter = 0;
@@ -4772,7 +4853,10 @@ impl TerminalBridge {
             self.send_encrypted_json_for_session(
                 relay_session_id,
                 ws_write,
-                json!({"kind":"status","message":"Local daemon secure channel ready (reattached)."}),
+                json!({
+                    "kind":"status",
+                    "message":"Local daemon secure channel ready (reattached). Session is active; if the terminal looks blank, press Enter or send a command to refresh output."
+                }),
             )
             .await?;
             self.replay_stdout_since(
@@ -5861,6 +5945,10 @@ pub fn run_local_start_cli(
             agent
         );
     };
+    let (agent_args, _) = crate::normalize_terminal_agent_permission_aliases(
+        Some(agent.as_str()),
+        agent_args.to_vec(),
+    );
 
     let endpoint = load_local_attach_endpoint()?;
     let address = format!("{}:{}", endpoint.host, endpoint.port);
@@ -6084,6 +6172,30 @@ mod tests {
         let last = queue.low.back().expect("last");
         assert_eq!(first.session_id, "s1");
         assert_eq!(last.session_id, format!("s{}", OUTBOUND_LOW_QUEUE_CAP));
+    }
+
+    #[test]
+    fn test_next_reconnect_backoff_ms_doubles_until_cap() {
+        assert_eq!(
+            TerminalBridge::next_reconnect_backoff_ms(RECONNECT_INITIAL_MS),
+            RECONNECT_INITIAL_MS * 2
+        );
+        assert_eq!(
+            TerminalBridge::next_reconnect_backoff_ms(RECONNECT_MAX_MS / 2),
+            RECONNECT_MAX_MS
+        );
+        assert_eq!(
+            TerminalBridge::next_reconnect_backoff_ms(RECONNECT_MAX_MS),
+            RECONNECT_MAX_MS
+        );
+    }
+
+    #[test]
+    fn test_next_reconnect_backoff_ms_normalizes_zero_input() {
+        assert_eq!(
+            TerminalBridge::next_reconnect_backoff_ms(0),
+            RECONNECT_INITIAL_MS
+        );
     }
 
     #[test]
@@ -6453,15 +6565,29 @@ mod tests {
     #[test]
     fn test_normalize_agent_args_drops_shell_metacharacters() {
         let payload = serde_json::json!(["--model", "gpt-5", "foo;bar", "$(whoami)", "--json"]);
-        let args = normalize_agent_args(Some(&payload));
+        let args = normalize_agent_args(Some(&payload), Some("codex"));
         assert_eq!(args, vec!["--model", "gpt-5", "--json"]);
     }
 
     #[test]
     fn test_normalize_agent_args_splits_single_string_payload() {
         let payload = serde_json::json!("--model gpt-5 --json");
-        let args = normalize_agent_args(Some(&payload));
+        let args = normalize_agent_args(Some(&payload), Some("codex"));
         assert_eq!(args, vec!["--model", "gpt-5", "--json"]);
+    }
+
+    #[test]
+    fn test_requested_agent_args_from_client_hello_rewrites_claude_allow_alias() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "agent": "claude",
+            "agent_args": ["--allow-dangerously-skip-permissions", "--output-format", "json"],
+        });
+        let args = requested_agent_args_from_client_hello(&frame);
+        assert_eq!(
+            args,
+            vec!["--dangerously-skip-permissions", "--output-format", "json"]
+        );
     }
 
     #[test]

@@ -37,6 +37,32 @@ smart = "anthropic/claude-sonnet-4"
 bot_token = "keychain"
 # bot_token = "${TELOXIDE_TOKEN}"
 allowed_user_ids = [123456789]
+# Optional webhook mode for lower delivery latency in production.
+# Long polling remains the default unless explicitly enabled.
+# Multi-bot note: if multiple bots enable webhooks on one aidaemon instance,
+# each bot needs a unique `listen_addr` (port).
+# [telegram.webhook]
+# enabled = false
+# public_url = "https://bot.example.com"
+# listen_addr = "0.0.0.0:8443"
+# # Optional custom path (defaults to "/telegram/{bot_username}").
+# # path = "/telegram"
+# # Optional 1..100, Telegram defaults to 40.
+# # max_connections = 40
+# # Optional: clear queued Telegram updates when setting the webhook.
+# # drop_pending_updates = false
+
+# Global webhook defaults for ALL Telegram bots (config-based and dynamic).
+# When enabled, any bot without an explicit [webhook] section with enabled = true
+# will auto-derive webhook settings from these defaults at startup.
+# Per-bot [telegram.webhook] with enabled = true always takes precedence.
+# [telegram_webhook_defaults]
+# enabled = false
+# base_domain = "bots.example.com"   # Each bot gets <slug>.bots.example.com
+# port_start = 8443                  # First auto-assigned port; increments for each bot
+# max_connections = 40               # Telegram max_connections (1..100)
+# drop_pending_updates = false       # Clear queued updates when setting webhook
+# bind_local_only = true             # true → 127.0.0.1, false → 0.0.0.0
 
 [state]
 db_path = "aidaemon.db"

@@ -1,6 +1,7 @@
 mod agent;
 mod agent_handoff;
 mod channels;
+mod cli_agent_flags;
 mod config;
 mod conversation;
 mod core;
@@ -33,6 +34,7 @@ mod state;
 mod tasks;
 #[cfg(feature = "terminal-bridge")]
 mod terminal_bridge;
+mod terminal_lite;
 mod token_alerts;
 mod tools;
 mod traits;
@@ -107,6 +109,7 @@ pub fn run() -> anyhow::Result<()> {
                 println!("  install-service       Install as a system service (launchd/systemd)");
                 println!("  check-update          Check for available updates");
                 println!("  migrate [--config]    Run DB migrations and exit");
+                println!("  setup low-latency     Configure Telegram webhook low-latency mode");
                 println!(
                     "  browser login          Launch Chrome to log into services for the agent"
                 );
@@ -155,6 +158,9 @@ pub fn run() -> anyhow::Result<()> {
             }
             "migrate" => {
                 return handle_migrate_command(&args[2..], config_path.as_path());
+            }
+            "setup" => {
+                return handle_setup_command(&args[2..], config_path.as_path());
             }
             "browser" => {
                 return crate::handle_browser_command(&args[2..], config_path.as_path());
@@ -363,6 +369,31 @@ fn handle_migrate_command(args: &[String], default_config_path: &Path) -> anyhow
     Ok(())
 }
 
+fn handle_setup_command(args: &[String], default_config_path: &Path) -> anyhow::Result<()> {
+    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+    match action {
+        "low-latency" | "telegram-webhook" => {
+            if !default_config_path.exists() {
+                anyhow::bail!(
+                    "Config file not found at {}. Run `aidaemon` once to generate config.toml first.",
+                    default_config_path.display()
+                );
+            }
+            wizard::run_low_latency_setup(default_config_path)
+        }
+        "-h" | "--help" | "" => {
+            println!("Usage:");
+            println!("  aidaemon setup low-latency");
+            println!("  aidaemon setup telegram-webhook");
+            println!();
+            println!("Configure Telegram webhook low-latency mode (opt-in).");
+            println!("Defaults remain polling unless you run this setup.");
+            Ok(())
+        }
+        other => anyhow::bail!("Unknown setup command: {other}"),
+    }
+}
+
 fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
     let action = args.first().map(|s| s.as_str()).unwrap_or("");
     match action {
@@ -431,7 +462,7 @@ fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
     }
 }
 
-fn normalize_terminal_agent_name(raw: &str) -> Option<&'static str> {
+pub(crate) fn normalize_terminal_agent_name(raw: &str) -> Option<&'static str> {
     let normalized = raw.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "codex" => Some("codex"),
@@ -440,6 +471,39 @@ fn normalize_terminal_agent_name(raw: &str) -> Option<&'static str> {
         "opencode" => Some("opencode"),
         _ => None,
     }
+}
+
+pub(crate) fn normalize_terminal_agent_permission_aliases(
+    agent: Option<&str>,
+    args: Vec<String>,
+) -> (Vec<String>, bool) {
+    if !agent
+        .map(|value| value.trim().eq_ignore_ascii_case("claude"))
+        .unwrap_or(false)
+    {
+        return (args, false);
+    }
+
+    let mut out = Vec::with_capacity(args.len());
+    let mut has_dangerous_skip = false;
+    let mut rewrote = false;
+
+    for arg in args {
+        if arg == "--dangerously-skip-permissions" {
+            has_dangerous_skip = true;
+            out.push(arg);
+        } else if arg == "--allow-dangerously-skip-permissions" {
+            rewrote = true;
+            if !has_dangerous_skip {
+                out.push("--dangerously-skip-permissions".to_string());
+                has_dangerous_skip = true;
+            }
+        } else {
+            out.push(arg);
+        }
+    }
+
+    (out, rewrote)
 }
 
 fn parse_terminal_agent_launch_args(
@@ -497,6 +561,7 @@ fn launch_terminal_agent(agent: &str, raw_args: &[String]) -> anyhow::Result<()>
     }
 
     let (cwd, launch_args) = parse_terminal_agent_launch_args(raw_args)?;
+    let (launch_args, _) = normalize_terminal_agent_permission_aliases(Some(agent), launch_args);
     #[cfg(feature = "terminal-bridge")]
     {
         crate::terminal_bridge::run_local_start_cli(agent, cwd.as_deref(), &launch_args)
@@ -571,6 +636,35 @@ mod cli_alias_tests {
         assert_eq!(normalize_terminal_agent_name("CoDeX"), Some("codex"));
         assert_eq!(normalize_terminal_agent_name("claude"), Some("claude"));
         assert_eq!(normalize_terminal_agent_name("nope"), None);
+    }
+
+    #[test]
+    fn normalize_terminal_agent_permission_aliases_rewrites_claude_allow_flag() {
+        let args = vec![
+            "--allow-dangerously-skip-permissions".to_string(),
+            "--model".to_string(),
+            "sonnet".to_string(),
+        ];
+        let (normalized, rewrote) =
+            normalize_terminal_agent_permission_aliases(Some("claude"), args);
+        assert!(rewrote);
+        assert_eq!(
+            normalized,
+            vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_terminal_agent_permission_aliases_leaves_other_agents_unchanged() {
+        let args = vec!["--allow-dangerously-skip-permissions".to_string()];
+        let (normalized, rewrote) =
+            normalize_terminal_agent_permission_aliases(Some("codex"), args.clone());
+        assert!(!rewrote);
+        assert_eq!(normalized, args);
     }
 }
 

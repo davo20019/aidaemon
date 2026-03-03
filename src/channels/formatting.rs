@@ -671,7 +671,7 @@ pub(crate) fn build_help_text(
 
     if include_terminal {
         text.push_str(&format!(
-            "\n`{p}agent` — Start Codex/Claude/Gemini/OpenCode session\n`{p}agent flags` — Discover available flags for an agent\n`{p}agent defaults` — Manage saved agent flags\n`{p}terminal lite` — Chat-based shell mode"
+            "\n`{p}agent` — Start Codex/Claude/Gemini/OpenCode session\n`{p}agent flags` — Discover available flags for an agent\n`{p}agent defaults` — Manage saved agent flags\n`{p}terminal lite` — Chat-based shell mode\n`{p}setup lowlatency` — Configure Telegram webhook low-latency mode (owner only)"
         ));
     }
 

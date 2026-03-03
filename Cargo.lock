@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon"
-version = "0.9.11"
+version = "0.9.12"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5388,6 +5388,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84992abeed3ae42e8401b25d266d12bcba1def0abe59d22f6b9781167545f71e"
 dependencies = [
  "aquamarine",
+ "axum",
  "bytes",
  "derive_more",
  "dptree",
@@ -5396,6 +5397,7 @@ dependencies = [
  "log",
  "mime",
  "pin-project",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "teloxide-core",
@@ -5404,6 +5406,8 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower",
+ "tower-http",
  "url",
 ]
 
@@ -5883,6 +5887,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

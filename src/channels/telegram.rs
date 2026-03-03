@@ -1,26 +1,28 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
 use teloxide::types::{
     ButtonRequest, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
     KeyboardButton, KeyboardMarkup, ParseMode, WebAppInfo,
 };
+use teloxide::update_listeners::webhooks;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::formatting::{
-    build_help_text, format_number, html_escape, markdown_to_telegram_html, sanitize_filename,
-    split_message, strip_latex,
+    build_help_text, html_escape, markdown_to_telegram_html, sanitize_filename, split_message,
+    strip_latex,
 };
 use crate::agent::Agent;
 use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, SessionMap};
@@ -28,7 +30,7 @@ use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, Sessio
 use crate::channels::{spawn_discord_channel, DiscordChannel};
 #[cfg(feature = "slack")]
 use crate::channels::{spawn_slack_channel, SlackChannel};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, TelegramWebhookConfig};
 use crate::tasks::TaskRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
@@ -49,6 +51,7 @@ pub struct TelegramChannel {
     session_namespace: StdRwLock<Option<String>>,
     bot: Bot,
     bot_token: String,
+    webhook: TelegramWebhookConfig,
     allowed_user_ids: StdRwLock<Vec<u64>>,
     /// Telegram user IDs recognized as owners (from `users.owner_ids.telegram`).
     owner_user_ids: Vec<u64>,
@@ -75,51 +78,26 @@ pub struct TelegramChannel {
     watchdog_stale_threshold_secs: u64,
     /// URL for the Telegram Mini App terminal frontend.
     terminal_web_app_url: String,
-    /// Chat-only terminal-lite sessions keyed by Telegram chat id.
-    terminal_lite_sessions: Mutex<HashMap<i64, TerminalLiteSession>>,
-    /// Commands allowed in `/terminal lite`, derived from `[terminal].allowed_prefixes`.
-    terminal_allowed_prefixes: HashSet<String>,
+    /// Terminal-lite session manager.
+    terminal_lite: crate::terminal_lite::TerminalLiteManager,
     /// Daemon start time used for post-restart UX guardrails.
     started_at: Instant,
 }
 
-#[derive(Debug, Clone)]
-struct TerminalLiteSession {
-    owner_user_id: u64,
-    cwd: PathBuf,
-    shell: String,
-    preferred_agent: Option<String>,
-    started_at: Instant,
-    busy: bool,
+#[derive(Debug, Default)]
+struct SetupLoginResult {
+    success: bool,
+    timed_out: bool,
+    error: Option<String>,
+    lines: Vec<String>,
+    urls: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct AgentFlagDoc {
-    flag: String,
-    #[serde(default)]
-    description: Option<String>,
-}
+use crate::wizard::CloudflaredZoneValidation;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct AgentFlagsCacheEntry {
-    updated_at_unix: i64,
-    #[serde(default)]
-    flags: Vec<String>,
-    #[serde(default)]
-    docs: Vec<AgentFlagDoc>,
-}
+use crate::cli_agent_flags::{self, AGENT_FLAGS_CACHE_TTL_SECS, SUPPORTED_TERMINAL_AGENTS};
 
-const TERMINAL_LITE_MAX_OUTPUT_CHARS: usize = 12_000;
-const TERMINAL_LITE_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_TERMINAL_AGENT: &str = "codex";
-const SUPPORTED_TERMINAL_AGENTS: &[&str] = &["codex", "claude", "gemini", "opencode"];
-const MAX_TERMINAL_AGENT_ARGS: usize = 24;
-const MAX_TERMINAL_AGENT_ARG_CHARS: usize = 256;
-const AGENT_FLAGS_CACHE_TTL_SECS: i64 = 24 * 60 * 60;
-const MAX_DISCOVERED_AGENT_FLAGS: usize = 512;
-const MAX_DISCOVERED_AGENT_FLAG_CHARS: usize = 96;
-const MAX_DISCOVERED_AGENT_FLAG_DESC_CHARS: usize = 240;
-const AGENT_FLAGS_PAGE_SIZE: usize = 12;
 const TELEGRAM_EXPANDABLE_TRIGGER_CHARS: usize = 1_800;
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 const TELEGRAM_EXPANDABLE_WRAPPER_LEN: usize = "<blockquote expandable></blockquote>".len();
@@ -128,6 +106,7 @@ const TELEGRAM_EXPANDABLE_MAX_ESCAPED_CHARS: usize =
 const TELEGRAM_WEBAPP_TYPE_AGENT_MESSAGE: &str = "aidaemon.telegram.agent_message.v1";
 const TELEGRAM_WEBAPP_TYPE_CONTINUE_COMPUTER: &str = "aidaemon.telegram.open_on_computer.v1";
 const TELEGRAM_WEBAPP_MAX_TEXT_CHARS: usize = 2_000;
+static LOW_LATENCY_RESTART_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
 enum TelegramWebAppAction {
     AgentMessage(String),
@@ -139,6 +118,7 @@ impl TelegramChannel {
     pub fn new(
         bot_token: &str,
         allowed_user_ids: Vec<u64>,
+        webhook: TelegramWebhookConfig,
         owner_user_ids: Vec<u64>,
         agent: Arc<Agent>,
         config_path: PathBuf,
@@ -164,6 +144,7 @@ impl TelegramChannel {
             session_namespace: StdRwLock::new(None),
             bot,
             bot_token: bot_token.to_string(),
+            webhook,
             allowed_user_ids: StdRwLock::new(allowed_user_ids),
             owner_user_ids,
             agent,
@@ -178,8 +159,9 @@ impl TelegramChannel {
             channel_hub: StdRwLock::new(None),
             watchdog_stale_threshold_secs,
             terminal_web_app_url,
-            terminal_lite_sessions: Mutex::new(HashMap::new()),
-            terminal_allowed_prefixes,
+            terminal_lite: crate::terminal_lite::TerminalLiteManager::new(
+                terminal_allowed_prefixes,
+            ),
             started_at: Instant::now(),
         }
     }
@@ -389,11 +371,173 @@ impl TelegramChannel {
                 }
             }));
 
-        Dispatcher::builder(self.bot.clone(), handler)
+        let mut dispatcher = Dispatcher::builder(self.bot.clone(), handler)
             .enable_ctrlc_handler()
-            .build()
-            .dispatch()
-            .await;
+            .build();
+
+        if let Some((listen_addr, webhook_opts)) = self.build_webhook_options(&bot_username) {
+            info!(
+                name = %bot_username,
+                listen_addr = %listen_addr,
+                "Starting Telegram webhook listener"
+            );
+            match webhooks::axum_to_router(self.bot.clone(), webhook_opts).await {
+                Ok((listener, stop_flag, router)) => {
+                    match tokio::net::TcpListener::bind(listen_addr).await {
+                        Ok(tcp_listener) => {
+                            tokio::spawn(async move {
+                                if let Err(err) = axum::serve(tcp_listener, router)
+                                    .with_graceful_shutdown(stop_flag)
+                                    .await
+                                {
+                                    warn!(error = %err, "Telegram webhook server stopped with error");
+                                }
+                            });
+                            dispatcher
+                                .dispatch_with_listener(
+                                    listener,
+                                    LoggingErrorHandler::with_custom_text(
+                                        "An error from the Telegram webhook listener",
+                                    ),
+                                )
+                                .await;
+                            return;
+                        }
+                        Err(err) => {
+                            warn!(
+                                name = %bot_username,
+                                listen_addr = %listen_addr,
+                                error = %err,
+                                hint = "for multi-bot webhook mode, use a unique listen_addr per bot",
+                                "Failed to bind Telegram webhook listener, falling back to long polling"
+                            );
+                            let _ = self.bot.delete_webhook().send().await;
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        name = %bot_username,
+                        error = %err,
+                        "Failed to initialize Telegram webhook mode, falling back to long polling"
+                    );
+                }
+            }
+        }
+
+        dispatcher.dispatch().await;
+    }
+
+    fn build_webhook_options(
+        &self,
+        bot_username: &str,
+    ) -> Option<(std::net::SocketAddr, webhooks::Options)> {
+        if !self.webhook.enabled {
+            return None;
+        }
+
+        let public_url_raw = self
+            .webhook
+            .public_url
+            .as_ref()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty());
+        let Some(public_url_raw) = public_url_raw else {
+            warn!(
+                name = %bot_username,
+                "Telegram webhook enabled but `public_url` is empty; using long polling"
+            );
+            return None;
+        };
+        let public_url = match reqwest::Url::parse(public_url_raw) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    name = %bot_username,
+                    error = %err,
+                    public_url = %public_url_raw,
+                    "Invalid Telegram webhook public URL; using long polling"
+                );
+                return None;
+            }
+        };
+        if public_url.scheme() != "https" {
+            warn!(
+                name = %bot_username,
+                public_url = %public_url_raw,
+                "Telegram webhook public URL must use HTTPS; using long polling"
+            );
+            return None;
+        }
+
+        let listen_addr_raw = self
+            .webhook
+            .listen_addr
+            .as_ref()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty());
+        let Some(listen_addr_raw) = listen_addr_raw else {
+            warn!(
+                name = %bot_username,
+                "Telegram webhook enabled but `listen_addr` is empty; using long polling"
+            );
+            return None;
+        };
+        let listen_addr = match listen_addr_raw.parse::<std::net::SocketAddr>() {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    name = %bot_username,
+                    listen_addr = %listen_addr_raw,
+                    error = %err,
+                    "Invalid Telegram webhook listen address; using long polling"
+                );
+                return None;
+            }
+        };
+
+        // Teloxide sends the URL verbatim to Telegram's setWebhook, so we
+        // must include the path in the URL. The `opts.path()` call only sets
+        // the local axum route, NOT the URL registered with Telegram.
+        let path = self
+            .webhook
+            .path
+            .as_ref()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string());
+        let webhook_url = if let Some(ref path) = path {
+            let current_path = public_url.path().trim_end_matches('/');
+            // Only append if the URL doesn't already include the path
+            if current_path.is_empty() || current_path == "/" {
+                let mut url = public_url.clone();
+                url.set_path(path);
+                url
+            } else {
+                public_url
+            }
+        } else {
+            public_url
+        };
+        let mut opts = webhooks::Options::new(listen_addr, webhook_url);
+        if let Some(path) = path {
+            opts = opts.path(path);
+        }
+        if let Some(max_connections) = self.webhook.max_connections {
+            if (1..=100).contains(&max_connections) {
+                opts = opts.max_connections(max_connections);
+            } else {
+                warn!(
+                    name = %bot_username,
+                    max_connections,
+                    "Telegram webhook `max_connections` must be 1..=100; ignoring"
+                );
+            }
+        }
+        if self.webhook.drop_pending_updates {
+            opts = opts.drop_pending_updates();
+        }
+        Some((listen_addr, opts))
     }
 
     /// Handle callback query from inline keyboard buttons.
@@ -449,6 +593,11 @@ impl TelegramChannel {
         // or "goal:{confirm|cancel}:{id}"
         let parts: Vec<&str> = data.splitn(3, ':').collect();
         if parts.len() != 3 || (parts[0] != "approve" && parts[0] != "goal") {
+            let _ = bot
+                .answer_callback_query(q.id)
+                .text("This action is no longer valid. Please run the command again.")
+                .show_alert(true)
+                .await;
             return;
         }
 
@@ -460,7 +609,14 @@ impl TelegramChannel {
             match action {
                 "confirm" => (ApprovalResponse::AllowOnce, "Confirmed ✅"),
                 "cancel" => (ApprovalResponse::Deny, "Cancelled ❌"),
-                _ => return,
+                _ => {
+                    let _ = bot
+                        .answer_callback_query(q.id)
+                        .text("This confirmation action is no longer valid.")
+                        .show_alert(true)
+                        .await;
+                    return;
+                }
             }
         } else {
             let response = match action {
@@ -468,7 +624,14 @@ impl TelegramChannel {
                 "session" => ApprovalResponse::AllowSession,
                 "always" => ApprovalResponse::AllowAlways,
                 "deny" => ApprovalResponse::Deny,
-                _ => return,
+                _ => {
+                    let _ = bot
+                        .answer_callback_query(q.id)
+                        .text("This approval action is no longer valid.")
+                        .show_alert(true)
+                        .await;
+                    return;
+                }
             };
             let label = match &response {
                 ApprovalResponse::AllowOnce => "Allowed (once)",
@@ -485,6 +648,27 @@ impl TelegramChannel {
             let _ = tx.send(response);
         } else {
             warn!(approval_id, "Stale approval callback (no pending request)");
+            let _ = bot
+                .answer_callback_query(q.id.clone())
+                .text("Approval expired. Please run the command again.")
+                .show_alert(true)
+                .await;
+            if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) = q.message {
+                let original = m.text().unwrap_or("");
+                if !original.contains("Approval expired") {
+                    let _ = bot
+                        .edit_message_text(
+                            m.chat.id,
+                            m.id,
+                            format!(
+                                "{}\n\n⚠️ Approval expired or daemon restarted. Run the command again to create a new approval prompt.",
+                                original
+                            ),
+                        )
+                        .await;
+                }
+            }
+            return;
         }
 
         // Acknowledge the callback and update the message
@@ -509,72 +693,23 @@ impl TelegramChannel {
             return;
         }
 
+        // Try the shared command dispatcher first.
+        let ctx = crate::channels::commands::CommandContext {
+            agent: Arc::clone(&self.agent),
+            state: Arc::clone(&self.state),
+            task_registry: Arc::clone(&self.task_registry),
+            config_path: self.config_path.clone(),
+        };
+        let session_id = self.session_id(msg.chat.id.0).await;
+        if let Some(reply) = ctx.dispatch(cmd, arg, &session_id).await {
+            for chunk in split_message(&reply, 4096) {
+                let _ = bot.send_message(msg.chat.id, chunk).await;
+            }
+            return;
+        }
+
+        // Channel-specific commands.
         let reply = match cmd {
-            "/model" => {
-                if arg.is_empty() {
-                    let current = self.agent.current_model().await;
-                    format!(
-                        "Current model: {}\n\nUsage: /model <model-name>\nExample: /model gemini-3-pro-preview",
-                        current
-                    )
-                } else {
-                    self.agent.set_model(arg.to_string()).await;
-                    format!(
-                        "Model switched to: {}\nAuto-routing disabled. Use /auto to re-enable.",
-                        arg
-                    )
-                }
-            }
-            "/models" => match self.agent.list_models().await {
-                Ok(models) => {
-                    if models.is_empty() {
-                        "No models found from provider.".to_string()
-                    } else {
-                        let current = self.agent.current_model().await;
-                        let list: Vec<String> = models
-                            .iter()
-                            .map(|m| {
-                                if *m == current {
-                                    format!("• {} (active)", m)
-                                } else {
-                                    format!("• {}", m)
-                                }
-                            })
-                            .collect();
-                        format!("Available models:\n{}", list.join("\n"))
-                    }
-                }
-                Err(e) => format!("Failed to list models: {}", e),
-            },
-            "/auto" => {
-                self.agent.clear_model_override().await;
-                "Auto-routing re-enabled. Model will be selected automatically based on query complexity.".to_string()
-            }
-            "/reload" => match AppConfig::load(&self.config_path) {
-                Ok(new_config) => match self.agent.reload_provider(&new_config).await {
-                    Ok(status) => format!("Config reloaded. {}", status),
-                    Err(e) => format!("Provider reload failed: {}", e),
-                },
-                Err(e) => {
-                    // Config is broken — try to auto-restore from backup
-                    let backup = self.config_path.with_extension("toml.bak");
-                    if backup.exists() {
-                        if tokio::fs::copy(&backup, &self.config_path).await.is_ok() {
-                            format!(
-                                "Config reload failed: {}\n\nAuto-restored from backup. Config is back to the previous working state.",
-                                e
-                            )
-                        } else {
-                            format!(
-                                "Config reload failed: {}\n\nBackup restore also failed. Manual intervention needed.",
-                                e
-                            )
-                        }
-                    } else {
-                        format!("Config reload failed: {}\n\nNo backup available.", e)
-                    }
-                }
-            },
             "/restart" => {
                 let _ = bot.send_message(msg.chat.id, "Restarting...").await;
                 info!("Restart requested via Telegram");
@@ -582,58 +717,17 @@ impl TelegramChannel {
                 // If exec fails, we're still alive
                 "Restart failed. You may need to restart manually.".to_string()
             }
-            "/tasks" => {
-                let session_id = self.session_id(msg.chat.id.0).await;
-                let entries = self.task_registry.list_for_session(&session_id).await;
-                if entries.is_empty() {
-                    "No tasks found.".to_string()
-                } else {
-                    let lines: Vec<String> = entries
-                        .iter()
-                        .map(|e| {
-                            let elapsed = match e.finished_at {
-                                Some(fin) => {
-                                    let d = fin - e.started_at;
-                                    format!("{}s", d.num_seconds())
-                                }
-                                None => {
-                                    let d = Utc::now() - e.started_at;
-                                    format!("{}s elapsed", d.num_seconds())
-                                }
-                            };
-                            format!("#{} [{}] {} ({})", e.id, e.status, e.description, elapsed)
-                        })
-                        .collect();
-                    lines.join("\n")
-                }
-            }
-            "/cancel" => {
-                if arg.is_empty() {
-                    "Usage: /cancel <task-id>\nExample: /cancel 1".to_string()
-                } else {
-                    match arg.parse::<u64>() {
-                        Ok(task_id) => {
-                            if self.task_registry.cancel(task_id).await {
-                                format!("Task #{} cancelled.", task_id)
-                            } else {
-                                format!("Task #{} not found or not running.", task_id)
-                            }
-                        }
-                        Err(_) => "Invalid task ID. Usage: /cancel <task-id>".to_string(),
-                    }
-                }
-            }
-            "/clear" => {
-                let session_id = self.session_id(msg.chat.id.0).await;
-                match self.agent.clear_session(&session_id).await {
-                    Ok(_) => "Context cleared. Starting fresh.".to_string(),
-                    Err(e) => format!("Failed to clear context: {}", e),
-                }
-            }
-            "/cost" => self.handle_cost_command().await,
             "/connect" => {
                 self.handle_connect_command(arg, msg.from.as_ref().map(|u| u.id.0).unwrap_or(0))
                     .await
+            }
+            "/setup" => {
+                self.handle_setup_command(
+                    arg,
+                    msg.from.as_ref().map(|u| u.id.0).unwrap_or(0),
+                    msg.chat.id.0,
+                )
+                .await
             }
             "/bots" => self.handle_bots_command().await,
             "/help" | "/start" => build_help_text(true, true, true, "/"),
@@ -709,395 +803,6 @@ impl TelegramChannel {
             .to_string()
     }
 
-    fn terminal_lite_help_text() -> String {
-        "Terminal lite mode (owner only, chat-based)\n\n\
-         Commands:\n\
-         /terminal lite start [working_dir]\n\
-         /terminal lite start <codex|claude|gemini|opencode> [working_dir]\n\
-         /terminal lite [working_dir]\n\
-         /terminal lite <codex|claude|gemini|opencode> [working_dir]\n\
-         /terminal lite status\n\
-         /terminal lite stop\n\n\
-         After start, every non-slash message in this chat is treated as a shell command.\n\
-         Built-ins: cd <path>, exit, quit\n\
-         Note: interactive agent TUIs (codex/claude/gemini/opencode) require full /terminal Mini App mode.\n\
-         Timeout: 90s per command."
-            .to_string()
-    }
-
-    fn normalize_terminal_agent_name(value: &str) -> Option<String> {
-        let v = value.trim().to_ascii_lowercase();
-        if SUPPORTED_TERMINAL_AGENTS.contains(&v.as_str()) {
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    fn normalize_terminal_agent_args(values: Vec<String>) -> Vec<String> {
-        values
-            .into_iter()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty() && !v.contains('\0'))
-            .map(|v| {
-                v.chars()
-                    .take(MAX_TERMINAL_AGENT_ARG_CHARS)
-                    .collect::<String>()
-            })
-            .take(MAX_TERMINAL_AGENT_ARGS)
-            .collect()
-    }
-
-    fn normalize_discovered_agent_flags(values: Vec<String>) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut seen = HashSet::new();
-        for value in values {
-            let cleaned = value.trim().to_string();
-            if cleaned.is_empty() || !cleaned.starts_with("--") || cleaned.contains('\0') {
-                continue;
-            }
-            let clipped = cleaned
-                .chars()
-                .take(MAX_DISCOVERED_AGENT_FLAG_CHARS)
-                .collect::<String>();
-            if seen.insert(clipped.clone()) {
-                out.push(clipped);
-            }
-            if out.len() >= MAX_DISCOVERED_AGENT_FLAGS {
-                break;
-            }
-        }
-        out
-    }
-
-    fn normalize_agent_flag_docs(values: Vec<AgentFlagDoc>) -> Vec<AgentFlagDoc> {
-        let mut out: Vec<AgentFlagDoc> = Vec::new();
-        let mut seen: HashMap<String, usize> = HashMap::new();
-
-        for value in values {
-            let normalized_flags = Self::normalize_discovered_agent_flags(vec![value.flag]);
-            let Some(flag) = normalized_flags.first().cloned() else {
-                continue;
-            };
-
-            let description = value
-                .description
-                .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
-                .map(|d| d.trim().to_string())
-                .filter(|d| !d.is_empty())
-                .map(|d| {
-                    d.chars()
-                        .take(MAX_DISCOVERED_AGENT_FLAG_DESC_CHARS)
-                        .collect::<String>()
-                });
-
-            if let Some(idx) = seen.get(&flag).copied() {
-                let existing = out.get_mut(idx).expect("index from seen must exist");
-                let replace = match (&existing.description, &description) {
-                    (None, Some(_)) => true,
-                    (Some(old), Some(new)) => new.len() > old.len(),
-                    _ => false,
-                };
-                if replace {
-                    existing.description = description;
-                }
-            } else {
-                seen.insert(flag.clone(), out.len());
-                out.push(AgentFlagDoc { flag, description });
-                if out.len() >= MAX_DISCOVERED_AGENT_FLAGS {
-                    break;
-                }
-            }
-        }
-
-        out
-    }
-
-    fn format_agent_flag_docs(agent: &str, docs: &[AgentFlagDoc], cached: bool) -> Vec<String> {
-        if docs.is_empty() {
-            return vec![format!(
-                "### No flags found for `{}`{}\nTry `/agent flags {} refresh`.",
-                agent,
-                if cached { " (cached)" } else { "" },
-                agent
-            )];
-        }
-
-        let page_size = AGENT_FLAGS_PAGE_SIZE.max(1);
-        let total = docs.len();
-        let total_pages = total.div_ceil(page_size);
-        let mut pages = Vec::new();
-
-        for (idx, chunk) in docs.chunks(page_size).enumerate() {
-            let mut lines = Vec::new();
-            lines.push(format!(
-                "### Flags for `{}`{}",
-                agent,
-                if cached { " (cached)" } else { "" }
-            ));
-            lines.push(format!("**{} total**", total));
-            if total_pages > 1 {
-                let start = idx * page_size + 1;
-                let end = start + chunk.len() - 1;
-                lines.push(format!(
-                    "**Showing {}-{} of {} (page {}/{})**",
-                    start,
-                    end,
-                    total,
-                    idx + 1,
-                    total_pages
-                ));
-            }
-            lines.push(String::new());
-
-            for doc in chunk {
-                lines.push(format!("- `{}`", doc.flag));
-                if let Some(desc) = doc.description.as_deref() {
-                    lines.push(format!("Description: {}", desc));
-                }
-                lines.push(String::new());
-            }
-
-            if idx + 1 == total_pages {
-                lines.push(
-                    "Set defaults with `/agent defaults set <agent> [flags...]`.".to_string(),
-                );
-                lines.push("Bypass once with `--no-default-flags`.".to_string());
-                lines.push("Refresh with `/agent flags <agent> refresh`.".to_string());
-            }
-
-            while lines.last().map(|line| line.is_empty()).unwrap_or(false) {
-                lines.pop();
-            }
-            pages.push(lines.join("\n"));
-        }
-
-        pages
-    }
-
-    fn strip_no_default_flag(agent_args: &mut Vec<String>) -> bool {
-        let before = agent_args.len();
-        agent_args.retain(|arg| arg != "--no-default-flags");
-        before != agent_args.len()
-    }
-
-    async fn terminal_agent_defaults_key(&self, chat_id: i64, user_id: u64) -> String {
-        let scope = self.session_namespace().await;
-        format!("telegram:agent_defaults:{}:{}:{}", scope, user_id, chat_id)
-    }
-
-    async fn load_terminal_agent_defaults(
-        &self,
-        chat_id: i64,
-        user_id: u64,
-    ) -> HashMap<String, Vec<String>> {
-        let key = self.terminal_agent_defaults_key(chat_id, user_id).await;
-        let raw = match self.state.get_setting(&key).await {
-            Ok(Some(v)) => v,
-            _ => return HashMap::new(),
-        };
-        let parsed: HashMap<String, Vec<String>> =
-            serde_json::from_str(&raw).unwrap_or_else(|_| HashMap::new());
-        let mut sanitized = HashMap::new();
-        for (agent, args) in parsed {
-            let Some(agent_name) = Self::normalize_terminal_agent_name(&agent) else {
-                continue;
-            };
-            let cleaned = Self::normalize_terminal_agent_args(args);
-            if cleaned.is_empty() {
-                continue;
-            }
-            sanitized.insert(agent_name, cleaned);
-        }
-        sanitized
-    }
-
-    async fn save_terminal_agent_defaults(
-        &self,
-        chat_id: i64,
-        user_id: u64,
-        defaults: &HashMap<String, Vec<String>>,
-    ) -> anyhow::Result<()> {
-        let key = self.terminal_agent_defaults_key(chat_id, user_id).await;
-        let serialized = serde_json::to_string(defaults)?;
-        self.state.set_setting(&key, &serialized).await
-    }
-
-    async fn agent_flags_cache_key(&self, user_id: u64, agent: &str) -> String {
-        let scope = self.session_namespace().await;
-        format!(
-            "telegram:agent_flags_cache:{}:{}:{}",
-            scope,
-            user_id,
-            agent.to_ascii_lowercase()
-        )
-    }
-
-    async fn load_agent_flags_cache(
-        &self,
-        user_id: u64,
-        agent: &str,
-    ) -> Option<AgentFlagsCacheEntry> {
-        let key = self.agent_flags_cache_key(user_id, agent).await;
-        let raw = self.state.get_setting(&key).await.ok().flatten()?;
-        let mut parsed: AgentFlagsCacheEntry = serde_json::from_str(&raw).ok()?;
-        let mut docs = Self::normalize_agent_flag_docs(parsed.docs.clone());
-        if docs.is_empty() && !parsed.flags.is_empty() {
-            docs = Self::normalize_discovered_agent_flags(parsed.flags.clone())
-                .into_iter()
-                .map(|flag| AgentFlagDoc {
-                    flag,
-                    description: None,
-                })
-                .collect();
-        }
-        if docs.is_empty() {
-            return None;
-        }
-        parsed.docs = docs.clone();
-        parsed.flags = docs.iter().map(|d| d.flag.clone()).collect();
-        Some(parsed)
-    }
-
-    async fn save_agent_flags_cache(
-        &self,
-        user_id: u64,
-        agent: &str,
-        docs: &[AgentFlagDoc],
-    ) -> anyhow::Result<()> {
-        let key = self.agent_flags_cache_key(user_id, agent).await;
-        let normalized_docs = Self::normalize_agent_flag_docs(docs.to_vec());
-        let payload = AgentFlagsCacheEntry {
-            updated_at_unix: chrono::Utc::now().timestamp(),
-            flags: normalized_docs.iter().map(|d| d.flag.clone()).collect(),
-            docs: normalized_docs,
-        };
-        let serialized = serde_json::to_string(&payload)?;
-        self.state.set_setting(&key, &serialized).await
-    }
-
-    fn extract_long_flags_from_help(help_text: &str) -> Vec<String> {
-        static LONG_FLAG_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"--[a-zA-Z0-9][a-zA-Z0-9\-]*").expect("valid long flag regex")
-        });
-        let mut out = Vec::new();
-        let mut seen = HashSet::new();
-        for cap in LONG_FLAG_RE.find_iter(help_text) {
-            let flag = cap.as_str().to_string();
-            if seen.insert(flag.clone()) {
-                out.push(flag);
-            }
-        }
-        out
-    }
-
-    fn extract_flag_docs_from_help(help_text: &str) -> Vec<AgentFlagDoc> {
-        static LONG_FLAG_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"--[a-zA-Z0-9][a-zA-Z0-9\-]*").expect("valid long flag regex")
-        });
-        let mut docs = Vec::new();
-        for raw_line in help_text.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let matches = LONG_FLAG_RE.find_iter(line).collect::<Vec<_>>();
-            if matches.is_empty() {
-                continue;
-            }
-            let first_end = matches[0].end();
-            let desc_raw = line
-                .get(first_end..)
-                .unwrap_or("")
-                .trim()
-                .trim_start_matches([':', ';', ',', '|', '-', ' ']);
-            let description = if desc_raw.is_empty() {
-                None
-            } else {
-                Some(desc_raw.to_string())
-            };
-            for m in matches {
-                docs.push(AgentFlagDoc {
-                    flag: m.as_str().to_string(),
-                    description: description.clone(),
-                });
-            }
-        }
-        Self::normalize_agent_flag_docs(docs)
-    }
-
-    async fn discover_agent_flags(agent: &str) -> anyhow::Result<Vec<AgentFlagDoc>> {
-        let run_help_cmd = |help_arg: &str| {
-            let mut cmd = Command::new(agent);
-            cmd.arg(help_arg);
-            cmd.stdin(Stdio::null());
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-            cmd.kill_on_drop(true);
-            cmd.env_remove("CLAUDECODE");
-            cmd.env_remove("CLAUDE_CODE");
-            cmd
-        };
-
-        let output =
-            match tokio::time::timeout(Duration::from_secs(10), run_help_cmd("--help").output())
-                .await
-            {
-                Ok(Ok(v)) => v,
-                Ok(Err(err)) => {
-                    if err.kind() == std::io::ErrorKind::NotFound {
-                        anyhow::bail!(
-                            "`{}` is not installed or not in PATH on this machine.",
-                            agent
-                        );
-                    }
-                    match tokio::time::timeout(Duration::from_secs(10), run_help_cmd("-h").output())
-                        .await
-                    {
-                        Ok(Ok(v)) => v,
-                        Ok(Err(second_err)) => {
-                            anyhow::bail!("Failed to run `{}` help: {}", agent, second_err)
-                        }
-                        Err(_) => {
-                            anyhow::bail!("`{} -h` timed out while fetching help output.", agent)
-                        }
-                    }
-                }
-                Err(_) => anyhow::bail!("`{} --help` timed out while fetching help output.", agent),
-            };
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = if stdout.is_empty() {
-            stderr.clone()
-        } else if stderr.is_empty() {
-            stdout.clone()
-        } else {
-            format!("{}\n{}", stdout, stderr)
-        };
-
-        let flags = Self::extract_long_flags_from_help(&combined);
-        if flags.is_empty() {
-            anyhow::bail!(
-                "No long-form flags were detected in `{}` help output. Try running `{}` manually.",
-                agent,
-                agent
-            );
-        }
-        let docs = Self::extract_flag_docs_from_help(&combined);
-        if docs.is_empty() {
-            let fallback = Self::normalize_discovered_agent_flags(flags)
-                .into_iter()
-                .map(|flag| AgentFlagDoc {
-                    flag,
-                    description: None,
-                })
-                .collect::<Vec<_>>();
-            return Ok(fallback);
-        }
-        Ok(docs)
-    }
-
     async fn handle_agent_flags_command(
         &self,
         args: Vec<String>,
@@ -1129,7 +834,7 @@ impl TelegramChannel {
             (args[0].clone(), refresh)
         };
 
-        let Some(agent) = Self::normalize_terminal_agent_name(&agent_raw) else {
+        let Some(agent) = cli_agent_flags::normalize_terminal_agent_name(&agent_raw) else {
             let _ = bot
                 .send_message(
                     msg.chat.id,
@@ -1139,11 +844,15 @@ impl TelegramChannel {
             return;
         };
 
+        let namespace = self.session_namespace().await;
         if !refresh {
-            if let Some(cached) = self.load_agent_flags_cache(user_id, &agent).await {
+            if let Some(cached) =
+                cli_agent_flags::load_agent_flags_cache(&*self.state, &namespace, user_id, &agent)
+                    .await
+            {
                 let age = chrono::Utc::now().timestamp() - cached.updated_at_unix;
                 if (0..=AGENT_FLAGS_CACHE_TTL_SECS).contains(&age) {
-                    let pages = Self::format_agent_flag_docs(&agent, &cached.docs, true);
+                    let pages = cli_agent_flags::format_agent_flag_docs(&agent, &cached.docs, true);
                     for page in pages {
                         send_markdown_chunks_or_fallback(bot, msg.chat.id, &page).await;
                     }
@@ -1156,10 +865,17 @@ impl TelegramChannel {
             .send_message(msg.chat.id, format!("Discovering flags for {}...", agent))
             .await;
 
-        match Self::discover_agent_flags(&agent).await {
+        match cli_agent_flags::discover_agent_flags(&agent).await {
             Ok(docs) => {
-                let _ = self.save_agent_flags_cache(user_id, &agent, &docs).await;
-                let pages = Self::format_agent_flag_docs(&agent, &docs, false);
+                let _ = cli_agent_flags::save_agent_flags_cache(
+                    &*self.state,
+                    &namespace,
+                    user_id,
+                    &agent,
+                    &docs,
+                )
+                .await;
+                let pages = cli_agent_flags::format_agent_flag_docs(&agent, &docs, false);
                 for page in pages {
                     send_markdown_chunks_or_fallback(bot, msg.chat.id, &page).await;
                 }
@@ -1201,7 +917,7 @@ impl TelegramChannel {
                     .await;
                 return;
             };
-            let Some(agent) = Self::normalize_terminal_agent_name(agent_raw) else {
+            let Some(agent) = cli_agent_flags::normalize_terminal_agent_name(agent_raw) else {
                 let _ = bot
                     .send_message(
                         msg.chat.id,
@@ -1210,8 +926,11 @@ impl TelegramChannel {
                     .await;
                 return;
             };
-            let cleaned =
-                Self::normalize_terminal_agent_args(args.into_iter().skip(1).collect::<Vec<_>>());
+            let cleaned = cli_agent_flags::normalize_terminal_agent_args(
+                args.into_iter().skip(1).collect::<Vec<_>>(),
+            );
+            let (cleaned, rewrote_permission_flag) =
+                crate::normalize_terminal_agent_permission_aliases(Some(agent.as_str()), cleaned);
             if cleaned.is_empty() {
                 let _ = bot
                     .send_message(
@@ -1221,25 +940,39 @@ impl TelegramChannel {
                     .await;
                 return;
             }
-            let mut defaults = self
-                .load_terminal_agent_defaults(msg.chat.id.0, user_id)
-                .await;
+            let namespace = self.session_namespace().await;
+            let mut defaults = cli_agent_flags::load_terminal_agent_defaults(
+                &*self.state,
+                &namespace,
+                msg.chat.id.0,
+                user_id,
+            )
+            .await;
             defaults.insert(agent.clone(), cleaned.clone());
-            match self
-                .save_terminal_agent_defaults(msg.chat.id.0, user_id, &defaults)
-                .await
+            match cli_agent_flags::save_terminal_agent_defaults(
+                &*self.state,
+                &namespace,
+                msg.chat.id.0,
+                user_id,
+                &defaults,
+            )
+            .await
             {
                 Ok(_) => {
-                    let _ = bot
-                        .send_message(
-                            msg.chat.id,
-                            format!(
-                                "Saved default flags for {}:\n`{}`",
-                                agent,
-                                cleaned.join(" ")
-                            ),
+                    let saved_message = if rewrote_permission_flag {
+                        format!(
+                            "Saved default flags for {}:\n`{}`\n\nNormalized `--allow-dangerously-skip-permissions` to `--dangerously-skip-permissions` for Claude.",
+                            agent,
+                            cleaned.join(" ")
                         )
-                        .await;
+                    } else {
+                        format!(
+                            "Saved default flags for {}:\n`{}`",
+                            agent,
+                            cleaned.join(" ")
+                        )
+                    };
+                    let _ = bot.send_message(msg.chat.id, saved_message).await;
                 }
                 Err(err) => {
                     warn!(error = %err, "Failed to save /agent defaults");
@@ -1252,9 +985,14 @@ impl TelegramChannel {
         }
 
         if subcommand == "clear" {
-            let mut defaults = self
-                .load_terminal_agent_defaults(msg.chat.id.0, user_id)
-                .await;
+            let namespace = self.session_namespace().await;
+            let mut defaults = cli_agent_flags::load_terminal_agent_defaults(
+                &*self.state,
+                &namespace,
+                msg.chat.id.0,
+                user_id,
+            )
+            .await;
             if defaults.is_empty() {
                 let _ = bot.send_message(msg.chat.id, "No saved defaults.").await;
                 return;
@@ -1266,10 +1004,15 @@ impl TelegramChannel {
                 .unwrap_or_else(|| "all".to_string());
             if target == "all" {
                 defaults.clear();
-                if self
-                    .save_terminal_agent_defaults(msg.chat.id.0, user_id, &defaults)
-                    .await
-                    .is_ok()
+                if cli_agent_flags::save_terminal_agent_defaults(
+                    &*self.state,
+                    &namespace,
+                    msg.chat.id.0,
+                    user_id,
+                    &defaults,
+                )
+                .await
+                .is_ok()
                 {
                     let _ = bot
                         .send_message(msg.chat.id, "Cleared all agent defaults.")
@@ -1282,7 +1025,7 @@ impl TelegramChannel {
                 return;
             }
 
-            let Some(agent) = Self::normalize_terminal_agent_name(&target) else {
+            let Some(agent) = cli_agent_flags::normalize_terminal_agent_name(&target) else {
                 let _ = bot
                     .send_message(
                         msg.chat.id,
@@ -1297,10 +1040,15 @@ impl TelegramChannel {
                     .await;
                 return;
             }
-            if self
-                .save_terminal_agent_defaults(msg.chat.id.0, user_id, &defaults)
-                .await
-                .is_ok()
+            if cli_agent_flags::save_terminal_agent_defaults(
+                &*self.state,
+                &namespace,
+                msg.chat.id.0,
+                user_id,
+                &defaults,
+            )
+            .await
+            .is_ok()
             {
                 let _ = bot
                     .send_message(msg.chat.id, format!("Cleared defaults for {}.", agent))
@@ -1313,9 +1061,14 @@ impl TelegramChannel {
             return;
         }
 
-        let defaults = self
-            .load_terminal_agent_defaults(msg.chat.id.0, user_id)
-            .await;
+        let namespace = self.session_namespace().await;
+        let defaults = cli_agent_flags::load_terminal_agent_defaults(
+            &*self.state,
+            &namespace,
+            msg.chat.id.0,
+            user_id,
+        )
+        .await;
         if defaults.is_empty() {
             let _ = bot
                 .send_message(
@@ -1335,305 +1088,18 @@ impl TelegramChannel {
         let _ = bot.send_message(msg.chat.id, lines.join("\n")).await;
     }
 
-    fn is_terminal_lite_interactive_agent_command(text: &str) -> Option<String> {
-        let parts = shell_words::split(text).unwrap_or_else(|_| {
-            text.split_whitespace()
-                .map(std::string::ToString::to_string)
-                .collect()
-        });
-        parts
-            .first()
-            .and_then(|v| Self::normalize_terminal_agent_name(v))
-    }
-
-    fn default_terminal_lite_shell(&self) -> String {
-        std::env::var("SHELL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "/bin/bash".to_string())
-    }
-
-    fn is_shell_env_assignment(token: &str) -> bool {
-        let Some((name, _)) = token.split_once('=') else {
-            return false;
-        };
-        if name.is_empty() {
-            return false;
-        }
-        for (idx, ch) in name.chars().enumerate() {
-            let is_valid = if idx == 0 {
-                ch.is_ascii_alphabetic() || ch == '_'
-            } else {
-                ch.is_ascii_alphanumeric() || ch == '_'
-            };
-            if !is_valid {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn extract_terminal_lite_command_name(text: &str) -> Option<String> {
-        let parts = shell_words::split(text).unwrap_or_else(|_| {
-            text.split_whitespace()
-                .map(std::string::ToString::to_string)
-                .collect()
-        });
-        for token in parts {
-            let trimmed = token.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if Self::is_shell_env_assignment(trimmed) {
-                continue;
-            }
-            return Some(trimmed.to_string());
-        }
-        None
-    }
-
-    fn contains_shell_control_operators(text: &str) -> bool {
-        let mut chars = text.chars().peekable();
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut escaped = false;
-
-        while let Some(ch) = chars.next() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-
-            if ch == '\\' && !in_single {
-                escaped = true;
-                continue;
-            }
-
-            if ch == '\'' && !in_double {
-                in_single = !in_single;
-                continue;
-            }
-
-            if ch == '"' && !in_single {
-                in_double = !in_double;
-                continue;
-            }
-
-            // Command substitution works inside double quotes, so block it
-            // unless we're inside single quotes.
-            if ch == '$' && !in_single && matches!(chars.peek(), Some('(')) {
-                return true;
-            }
-            if ch == '`' && !in_single {
-                return true;
-            }
-
-            if in_single || in_double {
-                continue;
-            }
-
-            if matches!(ch, ';' | '|' | '&' | '>' | '<' | '\n' | '\r') {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    fn validate_terminal_lite_command(&self, text: &str) -> Result<(), String> {
-        if self.terminal_allowed_prefixes.contains("*") {
-            return Ok(());
-        }
-        if self.terminal_allowed_prefixes.is_empty() {
-            return Err(
-                "Terminal lite is disabled because `[terminal].allowed_prefixes` is empty."
-                    .to_string(),
-            );
-        }
-
-        let raw = Self::extract_terminal_lite_command_name(text)
-            .ok_or_else(|| "Could not determine command name.".to_string())?;
-        let command_name = Path::new(&raw)
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or(raw.as_str())
-            .trim()
-            .to_ascii_lowercase();
-
-        if command_name.is_empty() {
-            return Err("Could not determine command name.".to_string());
-        }
-        if Self::contains_shell_control_operators(text) {
-            return Err(
-                "Shell operators are not allowed in `/terminal lite` commands (use `/terminal` full mode)."
-                    .to_string(),
-            );
-        }
-        if self.terminal_allowed_prefixes.contains(&command_name) {
-            return Ok(());
-        }
-
-        let mut allowed = self
-            .terminal_allowed_prefixes
-            .iter()
-            .filter(|value| value.as_str() != "*")
-            .cloned()
-            .collect::<Vec<_>>();
-        allowed.sort();
-        Err(format!(
-            "Command `{}` is not allowed in `/terminal lite`.\nAllowed commands: {}",
-            command_name,
-            allowed.join(", ")
-        ))
-    }
-
-    fn resolve_terminal_lite_cwd(raw: Option<&str>) -> anyhow::Result<PathBuf> {
-        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::resolve_terminal_lite_cwd_from_base(&base, raw.unwrap_or("").trim())
-    }
-
-    fn resolve_terminal_lite_cwd_from_base(base: &Path, raw: &str) -> anyhow::Result<PathBuf> {
-        let resolved = if raw.is_empty() || raw == "~" {
-            dirs::home_dir().unwrap_or_else(|| base.to_path_buf())
-        } else if let Some(rest) = raw.strip_prefix("~/") {
-            dirs::home_dir()
-                .map(|home| home.join(rest))
-                .unwrap_or_else(|| base.join(rest))
-        } else {
-            let p = PathBuf::from(raw);
-            if p.is_absolute() {
-                p
-            } else {
-                base.join(p)
-            }
-        };
-        let canonical = resolved
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("invalid working dir '{}': {}", resolved.display(), e))?;
-        if !canonical.is_dir() {
-            anyhow::bail!("'{}' is not a directory", canonical.display());
-        }
-        Ok(canonical)
-    }
-
     async fn handle_terminal_lite_command(
         &self,
-        mut args: Vec<String>,
+        args: Vec<String>,
         msg: &teloxide::types::Message,
         bot: &Bot,
         user_id: u64,
     ) {
-        let subcommand = args
-            .first()
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_else(|| "start".to_string());
-
-        if subcommand == "help" {
-            let _ = bot
-                .send_message(msg.chat.id, Self::terminal_lite_help_text())
-                .await;
-            return;
-        }
-
-        if subcommand == "status" {
-            let sessions = self.terminal_lite_sessions.lock().await;
-            if let Some(session) = sessions.get(&msg.chat.id.0) {
-                let elapsed = session.started_at.elapsed().as_secs();
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!(
-                            "Terminal lite is active.\nOwner: {}\nWorking dir: {}\nShell: {}\nPreferred agent: {}\nBusy: {}\nUptime: {}s",
-                            session.owner_user_id,
-                            session.cwd.display(),
-                            session.shell,
-                            session.preferred_agent.as_deref().unwrap_or("none"),
-                            if session.busy { "yes" } else { "no" },
-                            elapsed
-                        ),
-                    )
-                    .await;
-            } else {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        "Terminal lite is not active. Start with `/terminal lite start`.",
-                    )
-                    .await;
-            }
-            return;
-        }
-
-        if subcommand == "stop" {
-            let mut sessions = self.terminal_lite_sessions.lock().await;
-            if sessions.remove(&msg.chat.id.0).is_some() {
-                let _ = bot
-                    .send_message(msg.chat.id, "Terminal lite stopped for this chat.")
-                    .await;
-            } else {
-                let _ = bot
-                    .send_message(msg.chat.id, "Terminal lite is not active.")
-                    .await;
-            }
-            return;
-        }
-
-        if subcommand == "start" {
-            args.remove(0);
-        }
-
-        let preferred_agent = args
-            .first()
-            .and_then(|value| Self::normalize_terminal_agent_name(value));
-        if preferred_agent.is_some() && !args.is_empty() {
-            args.remove(0);
-        }
-
-        let cwd_arg = if args.is_empty() {
-            None
-        } else {
-            Some(args.join(" "))
-        };
-        let cwd = match Self::resolve_terminal_lite_cwd(cwd_arg.as_deref()) {
-            Ok(v) => v,
-            Err(err) => {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!("Failed to start terminal lite: {}", err),
-                    )
-                    .await;
-                return;
-            }
-        };
-
-        let shell = self.default_terminal_lite_shell();
-        let session = TerminalLiteSession {
-            owner_user_id: user_id,
-            cwd: cwd.clone(),
-            shell: shell.clone(),
-            preferred_agent: preferred_agent.clone(),
-            started_at: Instant::now(),
-            busy: false,
-        };
-
-        {
-            let mut sessions = self.terminal_lite_sessions.lock().await;
-            sessions.insert(msg.chat.id.0, session);
-        }
-
-        let _ = bot
-            .send_message(
-                msg.chat.id,
-                format!(
-                    "Terminal lite started.\nWorking dir: {}\nShell: {}\nPreferred agent: {}\n\nSend commands as chat messages.\nUse `/terminal lite stop` to stop.",
-                    cwd.display(),
-                    shell,
-                    preferred_agent.as_deref().unwrap_or("none")
-                ),
-            )
+        let reply = self
+            .terminal_lite
+            .start_session(msg.chat.id.0, user_id, args)
             .await;
+        let _ = bot.send_message(msg.chat.id, reply).await;
     }
 
     async fn handle_terminal_lite_input(
@@ -1643,157 +1109,9 @@ impl TelegramChannel {
         user_role: UserRole,
         text: &str,
     ) -> Option<String> {
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let mut sessions = self.terminal_lite_sessions.lock().await;
-        let session = sessions.get_mut(&chat_id)?;
-
-        if user_role != UserRole::Owner || session.owner_user_id != user_id {
-            return Some("Only the owner can use terminal lite in this chat.".to_string());
-        }
-
-        if session.busy {
-            return Some(
-                "Terminal lite is busy with the previous command. Wait or run `/terminal lite stop`."
-                    .to_string(),
-            );
-        }
-
-        if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
-            sessions.remove(&chat_id);
-            return Some("Terminal lite stopped.".to_string());
-        }
-
-        if let Some(reply) = Self::terminal_lite_try_handle_cd(session, trimmed) {
-            return Some(reply);
-        }
-
-        if let Some(agent) = Self::is_terminal_lite_interactive_agent_command(trimmed) {
-            return Some(format!(
-                    "`{}` is an interactive TUI and is not supported in `/terminal lite`.\nUse full mode instead: `/terminal {} {}`",
-                agent,
-                agent,
-                session.cwd.display()
-            ));
-        }
-
-        if let Err(err) = self.validate_terminal_lite_command(trimmed) {
-            return Some(err);
-        }
-
-        let snapshot = session.clone();
-        session.busy = true;
-        drop(sessions);
-
-        let reply = Self::run_terminal_lite_command(&snapshot, trimmed).await;
-
-        let mut sessions = self.terminal_lite_sessions.lock().await;
-        if let Some(active) = sessions.get_mut(&chat_id) {
-            active.busy = false;
-        }
-        Some(reply)
-    }
-
-    fn terminal_lite_try_handle_cd(
-        session: &mut TerminalLiteSession,
-        text: &str,
-    ) -> Option<String> {
-        let parts = shell_words::split(text).unwrap_or_else(|_| {
-            text.split_whitespace()
-                .map(std::string::ToString::to_string)
-                .collect()
-        });
-        if parts.is_empty() || parts[0] != "cd" {
-            return None;
-        }
-        let target = if parts.len() <= 1 {
-            "~".to_string()
-        } else {
-            parts[1].clone()
-        };
-        match Self::resolve_terminal_lite_cwd_from_base(&session.cwd, target.trim()) {
-            Ok(path) => {
-                session.cwd = path.clone();
-                Some(format!("cwd -> {}", path.display()))
-            }
-            Err(err) => Some(format!("cd: {}", err)),
-        }
-    }
-
-    async fn run_terminal_lite_command(
-        session: &TerminalLiteSession,
-        command_text: &str,
-    ) -> String {
-        let mut cmd = Command::new(&session.shell);
-        if cfg!(windows) {
-            cmd.arg("-NoLogo").arg("-Command").arg(command_text);
-        } else {
-            cmd.arg("-lc").arg(command_text);
-        }
-        cmd.current_dir(&session.cwd);
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
-        cmd.env_remove("CLAUDECODE");
-        cmd.env_remove("CLAUDE_CODE");
-        if !cfg!(windows) {
-            cmd.env("TERM", "xterm-256color");
-        }
-
-        let output = match tokio::time::timeout(
-            Duration::from_secs(TERMINAL_LITE_TIMEOUT_SECS),
-            cmd.output(),
-        )
-        .await
-        {
-            Ok(Ok(v)) => v,
-            Ok(Err(err)) => {
-                return format!("Failed to run command: {}", err);
-            }
-            Err(_) => {
-                return format!(
-                    "⏱️ Command timed out after {}s: {}",
-                    TERMINAL_LITE_TIMEOUT_SECS, command_text
-                );
-            }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let mut body = String::new();
-        body.push_str("$ ");
-        body.push_str(command_text);
-        body.push_str("\n\n");
-
-        if stdout.trim().is_empty() && stderr.trim().is_empty() {
-            body.push_str("(no output)\n");
-        } else {
-            if !stdout.is_empty() {
-                body.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !stdout.ends_with('\n') && !stdout.is_empty() {
-                    body.push('\n');
-                }
-                body.push_str(&stderr);
-            }
-        }
-
-        if body.chars().count() > TERMINAL_LITE_MAX_OUTPUT_CHARS {
-            let clipped: String = body.chars().take(TERMINAL_LITE_MAX_OUTPUT_CHARS).collect();
-            body = format!(
-                "{}\n\n[output truncated to {} chars]",
-                clipped, TERMINAL_LITE_MAX_OUTPUT_CHARS
-            );
-        }
-
-        let exit_code = output.status.code().unwrap_or(-1);
-        body.push_str(&format!("\n[exit {}]", exit_code));
-        body
+        self.terminal_lite
+            .handle_input(chat_id, user_id, user_role, text)
+            .await
     }
 
     async fn handle_terminal_command(
@@ -1944,6 +1262,7 @@ impl TelegramChannel {
         let mut agent: Option<String> = None;
         let mut cwd_parts: Vec<String> = Vec::new();
         let mut agent_args: Vec<String> = Vec::new();
+        let mut rewrote_permission_flag = false;
         let mut had_explicit_arg_delimiter = false;
         let mut used_saved_args = false;
         let mut saved_args_updated = false;
@@ -2031,30 +1350,55 @@ impl TelegramChannel {
             // Flags imply a terminal launch context; default agent to codex.
             agent = Some(DEFAULT_TERMINAL_AGENT.to_string());
         }
-        agent_args = Self::normalize_terminal_agent_args(agent_args);
-        let skip_saved_defaults = Self::strip_no_default_flag(&mut agent_args);
+        agent_args = cli_agent_flags::normalize_terminal_agent_args(agent_args);
+        let skip_saved_defaults = cli_agent_flags::strip_no_default_flag(&mut agent_args);
+        let (normalized_agent_args, rewrote) =
+            crate::normalize_terminal_agent_permission_aliases(agent.as_deref(), agent_args);
+        agent_args = normalized_agent_args;
+        rewrote_permission_flag |= rewrote;
 
+        let namespace = self.session_namespace().await;
         if invoked_cmd == "/agent" && agent_args.is_empty() && !skip_saved_defaults {
             if let Some(agent_name) = agent.as_deref() {
-                let defaults = self
-                    .load_terminal_agent_defaults(msg.chat.id.0, user_id)
-                    .await;
+                let defaults = cli_agent_flags::load_terminal_agent_defaults(
+                    &*self.state,
+                    &namespace,
+                    msg.chat.id.0,
+                    user_id,
+                )
+                .await;
                 if let Some(saved) = defaults.get(agent_name) {
-                    agent_args = Self::normalize_terminal_agent_args(saved.clone());
+                    agent_args = cli_agent_flags::normalize_terminal_agent_args(saved.clone());
+                    let (normalized_agent_args, rewrote) =
+                        crate::normalize_terminal_agent_permission_aliases(
+                            agent.as_deref(),
+                            agent_args,
+                        );
+                    agent_args = normalized_agent_args;
+                    rewrote_permission_flag |= rewrote;
                     used_saved_args = !agent_args.is_empty();
                 }
             }
         } else if invoked_cmd == "/agent" && !agent_args.is_empty() {
             if let Some(agent_name) = agent.as_deref() {
-                let mut defaults = self
-                    .load_terminal_agent_defaults(msg.chat.id.0, user_id)
-                    .await;
+                let mut defaults = cli_agent_flags::load_terminal_agent_defaults(
+                    &*self.state,
+                    &namespace,
+                    msg.chat.id.0,
+                    user_id,
+                )
+                .await;
                 let changed = defaults.get(agent_name) != Some(&agent_args);
                 if changed {
                     defaults.insert(agent_name.to_string(), agent_args.clone());
-                    if let Err(err) = self
-                        .save_terminal_agent_defaults(msg.chat.id.0, user_id, &defaults)
-                        .await
+                    if let Err(err) = cli_agent_flags::save_terminal_agent_defaults(
+                        &*self.state,
+                        &namespace,
+                        msg.chat.id.0,
+                        user_id,
+                        &defaults,
+                    )
+                    .await
                     {
                         warn!(error = %err, "Failed to persist /agent default flags");
                     } else {
@@ -2169,6 +1513,12 @@ impl TelegramChannel {
                 );
             } else if saved_args_updated {
                 summary_lines.push("Saved as new defaults for this chat and agent.".to_string());
+            }
+            if rewrote_permission_flag {
+                summary_lines.push(
+                    "Normalized <code>--allow-dangerously-skip-permissions</code> to <code>--dangerously-skip-permissions</code> for Claude."
+                        .to_string(),
+                );
             }
         }
         summary_lines.push(String::new());
@@ -2393,60 +1743,6 @@ impl TelegramChannel {
         Ok(context)
     }
 
-    async fn handle_cost_command(&self) -> String {
-        use std::collections::HashMap as StdHashMap;
-
-        let now = Utc::now();
-        let since_24h = (now - chrono::Duration::hours(24))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        let since_7d = (now - chrono::Duration::days(7))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-
-        let records_24h = match self.state.get_token_usage_since(&since_24h).await {
-            Ok(r) => r,
-            Err(e) => return format!("Failed to query token usage: {}", e),
-        };
-        let records_7d = match self.state.get_token_usage_since(&since_7d).await {
-            Ok(r) => r,
-            Err(e) => return format!("Failed to query token usage: {}", e),
-        };
-
-        let (input_24h, output_24h) = records_24h.iter().fold((0i64, 0i64), |(i, o), r| {
-            (i + r.input_tokens, o + r.output_tokens)
-        });
-        let (input_7d, output_7d) = records_7d.iter().fold((0i64, 0i64), |(i, o), r| {
-            (i + r.input_tokens, o + r.output_tokens)
-        });
-
-        // Top models (by total tokens in 7d)
-        let mut model_totals: StdHashMap<&str, i64> = StdHashMap::new();
-        for r in &records_7d {
-            *model_totals.entry(&r.model).or_insert(0) += r.input_tokens + r.output_tokens;
-        }
-        let mut models_sorted: Vec<(&&str, &i64)> = model_totals.iter().collect();
-        models_sorted.sort_by(|a, b| b.1.cmp(a.1));
-
-        let mut reply = format!(
-            "Token usage (last 24h):\n  Input:  {} tokens\n  Output: {} tokens\n\n\
-             Token usage (last 7d):\n  Input:  {} tokens\n  Output: {} tokens",
-            format_number(input_24h),
-            format_number(output_24h),
-            format_number(input_7d),
-            format_number(output_7d),
-        );
-
-        if !models_sorted.is_empty() {
-            reply.push_str("\n\nTop models (7d):");
-            for (model, total) in models_sorted.iter().take(5) {
-                reply.push_str(&format!("\n  {}: {} tokens", model, format_number(**total)));
-            }
-        }
-
-        reply
-    }
-
     /// Auto-send file attachments referenced as absolute paths in a reply.
     async fn send_referenced_files_from_reply(
         bot: &Bot,
@@ -2546,6 +1842,1146 @@ impl TelegramChannel {
         }
     }
 
+    /// Handle /setup command for owner-only operational setup workflows.
+    /// Usage:
+    ///   /setup lowlatency status
+    ///   /setup lowlatency reauth
+    ///   /setup lowlatency plan <base-domain>
+    ///   /setup lowlatency apply <base-domain>
+    async fn handle_setup_command(&self, arg: &str, user_id: u64, chat_id: i64) -> String {
+        if determine_role(&self.owner_user_ids, user_id) != UserRole::Owner {
+            return "Only the owner can run /setup commands.".to_string();
+        }
+
+        let usage = "Setup commands (owner only)\n\n\
+            Usage:\n\
+            /setup lowlatency status\n\
+            /setup lowlatency reauth\n\
+            /setup lowlatency plan <base-domain>\n\
+            /setup lowlatency apply <base-domain>\n\n\
+            Examples:\n\
+            /setup lowlatency status\n\
+            /setup lowlatency reauth\n\
+            /setup lowlatency plan bots.example.com\n\
+            /setup lowlatency apply bots.example.com\n\n\
+            Notes:\n\
+            - `plan` is dry-run only (no config changes).\n\
+            - `apply` updates local webhook config for all Telegram bots and keeps polling fallback enabled.\n\
+            - If `cloudflared` or `wrangler` are missing, `apply` can ask to install them.\n\
+            - If `cloudflared` or `wrangler` are not authenticated, `apply` can ask to run login flows.\n\
+            - `apply` verifies your `cloudflared` zone context before DNS routing.\n\
+            - `reauth` runs `cloudflared tunnel login` to refresh zone/account selection.\n\
+            - `apply` asks for approval before running Cloudflare tunnel/DNS commands.\n\
+            - When approved and provisioning succeeds, `apply` starts the tunnel and runs `/restart` automatically.\n\
+            - If denied, the command returns manual next steps."
+            .to_string();
+
+        let mut parts: Vec<&str> = arg.split_whitespace().collect();
+        if parts.is_empty() {
+            return usage;
+        }
+
+        if matches!(
+            parts.first().map(|v| v.to_ascii_lowercase()),
+            Some(value) if value == "lowlatency" || value == "low-latency" || value == "telegram-webhook"
+        ) {
+            let _ = parts.remove(0);
+        }
+        if parts.is_empty() {
+            return usage;
+        }
+
+        let action = parts[0].to_ascii_lowercase();
+        let config_path = self.config_path.clone();
+
+        match action.as_str() {
+            "status" => match tokio::task::spawn_blocking({
+                let config_path = config_path.clone();
+                move || crate::wizard::low_latency_status_summary(&config_path)
+            })
+            .await
+            {
+                Ok(Ok(text)) => text,
+                Ok(Err(err)) => format!("Setup status failed: {}", err),
+                Err(err) => format!("Setup status task failed: {}", err),
+            },
+            "reauth" => {
+                if !crate::wizard::command_exists("cloudflared").await {
+                    return "Cloudflared is not installed.\nInstall it first (for example `brew install cloudflared`), then rerun `/setup lowlatency reauth`.".to_string();
+                }
+                let session_id = self.session_id(chat_id).await;
+                let login_spec = crate::wizard::SetupCommandSpec {
+                    program: "cloudflared".to_string(),
+                    args: vec!["tunnel".to_string(), "login".to_string()],
+                };
+                let login_approval_text = format!(
+                    "Run cloudflared re-authentication now?\n\n{}",
+                    crate::wizard::format_setup_command(&login_spec)
+                );
+                let login_warnings = vec![
+                    "This opens a one-time Cloudflare authorization flow.".to_string(),
+                    "Use this when DNS routing is targeting the wrong zone/account.".to_string(),
+                ];
+                let login_approval = match self
+                    .request_approval(
+                        &session_id,
+                        &login_approval_text,
+                        RiskLevel::High,
+                        &login_warnings,
+                        PermissionMode::Cautious,
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return format!(
+                            "Could not request approval for cloudflared re-authentication: {}\nRun `cloudflared tunnel login` manually if needed.",
+                            err
+                        )
+                    }
+                };
+                if matches!(login_approval, ApprovalResponse::Deny) {
+                    return "Cloudflared re-authentication skipped (approval denied).".to_string();
+                }
+                match self.run_cloudflared_login_and_verify(chat_id).await {
+                    Ok(report) => format!("Cloudflared re-authentication completed.\n{}", report),
+                    Err(err) => format!(
+                        "{}\nRun `cloudflared tunnel login` manually, ensure it succeeds, then rerun your setup command.",
+                        err
+                    ),
+                }
+            }
+            "plan" => {
+                let Some(domain) = parts.get(1).map(|v| v.to_string()) else {
+                    return "Usage: /setup lowlatency plan <base-domain>\nExample: /setup lowlatency plan bots.example.com".to_string();
+                };
+                let dynamic_bots = self.state.get_dynamic_bots().await.unwrap_or_default();
+                let config_path = config_path.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::wizard::low_latency_plan_from_base_domain_with_dynamic(
+                        &config_path,
+                        &domain,
+                        &dynamic_bots,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(text)) => text,
+                    Ok(Err(err)) => format!("Setup plan failed: {}", err),
+                    Err(err) => format!("Setup plan task failed: {}", err),
+                }
+            }
+            "apply" => {
+                let Some(domain) = parts.get(1).map(|v| v.to_string()) else {
+                    return "Usage: /setup lowlatency apply <base-domain>\nExample: /setup lowlatency apply bots.example.com".to_string();
+                };
+                let dynamic_bots = self.state.get_dynamic_bots().await.unwrap_or_default();
+                let apply_text = match tokio::task::spawn_blocking({
+                    let config_path = config_path.clone();
+                    let domain = domain.clone();
+                    let dynamic_bots = dynamic_bots.clone();
+                    move || {
+                        crate::wizard::low_latency_apply_from_base_domain_with_dynamic(
+                            &config_path,
+                            &domain,
+                            &dynamic_bots,
+                        )
+                    }
+                })
+                .await
+                {
+                    Ok(Ok(text)) => text,
+                    Ok(Err(err)) => return format!("Setup apply failed: {}", err),
+                    Err(err) => return format!("Setup apply task failed: {}", err),
+                };
+
+                let command_specs = match tokio::task::spawn_blocking({
+                    let config_path = config_path.clone();
+                    let domain = domain.clone();
+                    let dynamic_bots = dynamic_bots.clone();
+                    move || {
+                        crate::wizard::low_latency_cloudflared_commands_from_base_domain_with_dynamic(
+                            &config_path,
+                            &domain,
+                            &dynamic_bots,
+                        )
+                    }
+                })
+                .await
+                {
+                    Ok(Ok(cmds)) => cmds,
+                    Ok(Err(err)) => {
+                        return format!(
+                            "{}\n\nCould not prepare Cloudflare commands: {}\nRun manual next steps above, then /restart to apply webhook listeners.",
+                            apply_text, err
+                        )
+                    }
+                    Err(err) => {
+                        return format!(
+                            "{}\n\nSetup command preparation failed: {}\nRun manual next steps above, then /restart to apply webhook listeners.",
+                            apply_text, err
+                        )
+                    }
+                };
+
+                if command_specs.is_empty() {
+                    return format!(
+                        "{}\n\nNo Cloudflare commands were generated.\nRun manual next steps above, then /restart to apply webhook listeners.",
+                        apply_text
+                    );
+                }
+
+                let session_id = self.session_id(chat_id).await;
+                let has_brew = crate::wizard::command_exists("brew").await;
+                let has_npm = crate::wizard::command_exists("npm").await;
+                let mut install_specs: Vec<(String, crate::wizard::SetupCommandSpec)> = Vec::new();
+                let cloudflared_present = crate::wizard::command_exists("cloudflared").await;
+                if !cloudflared_present {
+                    if let Some(spec) =
+                        crate::wizard::installer_for_missing_tool("cloudflared", has_brew, has_npm)
+                    {
+                        install_specs.push(("cloudflared".to_string(), spec));
+                    } else {
+                        return format!(
+                            "{}\n\n`cloudflared` is not installed and no supported automatic installer was detected.\nInstall it manually (for example `brew install cloudflared`), then rerun /setup lowlatency apply <base-domain>.",
+                            apply_text
+                        );
+                    }
+                }
+                let wrangler_present = crate::wizard::command_exists("wrangler").await;
+                if !wrangler_present {
+                    if let Some(spec) =
+                        crate::wizard::installer_for_missing_tool("wrangler", has_brew, has_npm)
+                    {
+                        install_specs.push(("wrangler".to_string(), spec));
+                    }
+                }
+
+                let mut install_report = String::new();
+                if !install_specs.is_empty() {
+                    let install_preview = install_specs
+                        .iter()
+                        .map(|(tool, spec)| {
+                            format!("{}: {}", tool, crate::wizard::format_setup_command(spec))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let install_approval_text = format!(
+                        "Install missing setup dependencies now?\n\n{}",
+                        install_preview
+                    );
+                    let install_warnings = vec![
+                        "This will install CLI tools on your host.".to_string(),
+                        "Deny to keep manual setup.".to_string(),
+                    ];
+                    let install_approval = match self
+                        .request_approval(
+                            &session_id,
+                            &install_approval_text,
+                            RiskLevel::High,
+                            &install_warnings,
+                            PermissionMode::Cautious,
+                        )
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return format!(
+                                "{}\n\nCould not request approval for dependency installation: {}\nRun manual next steps above, then /restart to apply webhook listeners.",
+                                apply_text, err
+                            )
+                        }
+                    };
+
+                    if matches!(install_approval, ApprovalResponse::Deny) {
+                        if !cloudflared_present {
+                            return format!(
+                                "{}\n\nAutomatic setup skipped because install approval was denied and `cloudflared` is required.\nInstall `cloudflared` manually, then rerun /setup lowlatency apply <base-domain>.",
+                                apply_text
+                            );
+                        }
+                        install_report =
+                            "Dependency installation skipped (approval denied).".to_string();
+                    } else {
+                        let specs: Vec<crate::wizard::SetupCommandSpec> =
+                            install_specs.iter().map(|(_, spec)| spec.clone()).collect();
+                        let (lines, had_failures) =
+                            Self::run_setup_commands(&specs, 600, false).await;
+                        install_report =
+                            format!("Dependency installation results:\n{}", lines.join("\n"));
+                        if had_failures {
+                            let cloudflared_after =
+                                crate::wizard::command_exists("cloudflared").await;
+                            if !cloudflared_after {
+                                return format!(
+                                    "{}\n\n{}\n\n`cloudflared` is still missing, so automatic provisioning cannot continue.\nInstall it manually and rerun /setup lowlatency apply <base-domain>.",
+                                    apply_text, install_report
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let mut cloudflared_auth_report = String::new();
+                let mut wrangler_auth_report = String::new();
+                let cloudflared_available = crate::wizard::command_exists("cloudflared").await;
+                if cloudflared_available
+                    && !crate::wizard::command_succeeds("cloudflared", &["tunnel", "list"], 20)
+                        .await
+                {
+                    let login_spec = crate::wizard::SetupCommandSpec {
+                        program: "cloudflared".to_string(),
+                        args: vec!["tunnel".to_string(), "login".to_string()],
+                    };
+                    let login_preview = crate::wizard::format_setup_command(&login_spec);
+                    let login_approval_text = format!(
+                        "Cloudflared is not authenticated. Run login now?\n\n{}",
+                        login_preview
+                    );
+                    let login_warnings = vec![
+                        "This opens a one-time Cloudflare authorization flow.".to_string(),
+                        "You may need to open a URL from your browser/phone and approve access."
+                            .to_string(),
+                    ];
+                    let login_approval = match self
+                        .request_approval(
+                            &session_id,
+                            &login_approval_text,
+                            RiskLevel::High,
+                            &login_warnings,
+                            PermissionMode::Cautious,
+                        )
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return format!(
+                                "{}\n\nCould not request approval for cloudflared authentication: {}\nRun `cloudflared tunnel login` manually, then rerun /setup lowlatency apply <base-domain>.",
+                                apply_text, err
+                            )
+                        }
+                    };
+                    if matches!(login_approval, ApprovalResponse::Deny) {
+                        return format!(
+                            "{}\n\nAutomatic setup skipped because cloudflared authentication was denied.\nRun `cloudflared tunnel login` manually, then rerun /setup lowlatency apply <base-domain>.",
+                            apply_text
+                        );
+                    }
+                    match self.run_cloudflared_login_and_verify(chat_id).await {
+                        Ok(report) => {
+                            cloudflared_auth_report = report;
+                        }
+                        Err(err) => {
+                            return format!(
+                                "{}\n\n{}\nRun `cloudflared tunnel login` manually, ensure it succeeds, then rerun /setup lowlatency apply <base-domain>.",
+                                apply_text, err
+                            );
+                        }
+                    }
+                }
+
+                let route_hosts = crate::wizard::setup_route_dns_hosts(&command_specs);
+                match crate::wizard::validate_cloudflared_zone_for_hosts(&route_hosts).await {
+                    CloudflaredZoneValidation::Match { zone_name } => {
+                        let note = format!("Cloudflared zone context verified: `{}`.", zone_name);
+                        if cloudflared_auth_report.is_empty() {
+                            cloudflared_auth_report = note;
+                        } else {
+                            cloudflared_auth_report =
+                                format!("{}\n{}", cloudflared_auth_report, note);
+                        }
+                    }
+                    CloudflaredZoneValidation::Unknown { reason } => {
+                        if !reason.is_empty() {
+                            let note = format!("Cloudflared zone preflight: {}.", reason);
+                            if cloudflared_auth_report.is_empty() {
+                                cloudflared_auth_report = note;
+                            } else {
+                                cloudflared_auth_report =
+                                    format!("{}\n{}", cloudflared_auth_report, note);
+                            }
+                        }
+                    }
+                    CloudflaredZoneValidation::Mismatch {
+                        zone_name,
+                        mismatched_hosts,
+                    } => {
+                        let sample = mismatched_hosts
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let login_spec = crate::wizard::SetupCommandSpec {
+                            program: "cloudflared".to_string(),
+                            args: vec!["tunnel".to_string(), "login".to_string()],
+                        };
+                        let reauth_prompt = format!(
+                            "Cloudflared is authenticated for zone `{}`, but planned webhook host `{}` is outside that zone.\nRe-authenticate now to select the correct zone/account?\n\n{}",
+                            zone_name,
+                            sample,
+                            crate::wizard::format_setup_command(&login_spec)
+                        );
+                        let warnings = vec![
+                            "Without re-auth, DNS records can be created in the wrong zone."
+                                .to_string(),
+                            "Deny to abort automatic provisioning safely.".to_string(),
+                        ];
+                        let approval = match self
+                            .request_approval(
+                                &session_id,
+                                &reauth_prompt,
+                                RiskLevel::High,
+                                &warnings,
+                                PermissionMode::Cautious,
+                            )
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                return format!(
+                                    "{}\n\nCloudflared zone mismatch detected: current zone `{}` does not include planned host(s): {}.\nCould not request re-auth approval: {}\nAutomatic provisioning stopped to prevent wrong DNS records.\nRun `cloudflared tunnel login` with the correct account/zone, then rerun /setup lowlatency apply <base-domain>.",
+                                    apply_text,
+                                    zone_name,
+                                    mismatched_hosts.join(", "),
+                                    err
+                                )
+                            }
+                        };
+                        if matches!(approval, ApprovalResponse::Deny) {
+                            return format!(
+                                "{}\n\nCloudflared zone mismatch detected: current zone `{}` does not include planned host(s): {}.\nAutomatic provisioning stopped to prevent wrong DNS records.\nRun `cloudflared tunnel login` with the correct account/zone, then rerun /setup lowlatency apply <base-domain>.",
+                                apply_text,
+                                zone_name,
+                                mismatched_hosts.join(", ")
+                            );
+                        }
+                        let reauth_report = match self
+                            .run_cloudflared_login_and_verify(chat_id)
+                            .await
+                        {
+                            Ok(report) => report,
+                            Err(err) => {
+                                return format!(
+                                    "{}\n\n{}\nRun `cloudflared tunnel login` manually with the correct account/zone, then rerun /setup lowlatency apply <base-domain>.",
+                                    apply_text, err
+                                );
+                            }
+                        };
+                        match crate::wizard::validate_cloudflared_zone_for_hosts(&route_hosts).await
+                        {
+                            CloudflaredZoneValidation::Match {
+                                zone_name: refreshed_zone,
+                            } => {
+                                let note = format!(
+                                    "Cloudflared re-authentication completed.\n{}\nCloudflared zone context verified: `{}`.",
+                                    reauth_report, refreshed_zone
+                                );
+                                if cloudflared_auth_report.is_empty() {
+                                    cloudflared_auth_report = note;
+                                } else {
+                                    cloudflared_auth_report =
+                                        format!("{}\n{}", cloudflared_auth_report, note);
+                                }
+                            }
+                            CloudflaredZoneValidation::Mismatch {
+                                zone_name: refreshed_zone,
+                                mismatched_hosts: refreshed_hosts,
+                            } => {
+                                return format!(
+                                    "{}\n\nCloudflared re-authentication completed but zone mismatch remains.\nCurrent zone: `{}`\nPlanned host(s): {}\nAutomatic provisioning stopped to prevent wrong DNS records.\nRun `cloudflared tunnel login` again with the correct account/zone, then rerun /setup lowlatency apply <base-domain>.",
+                                    apply_text,
+                                    refreshed_zone,
+                                    refreshed_hosts.join(", ")
+                                );
+                            }
+                            CloudflaredZoneValidation::Unknown { reason } => {
+                                let note = if reason.is_empty() {
+                                    format!(
+                                        "Cloudflared re-authentication completed.\n{}",
+                                        reauth_report
+                                    )
+                                } else {
+                                    format!(
+                                        "Cloudflared re-authentication completed.\n{}\nCloudflared zone preflight after re-auth: {}.",
+                                        reauth_report, reason
+                                    )
+                                };
+                                if cloudflared_auth_report.is_empty() {
+                                    cloudflared_auth_report = note;
+                                } else {
+                                    cloudflared_auth_report =
+                                        format!("{}\n{}", cloudflared_auth_report, note);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let wrangler_available = crate::wizard::command_exists("wrangler").await;
+                if wrangler_available
+                    && !crate::wizard::command_succeeds("wrangler", &["whoami", "--json"], 20).await
+                {
+                    let login_spec = crate::wizard::SetupCommandSpec {
+                        program: "wrangler".to_string(),
+                        args: vec!["login".to_string()],
+                    };
+                    let login_preview = crate::wizard::format_setup_command(&login_spec);
+                    let login_approval_text = format!(
+                        "Wrangler is not authenticated. Run login now?\n\n{}",
+                        login_preview
+                    );
+                    let login_warnings = vec![
+                        "This opens a one-time Cloudflare authorization flow for wrangler."
+                            .to_string(),
+                        "You may need to open a URL from your browser/phone and approve access."
+                            .to_string(),
+                    ];
+                    let login_approval = match self
+                        .request_approval(
+                            &session_id,
+                            &login_approval_text,
+                            RiskLevel::High,
+                            &login_warnings,
+                            PermissionMode::Cautious,
+                        )
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            wrangler_auth_report = format!(
+                                "Wrangler authentication was skipped (approval request failed: {}).",
+                                err
+                            );
+                            ApprovalResponse::Deny
+                        }
+                    };
+
+                    if matches!(login_approval, ApprovalResponse::Deny) {
+                        if wrangler_auth_report.is_empty() {
+                            wrangler_auth_report =
+                                "Wrangler authentication skipped (approval denied).".to_string();
+                        }
+                    } else {
+                        let login_result = self
+                            .run_login_command_with_live_output(
+                                chat_id,
+                                &login_spec,
+                                600,
+                                "Starting wrangler authentication flow.",
+                            )
+                            .await;
+                        if login_result.timed_out {
+                            wrangler_auth_report =
+                                "Wrangler login timed out after 600s; finish `wrangler login` manually if you need wrangler actions."
+                                    .to_string();
+                        } else if let Some(err) = login_result.error {
+                            wrangler_auth_report = format!(
+                                "Wrangler login failed: {}. Run `wrangler login` manually if needed.",
+                                err
+                            );
+                        } else {
+                            let wrangler_ok = login_result.success
+                                && crate::wizard::command_succeeds(
+                                    "wrangler",
+                                    &["whoami", "--json"],
+                                    20,
+                                )
+                                .await;
+                            let summary =
+                                crate::wizard::summarize_setup_log_lines(&login_result.lines);
+                            if wrangler_ok {
+                                wrangler_auth_report = if let Some(url) = login_result.urls.first()
+                                {
+                                    if summary.is_empty() {
+                                        format!("Wrangler authentication completed.\nURL: {}", url)
+                                    } else {
+                                        format!(
+                                            "Wrangler authentication completed.\nURL: {}\n{}",
+                                            url, summary
+                                        )
+                                    }
+                                } else if summary.is_empty() {
+                                    "Wrangler authentication completed.".to_string()
+                                } else {
+                                    format!("Wrangler authentication completed.\n{}", summary)
+                                };
+                            } else {
+                                wrangler_auth_report = if summary.is_empty() {
+                                    "Wrangler authentication did not complete; run `wrangler login` manually if needed.".to_string()
+                                } else {
+                                    format!(
+                                        "Wrangler authentication did not complete.\n{}\nRun `wrangler login` manually if needed.",
+                                        summary
+                                    )
+                                };
+                            }
+                        }
+                    }
+                }
+
+                let command_preview = command_specs
+                    .iter()
+                    .map(crate::wizard::format_setup_command)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let approval_command = format!(
+                    "Run Cloudflare provisioning commands now for `{}`?\n\n{}",
+                    domain, command_preview
+                );
+                let warnings = vec![
+                    "This will execute cloudflared commands on your host.".to_string(),
+                    "Deny to keep the manual setup flow.".to_string(),
+                ];
+                let approval = match self
+                    .request_approval(
+                        &session_id,
+                        &approval_command,
+                        RiskLevel::High,
+                        &warnings,
+                        PermissionMode::Cautious,
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return format!(
+                            "{}\n\nCould not request approval for automatic Cloudflare setup: {}\nRun manual next steps above, then /restart to apply webhook listeners.",
+                            apply_text, err
+                        )
+                    }
+                };
+                if matches!(approval, ApprovalResponse::Deny) {
+                    let mut out = apply_text;
+                    if !install_report.is_empty() {
+                        out.push_str("\n\n");
+                        out.push_str(&install_report);
+                    }
+                    if !cloudflared_auth_report.is_empty() {
+                        out.push_str("\n\n");
+                        out.push_str(&cloudflared_auth_report);
+                    }
+                    if !wrangler_auth_report.is_empty() {
+                        out.push_str("\n\n");
+                        out.push_str(&wrangler_auth_report);
+                    }
+                    out.push_str(
+                        "\n\nAutomatic Cloudflare setup skipped (approval denied).\nRun manual next steps above, then /restart to apply webhook listeners.",
+                    );
+                    out
+                } else {
+                    let (result_lines, had_failures) =
+                        Self::run_setup_commands(&command_specs, 60, true).await;
+                    let mut out = apply_text.clone();
+                    let mut automatic_tunnel_startup_ok = false;
+                    let mut automatic_tunnel_startup_failed = false;
+                    if !install_report.is_empty() {
+                        out.push_str("\n\n");
+                        out.push_str(&install_report);
+                    }
+                    if !cloudflared_auth_report.is_empty() {
+                        out.push_str("\n\n");
+                        out.push_str(&cloudflared_auth_report);
+                    }
+                    if !wrangler_auth_report.is_empty() {
+                        out.push_str("\n\n");
+                        out.push_str(&wrangler_auth_report);
+                    }
+                    if had_failures {
+                        out.push_str(
+                            "\n\nAutomatic Cloudflare provisioning finished with failures:\n",
+                        );
+                        out.push_str(&result_lines.join("\n"));
+                        out.push_str(
+                            "\n\nRun the failed command(s) manually, then start your tunnel process and run /restart to apply webhook listeners.",
+                        );
+                    } else {
+                        out.push_str("\n\nAutomatic Cloudflare provisioning completed:\n");
+                        out.push_str(&result_lines.join("\n"));
+                        let ingress_routes = match tokio::task::spawn_blocking({
+                            let config_path = config_path.clone();
+                            let domain = domain.clone();
+                            let dynamic_bots = dynamic_bots.clone();
+                            move || {
+                                crate::wizard::low_latency_cloudflared_ingress_routes_from_base_domain_with_dynamic(
+                                    &config_path,
+                                    &domain,
+                                    &dynamic_bots,
+                                )
+                            }
+                        })
+                        .await
+                        {
+                            Ok(Ok(routes)) => routes,
+                            Ok(Err(err)) => {
+                                automatic_tunnel_startup_failed = true;
+                                out.push_str(
+                                    "\n\nAutomatic tunnel startup failed:\n",
+                                );
+                                out.push_str(&format!(
+                                    "Could not derive ingress routes from config: {}",
+                                    err
+                                ));
+                                out.push_str(
+                                    "\nRun `cloudflared tunnel run aidaemon-telegram` manually after reviewing your tunnel config.",
+                                );
+                                Vec::new()
+                            }
+                            Err(err) => {
+                                automatic_tunnel_startup_failed = true;
+                                out.push_str(
+                                    "\n\nAutomatic tunnel startup failed:\n",
+                                );
+                                out.push_str(&format!(
+                                    "Ingress route task failed: {}",
+                                    err
+                                ));
+                                out.push_str(
+                                    "\nRun `cloudflared tunnel run aidaemon-telegram` manually after reviewing your tunnel config.",
+                                );
+                                Vec::new()
+                            }
+                        };
+
+                        if !ingress_routes.is_empty() {
+                            match crate::wizard::start_cloudflared_tunnel_background(
+                                "aidaemon-telegram",
+                                &ingress_routes,
+                            )
+                            .await
+                            {
+                                Ok(tunnel_status) => {
+                                    automatic_tunnel_startup_ok = true;
+                                    out.push_str("\n\nAutomatic tunnel startup completed:\n");
+                                    out.push_str(&tunnel_status);
+                                }
+                                Err(err) => {
+                                    automatic_tunnel_startup_failed = true;
+                                    out.push_str("\n\nAutomatic tunnel startup failed:\n");
+                                    out.push_str(&format!(
+                                        "FAIL cloudflared tunnel run aidaemon-telegram - {}",
+                                        err
+                                    ));
+                                    out.push_str(
+                                        "\nRun `cloudflared tunnel run aidaemon-telegram` manually after reviewing your tunnel config.",
+                                    );
+                                }
+                            }
+                        }
+
+                        let restart_scheduled =
+                            Self::schedule_low_latency_restart(Duration::from_secs(3));
+
+                        // When the full automation succeeds end-to-end, replace
+                        // verbose output with a concise success summary.
+                        if automatic_tunnel_startup_ok && !automatic_tunnel_startup_failed {
+                            // Extract public_url lines from the original apply text
+                            let webhook_urls: Vec<&str> = apply_text
+                                .lines()
+                                .filter(|l| l.trim_start().starts_with("public_url:"))
+                                .map(|l| l.trim())
+                                .collect();
+                            out = String::new();
+                            out.push_str("Webhook mode setup complete.\n");
+                            if !webhook_urls.is_empty() {
+                                out.push('\n');
+                                for url in &webhook_urls {
+                                    out.push_str(&format!("  {}\n", url));
+                                }
+                            }
+                            out.push_str("\nTunnel running. Restarting daemon to switch from polling to webhooks...");
+                        } else if restart_scheduled {
+                            out.push_str(
+                                "\n\nAutomatic daemon restart scheduled in ~3s to activate Telegram webhook listeners.",
+                            );
+                        } else {
+                            out.push_str(
+                                "\n\nDaemon restart was already scheduled. Webhook listeners will be activated shortly.",
+                            );
+                        }
+                    }
+                    out
+                }
+            }
+            "help" => usage,
+            _ => usage,
+        }
+    }
+
+    #[cfg(test)]
+    fn strip_low_latency_next_steps(text: &str) -> String {
+        let marker = "\nNext steps:\n";
+        if let Some(index) = text.find(marker) {
+            text[..index].trim_end().to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    async fn backup_cloudflared_origin_cert_if_present(
+        cert_path: &Path,
+    ) -> Result<Option<PathBuf>, String> {
+        let metadata = match tokio::fs::metadata(cert_path).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(format!(
+                    "failed to inspect cloudflared cert at `{}`: {}",
+                    cert_path.display(),
+                    err
+                ))
+            }
+        };
+        if !metadata.is_file() {
+            return Err(format!(
+                "cloudflared cert path `{}` exists but is not a file",
+                cert_path.display()
+            ));
+        }
+
+        let parent = cert_path.parent().ok_or_else(|| {
+            format!(
+                "cannot determine parent directory for cloudflared cert `{}`",
+                cert_path.display()
+            )
+        })?;
+        let file_name = cert_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "cannot derive file name for cloudflared cert `{}`",
+                    cert_path.display()
+                )
+            })?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for attempt in 0..20 {
+            let backup_name = if attempt == 0 {
+                format!("{}.bak.{}", file_name, timestamp)
+            } else {
+                format!("{}.bak.{}.{}", file_name, timestamp, attempt)
+            };
+            let backup_path = parent.join(backup_name);
+            match tokio::fs::metadata(&backup_path).await {
+                Ok(_) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(format!(
+                        "failed to inspect cloudflared backup path `{}`: {}",
+                        backup_path.display(),
+                        err
+                    ))
+                }
+            }
+
+            match tokio::fs::rename(cert_path, &backup_path).await {
+                Ok(_) => return Ok(Some(backup_path)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    return Err(format!(
+                        "failed to back up cloudflared cert `{}` to `{}`: {}",
+                        cert_path.display(),
+                        backup_path.display(),
+                        err
+                    ))
+                }
+            }
+        }
+
+        Err(format!(
+            "failed to back up cloudflared cert `{}`: too many backup name collisions",
+            cert_path.display()
+        ))
+    }
+
+    async fn prepare_cloudflared_origin_cert_for_login() -> Result<Option<String>, String> {
+        let Some(cert_path) = crate::wizard::cloudflared_origin_cert_path() else {
+            return Ok(None);
+        };
+        let backup_path = Self::backup_cloudflared_origin_cert_if_present(&cert_path).await?;
+        Ok(backup_path.map(|path| {
+            format!(
+                "Existing cloudflared origin cert was backed up to `{}` before re-authentication.",
+                path.display()
+            )
+        }))
+    }
+
+    async fn read_setup_command_stream<R>(reader: R, tx: mpsc::UnboundedSender<String>)
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    async fn run_login_command_with_live_output(
+        &self,
+        chat_id: i64,
+        spec: &crate::wizard::SetupCommandSpec,
+        timeout_secs: u64,
+        intro: &str,
+    ) -> SetupLoginResult {
+        let mut result = SetupLoginResult::default();
+        let _ = self
+            .bot
+            .send_message(
+                ChatId(chat_id),
+                format!(
+                    "{}\nCommand: {}",
+                    intro,
+                    crate::wizard::format_setup_command(spec)
+                ),
+            )
+            .await;
+
+        let mut child = match Command::new(&spec.program)
+            .args(&spec.args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                result.error = Some(err.to_string());
+                return result;
+            }
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let mut stream_tasks = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            let tx_clone = tx.clone();
+            stream_tasks.push(tokio::spawn(async move {
+                Self::read_setup_command_stream(stdout, tx_clone).await;
+            }));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let tx_clone = tx.clone();
+            stream_tasks.push(tokio::spawn(async move {
+                Self::read_setup_command_stream(stderr, tx_clone).await;
+            }));
+        }
+        drop(tx);
+
+        let bot = self.bot.clone();
+        let announcer = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            let mut urls = Vec::new();
+            let mut seen_urls = HashSet::new();
+            while let Some(line) = rx.recv().await {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if lines.len() < 300 {
+                    lines.push(trimmed.to_string());
+                }
+                for url in crate::wizard::extract_urls(trimmed) {
+                    if seen_urls.insert(url.clone()) {
+                        urls.push(url.clone());
+                        let _ = bot
+                            .send_message(
+                                ChatId(chat_id),
+                                format!("Open this URL to continue auth:\n{}", url),
+                            )
+                            .await;
+                    }
+                }
+            }
+            (lines, urls)
+        });
+
+        let wait_outcome =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+        match wait_outcome {
+            Ok(Ok(status)) => {
+                result.success = status.success();
+            }
+            Ok(Err(err)) => {
+                result.error = Some(err.to_string());
+            }
+            Err(_) => {
+                result.timed_out = true;
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
+        }
+
+        for task in stream_tasks {
+            let _ = task.await;
+        }
+        match announcer.await {
+            Ok((lines, urls)) => {
+                result.lines = lines;
+                result.urls = urls;
+            }
+            Err(err) => {
+                if result.error.is_none() {
+                    result.error = Some(format!("failed to capture auth output: {}", err));
+                }
+            }
+        }
+        result
+    }
+
+    async fn run_cloudflared_login_and_verify(&self, chat_id: i64) -> Result<String, String> {
+        let preflight_note = Self::prepare_cloudflared_origin_cert_for_login().await?;
+        let login_spec = crate::wizard::SetupCommandSpec {
+            program: "cloudflared".to_string(),
+            args: vec!["tunnel".to_string(), "login".to_string()],
+        };
+        let login_result = self
+            .run_login_command_with_live_output(
+                chat_id,
+                &login_spec,
+                600,
+                "Starting cloudflared authentication flow.",
+            )
+            .await;
+        if login_result.timed_out {
+            return Err(
+                "Cloudflared login timed out after 600s. Complete authorization and retry."
+                    .to_string(),
+            );
+        }
+        if let Some(err) = login_result.error {
+            return Err(format!("Failed to run cloudflared login: {}", err));
+        }
+
+        let auth_ok = login_result.success
+            && crate::wizard::command_succeeds("cloudflared", &["tunnel", "list"], 20).await;
+        if !auth_ok {
+            let summary = crate::wizard::summarize_setup_log_lines(&login_result.lines);
+            let mut details = Vec::new();
+            if let Some(note) = preflight_note.clone() {
+                details.push(note);
+            }
+            if !summary.is_empty() {
+                details.push(summary);
+            }
+            if !login_result.urls.is_empty() {
+                details.push(format!(
+                    "Authorization URL: {}",
+                    login_result.urls.join(", ")
+                ));
+            }
+            let detail_block = if details.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", details.join("\n"))
+            };
+            return Err(format!(
+                "Cloudflared authentication did not complete successfully.{}",
+                detail_block
+            ));
+        }
+
+        let summary = crate::wizard::summarize_setup_log_lines(&login_result.lines);
+        let mut report_lines = vec!["Cloudflared authentication completed.".to_string()];
+        if let Some(url) = login_result.urls.first() {
+            report_lines.push(format!("URL: {}", url));
+        }
+        if let Some(note) = preflight_note {
+            report_lines.push(note);
+        }
+        if !summary.is_empty() {
+            report_lines.push(summary);
+        }
+        Ok(report_lines.join("\n"))
+    }
+
+    async fn run_setup_commands(
+        specs: &[crate::wizard::SetupCommandSpec],
+        timeout_secs: u64,
+        treat_existing_resource_as_success: bool,
+    ) -> (Vec<String>, bool) {
+        let mut lines = Vec::with_capacity(specs.len());
+        let mut had_failures = false;
+        for spec in specs {
+            let display = crate::wizard::format_setup_command(spec);
+            let run_result = tokio::time::timeout(
+                Duration::from_secs(timeout_secs),
+                Command::new(&spec.program)
+                    .args(&spec.args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output(),
+            )
+            .await;
+            match run_result {
+                Ok(Ok(output)) => {
+                    let summary = crate::wizard::summarize_setup_command_output(
+                        &output.stdout,
+                        &output.stderr,
+                    );
+                    let combined = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let treated_as_success = output.status.success()
+                        || (treat_existing_resource_as_success
+                            && crate::wizard::cloudflared_reports_existing_resource(&combined));
+                    if treated_as_success {
+                        if summary.is_empty() {
+                            lines.push(format!("OK   {}", display));
+                        } else {
+                            lines.push(format!("OK   {} - {}", display, summary));
+                        }
+                    } else {
+                        had_failures = true;
+                        if summary.is_empty() {
+                            lines.push(format!(
+                                "FAIL {} - exited with status {}",
+                                display, output.status
+                            ));
+                        } else {
+                            lines.push(format!("FAIL {} - {}", display, summary));
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    had_failures = true;
+                    lines.push(format!("FAIL {} - {}", display, err));
+                }
+                Err(_) => {
+                    had_failures = true;
+                    lines.push(format!(
+                        "FAIL {} - timed out after {}s",
+                        display, timeout_secs
+                    ));
+                }
+            }
+        }
+        (lines, had_failures)
+    }
+
+    fn schedule_low_latency_restart(delay: Duration) -> bool {
+        if LOW_LATENCY_RESTART_SCHEDULED.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            info!("Automatic restart requested after low-latency setup");
+            restart_process();
+            LOW_LATENCY_RESTART_SCHEDULED.store(false, Ordering::SeqCst);
+        });
+        true
+    }
+
     /// Handle /connect command - add a new bot dynamically.
     /// Usage: /connect telegram <bot_token>
     ///        /connect discord <bot_token>
@@ -2608,31 +3044,20 @@ impl TelegramChannel {
     /// Connect a new Telegram bot by validating its token.
     async fn connect_telegram_bot(&self, token: &str, user_id: u64) -> String {
         // Validate the token by calling getMe
-        let test_bot = Bot::new(token);
-        let me = match test_bot.get_me().await {
-            Ok(me) => me,
-            Err(e) => {
-                return format!(
-                    "Invalid token: {}\n\nMake sure you copied the full token from @BotFather.",
-                    e
-                );
-            }
+        let bot_username = match super::connect::validate_telegram_token(token).await {
+            Ok(name) => name,
+            Err(e) => return e,
         };
 
-        let bot_username = me.username.clone().unwrap_or_else(|| "unknown".to_string());
-
         // Check if this bot is already connected
-        match self.state.get_dynamic_bots().await {
-            Ok(bots) => {
-                for existing in &bots {
-                    if existing.channel_type == "telegram" && existing.bot_token == token {
-                        return format!(
-                            "Bot @{} is already connected.\n\nUse /bots to see all connected bots.",
-                            bot_username
-                        );
-                    }
-                }
+        match super::connect::check_bot_exists(self.state.as_ref(), "telegram", token).await {
+            Ok(true) => {
+                return format!(
+                    "Bot @{} is already connected.\n\nUse /bots to see all connected bots.",
+                    bot_username
+                );
             }
+            Ok(false) => {}
             Err(e) => {
                 warn!("Failed to check existing bots: {}", e);
             }
@@ -2653,15 +3078,15 @@ impl TelegramChannel {
             bot_token: token.to_string(),
             app_token: None,
             allowed_user_ids: allowed_user_ids_str,
-            extra_config: "{}".to_string(),
+            extra_config: serde_json::json!({"username": bot_username}).to_string(),
             created_at: String::new(), // Will be set by database
         };
 
-        let db_id = match self.state.add_dynamic_bot(&new_bot).await {
+        let db_id = match super::connect::persist_dynamic_bot(self.state.as_ref(), &new_bot).await {
             Ok(id) => id,
             Err(e) => {
                 warn!("Failed to save bot: {}", e);
-                return format!("Failed to save bot configuration: {}", e);
+                return e;
             }
         };
 
@@ -2683,6 +3108,7 @@ impl TelegramChannel {
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone(),
+                    TelegramWebhookConfig::default(),
                     self.owner_user_ids.clone(),
                     Arc::clone(&self.agent),
                     self.config_path.clone(),
@@ -2694,7 +3120,7 @@ impl TelegramChannel {
                     Arc::clone(&self.state),
                     self.watchdog_stale_threshold_secs,
                     self.terminal_web_app_url.clone(),
-                    self.terminal_allowed_prefixes.iter().cloned().collect(),
+                    self.terminal_lite.allowed_prefixes(),
                 ));
 
                 // Give the new channel a reference to the hub too
@@ -2731,43 +3157,20 @@ impl TelegramChannel {
     #[cfg(feature = "discord")]
     async fn connect_discord_bot(&self, token: &str, user_id: u64) -> String {
         // Validate the token by making a test API call
-        let client = reqwest::Client::new();
-        let response = client
-            .get("https://discord.com/api/v10/users/@me")
-            .header("Authorization", format!("Bot {}", token))
-            .send()
-            .await;
-
-        let bot_name = match response {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<serde_json::Value>().await {
-                    Ok(json) => json["username"].as_str().unwrap_or("unknown").to_string(),
-                    Err(_) => "unknown".to_string(),
-                }
-            }
-            Ok(resp) => {
-                return format!(
-                    "Invalid Discord token (HTTP {}). Make sure you copied the bot token from Discord Developer Portal.",
-                    resp.status()
-                );
-            }
-            Err(e) => {
-                return format!("Failed to validate token: {}", e);
-            }
+        let bot_name = match super::connect::validate_discord_token(token).await {
+            Ok(name) => name,
+            Err(e) => return e,
         };
 
         // Check if already connected
-        match self.state.get_dynamic_bots().await {
-            Ok(bots) => {
-                for existing in &bots {
-                    if existing.channel_type == "discord" && existing.bot_token == token {
-                        return format!(
-                            "Bot {} is already connected.\n\nUse /bots to see all connected bots.",
-                            bot_name
-                        );
-                    }
-                }
+        match super::connect::check_bot_exists(self.state.as_ref(), "discord", token).await {
+            Ok(true) => {
+                return format!(
+                    "Bot {} is already connected.\n\nUse /bots to see all connected bots.",
+                    bot_name
+                );
             }
+            Ok(false) => {}
             Err(e) => {
                 warn!("Failed to check existing bots: {}", e);
             }
@@ -2785,11 +3188,9 @@ impl TelegramChannel {
             created_at: String::new(),
         };
 
-        let db_id = match self.state.add_dynamic_bot(&new_bot).await {
+        let db_id = match super::connect::persist_dynamic_bot(self.state.as_ref(), &new_bot).await {
             Ok(id) => id,
-            Err(e) => {
-                return format!("Failed to save bot configuration: {}", e);
-            }
+            Err(e) => return e,
         };
 
         info!(
@@ -2853,59 +3254,35 @@ impl TelegramChannel {
 
     /// Connect a new Discord bot (stub when feature disabled).
     #[cfg(not(feature = "discord"))]
-    async fn connect_discord_bot(&self, _token: &str, _user_id: u64) -> String {
-        "Discord support is not enabled in this build.\n\n\
-        Rebuild with `cargo build --features discord` to enable Discord bots."
-            .to_string()
+    async fn connect_discord_bot(&self, token: &str, _user_id: u64) -> String {
+        match super::connect::validate_discord_token(token).await {
+            Ok(_) => unreachable!("discord feature is disabled"),
+            Err(e) => format!(
+                "{}\n\nRebuild with `cargo build --features discord` to enable Discord bots.",
+                e
+            ),
+        }
     }
 
-    /// Connect a new Slack bot.
     /// Connect a new Slack bot.
     #[cfg(feature = "slack")]
     async fn connect_slack_bot(&self, bot_token: &str, app_token: &str, user_id: u64) -> String {
         // Validate the bot token by calling auth.test
-        let client = reqwest::Client::new();
-        let response = client
-            .get("https://slack.com/api/auth.test")
-            .header("Authorization", format!("Bearer {}", bot_token))
-            .send()
-            .await;
-
-        let (bot_name, team_name) = match response {
-            Ok(resp) => match resp.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    if json["ok"].as_bool() != Some(true) {
-                        return format!(
-                            "Invalid Slack token: {}\n\nMake sure you have the correct bot token.",
-                            json["error"].as_str().unwrap_or("unknown error")
-                        );
-                    }
-                    (
-                        json["user"].as_str().unwrap_or("unknown").to_string(),
-                        json["team"].as_str().unwrap_or("unknown").to_string(),
-                    )
-                }
-                Err(e) => {
-                    return format!("Failed to parse Slack response: {}", e);
-                }
-            },
-            Err(e) => {
-                return format!("Failed to validate Slack token: {}", e);
-            }
-        };
+        let (bot_name, team_name) =
+            match super::connect::validate_slack_tokens(bot_token, app_token).await {
+                Ok(pair) => pair,
+                Err(e) => return e,
+            };
 
         // Check if already connected
-        match self.state.get_dynamic_bots().await {
-            Ok(bots) => {
-                for existing in &bots {
-                    if existing.channel_type == "slack" && existing.bot_token == bot_token {
-                        return format!(
-                            "Slack bot {} ({}) is already connected.\n\nUse /bots to see all connected bots.",
-                            bot_name, team_name
-                        );
-                    }
-                }
+        match super::connect::check_bot_exists(self.state.as_ref(), "slack", bot_token).await {
+            Ok(true) => {
+                return format!(
+                    "Slack bot {} ({}) is already connected.\n\nUse /bots to see all connected bots.",
+                    bot_name, team_name
+                );
             }
+            Ok(false) => {}
             Err(e) => {
                 warn!("Failed to check existing bots: {}", e);
             }
@@ -2923,11 +3300,9 @@ impl TelegramChannel {
             created_at: String::new(),
         };
 
-        let db_id = match self.state.add_dynamic_bot(&new_bot).await {
+        let db_id = match super::connect::persist_dynamic_bot(self.state.as_ref(), &new_bot).await {
             Ok(id) => id,
-            Err(e) => {
-                return format!("Failed to save bot configuration: {}", e);
-            }
+            Err(e) => return e,
         };
 
         info!(
@@ -2991,10 +3366,14 @@ impl TelegramChannel {
 
     /// Connect a new Slack bot (stub when feature disabled).
     #[cfg(not(feature = "slack"))]
-    async fn connect_slack_bot(&self, _bot_token: &str, _app_token: &str, _user_id: u64) -> String {
-        "Slack support is not enabled in this build.\n\n\
-        Rebuild with `cargo build --features slack` to enable Slack bots."
-            .to_string()
+    async fn connect_slack_bot(&self, bot_token: &str, app_token: &str, _user_id: u64) -> String {
+        match super::connect::validate_slack_tokens(bot_token, app_token).await {
+            Ok(_) => unreachable!("slack feature is disabled"),
+            Err(e) => format!(
+                "{}\n\nRebuild with `cargo build --features slack` to enable Slack bots.",
+                e
+            ),
+        }
     }
 
     /// Handle /bots command - list all connected bots.
@@ -3009,7 +3388,7 @@ impl TelegramChannel {
         ));
 
         // Add dynamic bots from database
-        match self.state.get_dynamic_bots().await {
+        match super::connect::list_dynamic_bots(self.state.as_ref()).await {
             Ok(bots) => {
                 for bot in bots {
                     let bot_info = match bot.channel_type.as_str() {
@@ -3460,7 +3839,7 @@ impl TelegramChannel {
             .await;
     }
 
-    async fn handle_message(&self, msg: teloxide::types::Message, bot: Bot) {
+    async fn handle_message(self: &Arc<Self>, msg: teloxide::types::Message, bot: Bot) {
         let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
 
         // Authorization check with first-user auto-claim (DM only).
@@ -3623,9 +4002,30 @@ impl TelegramChannel {
             return;
         };
 
-        // Handle slash commands
+        // Handle slash commands.
+        // `/setup` is spawned in a separate task because `handle_setup_command`
+        // may call `request_approval`, which blocks waiting for a Telegram
+        // callback query.  Teloxide dispatches updates per-chat sequentially,
+        // so running it inline would deadlock: the callback can't be delivered
+        // until the message handler returns, but the message handler is waiting
+        // for that callback.
         if text.starts_with('/') {
-            self.handle_command(&text, &msg, &bot).await;
+            let is_setup = {
+                let cmd = text.split_whitespace().next().unwrap_or("");
+                let cmd = cmd.split('@').next().unwrap_or(cmd);
+                cmd == "/setup"
+            };
+            if is_setup {
+                let channel = Arc::clone(self);
+                let text = text.clone();
+                let msg = msg.clone();
+                let bot = bot.clone();
+                tokio::spawn(async move {
+                    channel.handle_command(&text, &msg, &bot).await;
+                });
+            } else {
+                self.handle_command(&text, &msg, &bot).await;
+            }
             return;
         }
 
@@ -4806,58 +5206,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_lite_detects_shell_control_operators() {
-        assert!(TelegramChannel::contains_shell_control_operators(
-            "ls && rm -rf /tmp/demo"
-        ));
-        assert!(TelegramChannel::contains_shell_control_operators(
-            "echo $(whoami)"
-        ));
-        assert!(TelegramChannel::contains_shell_control_operators(
-            "echo `whoami`"
-        ));
+    fn normalize_agent_permission_aliases_maps_claude_allow_flag() {
+        let args = vec![
+            "--allow-dangerously-skip-permissions".to_string(),
+            "--model".to_string(),
+            "sonnet".to_string(),
+        ];
+        let (normalized, rewrote) =
+            crate::normalize_terminal_agent_permission_aliases(Some("claude"), args);
+        assert!(rewrote);
+        assert_eq!(
+            normalized,
+            vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string()
+            ]
+        );
     }
 
     #[test]
-    fn terminal_lite_allows_simple_commands_without_operators() {
-        assert!(!TelegramChannel::contains_shell_control_operators(
-            "ls -la /tmp"
-        ));
-        assert!(!TelegramChannel::contains_shell_control_operators(
-            "FOO=bar env"
-        ));
-        assert!(!TelegramChannel::contains_shell_control_operators(
-            "echo ';' '|' '>'"
-        ));
-    }
-
-    #[test]
-    fn format_agent_flag_docs_paginates_and_keeps_footer_actions() {
-        let docs = (1..=13)
-            .map(|n| AgentFlagDoc {
-                flag: format!("--flag-{}", n),
-                description: Some(format!("Description {}", n)),
-            })
-            .collect::<Vec<_>>();
-
-        let pages = TelegramChannel::format_agent_flag_docs("claude", &docs, false);
-        assert_eq!(pages.len(), 2);
-        assert!(pages[0].contains("Showing 1-12 of 13 (page 1/2)"));
-        assert!(pages[1].contains("Showing 13-13 of 13 (page 2/2)"));
-        assert!(pages[1].contains("Set defaults with `/agent defaults set <agent> [flags...]`."));
-        assert!(pages[1].contains("Bypass once with `--no-default-flags`."));
-        assert!(pages[1].contains("Refresh with `/agent flags <agent> refresh`."));
-    }
-
-    #[test]
-    fn format_agent_flag_docs_includes_cached_badge() {
-        let docs = vec![AgentFlagDoc {
-            flag: "--print".to_string(),
-            description: Some("Output format.".to_string()),
-        }];
-        let pages = TelegramChannel::format_agent_flag_docs("claude", &docs, true);
-        assert_eq!(pages.len(), 1);
-        assert!(pages[0].contains("Flags for `claude` (cached)"));
+    fn normalize_agent_permission_aliases_leaves_non_claude_args_unchanged() {
+        let args = vec!["--allow-dangerously-skip-permissions".to_string()];
+        let (normalized, rewrote) =
+            crate::normalize_terminal_agent_permission_aliases(Some("codex"), args.clone());
+        assert!(!rewrote);
+        assert_eq!(normalized, args);
     }
 
     #[test]
@@ -5051,6 +5425,50 @@ mod tests {
     fn fallback_session_namespace_sanitizes_invalid_chars() {
         let ns = fallback_session_namespace_from_token("12$34:^secret");
         assert_eq!(ns, "tg1234");
+    }
+
+    #[test]
+    fn strip_low_latency_next_steps_removes_manual_instructions() {
+        let text = "Low-latency webhook config applied (local config only).\nBackup: config.toml.lowlatency.bak\n\nNext steps:\n1. step one\n2. step two\n";
+        let stripped = TelegramChannel::strip_low_latency_next_steps(text);
+        assert_eq!(
+            stripped,
+            "Low-latency webhook config applied (local config only).\nBackup: config.toml.lowlatency.bak"
+        );
+    }
+
+    #[test]
+    fn strip_low_latency_next_steps_leaves_text_without_marker() {
+        let text = "Low-latency webhook config applied (local config only).\nBackup: config.toml.lowlatency.bak\n";
+        let stripped = TelegramChannel::strip_low_latency_next_steps(text);
+        assert_eq!(stripped, text);
+    }
+
+    #[tokio::test]
+    async fn backup_cloudflared_origin_cert_moves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        tokio::fs::write(&cert_path, "dummy-cert").await.unwrap();
+
+        let backup = TelegramChannel::backup_cloudflared_origin_cert_if_present(&cert_path)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(tokio::fs::metadata(&cert_path).await.is_err());
+        let backup_content = tokio::fs::read_to_string(&backup).await.unwrap();
+        assert_eq!(backup_content, "dummy-cert");
+    }
+
+    #[tokio::test]
+    async fn backup_cloudflared_origin_cert_is_noop_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+
+        let backup = TelegramChannel::backup_cloudflared_origin_cert_if_present(&cert_path)
+            .await
+            .unwrap();
+        assert!(backup.is_none());
     }
 
     // --- persist_allowed_user_ids (config file update) ---
