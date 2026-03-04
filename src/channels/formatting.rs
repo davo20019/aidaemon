@@ -596,18 +596,11 @@ fn convert_slack_inline(s: &str) -> String {
     result
 }
 
-/// Build the /help response text.
+/// Build the /help response text from a list of command definitions.
 ///
-/// `include_restart`: whether to show the /restart command (Telegram, Slack)
-/// `include_connect`: whether to show /connect and /bots (Telegram only)
-/// `include_terminal`: whether to show /terminal command (Telegram only)
-/// `prefix`: command prefix character ("/" for Telegram, "!" for Slack)
-pub(crate) fn build_help_text(
-    include_restart: bool,
-    include_connect: bool,
-    include_terminal: bool,
-    prefix: &str,
-) -> String {
+/// `commands`: the command definitions to include (platform-specific).
+/// `prefix`: command prefix character ("/" for Telegram/Discord, "!" for Slack).
+pub(crate) fn build_help_text(commands: &[super::commands::CommandDef], prefix: &str) -> String {
     let p = prefix;
     let mut text = String::from(
         "**What I can do**\n\
@@ -649,41 +642,20 @@ pub(crate) fn build_help_text(
          **Commands**",
     );
 
-    text.push_str(&format!(
-        "\n\
-         `{p}model` — Show or switch AI model\n\
-         `{p}models` — List available models\n\
-         `{p}auto` — Re-enable automatic model routing\n\
-         `{p}reload` — Reload configuration",
-    ));
-
-    if include_restart {
-        text.push_str(&format!("\n`{p}restart` — Restart the daemon"));
+    for cmd in commands {
+        let label = match cmd.usage {
+            Some(usage) => {
+                // Replace the leading "/" with the platform prefix.
+                if let Some(rest) = usage.strip_prefix('/') {
+                    format!("{p}{rest}")
+                } else {
+                    usage.to_string()
+                }
+            }
+            None => format!("{p}{}", cmd.name),
+        };
+        text.push_str(&format!("\n`{}` — {}", label, cmd.description));
     }
-
-    text.push_str(&format!(
-        "\n\
-         `{p}tasks` — List running tasks\n\
-         `{p}cancel <id>` — Cancel a running task\n\
-         `{p}clear` — Start fresh conversation\n\
-         `{p}cost` — Show token usage stats",
-    ));
-
-    if include_terminal {
-        text.push_str(&format!(
-            "\n`{p}agent` — Start Codex/Claude/Gemini/OpenCode session\n`{p}agent flags` — Discover available flags for an agent\n`{p}agent defaults` — Manage saved agent flags\n`{p}terminal lite` — Chat-based shell mode\n`{p}setup lowlatency` — Configure Telegram webhook low-latency mode (owner only)"
-        ));
-    }
-
-    if include_connect {
-        text.push_str(&format!(
-            "\n\
-             `{p}connect` — Add a new bot\n\
-             `{p}bots` — List connected bots",
-        ));
-    }
-
-    text.push_str(&format!("\n`{p}help` — Show this message"));
 
     text
 }

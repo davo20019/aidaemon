@@ -10,6 +10,90 @@ use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::traits::StateStore;
 
+/// Single source of truth for command definitions.
+///
+/// Each command is defined once here; the registry drives Telegram's
+/// `setMyCommands` API, the `/help` output, and (in the future) Slack/Discord
+/// command registration.
+pub(crate) struct CommandDef {
+    /// Command name without leading `/` or `!`.
+    pub name: &'static str,
+    /// Short description shown in Telegram's command menu and `/help` text.
+    /// Must be 3-256 characters for Telegram's `BotCommand`.
+    pub description: &'static str,
+    /// Optional usage string shown only in `/help` (e.g. "/model [name]").
+    pub usage: Option<&'static str>,
+    /// Which platform group this command belongs to.
+    pub category: CommandCategory,
+}
+
+/// Determines which platforms show a command.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandCategory {
+    /// Available on all platforms.
+    Core,
+    /// Telegram + Slack (process restart).
+    Restart,
+    /// Telegram-only (dynamic bot management).
+    Connect,
+    /// Telegram-only (terminal/agent bridge).
+    Terminal,
+}
+
+/// Returns the shared commands available on every platform.
+pub(crate) fn shared_commands() -> Vec<CommandDef> {
+    vec![
+        CommandDef {
+            name: "model",
+            description: "Show or switch AI model",
+            usage: Some("/model [name]"),
+            category: CommandCategory::Core,
+        },
+        CommandDef {
+            name: "models",
+            description: "List available models",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+        CommandDef {
+            name: "auto",
+            description: "Re-enable automatic model routing",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+        CommandDef {
+            name: "reload",
+            description: "Reload configuration",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+        CommandDef {
+            name: "tasks",
+            description: "List running tasks",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+        CommandDef {
+            name: "cancel",
+            description: "Cancel a running task",
+            usage: Some("/cancel <id>"),
+            category: CommandCategory::Core,
+        },
+        CommandDef {
+            name: "clear",
+            description: "Start fresh conversation",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+        CommandDef {
+            name: "cost",
+            description: "Show token usage stats",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+    ]
+}
+
 /// Shared command dispatcher for commands that behave identically across
 /// Telegram, Slack, and Discord channels.
 pub(crate) struct CommandContext {

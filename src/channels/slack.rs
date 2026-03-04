@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{
     build_help_text, markdown_to_slack_mrkdwn, sanitize_filename, split_message,
 };
@@ -24,6 +25,27 @@ use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 
 /// Maximum message length for Slack (actual limit is 40,000 but leave margin).
 const MAX_MESSAGE_LEN: usize = 39_000;
+
+/// Commands available in the Slack channel (shared Core + Restart).
+fn slack_commands() -> Vec<CommandDef> {
+    let mut cmds: Vec<CommandDef> = shared_commands()
+        .into_iter()
+        .filter(|c| matches!(c.category, CommandCategory::Core))
+        .collect();
+    cmds.push(CommandDef {
+        name: "restart",
+        description: "Restart the daemon",
+        usage: None,
+        category: CommandCategory::Restart,
+    });
+    cmds.push(CommandDef {
+        name: "help",
+        description: "Show available commands",
+        usage: None,
+        category: CommandCategory::Core,
+    });
+    cmds
+}
 
 /// Slack channel implementation using Socket Mode (WebSocket) for receiving
 /// events and the Web API (HTTP) for sending messages.
@@ -1660,7 +1682,7 @@ impl SlackChannel {
                 restart_process();
                 "Restart failed. You may need to restart manually.".to_string()
             }
-            "/help" | "/start" => build_help_text(true, false, false, "!"),
+            "/help" | "/start" => build_help_text(&slack_commands(), "!"),
             _ => format!(
                 "Unknown command: {}\nType `!help` for available commands.",
                 cmd

@@ -17,6 +17,7 @@ use serenity::Client;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{build_help_text, sanitize_filename, split_message};
 use crate::agent::Agent;
 use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, SessionMap};
@@ -25,6 +26,21 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
+
+/// Commands available in the Discord channel (shared Core only).
+fn discord_commands() -> Vec<CommandDef> {
+    let mut cmds: Vec<CommandDef> = shared_commands()
+        .into_iter()
+        .filter(|c| matches!(c.category, CommandCategory::Core))
+        .collect();
+    cmds.push(CommandDef {
+        name: "help",
+        description: "Show available commands",
+        usage: None,
+        category: CommandCategory::Core,
+    });
+    cmds
+}
 
 /// Discord channel implementation using the serenity library.
 pub struct DiscordChannel {
@@ -952,7 +968,7 @@ impl DiscordChannel {
 
         // Channel-specific commands.
         match cmd {
-            "/help" | "/start" => build_help_text(false, false, false, "/"),
+            "/help" | "/start" => build_help_text(&discord_commands(), "/"),
             _ => format!(
                 "Unknown command: {}\nType /help for available commands.",
                 cmd

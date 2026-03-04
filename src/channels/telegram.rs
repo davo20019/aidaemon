@@ -11,7 +11,7 @@ use regex::Regex;
 use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ButtonRequest, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+    BotCommand, ButtonRequest, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
     KeyboardButton, KeyboardMarkup, ParseMode, WebAppInfo,
 };
 use teloxide::update_listeners::webhooks;
@@ -20,6 +20,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
+use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{
     build_help_text, html_escape, markdown_to_telegram_html, sanitize_filename, split_message,
     strip_latex,
@@ -111,6 +112,59 @@ static LOW_LATENCY_RESTART_SCHEDULED: AtomicBool = AtomicBool::new(false);
 enum TelegramWebAppAction {
     AgentMessage(String),
     ContinueOnComputer { relay_session_id: Option<String> },
+}
+
+/// All commands available in the Telegram channel (shared + Telegram-specific).
+///
+/// Used to register Telegram's `/` command menu via `setMyCommands` and to
+/// generate `/help` output.
+fn telegram_commands() -> Vec<CommandDef> {
+    let mut cmds = shared_commands();
+    cmds.extend(vec![
+        CommandDef {
+            name: "restart",
+            description: "Restart the daemon",
+            usage: None,
+            category: CommandCategory::Restart,
+        },
+        CommandDef {
+            name: "connect",
+            description: "Add a new bot channel",
+            usage: Some("/connect <platform> <token>"),
+            category: CommandCategory::Connect,
+        },
+        CommandDef {
+            name: "setup",
+            description: "Setup wizard (webhooks, low-latency)",
+            usage: Some("/setup [lowlatency]"),
+            category: CommandCategory::Connect,
+        },
+        CommandDef {
+            name: "bots",
+            description: "List connected bots",
+            usage: None,
+            category: CommandCategory::Connect,
+        },
+        CommandDef {
+            name: "agent",
+            description: "Start or manage CLI agent sessions",
+            usage: Some("/agent [codex|claude|gemini|opencode] [dir]"),
+            category: CommandCategory::Terminal,
+        },
+        CommandDef {
+            name: "terminal",
+            description: "Terminal bridge commands",
+            usage: Some("/terminal [lite|start|open]"),
+            category: CommandCategory::Terminal,
+        },
+        CommandDef {
+            name: "help",
+            description: "Show available commands",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+    ]);
+    cmds
 }
 
 impl TelegramChannel {
@@ -348,6 +402,15 @@ impl TelegramChannel {
     pub async fn start(self: Arc<Self>) {
         let bot_username = self.get_bot_username().await;
         info!(name = %bot_username, "Starting Telegram channel");
+
+        // Register commands with Telegram so they appear in the "/" menu.
+        let bot_commands: Vec<BotCommand> = telegram_commands()
+            .iter()
+            .map(|c| BotCommand::new(c.name, c.description))
+            .collect();
+        if let Err(e) = self.bot.set_my_commands(bot_commands).await {
+            warn!(error = %e, "Failed to register bot commands with Telegram");
+        }
 
         let handler = dptree::entry()
             .branch(Update::filter_message().endpoint({
@@ -730,7 +793,7 @@ impl TelegramChannel {
                 .await
             }
             "/bots" => self.handle_bots_command().await,
-            "/help" | "/start" => build_help_text(true, true, true, "/"),
+            "/help" | "/start" => build_help_text(&telegram_commands(), "/"),
             _ => format!(
                 "Unknown command: {}\nType /help for available commands.",
                 cmd_raw

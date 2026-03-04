@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.13] - 2026-03-03
+
+### Added
+
+- **Telegram command menu auto-registration**: Bot commands are now registered with Telegram's `setMyCommands` API at startup, populating the `/` command menu automatically.
+- **Command definition registry**: Single source of truth for all command definitions (`CommandDef` struct with name, description, usage, and platform category) in `channels::commands`. Adding a new command to the registry automatically surfaces it in Telegram's menu and `/help` output.
+- **Platform-scoped command lists**: `telegram_commands()`, `slack_commands()`, and `discord_commands()` filter the registry by `CommandCategory` (Core, Restart, Connect, Terminal) so each platform only shows relevant commands.
+
+### Changed
+
+- **`build_help_text()` refactored**: Now accepts `&[CommandDef]` instead of boolean flags, generating the command list dynamically from the registry.
+
 ## [0.9.12] - 2026-03-03
 
 ### Added
