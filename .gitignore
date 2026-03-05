@@ -65,3 +65,13 @@ docs/
 
 # Runtime logs
 *.caffeinate.log
+*.caffeinate.pid
+
+# Claude Code local state
+.claude/
+
+# Scratch/exploration directories
+crates-explorer/
+
+# Misc scratch files
+hello_world.php
