@@ -139,11 +139,7 @@ impl Updater {
 
     /// Notify users that an update is available.
     async fn notify_update_available(&self, new_version: &str, release_notes: &str) {
-        let truncated_notes = if release_notes.len() > 500 {
-            format!("{}...", &release_notes[..500])
-        } else {
-            release_notes.to_string()
-        };
+        let truncated_notes = crate::utils::truncate_str(release_notes, 503);
 
         let action_line = match self.config.mode {
             UpdateMode::Enable => "Update will be applied automatically.",

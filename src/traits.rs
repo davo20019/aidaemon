@@ -29,7 +29,7 @@ pub use provider::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord,
     ToolChoiceMode,
 };
-pub use tools::{AgentRole, Tool, ToolCapabilities, ToolRole};
+pub use tools::{AgentRole, Tool, ToolCallMetadata, ToolCallOutcome, ToolCapabilities, ToolRole};
 pub use trigger_event::TriggerEvent;
 
 mod state_store;

@@ -533,7 +533,8 @@ impl Tool for HttpRequestTool {
                 desc.push_str(&format!(" [auth: {}]", name));
             }
             if let Some(b) = body {
-                let snippet = if b.len() > 200 { &b[..200] } else { b };
+                let boundary = crate::utils::floor_char_boundary(b, 200);
+                let snippet = if b.len() > 200 { &b[..boundary] } else { b };
                 desc.push_str(&format!("\nBody: {}", snippet));
             }
 

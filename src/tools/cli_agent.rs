@@ -42,8 +42,8 @@ const LOOP_DETECTION_THRESHOLD: usize = 50;
 /// Max concurrent CLI agent processes
 const DEFAULT_MAX_CONCURRENT: usize = 3;
 
-/// Max enriched prompt size (8 KB)
-const MAX_PROMPT_SIZE: usize = 8192;
+/// Max enriched prompt size (16 KB)
+const MAX_PROMPT_SIZE: usize = 16384;
 
 /// Max git diff size to append to results (4 KB)
 const MAX_DIFF_SIZE: usize = 4096;
@@ -810,11 +810,12 @@ impl CliAgentTool {
         session_id: &str,
         system_instruction: &str,
         task_prompt: &str,
+        working_dir: Option<&str>,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
         // System instruction (never truncated)
-        if !system_instruction.is_empty() {
+        if !system_instruction.trim().is_empty() {
             parts.push(system_instruction.to_string());
         }
 
@@ -827,17 +828,17 @@ impl CliAgentTool {
 
         // Conversation context (truncated first if over budget)
         let mut context_text = String::new();
-        if let Ok(history) = self.state.get_history(session_id, 5).await {
+        if let Ok(history) = self.state.get_history(session_id, 10).await {
             if !history.is_empty() {
                 let mut lines = Vec::new();
-                for msg in history.iter().rev().take(5) {
+                for msg in history.iter().rev().take(10) {
                     let role = &msg.role;
                     let content: String = msg
                         .content
                         .as_deref()
                         .unwrap_or("")
                         .chars()
-                        .take(200)
+                        .take(400)
                         .collect();
                     lines.push(format!("{}: {}", role, content));
                 }
@@ -845,11 +846,40 @@ impl CliAgentTool {
             }
         }
 
-        // Relevant facts
+        // Relevant facts (query both task prompt and recent user message)
         let mut facts_text = String::new();
-        if let Ok(facts) = self.state.get_relevant_facts(task_prompt, 10).await {
-            if !facts.is_empty() {
-                let fact_lines: Vec<String> = facts
+        {
+            let mut seen = HashSet::new();
+            let mut facts_accum = Vec::new();
+
+            if let Ok(facts) = self.state.get_relevant_facts(task_prompt, 15).await {
+                for fact in facts {
+                    if seen.insert((fact.category.clone(), fact.key.clone())) {
+                        facts_accum.push(fact);
+                    }
+                }
+            }
+
+            if let Ok(history) = self.state.get_history(session_id, 10).await {
+                if let Some(last_user_msg) = history.iter().rev().find(|m| m.role == "user") {
+                    if let Some(content) = last_user_msg.content.as_deref() {
+                        let user_text: String = content.chars().take(500).collect();
+                        if user_text != task_prompt {
+                            if let Ok(facts) = self.state.get_relevant_facts(&user_text, 10).await {
+                                for fact in facts {
+                                    if seen.insert((fact.category.clone(), fact.key.clone())) {
+                                        facts_accum.push(fact);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            facts_accum.truncate(20);
+            if !facts_accum.is_empty() {
+                let fact_lines: Vec<String> = facts_accum
                     .iter()
                     .map(|f| format!("- {}: {}", f.key, f.value))
                     .collect();
@@ -857,26 +887,170 @@ impl CliAgentTool {
             }
         }
 
-        // Fit within budget: truncate context first, then facts
-        let total = context_text.len() + facts_text.len();
+        // Active goal context
+        let mut active_goal_text = String::new();
+        if let Ok(goals) = self.state.get_goals_for_session(session_id).await {
+            if let Some(active_goal) = goals
+                .iter()
+                .find(|g| g.status == "active" || g.status == "in_progress")
+            {
+                active_goal_text = active_goal.description.chars().take(500).collect();
+            }
+        }
+
+        // Project docs hinting
+        let mut project_docs_text = String::new();
+        if let Some(dir) = working_dir {
+            for doc_name in ["CLAUDE.md", "README.md"] {
+                let doc_path = std::path::Path::new(dir).join(doc_name);
+                if let Ok(content) = tokio::fs::read_to_string(&doc_path).await {
+                    let mut snippet: String = content.chars().take(3072).collect();
+                    if content.chars().count() > 3072 {
+                        snippet.push_str("\n...[truncated]");
+                    }
+                    project_docs_text = format!("From {}:\n{}", doc_name, snippet);
+                    break;
+                }
+            }
+        }
+
+        // Native file listing from working directory (up to 3 levels)
+        let mut files_text = String::new();
+        if let Some(dir) = working_dir {
+            let cap = 200usize;
+            let skip: HashSet<&str> = [
+                ".git",
+                "node_modules",
+                "target",
+                "__pycache__",
+                ".venv",
+                "dist",
+                "build",
+            ]
+            .into_iter()
+            .collect();
+            let mut file_paths = Vec::new();
+
+            if let Ok(mut level1) = tokio::fs::read_dir(dir).await {
+                while let Ok(Some(entry1)) = level1.next_entry().await {
+                    if file_paths.len() >= cap {
+                        break;
+                    }
+                    let name1 = entry1.file_name().to_string_lossy().to_string();
+                    if skip.contains(name1.as_str()) {
+                        continue;
+                    }
+                    let Ok(ft1) = entry1.file_type().await else {
+                        continue;
+                    };
+                    if ft1.is_file() {
+                        file_paths.push(name1.clone());
+                        continue;
+                    }
+                    if !ft1.is_dir() {
+                        continue;
+                    }
+
+                    if let Ok(mut level2) = tokio::fs::read_dir(entry1.path()).await {
+                        while let Ok(Some(entry2)) = level2.next_entry().await {
+                            if file_paths.len() >= cap {
+                                break;
+                            }
+                            let name2 = entry2.file_name().to_string_lossy().to_string();
+                            if skip.contains(name2.as_str()) {
+                                continue;
+                            }
+                            let rel2 = format!("{}/{}", name1, name2);
+                            let Ok(ft2) = entry2.file_type().await else {
+                                continue;
+                            };
+                            if ft2.is_file() {
+                                file_paths.push(rel2);
+                                continue;
+                            }
+                            if !ft2.is_dir() {
+                                continue;
+                            }
+
+                            if let Ok(mut level3) = tokio::fs::read_dir(entry2.path()).await {
+                                while let Ok(Some(entry3)) = level3.next_entry().await {
+                                    if file_paths.len() >= cap {
+                                        break;
+                                    }
+                                    let Ok(ft3) = entry3.file_type().await else {
+                                        continue;
+                                    };
+                                    if !ft3.is_file() {
+                                        continue;
+                                    }
+                                    let name3 = entry3.file_name().to_string_lossy().to_string();
+                                    if skip.contains(name3.as_str()) {
+                                        continue;
+                                    }
+                                    file_paths.push(format!("{}/{}/{}", name1, name2, name3));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !file_paths.is_empty() {
+                file_paths.sort();
+                files_text = file_paths.join("\n");
+            }
+        }
+
+        // Fit within budget by truncating lower-priority sections first.
+        let total = active_goal_text.len()
+            + project_docs_text.len()
+            + facts_text.len()
+            + files_text.len()
+            + context_text.len();
         if total > budget {
-            let context_budget = budget / 3;
-            let facts_budget = budget - context_budget;
-            if context_text.len() > context_budget {
-                context_text = context_text.chars().take(context_budget).collect();
-                context_text.push_str("...[truncated]");
+            let goal_budget = budget / 10;
+            let docs_budget = budget * 3 / 10;
+            let facts_budget = budget * 3 / 10;
+            let files_budget = budget * 2 / 10;
+            let context_budget =
+                budget.saturating_sub(goal_budget + docs_budget + facts_budget + files_budget);
+
+            if active_goal_text.len() > goal_budget {
+                active_goal_text = active_goal_text.chars().take(goal_budget).collect();
+                active_goal_text.push_str("...[truncated]");
+            }
+            if project_docs_text.len() > docs_budget {
+                project_docs_text = project_docs_text.chars().take(docs_budget).collect();
+                project_docs_text.push_str("...[truncated]");
             }
             if facts_text.len() > facts_budget {
                 facts_text = facts_text.chars().take(facts_budget).collect();
                 facts_text.push_str("...[truncated]");
             }
+            if files_text.len() > files_budget {
+                files_text = files_text.chars().take(files_budget).collect();
+                files_text.push_str("...[truncated]");
+            }
+            if context_text.len() > context_budget {
+                context_text = context_text.chars().take(context_budget).collect();
+                context_text.push_str("...[truncated]");
+            }
         }
 
-        if !context_text.is_empty() {
-            parts.push(format!("## Relevant Context\n{}", context_text));
+        if !active_goal_text.is_empty() {
+            parts.push(format!("## Active Goal\n{}", active_goal_text));
+        }
+        if !project_docs_text.is_empty() {
+            parts.push(format!("## Project Documentation\n{}", project_docs_text));
         }
         if !facts_text.is_empty() {
             parts.push(format!("## Known Facts\n{}", facts_text));
+        }
+        if !files_text.is_empty() {
+            parts.push(format!("## Project Files\n{}", files_text));
+        }
+        if !context_text.is_empty() {
+            parts.push(format!("## Conversation Context\n{}", context_text));
         }
 
         parts.push(
@@ -1175,8 +1349,13 @@ impl CliAgentTool {
 
         // Build the enriched prompt if system_instruction is provided
         let final_prompt = if let Some(instruction) = system_instruction {
-            self.build_enriched_prompt(session_id, instruction, prompt)
-                .await
+            self.build_enriched_prompt(
+                session_id,
+                instruction,
+                prompt,
+                canonical_working_dir.as_deref(),
+            )
+            .await
         } else {
             prompt.to_string()
         };
@@ -2422,6 +2601,10 @@ impl Tool for CliAgentTool {
             idempotent: false,
             high_impact_write: true,
         }
+    }
+
+    fn is_available(&self) -> bool {
+        self.has_tools()
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -3909,10 +4092,12 @@ mod tests {
     async fn test_has_tools() {
         let (tool, _db) = setup_echo_tool().await;
         assert!(tool.has_tools());
+        assert!(Tool::is_available(&tool));
 
         // Clear all tools
         tool.tools.write().unwrap().clear();
         assert!(!tool.has_tools());
+        assert!(!Tool::is_available(&tool));
     }
 
     #[tokio::test]
@@ -3944,6 +4129,7 @@ mod tests {
                 "test-session",
                 "You are a security auditor",
                 "Audit this codebase",
+                None,
             )
             .await;
 
@@ -3958,7 +4144,7 @@ mod tests {
         let (tool, _db) = setup_echo_tool().await;
 
         let prompt = tool
-            .build_enriched_prompt("test-session", "", "Just do the task")
+            .build_enriched_prompt("test-session", "", "Just do the task", None)
             .await;
 
         // Empty instruction should not appear

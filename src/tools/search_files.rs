@@ -180,11 +180,7 @@ impl SearchResult {
         } else {
             let mut s = format!("{}:", path_str);
             for (line_num, line) in &self.matches {
-                let truncated = if line.len() > 200 {
-                    format!("{}...", &line[..200])
-                } else {
-                    line.clone()
-                };
+                let truncated = crate::utils::truncate_str(line, 203);
                 s.push_str(&format!("\n  {:>4}: {}", line_num, truncated));
             }
             s

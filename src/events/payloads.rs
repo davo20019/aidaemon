@@ -511,16 +511,12 @@ impl ToolCallData {
     }
 
     fn generate_summary(name: &str, arguments: &JsonValue) -> String {
+        use crate::utils::truncate_str;
         // Generate a brief human-readable summary of the tool call
         match name {
             "terminal" => {
                 if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
-                    let truncated = if cmd.len() > 50 {
-                        format!("{}...", &cmd[..47])
-                    } else {
-                        cmd.to_string()
-                    };
-                    format!("`{}`", truncated)
+                    format!("`{}`", truncate_str(cmd, 50))
                 } else {
                     "terminal command".to_string()
                 }
@@ -534,12 +530,7 @@ impl ToolCallData {
             }
             "web_fetch" => {
                 if let Some(url) = arguments.get("url").and_then(|v| v.as_str()) {
-                    let truncated = if url.len() > 40 {
-                        format!("{}...", &url[..37])
-                    } else {
-                        url.to_string()
-                    };
-                    truncated
+                    truncate_str(url, 40)
                 } else {
                     "fetch URL".to_string()
                 }
@@ -549,12 +540,7 @@ impl ToolCallData {
                 if let Some(obj) = arguments.as_object() {
                     if let Some((_, first_val)) = obj.iter().next() {
                         if let Some(s) = first_val.as_str() {
-                            let truncated = if s.len() > 30 {
-                                format!("{}...", &s[..27])
-                            } else {
-                                s.to_string()
-                            };
-                            return truncated;
+                            return truncate_str(s, 30);
                         }
                     }
                 }

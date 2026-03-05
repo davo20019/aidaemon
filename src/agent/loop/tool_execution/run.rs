@@ -1,4 +1,4 @@
-use super::budget_blocking::{DuplicateSendFileNoopCtx, ToolBudgetBlockCtx};
+use super::budget_blocking::{DuplicateSendFileNoopCtx, ToolBlockKind, ToolBudgetBlockCtx};
 use super::execution_io::ToolExecutionIoCtx;
 use super::guards::LoopPatternGuardOutcome;
 use super::project_dir::{
@@ -152,8 +152,15 @@ fn is_hard_policy_tool_budget_reached(
     policy_tool_budget > 0 && total_tool_calls_attempted >= policy_tool_budget
 }
 
-fn tool_result_indicates_background_detach(tool_name: &str, result_text: &str) -> bool {
+fn tool_result_indicates_background_detach(
+    tool_name: &str,
+    result_text: &str,
+    metadata: &crate::traits::ToolCallMetadata,
+) -> bool {
     let _ = tool_name;
+    if metadata.background_started {
+        return true;
+    }
     result_text.contains("Moved to background")
         || result_text.contains("started in background")
         || result_text.contains("spawned in background")
@@ -292,6 +299,7 @@ impl Agent {
             std::mem::take(ctx.dirs_with_project_inspect_file_evidence);
         let mut dirs_with_search_no_matches = std::mem::take(ctx.dirs_with_search_no_matches);
         let mut require_file_recheck_before_answer = *ctx.require_file_recheck_before_answer;
+        let mut tool_result_cache = std::mem::take(ctx.tool_result_cache);
 
         macro_rules! commit_state {
             () => {
@@ -330,6 +338,7 @@ impl Agent {
                     dirs_with_project_inspect_file_evidence;
                 *ctx.dirs_with_search_no_matches = dirs_with_search_no_matches;
                 *ctx.require_file_recheck_before_answer = require_file_recheck_before_answer;
+                *ctx.tool_result_cache = tool_result_cache;
             };
         }
 
@@ -339,6 +348,13 @@ impl Agent {
 
         let mut successful_tool_calls = 0;
         let mut iteration_had_tool_failures = false;
+        info!(
+            session_id,
+            iteration,
+            tool_count = resp.tool_calls.len(),
+            total_successful_tool_calls,
+            "Tool execution phase starting"
+        );
         for tc in &resp.tool_calls {
             let policy_tool_budget = policy_bundle.policy.tool_budget;
             if self.policy_config.policy_enforce
@@ -349,7 +365,13 @@ impl Agent {
             {
                 force_text_response = true;
                 pending_system_messages.push(format!(
-                    "[SYSTEM] Hard tool budget reached ({} calls). Stop calling tools and answer with the evidence already collected.",
+                    "[SYSTEM] Hard tool budget reached ({} calls). No more tool calls available.\n\n\
+                     You MUST now respond with a concise summary:\n\
+                     1. What you accomplished (files modified, bugs fixed, features added)\n\
+                     2. What remains unfinished and why\n\
+                     3. Any test results or verification status\n\n\
+                     Do NOT restate the original task or say what you would do next. \
+                     Focus only on concrete results and outcomes.",
                     policy_tool_budget
                 ));
                 self.emit_decision_point(
@@ -544,6 +566,7 @@ impl Agent {
                     "[SYSTEM] The previous `{}` tool call was blocked by deterministic scope locks ({}). Use paths/tool args aligned with the current request scope.",
                     tc.name, scope_reason
                 ));
+                iteration_had_tool_failures = true;
                 continue;
             }
 
@@ -581,10 +604,10 @@ Continue with tools that directly match the user request.",
                     "[SYSTEM] The previous `{}` tool call was blocked ({}). {}",
                     tc.name, contract_violation.reason, contract_violation.coaching
                 ));
+                iteration_had_tool_failures = true;
                 continue;
             }
-
-            if self
+            match self
                 .maybe_block_tool_by_budget(
                     tc,
                     &mut ToolBudgetBlockCtx {
@@ -601,9 +624,32 @@ Continue with tools that directly match the user request.",
                 )
                 .await?
             {
-                continue;
+                ToolBlockKind::NotBlocked => {}
+                ToolBlockKind::Cooldown => {
+                    // Cooldown blocks are temporary — the tool will be available
+                    // again in a few iterations. Do NOT set force_text_response;
+                    // let the agent try other tools or wait for cooldown to expire.
+                    continue;
+                }
+                ToolBlockKind::HardBlock => {
+                    // Permanent block (semantic failure limit, unknown tool, call
+                    // count limit). Activate force-text so the next LLM call
+                    // strips all tools and forces a text response. Without this,
+                    // weak models keep retrying the same blocked tool indefinitely.
+                    force_text_response = true;
+                    pending_system_messages.push(
+                        "[SYSTEM] Tool limit reached. No more tool calls available.\n\n\
+                         You MUST now respond with a concise summary:\n\
+                         1. What you accomplished (files modified, bugs fixed, features added)\n\
+                         2. What remains unfinished and why\n\
+                         3. Any test results or verification status\n\n\
+                         Do NOT restate the original task or say what you would do next. \
+                         Focus only on concrete results and outcomes."
+                            .to_string(),
+                    );
+                    continue;
+                }
             }
-
             // Budget/unknown-tool blocks are deterministic hard gates.
             // They must run BEFORE loop-pattern guards so blocked calls
             // do not inflate repetitive/same-tool counters and trigger
@@ -622,18 +668,20 @@ Continue with tools that directly match the user request.",
                     &mut recent_tool_names,
                     &mut consecutive_same_tool,
                     &mut consecutive_same_tool_arg_hashes,
+                    &tool_result_cache,
                 )
                 .await?
             {
                 match guard_outcome {
-                    LoopPatternGuardOutcome::ContinueLoop => continue,
+                    LoopPatternGuardOutcome::ContinueLoop => {
+                        continue;
+                    }
                     LoopPatternGuardOutcome::Return(outcome) => {
                         commit_state!();
                         return Ok(outcome);
                     }
                 }
             }
-
             if self
                 .maybe_handle_duplicate_send_file_noop(
                     tc,
@@ -676,6 +724,7 @@ Continue with tools that directly match the user request.",
                 .await;
             let mut result_text = io.result_text;
             let mut tool_duration_ms = io.tool_duration_ms;
+            let mut result_metadata = io.result_metadata;
             if tc.name == "run_command" && run_command_policy_block_requires_terminal(&result_text)
             {
                 if let Some(terminal_args) =
@@ -683,7 +732,7 @@ Continue with tools that directly match the user request.",
                 {
                     let fallback_started = Instant::now();
                     let terminal_result = self
-                        .execute_tool_with_watchdog(
+                        .execute_tool_with_watchdog_outcome(
                             "terminal",
                             &terminal_args,
                             &tool_exec::ToolExecCtx {
@@ -703,8 +752,14 @@ Continue with tools that directly match the user request.",
                     let fallback_note =
                         "[SYSTEM] run_command was blocked by policy; auto-routed to `terminal`.";
                     result_text = match terminal_result {
-                        Ok(text) => format!("{}\n\n{}", text, fallback_note),
-                        Err(e) => format!("Error: {}\n\n{}", e, fallback_note),
+                        Ok(outcome) => {
+                            result_metadata = outcome.metadata;
+                            format!("{}\n\n{}", outcome.output, fallback_note)
+                        }
+                        Err(e) => {
+                            result_metadata.transport_error = Some(e.to_string());
+                            format!("Error: {}\n\n{}", e, fallback_note)
+                        }
                     };
                     if self.context_window_config.enabled {
                         result_text = crate::memory::context_window::compress_tool_result(
@@ -716,7 +771,7 @@ Continue with tools that directly match the user request.",
                 }
             }
             let background_detached =
-                tool_result_indicates_background_detach(&tc.name, &result_text);
+                tool_result_indicates_background_detach(&tc.name, &result_text, &result_metadata);
 
             if background_detached {
                 pending_background_ack = Some(build_background_detach_ack(&tc.name, &result_text));
@@ -731,6 +786,46 @@ Do NOT call additional tools or poll status in this turn. Reply to the user now 
             // Track total calls per tool
             *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
 
+            // Cache successful read_file/search_files results so the repetitive
+            // redirect can replay them instead of sending a generic "BLOCKED"
+            // message.  This solves the lost-context problem: when context
+            // truncation drops earlier read results, the model re-reads the same
+            // file, gets redirected, and receives the cached content + coaching
+            // to write fixes instead of reading again.
+            if matches!(tc.name.as_str(), "read_file" | "search_files") {
+                let cache_hash = hash_tool_call(&tc.name, &tc.arguments);
+                // Cap cached content at 8KB to avoid bloating the redirect msg
+                let max_cache_chars = 8000;
+                if result_text.len() <= max_cache_chars
+                    && !result_text.starts_with("Error")
+                    && !result_text.starts_with("[SYSTEM]")
+                {
+                    tool_result_cache.insert(cache_hash, result_text.clone());
+                } else if result_text.len() > max_cache_chars {
+                    // Store a truncated version rather than nothing
+                    let mut boundary = max_cache_chars;
+                    while boundary > 0 && !result_text.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
+                    tool_result_cache.insert(
+                        cache_hash,
+                        format!(
+                            "{}…\n[truncated — {} total chars]",
+                            &result_text[..boundary],
+                            result_text.len()
+                        ),
+                    );
+                }
+                // Bound the cache size to prevent unbounded growth
+                const MAX_CACHE_ENTRIES: usize = 20;
+                if tool_result_cache.len() > MAX_CACHE_ENTRIES {
+                    // Remove the oldest entry (arbitrary, but bounded)
+                    if let Some(key) = tool_result_cache.keys().next().copied() {
+                        tool_result_cache.remove(&key);
+                    }
+                }
+            }
+
             // Track tool call for learning
             let tool_summary = format!(
                 "{}({})",
@@ -741,12 +836,22 @@ Do NOT call additional tools or poll status in this turn. Reply to the user now 
 
             // Track tool failures across iterations using structured detection
             // (prefixes, JSON error payloads, HTTP statuses, non-zero exit codes).
-            let failure_class = classify_tool_result_failure_with_args(
+            let failure_class = classify_tool_result_failure_with_context(
                 &tc.name,
                 &result_text,
                 Some(&effective_arguments),
+                Some(&result_metadata),
             );
             let is_error = failure_class.is_some();
+            info!(
+                session_id,
+                iteration,
+                tool = %tc.name,
+                is_error,
+                result_len = result_text.len(),
+                result_preview = &result_text.chars().take(80).collect::<String>() as &str,
+                "Tool execution completed"
+            );
 
             let learning_env = ResultLearningEnv {
                 attempted_required_file_recheck,
@@ -875,26 +980,43 @@ Do NOT call additional tools or poll status in this turn. Reply to the user now 
             }
         }
 
-        self.apply_post_tool_iteration_controls(
+        info!(
             session_id,
             iteration,
-            task_tokens_used,
             successful_tool_calls,
             iteration_had_tool_failures,
-            restrict_to_personal_memory_tools,
-            base_tool_defs,
-            available_capabilities,
-            policy_bundle,
-            total_tool_calls_attempted,
-            resolved_goal_id.is_some(),
-            &mut total_successful_tool_calls,
-            &mut force_text_response,
-            &mut pending_system_messages,
-            &mut tool_defs,
-            &mut stall_count,
-            &mut deferred_no_tool_streak,
-            &mut consecutive_clean_iterations,
-            &mut fallback_expanded_once,
+            total_successful_tool_calls,
+            stall_count,
+            "Tool execution phase completed, entering post-loop"
+        );
+
+        self.apply_post_tool_iteration_controls(
+            super::post_loop::PostToolIterationInputs {
+                session_id,
+                iteration,
+                task_tokens_used,
+                successful_tool_calls,
+                iteration_had_tool_failures,
+                restrict_to_personal_memory_tools,
+                base_tool_defs,
+                available_capabilities,
+                policy_bundle,
+                total_tool_calls_attempted,
+                has_active_goal: resolved_goal_id.is_some(),
+                completed_tool_calls: &learning_ctx.tool_calls,
+                recent_tool_names: &recent_tool_names,
+                user_text: _user_text,
+            },
+            super::post_loop::PostToolIterationState {
+                total_successful_tool_calls: &mut total_successful_tool_calls,
+                force_text_response: &mut force_text_response,
+                pending_system_messages: &mut pending_system_messages,
+                tool_defs: &mut tool_defs,
+                stall_count: &mut stall_count,
+                deferred_no_tool_streak: &mut deferred_no_tool_streak,
+                consecutive_clean_iterations: &mut consecutive_clean_iterations,
+                fallback_expanded_once: &mut fallback_expanded_once,
+            },
         );
         commit_state!();
         Ok(ToolExecutionOutcome::NextIteration)
@@ -1028,25 +1150,40 @@ mod tests {
 
     #[test]
     fn detects_background_detach_markers_for_supported_tools() {
+        let none = crate::traits::ToolCallMetadata::default();
+        let flagged = crate::traits::ToolCallMetadata {
+            background_started: true,
+            ..Default::default()
+        };
         assert!(tool_result_indicates_background_detach(
             "terminal",
-            "Command still running after 30s. Moved to background (pid=123)."
+            "Process finished normally.",
+            &flagged
+        ));
+        assert!(tool_result_indicates_background_detach(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=123).",
+            &none
         ));
         assert!(tool_result_indicates_background_detach(
             "cli_agent",
-            "CLI agent 'x' started in background (task_id=abc)."
+            "CLI agent 'x' started in background (task_id=abc).",
+            &none
         ));
         assert!(tool_result_indicates_background_detach(
             "spawn_agent",
-            "Sub-agent spawned in background for mission: \"...\""
+            "Sub-agent spawned in background for mission: \"...\"",
+            &none
         ));
         assert!(tool_result_indicates_background_detach(
             "web_search",
-            "Moved to background (pid=1)"
+            "Moved to background (pid=1)",
+            &none
         ));
         assert!(!tool_result_indicates_background_detach(
             "terminal",
-            "Process finished normally."
+            "Process finished normally.",
+            &none
         ));
     }
 

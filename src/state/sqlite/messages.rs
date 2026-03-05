@@ -6,7 +6,12 @@ impl crate::traits::MessageStore for SqliteStateStore {
         // Canonical persistence is event-sourced (events table). Keep only an
         // in-memory hot window here for low-latency context assembly.
         {
-            let mut wm = self.working_memory.write().await;
+            let mut wm = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.working_memory.write(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("append_message: working_memory write lock timed out"))?;
             let deque = wm
                 .entry(msg.session_id.clone())
                 .or_insert_with(VecDeque::new);
@@ -46,7 +51,25 @@ impl crate::traits::MessageStore for SqliteStateStore {
     async fn get_history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
         // Check working memory first
         {
-            let wm = self.working_memory.read().await;
+            let wm = match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.working_memory.read(),
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    tracing::warn!(
+                        session_id,
+                        "get_history: working_memory read lock timed out, falling back to DB hydrate"
+                    );
+                    // Fall through to DB hydrate path.
+                    return self.hydrate(session_id).await.map(|deque| {
+                        let msgs: Vec<_> = deque.iter().cloned().collect();
+                        crate::conversation::truncate_with_anchor(msgs, limit)
+                    });
+                }
+            };
             tracing::debug!(
                 session_id,
                 wm_sessions = wm.len(),
@@ -89,8 +112,22 @@ impl crate::traits::MessageStore for SqliteStateStore {
         );
 
         // Cache in working memory
-        let mut wm = self.working_memory.write().await;
-        wm.insert(session_id.to_string(), deque);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.working_memory.write(),
+        )
+        .await
+        {
+            Ok(mut wm) => {
+                wm.insert(session_id.to_string(), deque);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    session_id,
+                    "get_history: working_memory write lock timed out, skipping cache insert"
+                );
+            }
+        }
 
         Ok(result)
     }
@@ -109,8 +146,22 @@ impl crate::traits::MessageStore for SqliteStateStore {
     async fn clear_session(&self, session_id: &str) -> anyhow::Result<()> {
         // Clear working memory
         {
-            let mut wm = self.working_memory.write().await;
-            wm.remove(session_id);
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.working_memory.write(),
+            )
+            .await
+            {
+                Ok(mut wm) => {
+                    wm.remove(session_id);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        session_id,
+                        "clear_session: working_memory write lock timed out"
+                    );
+                }
+            }
         }
 
         // Delete session rows across canonical tables.

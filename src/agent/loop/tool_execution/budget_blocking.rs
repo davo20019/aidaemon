@@ -1,6 +1,19 @@
 use crate::agent::*;
 use crate::execution_policy::PolicyBundle;
 
+/// Distinguishes temporary blocks (cooldown) from permanent blocks (budget/limit).
+/// Cooldown blocks should NOT trigger force_text_response — the tool will be
+/// available again in a few iterations. Permanent blocks mean the tool is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToolBlockKind {
+    /// Tool was not blocked; proceed with execution.
+    NotBlocked,
+    /// Tool is in transient-failure cooldown — temporary, don't kill the task.
+    Cooldown,
+    /// Tool hit a permanent limit (semantic failures, call count, unknown tool).
+    HardBlock,
+}
+
 pub(super) struct ToolBudgetBlockCtx<'a> {
     pub emitter: &'a crate::events::EventEmitter,
     pub task_id: &'a str,
@@ -33,7 +46,7 @@ impl Agent {
         &self,
         tc: &ToolCall,
         ctx: &mut ToolBudgetBlockCtx<'_>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<ToolBlockKind> {
         // `tool_failure_count` tracks the highest repeated semantic failure signature
         // count for this tool in the current task (not aggregate misses).
         let prior_signature_failures = ctx.tool_failure_count.get(&tc.name).copied().unwrap_or(0);
@@ -72,7 +85,7 @@ impl Agent {
                     Some(ctx.task_id),
                 )
                 .await?;
-                return Ok(true);
+                return Ok(ToolBlockKind::Cooldown);
             }
             // Cooldown has elapsed; allow attempts again.
             ctx.tool_cooldown_until_iteration.remove(&tc.name);
@@ -133,9 +146,12 @@ impl Agent {
                 tc.name.as_str(),
                 "terminal"
                     | "cli_agent"
+                    | "read_file"
+                    | "edit_file"
+                    | "write_file"
+                    | "search_files"
                     | "remember_fact"
                     | "manage_memories"
-                    | "manage_goal_tasks"
                     | "web_fetch"
             )
             && !tc.name.contains("__")
@@ -179,7 +195,7 @@ impl Agent {
         };
 
         let Some(result_text) = blocked else {
-            return Ok(false);
+            return Ok(ToolBlockKind::NotBlocked);
         };
 
         warn!(
@@ -232,7 +248,7 @@ impl Agent {
         // to keep extending even when the agent is stuck hitting walls.
         // For stall detection, the iteration counter still advances,
         // which is sufficient to prevent infinite loops.
-        Ok(true)
+        Ok(ToolBlockKind::HardBlock)
     }
 
     pub(super) async fn maybe_handle_duplicate_send_file_noop(

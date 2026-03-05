@@ -212,12 +212,8 @@ impl ProbeResult {
 
     pub fn with_body(mut self, body: impl Into<String>) -> Self {
         let body = body.into();
-        // Truncate to 1KB
-        self.response_body = Some(if body.len() > 1024 {
-            format!("{}...", &body[..1021])
-        } else {
-            body
-        });
+        // Truncate to ~1KB
+        self.response_body = Some(crate::utils::truncate_str(&body, 1024));
         self
     }
 }

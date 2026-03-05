@@ -18,7 +18,7 @@ use crate::channels::ChannelHub;
 use crate::events::{
     ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, EventStore, EventType,
 };
-use crate::traits::{StateStore, Tool, ToolCapabilities};
+use crate::traits::{StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCapabilities};
 use crate::types::{ApprovalResponse, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
 
@@ -33,6 +33,9 @@ const BUFFER_CAP: usize = 1_048_576;
 const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 1;
 #[cfg(not(test))]
 const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 35;
+/// Maximum number of periodic progress pings before going silent.
+/// Prevents notification spam for long-running processes (servers, daemons).
+const MAX_BACKGROUND_PROGRESS_PINGS: u32 = 3;
 
 /// A request sent to the ChannelHub for command approval.
 pub struct ApprovalRequest {
@@ -104,6 +107,65 @@ fn contains_shell_operator(cmd: &str) -> bool {
     false
 }
 
+/// Split a chained command into individual segments by pipe, semicolon, &&, ||.
+/// Used by session-approval to extract per-segment binary names.
+fn split_command_segments(cmd: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b'|' if i + 1 < len && bytes[i + 1] == b'|' => {
+                segments.push(&cmd[start..i]);
+                i += 2;
+                start = i;
+            }
+            b'|' => {
+                segments.push(&cmd[start..i]);
+                i += 1;
+                start = i;
+            }
+            b'&' if i + 1 < len && bytes[i + 1] == b'&' => {
+                segments.push(&cmd[start..i]);
+                i += 2;
+                start = i;
+            }
+            b';' => {
+                segments.push(&cmd[start..i]);
+                i += 1;
+                start = i;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    if start < len {
+        segments.push(&cmd[start..]);
+    }
+    segments
+        .into_iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Extract the binary/command name from a single command segment.
+/// Handles variable assignments like `VAR=val cmd args...` by skipping
+/// assignment tokens and returning the first non-assignment word.
+fn extract_segment_binary(segment: &str) -> &str {
+    for word in segment.split_whitespace() {
+        // Skip shell variable assignments (e.g., EPOCH=$(date ...))
+        if word.contains('=') {
+            continue;
+        }
+        return word;
+    }
+    ""
+}
+
 fn is_grep_command(token: &str) -> bool {
     std::path::Path::new(token)
         .file_name()
@@ -131,6 +193,68 @@ fn has_recursive_grep_scope_controls(command: &str) -> bool {
         || lower.contains("--include")
         || lower.contains("-d skip")
         || lower.contains("-dskip")
+}
+
+/// Detect `python3 -c "..."` commands that perform file I/O.
+/// These should use read_file/write_file tools instead of terminal.
+fn is_python_c_with_file_io(command: &str) -> bool {
+    // Split by shell operators to check each segment
+    let lower = command.to_ascii_lowercase();
+
+    // Quick pre-check: must contain python and -c
+    if !lower.contains("python") || !lower.contains("-c") {
+        return false;
+    }
+
+    // Parse the command properly to extract the -c argument
+    let parts = match shell_words::split(command) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    // Find python/python3 followed by -c
+    let mut i = 0;
+    while i < parts.len() {
+        let base = std::path::Path::new(&parts[i])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&parts[i]);
+
+        if matches!(base, "python" | "python3") {
+            // Look for -c flag in subsequent args
+            for j in (i + 1)..parts.len() {
+                if parts[j] == "-c" {
+                    // The code string is the next argument (or concatenated)
+                    let code = if j + 1 < parts.len() {
+                        parts[j + 1].to_ascii_lowercase()
+                    } else {
+                        String::new()
+                    };
+                    let file_io_patterns = [
+                        "open(",
+                        "with open",
+                        ".read(",
+                        ".write(",
+                        ".readlines(",
+                        ".writelines(",
+                        "read_text(",
+                        "write_text(",
+                        "json.load",
+                        "json.dump",
+                        "os.walk",
+                        "os.listdir",
+                    ];
+                    if file_io_patterns.iter().any(|p| code.contains(p)) {
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    false
 }
 
 fn detect_unscoped_recursive_grep_segment(segment: &str) -> Option<(String, String)> {
@@ -350,7 +474,30 @@ impl TerminalTool {
             return true;
         }
         let trimmed = command.trim();
-        if contains_shell_operator(trimmed) {
+        let has_shell_ops = contains_shell_operator(trimmed);
+
+        // For chained commands (&&, ||, ;, |), check each segment's binary
+        // against both permanent and session-approved prefixes.
+        // This means approving `curl ... | python3 ...` also allows
+        // `curl ... | grep ...` since both curl and grep are safe/approved.
+        if has_shell_ops {
+            let session = self.session_approved.read().await;
+            // First check for exact full-command match (legacy behavior)
+            if session.iter().any(|s| trimmed == s.as_str()) {
+                return true;
+            }
+            // Then check per-segment: every segment's binary must be approved
+            let segments = split_command_segments(trimmed);
+            if !segments.is_empty() {
+                return segments.iter().all(|seg| {
+                    let binary = extract_segment_binary(seg);
+                    if binary.is_empty() {
+                        return true;
+                    }
+                    prefixes.iter().any(|p| p == "*" || binary == p.as_str())
+                        || session.iter().any(|p| p == "*" || binary == p.as_str())
+                });
+            }
             return false;
         }
 
@@ -375,14 +522,36 @@ impl TerminalTool {
     }
 
     /// Add a prefix to session-only approved list (cleared on restart).
+    /// For chained commands (containing shell operators), extracts the binary
+    /// name from each segment and stores each as a session-approved prefix.
+    /// This means approving `curl ... | python3 ... | head ...` will also
+    /// allow future commands like `curl ... | grep ... | head ...`.
+    /// For simple commands, stores the first word as prefix.
     async fn add_session_prefix(&self, command: &str) {
-        let prefix = command.split_whitespace().next().unwrap_or(command.trim());
+        let trimmed = command.trim();
         let mut session = self.session_approved.write().await;
-        if session.insert(prefix.to_string()) {
-            info!(
-                prefix,
-                "Added to session-approved prefixes (will reset on restart)"
-            );
+        if contains_shell_operator(trimmed) {
+            for seg in split_command_segments(trimmed) {
+                let binary = extract_segment_binary(seg);
+                if !binary.is_empty() && session.insert(binary.to_string()) {
+                    info!(
+                        prefix = %binary,
+                        "Session-approved prefix from chained command segment"
+                    );
+                }
+            }
+        } else {
+            let key = trimmed
+                .split_whitespace()
+                .next()
+                .unwrap_or(trimmed)
+                .to_string();
+            if session.insert(key.clone()) {
+                info!(
+                    prefix = %key,
+                    "Added to session-approved prefixes (will reset on restart)"
+                );
+            }
         }
     }
 
@@ -439,15 +608,29 @@ impl TerminalTool {
             return Err(anyhow::anyhow!("Approval channel closed: {}", send_err));
         }
 
+        // Sub-agents (session IDs starting with "sub-") get a short timeout
+        // since they can't reliably receive user approval through the channel hub.
+        // They should use safe tools (edit_file, write_file) instead of risky terminal commands.
+        let timeout_secs = if session_id.starts_with("sub-") {
+            10
+        } else {
+            300
+        };
         let response: ApprovalResponse =
-            match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), response_rx)
+                .await
+            {
                 Ok(Ok(response)) => response,
                 Ok(Err(_)) => {
                     tracing::warn!(command, "Approval response channel closed");
                     ApprovalResponse::Deny
                 }
                 Err(_) => {
-                    tracing::warn!(command, "Approval request timed out (300s), auto-denying");
+                    tracing::warn!(
+                        command,
+                        timeout_secs,
+                        "Approval request timed out, auto-denying"
+                    );
                     ApprovalResponse::Deny
                 }
             };
@@ -509,26 +692,36 @@ impl TerminalTool {
     }
 
     async fn add_prefix(&self, command: &str) {
-        let prefix = command.split_whitespace().next().unwrap_or(command.trim());
-        if prefix == "*" {
+        let trimmed = command.trim();
+        // For chained commands, store full command; for simple commands, store first word
+        let key = if contains_shell_operator(trimmed) {
+            trimmed.to_string()
+        } else {
+            command
+                .split_whitespace()
+                .next()
+                .unwrap_or(trimmed)
+                .to_string()
+        };
+        if key == "*" {
             warn!("Refusing to add wildcard '*' as permanent prefix");
             return;
         }
         let mut prefixes = self.allowed_prefixes.write().await;
-        if !prefixes.contains(&prefix.to_string()) {
-            info!(prefix, "Adding to allowed command prefixes (persistent)");
-            prefixes.push(prefix.to_string());
+        if !prefixes.contains(&key) {
+            info!(prefix = %key, "Adding to allowed command prefixes (persistent)");
+            prefixes.push(key.clone());
 
             // Persist to SQLite
             if let Some(ref pool) = self.pool {
                 if let Err(e) = sqlx::query(
                     "INSERT OR IGNORE INTO terminal_allowed_prefixes (prefix) VALUES (?)",
                 )
-                .bind(prefix)
+                .bind(&key)
                 .execute(pool)
                 .await
                 {
-                    warn!(prefix, "Failed to persist allowed prefix: {}", e);
+                    warn!(prefix = %key, "Failed to persist allowed prefix: {}", e);
                 }
             }
         }
@@ -1057,6 +1250,7 @@ impl TerminalTool {
                                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                             // Consume the immediate first tick; we want periodic pings only.
                             ping_interval.tick().await;
+                            let mut ping_count: u32 = 0;
 
                             loop {
                                 tokio::select! {
@@ -1174,6 +1368,13 @@ impl TerminalTool {
                                             return;
                                         }
 
+                                        ping_count += 1;
+                                        if ping_count > MAX_BACKGROUND_PROGRESS_PINGS {
+                                            // Stop sending periodic pings but keep waiting
+                                            // for completion to send the final notification.
+                                            // (intentionally empty — skip the rest of this branch)
+                                        } else {
+
                                         let elapsed_secs = started_at_for_notify.elapsed().as_secs();
                                         let stdout = String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
                                         let stderr = String::from_utf8_lossy(&stderr_buf.lock().await).to_string();
@@ -1248,6 +1449,7 @@ impl TerminalTool {
                                                 );
                                             }
                                         }
+                                        } // close else for ping_count cap
                                     }
                                 }
                             }
@@ -1269,7 +1471,9 @@ impl TerminalTool {
 
                 let mut msg = format!(
                     "Command still running after {}s. Moved to background (pid={}).\n\
-                     Use action=\"check\" with pid={} to see partial output, or action=\"kill\" with pid={} to stop it.",
+                     IMPORTANT: Continue with your next steps immediately — do NOT wait or repeatedly check this process.\n\
+                     You can run other commands (like curl) while this runs in the background.\n\
+                     Use action=\"check\" with pid={} to see output later, or action=\"kill\" with pid={} to stop it.",
                     elapsed, pid, pid, pid
                 );
                 if detach {
@@ -1425,6 +1629,43 @@ fn default_action() -> String {
     "run".to_string()
 }
 
+fn extract_terminal_exit_code(output: &str) -> Option<i32> {
+    let marker = "[exit code:";
+    let start = output.rfind(marker)?;
+    let rest = output[start + marker.len()..].trim_start();
+    let code_token: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+        .collect();
+    if code_token.is_empty() {
+        None
+    } else {
+        code_token.parse::<i32>().ok()
+    }
+}
+
+fn terminal_output_indicates_background_started(output: &str) -> bool {
+    output.contains("Moved to background")
+        || output.contains("Detached background command launched")
+        || output.contains("still running after")
+        || output.contains("[mode: detached]")
+}
+
+fn infer_terminal_metadata_from_output(output: &str, detach_requested: bool) -> ToolCallMetadata {
+    let background_started = terminal_output_indicates_background_started(output);
+    let detached = output.contains("Detached background command launched")
+        || output.contains("[mode: detached]")
+        || output.contains("Detached mode is enabled")
+        || (detach_requested && background_started);
+    ToolCallMetadata {
+        exit_code: extract_terminal_exit_code(output),
+        timed_out: output.contains("still running after"),
+        background_started,
+        detached,
+        transport_error: None,
+    }
+}
+
 #[async_trait]
 impl Tool for TerminalTool {
     fn name(&self) -> &str {
@@ -1444,12 +1685,12 @@ impl Tool for TerminalTool {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The command to execute (required for action=\"run\")"
+                        "description": "The shell command to execute. REQUIRED when action is \"run\"."
                     },
                     "action": {
                         "type": "string",
                         "enum": ["run", "check", "kill", "trust_all"],
-                        "description": "Action to perform: \"run\" (default) executes a command, \"check\" shows output of a background process, \"kill\" stops a background process, \"trust_all\" enables auto-approval for all commands (requires user confirmation)"
+                        "description": "Action to perform: \"run\" (default) executes a command — requires \"command\". \"check\" shows output of a background process — requires \"pid\". \"kill\" stops a background process — requires \"pid\". \"trust_all\" enables auto-approval for all commands."
                     },
                     "detach": {
                         "type": "boolean",
@@ -1460,34 +1701,8 @@ impl Tool for TerminalTool {
                         "description": "Process ID for check/kill actions (returned when a command moves to background)"
                     }
                 },
-                "required": ["action"],
-                "additionalProperties": false,
-                "anyOf": [
-                    {
-                        "required": ["action", "command"],
-                        "properties": {
-                            "action": {
-                                "enum": ["run"]
-                            }
-                        }
-                    },
-                    {
-                        "required": ["action", "pid"],
-                        "properties": {
-                            "action": {
-                                "enum": ["check", "kill"]
-                            }
-                        }
-                    },
-                    {
-                        "required": ["action"],
-                        "properties": {
-                            "action": {
-                                "enum": ["trust_all"]
-                            }
-                        }
-                    }
-                ]
+                "required": ["action", "command"],
+                "additionalProperties": false
             }
         })
     }
@@ -1512,6 +1727,16 @@ impl Tool for TerminalTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
+        self.call_with_status_outcome(arguments, status_tx)
+            .await
+            .map(|outcome| outcome.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
         let args: TerminalArgs = serde_json::from_str(arguments)?;
 
         // Reap any finished background processes on each call.
@@ -1528,20 +1753,22 @@ impl Tool for TerminalTool {
             }
         }
 
-        match args.action.as_str() {
+        let mut outcome = match args.action.as_str() {
             "check" => {
                 let pid = args
                     .pid
                     .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"check\""))?;
-                self.handle_check(pid).await
+                ToolCallOutcome::from_output(self.handle_check(pid).await?)
             }
             "kill" => {
                 let pid = args
                     .pid
                     .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"kill\""))?;
-                self.handle_kill(pid).await
+                ToolCallOutcome::from_output(self.handle_kill(pid).await?)
             }
-            "trust_all" => self.handle_trust_all(&args._session_id).await,
+            "trust_all" => {
+                ToolCallOutcome::from_output(self.handle_trust_all(&args._session_id).await?)
+            }
             _ => {
                 // "run" or default
                 let command = args
@@ -1554,18 +1781,46 @@ impl Tool for TerminalTool {
                 }
 
                 if let Some((pattern, path)) = detect_unscoped_recursive_grep(command) {
-                    return Ok(recursive_grep_block_message(&pattern, &path));
+                    return Ok(ToolCallOutcome::from_output(recursive_grep_block_message(
+                        &pattern, &path,
+                    )));
                 }
 
                 // Soft-block large heredoc file creation: redirects to write_file
                 // which writes atomically without shell quoting issues.
+                // Allow quoted heredoc delimiters (<<'EOF' or << 'EOF') since they
+                // avoid shell expansion issues and serve as a fallback when write_file
+                // fails with JSON escaping errors on complex content.
                 if command.contains("<<") && command.len() > 500 {
-                    return Ok(
-                        "Large heredoc file creation is unreliable through the terminal. \
-                         Use the `write_file` tool instead — it writes files atomically \
-                         and avoids shell quoting issues."
+                    let uses_quoted_heredoc = command.contains("<<'")
+                        || command.contains("<< '")
+                        || command.contains("<<\"")
+                        || command.contains("<< \"");
+                    if !uses_quoted_heredoc {
+                        return Ok(ToolCallOutcome::from_output(
+                            "Large heredoc file creation is unreliable through the terminal. \
+                             Use the `write_file` tool instead — it writes files atomically \
+                             and avoids shell quoting issues. If write_file fails with JSON \
+                             encoding errors, use a quoted heredoc: cat > file << 'EOF'"
+                                .to_string(),
+                        ));
+                    }
+                }
+
+                // Soft-block python3 -c with file I/O: redirects to read_file/write_file
+                // which are safer, faster, and don't require approval.
+                if is_python_c_with_file_io(command) {
+                    return Ok(ToolCallOutcome::from_output(
+                        "Blocked: `python3 -c` with file I/O is not allowed through terminal.\n\n\
+                         Use dedicated tools instead:\n\
+                         - `read_file` to read file contents\n\
+                         - `write_file` to create or overwrite files\n\
+                         - `edit_file` to modify specific parts of a file\n\
+                         - `search_files` to search for patterns in files\n\n\
+                         These tools are faster, do not require approval, and handle \
+                         encoding/quoting correctly."
                             .to_string(),
-                    );
+                    ));
                 }
 
                 let daemon_hits = detect_daemonization_primitives(command);
@@ -1576,18 +1831,18 @@ impl Tool for TerminalTool {
                         .as_deref()
                         .is_some_and(|role| role.eq_ignore_ascii_case("owner"));
                     if !is_owner {
-                        return Ok(format!(
+                        return Ok(ToolCallOutcome::from_output(format!(
                             "Blocked: daemonization primitives detected ({}) and only owners can approve detached/background process commands.",
                             daemon_hits.join(", ")
-                        ));
+                        )));
                     }
 
                     if !args.detach {
-                        return Ok(format!(
+                        return Ok(ToolCallOutcome::from_output(format!(
                             "Blocked: daemonization primitives detected ({}). \
                              Set `detach=true` explicitly for intentional long-lived background execution.",
                             daemon_hits.join(", ")
-                        ));
+                        )));
                     }
 
                     let mut warnings = vec![
@@ -1615,13 +1870,15 @@ impl Tool for TerminalTool {
                             daemonization_approved = true;
                         }
                         Ok(ApprovalResponse::Deny) => {
-                            return Ok("Daemonizing command denied by owner.".to_string());
+                            return Ok(ToolCallOutcome::from_output(
+                                "Daemonizing command denied by owner.".to_string(),
+                            ));
                         }
                         Err(e) => {
-                            return Ok(format!(
+                            return Ok(ToolCallOutcome::from_output(format!(
                                 "Could not get owner approval for daemonizing command: {}",
                                 e
-                            ));
+                            )));
                         }
                     }
                 }
@@ -1638,10 +1895,10 @@ impl Tool for TerminalTool {
                         reason = %reason,
                         "Blocked dangerous irreversible command"
                     );
-                    return Ok(format!(
+                    return Ok(ToolCallOutcome::from_output(format!(
                         "{} Use scoped, non-destructive commands instead.",
                         reason
-                    ));
+                    )));
                 }
 
                 // Check for learned patterns and potentially lower risk
@@ -1690,10 +1947,10 @@ impl Tool for TerminalTool {
                 if args.detach && is_trusted_session {
                     // Intentional: trusted scheduled sessions are auto-approved, so
                     // disallow detached long-lived processes in that mode.
-                    return Ok(
+                    return Ok(ToolCallOutcome::from_output(
                         "Blocked: detach=true is not allowed for trusted scheduled sessions."
                             .to_string(),
-                    );
+                    ));
                 }
 
                 if args.detach && !daemonization_approved {
@@ -1767,25 +2024,49 @@ impl Tool for TerminalTool {
                             if let Some(ref pool) = self.pool {
                                 let _ = record_denial(pool, command).await;
                             }
-                            return Ok("Command denied by user.".to_string());
+                            return Ok(ToolCallOutcome::from_output(
+                                "Command denied by user.".to_string(),
+                            ));
                         }
                         Err(e) => {
-                            return Ok(format!("Could not get approval: {}", e));
+                            return Ok(ToolCallOutcome::from_output(format!(
+                                "Could not get approval: {}",
+                                e
+                            )));
                         }
                     }
                 }
 
-                self.handle_run(
-                    command,
-                    &notify_session_id,
-                    args._goal_id.as_deref(),
-                    args._task_id.as_deref(),
-                    args.detach,
-                    status_tx,
+                ToolCallOutcome::from_output(
+                    self.handle_run(
+                        command,
+                        &notify_session_id,
+                        args._goal_id.as_deref(),
+                        args._task_id.as_deref(),
+                        args.detach,
+                        status_tx,
+                    )
+                    .await?,
                 )
-                .await
             }
+        };
+
+        if outcome.metadata == ToolCallMetadata::default() {
+            outcome.metadata = infer_terminal_metadata_from_output(&outcome.output, args.detach);
+        } else {
+            // Preserve any structured values if a future branch sets them directly,
+            // while still backfilling missing fields from the canonical output format.
+            if outcome.metadata.exit_code.is_none() {
+                outcome.metadata.exit_code = extract_terminal_exit_code(&outcome.output);
+            }
+            outcome.metadata.background_started |=
+                terminal_output_indicates_background_started(&outcome.output);
+            outcome.metadata.timed_out |= outcome.output.contains("still running after");
+            outcome.metadata.detached |=
+                infer_terminal_metadata_from_output(&outcome.output, args.detach).detached;
         }
+
+        Ok(outcome)
     }
 
     async fn on_task_end(&self, task_id: &str, _session_id: &str) -> anyhow::Result<()> {
@@ -1821,6 +2102,28 @@ mod tests {
             .take_while(|c| c.is_ascii_digit())
             .collect();
         digits.parse().expect("pid should parse as u32")
+    }
+
+    #[test]
+    fn infer_terminal_metadata_extracts_exit_code() {
+        let metadata = infer_terminal_metadata_from_output(
+            "[Process pid=123 finished after 2s]\nall done\n[exit code: 42]",
+            false,
+        );
+        assert_eq!(metadata.exit_code, Some(42));
+        assert!(!metadata.background_started);
+        assert!(!metadata.detached);
+    }
+
+    #[test]
+    fn infer_terminal_metadata_marks_background_and_detached() {
+        let metadata = infer_terminal_metadata_from_output(
+            "Command still running after 30s. Moved to background (pid=11).\n\nDetached mode is enabled: this process will not be auto-killed at task end.",
+            true,
+        );
+        assert!(metadata.background_started);
+        assert!(metadata.timed_out);
+        assert!(metadata.detached);
     }
 
     // ── contains_shell_operator tests ──
@@ -2441,9 +2744,9 @@ mod tests {
         )
         .await;
 
-        // Build a command >500 chars with heredoc
+        // Build a command >500 chars with UNQUOTED heredoc (should be soft-blocked)
         let large_content = "x".repeat(600);
-        let command = format!(r#"cat > /tmp/test.html << 'EOF'\n{}\nEOF"#, large_content);
+        let command = format!("cat > /tmp/test.html << EOF\n{}\nEOF", large_content);
         let args = serde_json::json!({
             "action": "run",
             "command": command,
@@ -2460,6 +2763,43 @@ mod tests {
         assert!(
             response.contains("unreliable"),
             "expected heredoc soft-block message, got: {}",
+            response
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_quoted_heredoc_allowed() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            1000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        // Build a command >500 chars with QUOTED heredoc (should be allowed)
+        let large_content = "echo 'hello'";
+        let command = format!(
+            "cat > /tmp/test.py << 'PYEOF'\n{}\nPYEOF",
+            large_content.repeat(50)
+        );
+        let args = serde_json::json!({
+            "action": "run",
+            "command": command,
+            "_session_id": "s1",
+            "_user_role": "Owner"
+        });
+
+        let response = tool.call(&args.to_string()).await.unwrap();
+        assert!(
+            !response.contains("unreliable"),
+            "quoted heredoc should NOT be soft-blocked, got: {}",
             response
         );
     }

@@ -51,6 +51,7 @@ pub(super) struct ConsultantPhaseCtx<'a> {
     pub require_file_recheck_before_answer: &'a mut bool,
     pub turn_context: &'a TurnContext,
     pub needs_tools_for_turn: &'a mut bool,
+    pub force_text_response: bool,
 }
 
 impl Agent {
@@ -127,6 +128,7 @@ impl Agent {
                 pending_background_ack: &mut *ctx.pending_background_ack,
                 require_file_recheck_before_answer: &mut *ctx.require_file_recheck_before_answer,
                 needs_tools_for_turn: *ctx.needs_tools_for_turn,
+                force_text_response: ctx.force_text_response,
             })
             .await?;
         if let Some(outcome) = completion_outcome {

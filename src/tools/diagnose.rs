@@ -1522,7 +1522,7 @@ impl Tool for DiagnoseTool {
     fn schema(&self) -> Value {
         json!({
             "name": "self_diagnose",
-            "description": "Self-diagnostics for agent task failures. Use list_tasks, timeline, diagnose, compare.",
+            "description": "Diagnose why a PREVIOUS agent task failed. ONLY use when the user explicitly asks why something failed or requests diagnostics. Do NOT call during normal task execution (code generation, file operations, etc.).",
             "parameters": {
                 "type": "object",
                 "properties": {

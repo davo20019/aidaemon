@@ -94,11 +94,7 @@ impl Tool for McpTool {
         // Audit log: truncate args for logging to avoid flooding logs with large payloads
         let args_preview: String = {
             let s = args.to_string();
-            if s.len() > 200 {
-                format!("{}...", &s[..200])
-            } else {
-                s
-            }
+            crate::utils::truncate_str(&s, 203)
         };
 
         // Threat detection: flag suspicious patterns in tool arguments
@@ -295,9 +291,10 @@ fn detect_suspicious_args(tool_name: &str, args: &str) {
 
 /// Check MCP tool output for suspicious patterns and log warnings.
 fn detect_suspicious_output(tool_name: &str, output: &str) {
-    // Only check first 4096 bytes to avoid scanning huge outputs
+    // Only check first ~4096 bytes to avoid scanning huge outputs
     let check = if output.len() > 4096 {
-        &output[..4096]
+        let boundary = crate::utils::floor_char_boundary(output, 4096);
+        &output[..boundary]
     } else {
         output
     };

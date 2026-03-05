@@ -63,14 +63,25 @@ impl Tool for EditFileTool {
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
+
+        // Parameter aliasing: models often use slightly different names
         let path_str = args["path"]
             .as_str()
+            .or_else(|| args["file_path"].as_str())
+            .or_else(|| args["file"].as_str())
+            .or_else(|| args["filename"].as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
         let old_text = args["old_text"]
             .as_str()
+            .or_else(|| args["old_string"].as_str())
+            .or_else(|| args["search"].as_str())
+            .or_else(|| args["find"].as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: old_text"))?;
         let new_text = args["new_text"]
             .as_str()
+            .or_else(|| args["new_string"].as_str())
+            .or_else(|| args["replace"].as_str())
+            .or_else(|| args["replacement"].as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: new_text"))?;
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
@@ -142,9 +153,10 @@ impl Tool for EditFileTool {
         let replaced_count = if replace_all { count } else { 1 };
         let context = get_change_context(&new_content, &effective_new_text);
         let used_newline_recovery = effective_old_text != old_text;
+        let diagnostics = fs_utils::post_write_diagnostics(&path).await;
 
         Ok(format!(
-            "Edited {}: replaced {} occurrence{}{}\n\n{}",
+            "Edited {}: replaced {} occurrence{}{}\n\n{}{}",
             path_str,
             replaced_count,
             if replaced_count > 1 { "s" } else { "" },
@@ -153,7 +165,8 @@ impl Tool for EditFileTool {
             } else {
                 ""
             },
-            context
+            context,
+            diagnostics
         ))
     }
 }

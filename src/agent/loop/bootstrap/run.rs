@@ -17,6 +17,7 @@ impl Agent {
         let status_tx = ctx.status_tx.clone();
         let user_role = ctx.user_role;
         let channel_ctx = ctx.channel_ctx.clone();
+        info!(session_id, "Bootstrap phase started");
         let resume_checkpoint = if is_resume_request(user_text) {
             match self.build_resume_checkpoint(session_id).await {
                 Ok(checkpoint) => checkpoint,
@@ -373,17 +374,30 @@ impl Agent {
         // Keep provider + router consistent for this task, even if runtime reloads.
         let llm_runtime_snapshot = self.llm_runtime.snapshot();
         let llm_provider = llm_runtime_snapshot.provider();
-        let llm_router = if self.depth == 0 {
-            llm_runtime_snapshot.router()
-        } else {
-            None
-        };
+        // All depths get the router so cascade fallback works on rate limits.
+        // Other depth-0-only features (identity detection, memory loading) have
+        // their own separate depth checks.
+        let llm_router = llm_runtime_snapshot.router();
 
         // Model selection: route to the appropriate model.
         // Consultant text-only pre-pass is disabled; iteration 1 runs deterministic
         // control-plane routing before entering the normal tool-enabled loop.
         let (selected_model, mut consultant_pass_active) = {
-            let is_override = *self.model_override.read().await;
+            let is_override = match tokio::time::timeout(
+                Duration::from_secs(2),
+                self.model_override.read(),
+            )
+            .await
+            {
+                Ok(guard) => *guard,
+                Err(_) => {
+                    warn!(
+                        session_id,
+                        "Timed out acquiring model_override lock while selecting bootstrap model"
+                    );
+                    false
+                }
+            };
             if !is_override {
                 if let Some(ref router) = llm_router {
                     let new_model = router
@@ -415,13 +429,33 @@ impl Agent {
                     let m = if self.depth == 0 {
                         llm_runtime_snapshot.primary_model()
                     } else {
-                        self.model.read().await.clone()
+                        match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await
+                        {
+                            Ok(guard) => guard.clone(),
+                            Err(_) => {
+                                warn!(
+                                    session_id,
+                                    "Timed out acquiring model lock while selecting bootstrap model"
+                                );
+                                llm_runtime_snapshot.primary_model()
+                            }
+                        }
                     };
                     (m, false)
                 }
             } else {
                 // Model override keeps normal loop behavior.
-                let m = self.model.read().await.clone();
+                let m = match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await
+                {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => {
+                        warn!(
+                            session_id,
+                            "Timed out acquiring model lock while honoring override"
+                        );
+                        llm_runtime_snapshot.primary_model()
+                    }
+                };
                 (m, false)
             }
         };

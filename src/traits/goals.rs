@@ -85,10 +85,10 @@ impl Goal {
             conditions: None,
             context: None,
             resources: None,
-            // Safety defaults: generous enough for normal usage, but prevents
-            // runaway autonomous execution from going unbounded.
+            // Safety defaults: generous enough for normal usage (including
+            // sub-agent token overhead), but prevents runaway execution.
             budget_per_check: Some(100_000),
-            budget_daily: Some(500_000),
+            budget_daily: Some(1_000_000),
             tokens_used_today: 0,
             tokens_used_day: day,
             last_useful_action: None,

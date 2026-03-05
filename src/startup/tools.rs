@@ -397,10 +397,13 @@ pub async fn register_optional_tools(
                 has_cli_agents = cli_tool.has_tools();
                 let arc = Arc::new(cli_tool);
                 cli_agent_tool = Some(arc.clone());
-                if has_cli_agents {
-                    tools.push(arc.clone());
-                } else {
-                    info!("CLI agents enabled but no tools found on system");
+                // Always register cli_agent so runtime-added agents become
+                // immediately usable without restart.
+                tools.push(arc.clone());
+                if !has_cli_agents {
+                    info!(
+                        "CLI agents enabled but no tools found on system (cli_agent registered for runtime discovery)"
+                    );
                 }
                 let manage_cli = ManageCliAgentsTool::new(arc, state.clone(), approval_tx.clone());
                 tools.push(Arc::new(manage_cli));

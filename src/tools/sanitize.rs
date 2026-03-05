@@ -82,9 +82,24 @@ static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         // most common phrases the LLM copies verbatim from injected diagnostics.
         Regex::new(r"(?m)Similar errors resolved before:\n(?:[ \t-][^\n]*\n?)*").unwrap(),
         // Raw LLM tool-call formatting tokens leaked into user-facing text.
+        // Whole-line match: lines starting with these tokens.
         Regex::new(r"(?m)^[^\S\n]*<\|tool_call[^|]*\|>?[^\n]*$").unwrap(),
+        // Inline match: <|tool_call...|> tokens appearing mid-text.
+        // Some models emit tool syntax after normal text on the same line.
+        Regex::new(r"<\|tool_call[^|]*\|>?").unwrap(),
+        // <|tool_calls_section_begin|> / <|tool_calls_section_end|> specifically.
+        Regex::new(r"<\|tool_calls?_section_(?:begin|end)\|>?").unwrap(),
+        // XML-style tool call tags (e.g. "<tool_call>write_file", "</tool_call>").
+        // Leaked when force-text mode strips tools and the LLM outputs tool syntax as text.
+        Regex::new(r"(?m)^[^\S\n]*</?tool_call>\s*\w*[^\n]*$").unwrap(),
+        // XML-style tool argument tags (e.g. "<arg_key>content</arg_key>",
+        // "<arg_value>/tmp/bank/bank.py</arg_value>").
+        // Leaked when force-text mode strips tools and the LLM emits raw argument markup.
+        Regex::new(r"(?m)^[^\S\n]*</?arg_(?:key|value)>[^\n]*$").unwrap(),
         // Raw function call markers (e.g. "functions.terminal:0 {...}").
+        // Whole-line and inline variants.
         Regex::new(r"(?m)^[^\S\n]*functions\.\w+:\d+[^\n]*$").unwrap(),
+        Regex::new(r"functions\.\w+:\d+\s*\{[^}]*\}").unwrap(),
     ]
 });
 
@@ -198,6 +213,13 @@ pub fn strip_diagnostic_blocks(content: &str) -> String {
     for pattern in DIAGNOSTIC_BLOCK_PATTERNS.iter() {
         result = pattern.replace_all(&result, "").to_string();
     }
+    // Safety-net: strip any remaining bare XML-style tool/arg tags that survived
+    // the line-anchored block patterns above. These tags can appear mid-line
+    // (e.g. "import task</arg_value>") when the LLM embeds partial tool markup
+    // inside otherwise normal text during force-text mode.
+    static INLINE_XML_TOOL_TAGS: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"</?(?:tool_call|arg_(?:key|value))>").unwrap());
+    result = INLINE_XML_TOOL_TAGS.replace_all(&result, "").to_string();
     // Collapse runs of 3+ newlines left by removed blocks into double newlines.
     static EXCESS_NEWLINES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
     result = EXCESS_NEWLINES.replace_all(&result, "\n\n").to_string();
@@ -789,6 +811,65 @@ mod tests {
         assert!(!result.contains("functions.terminal:0"));
         assert!(result.contains("I investigated the issue."));
         assert!(result.contains("Here's what went wrong."));
+    }
+
+    #[test]
+    fn test_strip_xml_style_tool_call_tags() {
+        let input = "I'll create the Calculator class with all methods.\n<tool_call>write_file\nSome real content here.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(!result.contains("<tool_call>"));
+        assert!(result.contains("I'll create the Calculator class"));
+        assert!(result.contains("Some real content here."));
+    }
+
+    #[test]
+    fn test_strip_xml_style_arg_key_value_tags() {
+        let input =
+            "return False\n<arg_key>path</arg_key>\n<arg_value>/tmp/bank/bank.py</arg_value>";
+        let result = strip_diagnostic_blocks(input);
+        assert!(!result.contains("<arg_key>"));
+        assert!(!result.contains("</arg_key>"));
+        assert!(!result.contains("<arg_value>"));
+        assert!(!result.contains("</arg_value>"));
+        assert!(result.contains("return False"));
+
+        // Also test <arg_key>content</arg_key> variant
+        let input2 = "<arg_key>content</arg_key>\n<arg_value>from typing import Dict\nclass Bank:";
+        let result2 = strip_diagnostic_blocks(input2);
+        assert!(!result2.contains("<arg_key>"));
+        assert!(result2.contains("class Bank:"));
+    }
+
+    #[test]
+    fn test_strip_inline_xml_tool_tags_mid_line() {
+        // </arg_value> appearing mid-line (not at start) — the line-anchored
+        // patterns miss these, but the inline safety-net should strip them.
+        let input = "from typing import List, Optional\nimport task</arg_value>\n\nfrom typing import List, Optional\nfrom .task import Task</arg_value>";
+        let result = strip_diagnostic_blocks(input);
+        assert!(
+            !result.contains("</arg_value>"),
+            "mid-line </arg_value> should be stripped"
+        );
+        assert!(
+            result.contains("import task"),
+            "surrounding content preserved"
+        );
+        assert!(
+            result.contains("from .task import Task"),
+            "surrounding content preserved"
+        );
+
+        // <tool_call> embedded mid-text
+        let input2 = "Let me fix this. <tool_call>edit_file some content";
+        let result2 = strip_diagnostic_blocks(input2);
+        assert!(
+            !result2.contains("<tool_call>"),
+            "inline <tool_call> stripped"
+        );
+        assert!(
+            result2.contains("Let me fix this."),
+            "surrounding text preserved"
+        );
     }
 
     mod proptest_sanitize {

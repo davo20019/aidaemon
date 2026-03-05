@@ -17,6 +17,17 @@ impl Agent {
         arguments: &str,
         ctx: &ToolExecCtx<'_>,
     ) -> anyhow::Result<String> {
+        self.execute_tool_with_watchdog_outcome(name, arguments, ctx)
+            .await
+            .map(|outcome| outcome.output)
+    }
+
+    pub(super) async fn execute_tool_with_watchdog_outcome(
+        &self,
+        name: &str,
+        arguments: &str,
+        ctx: &ToolExecCtx<'_>,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         let name = name.trim();
         let session_id = ctx.session_id;
         // `cli_agent` can legitimately run longer than the generic watchdog
@@ -24,10 +35,12 @@ impl Agent {
         // Wrapping it here causes premature cancellation (and can orphan the
         // underlying child process).
         if name == "cli_agent" {
-            return self.execute_tool(name, arguments, ctx).await;
+            return self.execute_tool_outcome(name, arguments, ctx).await;
         }
         if let Some(timeout_dur) = self.llm_call_timeout {
-            match tokio::time::timeout(timeout_dur, self.execute_tool(name, arguments, ctx)).await {
+            match tokio::time::timeout(timeout_dur, self.execute_tool_outcome(name, arguments, ctx))
+                .await
+            {
                 Ok(result) => result,
                 Err(_) => {
                     warn!(
@@ -40,16 +53,16 @@ impl Agent {
                 }
             }
         } else {
-            self.execute_tool(name, arguments, ctx).await
+            self.execute_tool_outcome(name, arguments, ctx).await
         }
     }
 
-    pub(super) async fn execute_tool(
+    pub(super) async fn execute_tool_outcome(
         &self,
         name: &str,
         arguments: &str,
         ctx: &ToolExecCtx<'_>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
         let name = name.trim();
         let session_id = ctx.session_id;
         let task_id = ctx.task_id;
@@ -120,12 +133,12 @@ impl Agent {
             if let Some(ref tracker) = self.verification_tracker {
                 if let Some(cmd) = extract_command_from_args(&enriched_args) {
                     if let Some(warning) = tracker.check_modifying_command(session_id, &cmd).await {
-                        return Ok(format!(
+                        return Ok(crate::traits::ToolCallOutcome::from_output(format!(
                             "[VERIFICATION WARNING] {}\nUnverified paths: {}\n\
-                             Verify targets exist using 'ls' or 'stat' first, then retry.",
+                                 Verify targets exist using 'ls' or 'stat' first, then retry.",
                             warning.message,
                             warning.unverified_paths.join(", ")
-                        ));
+                        )));
                     }
                 }
             }
@@ -134,7 +147,7 @@ impl Agent {
         for tool in &self.tools {
             if tool.name() == name {
                 let result = tool
-                    .call_with_status(&enriched_args, ctx.status_tx.clone())
+                    .call_with_status_outcome(&enriched_args, ctx.status_tx.clone())
                     .await;
 
                 // Post-execution: record seen paths from successful commands
@@ -164,7 +177,7 @@ impl Agent {
         if let Some(ref registry) = self.mcp_registry {
             if let Some(tool) = registry.find_tool(name).await {
                 return tool
-                    .call_with_status(&enriched_args, ctx.status_tx.clone())
+                    .call_with_status_outcome(&enriched_args, ctx.status_tx.clone())
                     .await;
             }
         }

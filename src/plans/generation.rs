@@ -147,7 +147,7 @@ fn extract_json_array(text: &str) -> anyhow::Result<String> {
 
     anyhow::bail!(
         "Could not find JSON array in response. Expected format: [\"step1\", \"step2\", ...]. Got: {}",
-        if text.len() > 200 { &text[..200] } else { text }
+        if text.len() > 200 { &text[..crate::utils::floor_char_boundary(text, 200)] } else { text }
     )
 }
 

@@ -1,5 +1,42 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum GoalBudgetCheckSource {
+    PreCheck,
+    PostLlm,
+}
+
+pub(super) struct GoalBudgetControlCtx<'a> {
+    pub emitter: &'a crate::events::EventEmitter,
+    pub task_id: &'a str,
+    pub session_id: &'a str,
+    pub iteration: usize,
+    pub goal_id: &'a str,
+    pub status: &'a crate::traits::GoalTokenBudgetStatus,
+    pub user_role: UserRole,
+    pub learning_ctx: &'a LearningContext,
+    pub evidence_gain_count: usize,
+    pub stall_count: usize,
+    pub consecutive_same_tool_count: usize,
+    pub consecutive_same_tool_unique_args: usize,
+    pub total_successful_tool_calls: usize,
+    pub pending_system_messages: &'a mut Vec<String>,
+    pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
+    pub effective_goal_daily_budget: &'a mut Option<i64>,
+    pub budget_extensions_count: &'a mut usize,
+    pub max_budget_extensions: usize,
+    pub hard_token_cap: i64,
+    pub source: GoalBudgetCheckSource,
+}
+
+pub(super) enum GoalBudgetControlOutcome {
+    Continue,
+    Exhausted {
+        tokens_used_today: i64,
+        budget_daily: i64,
+    },
+}
+
 impl Agent {
     pub(super) async fn run_task_end_tool_hooks(&self, task_id: &str, session_id: &str) {
         for tool in &self.tools {
@@ -34,7 +71,17 @@ impl Agent {
             return false;
         }
 
-        let hub_weak = self.hub.read().await.clone();
+        let hub_weak = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                warn!(
+                    session_id,
+                    scope = scope_label,
+                    "Timed out acquiring hub lock for budget extension approval"
+                );
+                return false;
+            }
+        };
         let Some(hub_weak) = hub_weak else {
             return false;
         };
@@ -74,6 +121,141 @@ impl Agent {
                 );
                 false
             }
+        }
+    }
+
+    pub(super) async fn enforce_goal_daily_budget_control(
+        &self,
+        ctx: &mut GoalBudgetControlCtx<'_>,
+    ) -> GoalBudgetControlOutcome {
+        let Some(db_budget_daily) = ctx.status.budget_daily else {
+            return GoalBudgetControlOutcome::Continue;
+        };
+        let budget_daily = ctx.effective_goal_daily_budget.unwrap_or(db_budget_daily);
+        if budget_daily <= 0 || ctx.status.tokens_used_today < budget_daily {
+            return GoalBudgetControlOutcome::Continue;
+        }
+
+        let old_gbudget = budget_daily;
+        let new_gbudget = old_gbudget
+            .saturating_mul(2)
+            .max(ctx.status.tokens_used_today.saturating_add(old_gbudget / 2))
+            .min(ctx.hard_token_cap);
+
+        let productive = ctx.evidence_gain_count >= 2
+            && post_task::is_productive(
+                ctx.learning_ctx,
+                ctx.stall_count,
+                ctx.consecutive_same_tool_count,
+                ctx.consecutive_same_tool_unique_args,
+                ctx.total_successful_tool_calls,
+            );
+
+        let (auto_condition, manual_condition, source_label) = match ctx.source {
+            GoalBudgetCheckSource::PreCheck => (
+                "goal_daily_budget_extension",
+                "goal_daily_budget_extension_manual",
+                "pre-check",
+            ),
+            GoalBudgetCheckSource::PostLlm => (
+                "goal_daily_budget_extension_post_llm",
+                "goal_daily_budget_extension_manual_post_llm",
+                "post-LLM",
+            ),
+        };
+
+        if *ctx.budget_extensions_count < ctx.max_budget_extensions
+            && old_gbudget < ctx.hard_token_cap
+            && new_gbudget > ctx.status.tokens_used_today
+            && productive
+        {
+            *ctx.budget_extensions_count += 1;
+            *ctx.effective_goal_daily_budget = Some(new_gbudget);
+            info!(
+                ctx.session_id,
+                goal_id = %ctx.goal_id,
+                old_budget = old_gbudget,
+                new_budget = new_gbudget,
+                extension = *ctx.budget_extensions_count,
+                source = source_label,
+                "Auto-extended goal daily token budget in-memory"
+            );
+            ctx.pending_system_messages.push(format!(
+                "[SYSTEM] Goal daily token budget auto-extended from {} to {} ({}/{} extensions). \
+                 Continue working.",
+                old_gbudget, new_gbudget, *ctx.budget_extensions_count, ctx.max_budget_extensions
+            ));
+            send_status(
+                ctx.status_tx,
+                StatusUpdate::BudgetExtended {
+                    old_budget: old_gbudget,
+                    new_budget: new_gbudget,
+                    extension: *ctx.budget_extensions_count,
+                    max_extensions: ctx.max_budget_extensions,
+                },
+            );
+            self.emit_decision_point(
+                ctx.emitter,
+                ctx.task_id,
+                ctx.iteration,
+                DecisionType::BudgetAutoExtension,
+                "Auto-extended goal daily token budget on productive progress".to_string(),
+                json!({
+                    "condition": auto_condition,
+                    "goal_id": ctx.goal_id,
+                    "old_budget": old_gbudget,
+                    "new_budget": new_gbudget,
+                    "extension": *ctx.budget_extensions_count,
+                    "max_extensions": ctx.max_budget_extensions,
+                }),
+            )
+            .await;
+            return GoalBudgetControlOutcome::Continue;
+        }
+
+        let approved_extension =
+            if old_gbudget < ctx.hard_token_cap && new_gbudget > ctx.status.tokens_used_today {
+                self.request_budget_continue_approval(
+                    ctx.session_id,
+                    ctx.user_role,
+                    "goal daily",
+                    ctx.status.tokens_used_today,
+                    old_gbudget,
+                    new_gbudget,
+                )
+                .await
+            } else {
+                false
+            };
+
+        if approved_extension {
+            *ctx.effective_goal_daily_budget = Some(new_gbudget);
+            ctx.pending_system_messages.push(format!(
+                "[SYSTEM] Goal daily token budget extension approved by owner: {} -> {}. \
+                 Continue working.",
+                old_gbudget, new_gbudget
+            ));
+            self.emit_decision_point(
+                ctx.emitter,
+                ctx.task_id,
+                ctx.iteration,
+                DecisionType::BudgetAutoExtension,
+                "Extended goal daily token budget via owner approval".to_string(),
+                json!({
+                    "condition": manual_condition,
+                    "goal_id": ctx.goal_id,
+                    "old_budget": old_gbudget,
+                    "new_budget": new_gbudget,
+                    "tokens_used_today": ctx.status.tokens_used_today,
+                }),
+            )
+            .await;
+            return GoalBudgetControlOutcome::Continue;
+        }
+
+        GoalBudgetControlOutcome::Exhausted {
+            tokens_used_today: ctx.status.tokens_used_today,
+            budget_daily,
         }
     }
 
@@ -208,7 +390,16 @@ impl Agent {
             )
         });
 
-        let hub = self.hub.read().await.clone();
+        let hub = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                warn!(
+                    trigger_session_id,
+                    "Timed out acquiring hub lock while faning out token alert"
+                );
+                None
+            }
+        };
         for target in targets {
             let entry =
                 crate::traits::NotificationEntry::new(&goal_ref, &target, "token_alert", message);
@@ -312,7 +503,13 @@ impl Agent {
             serde_json::json!({"role": "user", "content": user_text}),
         ];
         let provider = self.llm_runtime.provider();
-        let model = self.model.read().await.clone();
+        let model = match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                warn!("Timed out acquiring model lock during knowledge fallback");
+                return None;
+            }
+        };
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             provider.chat(&model, &messages, &[]),

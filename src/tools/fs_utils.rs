@@ -192,6 +192,88 @@ pub fn should_skip_dir(name: &str) -> bool {
     DEFAULT_IGNORE_DIRS.contains(&name)
 }
 
+/// Returns true if the filename looks like a test file (test_*.py, *_test.py).
+pub fn is_test_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let lower = name.to_lowercase();
+    (lower.starts_with("test_") && lower.ends_with(".py"))
+        || (lower.ends_with("_test.py"))
+        || (lower.starts_with("test_") && lower.ends_with(".js"))
+        || (lower.ends_with(".test.js"))
+        || (lower.ends_with(".test.ts"))
+        || (lower.ends_with(".spec.js"))
+        || (lower.ends_with(".spec.ts"))
+}
+
+/// Validate Python syntax by running py_compile. Returns None if valid, or
+/// the error message if there's a SyntaxError. Runs with a 5-second timeout.
+pub async fn validate_python_syntax(path: &Path) -> Option<String> {
+    if path.extension().map(|e| e == "py").unwrap_or(false) {
+        let path_str = path.to_string_lossy();
+        let cmd = format!(
+            "python3 -c \"import py_compile; py_compile.compile('{}', doraise=True)\"",
+            path_str.replace('\'', "'\\''")
+        );
+        match run_cmd(&cmd, None, 5).await {
+            Ok(output) if output.exit_code != 0 => {
+                let error = if !output.stderr.is_empty() {
+                    output.stderr.trim().to_string()
+                } else {
+                    output.stdout.trim().to_string()
+                };
+                // Extract just the SyntaxError line for conciseness
+                let relevant: String = error
+                    .lines()
+                    .filter(|l| {
+                        l.contains("SyntaxError")
+                            || l.contains("IndentationError")
+                            || l.contains("TabError")
+                            || l.trim().starts_with("File ")
+                            || l.trim().starts_with('^')
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if relevant.is_empty() {
+                    Some(error)
+                } else {
+                    Some(relevant)
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Build post-write diagnostics: Python syntax check + test file warning.
+/// Returns a string to append to the tool result, or empty string.
+pub async fn post_write_diagnostics(path: &Path) -> String {
+    let mut notes = Vec::new();
+
+    // Check Python syntax
+    if let Some(syntax_err) = validate_python_syntax(path).await {
+        notes.push(format!(
+            "\n⚠ SYNTAX ERROR detected in written file:\n{}\nFix the syntax error before proceeding.",
+            syntax_err
+        ));
+    }
+
+    // Warn about test file modification
+    if is_test_file(path) {
+        notes.push(
+            "\n⚠ WARNING: You modified a test file. If your task is to implement code that passes tests, \
+you should NOT modify the test file — implement the module to pass the tests as-is."
+                .to_string(),
+        );
+    }
+
+    notes.join("")
+}
+
 /// Check if a shell command contains operators that could be dangerous.
 pub fn contains_shell_operator(cmd: &str) -> bool {
     for ch in [';', '|', '`', '\n'] {

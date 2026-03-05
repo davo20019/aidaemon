@@ -675,12 +675,15 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
         let ext = &sanitized[dot_pos..];
         if ext.len() < 20 {
             let stem_len = 200 - ext.len();
-            format!("{}{}", &sanitized[..stem_len], ext)
+            let boundary = crate::utils::floor_char_boundary(&sanitized, stem_len);
+            format!("{}{}", &sanitized[..boundary], ext)
         } else {
-            sanitized[..200].to_string()
+            let boundary = crate::utils::floor_char_boundary(&sanitized, 200);
+            sanitized[..boundary].to_string()
         }
     } else {
-        sanitized[..200].to_string()
+        let boundary = crate::utils::floor_char_boundary(&sanitized, 200);
+        sanitized[..boundary].to_string()
     }
 }
 

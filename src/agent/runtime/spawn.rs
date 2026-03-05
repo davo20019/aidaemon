@@ -9,8 +9,9 @@ impl Agent {
     /// its own `spawn_agent` tool so it can recurse further.
     ///
     /// When `child_role` is `Some`, tools are scoped by role:
-    /// - TaskLead: Management + Universal tools + ManageGoalTasksTool + SpawnAgentTool
-    /// - Executor: Action + Universal tools + ReportBlockerTool, NO SpawnAgentTool
+    /// - TaskLead: Management + Universal + cli_agent (if available) +
+    ///   ManageGoalTasksTool + SpawnAgentTool
+    /// - Executor: Action + Universal + ReportBlockerTool, NO SpawnAgentTool
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_child(
         self: &Arc<Self>,
@@ -31,7 +32,13 @@ impl Agent {
         }
 
         let child_depth = self.depth + 1;
-        let model = self.model.read().await.clone();
+        let model = match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                warn!("Timed out acquiring model lock while spawning child agent");
+                self.llm_runtime.snapshot().primary_model()
+            }
+        };
 
         // Collect parent's non-spawn tools for the child.
         // Use root_tools if available (TaskLead spawning Executor needs the full
@@ -57,6 +64,18 @@ impl Agent {
                         })
                         .cloned()
                         .collect();
+                    // Give task leads direct cli_agent access when available.
+                    let has_cli_agent = if let Some(cli_tool) = full_tools
+                        .iter()
+                        .find(|t| t.name() == "cli_agent" && t.is_available())
+                    {
+                        if !tools.iter().any(|t| t.name() == "cli_agent") {
+                            tools.push(cli_tool.clone());
+                        }
+                        true
+                    } else {
+                        false
+                    };
                     // Add ManageGoalTasksTool
                     if let Some(gid) = goal_id {
                         tools.push(Arc::new(crate::tools::ManageGoalTasksTool::new(
@@ -81,6 +100,7 @@ impl Agent {
                         goal_context.as_deref(),
                         child_depth,
                         self.max_depth,
+                        has_cli_agent,
                     );
                     // Pass the full unfiltered tools as root_tools so that when
                     // this TaskLead spawns Executor children, they can access
@@ -88,12 +108,20 @@ impl Agent {
                     (tools, prompt, Some(full_tools.clone()))
                 }
                 AgentRole::Executor => {
-                    // Executors get Action + Universal tools
+                    let has_cli_agent = full_tools
+                        .iter()
+                        .any(|t| t.name() == "cli_agent" && t.is_available());
+                    // Executors get Action + Universal tools.
                     let mut tools: Vec<Arc<dyn Tool>> = full_tools
                         .iter()
                         .filter(|t| matches!(t.tool_role(), ToolRole::Action | ToolRole::Universal))
                         .cloned()
                         .collect();
+                    if has_cli_agent {
+                        // Delegation mode: avoid competing execution surfaces when
+                        // cli_agent is available for the same task.
+                        tools.retain(|t| !recall_guardrails::is_delegation_blocked_tool(t.name()));
+                    }
                     // Add ReportBlockerTool
                     if let Some(tid) = task_id {
                         tools.push(Arc::new(crate::tools::ReportBlockerTool::new(
@@ -101,7 +129,13 @@ impl Agent {
                             self.state.clone(),
                         )));
                     }
-                    let prompt = Self::build_executor_prompt(task, child_depth, self.max_depth);
+                    let prompt = Self::build_executor_prompt(
+                        task,
+                        mission,
+                        child_depth,
+                        self.max_depth,
+                        has_cli_agent,
+                    );
                     // Executors never get SpawnAgentTool
                     return self
                         .spawn_child_inner(
@@ -285,7 +319,13 @@ impl Agent {
                 goal_id,
                 child_cancel,
                 self.goal_token_registry.clone(),
-                self.hub.read().await.clone(),
+                match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => {
+                        warn!("Timed out acquiring hub lock while spawning child agent");
+                        None
+                    }
+                },
                 self.schedule_approved_sessions.clone(),
                 self.record_decision_points,
                 self.context_window_config.clone(),
@@ -338,7 +378,13 @@ impl Agent {
                 goal_id,
                 child_cancel,
                 self.goal_token_registry.clone(),
-                self.hub.read().await.clone(),
+                match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => {
+                        warn!("Timed out acquiring hub lock while spawning child agent");
+                        None
+                    }
+                },
                 self.schedule_approved_sessions.clone(),
                 self.record_decision_points,
                 self.context_window_config.clone(),
@@ -390,8 +436,22 @@ impl Agent {
                     if completed_task.status == "completed" {
                         let state = self.state.clone();
                         let provider = self.llm_runtime.provider();
-                        let model = self.fallback_model.read().await.clone();
                         let tid = task_id.clone();
+                        let model = match tokio::time::timeout(
+                            Duration::from_secs(2),
+                            self.fallback_model.read(),
+                        )
+                        .await
+                        {
+                            Ok(guard) => guard.clone(),
+                            Err(_) => {
+                                warn!(
+                                    task_id = %tid,
+                                    "Timed out acquiring fallback_model lock for task knowledge extraction"
+                                );
+                                self.llm_runtime.snapshot().primary_model()
+                            }
+                        };
                         tokio::spawn(async move {
                             if let Err(e) = crate::memory::task_learning::extract_task_knowledge(
                                 state,
@@ -447,7 +507,14 @@ impl Agent {
             }
 
             let child_depth = self.depth + 1;
-            let model = self.model.read().await.clone();
+            let model = match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await
+            {
+                Ok(guard) => guard.clone(),
+                Err(_) => {
+                    warn!("Timed out acquiring model lock while spawning task lead");
+                    self.llm_runtime.snapshot().primary_model()
+                }
+            };
 
             // Task leads get Management + Universal tools from parent
             let mut tl_tools: Vec<Arc<dyn Tool>> = self
@@ -457,6 +524,20 @@ impl Agent {
                 .filter(|t| matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal))
                 .cloned()
                 .collect();
+
+            // Give TaskLead direct cli_agent access for delegation.
+            let root_tools = self.root_tools.as_ref().unwrap_or(&self.tools);
+            let has_cli_agent = if let Some(cli_tool) = root_tools
+                .iter()
+                .find(|t| t.name() == "cli_agent" && t.is_available())
+            {
+                if !tl_tools.iter().any(|t| t.name() == "cli_agent") {
+                    tl_tools.push(cli_tool.clone());
+                }
+                true
+            } else {
+                false
+            };
 
             // Add ManageGoalTasksTool scoped to this goal
             tl_tools.push(Arc::new(crate::tools::ManageGoalTasksTool::new(
@@ -479,6 +560,7 @@ impl Agent {
                 goal_context.as_deref(),
                 child_depth,
                 self.max_depth,
+                has_cli_agent,
             );
 
             let task_text = format!(
@@ -576,7 +658,13 @@ impl Agent {
                 Some(goal_id.to_string()),        // goal_id (context injection for child)
                 child_cancel_token,               // cancel_token (derived from goal token)
                 self.goal_token_registry.clone(), // goal_token_registry
-                self.hub.read().await.clone(),    // hub
+                match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => {
+                        warn!("Timed out acquiring hub lock while spawning task lead");
+                        None
+                    }
+                }, // hub
                 self.schedule_approved_sessions.clone(),
                 self.record_decision_points,
                 self.context_window_config.clone(),
@@ -635,6 +723,7 @@ impl Agent {
         goal_context: Option<&str>,
         depth: usize,
         max_depth: usize,
+        has_cli_agent: bool,
     ) -> String {
         let mut prompt = format!(
             "You are a Task Lead managing goal: {goal_id}\n\
@@ -675,33 +764,127 @@ impl Agent {
             ));
         }
 
+        if has_cli_agent {
+            prompt.push_str(
+                "\n\n## CLI Agent Delegation\n\
+                 You have direct access to `cli_agent` (a specialized coding/research agent running on this machine).\n\
+                 Prefer `cli_agent` for execution-heavy tasks (coding, analysis, file work, command workflows).\n\
+                 Use `spawn_agent` only when work specifically needs aidaemon-only tools like memory/people/MCP.\n\
+                 Note: Executor sub-agents have `terminal`, `read_file`, `write_file`, `edit_file`, and `search_files` available alongside `cli_agent`.",
+            );
+        }
+
         prompt
     }
 
     /// Build system prompt for an Executor agent.
-    fn build_executor_prompt(task_description: &str, depth: usize, max_depth: usize) -> String {
-        format!(
+    /// Extract absolute directory paths from text (e.g. /tmp/debugme3/, /home/user/project/).
+    /// Returns deduplicated list of directory paths found.
+    fn extract_directory_paths(text: &str) -> Vec<String> {
+        let mut dirs = Vec::new();
+        // Match absolute paths: /word/word... optionally ending with /
+        for word in text.split_whitespace() {
+            // Strip trailing punctuation
+            let clean = word.trim_end_matches(|c: char| {
+                c == '.' || c == ',' || c == ':' || c == ';' || c == ')' || c == '\''
+            });
+            if clean.starts_with('/')
+                && clean.len() > 2
+                && !clean.starts_with("//")
+                // Must have at least 2 path components
+                && clean.matches('/').count() >= 2
+                // Skip common non-directory paths
+                && !clean.ends_with(".rs")
+                && !clean.ends_with(".toml")
+            {
+                // Normalize to directory (remove trailing filename if it has an extension)
+                let path = std::path::Path::new(clean);
+                let dir = if path.extension().is_some() {
+                    // Looks like a file path — take parent directory
+                    path.parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| clean.to_string())
+                } else {
+                    clean.trim_end_matches('/').to_string()
+                };
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        dirs
+    }
+
+    fn build_executor_prompt(
+        task_description: &str,
+        parent_mission: &str,
+        depth: usize,
+        max_depth: usize,
+        has_cli_agent: bool,
+    ) -> String {
+        // Extract directory paths from both parent mission and task description
+        let mut all_dirs = Self::extract_directory_paths(parent_mission);
+        for dir in Self::extract_directory_paths(task_description) {
+            if !all_dirs.contains(&dir) {
+                all_dirs.push(dir);
+            }
+        }
+
+        let mut prompt = format!(
             "You are an Executor. Complete this single task and return your results.\n\n\
-             You are a sub-agent (depth {depth}/{max_depth}).\n\n\
-             Task: {task_description}\n\n\
+             You are a sub-agent (depth {depth}/{max_depth}).\n\n"
+        );
+
+        // Inject extracted directory paths at the very top — before anything else
+        if !all_dirs.is_empty() {
+            prompt.push_str("## WORKING DIRECTORY (CRITICAL)\n");
+            prompt.push_str("All files for this task are in: ");
+            prompt.push_str(&all_dirs.join(", "));
+            prompt.push_str("\n\nYou MUST use absolute paths when calling read_file, edit_file, write_file, search_files.\n");
+            prompt.push_str("Examples:\n");
+            for dir in &all_dirs {
+                prompt.push_str(&format!(
+                    "- read_file: path=\"{dir}/filename.py\"\n\
+                     - edit_file: path=\"{dir}/filename.py\"\n\
+                     - search_files: path=\"{dir}\"\n"
+                ));
+            }
+            prompt.push_str(
+                "Do NOT use relative paths. Do NOT search in the default project directory.\n\n",
+            );
+        }
+
+        prompt.push_str(&format!(
+            "## Original User Request\n\
+             {parent_mission}\n\n\
+             ## Your Specific Task\n\
+             {task_description}\n\n\
              Rules:\n\
-             - Focus ONLY on this task. Do not expand scope.\n\
+             - Focus ONLY on your specific task. Do not expand scope.\n\
              - EXECUTE the task immediately. Do NOT ask for permission or confirmation.\n\
              - Do NOT ask \"Shall I proceed?\" or \"Would you like me to...?\". Just do the work.\n\
              - There is no human in this loop — you are an autonomous executor.\n\
-             - For searching files by name/content, use `search_files` (NOT recursive terminal grep/find).\n\
-             - Prefer `project_inspect` for high-level project discovery before ad-hoc shell exploration.\n\
+             - For modifying code: use `edit_file` (preferred) or `write_file`. NEVER use `python3 -c` to rewrite files — it is blocked.\n\
+             - For reading code: use `read_file` with ABSOLUTE paths. For searching: use `search_files` with ABSOLUTE directory path.\n\
+             - For running tests or commands: use `terminal` with simple, single-line commands.\n\
+             - Avoid multi-line terminal commands. If you need to do file edits, use `edit_file` tool.\n\
              - If terminal is unavoidable, scope commands to explicit directories and avoid scanning `target`, `node_modules`, and `.git` trees.\n\
              - If you encounter ambiguity or a blocker you cannot resolve, use report_blocker immediately.\n\
              - Return the FULL content you produced — not a meta-description of what you did.\n\
-             - If your task is research: return all findings, data points, and analysis in detail.\n\
-             - If your task is to write a report: return the complete report text.\n\
-             - If your task is to run a command: return the full output.\n\
              - NEVER return just \"I researched X\" or \"Generated a report about Y\". Return the actual content.\n\
              - Include specific outputs (file paths, data retrieved, commands run).\n\
              - If you create or write a file, include its FULL ABSOLUTE PATH in your result text.\n\
              - Do NOT spawn sub-agents."
-        )
+        ));
+
+        if has_cli_agent {
+            prompt.push_str(
+                "\n- `cli_agent` is available for multi-step coding, research, and file work.\n\
+                 For simple operations (single commands, file reads), prefer `terminal` directly.",
+            );
+        }
+
+        prompt
     }
 }
 
@@ -711,16 +894,65 @@ mod tests {
 
     #[test]
     fn executor_prompt_includes_search_files_preference() {
-        let prompt = Agent::build_executor_prompt("find async fns", 2, 4);
-        assert!(prompt.contains("use `search_files`"));
-        assert!(prompt.contains("NOT recursive terminal grep/find"));
+        let prompt = Agent::build_executor_prompt("find async fns", "user request", 2, 4, false);
+        assert!(prompt.contains("search_files"));
+        assert!(prompt.contains("edit_file"));
         assert!(prompt.contains("avoid scanning `target`, `node_modules`, and `.git`"));
     }
 
     #[test]
+    fn executor_prompt_extracts_directory_paths_from_mission() {
+        let prompt = Agent::build_executor_prompt(
+            "Fix the bug in task_scheduler.py",
+            "There are 5 bugs in /tmp/debugme3/. Fix them all.",
+            2,
+            4,
+            false,
+        );
+        assert!(
+            prompt.contains("WORKING DIRECTORY"),
+            "Should have WORKING DIRECTORY section"
+        );
+        assert!(
+            prompt.contains("/tmp/debugme3"),
+            "Should extract /tmp/debugme3 path"
+        );
+        assert!(
+            prompt.contains("read_file: path=\"/tmp/debugme3/filename.py\""),
+            "Should show read_file example"
+        );
+    }
+
+    #[test]
+    fn extract_directory_paths_basic() {
+        let dirs = Agent::extract_directory_paths("Fix bugs in /tmp/debugme3/ and run tests");
+        assert_eq!(dirs, vec!["/tmp/debugme3"]);
+
+        let dirs = Agent::extract_directory_paths("Edit /home/user/project/foo.py");
+        assert_eq!(dirs, vec!["/home/user/project"]);
+
+        let dirs = Agent::extract_directory_paths("No paths here");
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
     fn task_lead_prompt_requires_concrete_final_results() {
-        let prompt = Agent::build_task_lead_prompt("goal_1", "audit disk usage", None, 1, 3);
+        let prompt = Agent::build_task_lead_prompt("goal_1", "audit disk usage", None, 1, 3, false);
         assert!(prompt.contains("final reply MUST include concrete executor results"));
         assert!(prompt.contains("not just \"goal completed\""));
+    }
+
+    #[test]
+    fn executor_prompt_mentions_cli_delegate_mode_when_cli_present() {
+        let prompt = Agent::build_executor_prompt("refactor auth", "user request", 2, 4, true);
+        assert!(prompt.contains("`cli_agent` is available"));
+        assert!(prompt.contains("prefer `terminal` directly"));
+    }
+
+    #[test]
+    fn task_lead_prompt_mentions_cli_agent_when_available() {
+        let prompt = Agent::build_task_lead_prompt("goal_2", "build release", None, 1, 3, true);
+        assert!(prompt.contains("## CLI Agent Delegation"));
+        assert!(prompt.contains("Prefer `cli_agent`"));
     }
 }

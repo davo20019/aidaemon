@@ -5,6 +5,10 @@ use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+/// Window in seconds during which identical messages to the same session
+/// are treated as duplicates, even after the original was popped from the queue.
+const DEDUP_WINDOW_SECS: i64 = 120;
+
 /// A queued message waiting to be processed.
 #[derive(Clone, Debug)]
 pub struct QueuedMessage {
@@ -56,6 +60,10 @@ pub struct TaskRegistry {
     max_completed: usize,
     /// Message queues per session - messages wait here when a task is running.
     queues: RwLock<HashMap<String, VecDeque<QueuedMessage>>>,
+    /// Recently seen message fingerprints per session for deduplication.
+    /// Key: (session_id, text_hash), Value: timestamp when first seen.
+    /// This survives message pops so webhook retries are caught.
+    recently_seen: RwLock<HashMap<(String, u64), DateTime<Utc>>>,
 }
 
 impl TaskRegistry {
@@ -65,7 +73,16 @@ impl TaskRegistry {
             next_id: AtomicU64::new(1),
             max_completed,
             queues: RwLock::new(HashMap::new()),
+            recently_seen: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Simple hash for dedup fingerprinting.
+    fn text_hash(text: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Register a new task. Returns the task ID and a cancellation token.
@@ -206,34 +223,94 @@ impl TaskRegistry {
             .map(|h| h.entry.description.clone())
     }
 
+    /// Atomically mark a message as "seen" for dedup purposes.
+    /// Returns `true` if this is the first time (caller should proceed),
+    /// or `false` if a duplicate (caller should drop the message).
+    ///
+    /// Call this at the start of **direct** message processing (when no task
+    /// is already running) to prevent concurrent webhook handlers from all
+    /// bypassing `queue_message()` and starting separate processing flows.
+    pub async fn mark_seen(&self, session_id: &str, text: &str) -> bool {
+        let now = Utc::now();
+        let hash = Self::text_hash(text);
+        let key = (session_id.to_string(), hash);
+        let mut seen = self.recently_seen.write().await;
+        seen.retain(|_, ts| (now - *ts).num_seconds() < DEDUP_WINDOW_SECS);
+        use std::collections::hash_map::Entry;
+        match seen.entry(key) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                e.insert(now);
+                true
+            }
+        }
+    }
+
     /// Queue a message for later processing.
     /// Returns `Some(position)` if queued, or `None` if deduplicated (identical message
-    /// already exists in the queue within the dedup window).
+    /// already exists in the queue or was recently processed).
     pub async fn queue_message(&self, session_id: &str, text: &str) -> Option<usize> {
+        let now = Utc::now();
+        let hash = Self::text_hash(text);
+        let key = (session_id.to_string(), hash);
+
+        // Check recently_seen first — this survives queue pops and catches
+        // webhook retries even after the original message was processed.
+        {
+            let mut seen = self.recently_seen.write().await;
+            // Prune stale entries while we hold the lock.
+            seen.retain(|_, ts| (now - *ts).num_seconds() < DEDUP_WINDOW_SECS);
+
+            if let Some(first_seen) = seen.get(&key) {
+                if (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS {
+                    return None; // Duplicate — silently drop
+                }
+            }
+            seen.insert(key, now);
+        }
+
         let mut queues = self.queues.write().await;
         let queue = queues.entry(session_id.to_string()).or_default();
 
-        // Dedup: skip if an identical message is already in the queue and was queued
-        // within the last 30 seconds. This prevents duplicate processing when a client
-        // sends the same message multiple times in rapid succession.
-        let is_duplicate = queue
-            .iter()
-            .any(|m| m.text == text && (Utc::now() - m.queued_at).num_seconds() < 30);
-        if is_duplicate {
-            return None;
-        }
-
         queue.push_back(QueuedMessage {
             text: text.to_string(),
-            queued_at: Utc::now(),
+            queued_at: now,
         });
         Some(queue.len())
     }
 
     /// Pop the next queued message for a session.
+    #[allow(dead_code)] // Retained for compatibility with single-pop queue consumers.
     pub async fn pop_queued_message(&self, session_id: &str) -> Option<QueuedMessage> {
         let mut queues = self.queues.write().await;
         queues.get_mut(session_id).and_then(|q| q.pop_front())
+    }
+
+    /// Drain all queued messages for a session and coalesce into one.
+    /// When a long message is fragmented by the client (e.g. Telegram Web),
+    /// each fragment lands as a separate queued message. This method pops
+    /// them all and concatenates their text with newlines so the agent
+    /// sees the full message as a single prompt.
+    pub async fn pop_all_queued_messages(&self, session_id: &str) -> Option<QueuedMessage> {
+        let mut queues = self.queues.write().await;
+        let queue = queues.get_mut(session_id)?;
+        if queue.is_empty() {
+            return None;
+        }
+        let first = queue.pop_front().unwrap();
+        if queue.is_empty() {
+            return Some(first);
+        }
+        // Coalesce remaining messages into the first
+        let mut combined = first.text;
+        while let Some(msg) = queue.pop_front() {
+            combined.push('\n');
+            combined.push_str(&msg.text);
+        }
+        Some(QueuedMessage {
+            text: combined,
+            queued_at: first.queued_at,
+        })
     }
 
     /// Get the number of queued messages for a session.
@@ -264,7 +341,7 @@ mod tests {
         let result = registry.queue_message(session, "hello world").await;
         assert_eq!(result, Some(1));
 
-        // Identical message within 30s is deduplicated
+        // Identical message within dedup window is deduplicated
         let result = registry.queue_message(session, "hello world").await;
         assert_eq!(result, None);
 
@@ -289,7 +366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_queue_allows_requeue_after_pop() {
+    async fn test_queue_deduplicates_after_pop() {
         let registry = TaskRegistry::new(10);
         let session = "test-session";
 
@@ -301,8 +378,77 @@ mod tests {
         assert!(popped.is_some());
         assert_eq!(popped.unwrap().text, "hello");
 
-        // Same message can be queued again after being popped (queue is empty now)
+        // Same message should STILL be deduplicated after pop (within dedup window).
+        // This prevents webhook retry duplicates from re-entering the queue.
         let result = registry.queue_message(session, "hello").await;
-        assert_eq!(result, Some(1));
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_mark_seen_prevents_duplicates() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // First call returns true (proceed)
+        assert!(registry.mark_seen(session, "hello world").await);
+
+        // Second call with same text returns false (duplicate)
+        assert!(!registry.mark_seen(session, "hello world").await);
+
+        // Different text returns true
+        assert!(registry.mark_seen(session, "different text").await);
+
+        // Different session with same text returns true
+        assert!(registry.mark_seen("other-session", "hello world").await);
+    }
+
+    #[tokio::test]
+    async fn test_mark_seen_blocks_subsequent_queue() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // mark_seen first (simulates direct processing)
+        assert!(registry.mark_seen(session, "hello").await);
+
+        // queue_message for the same text should be deduplicated
+        let result = registry.queue_message(session, "hello").await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_pop_all_coalesces_fragments() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // Simulate a long message fragmented into 4 parts
+        registry.queue_message(session, "Part 1: Hello").await;
+        registry.queue_message(session, "Part 2: World").await;
+        registry.queue_message(session, "Part 3: How are").await;
+        registry.queue_message(session, "Part 4: you?").await;
+        assert_eq!(registry.queue_len(session).await, 4);
+
+        // pop_all should coalesce into a single message
+        let coalesced = registry.pop_all_queued_messages(session).await;
+        assert!(coalesced.is_some());
+        let msg = coalesced.unwrap();
+        assert_eq!(
+            msg.text,
+            "Part 1: Hello\nPart 2: World\nPart 3: How are\nPart 4: you?"
+        );
+
+        // Queue should now be empty
+        assert_eq!(registry.queue_len(session).await, 0);
+        assert!(registry.pop_all_queued_messages(session).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pop_all_single_message() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        registry.queue_message(session, "only one").await;
+        let result = registry.pop_all_queued_messages(session).await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().text, "only one");
     }
 }

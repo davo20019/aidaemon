@@ -60,7 +60,18 @@ impl ChannelHub {
     #[allow(dead_code)]
     pub async fn register_channel(&self, channel: Arc<dyn Channel>) -> String {
         let name = channel.name();
-        let mut channels = self.channels.write().await;
+        let mut channels = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.channels.write(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                warn!(channel = %name, "Timed out acquiring channels write lock while registering channel");
+                return name;
+            }
+        };
         channels.push(channel);
         info!(channel = %name, total = channels.len(), "Registered new channel");
         name
@@ -75,8 +86,32 @@ impl ChannelHub {
     /// Find the channel that owns a session.
     /// Returns None for unknown sessions to prevent cross-channel privacy leaks.
     async fn channel_for_session(&self, session_id: &str) -> Option<Arc<dyn Channel>> {
-        let map = self.session_map.read().await;
-        let channels = self.channels.read().await;
+        let map =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), self.session_map.read())
+                .await
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    warn!(
+                        session_id,
+                        "Timed out acquiring session_map read lock while routing session"
+                    );
+                    return None;
+                }
+            };
+        let channels =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), self.channels.read())
+                .await
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    warn!(
+                        session_id,
+                        "Timed out acquiring channels read lock while routing session"
+                    );
+                    return None;
+                }
+            };
         if let Some(channel_name) = map.get(session_id) {
             if let Some(ch) = channels.iter().find(|c| &c.name() == channel_name) {
                 return Some(ch.clone());
@@ -389,15 +424,29 @@ impl ChannelHub {
         {
             let now = tokio::time::Instant::now();
             let text_norm = text.trim();
-            let mut last = self.last_sent_text.write().await;
-            if let Some((prev, prev_at)) = last.get(session_id) {
-                if prev.trim() == text_norm
-                    && now.duration_since(*prev_at) < std::time::Duration::from_secs(10)
-                {
-                    return Ok(());
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.last_sent_text.write(),
+            )
+            .await
+            {
+                Ok(mut last) => {
+                    if let Some((prev, prev_at)) = last.get(session_id) {
+                        if prev.trim() == text_norm
+                            && now.duration_since(*prev_at) < std::time::Duration::from_secs(10)
+                        {
+                            return Ok(());
+                        }
+                    }
+                    last.insert(session_id.to_string(), (text_norm.to_string(), now));
+                }
+                Err(_) => {
+                    warn!(
+                        session_id,
+                        "Timed out acquiring dedupe lock in send_text; continuing without dedupe"
+                    );
                 }
             }
-            last.insert(session_id.to_string(), (text_norm.to_string(), now));
         }
 
         if let Some(channel) = self.channel_for_session(session_id).await {

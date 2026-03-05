@@ -61,8 +61,12 @@ impl Tool for ReadFileTool {
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
+        // Parameter aliasing: models often use "file_path" or "file" instead of "path"
         let path_str = args["path"]
             .as_str()
+            .or_else(|| args["file_path"].as_str())
+            .or_else(|| args["file"].as_str())
+            .or_else(|| args["filename"].as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
 
         let path = fs_utils::validate_path(path_str)?;
@@ -122,6 +126,9 @@ impl Tool for ReadFileTool {
                 total_lines
             );
         }
+
+        // Ensure start <= end (LLM may provide start_line > end_line)
+        let end = end.max(start);
 
         let selected: Vec<&str> = lines[start..end].to_vec();
         let selected_content = selected.join("\n");

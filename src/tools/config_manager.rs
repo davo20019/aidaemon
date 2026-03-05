@@ -86,6 +86,19 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         requires_custom_base_url: false,
     },
     ProviderPreset {
+        id: "xai",
+        aliases: &["x.ai", "grok"],
+        display_name: "xAI (Grok)",
+        kind: "xai_native",
+        base_url: "https://api.x.ai/v1",
+        primary: "grok-4",
+        fast: "grok-4",
+        smart: "grok-4",
+        needs_api_key: true,
+        supports_gateway_token: false,
+        requires_custom_base_url: false,
+    },
+    ProviderPreset {
         id: "anthropic_native",
         aliases: &["anthropic"],
         display_name: "Anthropic (Native)",
@@ -701,7 +714,7 @@ impl Tool for ConfigManagerTool {
                     },
                     "provider": {
                         "type": "string",
-                        "description": "Provider preset for switch_provider (e.g. moonshot, minimax, openai, cloudflare_gateway, custom_openai_compatible)."
+                        "description": "Provider preset for switch_provider (e.g. openai, xai, moonshot, minimax, cloudflare_gateway, custom_openai_compatible)."
                     },
                     "api_key": {
                         "type": "string",
@@ -986,11 +999,15 @@ mod tests {
 
         let kimi = ConfigManagerTool::find_provider_preset("kimi").unwrap();
         assert_eq!(kimi.id, "moonshot");
+
+        let xai = ConfigManagerTool::find_provider_preset("grok").unwrap();
+        assert_eq!(xai.id, "xai");
     }
 
     #[test]
     fn list_provider_presets_message_includes_expected_entries() {
         let msg = ConfigManagerTool::list_provider_presets_message();
+        assert!(msg.contains("xAI (Grok)"));
         assert!(msg.contains("cloudflare_gateway"));
         assert!(msg.contains("custom_openai_compatible"));
         assert!(msg.contains("\"action\":\"switch_provider\""));

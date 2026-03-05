@@ -208,11 +208,7 @@ impl McpClient {
                                 let trimmed = line.trim_end();
                                 if !trimmed.is_empty() {
                                     // Truncate long stderr lines to prevent log flooding
-                                    let safe_line = if trimmed.len() > 500 {
-                                        format!("{}... [truncated]", &trimmed[..500])
-                                    } else {
-                                        trimmed.to_string()
-                                    };
+                                    let safe_line = crate::utils::truncate_str(trimmed, 503);
                                     warn!(mcp_server = %cmd_name, "{}", safe_line);
                                 }
                             }

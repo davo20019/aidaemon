@@ -24,7 +24,7 @@ use crate::tools::memory::RememberFactTool;
 use crate::tools::{SystemInfoTool, TerminalTool};
 use crate::traits::{
     Channel, ChannelCapabilities, ChatOptions, ModelProvider, ProviderResponse, TokenUsage, Tool,
-    ToolCall,
+    ToolCall, ToolRole,
 };
 use crate::types::{ApprovalResponse, MediaMessage};
 
@@ -551,6 +551,8 @@ pub struct MockTool {
     tool_name: String,
     tool_description: String,
     return_value: String,
+    role: ToolRole,
+    available: bool,
 }
 
 #[allow(dead_code)]
@@ -560,7 +562,19 @@ impl MockTool {
             tool_name: name.to_string(),
             tool_description: description.to_string(),
             return_value: return_value.to_string(),
+            role: ToolRole::Action,
+            available: true,
         }
+    }
+
+    pub fn with_role(mut self, role: ToolRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    pub fn with_availability(mut self, available: bool) -> Self {
+        self.available = available;
+        self
     }
 }
 
@@ -588,6 +602,14 @@ impl Tool for MockTool {
 
     async fn call(&self, _args: &str) -> anyhow::Result<String> {
         Ok(self.return_value.clone())
+    }
+
+    fn tool_role(&self) -> ToolRole {
+        self.role
+    }
+
+    fn is_available(&self) -> bool {
+        self.available
     }
 }
 

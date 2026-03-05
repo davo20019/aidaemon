@@ -259,6 +259,36 @@ If the user is asking to store facts, use `remember_fact` instead."
                     *result_text = format!("{}\n\n{}", result_text, coach);
                 }
 
+                // write_file JSON escaping recovery: when write_file fails with
+                // JSON parsing errors, the LLM's tool call JSON had improperly escaped
+                // content (common with code containing backslashes like JSON parsers,
+                // regex engines, etc.). Direct the LLM to use terminal heredoc instead.
+                if tc.name == "write_file"
+                    && (base_error.contains("EOF while parsing")
+                        || base_error.contains("trailing characters")
+                        || base_error.contains("invalid escape")
+                        || base_error.contains("control character"))
+                {
+                    let write_path = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("path")
+                                .and_then(|p| p.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_else(|| "<target file>".to_string());
+                    *result_text = format!(
+                        "{}\n\n[SYSTEM] write_file recovery: The file content has characters that broke \
+JSON encoding in the tool call arguments (backslashes, quotes, etc.). \
+Retry write_file but carefully escape ALL backslashes (\\\\) and quotes (\\\") in the content string. \
+For code with many special chars (regex, JSON), double-check each backslash is escaped as \\\\. \
+If write_file fails again, use terminal with a SHORT heredoc:\n\
+cat > {} << 'PYEOF'\n<content here>\nPYEOF\n\
+Keep heredoc commands under 3000 chars to avoid approval message truncation.",
+                        result_text, write_path
+                    );
+                }
+
                 if tc.name == "edit_file" {
                     let edit_path = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                         .ok()
@@ -268,7 +298,26 @@ If the user is asking to store facts, use `remember_fact` instead."
                                 .map(|s| s.to_string())
                         })
                         .unwrap_or_else(|| "<same file>".to_string());
-                    if base_error.contains("Text not found in ") {
+                    // edit_file JSON escaping recovery: when edit_file fails with
+                    // JSON parsing errors, the old_text/new_text content broke the
+                    // tool call JSON (backslashes, quotes, unicode escapes).
+                    // Direct to terminal sed for small fixes, or heredoc for rewrites.
+                    if base_error.contains("EOF while parsing")
+                        || base_error.contains("trailing characters")
+                        || base_error.contains("invalid escape")
+                        || base_error.contains("control character")
+                    {
+                        *result_text = format!(
+                            "{}\n\n[SYSTEM] edit_file recovery: The edit content has characters that broke \
+JSON encoding (backslashes, quotes, unicode escapes). Do NOT retry edit_file with the same content. \
+Instead, use the terminal tool with `sed` for small targeted fixes:\n\
+  sed -i '' 's/old_pattern/new_pattern/' {}\n\
+Or rewrite the entire file using a QUOTED heredoc:\n\
+  cat > {} << 'PYEOF'\n<full corrected file>\nPYEOF\n\
+The single-quoted delimiter prevents shell expansion.",
+                            result_text, edit_path, edit_path
+                        );
+                    } else if base_error.contains("Text not found in ") {
                         *result_text = format!(
                             "{}\n\n[SYSTEM] edit_file recovery: do NOT ask the user for file contents yet. \
 Call read_file(path=\"{}\") now, then retry edit_file with exact copied old_text. \

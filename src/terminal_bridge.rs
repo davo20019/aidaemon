@@ -1096,6 +1096,56 @@ fn requested_relay_session_id_from_client_hello(frame: &Value) -> Option<String>
     None
 }
 
+fn parse_boolish_client_hello_value(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(v) => Some(*v),
+        Value::Number(n) => n
+            .as_u64()
+            .map(|v| v != 0)
+            .or_else(|| n.as_i64().map(|v| v != 0)),
+        Value::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return None;
+            }
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "y" | "on" => Some(true),
+                "0" | "false" | "no" | "n" | "off" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn requested_fresh_start_from_client_hello(frame: &Value) -> bool {
+    let key_order = [
+        "fresh_start",
+        "freshStart",
+        "force_fresh_start",
+        "forceFreshStart",
+        "start_fresh",
+        "startFresh",
+    ];
+    for key in key_order {
+        if let Some(raw) = frame.get(key) {
+            if let Some(value) = parse_boolish_client_hello_value(raw) {
+                return value;
+            }
+        }
+    }
+    if let Some(launch_obj) = frame.get("launch").and_then(Value::as_object) {
+        for key in key_order {
+            if let Some(raw) = launch_obj.get(key) {
+                if let Some(value) = parse_boolish_client_hello_value(raw) {
+                    return value;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn is_safe_agent_bootstrap_arg(value: &str) -> bool {
     if value.contains("$(") || value.contains('\n') || value.contains('\r') {
         return false;
@@ -3605,6 +3655,13 @@ impl TerminalBridge {
                     };
                     if let Err(err) = self.handle_shell_event(event, Some(&mut outbound_queue)) {
                         warn!(error = %err, "Failed to relay shell output event");
+                        continue;
+                    }
+                    // Under continuous PTY output (spinner frames, progress redraws), keep draining
+                    // outbound payloads immediately so low-priority stdout doesn't get starved.
+                    if !outbound_queue.is_empty() {
+                        self.flush_outbound_queue(&mut outbound_queue, &mut ws_write, OUTBOUND_FLUSH_BURST)
+                            .await?;
                     }
                 }
                 _ = std::future::ready(()), if !outbound_queue.is_empty() => {
@@ -4731,6 +4788,7 @@ impl TerminalBridge {
         let requested_agent_args = requested_agent_args_from_client_hello(frame);
         let requested_relay_session_id = requested_relay_session_id_from_client_hello(frame);
         let telegram_session_id = requested_telegram_session_id_from_client_hello(frame);
+        let requested_fresh_start = requested_fresh_start_from_client_hello(frame);
         let mut remap_source_session_id: Option<String> = None;
         let mut remap_reason: Option<&'static str> = None;
         if let Some(explicit_relay_session_id) = requested_relay_session_id.as_deref() {
@@ -4796,19 +4854,17 @@ impl TerminalBridge {
             &client_pub_b64,
         )?;
 
-        // If the client is requesting a fresh agent start (resume_from_seq == 0, agent
-        // requested) but the existing session already bootstrapped an agent, the old
-        // agent process is likely dead/stale (e.g., Mini App's "Resume failed" → start
-        // new session).  Tear down the stale session so we fall through to spawn a fresh
-        // shell + agent below.
-        if requested_agent.is_some() && resume_from_seq == 0 {
+        // Only tear down an already-bootstrapped session when the client explicitly
+        // asks for a fresh start. A plain Mini App reopen resets local replay cursors
+        // to zero, so resume_from_seq == 0 alone must not trigger session teardown.
+        if requested_fresh_start && requested_agent.is_some() && resume_from_seq == 0 {
             if let Some(active) = self.sessions.get(relay_session_id) {
                 if active.crypto.bootstrapped_agent {
                     info!(
                         relay_session_id,
                         old_agent = active.crypto.agent.as_deref().unwrap_or("none"),
                         new_agent = requested_agent.as_deref().unwrap_or("none"),
-                        "Tearing down stale session for fresh agent start (resume_from_seq=0)"
+                        "Tearing down stale session for explicit fresh agent start"
                     );
                     self.remove_session(relay_session_id, "fresh agent start")
                         .await;
@@ -6695,6 +6751,44 @@ mod tests {
             "relay_session_id": "native-1234/../../etc/passwd",
         });
         assert!(requested_relay_session_id_from_client_hello(&frame).is_none());
+    }
+
+    #[test]
+    fn test_requested_fresh_start_from_client_hello_accepts_boolean_flag() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "fresh_start": true,
+        });
+        assert!(requested_fresh_start_from_client_hello(&frame));
+    }
+
+    #[test]
+    fn test_requested_fresh_start_from_client_hello_accepts_string_flag() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "freshStart": "yes",
+        });
+        assert!(requested_fresh_start_from_client_hello(&frame));
+    }
+
+    #[test]
+    fn test_requested_fresh_start_from_client_hello_accepts_nested_launch_flag() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "launch": {
+                "force_fresh_start": 1
+            }
+        });
+        assert!(requested_fresh_start_from_client_hello(&frame));
+    }
+
+    #[test]
+    fn test_requested_fresh_start_from_client_hello_defaults_false() {
+        let frame = serde_json::json!({
+            "type": "e2ee_client_hello",
+            "fresh_start": "maybe",
+        });
+        assert!(!requested_fresh_start_from_client_hello(&frame));
     }
 
     #[test]

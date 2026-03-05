@@ -20,7 +20,14 @@ impl Agent {
         exclude: &[&str],
         router: Option<&Router>,
     ) -> Option<String> {
-        let stored = self.fallback_model.read().await.clone();
+        let stored =
+            match tokio::time::timeout(Duration::from_secs(2), self.fallback_model.read()).await {
+                Ok(guard) => guard.clone(),
+                Err(_) => {
+                    warn!("Timed out acquiring fallback_model lock while picking fallback");
+                    self.llm_runtime.snapshot().primary_model()
+                }
+            };
         if stored != failed_model && !exclude.contains(&stored.as_str()) {
             return Some(stored);
         }

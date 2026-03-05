@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 pub(super) struct ToolExecutionIoResult {
     pub result_text: String,
     pub tool_duration_ms: u64,
+    pub result_metadata: crate::traits::ToolCallMetadata,
 }
 
 pub(super) struct ToolExecutionIoCtx<'a> {
@@ -86,7 +87,7 @@ impl Agent {
             };
 
         let result = self
-            .execute_tool_with_watchdog(
+            .execute_tool_with_watchdog_outcome(
                 &tc.name,
                 ctx.effective_arguments,
                 &tool_exec::ToolExecCtx {
@@ -105,9 +106,12 @@ impl Agent {
         // which triggers AbortOnDrop to cancel the background task.
         drop(_heartbeat_keeper);
         touch_heartbeat(ctx.heartbeat);
+        let mut result_metadata = crate::traits::ToolCallMetadata::default();
         let mut result_is_err = result.is_err();
         let mut result_text = match result {
-            Ok(text) => {
+            Ok(outcome) => {
+                result_metadata = outcome.metadata;
+                let text = outcome.output;
                 // Sanitize and wrap untrusted tool outputs
                 if !crate::tools::sanitize::is_trusted_tool(&tc.name) {
                     let sanitized = crate::tools::sanitize::sanitize_external_content(&text);
@@ -118,7 +122,10 @@ impl Agent {
                     text
                 }
             }
-            Err(e) => format!("Error: {}", e),
+            Err(e) => {
+                result_metadata.transport_error = Some(e.to_string());
+                format!("Error: {}", e)
+            }
         };
 
         if result_is_err && tc.name == "edit_file" {
@@ -128,6 +135,7 @@ impl Agent {
             {
                 result_text = recovered_text;
                 result_is_err = false;
+                result_metadata.transport_error = None;
             }
         }
 
@@ -172,6 +180,7 @@ impl Agent {
         ToolExecutionIoResult {
             result_text,
             tool_duration_ms,
+            result_metadata,
         }
     }
 

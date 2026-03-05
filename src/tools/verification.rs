@@ -6,8 +6,11 @@ use tokio::sync::RwLock;
 use super::command_risk::split_by_operators;
 
 /// Commands that modify files on disk.
+/// NOTE: `mkdir` and `touch` are excluded because they CREATE new paths —
+/// they don't destroy or modify existing data and should not require
+/// prior verification that the target already exists.
 const FILE_MODIFYING_COMMANDS: &[&str] = &[
-    "rm", "shred", "mv", "cp", "chmod", "chown", "chattr", "dd", "mkfs", "ln", "touch", "mkdir",
+    "rm", "shred", "mv", "cp", "chmod", "chown", "chattr", "dd", "mkfs", "ln",
 ];
 
 /// Commands that modify files only when a specific flag is present.
@@ -16,10 +19,12 @@ const CONDITIONAL_MODIFYING: &[(&str, &str)] = &[
     ("tee", ""), // tee always writes
 ];
 
-/// Read-only commands whose path arguments should be recorded as "seen."
-const READ_ONLY_COMMANDS: &[&str] = &[
+/// Commands whose path arguments should be recorded as "seen."
+/// Includes read-only commands and creation commands (`mkdir`, `touch`)
+/// that produce paths safe for subsequent operations.
+const PATH_RECORDING_COMMANDS: &[&str] = &[
     "ls", "cat", "head", "tail", "less", "more", "file", "stat", "wc", "du", "find", "tree", "fd",
-    "grep", "rg", "diff", "bat", "exa", "eza", "readlink", "test",
+    "grep", "rg", "diff", "bat", "exa", "eza", "readlink", "test", "mkdir", "touch",
 ];
 
 /// A warning returned when a modifying command targets unverified paths.
@@ -72,7 +77,7 @@ impl VerificationTracker {
             }
             if let Some((base_cmd, args)) = parse_command_and_args(trimmed) {
                 let cmd_name = strip_sudo(&base_cmd);
-                if READ_ONLY_COMMANDS.contains(&cmd_name.as_str()) {
+                if PATH_RECORDING_COMMANDS.contains(&cmd_name.as_str()) {
                     let paths = extract_path_args(&args);
                     for p in paths {
                         self.record_seen_path(session_id, &p).await;
@@ -535,5 +540,65 @@ mod tests {
         let args: Vec<String> = vec!["$HOME/file".into(), "/real/path".into()];
         let paths = extract_path_args(&args);
         assert_eq!(paths, vec!["/real/path".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_mkdir_not_blocked() {
+        let tracker = VerificationTracker::new();
+        let sid = "test-session";
+
+        // mkdir should NOT be blocked even when path is unverified
+        // because it creates new directories
+        let warning = tracker
+            .check_modifying_command(sid, "mkdir -p /tmp/new_project")
+            .await;
+        assert!(
+            warning.is_none(),
+            "mkdir should not be blocked by verification"
+        );
+
+        let warning = tracker
+            .check_modifying_command(sid, "mkdir /tmp/another_dir")
+            .await;
+        assert!(warning.is_none(), "mkdir without -p should not be blocked");
+    }
+
+    #[tokio::test]
+    async fn test_touch_not_blocked() {
+        let tracker = VerificationTracker::new();
+        let sid = "test-session";
+
+        // touch should NOT be blocked — it creates files or updates timestamps
+        let warning = tracker
+            .check_modifying_command(sid, "touch /tmp/new_file.txt")
+            .await;
+        assert!(
+            warning.is_none(),
+            "touch should not be blocked by verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mkdir_records_paths() {
+        let tracker = VerificationTracker::new();
+        let sid = "test-session";
+
+        // After mkdir, the created path should be recorded as seen
+        tracker
+            .record_from_command(sid, "mkdir -p /tmp/new_project")
+            .await;
+
+        // Now cp into that directory should work
+        let warning = tracker
+            .check_modifying_command(sid, "cp /verified/file /tmp/new_project/file")
+            .await;
+        // /tmp/new_project is seen, but /verified/file is not
+        // We just check that /tmp/new_project/file is resolved via parent
+        let w = warning.unwrap();
+        assert!(
+            !w.unverified_paths
+                .contains(&"/tmp/new_project/file".to_string()),
+            "path under mkdir'd dir should be verified"
+        );
     }
 }

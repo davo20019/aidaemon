@@ -194,11 +194,7 @@ async fn get_dev_processes(filters: &[String]) -> String {
                     let cmd_parts = &parts[10..];
                     let cmd_str: String = cmd_parts.join(" ");
                     // Truncate long commands
-                    let cmd_display = if cmd_str.len() > 80 {
-                        format!("{}...", &cmd_str[..80])
-                    } else {
-                        cmd_str
-                    };
+                    let cmd_display = crate::utils::truncate_str(&cmd_str, 83);
                     result.push_str(&format!(
                         "  PID {} ({}): CPU {}% MEM {}% {}\n",
                         pid, user, cpu, mem, cmd_display

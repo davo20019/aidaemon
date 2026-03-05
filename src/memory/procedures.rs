@@ -153,7 +153,8 @@ pub fn extract_trigger_pattern(task_context: &str) -> String {
         .trim();
 
     if first_sentence.len() > 100 {
-        first_sentence[..100].to_string()
+        let boundary = crate::utils::floor_char_boundary(first_sentence, 100);
+        first_sentence[..boundary].to_string()
     } else {
         first_sentence.to_string()
     }
@@ -216,7 +217,8 @@ pub fn extract_error_pattern(error: &str) -> String {
 
     // Truncate to first 200 chars
     if pattern.len() > 200 {
-        pattern[..200].to_string()
+        let boundary = crate::utils::floor_char_boundary(&pattern, 200);
+        pattern[..boundary].to_string()
     } else {
         pattern
     }

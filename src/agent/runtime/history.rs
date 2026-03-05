@@ -383,6 +383,19 @@ fn is_likely_filename(token: &str) -> bool {
 }
 
 fn token_looks_like_filesystem_path(token: &str) -> bool {
+    // Reject URL-like tokens without a protocol prefix (e.g., "api.waqi.info/feed/miami").
+    // These contain dots before the first slash, resembling hostnames, not file paths.
+    if let Some(slash_idx) = token.find('/') {
+        let before_slash = &token[..slash_idx];
+        if before_slash.contains('.') && !before_slash.starts_with('.') {
+            return false;
+        }
+        // Also reject tokens containing '?' (query strings) — never valid in file paths.
+        if token.contains('?') {
+            return false;
+        }
+    }
+
     let bytes = token.as_bytes();
     let looks_windows_abs = bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
@@ -668,6 +681,13 @@ fn normalize_project_scope_path_with_aliases(
     };
     let mut normalized = crate::tools::fs_utils::validate_path(&path_for_resolution).ok()?;
 
+    // Reject paths whose first directory component doesn't exist on disk.
+    // This filters out API endpoint paths like /api/notes that aren't real
+    // filesystem locations.
+    if !first_dir_component_exists(&normalized) {
+        return None;
+    }
+
     let trimmed = raw_path.trim_end_matches('/');
     let file_name_looks_like_file = std::path::Path::new(trimmed)
         .file_name()
@@ -680,6 +700,23 @@ fn normalize_project_scope_path_with_aliases(
     }
 
     Some(normalized.to_string_lossy().to_string())
+}
+
+/// Returns true if the first directory component after root exists on disk.
+/// `/tmp/notes_api` -> checks `/tmp` (exists) -> true
+/// `/api/notes` -> checks `/api` (doesn't exist) -> false
+fn first_dir_component_exists(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    let mut components = path.components();
+    // Skip RootDir "/"
+    match components.next() {
+        Some(Component::RootDir) => {}
+        _ => return true, // relative paths are assumed valid
+    }
+    match components.next() {
+        Some(comp) => std::path::Path::new("/").join(comp).exists(),
+        None => true, // bare "/" is fine
+    }
 }
 
 fn push_project_scope(scopes: &mut Vec<String>, scope: String, max_scopes: usize) {
@@ -704,7 +741,20 @@ fn extract_project_scopes_from_text(
                 c.is_ascii_whitespace()
                     || matches!(
                         c,
-                        '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+                        '`' | '\''
+                            | '"'
+                            | ','
+                            | ';'
+                            | ':'
+                            | '.'
+                            | '!'
+                            | '?'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
                     )
             })
             .trim();
@@ -1243,5 +1293,81 @@ mod tests {
             prop_assert_eq!(mode, FollowupMode::NewTask);
             prop_assert!(reasons.contains(&TurnContextReason::FollowupOverrideStandalone));
         }
+    }
+
+    #[test]
+    fn scope_extraction_rejects_api_endpoint_paths() {
+        // /api/notes is a REST API endpoint, not a filesystem path.
+        // /tmp/notes_api/ is the actual project directory.
+        let mut scopes = Vec::new();
+        extract_project_scopes_from_text(
+            "Build /api/notes endpoint. Create everything in /tmp/notes_api/",
+            &mut scopes,
+            5,
+            &[],
+        );
+        // /api doesn't exist on disk, so /api/notes should be rejected
+        assert!(
+            !scopes.iter().any(|s| s.contains("/api/notes")),
+            "API endpoint path should not be extracted as scope, got: {:?}",
+            scopes
+        );
+        // /tmp exists, so /tmp/notes_api should be accepted
+        assert!(
+            scopes.iter().any(|s| s.contains("notes_api")),
+            "Real filesystem path should be extracted, got: {:?}",
+            scopes
+        );
+    }
+
+    #[test]
+    fn first_dir_component_exists_filters_correctly() {
+        assert!(first_dir_component_exists(std::path::Path::new(
+            "/tmp/test"
+        )));
+        assert!(!first_dir_component_exists(std::path::Path::new(
+            "/api/notes"
+        )));
+    }
+
+    #[test]
+    fn hostname_urls_not_treated_as_filesystem_paths() {
+        // URLs without protocol prefix should NOT be treated as file paths
+        assert!(!token_looks_like_filesystem_path(
+            "api.waqi.info/feed/miami/?token=demo"
+        ));
+        assert!(!token_looks_like_filesystem_path(
+            "example.com/path/to/resource"
+        ));
+        assert!(!token_looks_like_filesystem_path("wttr.in/Miami?format=j1"));
+        // But real relative paths with dots should still work
+        assert!(token_looks_like_filesystem_path("./src/main.rs"));
+        assert!(token_looks_like_filesystem_path("../parent/file.txt"));
+        // Dot-prefixed directories (hidden dirs) should work
+        assert!(token_looks_like_filesystem_path(".hidden/config"));
+        // Absolute paths should work
+        assert!(token_looks_like_filesystem_path("/tmp/weather.py"));
+        assert!(token_looks_like_filesystem_path("/usr/local/bin"));
+        // Simple relative paths without dots before slash should work
+        assert!(token_looks_like_filesystem_path("src/main.rs"));
+    }
+
+    #[test]
+    fn url_without_protocol_not_extracted_as_project_scope() {
+        let text = "Fetch from api.waqi.info/feed/miami/?token=demo and save to /tmp/weather.py";
+        let mut scopes = Vec::new();
+        extract_project_scopes_from_text(text, &mut scopes, 5, &[]);
+        assert!(
+            !scopes
+                .iter()
+                .any(|s| s.contains("waqi") || s.contains("api.")),
+            "URL hostname should not be extracted as scope, got: {:?}",
+            scopes
+        );
+        assert!(
+            scopes.iter().any(|s| s.contains("tmp")),
+            "Real path /tmp should be extracted, got: {:?}",
+            scopes
+        );
     }
 }

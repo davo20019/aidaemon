@@ -74,4 +74,8 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub require_file_recheck_before_answer: &'a mut bool,
     pub turn_context: &'a TurnContext,
     pub resolved_goal_id: Option<&'a str>,
+    /// Cache of last successful tool results keyed by call hash.
+    /// Used to replay read_file/search_files content when the repetitive
+    /// redirect fires, so the model retains data lost to context truncation.
+    pub tool_result_cache: &'a mut HashMap<u64, String>,
 }

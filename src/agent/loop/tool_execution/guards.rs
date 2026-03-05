@@ -22,6 +22,7 @@ impl Agent {
         recent_tool_names: &mut VecDeque<String>,
         consecutive_same_tool: &mut (String, usize),
         consecutive_same_tool_arg_hashes: &mut HashSet<u64>,
+        tool_result_cache: &HashMap<u64, String>,
     ) -> anyhow::Result<Option<LoopPatternGuardOutcome>> {
         // Check for repetitive behavior (same tool call hash appearing too often)
         let call_hash = hash_tool_call(&tc.name, &tc.arguments);
@@ -64,17 +65,54 @@ impl Agent {
                 }),
             )
             .await;
-            let redirect_msg = format!(
-                "[SYSTEM] BLOCKED: You already called `{}` with these exact same arguments {} times \
-                         and got the same result. Repeating it will NOT produce a different outcome.\n\n\
-                         You MUST change your approach. Options:\n\
-                         - Use DIFFERENT arguments or a different command\n\
-                         - If you're missing information (URL, credentials, deployment method), \
-                         ASK the user instead of guessing\n\
-                         - If this sub-task is blocked, skip it and tell the user what you \
-                         accomplished and what still needs their input",
-                tc.name, repetitive_count
-            );
+            let is_read_only = matches!(tc.name.as_str(), "read_file" | "search_files");
+            let redirect_msg = if is_read_only {
+                // For read-only tools, replay cached content so the model can
+                // act on it despite context truncation dropping earlier results.
+                if let Some(cached) = tool_result_cache.get(&call_hash) {
+                    format!(
+                        "[SYSTEM] You already read this content {} times. Here it is again — \
+                         do NOT read it again. Use `write_file` to apply your fixes NOW.\n\n\
+                         --- CACHED CONTENT ---\n{}\n--- END CACHED CONTENT ---\n\n\
+                         IMPORTANT: You have the file content above. Analyze the bugs and \
+                         write the corrected version using `write_file`. Do not call `{}` again.",
+                        repetitive_count, cached, tc.name
+                    )
+                } else {
+                    format!(
+                        "[SYSTEM] BLOCKED: You already called `{}` with these exact same arguments {} times. \
+                         The file content should be in your conversation history. \
+                         Use `write_file` to apply your fixes based on what you already know.\n\n\
+                         You MUST use `write_file` now — do not try to read the file again.",
+                        tc.name, repetitive_count
+                    )
+                }
+            } else {
+                // Check if the agent has been editing files — if so, guide toward
+                // edit_file rather than generic "change approach" advice.
+                let has_edited = recent_tool_names.iter().any(|n| n == "edit_file");
+                if has_edited && tc.name == "terminal" {
+                    format!(
+                        "[SYSTEM] BLOCKED: You already ran this exact terminal command {} times. \
+                         Re-running tests will NOT fix bugs — you must edit the code first.\n\n\
+                         NEXT STEP: Use `edit_file` to fix the next bug, THEN run tests once to verify.\n\
+                         Look at the test failure output you already have and identify which file and line needs fixing.",
+                        repetitive_count
+                    )
+                } else {
+                    format!(
+                        "[SYSTEM] BLOCKED: You already called `{}` with these exact same arguments {} times \
+                                 and got the same result. Repeating it will NOT produce a different outcome.\n\n\
+                                 You MUST change your approach. Options:\n\
+                                 - Use DIFFERENT arguments or a different command\n\
+                                 - If you're missing information (URL, credentials, deployment method), \
+                                 ASK the user instead of guessing\n\
+                                 - If this sub-task is blocked, skip it and tell the user what you \
+                                 accomplished and what still needs their input",
+                        tc.name, repetitive_count
+                    )
+                }
+            };
             let tool_msg = Message {
                 id: Uuid::new_v4().to_string(),
                 session_id: session_id.to_string(),
@@ -106,25 +144,42 @@ impl Agent {
                 repetitive_count,
                 "Repetitive tool call detected - agent may be stuck"
             );
-            self.emit_decision_point(
-                emitter,
-                task_id,
-                iteration,
-                DecisionType::RepetitiveCallDetection,
-                format!(
-                    "Repetitive tool call hard-stopped for {} (count={})",
-                    tc.name, repetitive_count
-                ),
-                json!({
-                    "tool": tc.name,
-                    "count": repetitive_count,
-                    "action": "hard_stop"
-                }),
-            )
-            .await;
-            let result = self
-                .graceful_repetitive_response(emitter, session_id, learning_ctx, &tc.name)
+            // Wrap the entire graceful shutdown in a timeout to prevent
+            // indefinite hangs from SQLite pool exhaustion or deadlocks.
+            let graceful_fut = async {
+                self.emit_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::RepetitiveCallDetection,
+                    format!(
+                        "Repetitive tool call hard-stopped for {} (count={})",
+                        tc.name, repetitive_count
+                    ),
+                    json!({
+                        "tool": tc.name,
+                        "count": repetitive_count,
+                        "action": "hard_stop"
+                    }),
+                )
                 .await;
+                self.graceful_repetitive_response(emitter, session_id, learning_ctx, &tc.name)
+                    .await
+            };
+            let result = match tokio::time::timeout(Duration::from_secs(10), graceful_fut).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        session_id,
+                        tool = %tc.name,
+                        "Graceful repetitive response timed out after 10s — using fallback"
+                    );
+                    Ok(crate::agent::post_task::graceful_repetitive_response(
+                        learning_ctx,
+                        &tc.name,
+                    ))
+                }
+            };
             let (status, error, summary) = match &result {
                 Ok(reply) => (
                     TaskStatus::Failed,
@@ -136,15 +191,19 @@ impl Agent {
             if status == TaskStatus::Failed {
                 record_failed_task_tokens(task_tokens_used);
             }
-            self.emit_task_end(
-                emitter,
-                task_id,
-                status,
-                task_start,
-                iteration,
-                learning_ctx.tool_calls.len(),
-                error,
-                summary,
+            // Also timeout the task_end emit to prevent hangs there too.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.emit_task_end(
+                    emitter,
+                    task_id,
+                    status,
+                    task_start,
+                    iteration,
+                    learning_ctx.tool_calls.len(),
+                    error,
+                    summary,
+                ),
             )
             .await;
             return Ok(Some(LoopPatternGuardOutcome::Return(
@@ -164,7 +223,19 @@ impl Agent {
             consecutive_same_tool_arg_hashes.clear();
             consecutive_same_tool_arg_hashes.insert(call_hash);
         }
-        if consecutive_same_tool.1 >= MAX_CONSECUTIVE_SAME_TOOL {
+        // Read-only tools get a higher threshold instead of complete exemption.
+        // A 3-file debugging task may need ~5 reads, but 10+ reads in a row
+        // with low argument diversity is a stuck loop, not productive work.
+        let read_only_higher_threshold = matches!(
+            tc.name.as_str(),
+            "read_file" | "search_files" | "check_environment"
+        );
+        let effective_same_tool_limit = if read_only_higher_threshold {
+            MAX_CONSECUTIVE_SAME_TOOL + 4 // 12 for read tools
+        } else {
+            MAX_CONSECUTIVE_SAME_TOOL
+        };
+        if consecutive_same_tool.1 >= effective_same_tool_limit {
             let total = consecutive_same_tool.1;
             let unique = consecutive_same_tool_arg_hashes.len();
             // Diverse args get a small bonus (+4), not a full bypass.
@@ -232,7 +303,30 @@ impl Agent {
         // Only detects when exactly 2 different tools alternate — a
         // single tool used repeatedly is handled by consecutive-same-tool
         // detection above (which has proper argument diversity checks).
-        recent_tool_names.push_back(tc.name.clone());
+        //
+        // Read-like terminal commands (cat, head, tail) are tagged as
+        // "terminal_read" so the read-saturation escalation counts them
+        // as consecutive reads. Without this, the agent alternates
+        // read_file + terminal(cat), resetting the read counter each time.
+        let effective_tool_name = if tc.name == "terminal" {
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                let cmd = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                let first_word = cmd.split_whitespace().next().unwrap_or("");
+                if matches!(
+                    first_word,
+                    "cat" | "head" | "tail" | "less" | "more" | "bat"
+                ) {
+                    "terminal_read".to_string()
+                } else {
+                    tc.name.clone()
+                }
+            } else {
+                tc.name.clone()
+            }
+        } else {
+            tc.name.clone()
+        };
+        recent_tool_names.push_back(effective_tool_name);
         if recent_tool_names.len() > ALTERNATING_PATTERN_WINDOW {
             recent_tool_names.pop_front();
         }
@@ -244,68 +338,87 @@ impl Agent {
             // terminal with different args) and is guarded by the
             // consecutive-same-tool check instead.
             if unique_tools.len() == 2 {
-                // Additional diversity check: if the argument hashes in the
-                // window are mostly unique, the agent may be doing real work
-                // that happens to bounce between two tools (e.g. terminal +
-                // web_search).  Only trigger when diversity is low.
-                let recent_hashes: HashSet<&u64> = recent_tool_calls.iter().collect();
-                let diversity_ratio = if recent_tool_calls.is_empty() {
-                    1.0
+                // Skip if one of the tools is a read-only tool. The agent
+                // legitimately alternates read_file/search_files with terminal
+                // when gathering information, especially during multi-file
+                // debugging where context truncation forces re-reads.
+                let has_read_only_tool = unique_tools.iter().any(|t| {
+                    let s = t.as_str();
+                    matches!(s, "read_file" | "search_files" | "terminal_read")
+                        || s.ends_with("__read_file")
+                        || s.ends_with("__search_files")
+                });
+                if has_read_only_tool {
+                    // Don't trigger alternating pattern for read-only tools
                 } else {
-                    recent_hashes.len() as f64 / recent_tool_calls.len() as f64
-                };
-                // High diversity (>60% unique calls) → productive work, skip
-                if diversity_ratio <= 0.6 {
-                    let tool_names: Vec<String> =
-                        unique_tools.iter().map(|t| (*t).clone()).collect();
-                    self.emit_decision_point(
-                        emitter,
-                        task_id,
-                        iteration,
-                        DecisionType::AlternatingPatternDetection,
-                        "Alternating A-B loop detected".to_string(),
-                        json!({
-                            "tools": tool_names,
-                            "diversity_ratio": diversity_ratio
-                        }),
-                    )
-                    .await;
-                    warn!(
-                        session_id,
-                        tools = ?unique_tools,
-                        window = ALTERNATING_PATTERN_WINDOW,
-                        diversity_ratio,
-                        "Alternating tool pattern detected - agent is looping"
-                    );
-                    let result = self
-                        .graceful_repetitive_response(emitter, session_id, learning_ctx, &tc.name)
-                        .await;
-                    let (status, error, summary) = match &result {
-                        Ok(reply) => (
-                            TaskStatus::Failed,
-                            Some("Alternating tool loop".to_string()),
-                            Some(reply.chars().take(200).collect()),
-                        ),
-                        Err(e) => (TaskStatus::Failed, Some(e.to_string()), None),
+                    // Additional diversity check: if the argument hashes in the
+                    // window are mostly unique, the agent may be doing real work
+                    // that happens to bounce between two tools (e.g. terminal +
+                    // web_search).  Only trigger when diversity is low.
+                    let recent_hashes: HashSet<&u64> = recent_tool_calls.iter().collect();
+                    let diversity_ratio = if recent_tool_calls.is_empty() {
+                        1.0
+                    } else {
+                        recent_hashes.len() as f64 / recent_tool_calls.len() as f64
                     };
-                    if status == TaskStatus::Failed {
-                        record_failed_task_tokens(task_tokens_used);
+                    // High diversity (>60% unique calls) → productive work, skip
+                    if diversity_ratio <= 0.6 {
+                        let tool_names: Vec<String> =
+                            unique_tools.iter().map(|t| (*t).clone()).collect();
+                        self.emit_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::AlternatingPatternDetection,
+                            "Alternating A-B loop detected".to_string(),
+                            json!({
+                                "tools": tool_names,
+                                "diversity_ratio": diversity_ratio
+                            }),
+                        )
+                        .await;
+                        warn!(
+                            session_id,
+                            tools = ?unique_tools,
+                            window = ALTERNATING_PATTERN_WINDOW,
+                            diversity_ratio,
+                            "Alternating tool pattern detected - agent is looping"
+                        );
+                        let result = self
+                            .graceful_repetitive_response(
+                                emitter,
+                                session_id,
+                                learning_ctx,
+                                &tc.name,
+                            )
+                            .await;
+                        let (status, error, summary) = match &result {
+                            Ok(reply) => (
+                                TaskStatus::Failed,
+                                Some("Alternating tool loop".to_string()),
+                                Some(reply.chars().take(200).collect()),
+                            ),
+                            Err(e) => (TaskStatus::Failed, Some(e.to_string()), None),
+                        };
+                        if status == TaskStatus::Failed {
+                            record_failed_task_tokens(task_tokens_used);
+                        }
+                        self.emit_task_end(
+                            emitter,
+                            task_id,
+                            status,
+                            task_start,
+                            iteration,
+                            learning_ctx.tool_calls.len(),
+                            error,
+                            summary,
+                        )
+                        .await;
+                        return Ok(Some(LoopPatternGuardOutcome::Return(
+                            ToolExecutionOutcome::Return(result),
+                        )));
                     }
-                    self.emit_task_end(
-                        emitter,
-                        task_id,
-                        status,
-                        task_start,
-                        iteration,
-                        learning_ctx.tool_calls.len(),
-                        error,
-                        summary,
-                    )
-                    .await;
-                    return Ok(Some(LoopPatternGuardOutcome::Return(
-                        ToolExecutionOutcome::Return(result),
-                    )));
-                }
+                } // close else branch for non-read-only tools
             }
         }
 
@@ -331,6 +444,12 @@ fn repetitive_redirect_threshold_for_call(tool_name: &str, arguments: &str) -> u
     if is_background_status_poll(tool_name, arguments) {
         // Background status checks can consume budget quickly with little progress.
         2
+    } else if matches!(tool_name, "read_file" | "search_files") {
+        // Read-only tools need a higher threshold because context truncation
+        // in long sessions drops their results, forcing legitimate re-reads.
+        // Blocking at 3 prevents the agent from ever reaching the write phase
+        // in multi-file debugging tasks.
+        6
     } else {
         REPETITIVE_REDIRECT_THRESHOLD
     }
@@ -363,6 +482,23 @@ mod tests {
             "cli_agent",
             r#"{"action":"check","task_id":"abc"}"#
         ));
+    }
+
+    #[test]
+    fn raises_redirect_threshold_for_read_only_tools() {
+        assert_eq!(
+            repetitive_redirect_threshold_for_call("read_file", r#"{"path":"/tmp/foo.py"}"#),
+            6
+        );
+        assert_eq!(
+            repetitive_redirect_threshold_for_call("search_files", r#"{"query":"bug"}"#),
+            6
+        );
+        // Other tools use default threshold
+        assert_eq!(
+            repetitive_redirect_threshold_for_call("write_file", r#"{"path":"/tmp/foo.py"}"#),
+            REPETITIVE_REDIRECT_THRESHOLD
+        );
     }
 
     #[test]

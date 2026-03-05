@@ -72,6 +72,9 @@ impl Agent {
         let mut capabilities: HashMap<String, ToolCapabilities> = HashMap::new();
 
         for tool in &self.tools {
+            if !tool.is_available() {
+                continue;
+            }
             let name = tool.name().to_string();
             capabilities.insert(name.clone(), tool.capabilities());
             let candidate = json!({
@@ -130,6 +133,16 @@ impl Agent {
             .0
     }
 
+    pub(super) fn has_available_tool(&self, tool_name: &str) -> bool {
+        self.tools
+            .iter()
+            .any(|tool| tool.name() == tool_name && tool.is_available())
+    }
+
+    pub(super) fn has_cli_agents_available(&self) -> bool {
+        self.has_available_tool("cli_agent")
+    }
+
     pub(super) fn tool_name_from_definition(def: &Value) -> Option<&str> {
         def.get("function")
             .and_then(|f| f.get("name"))
@@ -153,9 +166,29 @@ impl Agent {
             })
             .collect();
 
-        // Stable prioritization: read-only + idempotent first for low-risk turns.
-        ordered.sort_by_key(|(_, _, caps)| {
+        // Essential tools that must always be available regardless of profile/approval filters.
+        // Without these, the agent can read files but never write them — rendering coding useless.
+        // Memory tools are included because the agent's core personal-assistant function
+        // depends on being able to store and manage facts/people at any risk level.
+        // Web tools are essential because a personal assistant must be able to search the web
+        // and fetch URLs — without these, the model resorts to terminal curl/grep workarounds.
+        const ESSENTIAL_TOOLS: &[&str] = &[
+            "write_file",
+            "edit_file",
+            "terminal",
+            "remember_fact",
+            "manage_memories",
+            "manage_people",
+            "web_search",
+            "web_fetch",
+        ];
+
+        // Stable prioritization: essential tools first, then read-only + idempotent.
+        // Essential tools must sort before truncation cuts them off.
+        ordered.sort_by_key(|(_, name, caps)| {
+            let is_essential = ESSENTIAL_TOOLS.contains(&name.as_str());
             (
+                !is_essential, // essential tools first
                 !caps.read_only,
                 caps.needs_approval,
                 !caps.idempotent,
@@ -172,12 +205,13 @@ impl Agent {
         let low_risk = risk_score < 0.34 && matches!(policy.model_profile, ModelProfile::Cheap);
 
         if low_risk {
-            let readonly: Vec<_> = filtered
+            // Start with essential tools (always available) + read-only tools.
+            let mut keep: Vec<_> = filtered
                 .iter()
-                .filter(|(_, _, c)| c.read_only)
+                .filter(|(_, name, c)| c.read_only || ESSENTIAL_TOOLS.contains(&name.as_str()))
                 .cloned()
                 .collect();
-            let mut keep = readonly;
+            // Fill up to a minimum of 5 with remaining tools from the sorted list.
             if keep.len() < 5 {
                 for candidate in filtered.iter().cloned() {
                     if keep.iter().any(|(_, n, _)| n == &candidate.1) {
@@ -189,20 +223,28 @@ impl Agent {
                     }
                 }
             }
-            if keep.len() > 10 {
-                keep.truncate(10);
+            if keep.len() > 16 {
+                keep.truncate(16);
             }
             return keep.into_iter().map(|(d, _, _)| d).collect();
         }
 
         match policy.model_profile {
             ModelProfile::Cheap => {
-                filtered.retain(|(_, _, caps)| caps.read_only || !caps.high_impact_write);
-                filtered.truncate(12);
+                filtered.retain(|(_, name, caps)| {
+                    ESSENTIAL_TOOLS.contains(&name.as_str())
+                        || caps.read_only
+                        || !caps.high_impact_write
+                });
+                filtered.truncate(16);
             }
             ModelProfile::Balanced => {
                 if risk_score < 0.55 {
-                    filtered.retain(|(_, _, caps)| caps.read_only || !caps.high_impact_write);
+                    filtered.retain(|(_, name, caps)| {
+                        ESSENTIAL_TOOLS.contains(&name.as_str())
+                            || caps.read_only
+                            || !caps.high_impact_write
+                    });
                 }
                 filtered.truncate(20);
             }
@@ -213,7 +255,9 @@ impl Agent {
         }
 
         if matches!(policy.approval_mode, ApprovalMode::Auto) {
-            filtered.retain(|(_, _, caps)| caps.read_only || !caps.needs_approval);
+            filtered.retain(|(_, name, caps)| {
+                ESSENTIAL_TOOLS.contains(&name.as_str()) || caps.read_only || !caps.needs_approval
+            });
         }
 
         filtered.into_iter().map(|(d, _, _)| d).collect()
@@ -249,7 +293,43 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{setup_full_stack_test_agent_with_extra_tools, MockProvider, MockTool};
+    use crate::traits::Tool;
     use proptest::prelude::*;
+    use std::sync::Arc;
+
+    struct UnavailableMockTool;
+
+    #[async_trait::async_trait]
+    impl Tool for UnavailableMockTool {
+        fn name(&self) -> &str {
+            "cli_agent"
+        }
+
+        fn description(&self) -> &str {
+            "unavailable cli_agent for tests"
+        }
+
+        fn schema(&self) -> Value {
+            json!({
+                "name": "cli_agent",
+                "description": "unavailable cli_agent for tests",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            })
+        }
+
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn is_available(&self) -> bool {
+            false
+        }
+    }
 
     fn valid_tool_def() -> Value {
         json!({
@@ -291,5 +371,33 @@ mod tests {
             let result = Agent::validate_tool_definition_contract(&def);
             prop_assert!(result.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn tool_definitions_skip_unavailable_tools() {
+        let available = Arc::new(MockTool::new("web_search", "search", "ok")) as Arc<dyn Tool>;
+        let unavailable = Arc::new(UnavailableMockTool) as Arc<dyn Tool>;
+        let harness = setup_full_stack_test_agent_with_extra_tools(
+            MockProvider::new(),
+            vec![available, unavailable],
+        )
+        .await
+        .unwrap();
+
+        let (defs, caps) = harness
+            .agent
+            .tool_definitions_with_capabilities("test query")
+            .await;
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(Agent::tool_name_from_definition)
+            .map(ToString::to_string)
+            .collect();
+
+        assert!(names.contains(&"web_search".to_string()));
+        assert!(!names.contains(&"cli_agent".to_string()));
+        assert!(caps.contains_key("web_search"));
+        assert!(!caps.contains_key("cli_agent"));
+        assert!(!harness.agent.has_cli_agents_available());
     }
 }

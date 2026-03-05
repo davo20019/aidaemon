@@ -55,6 +55,15 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?,
         ),
+        ProviderKind::XaiNative => Arc::new(
+            crate::providers::XaiNativeProvider::new_with_options(
+                &config.provider.api_key,
+                Some(&config.provider.base_url),
+                config.provider.max_tokens,
+                config.provider.extra_headers.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?,
+        ),
         ProviderKind::GoogleGenai => Arc::new(crate::providers::GoogleGenAiProvider::new(
             &config.provider.api_key,
         )),
@@ -233,6 +242,15 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
             crate::providers::OpenAiCompatibleProvider::new(
                 &config.provider.base_url,
                 &config.provider.api_key,
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?,
+        ),
+        ProviderKind::XaiNative => Arc::new(
+            crate::providers::XaiNativeProvider::new_with_options(
+                &config.provider.api_key,
+                Some(&config.provider.base_url),
+                config.provider.max_tokens,
+                config.provider.extra_headers.clone(),
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?,
         ),

@@ -51,7 +51,7 @@ pub fn compute_available_budget(
     let system_tokens = estimate_tokens(system_prompt);
     let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
     let tools_tokens = estimate_tokens(&tools_json);
-    let response_reserve = 2048;
+    let response_reserve = 1536;
 
     total_budget.saturating_sub(system_tokens + tools_tokens + response_reserve)
 }
@@ -82,8 +82,8 @@ pub fn fit_messages_to_budget(
         return messages;
     }
 
-    // Keep first user message (anchor) + last 4 messages (current context)
-    let keep_recent = 4.min(msg_count - 1);
+    // Keep first user message (anchor) + last 8 messages (current context)
+    let keep_recent = 8.min(msg_count - 1);
     let anchor = messages[0].clone();
     let recent: Vec<Value> = messages[msg_count - keep_recent..].to_vec();
 
@@ -117,8 +117,8 @@ pub fn fit_messages_to_budget(
 fn role_quota(role: &str) -> usize {
     match role {
         "user" => 10,
-        "assistant" => 8,
-        "tool" => 4,
+        "assistant" => 10,
+        "tool" => 8,
         _ => 6,
     }
 }
@@ -158,8 +158,9 @@ pub fn fit_messages_with_source_quotas(
         .to_string();
     *role_counts.entry(anchor_role).or_insert(0) += 1;
 
-    // Always keep a recent tail window.
-    let keep_recent = 4usize.min(messages.len());
+    // Always keep a recent tail window — must be large enough to hold a multi-step
+    // task's tool calls (write → run → verify cycles easily produce 8+ messages).
+    let keep_recent = 8usize.min(messages.len());
     let start = messages.len().saturating_sub(keep_recent);
     for (idx, msg) in messages.iter().enumerate().skip(start) {
         if selected_indices.insert(idx) {
@@ -217,8 +218,9 @@ pub fn fit_messages_with_source_quotas(
             break;
         }
 
-        // Keep first (anchor) and last 2 always; drop from the middle.
-        if result.len() > 3 {
+        // Keep first (anchor) and last 6 always; drop from the middle.
+        // Protecting more recent messages prevents loss of current-task tool results.
+        if result.len() > 7 {
             result.remove(1);
         } else {
             break;
@@ -733,8 +735,8 @@ mod tests {
         // Very small budget to force trimming
         let result =
             fit_messages_to_budget(messages.clone(), 50, Some("We discussed topics A and B"));
-        // Should have: anchor(1) + summary(1) + recent(4) = 6
-        assert_eq!(result.len(), 6);
+        // Should have: anchor(1) + summary(1) + recent(8) = 10
+        assert_eq!(result.len(), 10);
         // First should be the anchor (first user message)
         assert_eq!(result[0]["content"], "Message number 0");
         // Second should be the injected summary
@@ -743,7 +745,7 @@ mod tests {
             .unwrap()
             .contains("Conversation summary"));
         // Last should be the last original message
-        assert_eq!(result[5]["content"], "Message number 14");
+        assert_eq!(result[9]["content"], "Message number 14");
     }
 
     #[test]
@@ -755,10 +757,10 @@ mod tests {
         }
 
         let result = fit_messages_to_budget(messages, 50, None);
-        // Should have: anchor(1) + recent(4) = 5
-        assert_eq!(result.len(), 5);
+        // Should have: anchor(1) + recent(8) = 9
+        assert_eq!(result.len(), 9);
         assert_eq!(result[0]["content"], "Message 0");
-        assert_eq!(result[4]["content"], "Message 9");
+        assert_eq!(result[8]["content"], "Message 9");
     }
 
     #[test]
@@ -802,7 +804,7 @@ mod tests {
     #[test]
     fn test_compute_budget() {
         let config = ContextWindowConfig {
-            default_budget: 24000,
+            default_budget: 32000,
             model_budgets: {
                 let mut m = std::collections::HashMap::new();
                 m.insert("big-model".to_string(), 100000);
@@ -813,13 +815,13 @@ mod tests {
 
         // Default model
         let budget = compute_available_budget("unknown-model", "system prompt", &[], &config);
-        // 24000 - estimate_tokens("system prompt") - estimate_tokens("[]") - 2048
-        let expected = 24000 - estimate_tokens("system prompt") - estimate_tokens("[]") - 2048;
+        // 32000 - estimate_tokens("system prompt") - estimate_tokens("[]") - 1536
+        let expected = 32000 - estimate_tokens("system prompt") - estimate_tokens("[]") - 1536;
         assert_eq!(budget, expected);
 
         // Named model with custom budget
         let budget = compute_available_budget("big-model", "system prompt", &[], &config);
-        let expected = 100000 - estimate_tokens("system prompt") - estimate_tokens("[]") - 2048;
+        let expected = 100000 - estimate_tokens("system prompt") - estimate_tokens("[]") - 1536;
         assert_eq!(budget, expected);
     }
 

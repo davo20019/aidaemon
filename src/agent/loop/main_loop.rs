@@ -8,21 +8,66 @@ use super::tool_execution_phase::{ToolExecutionCtx, ToolExecutionOutcome};
 use super::tool_prelude_phase::{ToolPreludeCtx, ToolPreludeOutcome};
 use super::*;
 
+/// Check if a cancel keyword appears in text without a preceding negation.
+/// Returns false for phrases like "do not stop", "don't cancel", "never stop".
+fn cancel_keyword_not_negated(text: &str, keyword: &str) -> bool {
+    if !contains_keyword_as_words(text, keyword) {
+        return false;
+    }
+    // Find the keyword position and check the 1-3 words before it for negation.
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let kw_lower = keyword.to_ascii_lowercase();
+    for (i, w) in words.iter().enumerate() {
+        let normalized = w
+            .trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
+            .to_ascii_lowercase();
+        if normalized == kw_lower {
+            // Check up to 3 words before for negation markers.
+            let start = i.saturating_sub(3);
+            for word in &words[start..i] {
+                let prev = word
+                    .trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
+                    .to_ascii_lowercase();
+                if matches!(
+                    prev.as_str(),
+                    "not" | "don't" | "dont" | "no" | "never" | "shouldn't" | "without"
+                ) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn infer_deterministic_orchestration_intent(user_text: &str) -> IntentGateDecision {
     let mut intent_gate = infer_intent_gate(user_text, "");
     let lower = user_text.trim().to_ascii_lowercase();
     let explicit_cancel_command = lower == "/cancel" || lower.starts_with("/cancel ");
-    let has_cancel_phrase = [
-        "cancel",
-        "stop",
-        "abort",
-        "never mind",
-        "nevermind",
-        "forget it",
-        "scratch that",
-    ]
-    .iter()
-    .any(|kw| contains_keyword_as_words(&lower, kw));
+
+    // Single-word cancel keywords ("cancel", "stop", "abort") are only treated
+    // as cancel intent in SHORT messages (< 80 chars). In long task descriptions
+    // they are almost always part of instructions, not commands.
+    // Multi-word phrases ("never mind", "forget it", "scratch that") are
+    // unambiguous regardless of message length.
+    let short_msg = lower.len() < 80;
+    let has_cancel_phrase = if short_msg {
+        [
+            "cancel",
+            "stop",
+            "abort",
+            "never mind",
+            "nevermind",
+            "forget it",
+            "scratch that",
+        ]
+        .iter()
+        .any(|kw| cancel_keyword_not_negated(&lower, kw))
+    } else {
+        ["never mind", "nevermind", "forget it", "scratch that"]
+            .iter()
+            .any(|kw| cancel_keyword_not_negated(&lower, kw))
+    };
     if explicit_cancel_command || has_cancel_phrase {
         let targeted_cancel = [
             "goal",
@@ -61,6 +106,7 @@ impl Agent {
         heartbeat: Option<Arc<AtomicU64>>,
     ) -> anyhow::Result<String> {
         touch_heartbeat(&heartbeat);
+        info!(session_id, "handle_message_impl: starting bootstrap phase");
 
         let bootstrap_outcome = self
             .run_bootstrap_phase(&BootstrapCtx {
@@ -104,6 +150,9 @@ impl Agent {
             .followup_mode
             .map(|mode| mode.as_str())
             .unwrap_or("unknown");
+        // Sticky new-task flag: computed once from TurnContext and reused across
+        // all iterations. Prevents mid-loop reclassification when history shifts.
+        let is_new_task = turn_context.followup_mode == Some(FollowupMode::NewTask);
         let turn_context_reasons: Vec<&'static str> = turn_context
             .reasons
             .iter()
@@ -174,6 +223,11 @@ impl Agent {
         }
         // Track recent tool names for alternating pattern detection (A-B-A-B cycles)
         let mut recent_tool_names: VecDeque<String> = VecDeque::new();
+        // Cache of last successful tool results (keyed by call hash).
+        // When the repetitive redirect fires for read_file/search_files, we
+        // replay the cached content so the model retains data lost to context
+        // truncation instead of getting a generic "BLOCKED" message.
+        let mut tool_result_cache: HashMap<u64, String> = HashMap::new();
         // Mid-loop adaptation and fallback expansion controls.
         let mut last_escalation_iteration: Option<usize> = None;
         let mut consecutive_clean_iterations: usize = 0;
@@ -452,6 +506,7 @@ impl Agent {
                     pending_system_messages: &mut pending_system_messages,
                     empty_response_retry_pending,
                     status_tx: &status_tx,
+                    is_new_task,
                 })
                 .await?;
 
@@ -540,6 +595,7 @@ impl Agent {
                     require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
                     turn_context: &turn_context,
                     needs_tools_for_turn: &mut needs_tools_for_turn,
+                    force_text_response,
                 })
                 .await?;
             match consultant_outcome {
@@ -627,6 +683,7 @@ impl Agent {
                     require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
                     turn_context: &turn_context,
                     resolved_goal_id: resolved_goal_id.as_deref(),
+                    tool_result_cache: &mut tool_result_cache,
                 })
                 .await?;
             match tool_execution_outcome {
@@ -640,3 +697,68 @@ impl Agent {
 #[cfg(test)]
 #[path = "characterization_tests.rs"]
 mod characterization_tests;
+
+#[cfg(test)]
+mod cancel_intent_tests {
+    use super::*;
+
+    #[test]
+    fn negated_stop_not_detected() {
+        // "Do not stop until every test passes" should NOT trigger cancel
+        assert!(!cancel_keyword_not_negated(
+            "do not stop until every test passes",
+            "stop"
+        ));
+    }
+
+    #[test]
+    fn negated_cancel_not_detected() {
+        assert!(!cancel_keyword_not_negated(
+            "don't cancel anything",
+            "cancel"
+        ));
+    }
+
+    #[test]
+    fn bare_stop_detected() {
+        assert!(cancel_keyword_not_negated("stop", "stop"));
+    }
+
+    #[test]
+    fn bare_cancel_detected() {
+        assert!(cancel_keyword_not_negated("cancel everything", "cancel"));
+    }
+
+    #[test]
+    fn never_stop_not_detected() {
+        assert!(!cancel_keyword_not_negated("never stop working", "stop"));
+    }
+
+    #[test]
+    fn long_message_with_stop_no_cancel() {
+        let msg = "write a script that does X and Y. do not stop until every test passes.";
+        let intent = infer_deterministic_orchestration_intent(msg);
+        assert!(!intent.cancel_intent.unwrap_or(false));
+    }
+
+    #[test]
+    fn short_stop_message_triggers_cancel() {
+        let intent = infer_deterministic_orchestration_intent("stop");
+        assert!(intent.cancel_intent.unwrap_or(false));
+    }
+
+    #[test]
+    fn short_cancel_message_triggers_cancel() {
+        let intent = infer_deterministic_orchestration_intent("cancel all");
+        assert!(intent.cancel_intent.unwrap_or(false));
+    }
+
+    #[test]
+    fn never_mind_in_long_message() {
+        // Multi-word phrases are always unambiguous
+        let intent = infer_deterministic_orchestration_intent(
+            "actually never mind about that whole thing I asked earlier, let me think about it",
+        );
+        assert!(intent.cancel_intent.unwrap_or(false));
+    }
+}

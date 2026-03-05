@@ -45,6 +45,12 @@ impl Tool for SystemInfoTool {
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
         let mut info = String::new();
 
+        // Current date and time
+        if let Ok(output) = tokio::process::Command::new("date").output().await {
+            let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            info.push_str(&format!("Date: {}\n", date));
+        }
+
         // Hostname
         if let Ok(output) = tokio::process::Command::new("hostname").output().await {
             let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();

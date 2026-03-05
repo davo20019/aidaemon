@@ -18,7 +18,7 @@ pub(super) struct CriticalFactSummary {
 }
 
 pub(super) fn is_personal_memory_tool(name: &str) -> bool {
-    matches!(name, "manage_people" | "manage_memories")
+    matches!(name, "manage_people" | "manage_memories" | "remember_fact")
 }
 
 fn normalize_name_candidate(raw: &str) -> Option<String> {
@@ -79,6 +79,19 @@ fn relationship_label_for_key(lower_key: &str) -> Option<&'static str> {
 pub(super) fn detect_critical_fact_query(user_text: &str) -> Option<CriticalFactQuery> {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
+        return None;
+    }
+
+    // Multi-part questions should NOT be handled deterministically.
+    // Questions like "What's my name, what do I like, and what's my dog's name?"
+    // need the full LLM with context to answer comprehensively.
+    let comma_count = lower.matches(',').count();
+    let question_mark_count = lower.matches('?').count();
+    let has_conjunction_joining = lower.contains(" and what")
+        || lower.contains(" and who")
+        || lower.contains(" and tell")
+        || lower.contains(" and my");
+    if comma_count >= 2 || question_mark_count >= 2 || has_conjunction_joining {
         return None;
     }
 
@@ -278,9 +291,82 @@ pub(super) fn filter_tool_defs_for_personal_memory(defs: &[Value]) -> Vec<Value>
         .collect()
 }
 
+/// Execution tools blocked when delegation mode is active.
+/// Keep spawn_agent available for task-lead orchestration.
+pub(super) fn is_delegation_blocked_tool(name: &str) -> bool {
+    matches!(name, "terminal" | "browser" | "run_command")
+}
+
+pub(super) fn filter_tool_defs_for_delegation(defs: &[Value]) -> Vec<Value> {
+    defs.iter()
+        .filter_map(|def| {
+            let name = def
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())?;
+            if is_delegation_blocked_tool(name) {
+                None
+            } else {
+                Some(def.clone())
+            }
+        })
+        .collect()
+}
+
+/// Detect store/write intent — user is asking the agent to SAVE facts, not recall them.
+/// When true, the personal-memory recall restriction should NOT apply because
+/// the agent needs to make multiple `remember_fact` / `manage_people` calls.
+pub(super) fn looks_like_personal_memory_store_request(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    // Imperative store verbs at the start or after common prefixes
+    contains_keyword_as_words(&lower, "remember")
+        || contains_keyword_as_words(&lower, "memorize")
+        || contains_keyword_as_words(&lower, "store")
+        || contains_keyword_as_words(&lower, "save")
+        || contains_keyword_as_words(&lower, "note that")
+        || contains_keyword_as_words(&lower, "keep in mind")
+        || contains_keyword_as_words(&lower, "learn that")
+        || contains_keyword_as_words(&lower, "learn this")
+        || contains_keyword_as_words(&lower, "record that")
+        || contains_keyword_as_words(&lower, "record this")
+        || contains_keyword_as_words(&lower, "update my")
+}
+
 pub(super) fn looks_like_personal_memory_recall_question(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
+        return false;
+    }
+
+    // Store intent takes priority — "remember these facts about me" is a write, not a read.
+    if looks_like_personal_memory_store_request(user_text) {
+        return false;
+    }
+
+    // Compound task detection: if the message contains BOTH recall keywords AND
+    // action verbs that require non-memory tools (create, write, build, etc.),
+    // it's a compound task, not a pure recall question. Don't restrict tools.
+    let has_action_verbs = contains_keyword_as_words(&lower, "create")
+        || contains_keyword_as_words(&lower, "write")
+        || contains_keyword_as_words(&lower, "build")
+        || contains_keyword_as_words(&lower, "generate")
+        || contains_keyword_as_words(&lower, "make")
+        || contains_keyword_as_words(&lower, "code")
+        || contains_keyword_as_words(&lower, "script")
+        || contains_keyword_as_words(&lower, "deploy")
+        || contains_keyword_as_words(&lower, "install")
+        || contains_keyword_as_words(&lower, "run")
+        || contains_keyword_as_words(&lower, "execute")
+        || contains_keyword_as_words(&lower, "search")
+        || contains_keyword_as_words(&lower, "fetch")
+        || contains_keyword_as_words(&lower, "download")
+        || contains_keyword_as_words(&lower, "send")
+        || contains_keyword_as_words(&lower, "post")
+        || contains_keyword_as_words(&lower, "tweet");
+    if has_action_verbs {
         return false;
     }
 
@@ -390,6 +476,79 @@ mod tests {
     }
 
     #[test]
+    fn store_requests_not_classified_as_recall() {
+        // Store intent should NOT trigger recall restriction
+        assert!(!looks_like_personal_memory_recall_question(
+            "Remember these facts about me: I like coffee"
+        ));
+        assert!(!looks_like_personal_memory_recall_question(
+            "Please remember my dog is named Luna"
+        ));
+        assert!(!looks_like_personal_memory_recall_question(
+            "Save this about me: I work in Miami"
+        ));
+        assert!(!looks_like_personal_memory_recall_question(
+            "Note that I prefer dark mode"
+        ));
+        assert!(!looks_like_personal_memory_recall_question(
+            "Keep in mind I work 8am-6pm"
+        ));
+        assert!(!looks_like_personal_memory_recall_question(
+            "Update my work hours to 9am-5pm"
+        ));
+    }
+
+    #[test]
+    fn compound_tasks_not_classified_as_recall() {
+        // Compound tasks that include recall + action should NOT be recall-only
+        assert!(!looks_like_personal_memory_recall_question(
+            "What do you know about me? After answering, create a Python script showing my info"
+        ));
+        assert!(!looks_like_personal_memory_recall_question(
+            "Tell me about me and then write a summary document"
+        ));
+        assert!(!looks_like_personal_memory_recall_question(
+            "What's my schedule? Also generate a calendar export"
+        ));
+        assert!(!looks_like_personal_memory_recall_question(
+            "Do I have any pets? Search the web for pet care tips"
+        ));
+        // Pure recall should still match
+        assert!(looks_like_personal_memory_recall_question(
+            "What do you know about me?"
+        ));
+        assert!(looks_like_personal_memory_recall_question(
+            "Do I have a dog?"
+        ));
+    }
+
+    #[test]
+    fn detects_personal_memory_store_requests() {
+        assert!(looks_like_personal_memory_store_request(
+            "Remember these facts about me"
+        ));
+        assert!(looks_like_personal_memory_store_request(
+            "Please save my preferences"
+        ));
+        assert!(looks_like_personal_memory_store_request(
+            "Note that I like dark mode"
+        ));
+        assert!(looks_like_personal_memory_store_request(
+            "Keep in mind I work remotely"
+        ));
+        assert!(looks_like_personal_memory_store_request(
+            "Update my schedule"
+        ));
+        // Pure recall should NOT trigger store detection
+        assert!(!looks_like_personal_memory_store_request(
+            "What do you know about me?"
+        ));
+        assert!(!looks_like_personal_memory_store_request(
+            "Do I have a dog?"
+        ));
+    }
+
+    #[test]
     fn distinguishes_challenge_vs_external_verification() {
         assert!(user_is_reaffirmation_challenge("Are you sure?"));
         assert!(!user_requests_external_verification("Are you sure?"));
@@ -430,6 +589,40 @@ mod tests {
     }
 
     #[test]
+    fn identifies_delegation_blocked_tools() {
+        assert!(is_delegation_blocked_tool("terminal"));
+        assert!(is_delegation_blocked_tool("browser"));
+        assert!(is_delegation_blocked_tool("run_command"));
+        assert!(!is_delegation_blocked_tool("spawn_agent"));
+        assert!(!is_delegation_blocked_tool("cli_agent"));
+        assert!(!is_delegation_blocked_tool("web_search"));
+    }
+
+    #[test]
+    fn filters_tool_defs_for_delegation_mode() {
+        let defs = vec![
+            json!({"type":"function","function":{"name":"terminal"}}),
+            json!({"type":"function","function":{"name":"cli_agent"}}),
+            json!({"type":"function","function":{"name":"web_search"}}),
+            json!({"type":"function","function":{"name":"browser"}}),
+            json!({"type":"function","function":{"name":"run_command"}}),
+            json!({"type":"function","function":{"name":"spawn_agent"}}),
+            json!({"type":"function","function":{"name":"remember_fact"}}),
+        ];
+        let filtered = filter_tool_defs_for_delegation(&defs);
+        let names: Vec<&str> = filtered
+            .iter()
+            .filter_map(|d| d.get("function"))
+            .filter_map(|f| f.get("name"))
+            .filter_map(|n| n.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["cli_agent", "web_search", "spawn_agent", "remember_fact"]
+        );
+    }
+
+    #[test]
     fn detects_critical_fact_queries() {
         assert_eq!(
             detect_critical_fact_query("What's my name?"),
@@ -442,6 +635,30 @@ mod tests {
         assert_eq!(
             detect_critical_fact_query("Do I have daughters?"),
             Some(CriticalFactQuery::CoreRelationships)
+        );
+    }
+
+    #[test]
+    fn multi_part_questions_bypass_deterministic_resolver() {
+        // Multi-part questions should go to the LLM for comprehensive answers
+        assert_eq!(
+            detect_critical_fact_query(
+                "What's my name, what programming languages do I love, and what's my dog's name?"
+            ),
+            None
+        );
+        assert_eq!(
+            detect_critical_fact_query("What's my name and what do I do for work?"),
+            None
+        );
+        assert_eq!(
+            detect_critical_fact_query("Who am I? What do I like? Where do I live?"),
+            None
+        );
+        // Single-part questions still work
+        assert_eq!(
+            detect_critical_fact_query("What's my name?"),
+            Some(CriticalFactQuery::OwnerName)
         );
     }
 

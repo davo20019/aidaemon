@@ -11,7 +11,7 @@
 # In no-keychain mode, secret updates (including OAuth token refresh rotation) are written to that env file.
 
 [provider]
-# Provider type: openai_compatible, google_genai, or anthropic
+# Provider type: openai_compatible, xai_native, google_genai, or anthropic
 api_key = "keychain"
 # api_key = "${AIDAEMON_API_KEY}"
 base_url = "https://openrouter.ai/api/v1"
@@ -21,6 +21,9 @@ base_url = "https://openrouter.ai/api/v1"
 #
 # Moonshot OpenAI-compatible base URL:
 # base_url = "https://api.moonshot.ai/v1"
+#
+# xAI (Grok) native base URL:
+# base_url = "https://api.x.ai/v1"
 #
 # MiniMax OpenAI-compatible base URL:
 # base_url = "https://api.minimax.io/v1"

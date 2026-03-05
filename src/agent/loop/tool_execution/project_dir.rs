@@ -27,6 +27,11 @@ pub(crate) fn extract_project_dir_hint(text: &str) -> Option<String> {
                         '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
                     )
             })
+            // Trim trailing sentence punctuation that follows file extensions.
+            // Without this, "event_system.py." extracts as `/path/event_system.py.`
+            // and the trailing dot breaks scope locking (makes it look like a
+            // non-file path, so normalize_project_dir doesn't strip to parent dir).
+            .trim_end_matches(['.', '!', '?'])
             .trim();
         if token.is_empty() || token.contains("://") {
             continue;
@@ -64,6 +69,13 @@ pub(crate) fn extract_project_dir_hint(text: &str) -> Option<String> {
 fn normalize_project_dir(raw_path: &str) -> Option<String> {
     let mut normalized = crate::tools::fs_utils::validate_path(raw_path).ok()?;
 
+    // Reject paths whose first directory component doesn't exist on disk.
+    // This filters out API endpoint paths like /api/notes that aren't real
+    // filesystem locations.
+    if !first_dir_component_exists(&normalized) {
+        return None;
+    }
+
     let trimmed = raw_path.trim_end_matches('/');
     let file_name_looks_like_file = std::path::Path::new(trimmed)
         .file_name()
@@ -76,6 +88,20 @@ fn normalize_project_dir(raw_path: &str) -> Option<String> {
     }
 
     Some(normalized.to_string_lossy().to_string())
+}
+
+/// Returns true if the first directory component after root exists on disk.
+fn first_dir_component_exists(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::RootDir) => {}
+        _ => return true,
+    }
+    match components.next() {
+        Some(comp) => std::path::Path::new("/").join(comp).exists(),
+        None => true,
+    }
 }
 
 fn push_unique_project_dir(collected: &mut Vec<String>, candidate: String) {
@@ -431,6 +457,25 @@ mod tests {
     }
 
     #[test]
+    fn strips_trailing_sentence_punctuation_from_path_hint() {
+        // "event_system.py." — period at end of sentence
+        let text = "Fix the bugs in /tmp/debugme/event_system.py. The tests are correct.";
+        let hint = extract_project_dir_hint(text).expect("project hint");
+        assert_eq!(hint, "/tmp/debugme");
+        assert!(!hint.contains("event_system"));
+
+        // Trailing exclamation mark
+        let text2 = "Look at /tmp/myproject/main.rs! It has bugs";
+        let hint2 = extract_project_dir_hint(text2).expect("project hint");
+        assert_eq!(hint2, "/tmp/myproject");
+
+        // No trailing punctuation — should still work
+        let text3 = "Fix /tmp/debugme/event_system.py please";
+        let hint3 = extract_project_dir_hint(text3).expect("project hint");
+        assert_eq!(hint3, "/tmp/debugme");
+    }
+
+    #[test]
     fn run_command_injection_falls_back_to_existing_parent_when_target_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = tmp.path().join("projects");
@@ -447,6 +492,33 @@ mod tests {
 
         assert_eq!(injected, parent.to_string_lossy());
         assert!(updated.contains(r#""working_dir":"#));
+    }
+
+    #[test]
+    fn rejects_api_endpoint_paths_as_project_dirs() {
+        // /api/notes is a REST API endpoint, not a filesystem path
+        // /tmp/notes_api/ is the actual project directory
+        let text = "Build /api/notes endpoint. Create everything in /tmp/notes_api/";
+        let hint = extract_project_dir_hint(text).expect("project hint");
+        assert_eq!(hint, "/tmp/notes_api");
+    }
+
+    #[test]
+    fn first_dir_component_exists_for_real_paths() {
+        assert!(first_dir_component_exists(std::path::Path::new("/tmp/foo")));
+        assert!(first_dir_component_exists(std::path::Path::new("/usr/bin")));
+        assert!(!first_dir_component_exists(std::path::Path::new(
+            "/api/notes"
+        )));
+        assert!(!first_dir_component_exists(std::path::Path::new(
+            "/v1/status"
+        )));
+        // Relative paths always pass
+        assert!(first_dir_component_exists(std::path::Path::new(
+            "src/main.rs"
+        )));
+        // Root itself passes
+        assert!(first_dir_component_exists(std::path::Path::new("/")));
     }
 
     proptest! {

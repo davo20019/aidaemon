@@ -1,5 +1,20 @@
 //! Common utility functions used across the codebase.
 
+/// Returns the largest byte index ≤ `byte_limit` that falls on a UTF-8 char boundary.
+///
+/// Use this when you need to slice a string by approximate byte length without panicking.
+/// The returned index is safe to use with `&s[..index]`.
+pub fn floor_char_boundary(s: &str, byte_limit: usize) -> usize {
+    if byte_limit >= s.len() {
+        return s.len();
+    }
+    let mut i = byte_limit;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Truncates a string to at most `max_chars` characters, adding "..." if truncated.
 ///
 /// This function is UTF-8 safe and respects character boundaries, avoiding panics

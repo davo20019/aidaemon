@@ -3,7 +3,8 @@ use crate::agent::consultant_direct_return::consultant_direct_return_ok;
 use crate::agent::consultant_fallthrough::consultant_fallthrough;
 use crate::agent::consultant_phase::ConsultantPhaseOutcome;
 use crate::agent::recall_guardrails::{
-    filter_tool_defs_for_personal_memory, is_personal_memory_tool,
+    filter_tool_defs_for_delegation, filter_tool_defs_for_personal_memory,
+    is_delegation_blocked_tool, is_personal_memory_tool,
 };
 use crate::agent::*;
 
@@ -659,8 +660,21 @@ impl Agent {
                 .collect::<Vec<_>>();
 
             let already_approved = {
-                let approved = self.schedule_approved_sessions.read().await;
-                approved.contains(ctx.session_id)
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    self.schedule_approved_sessions.read(),
+                )
+                .await
+                {
+                    Ok(approved) => approved.contains(ctx.session_id),
+                    Err(_) => {
+                        warn!(
+                            ctx.session_id,
+                            "Timed out acquiring schedule_approved_sessions lock"
+                        );
+                        false
+                    }
+                }
             };
             if already_approved {
                 return self
@@ -674,7 +688,17 @@ impl Agent {
             }
 
             let inline_confirmation = {
-                let hub_weak = self.hub.read().await.clone();
+                let hub_weak =
+                    match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
+                        Ok(guard) => guard.clone(),
+                        Err(_) => {
+                            warn!(
+                                ctx.session_id,
+                                "Timed out acquiring hub lock for inline schedule confirmation"
+                            );
+                            None
+                        }
+                    };
                 if let Some(hub_weak) = hub_weak {
                     if let Some(hub_arc) = hub_weak.upgrade() {
                         let confirmation_desc =
@@ -965,8 +989,21 @@ impl Agent {
         };
 
         let already_approved = {
-            let approved = self.schedule_approved_sessions.read().await;
-            approved.contains(ctx.session_id)
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                self.schedule_approved_sessions.read(),
+            )
+            .await
+            {
+                Ok(approved) => approved.contains(ctx.session_id),
+                Err(_) => {
+                    warn!(
+                        ctx.session_id,
+                        "Timed out acquiring schedule_approved_sessions lock"
+                    );
+                    false
+                }
+            }
         };
         if already_approved {
             return self
@@ -984,7 +1021,17 @@ impl Agent {
         // (Telegram/Discord/Slack). Shows Confirm ✅ / Cancel ❌ buttons.
         // Non-inline channels keep the existing text confirm/cancel fallback.
         let inline_confirmation = {
-            let hub_weak = self.hub.read().await.clone();
+            let hub_weak = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await
+            {
+                Ok(guard) => guard.clone(),
+                Err(_) => {
+                    warn!(
+                        ctx.session_id,
+                        "Timed out acquiring hub lock for inline goal confirmation"
+                    );
+                    None
+                }
+            };
             if let Some(hub_weak) = hub_weak {
                 if let Some(hub_arc) = hub_weak.upgrade() {
                     let confirmation_desc = format!(
@@ -1110,6 +1157,28 @@ impl Agent {
             // Non-owners cannot create complex goals — load tools and
             // fall through to agent loop so the request is handled directly.
             self.ensure_orchestrator_tools_loaded(ctx).await?;
+            let cli_agent_in_defs = ctx.tool_defs.iter().any(|def| {
+                def.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("cli_agent")
+            });
+            if self.has_cli_agents_available() && cli_agent_in_defs {
+                *ctx.tool_defs = filter_tool_defs_for_delegation(ctx.tool_defs);
+                *ctx.base_tool_defs = filter_tool_defs_for_delegation(ctx.base_tool_defs);
+                ctx.available_capabilities
+                    .retain(|name, _| !is_delegation_blocked_tool(name));
+                ctx.pending_system_messages.push(
+                    "[SYSTEM] Delegation mode active. Use `cli_agent` for execution tasks. \
+                     `terminal`, `browser`, and `run_command` are hidden in this turn."
+                        .to_string(),
+                );
+                info!(
+                    ctx.session_id,
+                    tool_count = ctx.tool_defs.len(),
+                    "Complex non-owner request: filtered competing execution tools for delegation mode"
+                );
+            }
             ctx.pending_system_messages.push(
                 "[SYSTEM] Creating goals is owner-only. Handle this request directly without creating a goal."
                     .to_string(),
@@ -1185,13 +1254,30 @@ impl Agent {
 
         // Upgrade weak self-reference to Arc for background spawning.
         let self_arc = {
-            let self_ref = self.self_ref.read().await;
-            self_ref.as_ref().and_then(|w| w.upgrade())
+            match tokio::time::timeout(Duration::from_secs(2), self.self_ref.read()).await {
+                Ok(self_ref) => self_ref.as_ref().and_then(|w| w.upgrade()),
+                Err(_) => {
+                    warn!(
+                        ctx.session_id,
+                        "Timed out acquiring self_ref lock for background task-lead spawn"
+                    );
+                    None
+                }
+            }
         };
 
         if let Some(agent_arc) = self_arc {
             // Spawn the task lead in the background — user gets immediate response.
-            let bg_hub = self.hub.read().await.clone();
+            let bg_hub = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
+                Ok(guard) => guard.clone(),
+                Err(_) => {
+                    warn!(
+                        ctx.session_id,
+                        "Timed out acquiring hub lock for background task-lead spawn"
+                    );
+                    None
+                }
+            };
             spawn_background_task_lead(
                 agent_arc,
                 goal.clone(),
@@ -1411,6 +1497,8 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::recall_guardrails::filter_tool_defs_for_delegation;
+    use serde_json::json;
 
     #[test]
     fn build_scheduled_goal_description_empty_composed_returns_current() {
@@ -1467,5 +1555,44 @@ mod tests {
         let composed = "  Original request:   remind me to stretch   ";
         let result = Agent::build_scheduled_goal_description("ignored", composed);
         assert_eq!(result, "remind me to stretch");
+    }
+
+    #[test]
+    fn delegation_filter_requires_cli_agent_in_defs() {
+        let defs = vec![
+            json!({"function":{"name":"terminal"}}),
+            json!({"function":{"name":"run_command"}}),
+            json!({"function":{"name":"web_search"}}),
+        ];
+        let cli_agent_in_defs = defs.iter().any(|d| {
+            d.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                == Some("cli_agent")
+        });
+        assert!(!cli_agent_in_defs);
+    }
+
+    #[test]
+    fn delegation_filter_applies_when_cli_agent_present() {
+        let defs = vec![
+            json!({"function":{"name":"terminal"}}),
+            json!({"function":{"name":"cli_agent"}}),
+            json!({"function":{"name":"run_command"}}),
+            json!({"function":{"name":"web_search"}}),
+            json!({"function":{"name":"browser"}}),
+        ];
+        let filtered = filter_tool_defs_for_delegation(&defs);
+        let names: Vec<&str> = filtered
+            .iter()
+            .filter_map(|d| d.get("function"))
+            .filter_map(|f| f.get("name"))
+            .filter_map(|n| n.as_str())
+            .collect();
+        assert!(names.contains(&"cli_agent"));
+        assert!(names.contains(&"web_search"));
+        assert!(!names.contains(&"terminal"));
+        assert!(!names.contains(&"browser"));
+        assert!(!names.contains(&"run_command"));
     }
 }

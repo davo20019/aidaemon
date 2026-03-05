@@ -17,6 +17,10 @@ pub(super) struct MessageBuildCtx<'a> {
     pub pending_system_messages: &'a mut Vec<String>,
     pub empty_response_retry_pending: bool,
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
+    /// Sticky flag computed once at the start of the agent loop from
+    /// `TurnContext::followup_mode`. Prevents mid-loop reclassification
+    /// that causes context collapse when history shifts between iterations.
+    pub is_new_task: bool,
 }
 
 pub(super) struct MessageBuildData {
@@ -111,7 +115,37 @@ impl Agent {
         let status_tx = ctx.status_tx;
 
         // Fetch recent history from canonical event stream.
-        let recent_history = self.load_recent_history(session_id, 20).await?;
+        // A limit of 40 queries 120 events (40*3), enough to cover sessions with
+        // heavy tool usage (~5 tasks × 12 tool calls each = 60 events per task).
+        let mut recent_history = self.load_recent_history(session_id, 40).await?;
+
+        // Guarantee the current user message is always present in history.
+        // In sessions with heavy prior tool use, the 120-event window may not
+        // include the current user message (it was just committed). Without it,
+        // last_user_pos=None triggers the safe-collapse fallback which degrades
+        // context quality. Appending it ensures the collapse boundary is always
+        // correctly placed at the current task's user message.
+        let user_msg_present = recent_history
+            .iter()
+            .any(|m| m.role == "user" && m.content.as_deref() == Some(user_text));
+        if !user_msg_present && !user_text.is_empty() {
+            recent_history.push(Message {
+                id: format!("synthetic-user-{}", uuid::Uuid::new_v4()),
+                session_id: session_id.to_string(),
+                role: "user".to_string(),
+                content: Some(user_text.to_string()),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls_json: None,
+                created_at: chrono::Utc::now(),
+                importance: 1.0,
+                embedding: None,
+            });
+            info!(
+                session_id,
+                iteration, "Injected current user message into history (was outside event window)"
+            );
+        }
 
         // Merge Pinned + Recent using iterators to avoid cloning the Message structs
         let mut seen_ids: std::collections::HashSet<&String> = std::collections::HashSet::new();
@@ -149,7 +183,21 @@ impl Agent {
                 start..=end
             })
             .collect();
-        let last_user_pos = deduped_msgs.iter().rposition(|m| m.role == "user");
+        // Find the boundary between old and current interactions.
+        // If the current user_text is already in the history, use its position.
+        // Otherwise, the DB write hasn't committed yet (race condition) — treat
+        // ALL loaded messages as "old" so we collapse their tool results.
+        let last_user_pos: Option<usize> = deduped_msgs
+            .iter()
+            .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text));
+        if last_user_pos.is_none() {
+            warn!(
+                session_id,
+                iteration,
+                total = deduped_msgs.len(),
+                "Collapse boundary: last_user_pos=None (should be rare after synthetic injection)"
+            );
+        }
         let pre_collapse_len = deduped_msgs.len();
         let deduped_msgs: Vec<&Message> = if let Some(boundary) = last_user_pos {
             deduped_msgs
@@ -167,7 +215,41 @@ impl Agent {
                 .map(|(_, m)| m)
                 .collect()
         } else {
+            // Current user message not in history yet (race condition or history
+            // window too small). Keep the most recent tool results intact — they
+            // are very likely from the CURRENT task's previous iterations.
+            // Collapse only older tool results to prevent context bloat.
+            const KEEP_RECENT_TOOL_RESULTS: usize = 8;
+            let tool_positions: Vec<usize> = deduped_msgs
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.role == "tool")
+                .map(|(i, _)| i)
+                .collect();
+            let protect_from = if tool_positions.len() > KEEP_RECENT_TOOL_RESULTS {
+                tool_positions[tool_positions.len() - KEEP_RECENT_TOOL_RESULTS]
+            } else {
+                0
+            };
+            warn!(
+                session_id,
+                iteration,
+                total_tool_results = tool_positions.len(),
+                protect_from,
+                "Current user message not in history — using safe collapse (keeping recent tool results)"
+            );
             deduped_msgs
+                .into_iter()
+                .enumerate()
+                .filter(|(i, m)| {
+                    // Keep non-tool messages, recent tool results, and identity-critical ones;
+                    // collapse old tool results.
+                    m.role != "tool"
+                        || *i >= protect_from
+                        || identity_preserve_indices.contains(i)
+                })
+                .map(|(_, m)| m)
+                .collect()
         };
         let collapsed = pre_collapse_len.saturating_sub(deduped_msgs.len());
         if collapsed > 0 {
@@ -184,14 +266,70 @@ impl Agent {
         // from truncation — it typically contains the budget/timeout response with
         // handoff context (activity summary, files read, commands run) that the next
         // interaction needs to avoid re-exploring from scratch.
+        // However, when the current message is a clearly NEW task (very different from
+        // the prior user message), the old handoff context is harmful — truncate it too.
         let collapse_boundary = deduped_msgs.iter().rposition(|m| m.role == "user");
+
+        // Use the sticky is_new_task flag from TurnContext (computed once at loop start).
+        // This prevents mid-loop reclassification: when the agent loop runs 10+ iterations,
+        // the loaded history shifts as tool results accumulate. Recomputing word-overlap
+        // each iteration could flip is_new_task from false→true, collapsing context and
+        // causing the model to lose track of its in-progress work.
+        let is_new_task = ctx.is_new_task;
+
+        // Trim old conversation pairs to prevent context pollution.
+        // Two modes:
+        // - New task (is_new_task): keep at most 1 old user-assistant pair
+        // - Follow-up (!is_new_task): keep at most 3 old user-assistant pairs
+        // Without this cap, old pairs accumulate and crowd out current-task tool calls,
+        // causing the model to lose track of its in-progress work.
+        let max_old_pairs: usize = if is_new_task { 1 } else { 3 };
+        let deduped_msgs: Vec<&Message> = if let Some(boundary) = collapse_boundary {
+            // Find all user positions before boundary
+            let old_user_positions: Vec<usize> = deduped_msgs
+                .iter()
+                .enumerate()
+                .filter(|(i, m)| *i < boundary && m.role == "user")
+                .map(|(i, _)| i)
+                .collect();
+            // Keep at most `max_old_pairs` old user-assistant pairs
+            let keep_from = if old_user_positions.len() > max_old_pairs {
+                old_user_positions[old_user_positions.len() - max_old_pairs]
+            } else {
+                0
+            };
+            let trimmed: Vec<&Message> = deduped_msgs
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _m)| *i >= keep_from)
+                .map(|(_, m)| m)
+                .collect();
+            if trimmed.len() < pre_collapse_len {
+                info!(
+                    session_id,
+                    old_pairs_trimmed = pre_collapse_len - trimmed.len(),
+                    max_old_pairs,
+                    is_new_task,
+                    "Trimmed old conversation pairs to protect current-task context"
+                );
+            }
+            trimmed
+        } else {
+            deduped_msgs
+        };
+
         let old_interaction_assistant_ids: std::collections::HashSet<&str> =
-            if let Some(boundary) = collapse_boundary {
+            if let Some(boundary) = deduped_msgs.iter().rposition(|m| m.role == "user") {
                 // Find the immediately-prior assistant message (right before boundary).
-                let prior_assistant_id: Option<&str> = (0..boundary)
-                    .rev()
-                    .find(|&i| deduped_msgs[i].role == "assistant")
-                    .map(|i| deduped_msgs[i].id.as_str());
+                // Exempt it from truncation ONLY for follow-up messages in the same task.
+                let prior_assistant_id: Option<&str> = if is_new_task {
+                    None // new task: truncate all old assistants including handoff
+                } else {
+                    (0..boundary)
+                        .rev()
+                        .find(|&i| deduped_msgs[i].role == "assistant")
+                        .map(|i| deduped_msgs[i].id.as_str())
+                };
 
                 deduped_msgs
                     .iter()
@@ -244,14 +382,25 @@ impl Agent {
                     m.content.clone()
                 };
 
-                // Prevent "empty response" fallbacks from accumulating as prompt context.
-                // These messages are user-visible (stored in history) but not useful for
-                // subsequent turns and can contribute to degraded model behavior.
+                // Prevent stall/failure responses from accumulating as prompt context.
+                // These messages are user-visible (stored in history) but poison
+                // subsequent turns — the LLM reads its own prior "I failed" messages
+                // and gives up without even trying ("learned helplessness").
                 if m.role == "assistant"
                     && m.tool_calls_json.is_none()
                     && content.as_deref().is_some_and(|c| {
-                        c.trim_start()
-                            .starts_with("I wasn't able to process that request.")
+                        let t = c.trim_start();
+                        t.starts_with("I wasn't able to process that request.")
+                            || t.starts_with("I wasn't able to complete this task.")
+                            || t.starts_with(
+                                "I made some progress but wasn't able to fully complete",
+                            )
+                            || t.starts_with("I seem to be stuck on this task.")
+                            || t.starts_with("I've reached my processing limit")
+                            || t.starts_with("I sent the requested file(s), but ran into issues")
+                            || t.starts_with(
+                                "I completed the main deliverable but wasn't able to finish",
+                            )
                     })
                 {
                     return None;
@@ -347,6 +496,51 @@ impl Agent {
                     "role": "user",
                     "content": user_text,
                 }));
+            }
+        }
+
+        // Task boundary marker: when there are multiple user messages in context
+        // (i.e., multiple independent tasks in the same chat session), inject a
+        // system separator before the current user message so the LLM knows which
+        // task is current. Without this, models confuse old tasks with the new one.
+        if iteration <= 2 {
+            let user_positions: Vec<usize> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                .map(|(i, _)| i)
+                .collect();
+            if user_positions.len() >= 2 {
+                // Find the position of the *current* user message (last user message).
+                if let Some(&current_pos) = user_positions.last() {
+                    let prev_user_content = user_positions.iter().rev().skip(1).find_map(|&pos| {
+                        messages[pos]
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string())
+                    });
+                    // Only inject if the current task differs from the previous one.
+                    let is_new_task = prev_user_content.as_deref() != Some(user_text);
+                    if is_new_task {
+                        let marker = json!({
+                            "role": "system",
+                            "content": "[TASK BOUNDARY] The user has started a NEW, UNRELATED task below. \
+                                        Previous tasks in this session are COMPLETED — do NOT \
+                                        reference, revisit, or repeat them. Focus EXCLUSIVELY \
+                                        on the new request. If the new task asks to create files, \
+                                        search the web, write code, or perform any action, you MUST \
+                                        use the appropriate tools — do NOT answer with information \
+                                        from previous tasks instead."
+                        });
+                        messages.insert(current_pos, marker);
+                        info!(
+                            session_id,
+                            iteration,
+                            user_messages = user_positions.len(),
+                            "Task boundary marker injected before current user message"
+                        );
+                    }
+                }
             }
         }
 

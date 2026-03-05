@@ -30,7 +30,7 @@ impl Tool for UseSkillTool {
     fn schema(&self) -> Value {
         json!({
             "name": "use_skill",
-            "description": "Activate a skill by name to get its instructions. Use manage_skills list to see available skills.",
+            "description": "Activate a skill by name when one was injected into the system prompt or explicitly requested by the user. Do NOT guess skill names — only use skills that appear in the current context or that the user asked for by name.",
             "parameters": {
                 "type": "object",
                 "properties": {

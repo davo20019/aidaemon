@@ -160,7 +160,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     )
     .await?;
     let startup_tools::OptionalToolsOutcome {
-        has_cli_agents,
+        has_cli_agents: _has_cli_agents,
         inbox_dir,
         cli_agent_tool,
     } = startup_tools::register_optional_tools(
@@ -217,7 +217,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     } else {
         Vec::new()
     };
-    let base_system_prompt = build_base_system_prompt(&config, &skill_names, has_cli_agents);
+    let base_system_prompt = build_base_system_prompt(&config, &skill_names);
 
     let llm_call_timeout_secs = if config.daemon.watchdog.enabled {
         Some(config.daemon.watchdog.llm_call_timeout_secs)
@@ -1168,22 +1168,15 @@ fn cleanup_inbox(dir: &str, retention: Duration) {
     }
 }
 
-fn build_base_system_prompt(
-    config: &AppConfig,
-    skill_names: &[String],
-    has_cli_agents: bool,
-) -> String {
+fn build_base_system_prompt(config: &AppConfig, skill_names: &[String]) -> String {
     let spawn_table_row = if config.subagents.enabled {
         "\n| Complex sub-tasks needing focused reasoning | spawn_agent | — |"
     } else {
         ""
     };
 
-    let cli_agent_table_row = if has_cli_agents {
-        "\n| Complex multi-step tasks (research, coding, analysis, admin) | cli_agent (PREFERRED — more powerful + saves API costs) | terminal, spawn_agent |"
-    } else if config.cli_agents.enabled {
-        // enabled but no agents discovered — still show manage_cli_agents
-        ""
+    let cli_agent_table_row = if config.cli_agents.enabled {
+        "\n| Complex multi-step tasks (research, coding, analysis, admin) | cli_agent (REQUIRED when available at runtime) | terminal/run_command for simple or fallback work |"
     } else {
         ""
     };
@@ -1280,7 +1273,7 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         ""
     };
 
-    let cli_agent_tool_doc = if has_cli_agents {
+    let cli_agent_tool_doc = if config.cli_agents.enabled {
         "\n- `cli_agent`: YOUR PRIMARY TOOL FOR COMPLEX TASKS. CLI agents are specialized AI \
         agents running natively on this machine — more powerful than your built-in tools \
         with deeper integration, larger context windows, and sophisticated agentic loops. \
@@ -1302,11 +1295,13 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         4. REVIEW — inspect the output and file changes. Validate correctness.\n\
         5. REPORT — give the user a clear summary.\n\
         \n  ROUTING RULES:\n\
-        - Complex multi-step tasks -> ALWAYS use cli_agent\n\
+        - Complex multi-step tasks -> use `cli_agent` when available at runtime\n\
         - Tasks needing many file reads/writes -> cli_agent\n\
         - Research requiring multiple searches -> cli_agent\n\
         - Simple quick answers, memory lookups, one-off commands -> handle directly\n\
-        - If a cli_agent fails -> retry with different agent or handle directly\n\
+        - If a cli_agent fails -> retry with a different agent, or fallback to direct tools\n\
+        - In delegated executor/non-owner-complex flows, `terminal`, `browser`, and `run_command` \
+          are structurally hidden when `cli_agent` is available\n\
         \n  NO DOUBLE-DIPPING: When you delegate a task to a cli_agent, do NOT also perform the \
         same work yourself with your own tools (web_search, web_fetch, terminal, etc.). \
         The cli_agent handles it end-to-end. If you need to research AND build, dispatch \
@@ -1314,7 +1309,9 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         \n  Parameters: tool (optional specific agent), prompt (the task), working_dir (project path), \
         system_instruction (specialist role), async_mode (true for parallel dispatch).\n\
         If tool is omitted, the runtime auto-selects the first installed agent in this order: \
-        claude, gemini, codex, copilot, aider."
+        claude, gemini, codex, copilot, aider.\n\
+        \n  Availability is dynamic at runtime: if `cli_agent` is currently unavailable, \
+        use `manage_cli_agents` (list/add/enable) or fallback tools for this turn."
     } else {
         ""
     };
@@ -1328,22 +1325,11 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         ""
     };
 
-    // Direct mode guidance (when no CLI agents are available)
-    let direct_mode_doc = if config.cli_agents.enabled && !has_cli_agents {
-        "\n\n## Autonomous Agent Mode\n\
-        When facing complex, multi-step tasks, use your full toolkit autonomously:\n\
-        - `terminal`: Run commands — git, npm, pip, curl, etc. Chain commands for \
-        multi-step workflows.\n\
-        - `web_search` + `web_fetch`: Research anything — search, read docs, check APIs.\n\
-        - `spawn_agent`: Break complex tasks into sub-tasks and delegate to sub-agents \
-        for parallel execution.\n\
-        - `browser`: For visual inspection or web page interaction.\n\n\
-        For complex tasks, work like a senior engineer: understand the task, explore, \
-        execute, verify. But always match effort to task complexity — a simple lookup \
-        should not become a 20-command investigation. If you can't find something after \
-        a few targeted attempts, ask the user.\n\
-        \n  You can install CLI AI agents to further enhance your capabilities. \
-        Use `manage_cli_agents` to add agents like Claude Code, Gemini CLI, or Codex."
+    let direct_mode_doc = if config.cli_agents.enabled {
+        "\n\n## CLI Agent Availability\n\
+        `cli_agent` availability is dynamic at runtime. \
+        If it is unavailable on a turn, use `manage_cli_agents` to list/add/enable agents, \
+        or proceed with direct tools for that turn."
     } else {
         ""
     };
@@ -1594,6 +1580,23 @@ learn their preferences, track their goals, and improve through experience.
 - Only chain multiple tool calls when each subsequent call is a direct dependency of the task (e.g., \"create file\" then \"run build\"). Exploring tangentially related tools is wrong.
 - If you catch yourself calling 3+ DIFFERENT tools for a simple message, you have lost scope — stop and respond with what you have.
 
+## Coding & Debugging Workflow
+When asked to fix bugs, implement features, or modify code, follow this structured cycle:
+1. **Read & Analyze** — Read ALL relevant files first. Do not re-read a file you already read. Identify ALL issues across ALL files before writing anything.
+2. **Plan** — List every bug in every file. For multi-file bugs, plan fixes for ALL files before editing any.
+3. **Implement ALL fixes** — Fix EVERY file before running tests. Do not test after fixing only one file. \
+For files under 100 lines, use `write_file` to rewrite the entire file with all fixes applied at once. This is more reliable than multiple `edit_file` calls. \
+For larger files, use `edit_file` — but copy the exact text from your `read_file` output into `old_text`. Do not paraphrase or reformat.
+4. **Test** — ONLY after ALL files are fixed, run tests (`terminal`). Never skip this step.
+5. **Iterate on failures** — If tests fail, read the error, fix remaining issues, and re-test. \
+Each retry must build on what you learned — never repeat an approach that already failed.
+
+**Coding tasks are exempt from the 3-tool completion rule.**
+**Never skip testing.** Verify your changes work before responding.
+**Never claim a fix is done without testing it.**
+**NEVER use `terminal` with `python3 -c` to read or write files.** Use `read_file` and `write_file` instead — they are faster and do not require approval.
+**NEVER use `terminal` with `cat`, `head`, or `tail` to read files.** Always use `read_file` — it is the dedicated tool for reading files and avoids unnecessary terminal overhead.
+
 ## Memory
 You have persistent memory across sessions: facts (long-term knowledge about the user), \
 episodic memory (past session summaries), procedural memory (learned workflows), \
@@ -1650,8 +1653,8 @@ information lookups should use memory first, then ask the user.
 {browser_table_row}| Search the web | web_search | browser, terminal (curl) |
 | Read web pages, articles, docs | web_fetch | browser (for public pages) |
 | Read file contents | read_file | terminal (cat) |
-| Write/create files | write_file | terminal (echo >) |
-| Edit text in files | edit_file | terminal (sed) |
+| Write/create files | write_file | terminal (echo >, cat <<), python3 -c |
+| Edit text in files | edit_file | terminal (sed), python3 -c |
 | Search code/files | search_files | terminal (grep, find) |
 | Understand a project | project_inspect | terminal (multiple cmds) |
 | Run build/test/lint | run_command | terminal (for safe cmds) |
@@ -1674,7 +1677,7 @@ information lookups should use memory first, then ask the user.
 
 ## Tools
 - `read_file`: Read file contents with line numbers. Supports line ranges for large files. Use instead of terminal cat/head/tail.
-- `write_file`: Write or create files with atomic writes and automatic backup. Use instead of terminal echo/cat redirection.
+- `write_file`: Write or create files with atomic writes and automatic backup. Use instead of terminal echo/cat/heredoc redirection. ALWAYS prefer write_file over `cat > file << 'EOF'` in terminal — heredoc commands trigger approval flow and may be too long.
 - `edit_file`: Find and replace text in files. Validates uniqueness, shows context around changes. Use instead of terminal sed/awk. If it fails with not-found/ambiguous text, call `read_file` for the same path and retry once before asking the user.
 - `search_files`: Search by filename glob and/or content regex. Auto-skips .git/node_modules/target. Use instead of terminal find/grep.
 - `project_inspect`: Understand project(s) in one call: type detection, metadata, git info, directory structure. For multiple folders, prefer one batched call with `paths` instead of many repeated single-path calls.
@@ -1687,7 +1690,10 @@ information lookups should use memory first, then ask the user.
 Use for coding tasks, builds, deployments, and system administration. \
 Check if a dedicated tool exists first (read_file, write_file, edit_file, search_files, run_command, git_info, git_commit). \
 For recursive code/text search, prefer `search_files`; if using `terminal`, avoid broad `grep -r` over `.` without `--include` / `--exclude-dir` filters. \
-Commands that aren't pre-approved go through the user approval flow.
+Commands that aren't pre-approved go through the user approval flow. \
+IMPORTANT: If a user sends a command chain (using &&, ||, ;, or |) that contains ANY dangerous segment, \
+refuse the ENTIRE chain. Never split a dangerous chain to execute only the \"safe\" parts — \
+ask the user which specific operation they want instead.
 - `system_info`: Get CPU, memory, and OS information.
 - `remember_fact`: Store important facts about the user for long-term memory. Categories: \
 user (personal info), preference (tool/workflow prefs), project (current work), technical \

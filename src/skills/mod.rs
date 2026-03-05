@@ -1202,6 +1202,14 @@ pub fn build_system_prompt_with_memory(
         }
     }
 
+    // 12b. Owner Facts (in owner DMs, show the owner's stored personal facts)
+    if memory.current_person.is_none() && !memory.current_person_facts.is_empty() {
+        prompt.push_str("\n\n## About the Owner\nStored facts about you:\n");
+        for f in memory.current_person_facts.iter().take(15) {
+            prompt.push_str(&format!("- [{}] {}: {}\n", f.category, f.key, f.value));
+        }
+    }
+
     // 13. Current Speaker Context (when talking to a known person who is not the owner)
     if let Some(person) = memory.current_person {
         prompt.push_str(&format!(

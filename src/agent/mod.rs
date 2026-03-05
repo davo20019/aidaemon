@@ -41,14 +41,14 @@ use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole
 pub use crate::types::StatusUpdate;
 
 /// Constants for stall and repetitive behavior detection
-const MAX_STALL_ITERATIONS: usize = 3;
+const MAX_STALL_ITERATIONS: usize = 5;
 const DEFERRED_NO_TOOL_SWITCH_THRESHOLD: usize = 2;
 const MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES: usize = 1;
 const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
 /// After this many deferred-no-tool retries, accept substantive text-only responses
 /// instead of continuing to force tool use. This prevents stalls on simple
 /// conversational queries (greetings, capability questions, jokes) that don't need tools.
-const DEFERRED_NO_TOOL_ACCEPT_THRESHOLD: usize = 3;
+const DEFERRED_NO_TOOL_ACCEPT_THRESHOLD: usize = 2;
 const MAX_REPETITIVE_CALLS: usize = 8;
 const RECENT_CALLS_WINDOW: usize = 12;
 /// After this many identical calls (same tool+args hash), skip execution and
@@ -59,7 +59,7 @@ const REPETITIVE_REDIRECT_THRESHOLD: usize = 3;
 /// LLM keeps calling e.g. `terminal` with varied commands without progress.
 /// Set high enough to allow complex multi-step investigations from mobile,
 /// and to leave room for follow-up work after cli_agent returns.
-const MAX_CONSECUTIVE_SAME_TOOL: usize = 16;
+const MAX_CONSECUTIVE_SAME_TOOL: usize = 8;
 /// Hard iteration cap even in "unlimited" mode — prevents runaway resource
 /// consumption if stall detection is bypassed (e.g. alternating tool names).
 const HARD_ITERATION_CAP: usize = 200;
@@ -108,7 +108,7 @@ mod loop_utils;
 #[path = "policy/recall_guardrails.rs"]
 mod recall_guardrails;
 use loop_utils::{
-    build_task_boundary_hint, classify_tool_result_failure_with_args, extract_command_from_args,
+    build_task_boundary_hint, classify_tool_result_failure_with_context, extract_command_from_args,
     extract_file_path_from_args, extract_key_error_line, extract_send_file_dedupe_key_from_args,
     fixup_message_ordering, hash_tool_call, is_trigger_session, semantic_failure_limit,
     strip_appended_diagnostics, ToolFailureClass,
@@ -141,6 +141,7 @@ mod consultant_phase;
 mod graceful;
 #[path = "runtime/history.rs"]
 mod history;
+pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::TurnContext;
 #[path = "runtime/llm.rs"]
 mod llm;
@@ -273,6 +274,7 @@ pub(in crate::agent) fn provider_kind_metric_label(
 ) -> &'static str {
     match kind {
         crate::config::ProviderKind::OpenaiCompatible => "openai_compatible",
+        crate::config::ProviderKind::XaiNative => "xai_native",
         crate::config::ProviderKind::GoogleGenai => "google_genai",
         crate::config::ProviderKind::Anthropic => "anthropic",
     }
@@ -1729,6 +1731,8 @@ pub fn spawn_background_task_lead(
             let mut last_progress_key: Option<String> = None;
             let mut repeated_progress = 0u32;
             let mut planning_msg_count = 0u32;
+            let mut total_progress_emitted = 0u32;
+            const MAX_PROGRESS_MESSAGES: u32 = 4;
             loop {
                 // First update after 15s, then every 30s
                 let wait_secs = if interval_count == 0 { 15 } else { 30 };
@@ -1749,7 +1753,8 @@ pub fn spawn_background_task_lead(
                     // Now: send only on the first empty-tasks heartbeat, then
                     // stay silent until tasks are actually created.
                     planning_msg_count += 1;
-                    if planning_msg_count == 1 {
+                    if planning_msg_count == 1 && total_progress_emitted < MAX_PROGRESS_MESSAGES {
+                        total_progress_emitted += 1;
                         if let Some(hub_weak) = &heartbeat_hub {
                             if let Some(hub_arc) = hub_weak.upgrade() {
                                 let _ = hub_arc
@@ -1806,26 +1811,24 @@ pub fn spawn_background_task_lead(
                         )
                     };
 
-                    let progress_key = format!(
-                        "{}|{}|{}|{}",
-                        completed,
-                        total,
-                        active_count,
-                        in_progress.join("|")
-                    );
+                    // Dedup key uses only completed|total so we don't spam when
+                    // sub-tasks change status without any step actually completing.
+                    let progress_key = format!("{}|{}", completed, total);
                     let should_emit = if last_progress_key.as_deref() == Some(progress_key.as_str())
                     {
                         repeated_progress = repeated_progress.saturating_add(1);
-                        // Reduce spam for long-running tasks with unchanged state.
-                        repeated_progress.is_multiple_of(3)
+                        // Reduce spam for long-running tasks with unchanged state:
+                        // emit every 4th repeat (i.e. roughly every 2 minutes).
+                        repeated_progress.is_multiple_of(4)
                     } else {
                         last_progress_key = Some(progress_key);
                         repeated_progress = 0;
                         true
                     };
-                    if !should_emit {
+                    if !should_emit || total_progress_emitted >= MAX_PROGRESS_MESSAGES {
                         continue;
                     }
+                    total_progress_emitted += 1;
                     if let Some(hub_weak) = &heartbeat_hub {
                         if let Some(hub_arc) = hub_weak.upgrade() {
                             let _ = hub_arc.send_text(&heartbeat_session, &progress_msg).await;

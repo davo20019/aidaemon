@@ -15,7 +15,7 @@ use serenity::builder::CreateActionRow;
 use serenity::model::application::ButtonStyle;
 use serenity::Client;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{build_help_text, sanitize_filename, split_message};
@@ -677,28 +677,41 @@ impl DiscordChannel {
             let queue_result = self.task_registry.queue_message(&session_id, &text).await;
             match queue_result {
                 Some(queue_pos) => {
-                    let current_task = self
-                        .task_registry
-                        .get_running_task_description(&session_id)
-                        .await
-                        .unwrap_or_else(|| "processing".to_string());
-                    let preview: String = text.chars().take(50).collect();
-                    let suffix = if text.len() > 50 { "..." } else { "" };
-                    let _ = msg
-                        .channel_id
-                        .say(
-                            &ctx.http,
-                            format!(
-                                "📥 Queued ({}): \"{}{}\" | Currently: {}",
-                                queue_pos, preview, suffix, current_task
-                            ),
-                        )
-                        .await;
+                    // Only notify for the first 3 queued messages to avoid spam.
+                    if queue_pos <= 3 {
+                        let current_task = self
+                            .task_registry
+                            .get_running_task_description(&session_id)
+                            .await
+                            .unwrap_or_else(|| "processing".to_string());
+                        let preview: String = text.chars().take(50).collect();
+                        let suffix = if text.len() > 50 { "..." } else { "" };
+                        let _ = msg
+                            .channel_id
+                            .say(
+                                &ctx.http,
+                                format!(
+                                    "📥 Queued ({}): \"{}{}\" | Currently: {}",
+                                    queue_pos, preview, suffix, current_task
+                                ),
+                            )
+                            .await;
+                    }
                 }
                 None => {
                     info!(session_id, "Dropped duplicate queued message");
                 }
             }
+            return;
+        }
+
+        // Dedup gate: atomically mark this message as "seen" so concurrent
+        // handlers for the same text don't ALL start direct processing.
+        if !self.task_registry.mark_seen(&session_id, &text).await {
+            debug!(
+                session_id,
+                "Dropped duplicate message (direct processing race)"
+            );
             return;
         }
 
@@ -777,6 +790,7 @@ impl DiscordChannel {
             let mut current_status_task = status_task;
             let mut current_heartbeat = heartbeat;
             let mut current_typing_cancel = typing_cancel;
+            let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
 
             loop {
                 let result = tokio::select! {
@@ -795,6 +809,10 @@ impl DiscordChannel {
                             stale_mins,
                             if stale_mins == 1 { "" } else { "s" }
                         ))
+                    },
+                    _ = tokio::time::sleep_until(task_wall_deadline) => {
+                        tracing::error!(session_id = %session_id, "Task hit 20-minute hard wall-clock limit");
+                        Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
                     },
                 };
                 current_typing_cancel.cancel();
@@ -834,7 +852,7 @@ impl DiscordChannel {
                     registry.complete(current_task_id).await;
                 }
 
-                if let Some(queued) = registry.pop_queued_message(&session_id).await {
+                if let Some(queued) = registry.pop_all_queued_messages(&session_id).await {
                     tokio::time::sleep(Duration::from_millis(100)).await;
 
                     info!(

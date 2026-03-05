@@ -2,6 +2,7 @@ mod anthropic_native;
 mod error;
 mod google_genai;
 mod openai_compatible;
+mod xai_native;
 
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ pub use anthropic_native::AnthropicNativeProvider;
 pub use error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
 pub use google_genai::GoogleGenAiProvider;
 pub use openai_compatible::OpenAiCompatibleProvider;
+pub use xai_native::XaiNativeProvider;
 
 /// Build an HTTP client with a panic-safe fallback when system proxy discovery
 /// is unavailable in the runtime environment.

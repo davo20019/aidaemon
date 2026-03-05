@@ -20,6 +20,7 @@ pub struct OpenAiCompatibleProvider {
     gateway_token: Option<String>,
     extra_headers: HashMap<String, String>,
     is_cloudflare_gateway: bool,
+    max_tokens: Option<u32>,
 }
 
 impl Drop for OpenAiCompatibleProvider {
@@ -106,10 +107,20 @@ impl OpenAiCompatibleProvider {
         gateway_token: Option<&str>,
         extra_headers: Option<HashMap<String, String>>,
     ) -> Result<Self, String> {
+        Self::new_with_all_options(base_url, api_key, gateway_token, extra_headers, None)
+    }
+
+    pub fn new_with_all_options(
+        base_url: &str,
+        api_key: &str,
+        gateway_token: Option<&str>,
+        extra_headers: Option<HashMap<String, String>>,
+        max_tokens: Option<u32>,
+    ) -> Result<Self, String> {
         // Validate URL security before creating provider
         validate_base_url(base_url)?;
 
-        let client = crate::providers::build_http_client(Duration::from_secs(120))?;
+        let client = crate::providers::build_http_client(Duration::from_secs(300))?;
         let normalized_base_url = base_url.trim_end_matches('/').to_string();
 
         Ok(Self {
@@ -119,6 +130,7 @@ impl OpenAiCompatibleProvider {
             api_key: api_key.to_string(),
             gateway_token: gateway_token.map(|s| s.to_string()),
             extra_headers: extra_headers.unwrap_or_default(),
+            max_tokens,
         })
     }
 
@@ -186,6 +198,10 @@ impl OpenAiCompatibleProvider {
             "model": model,
             "messages": messages_cleaned,
         });
+
+        if let Some(max_tokens) = self.max_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
 
         if !tools.is_empty() {
             body["tools"] = json!(tools);
@@ -355,12 +371,35 @@ impl ModelProvider for OpenAiCompatibleProvider {
             })
         });
 
+        // Detect token-limit truncation: when finish_reason is "length", the
+        // model hit its max_tokens ceiling and the response was cut off
+        // mid-generation.  Surface this so the agent loop can retry or degrade
+        // gracefully instead of treating the empty/broken output as intentional.
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let response_note = if finish_reason == "length" {
+            warn!(
+                model,
+                output_tokens = usage.as_ref().map(|u| u.output_tokens).unwrap_or(0),
+                "LLM response truncated at token limit (finish_reason=length)"
+            );
+            Some(
+                "Response was truncated because it hit the model's maximum output token limit. \
+                  The output may be incomplete or missing tool calls."
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
         Ok(ProviderResponse {
             content,
             tool_calls,
             usage,
             thinking: None,
-            response_note: None,
+            response_note,
         })
     }
 

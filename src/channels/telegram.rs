@@ -4243,28 +4243,42 @@ impl TelegramChannel {
             let queue_result = self.task_registry.queue_message(&session_id, &text).await;
             match queue_result {
                 Some(queue_pos) => {
-                    let current_task = self
-                        .task_registry
-                        .get_running_task_description(&session_id)
-                        .await
-                        .unwrap_or_else(|| "processing".to_string());
-                    let preview: String = text.chars().take(50).collect();
-                    let suffix = if text.len() > 50 { "..." } else { "" };
-                    let _ = bot
-                        .send_message(
-                            msg.chat.id,
-                            format!(
-                                "📥 Queued ({}): \"{}{}\" | Currently: {}",
-                                queue_pos, preview, suffix, current_task
-                            ),
-                        )
-                        .await;
+                    // Only notify the user for the first 3 queued messages to avoid spam
+                    // (long messages fragmented by Telegram Web can produce 10+ fragments).
+                    if queue_pos <= 3 {
+                        let current_task = self
+                            .task_registry
+                            .get_running_task_description(&session_id)
+                            .await
+                            .unwrap_or_else(|| "processing".to_string());
+                        let preview: String = text.chars().take(50).collect();
+                        let suffix = if text.len() > 50 { "..." } else { "" };
+                        let _ = bot
+                            .send_message(
+                                msg.chat.id,
+                                format!(
+                                    "📥 Queued ({}): \"{}{}\" | Currently: {}",
+                                    queue_pos, preview, suffix, current_task
+                                ),
+                            )
+                            .await;
+                    }
                 }
                 None => {
                     // Duplicate message detected — silently ignore
                     debug!(session_id, "Dropped duplicate queued message");
                 }
             }
+            return;
+        }
+
+        // Dedup gate: atomically mark this message as "seen" so concurrent
+        // webhook handlers for the same text don't ALL start direct processing.
+        if !self.task_registry.mark_seen(&session_id, &text).await {
+            debug!(
+                session_id,
+                "Dropped duplicate message (direct processing race)"
+            );
             return;
         }
 
@@ -4325,6 +4339,8 @@ impl TelegramChannel {
             let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
             let min_interval = Duration::from_secs(3);
             let mut sent_thinking = false;
+            let mut dm_status_count: u32 = 0;
+            const MAX_DM_STATUS_MESSAGES: u32 = 6;
             while let Some(update) = status_rx.recv().await {
                 // In non-DM channels: only send one "Thinking..." then suppress
                 if !is_dm {
@@ -4353,6 +4369,15 @@ impl TelegramChannel {
                 let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
                     if chunk.contains("https://") || chunk.contains("http://"));
                 let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
+                // Hard cap on DM status messages to prevent notification spam.
+                // BudgetExtended and URL-containing messages always bypass the cap.
+                if !has_url && !is_budget_ext && dm_status_count >= MAX_DM_STATUS_MESSAGES {
+                    // After the cap, just send typing indicator instead
+                    let _ = status_bot
+                        .send_chat_action(status_chat_id, ChatAction::Typing)
+                        .await;
+                    continue;
+                }
                 if !has_url && !is_budget_ext && now.duration_since(last_sent) < min_interval {
                     continue;
                 }
@@ -4488,6 +4513,7 @@ impl TelegramChannel {
                     }
                 };
                 let _ = status_bot.send_message(status_chat_id, text).await;
+                dm_status_count += 1;
                 // Re-send typing indicator immediately after each status message.
                 // Telegram clears the typing indicator when a message is sent, so
                 // without this there's a visible gap until the typing loop's next
@@ -4538,6 +4564,11 @@ impl TelegramChannel {
             let mut current_typing_cancel = typing_cancel;
             let mut current_status_task = status_task;
             let mut current_heartbeat = heartbeat;
+            // Hard wall-clock deadline: no single message handling can exceed this,
+            // regardless of heartbeat or LLM watchdog state. This catches hangs in
+            // non-LLM code paths (DB queries, bootstrap phase, etc.) that the
+            // heartbeat-based watchdog cannot detect.
+            let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
 
             loop {
                 let result = tokio::select! {
@@ -4549,6 +4580,10 @@ impl TelegramChannel {
                             stale_mins,
                             if stale_mins == 1 { "" } else { "s" }
                         ))
+                    },
+                    _ = tokio::time::sleep_until(task_wall_deadline) => {
+                        tracing::error!(session_id = %session_id, "Task hit 20-minute hard wall-clock limit");
+                        Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
                     },
                 };
                 current_typing_cancel.cancel();
@@ -4613,8 +4648,9 @@ impl TelegramChannel {
                     registry.complete(current_task_id).await;
                 }
 
-                // Check if there are queued messages to process
-                if let Some(queued) = registry.pop_queued_message(&session_id).await {
+                // Drain and coalesce ALL queued messages so fragmented long
+                // messages (split by Telegram Web) are reassembled into one prompt.
+                if let Some(queued) = registry.pop_all_queued_messages(&session_id).await {
                     // Small delay to ensure previous message is fully committed to DB
                     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -4914,7 +4950,19 @@ impl Channel for TelegramChannel {
             ]])
         };
 
-        let escaped_cmd = html_escape(command);
+        // Truncate command display to fit Telegram's 4096 char limit.
+        // Reserve ~200 chars for risk label, warnings, buttons, and footer.
+        const MAX_CMD_DISPLAY: usize = 3600;
+        let display_cmd = if command.len() > MAX_CMD_DISPLAY {
+            format!(
+                "{}...\n[truncated — {} chars total]",
+                &command[..MAX_CMD_DISPLAY],
+                command.len()
+            )
+        } else {
+            command.to_string()
+        };
+        let escaped_cmd = html_escape(&display_cmd);
 
         // Build message with risk info
         let (risk_icon, risk_label) = match risk_level {

@@ -409,7 +409,7 @@ async fn test_old_interaction_assistant_content_truncated() {
         .agent
         .handle_message(
             "truncate_test",
-            "Third question?",
+            "Also third question?",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),

@@ -4,8 +4,57 @@ use super::*;
 use crate::execution_policy::PolicyBundle;
 use crate::traits::ProviderResponse;
 
-fn build_tool_output_completion_reply(tool_output: &str) -> String {
-    format!("Here is the latest tool output:\n\n{}", tool_output.trim())
+fn build_tool_output_completion_reply(tool_output: &str) -> Option<String> {
+    let trimmed = tool_output.trim();
+    // Don't use trivially uninformative tool outputs as completion replies.
+    // These produce confusing messages like "Here is the latest tool output: (no output)".
+    if is_trivial_tool_output(trimmed) {
+        return None;
+    }
+    Some(format!("Here is the latest tool output:\n\n{}", trimmed))
+}
+
+fn is_trivial_tool_output(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.is_empty()
+        || lower == "(no output)"
+        || lower == "no output"
+        || lower == "ok"
+        || lower == "done"
+        || lower == "success"
+        || lower.starts_with("exit code:")
+        || lower.starts_with("[exit code:")
+        || lower.starts_with("blocked:") // terminal safety rejection, not a user-facing answer
+        || lower.starts_with("error:")
+        || (lower.starts_with("file written") && lower.len() < 100)
+        || (lower.starts_with("wrote ") && lower.len() < 100)
+        || looks_like_directory_listing(&lower)
+}
+
+/// Detect `ls -la` style output: starts with "total N" and contains
+/// permission-style lines (e.g. "drwxr-xr-x", "-rw-r--r--").
+fn looks_like_directory_listing(lower: &str) -> bool {
+    if !lower.starts_with("total ") {
+        return false;
+    }
+    let mut perm_lines = 0;
+    for line in lower.lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("drwx") || trimmed.starts_with("-rw") || trimmed.starts_with("lrwx")
+        {
+            perm_lines += 1;
+        }
+    }
+    perm_lines >= 2
+}
+
+fn build_activity_summary_reply(tool_calls: &[&str]) -> String {
+    let mut summary = String::from("I completed the following actions:\n");
+    for (i, call) in tool_calls.iter().enumerate() {
+        summary.push_str(&format!("{}. {}\n", i + 1, call));
+    }
+    summary.push_str("\nLet me know if you need anything else.");
+    summary
 }
 
 fn should_recover_completion_from_tool_output(
@@ -63,6 +112,7 @@ pub(super) struct ConsultantCompletionCtx<'a> {
     pub pending_background_ack: &'a mut Option<String>,
     pub require_file_recheck_before_answer: &'a mut bool,
     pub needs_tools_for_turn: bool,
+    pub force_text_response: bool,
 }
 
 impl Agent {
@@ -101,6 +151,7 @@ impl Agent {
         let mut pending_background_ack = std::mem::take(ctx.pending_background_ack);
         let mut require_file_recheck_before_answer = *ctx.require_file_recheck_before_answer;
         let needs_tools_for_turn = ctx.needs_tools_for_turn;
+        let force_text_response = ctx.force_text_response;
 
         macro_rules! commit_state {
             () => {
@@ -219,21 +270,47 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
             }
 
             let low_signal_completion = is_low_signal_task_lead_reply(&reply);
+            let was_truly_empty = reply.trim().is_empty();
             if should_recover_completion_from_tool_output(
                 &reply,
                 self.depth,
                 total_successful_tool_calls,
             ) {
+                let mut recovered = false;
                 if let Some(tool_output) = self
                     .latest_non_system_tool_output_excerpt(session_id, 2500)
                     .await
                 {
-                    reply = build_tool_output_completion_reply(&tool_output);
+                    if let Some(tool_reply) = build_tool_output_completion_reply(&tool_output) {
+                        reply = tool_reply;
+                        recovered = true;
+                        info!(
+                            session_id,
+                            iteration,
+                            low_signal_completion,
+                            "Recovered completion reply from latest tool output"
+                        );
+                    }
+                }
+                // If tool output was trivial/empty and the LLM returned a truly empty
+                // response (not just low-signal), don't build an activity summary —
+                // leave reply empty so the empty-response retry mechanism kicks in
+                // and gives the model another chance to complete the task properly.
+                if !recovered && !was_truly_empty && !learning_ctx.tool_calls.is_empty() {
+                    let actions: Vec<&str> =
+                        learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
+                    reply = build_activity_summary_reply(&actions);
                     info!(
                         session_id,
                         iteration,
-                        low_signal_completion,
-                        "Recovered completion reply from latest tool output"
+                        tool_call_count = learning_ctx.tool_calls.len(),
+                        "Built activity summary as completion (low-signal reply, trivial tool output)"
+                    );
+                } else if !recovered && was_truly_empty {
+                    info!(
+                        session_id,
+                        iteration,
+                        "Empty LLM response with no recoverable tool output — deferring to empty-response retry"
                     );
                 }
             }
@@ -265,7 +342,22 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
 
                         // Retry once with a stronger model profile to avoid repeated empties,
                         // unless the user explicitly pinned a model override.
-                        let is_override = *self.model_override.read().await;
+                        let is_override = match tokio::time::timeout(
+                            Duration::from_secs(2),
+                            self.model_override.read(),
+                        )
+                        .await
+                        {
+                            Ok(guard) => *guard,
+                            Err(_) => {
+                                warn!(
+                                        session_id,
+                                        iteration,
+                                        "Timed out acquiring model_override lock during empty-response recovery"
+                                    );
+                                false
+                            }
+                        };
                         if !is_override {
                             let reason =
                                 format!("empty_response(iter={},model={})", iteration, model);
@@ -396,20 +488,54 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
             // produce a better response), but if the guard fires a second time,
             // accept the reply to avoid "Stuck" loops (e.g., after remember_fact
             // the LLM says "I'll remember that" — a confirmation, not a real deferral).
+            // Substantive-response fast path: if the model produced a long,
+            // content-rich answer (≥200 chars after stripping deferred-action
+            // lines) AND it doesn't contain leaked structural markers
+            // ([tool_use:], [INTENT_GATE], etc.), accept it immediately even
+            // if it opens with an action-promise phrase like "I'll recall…".
+            // This prevents recall/informational queries from being rejected
+            // and forced through unnecessary tool-call loops.
+            let has_structural_markers = {
+                let lower = reply.trim().to_ascii_lowercase();
+                lower.contains("[consultation]")
+                    || lower.contains(&INTENT_GATE_MARKER.to_ascii_lowercase())
+                    || lower.contains("[tool_use:")
+                    || lower.contains("[tool_call:")
+            };
+            let reply_is_substantive =
+                !has_structural_markers && is_substantive_text_response(&reply, 200);
+
             if self.depth == 0
                 && !used_identity_prefill
                 && looks_like_deferred_action_response(&reply)
+                && !reply_is_substantive
             {
                 // Post-tool-success: if we've already caught one deferral after tools
                 // succeeded, accept this reply instead of stalling further.
+                // Exception: when force_text is active (tools stripped), a deferred
+                // reply like "Let me examine..." is useless — the model can't act.
+                // Replace it with an activity summary of what was actually done.
                 if total_successful_tool_calls > 0 && stall_count >= 1 {
-                    info!(
-                        session_id,
-                        iteration,
-                        total_successful_tool_calls,
-                        stall_count,
-                        "Accepting deferred-looking reply as completion after tool progress"
-                    );
+                    if force_text_response && !learning_ctx.tool_calls.is_empty() {
+                        let actions: Vec<&str> =
+                            learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
+                        reply = build_activity_summary_reply(&actions);
+                        info!(
+                            session_id,
+                            iteration,
+                            total_successful_tool_calls,
+                            stall_count,
+                            "Force-text active: replaced deferred reply with activity summary"
+                        );
+                    } else {
+                        info!(
+                            session_id,
+                            iteration,
+                            total_successful_tool_calls,
+                            stall_count,
+                            "Accepting deferred-looking reply as completion after tool progress"
+                        );
+                    }
                     // Fall through to the normal completion path below
                 } else if tool_defs.is_empty() {
                     warn!(
@@ -688,16 +814,47 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
 #[cfg(test)]
 mod tests {
     use super::{
-        build_tool_output_completion_reply, should_enforce_no_tool_text_when_tools_required,
+        build_activity_summary_reply, build_tool_output_completion_reply,
+        should_enforce_no_tool_text_when_tools_required,
         should_recover_completion_from_tool_output,
     };
 
     #[test]
     fn tool_output_reply_is_result_focused() {
-        let reply = build_tool_output_completion_reply("cat: /nonexistent/file.txt: No such file");
+        let reply =
+            build_tool_output_completion_reply("cat: /nonexistent/file.txt: No such file").unwrap();
         assert!(reply.contains("latest tool output"));
         assert!(reply.contains("/nonexistent/file.txt"));
         assert!(!reply.starts_with("Done —"));
+    }
+
+    #[test]
+    fn trivial_tool_output_returns_none() {
+        assert!(build_tool_output_completion_reply("(no output)").is_none());
+        assert!(build_tool_output_completion_reply("").is_none());
+        assert!(build_tool_output_completion_reply("exit code: 0").is_none());
+        assert!(
+            build_tool_output_completion_reply("File written to /tmp/foo.py, 200 bytes").is_none()
+        );
+        // Directory listing is trivial
+        assert!(build_tool_output_completion_reply(
+            "total 24\ndrwxr-xr-x  3 user  wheel  96 Mar  4 21:08 __pycache__\n-rw-r--r--  1 user  wheel  1041 Mar  4 21:09 regex_engine.py\n-rw-r--r--  1 user  wheel  4972 Mar  4 21:03 test_regex.py"
+        ).is_none());
+        // Substantive output should still work
+        assert!(
+            build_tool_output_completion_reply("test_foo PASSED\ntest_bar PASSED\n2 passed")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn activity_summary_lists_tool_calls() {
+        let calls = vec!["terminal(mkdir -p /tmp/foo)", "write_file(/tmp/foo/bar.py)"];
+        let reply = build_activity_summary_reply(&calls);
+        assert!(reply.contains("terminal(mkdir"));
+        assert!(reply.contains("write_file("));
+        assert!(reply.contains("1."));
+        assert!(reply.contains("2."));
     }
 
     #[test]

@@ -1018,28 +1018,41 @@ impl SlackChannel {
                 .await;
             match queue_result {
                 Some(queue_pos) => {
-                    let current_task = self
-                        .task_registry
-                        .get_running_task_description(&session_id)
-                        .await
-                        .unwrap_or_else(|| "processing".to_string());
-                    let preview: String = agent_text.chars().take(50).collect();
-                    let suffix = if agent_text.len() > 50 { "..." } else { "" };
-                    let _ = self
-                        .post_message(
-                            &channel_id,
-                            &format!(
-                                "📥 Queued ({}): \"{}{}\" | Currently: {}",
-                                queue_pos, preview, suffix, current_task
-                            ),
-                            reply_thread.as_deref(),
-                        )
-                        .await;
+                    // Only notify for the first 3 queued messages to avoid spam.
+                    if queue_pos <= 3 {
+                        let current_task = self
+                            .task_registry
+                            .get_running_task_description(&session_id)
+                            .await
+                            .unwrap_or_else(|| "processing".to_string());
+                        let preview: String = agent_text.chars().take(50).collect();
+                        let suffix = if agent_text.len() > 50 { "..." } else { "" };
+                        let _ = self
+                            .post_message(
+                                &channel_id,
+                                &format!(
+                                    "📥 Queued ({}): \"{}{}\" | Currently: {}",
+                                    queue_pos, preview, suffix, current_task
+                                ),
+                                reply_thread.as_deref(),
+                            )
+                            .await;
+                    }
                 }
                 None => {
                     debug!(session_id, "Dropped duplicate queued message");
                 }
             }
+            return;
+        }
+
+        // Dedup gate: atomically mark this message as "seen" so concurrent
+        // handlers for the same text don't ALL start direct processing.
+        if !self.task_registry.mark_seen(&session_id, &agent_text).await {
+            debug!(
+                session_id,
+                "Dropped duplicate message (direct processing race)"
+            );
             return;
         }
 
@@ -1300,6 +1313,7 @@ impl SlackChannel {
             let mut current_typing_cancel = typing_cancel;
             let mut current_status_task = status_task;
             let mut current_heartbeat = heartbeat;
+            let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
 
             loop {
                 let result = tokio::select! {
@@ -1311,6 +1325,10 @@ impl SlackChannel {
                             stale_mins,
                             if stale_mins == 1 { "" } else { "s" }
                         ))
+                    },
+                    _ = tokio::time::sleep_until(task_wall_deadline) => {
+                        tracing::error!(session_id = %session_id, "Task hit 20-minute hard wall-clock limit");
+                        Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
                     },
                 };
                 current_typing_cancel.cancel();
@@ -1379,8 +1397,9 @@ impl SlackChannel {
                     registry.complete(current_task_id).await;
                 }
 
-                // Check if there are queued messages to process
-                if let Some(queued) = registry.pop_queued_message(&session_id).await {
+                // Drain and coalesce ALL queued messages so fragmented long
+                // messages are reassembled into one prompt.
+                if let Some(queued) = registry.pop_all_queued_messages(&session_id).await {
                     // Small delay to ensure previous message is fully committed to DB
                     tokio::time::sleep(Duration::from_millis(100)).await;
 

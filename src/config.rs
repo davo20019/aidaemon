@@ -439,6 +439,7 @@ impl fmt::Debug for ProviderConfig {
 pub enum ProviderKind {
     #[default]
     OpenaiCompatible,
+    XaiNative,
     GoogleGenai,
     Anthropic,
 }
@@ -483,6 +484,7 @@ impl ModelsConfig {
         let provider_default = match provider_kind {
             ProviderKind::GoogleGenai => "gemini-3-flash-preview".to_string(),
             ProviderKind::Anthropic => "claude-sonnet-4-20250514".to_string(),
+            ProviderKind::XaiNative => "grok-4".to_string(),
             ProviderKind::OpenaiCompatible => "openai/gpt-4o".to_string(),
         };
 
@@ -2061,7 +2063,7 @@ impl Default for ContextWindowConfig {
 }
 
 fn default_context_budget() -> usize {
-    24000
+    48000
 }
 fn default_tool_result_chars() -> usize {
     2000
@@ -2798,6 +2800,20 @@ primary = "claude-sonnet-4-20250514"
 "#;
         let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
         assert_eq!(cfg.provider.max_tokens, Some(32768));
+    }
+
+    #[test]
+    fn provider_kind_parses_xai_native() {
+        let toml = r#"
+[provider]
+kind = "xai_native"
+api_key = "test-key"
+
+[provider.models]
+primary = "grok-4"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        assert_eq!(cfg.provider.kind, ProviderKind::XaiNative);
     }
 
     #[test]

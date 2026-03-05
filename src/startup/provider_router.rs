@@ -27,10 +27,20 @@ pub fn build_provider_router(config: &AppConfig) -> anyhow::Result<ProviderRoute
 
     let provider: Arc<dyn crate::traits::ModelProvider> = match config.provider.kind {
         ProviderKind::OpenaiCompatible => Arc::new(
-            crate::providers::OpenAiCompatibleProvider::new_with_gateway_token_and_headers(
+            crate::providers::OpenAiCompatibleProvider::new_with_all_options(
                 &config.provider.base_url,
                 &config.provider.api_key,
                 config.provider.gateway_token.as_deref(),
+                config.provider.extra_headers.clone(),
+                config.provider.max_tokens,
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?,
+        ),
+        ProviderKind::XaiNative => Arc::new(
+            crate::providers::XaiNativeProvider::new_with_options(
+                &config.provider.api_key,
+                provider_base_override,
+                config.provider.max_tokens,
                 config.provider.extra_headers.clone(),
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?,

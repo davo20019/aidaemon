@@ -99,6 +99,13 @@ pub(super) fn has_action_promise(text: &str) -> bool {
         "know",
         "rephrase",
         "restate",
+        // Memory/recall verbs — can be answered from conversation context or stored facts
+        "recall",
+        "confirm",
+        "remember",
+        "think",
+        "point",
+        "help",
     ];
 
     let words: Vec<String> = normalized

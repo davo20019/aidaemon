@@ -350,6 +350,16 @@ fn extract_nonzero_exit_code(text: &str) -> Option<i32> {
     }
 }
 
+/// Tools whose results are file/data content, not tool execution status.
+/// Their output routinely contains words like "error:", "exception", "invalid"
+/// (e.g., Python source code with error handling) which are NOT tool failures.
+fn is_data_content_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file" | "search_files" | "read_channel_history" | "web_search"
+    )
+}
+
 pub(super) fn classify_tool_result_failure(
     tool_name: &str,
     result_text: &str,
@@ -373,6 +383,14 @@ pub(super) fn classify_tool_result_failure(
         return Some(classify_text_error(&lower));
     }
 
+    // Data-content tools (read_file, search_files) return file content that
+    // routinely contains error-related keywords. Only prefix errors above
+    // (which indicate actual tool failures like "File not found") should be
+    // classified as failures — not content-level error signals or exit codes.
+    if is_data_content_tool(tool_name) {
+        return None;
+    }
+
     if let Some(status) = extract_http_status_from_text(cleaned) {
         if let Some(kind) = classify_http_status(status) {
             return Some(kind);
@@ -393,6 +411,12 @@ pub(super) fn classify_tool_result_failure(
 
     if let Some(exit_code) = extract_nonzero_exit_code(cleaned) {
         let _ = exit_code;
+        // For terminal commands that produced substantial output (>500 chars),
+        // the command clearly ran and returned data (e.g., pytest with failing
+        // tests). Only treat short-output non-zero exits as real failures.
+        if matches!(tool_name, "terminal" | "run_command") && cleaned.len() > 500 {
+            return None;
+        }
         return Some(classify_text_error(&lower));
     }
 
@@ -400,7 +424,14 @@ pub(super) fn classify_tool_result_failure(
         return Some(ToolFailureClass::Semantic);
     }
 
+    // For terminal commands that produced substantial output (>500 chars),
+    // the command clearly ran and returned data. Error-related keywords
+    // in the output (e.g. pytest headers, test names containing "error")
+    // are content, not actual errors. Only flag short outputs.
     if looks_like_error_signal(&lower) {
+        if matches!(tool_name, "terminal" | "run_command") && cleaned.len() > 500 {
+            return None;
+        }
         return Some(classify_text_error(&lower));
     }
 
@@ -426,6 +457,64 @@ pub(super) fn classify_tool_result_failure_with_args(
     let command = tool_arguments.and_then(extract_command_from_args)?;
     let hinted_status = extract_httpbin_status_hint_from_command(&command)?;
     classify_http_status(hinted_status)
+}
+
+pub(super) fn classify_tool_result_failure_with_context(
+    tool_name: &str,
+    result_text: &str,
+    tool_arguments: Option<&str>,
+    metadata: Option<&crate::traits::ToolCallMetadata>,
+) -> Option<ToolFailureClass> {
+    if let Some(meta) = metadata {
+        if let Some(ref transport_err) = meta.transport_error {
+            // Tool Err results always set transport_error, but many are semantic
+            // errors (wrong path, invalid args) not true transport failures.
+            // Only classify as Transient if the error looks like an actual
+            // transport issue (timeout, network, rate limit). Otherwise, fall
+            // through to the regular text-based classification.
+            let lower_err = transport_err.to_ascii_lowercase();
+            let is_transport = contains_any(
+                &lower_err,
+                &[
+                    "timed out",
+                    "timeout",
+                    "connection refused",
+                    "connection reset",
+                    "broken pipe",
+                    "network",
+                    "rate limit",
+                    "429",
+                    "503",
+                    "502",
+                    "504",
+                    "econnrefused",
+                    "econnreset",
+                    "etimedout",
+                    "ehostunreach",
+                    "dns",
+                ],
+            );
+            if is_transport {
+                return Some(ToolFailureClass::Transient);
+            }
+            // Non-transport errors: fall through to text-based classification
+            // so file-path errors, "Path is a directory", etc. get proper
+            // semantic classification instead of triggering cooldowns.
+        }
+        if meta.timed_out {
+            return Some(ToolFailureClass::Transient);
+        }
+        if let Some(code) = meta.exit_code {
+            if code != 0 {
+                return Some(ToolFailureClass::Semantic);
+            }
+            // Explicit terminal success should not be reclassified by text scanning.
+            if matches!(tool_name, "terminal" | "run_command") {
+                return None;
+            }
+        }
+    }
+    classify_tool_result_failure_with_args(tool_name, result_text, tool_arguments)
 }
 
 /// Extract the most informative error line from a tool error result.
@@ -626,7 +715,8 @@ mod task_boundary_hint_tests {
 #[cfg(test)]
 mod tool_error_detection_tests {
     use super::{
-        classify_tool_result_failure, classify_tool_result_failure_with_args, ToolFailureClass,
+        classify_tool_result_failure, classify_tool_result_failure_with_args,
+        classify_tool_result_failure_with_context, ToolFailureClass,
     };
 
     #[test]
@@ -753,6 +843,92 @@ mod tool_error_detection_tests {
             "Search complete: 24 files scanned, 0 patterns not found",
         );
         assert_eq!(classified, None);
+    }
+
+    #[test]
+    fn structured_exit_code_zero_prevents_terminal_text_false_positive() {
+        let metadata = crate::traits::ToolCallMetadata {
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        let classified = classify_tool_result_failure_with_context(
+            "terminal",
+            "pytest summary includes: error: expected failure pattern",
+            None,
+            Some(&metadata),
+        );
+        assert_eq!(classified, None);
+    }
+
+    #[test]
+    fn structured_exit_code_nonzero_marks_terminal_failure() {
+        let metadata = crate::traits::ToolCallMetadata {
+            exit_code: Some(2),
+            ..Default::default()
+        };
+        let classified = classify_tool_result_failure_with_context(
+            "terminal",
+            "all good text otherwise",
+            None,
+            Some(&metadata),
+        );
+        assert_eq!(classified, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn transport_error_semantic_not_classified_as_transient() {
+        // When a tool returns Err("Path is a directory"), transport_error is set
+        // in metadata. This should NOT be classified as Transient — it's a semantic
+        // error, not a network/timeout issue.
+        let metadata = crate::traits::ToolCallMetadata {
+            transport_error: Some("Path is a directory, not a file: /tmp/test86".to_string()),
+            ..Default::default()
+        };
+        let classified = classify_tool_result_failure_with_context(
+            "read_file",
+            "Error: Path is a directory, not a file: /tmp/test86",
+            None,
+            Some(&metadata),
+        );
+        // Should be Semantic (from text classification), NOT Transient
+        assert_eq!(classified, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn transport_error_actual_timeout_still_transient() {
+        // Actual transport errors (timeouts, connection refused) should
+        // still be classified as Transient.
+        let metadata = crate::traits::ToolCallMetadata {
+            transport_error: Some("connection refused".to_string()),
+            ..Default::default()
+        };
+        let classified = classify_tool_result_failure_with_context(
+            "web_fetch",
+            "Error: connection refused",
+            None,
+            Some(&metadata),
+        );
+        assert_eq!(classified, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn transport_error_file_not_found_not_transient() {
+        // "File not found" through transport_error should NOT be transient.
+        // The text-based classification will classify it as Transient for
+        // file tools (via is_file_lookup_miss), but the transport_error
+        // path should not short-circuit to Transient.
+        let metadata = crate::traits::ToolCallMetadata {
+            transport_error: Some("File not found: /tmp/missing.txt".to_string()),
+            ..Default::default()
+        };
+        let classified = classify_tool_result_failure_with_context(
+            "read_file",
+            "Error: File not found: /tmp/missing.txt",
+            None,
+            Some(&metadata),
+        );
+        // Falls through to text classification → Transient (file lookup miss)
+        assert_eq!(classified, Some(ToolFailureClass::Transient));
     }
 }
 

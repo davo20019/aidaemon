@@ -463,7 +463,19 @@ impl Agent {
         } else if inject_personal {
             // In owner DMs: load full people list for system prompt
             let all_people = self.state.get_all_people().await.unwrap_or_default();
-            (all_people, None, vec![])
+            // Also load the owner's personal facts so they appear in the prompt
+            let owner_facts = if let Some(owner) = all_people
+                .iter()
+                .find(|p| p.relationship.as_deref() == Some("owner"))
+            {
+                self.state
+                    .get_person_facts(owner.id, None)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+            (all_people, None, owner_facts)
         } else if let Some(ref sender_id) = channel_ctx.sender_id {
             // Non-owner context: try to resolve who is speaking
             match self.state.get_person_by_platform_id(sender_id).await {
@@ -844,7 +856,22 @@ impl Agent {
              4. **Never mention tool names in responses.** \
              Do not reference internal tool names like `remember_fact`, `terminal`, `web_search`, or any other tool \
              by its programmatic name in your replies. Describe actions in natural language instead \
-             (e.g., \"I'll look that up\" not \"I'll use the web_search tool\").",
+             (e.g., \"I'll look that up\" not \"I'll use the web_search tool\").\n\
+             5. **Proactively store personal information.** \
+             When the user shares personal details about themselves — name, location, preferences, schedule, pets, \
+             hobbies, work habits, family, food/drink preferences, or anything they explicitly ask you to remember — \
+             you MUST use your fact storage tools to save this information persistently. \
+             Do NOT just acknowledge it in conversation — actually store it so it persists across sessions. \
+             When multiple facts are shared at once, store them all in a single batch call.\n\
+             6. **Never claim you lack capabilities you have.** \
+             You have tools listed in your tool definitions. Never tell the user you \"don't have access\" to memory, \
+             file operations, web search, or any other capability that appears in your available tools. \
+             If you're unsure whether you can do something, TRY using the relevant tool first rather than telling \
+             the user it's impossible.\n\
+             7. **Never claim tests pass or builds succeed without running them.** \
+             If you wrote or modified code and haven't run the test/build command after your last change, \
+             say \"I've created the code but haven't verified it yet\" or run the verification command. \
+             Do NOT say \"all tests pass\" unless you have a tool result showing that output.",
             system_prompt
         );
 

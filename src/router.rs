@@ -81,22 +81,16 @@ impl Router {
         out
     }
 
-    pub fn select(&self, tier: Tier) -> &str {
-        match tier {
-            Tier::Fast => self.first_fallback().unwrap_or(&self.models.default_model),
-            Tier::Primary => &self.models.default_model,
-            Tier::Smart => &self.models.default_model,
-        }
+    pub fn select(&self, _tier: Tier) -> &str {
+        &self.models.default_model
     }
 
     /// Profile mapping on top of default+fallback:
-    /// - Cheap -> first fallback when available (cost-oriented)
-    /// - Balanced/Strong -> default model
-    pub fn select_for_profile(&self, profile: ModelProfile) -> &str {
-        match profile {
-            ModelProfile::Cheap => self.first_fallback().unwrap_or(&self.models.default_model),
-            ModelProfile::Balanced | ModelProfile::Strong => &self.models.default_model,
-        }
+    /// All profiles use the default model.  Cost savings for Cheap come from
+    /// reduced tool_budget and context_budget, not from switching to a weaker
+    /// model.  Fallback models are reserved for error-recovery cascades only.
+    pub fn select_for_profile(&self, _profile: ModelProfile) -> &str {
+        &self.models.default_model
     }
 
     /// Returns true when there are no distinct fallback models.
@@ -155,10 +149,15 @@ mod tests {
             smart: "smart-model".to_string(),
         };
         let router = Router::new(models);
-        assert_eq!(router.select(Tier::Fast), "fast-model");
+        // All tiers and profiles now use the default model; fallbacks are
+        // reserved for error-recovery cascades only.
+        assert_eq!(router.select(Tier::Fast), "primary-model");
         assert_eq!(router.select(Tier::Primary), "primary-model");
         assert_eq!(router.select(Tier::Smart), "primary-model");
-        assert_eq!(router.select_for_profile(ModelProfile::Cheap), "fast-model");
+        assert_eq!(
+            router.select_for_profile(ModelProfile::Cheap),
+            "primary-model"
+        );
         assert_eq!(
             router.select_for_profile(ModelProfile::Balanced),
             "primary-model"

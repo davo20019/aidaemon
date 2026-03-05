@@ -273,11 +273,7 @@ impl BrowserTool {
         Ok(format!(
             "Filled '{}' with '{}'",
             selector,
-            if value.len() > 20 {
-                format!("{}...", &value[..20])
-            } else {
-                value.to_string()
-            }
+            crate::utils::truncate_str(value, 23)
         ))
     }
 
@@ -315,11 +311,7 @@ impl BrowserTool {
         };
 
         // Truncate if very long
-        let text = if text.len() > 4000 {
-            format!("{}... (truncated)", &text[..4000])
-        } else {
-            text
-        };
+        let text = crate::utils::truncate_with_note(&text, 4000);
 
         Ok(text)
     }
@@ -343,11 +335,7 @@ impl BrowserTool {
             Err(_) => "(no return value)".to_string(),
         };
 
-        let value_str = if value_str.len() > 4000 {
-            format!("{}... (truncated)", &value_str[..4000])
-        } else {
-            value_str
-        };
+        let value_str = crate::utils::truncate_with_note(&value_str, 4000);
 
         Ok(value_str)
     }

@@ -61,11 +61,17 @@ impl Tool for WriteFileTool {
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
+        // Parameter aliasing: models often use "file_path" or "file" instead of "path"
         let path_str = args["path"]
             .as_str()
+            .or_else(|| args["file_path"].as_str())
+            .or_else(|| args["file"].as_str())
+            .or_else(|| args["filename"].as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
         let content = args["content"]
             .as_str()
+            .or_else(|| args["data"].as_str())
+            .or_else(|| args["text"].as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: content"))?;
         let create_dirs = args["create_dirs"].as_bool().unwrap_or(false);
 
@@ -132,9 +138,11 @@ impl Tool for WriteFileTool {
             String::new()
         };
 
+        let diagnostics = fs_utils::post_write_diagnostics(&path).await;
+
         Ok(format!(
-            "{} {}\n{} bytes, {} lines{}",
-            action, path_str, new_size, line_count, size_info
+            "{} {}\n{} bytes, {} lines{}{}",
+            action, path_str, new_size, line_count, size_info, diagnostics
         ))
     }
 }

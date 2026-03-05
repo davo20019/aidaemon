@@ -1,4 +1,6 @@
-use super::stopping_conditions::{PureStoppingInputs, StoppingCondition};
+use super::stopping_conditions::{
+    LoopControlDecision, LoopControlInputs, PureStoppingInputs, StoppingCondition,
+};
 use super::*;
 use crate::execution_policy::PolicyBundle;
 use crate::traits::ConversationSummary;
@@ -59,7 +61,22 @@ impl Agent {
         session_id: &str,
         max_chars: usize,
     ) -> Option<String> {
-        let history = self.state.get_history(session_id, 80).await.ok()?;
+        let history = match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.state.get_history(session_id, 80),
+        )
+        .await
+        {
+            Ok(Ok(history)) => history,
+            Ok(Err(_)) => return None,
+            Err(_) => {
+                warn!(
+                    session_id,
+                    "Timed out while loading history for stall output excerpt"
+                );
+                return None;
+            }
+        };
 
         // Predicate: is this line internal metadata that shouldn't be shown to users?
         let is_metadata_line = |line: &str| {
@@ -76,6 +93,7 @@ impl Agent {
             "manage_memories",
             "manage_people",
             "remember_fact",
+            "check_environment", // diagnostic: lists installed tools, never a task result
         ];
 
         let clean_tool_content = |msg: &crate::traits::Message| -> Option<String> {
@@ -111,47 +129,6 @@ impl Agent {
             }
             clean_tool_content(msg)
         })
-    }
-
-    fn stall_threshold_for_state(
-        &self,
-        learning_ctx: &LearningContext,
-        deferred_no_tool_streak: usize,
-    ) -> (usize, &'static str) {
-        let recent_errors = learning_ctx
-            .errors
-            .iter()
-            .rev()
-            .take(8)
-            .map(|(e, _)| e.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        if deferred_no_tool_streak >= DEFERRED_NO_TOOL_SWITCH_THRESHOLD
-            || recent_errors.contains(DEFERRED_NO_TOOL_ERROR_MARKER)
-        {
-            return (MAX_STALL_ITERATIONS, "deferred_no_tool");
-        }
-
-        let transient_signals = recent_errors.contains("rate limit")
-            || recent_errors.contains("too many requests")
-            || recent_errors.contains("429")
-            || recent_errors.contains("timed out")
-            || recent_errors.contains("timeout")
-            || recent_errors.contains("network")
-            || recent_errors.contains("connection")
-            || recent_errors.contains("service unavailable")
-            || recent_errors.contains("bad gateway")
-            || recent_errors.contains("gateway timeout");
-        if transient_signals {
-            return (MAX_STALL_ITERATIONS + 2, "transient");
-        }
-
-        if recent_errors.contains("empty_response(") || recent_errors.contains("empty response") {
-            return (MAX_STALL_ITERATIONS + 2, "empty_response");
-        }
-
-        (MAX_STALL_ITERATIONS, "default")
     }
 
     pub(super) async fn run_stopping_phase(
@@ -392,11 +369,17 @@ impl Agent {
                     pct,
                     "Task token budget at 80%"
                 );
+                let task_hint = super::loop_utils::build_task_boundary_hint(user_text, 150);
+                let task_anchor = if task_hint.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Current task: {}", task_hint)
+                };
                 pending_system_messages.push(format!(
                     "[SYSTEM] TOKEN BUDGET WARNING: You have used {} of {} tokens ({}%). \
                          You are approaching the task token limit. Wrap up your work and \
-                         respond to the user immediately.",
-                    task_tokens_used, budget, pct
+                         respond to the user about THEIR CURRENT REQUEST immediately.{}",
+                    task_tokens_used, budget, pct, task_anchor
                 ));
             }
 
@@ -577,121 +560,42 @@ impl Agent {
                 .await
             {
                 Ok(Some(status)) => {
-                    if let Some(db_budget_daily) = status.budget_daily {
-                        let budget_daily = effective_goal_daily_budget.unwrap_or(db_budget_daily);
-                        if budget_daily > 0 && status.tokens_used_today >= budget_daily {
-                            // Try auto-extending goal daily budget if productive
-                            let old_gbudget = budget_daily;
-                            let new_gbudget = old_gbudget
-                                .saturating_mul(2)
-                                .max(status.tokens_used_today.saturating_add(old_gbudget / 2))
-                                .min(hard_token_cap);
-                            if budget_extensions_count < max_budget_extensions
-                                && old_gbudget < hard_token_cap
-                                && new_gbudget > status.tokens_used_today
-                                && evidence_gain_count >= 2
-                                && post_task::is_productive(
-                                    learning_ctx,
-                                    stall_count,
-                                    consecutive_same_tool.1,
-                                    consecutive_same_tool_arg_hashes.len(),
-                                    total_successful_tool_calls,
-                                )
-                            {
-                                budget_extensions_count += 1;
-                                effective_goal_daily_budget = Some(new_gbudget);
-                                // NOTE: Do NOT persist the extended budget to DB.
-                                // Persisting causes permanent budget ratcheting — once
-                                // doubled, the inflated budget becomes the baseline for
-                                // all future runs, eventually reaching the 2M hard cap.
-                                // The extension is in-memory only for this run.
-                                info!(
-                                    session_id,
-                                    goal_id = %goal_id,
-                                    old_budget = old_gbudget,
-                                    new_budget = new_gbudget,
-                                    extension = budget_extensions_count,
-                                    "Auto-extended goal daily token budget in-memory (pre-check)"
-                                );
-                                pending_system_messages.push(format!(
-                                        "[SYSTEM] Goal daily token budget auto-extended from {} to {} ({}/{} extensions). \
-                                         Continue working.",
-                                        old_gbudget, new_gbudget, budget_extensions_count, max_budget_extensions
-                                    ));
-                                send_status(
-                                    status_tx,
-                                    StatusUpdate::BudgetExtended {
-                                        old_budget: old_gbudget,
-                                        new_budget: new_gbudget,
-                                        extension: budget_extensions_count,
-                                        max_extensions: max_budget_extensions,
-                                    },
-                                );
-                                self.emit_decision_point(
-                                    emitter,
-                                    task_id,
-                                    iteration,
-                                    DecisionType::BudgetAutoExtension,
-                                    "Auto-extended goal daily token budget on productive progress"
-                                        .to_string(),
-                                    json!({
-                                        "condition": "goal_daily_budget_extension",
-                                        "goal_id": goal_id,
-                                        "old_budget": old_gbudget,
-                                        "new_budget": new_gbudget,
-                                        "extension": budget_extensions_count,
-                                        "max_extensions": max_budget_extensions,
-                                    }),
-                                )
-                                .await;
-                                commit_state!();
-                                return Ok(StoppingPhaseOutcome::ContinueLoop);
-                            }
-
-                            if old_gbudget < hard_token_cap
-                                && new_gbudget > status.tokens_used_today
-                                && self
-                                    .request_budget_continue_approval(
-                                        session_id,
-                                        user_role,
-                                        "goal daily",
-                                        status.tokens_used_today,
-                                        old_gbudget,
-                                        new_gbudget,
-                                    )
-                                    .await
-                            {
-                                effective_goal_daily_budget = Some(new_gbudget);
-                                pending_system_messages.push(format!(
-                                    "[SYSTEM] Goal daily token budget extension approved by owner: {} -> {}. \
-                                     Continue working.",
-                                    old_gbudget, new_gbudget
-                                ));
-                                self.emit_decision_point(
-                                    emitter,
-                                    task_id,
-                                    iteration,
-                                    DecisionType::BudgetAutoExtension,
-                                    "Extended goal daily token budget via owner approval"
-                                        .to_string(),
-                                    json!({
-                                        "condition": "goal_daily_budget_extension_manual",
-                                        "goal_id": goal_id,
-                                        "old_budget": old_gbudget,
-                                        "new_budget": new_gbudget,
-                                        "tokens_used_today": status.tokens_used_today,
-                                    }),
-                                )
-                                .await;
-                                commit_state!();
-                                return Ok(StoppingPhaseOutcome::ContinueLoop);
-                            }
-
+                    let mut goal_budget_ctx = graceful::GoalBudgetControlCtx {
+                        emitter,
+                        task_id,
+                        session_id,
+                        iteration,
+                        goal_id,
+                        status: &status,
+                        user_role,
+                        learning_ctx,
+                        evidence_gain_count,
+                        stall_count,
+                        consecutive_same_tool_count: consecutive_same_tool.1,
+                        consecutive_same_tool_unique_args: consecutive_same_tool_arg_hashes.len(),
+                        total_successful_tool_calls,
+                        pending_system_messages,
+                        status_tx,
+                        effective_goal_daily_budget: &mut effective_goal_daily_budget,
+                        budget_extensions_count: &mut budget_extensions_count,
+                        max_budget_extensions,
+                        hard_token_cap,
+                        source: graceful::GoalBudgetCheckSource::PreCheck,
+                    };
+                    match self
+                        .enforce_goal_daily_budget_control(&mut goal_budget_ctx)
+                        .await
+                    {
+                        graceful::GoalBudgetControlOutcome::Continue => {}
+                        graceful::GoalBudgetControlOutcome::Exhausted {
+                            tokens_used_today,
+                            budget_daily,
+                        } => {
                             warn!(
                                 session_id,
                                 iteration,
                                 goal_id = %goal_id,
-                                tokens_used_today = status.tokens_used_today,
+                                tokens_used_today,
                                 budget_daily,
                                 "Goal daily token budget exhausted"
                             );
@@ -706,14 +610,14 @@ impl Agent {
                                     "condition":"goal_daily_token_budget",
                                     "goal_id": goal_id,
                                     "budget_daily": budget_daily,
-                                    "tokens_used_today": status.tokens_used_today
+                                    "tokens_used_today": tokens_used_today
                                 }),
                             )
                             .await;
                             let alert_msg = format!(
-                                    "Token alert: goal '{}' hit daily token budget (used {} / limit {}). Execution was stopped to prevent overspending.",
-                                    goal_id, status.tokens_used_today, budget_daily
-                                );
+                                "Token alert: goal '{}' hit daily token budget (used {} / limit {}). Execution was stopped to prevent overspending.",
+                                goal_id, tokens_used_today, budget_daily
+                            );
                             self.fanout_token_alert(
                                 Some(goal_id.as_str()),
                                 session_id,
@@ -726,7 +630,7 @@ impl Agent {
                                     emitter,
                                     session_id,
                                     learning_ctx,
-                                    status.tokens_used_today,
+                                    tokens_used_today,
                                     budget_daily,
                                 )
                                 .await;
@@ -869,10 +773,30 @@ impl Agent {
         // 6. Pre-execution deferral guard — the model keeps narrating
         // planned actions without issuing any tool calls.
         const MAX_PRE_TOOL_DEFERRALS: usize = 6;
-        if total_successful_tool_calls == 0 && deferred_no_tool_streak >= MAX_PRE_TOOL_DEFERRALS {
+        let loop_control_decision = LoopControlInputs {
+            iteration,
+            hard_cap: None,
+            timeout_secs: None,
+            elapsed_secs: 0,
+            stall_count,
+            max_stall_iterations: MAX_STALL_ITERATIONS,
+            deferred_no_tool_streak,
+            deferred_no_tool_switch_threshold: DEFERRED_NO_TOOL_SWITCH_THRESHOLD,
+            deferred_no_tool_error_marker: DEFERRED_NO_TOOL_ERROR_MARKER,
+            max_pre_tool_deferrals: MAX_PRE_TOOL_DEFERRALS,
+            total_successful_tool_calls,
+            recent_errors: &learning_ctx.errors,
+        }
+        .evaluate();
+
+        if let Some(LoopControlDecision::PreToolDeferral {
+            deferred_no_tool_streak: decision_streak,
+            max_pre_tool_deferrals,
+        }) = loop_control_decision
+        {
             warn!(
                 session_id,
-                deferred_no_tool_streak, "Pre-tool deferral threshold reached"
+                decision_streak, "Pre-tool deferral threshold reached"
             );
             self.emit_decision_point(
                 emitter,
@@ -882,8 +806,8 @@ impl Agent {
                 "Stopping condition fired: repeated pre-tool deferrals".to_string(),
                 json!({
                     "condition":"pre_tool_deferral_stall",
-                    "deferred_no_tool_streak": deferred_no_tool_streak,
-                    "max_pre_tool_deferrals": MAX_PRE_TOOL_DEFERRALS
+                    "deferred_no_tool_streak": decision_streak,
+                    "max_pre_tool_deferrals": max_pre_tool_deferrals
                 }),
             )
             .await;
@@ -921,23 +845,13 @@ impl Agent {
         }
 
         // 7. Stall detection — agent spinning without progress
-        let (stall_limit, stall_mode) =
-            self.stall_threshold_for_state(learning_ctx, deferred_no_tool_streak);
-        let stall_detected = matches!(
-            PureStoppingInputs {
-                iteration,
-                hard_cap: None,
-                timeout_secs: None,
-                elapsed_secs: 0,
-                task_token_budget: None,
-                task_tokens_used: 0,
-                stall_count,
-                max_stall_iterations: stall_limit,
-            }
-            .evaluate(),
-            Some(StoppingCondition::Stall { .. })
-        );
-        if stall_detected {
+        if let Some(LoopControlDecision::Stall {
+            stall_count: detected_stall_count,
+            max_stall_iterations: stall_limit,
+            mode,
+        }) = loop_control_decision
+        {
+            let stall_mode = mode.as_code();
             if !successful_send_file_keys.is_empty() && learning_ctx.errors.is_empty() {
                 let reply = "I already sent the requested file. If you want any changes or another file, tell me exactly what to send.".to_string();
                 self.emit_decision_point(
@@ -949,7 +863,7 @@ impl Agent {
                         .to_string(),
                     json!({
                         "condition":"post_send_file_stall",
-                        "stall_count": stall_count,
+                        "stall_count": detected_stall_count,
                         "max_stall_iterations": stall_limit,
                         "stall_mode": stall_mode,
                         "successful_send_file_count": successful_send_file_keys.len()
@@ -1004,7 +918,7 @@ impl Agent {
             if meaningful_progress {
                 warn!(
                     session_id,
-                    stall_count,
+                    detected_stall_count,
                     total_successful_tool_calls,
                     unrecovered_errors,
                     "Agent stalled after meaningful progress"
@@ -1017,7 +931,7 @@ impl Agent {
                     "Stopping condition fired: stall after meaningful progress".to_string(),
                     json!({
                         "condition":"stall_with_progress",
-                        "stall_count": stall_count,
+                        "stall_count": detected_stall_count,
                         "max_stall_iterations": stall_limit,
                         "stall_mode": stall_mode,
                         "total_successful_tool_calls": total_successful_tool_calls,
@@ -1035,10 +949,8 @@ impl Agent {
                         .await
                     {
                         let activity = post_task::categorize_tool_calls(&learning_ctx.tool_calls);
-                        let mut reply = String::from(
-                            "I completed the requested work but the loop stalled before \
-                             composing a final summary. Here's what was done:\n\n",
-                        );
+                        let mut reply =
+                            String::from("Here's a summary of what was accomplished:\n\n");
                         if !activity.is_empty() {
                             reply.push_str(&activity);
                         }
@@ -1125,11 +1037,7 @@ impl Agent {
                     .latest_non_system_tool_output_excerpt(session_id, 2500)
                     .await
                 {
-                    let reply = format!(
-                        "I executed the requested command, but the loop stalled before composing a final narrative. \
-Here is the latest tool output:\n\n{}",
-                        tool_output
-                    );
+                    let reply = format!("Done. Here is the output:\n\n{}", tool_output);
                     self.emit_decision_point(
                         emitter,
                         task_id,
@@ -1139,7 +1047,7 @@ Here is the latest tool output:\n\n{}",
                             .to_string(),
                         json!({
                             "condition":"stall_with_tool_output_fallback",
-                            "stall_count": stall_count,
+                            "stall_count": detected_stall_count,
                             "max_stall_iterations": stall_limit,
                             "stall_mode": stall_mode,
                             "total_successful_tool_calls": total_successful_tool_calls
@@ -1186,7 +1094,7 @@ Here is the latest tool output:\n\n{}",
 
             warn!(
                 session_id,
-                stall_count, "Agent stalled - no progress detected"
+                detected_stall_count, "Agent stalled - no progress detected"
             );
             self.emit_decision_point(
                 emitter,
@@ -1196,7 +1104,7 @@ Here is the latest tool output:\n\n{}",
                 "Stopping condition fired: stall threshold reached".to_string(),
                 json!({
                     "condition":"stall",
-                    "stall_count": stall_count,
+                    "stall_count": detected_stall_count,
                     "max_stall_iterations": stall_limit,
                     "stall_mode": stall_mode
                 }),
@@ -1360,12 +1268,30 @@ Here is the latest tool output:\n\n{}",
                     .fetch_add(1, Ordering::Relaxed);
                 // Refresh summary context and re-score policy with fresh failure signal.
                 if self.context_window_config.enabled {
-                    session_summary = self
-                        .state
-                        .get_conversation_summary(session_id)
-                        .await
-                        .ok()
-                        .flatten();
+                    session_summary = match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        self.state.get_conversation_summary(session_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(summary)) => summary,
+                        Ok(Err(e)) => {
+                            warn!(
+                                session_id,
+                                iteration,
+                                error = %e,
+                                "Failed to refresh conversation summary"
+                            );
+                            None
+                        }
+                        Err(_) => {
+                            warn!(
+                                session_id,
+                                iteration, "Timed out refreshing conversation summary"
+                            );
+                            None
+                        }
+                    };
                 }
                 policy_bundle = build_policy_bundle(user_text, available_capabilities, true);
 

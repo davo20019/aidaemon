@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.14] - 2026-03-05
+
+### Added
+
+- **Unified loop control evaluator**: `LoopControlInputs::evaluate()` centralizes hard iteration cap, task timeout, pre-tool deferral, and post-tool stall checks with context-aware stall limits (transient errors, empty responses, deferred-no-tool recovery get extra room).
+- **Security injection detection**: Expanded prompt injection defense to detect social engineering attacks (fake "system override", "authorized security audit", `/etc/passwd` reads, API key extraction attempts) with dedicated system reminder and assistant prefill.
+- **StallMode classification**: Stall events now carry a mode (`Default`, `DeferredNoTool`, `Transient`, `EmptyResponse`) for better diagnostics and adaptive limits.
+
+### Changed
+
+- **UTF-8 safe string truncation**: Added `floor_char_boundary()` helper in `utils.rs` and applied safe byte-position slicing across 15+ files (events/payloads, channels/formatting, tools/read_file, tools/edit_file, tools/write_file, tools/search_files, tools/service_status, tools/browser, tools/cli_agent, tools/http_request, tools/diagnose, mcp/client, mcp/mod, memory/context_window, plans/generation, memory/procedures) to prevent panics on multi-byte UTF-8 characters.
+- **LLM token-limit truncation recovery**: OpenAI-compatible provider now detects `finish_reason=length` and signals the agent loop, which injects a retry nudge asking the model to continue from where it left off.
+- **Recall guardrails improvements**: Tightened policy recall filtering for cleaner memory context injection.
+- **Execution policy tool budgets**: Adjusted tool budget limits across policy profiles (Cheap/Balanced/Strong) for better alignment with force-text escalation thresholds.
+- **Read-saturation detection**: Consecutive `read_file` nudge at 2 calls, escalation at 4 in post-loop processing to prevent unproductive read loops.
+- **Context window management**: Improved token accounting and message truncation in context window module.
+- **Agent loop message building**: Refined message construction phase for better tool call chain handling.
+- **System prompt updates**: Enhanced system prompt construction in agent runtime.
+
+### Fixed
+
+- **UTF-8 panic on multi-byte characters**: Truncation operations across the codebase could panic when slicing through multi-byte UTF-8 code points (e.g., emoji, CJK characters). Comprehensive fix ensures all string truncation respects character boundaries.
+- **Stale budget extension logic**: Simplified and consolidated goal daily budget extension handling in LLM phase to reduce code complexity and prevent edge cases.
+
 ## [0.9.13] - 2026-03-03
 
 ### Added

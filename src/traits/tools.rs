@@ -37,6 +37,45 @@ pub struct ToolCapabilities {
     pub high_impact_write: bool,
 }
 
+/// Structured execution metadata returned by tools.
+///
+/// This is intentionally minimal and backward-compatible: tools can continue
+/// returning plain text while selectively populating structured fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCallMetadata {
+    /// Process exit code when applicable (e.g. terminal/run_command style tools).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// True when tool execution exceeded a timeout threshold.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// True when execution moved to background tracking.
+    #[serde(default)]
+    pub background_started: bool,
+    /// True when the process is detached and intentionally long-lived.
+    #[serde(default)]
+    pub detached: bool,
+    /// Transport/runtime failure outside normal tool semantics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCallOutcome {
+    pub output: String,
+    #[serde(default)]
+    pub metadata: ToolCallMetadata,
+}
+
+impl ToolCallOutcome {
+    pub fn from_output(output: String) -> Self {
+        Self {
+            output,
+            metadata: ToolCallMetadata::default(),
+        }
+    }
+}
+
 impl Default for ToolCapabilities {
     fn default() -> Self {
         Self {
@@ -71,6 +110,19 @@ pub trait Tool: Send + Sync {
         self.call(arguments).await
     }
 
+    /// Structured execution path used by the agent loop.
+    ///
+    /// Default behavior preserves compatibility for existing tools by wrapping
+    /// plain text output with empty metadata.
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let output = self.call_with_status(arguments, status_tx).await?;
+        Ok(ToolCallOutcome::from_output(output))
+    }
+
     /// Task lifecycle callback fired after the agent emits `TaskEnd`.
     /// Tools that spawn background activity can use this to clean up
     /// task-scoped resources.
@@ -88,5 +140,93 @@ pub trait Tool: Send + Sync {
     /// Defaults are intentionally conservative.
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities::default()
+    }
+
+    /// Whether this tool is currently operational.
+    ///
+    /// Default: true. Override for tools with dynamic backends that may be
+    /// temporarily unavailable at runtime.
+    fn is_available(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct AlwaysAvailableTool;
+
+    #[async_trait]
+    impl Tool for AlwaysAvailableTool {
+        fn name(&self) -> &str {
+            "always_available"
+        }
+
+        fn description(&self) -> &str {
+            "test"
+        }
+
+        fn schema(&self) -> Value {
+            json!({
+                "name": "always_available",
+                "description": "test",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            })
+        }
+
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    struct UnavailableTool;
+
+    #[async_trait]
+    impl Tool for UnavailableTool {
+        fn name(&self) -> &str {
+            "unavailable"
+        }
+
+        fn description(&self) -> &str {
+            "test"
+        }
+
+        fn schema(&self) -> Value {
+            json!({
+                "name": "unavailable",
+                "description": "test",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            })
+        }
+
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn is_available(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn default_is_available_returns_true() {
+        let tool = AlwaysAvailableTool;
+        assert!(tool.is_available());
+    }
+
+    #[test]
+    fn override_is_available_returns_false() {
+        let tool = UnavailableTool;
+        assert!(!tool.is_available());
     }
 }

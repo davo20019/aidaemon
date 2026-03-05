@@ -128,11 +128,7 @@ impl Tool for ShareMemoryTool {
                     "Share memory globally: [{}] {} = \"{}\"",
                     args.category,
                     args.key,
-                    if f.value.len() > 80 {
-                        format!("{}...", &f.value[..80])
-                    } else {
-                        f.value.clone()
-                    }
+                    crate::utils::truncate_str(&f.value, 83)
                 );
                 match self
                     .request_approval(&args._session_id, &description)
