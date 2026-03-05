@@ -244,9 +244,7 @@ impl Agent {
                 .filter(|(i, m)| {
                     // Keep non-tool messages, recent tool results, and identity-critical ones;
                     // collapse old tool results.
-                    m.role != "tool"
-                        || *i >= protect_from
-                        || identity_preserve_indices.contains(i)
+                    m.role != "tool" || *i >= protect_from || identity_preserve_indices.contains(i)
                 })
                 .map(|(_, m)| m)
                 .collect()
