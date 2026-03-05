@@ -1178,19 +1178,22 @@ mod tests {
 
     #[test]
     fn project_scope_extraction_keeps_history_for_followups() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_string_lossy().to_string();
         let history = vec![
             msg(
                 "user",
-                "Please work in /Users/davidloor/projects/aidaemon and inspect async functions.",
+                &format!(
+                    "Please work in {} and inspect async functions.",
+                    dir_path
+                ),
             ),
             msg("assistant", "Should I proceed with a full scan?"),
         ];
         let current = "Yes, do it.";
         let scopes = extract_project_scopes_from_history(&history, current, 4, true, &[]);
         assert!(
-            scopes
-                .iter()
-                .any(|scope| scope.contains("/projects/aidaemon")),
+            scopes.iter().any(|scope| scope.contains(&*dir_path)),
             "followup should carry prior project scope when explicit: {:?}",
             scopes
         );
