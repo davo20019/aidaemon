@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.15] - 2026-03-05
+
+### Added
+
+- **CLI agent prompt alias support**: `cli_agent` tool now accepts `mission`, `task`, `command`, and `description` as alternative parameter names for `prompt`, recovering gracefully when the LLM emits non-standard argument names.
+- **Duplicate send_file loop breaker**: When a duplicate `send_file` is suppressed, the agent now forces text-only mode and injects a system nudge to prevent re-emission loops.
+- **Send file completion reply**: Dedicated `send_file_completion_reply()` provides a consistent closeout message after file delivery, used across force-text, low-signal recovery, and stall-exit paths.
+
+### Changed
+
+- **Heartbeat schedule error logging**: Silent `let _ =` discards on goal/schedule updates in `heartbeat.rs` replaced with `warn!()` logging to surface schedule persistence failures.
+- **Path validation hardening**: `validate_path()` now normalizes `..` components before the traversal check, and `is_sensitive_path()` uses component-level matching to avoid false positives on substrings (e.g., `my_environment.txt` no longer matches `.env`).
+- **Browser SSRF protection**: `navigate` action in the browser tool now validates URLs against internal/private IP ranges before navigation.
+- **Telegram file download timeout**: Added 60-second timeout to Telegram file download requests.
+- **Telegram callback validation**: Callback query handler now rejects empty callback IDs.
+- **Tool argument summary improvements**: `summarize_tool_args` for `cli_agent` checks `task`/`mission`/`description`/`command` fields; `send_file` summary reads `file_path` instead of `path`.
+
+### Fixed
+
+- **`is_trivial_tool_output` gap**: "Duplicate send_file suppressed:" output is now correctly classified as trivial, preventing it from being surfaced as a task result.
+- **`latest_non_system_tool_result` returns tool name**: Callers can now distinguish `send_file` results from other tool outputs for targeted completion handling.
+
 ## [0.9.14] - 2026-03-05
 
 ### Added

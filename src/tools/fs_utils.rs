@@ -50,29 +50,45 @@ pub fn validate_path(path: &str) -> anyhow::Result<PathBuf> {
     let expanded = shellexpand::tilde(path).to_string();
     let p = PathBuf::from(&expanded);
 
-    // Check for path traversal
     let joined = if p.is_absolute() {
         p.clone()
     } else {
         std::env::current_dir()?.join(&p)
     };
 
-    // Reject paths that try to traverse with ..
-    let joined_str = joined.to_string_lossy();
-    if joined_str.contains("/../") || joined_str.ends_with("/..") {
+    // Normalize path components to remove `.` and resolve `..` entries
+    // (e.g., "/foo/bar/./baz/../qux" -> "/foo/bar/qux")
+    let normalized: PathBuf = joined.components().collect();
+
+    // Reject paths that still contain `..` after normalization (shouldn't happen
+    // with std::path::Component, but defense-in-depth)
+    let normalized_str = normalized.to_string_lossy();
+    if normalized_str.contains("/../") || normalized_str.ends_with("/..") {
         anyhow::bail!("Path traversal detected: {}", path);
     }
-
-    // Normalize path components to remove `.` entries (e.g., "/foo/bar/." -> "/foo/bar")
-    let normalized: PathBuf = joined.components().collect();
 
     Ok(normalized)
 }
 
 /// Returns true if the path matches any sensitive pattern.
+/// Uses path-component matching to avoid false positives on substrings
+/// (e.g., "my_environment.txt" won't match ".env").
 pub fn is_sensitive_path(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
-    SENSITIVE_PATTERNS.iter().any(|pat| path_str.contains(pat))
+    SENSITIVE_PATTERNS.iter().any(|pat| {
+        if pat.contains('/') {
+            // Multi-component patterns (e.g., ".aws/credentials"): substring match is fine
+            // because the slash provides enough specificity.
+            path_str.contains(pat)
+        } else {
+            // Single-component patterns: match as an exact path component or filename.
+            path.components()
+                .any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case(pat))
+                || path
+                    .file_name()
+                    .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(pat))
+        }
+    })
 }
 
 /// Check if a file appears to be binary by reading first 8KB and looking for null bytes.

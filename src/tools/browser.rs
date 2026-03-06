@@ -164,6 +164,11 @@ impl BrowserTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: url".to_string())?;
 
+        // Block navigation to internal/private IPs (SSRF protection)
+        if let Err(reason) = crate::tools::web_fetch::validate_url_for_ssrf(url) {
+            return Err(format!("Navigation blocked: {}", reason));
+        }
+
         self.ensure_browser().await?;
         let page = self.get_page().await?;
 

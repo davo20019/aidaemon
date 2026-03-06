@@ -26,6 +26,7 @@ fn is_trivial_tool_output(s: &str) -> bool {
         || lower.starts_with("[exit code:")
         || lower.starts_with("blocked:") // terminal safety rejection, not a user-facing answer
         || lower.starts_with("error:")
+        || lower.starts_with("duplicate send_file suppressed:")
         || (lower.starts_with("file written") && lower.len() < 100)
         || (lower.starts_with("wrote ") && lower.len() < 100)
         || looks_like_directory_listing(&lower)
@@ -202,6 +203,21 @@ impl Agent {
                 }
             }
 
+            if self.depth == 0
+                && force_text_response
+                && learning_ctx
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.starts_with("send_file("))
+                && (reply.trim().is_empty() || is_low_signal_task_lead_reply(&reply))
+            {
+                reply = Self::send_file_completion_reply().to_string();
+                info!(
+                    session_id,
+                    iteration, "Force-text send_file completion upgraded to shared closeout"
+                );
+            }
+
             if should_enforce_no_tool_text_when_tools_required(
                 &reply,
                 needs_tools_for_turn,
@@ -277,11 +293,20 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
                 total_successful_tool_calls,
             ) {
                 let mut recovered = false;
-                if let Some(tool_output) = self
-                    .latest_non_system_tool_output_excerpt(session_id, 2500)
-                    .await
+                if let Some((tool_name, tool_output)) =
+                    self.latest_non_system_tool_result(session_id, 2500).await
                 {
-                    if let Some(tool_reply) = build_tool_output_completion_reply(&tool_output) {
+                    if tool_name == "send_file" {
+                        reply = Self::send_file_completion_reply().to_string();
+                        recovered = true;
+                        info!(
+                            session_id,
+                            iteration,
+                            "Recovered completion reply after send_file with shared closeout"
+                        );
+                    } else if let Some(tool_reply) =
+                        build_tool_output_completion_reply(&tool_output)
+                    {
                         reply = tool_reply;
                         recovered = true;
                         info!(
@@ -315,7 +340,21 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
                 }
             }
 
-            if reply.is_empty() && total_successful_tool_calls > 0 && self.depth == 0 {
+            if reply.is_empty()
+                && self.depth == 0
+                && force_text_response
+                && learning_ctx
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.starts_with("send_file("))
+            {
+                reply = Self::send_file_completion_reply().to_string();
+                info!(
+                    session_id,
+                    iteration,
+                    "Recovered empty force-text completion with shared send_file closeout"
+                );
+            } else if reply.is_empty() && total_successful_tool_calls > 0 && self.depth == 0 {
                 reply = "I executed the requested tools, but I couldn't recover a usable output snapshot. Please ask me to rerun the command and I'll return the exact result.".to_string();
                 info!(
                     session_id,
@@ -833,6 +872,10 @@ mod tests {
         assert!(build_tool_output_completion_reply("(no output)").is_none());
         assert!(build_tool_output_completion_reply("").is_none());
         assert!(build_tool_output_completion_reply("exit code: 0").is_none());
+        assert!(build_tool_output_completion_reply(
+            "Duplicate send_file suppressed: this exact file+caption was already sent in this task."
+        )
+        .is_none());
         assert!(
             build_tool_output_completion_reply("File written to /tmp/foo.py, 200 bytes").is_none()
         );

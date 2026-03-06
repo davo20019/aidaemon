@@ -2156,6 +2156,14 @@ struct CliAgentArgs {
     action: Option<String>,
     tool: Option<String>,
     prompt: Option<String>,
+    /// Legacy/incorrect alias sometimes emitted by the model for delegated work.
+    mission: Option<String>,
+    /// Legacy/incorrect alias sometimes emitted by the model for delegated work.
+    task: Option<String>,
+    /// Terminal-like alias sometimes emitted instead of `prompt`.
+    command: Option<String>,
+    /// Optional description paired with `command`.
+    description: Option<String>,
     working_dir: Option<String>,
     task_id: Option<String>,
     /// Optional system instruction to shape the CLI agent into a specialist
@@ -2172,6 +2180,54 @@ struct CliAgentArgs {
     /// Injected by agent for role-aware safeguards.
     #[serde(default)]
     _user_role: Option<String>,
+}
+
+impl CliAgentArgs {
+    fn run_prompt(&self) -> Option<String> {
+        fn non_empty(value: Option<&str>) -> Option<String> {
+            let trimmed = value?.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+
+        if let Some(prompt) = non_empty(self.prompt.as_deref()) {
+            return Some(prompt);
+        }
+
+        let mission = non_empty(self.mission.as_deref());
+        let task = non_empty(self.task.as_deref());
+        if mission.is_some() || task.is_some() {
+            let mut parts = Vec::new();
+            if let Some(mission) = mission {
+                parts.push(format!("Mission: {}", mission));
+            }
+            if let Some(task) = task {
+                parts.push(format!("Task: {}", task));
+            }
+            return Some(parts.join("\n"));
+        }
+
+        let description = non_empty(self.description.as_deref());
+        let command = non_empty(self.command.as_deref());
+        if description.is_some() || command.is_some() {
+            let mut parts = Vec::new();
+            if let Some(description) = description {
+                parts.push(description);
+            }
+            if let Some(command) = command {
+                parts.push(format!(
+                    "Run this exact shell command in the working directory and report the result:\n{}",
+                    command
+                ));
+            }
+            return Some(parts.join("\n\n"));
+        }
+
+        None
+    }
 }
 
 /// Check if a string looks like JSON (starts with { or [).
@@ -2645,11 +2701,10 @@ impl Tool for CliAgentTool {
                     .or_else(|| self.default_tool_name())
                     .ok_or_else(|| anyhow::anyhow!("No CLI agents available for action=run"))?;
                 let prompt = args
-                    .prompt
-                    .as_ref()
+                    .run_prompt()
                     .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter for action=run"))?;
 
-                let mut daemon_hits = detect_daemonization_primitives(prompt);
+                let mut daemon_hits = detect_daemonization_primitives(&prompt);
                 if let Some(system_instruction) = args.system_instruction.as_deref() {
                     for hit in detect_daemonization_primitives(system_instruction) {
                         if !daemon_hits.contains(&hit) {
@@ -2674,7 +2729,7 @@ impl Tool for CliAgentTool {
                         .request_daemonization_approval(
                             session_id.trim(),
                             &tool,
-                            prompt,
+                            &prompt,
                             &daemon_hits,
                         )
                         .await
@@ -2706,7 +2761,7 @@ impl Tool for CliAgentTool {
 
                 self.handle_run(
                     &tool,
-                    prompt,
+                    &prompt,
                     args.working_dir.as_deref(),
                     &session_id,
                     args._goal_id.as_deref(),
@@ -3400,6 +3455,50 @@ mod tests {
         assert!(
             result.contains("No CLI agents currently running"),
             "Expected empty list message, got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_accepts_mission_and_task_aliases() {
+        let (tool, _db) = setup_echo_tool().await;
+        let result = tool
+            .call(
+                r#"{"action":"run","tool":"echo","mission":"Email helper","task":"Open Gmail and summarize the inbox"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.contains("Mission: Email helper"),
+            "Expected synthesized mission in output, got: {}",
+            result
+        );
+        assert!(
+            result.contains("Task: Open Gmail and summarize the inbox"),
+            "Expected synthesized task in output, got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_accepts_command_and_description_aliases() {
+        let (tool, _db) = setup_echo_tool().await;
+        let result = tool
+            .call(
+                r#"{"action":"run","tool":"echo","description":"Check test output","command":"pwd"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.contains("Check test output"),
+            "Expected synthesized description in output, got: {}",
+            result
+        );
+        assert!(
+            result.contains(
+                "Run this exact shell command in the working directory and report the result:\npwd"
+            ),
+            "Expected synthesized command guidance in output, got: {}",
             result
         );
     }

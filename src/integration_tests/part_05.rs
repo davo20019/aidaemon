@@ -415,6 +415,111 @@ async fn test_full_stack_duplicate_send_file_suppressed() {
     );
 }
 
+/// Regression: once a duplicate send_file is suppressed, the task should be
+/// forced into text-only mode instead of repeatedly attempting more file sends.
+#[tokio::test]
+async fn test_duplicate_send_file_forces_text_closeout() {
+    struct CountingSendFileTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::Tool for CountingSendFileTool {
+        fn name(&self) -> &str {
+            "send_file"
+        }
+
+        fn description(&self) -> &str {
+            "Test send_file tool that counts executions."
+        }
+
+        fn schema(&self) -> serde_json::Value {
+            json!({
+                "name": "send_file",
+                "description": self.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string" },
+                        "caption": { "type": "string" }
+                    },
+                    "required": ["file_path"]
+                }
+            })
+        }
+
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("File sent by counting send_file tool".to_string())
+        }
+    }
+
+    let send_file_args = r#"{"file_path":"/Users/testuser/projects/acme-corp/proposal/sow-project-plan.pdf","caption":"Here is the SOW PDF from the Acme project."}"#;
+    let responses = vec![
+        MockProvider::tool_call_response("send_file", send_file_args),
+        MockProvider::tool_call_response("send_file", send_file_args),
+        MockProvider::tool_call_response("send_file", send_file_args),
+        MockProvider::text_response("Done. I already sent the file."),
+    ];
+
+    let send_file_calls = Arc::new(AtomicUsize::new(0));
+    let send_file_tool = Arc::new(CountingSendFileTool {
+        calls: send_file_calls.clone(),
+    });
+
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        MockProvider::with_responses(responses),
+        vec![send_file_tool as Arc<dyn crate::traits::Tool>],
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "telegram_test_force_text",
+            "Send me the SOW PDF from the Lodestar project",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("Done. I already sent the file."),
+        "Agent should close out with plain text after duplicate send_file. Got: {}",
+        response
+    );
+    assert_eq!(
+        send_file_calls.load(Ordering::SeqCst),
+        1,
+        "Only the first send_file call should execute"
+    );
+
+    let history = harness
+        .state
+        .get_history("telegram_test_force_text", 200)
+        .await
+        .unwrap();
+    let dedupe_msgs = history
+        .iter()
+        .filter(|m| {
+            m.role == "tool"
+                && m.tool_name.as_deref() == Some("send_file")
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("Duplicate send_file suppressed"))
+        })
+        .count();
+    assert_eq!(
+        dedupe_msgs, 1,
+        "Expected exactly one duplicate suppression message"
+    );
+}
+
+
 /// Full-stack regression test: "What's the url of the site that you deployed?"
 ///
 /// Real-world scenario: user asks about a previously deployed site. The agent
@@ -620,4 +725,3 @@ async fn test_full_stack_blocked_tool_triggers_stall() {
         response.chars().take(400).collect::<String>()
     );
 }
-

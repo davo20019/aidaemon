@@ -56,11 +56,15 @@ pub(super) struct StoppingPhaseCtx<'a> {
 }
 
 impl Agent {
-    pub(super) async fn latest_non_system_tool_output_excerpt(
+    pub(super) fn send_file_completion_reply() -> &'static str {
+        "I've sent the requested file. If you want any changes or another file, tell me exactly what to send."
+    }
+
+    pub(super) async fn latest_non_system_tool_result(
         &self,
         session_id: &str,
         max_chars: usize,
-    ) -> Option<String> {
+    ) -> Option<(String, String)> {
         let history = match tokio::time::timeout(
             Duration::from_secs(5),
             self.state.get_history(session_id, 80),
@@ -96,7 +100,7 @@ impl Agent {
             "check_environment", // diagnostic: lists installed tools, never a task result
         ];
 
-        let clean_tool_content = |msg: &crate::traits::Message| -> Option<String> {
+        let clean_tool_content = |msg: &crate::traits::Message| -> Option<(String, String)> {
             if msg.role != "tool" {
                 return None;
             }
@@ -113,7 +117,10 @@ impl Agent {
             if cleaned.is_empty() {
                 return None;
             }
-            Some(truncate_with_note(cleaned, max_chars))
+            Some((
+                msg.tool_name.clone().unwrap_or_default(),
+                truncate_with_note(cleaned, max_chars),
+            ))
         };
 
         // Only return output from informative tools (terminal, search, etc.).
@@ -129,6 +136,16 @@ impl Agent {
             }
             clean_tool_content(msg)
         })
+    }
+
+    pub(super) async fn latest_non_system_tool_output_excerpt(
+        &self,
+        session_id: &str,
+        max_chars: usize,
+    ) -> Option<String> {
+        self.latest_non_system_tool_result(session_id, max_chars)
+            .await
+            .map(|(_, content)| content)
     }
 
     pub(super) async fn run_stopping_phase(
@@ -853,7 +870,7 @@ impl Agent {
         {
             let stall_mode = mode.as_code();
             if !successful_send_file_keys.is_empty() && learning_ctx.errors.is_empty() {
-                let reply = "I already sent the requested file. If you want any changes or another file, tell me exactly what to send.".to_string();
+                let reply = Self::send_file_completion_reply().to_string();
                 self.emit_decision_point(
                     emitter,
                     task_id,

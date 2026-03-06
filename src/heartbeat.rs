@@ -1066,16 +1066,24 @@ impl HeartbeatCoordinator {
         let mut updated_goal = goal.clone();
         updated_goal.last_useful_action = Some(now_ts.clone());
         updated_goal.updated_at = now_ts.clone();
-        let _ = self.state.update_goal(&updated_goal).await;
+        if let Err(e) = self.state.update_goal(&updated_goal).await {
+            warn!(goal_id = %goal.id, error = %e, "Failed to update goal timestamp after schedule fire");
+        }
 
         // Advance schedule state.
         if schedule.is_one_shot {
-            let _ = self.state.delete_goal_schedule(&schedule.id).await;
+            if let Err(e) = self.state.delete_goal_schedule(&schedule.id).await {
+                warn!(schedule_id = %schedule.id, error = %e, "Failed to delete one-shot schedule after fire");
+            }
         } else if let Ok(next) = crate::cron_utils::compute_next_run(&schedule.cron_expr) {
             schedule.last_run_at = Some(now_ts.clone());
             schedule.next_run_at = next.to_rfc3339();
             schedule.updated_at = now_ts.clone();
-            let _ = self.state.update_goal_schedule(&schedule).await;
+            if let Err(e) = self.state.update_goal_schedule(&schedule).await {
+                warn!(schedule_id = %schedule.id, error = %e, "Failed to advance recurring schedule — may cause duplicate fire on next tick");
+            }
+        } else {
+            warn!(schedule_id = %schedule.id, cron = %schedule.cron_expr, "Failed to compute next run for recurring schedule");
         }
 
         info!(

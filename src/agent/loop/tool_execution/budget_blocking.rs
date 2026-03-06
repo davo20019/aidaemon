@@ -32,6 +32,8 @@ pub(super) struct DuplicateSendFileNoopCtx<'a> {
     pub session_id: &'a str,
     pub iteration: usize,
     pub effective_arguments: &'a str,
+    pub force_text_response: &'a mut bool,
+    pub pending_system_messages: &'a mut Vec<String>,
     pub successful_tool_calls: &'a mut usize,
     pub total_successful_tool_calls: &'a mut usize,
     pub tool_call_count: &'a mut HashMap<String, usize>,
@@ -273,6 +275,15 @@ impl Agent {
         let result_text =
             "Duplicate send_file suppressed: this exact file+caption was already sent in this task."
                 .to_string();
+
+        // A duplicate send_file is a strong signal that the model is stuck in
+        // a file-delivery loop. Force the remainder of this task into text-only
+        // mode so it closes out instead of re-emitting more file sends.
+        *ctx.force_text_response = true;
+        ctx.pending_system_messages.push(
+            "[SYSTEM] The requested file was already sent in this task. Stop calling send_file and reply with plain text only."
+                .to_string(),
+        );
 
         // Count as a successful no-op so stall detection doesn't
         // treat idempotency suppression as lack of progress.

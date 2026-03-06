@@ -655,7 +655,8 @@ impl TelegramChannel {
         // Parse callback data: "approve:{once|session|always|deny}:{id}"
         // or "goal:{confirm|cancel}:{id}"
         let parts: Vec<&str> = data.splitn(3, ':').collect();
-        if parts.len() != 3 || (parts[0] != "approve" && parts[0] != "goal") {
+        if parts.len() != 3 || (parts[0] != "approve" && parts[0] != "goal") || parts[2].is_empty()
+        {
             let _ = bot
                 .answer_callback_query(q.id)
                 .text("This action is no longer valid. Please run the command again.")
@@ -1755,7 +1756,11 @@ impl TelegramChannel {
             "https://api.telegram.org/file/bot{}/{}",
             self.bot_token, file_path_on_server
         );
-        let response = reqwest::get(&download_url).await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_default();
+        let response = client.get(&download_url).send().await?;
         if !response.status().is_success() {
             anyhow::bail!(
                 "Failed to download file from Telegram: HTTP {}",
@@ -4954,9 +4959,10 @@ impl Channel for TelegramChannel {
         // Reserve ~200 chars for risk label, warnings, buttons, and footer.
         const MAX_CMD_DISPLAY: usize = 3600;
         let display_cmd = if command.len() > MAX_CMD_DISPLAY {
+            let end = crate::utils::floor_char_boundary(command, MAX_CMD_DISPLAY);
             format!(
                 "{}...\n[truncated — {} chars total]",
-                &command[..MAX_CMD_DISPLAY],
+                &command[..end],
                 command.len()
             )
         } else {

@@ -927,7 +927,12 @@ fn summarize_tool_args(name: &str, arguments: &str) -> String {
                 return format!("action={}", action);
             }
             let tool = get_str("tool").unwrap_or("auto");
-            let prompt = get_str("prompt").unwrap_or("");
+            let prompt = get_str("prompt")
+                .or_else(|| get_str("task"))
+                .or_else(|| get_str("mission"))
+                .or_else(|| get_str("description"))
+                .or_else(|| get_str("command"))
+                .unwrap_or("");
             let task_desc = truncate_summary(prompt, 50);
             if task_desc.is_empty() {
                 format!("→ {}", tool)
@@ -982,7 +987,7 @@ fn summarize_tool_args(name: &str, arguments: &str) -> String {
                 truncate_summary(channel, 30)
             }
         }
-        "send_file" => get_str("path")
+        "send_file" => get_str("file_path")
             .map(|p| short_path(p).to_string())
             .unwrap_or_default(),
 
