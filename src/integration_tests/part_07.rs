@@ -823,7 +823,7 @@ async fn test_orchestration_scheduled_single_description_uses_current_turn_task_
         .agent
         .handle_message(
             "test_session_description_contamination",
-            "today at 11:09pm EST remind me to check logs",
+            "tomorrow at 11:09pm EST remind me to check logs",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),

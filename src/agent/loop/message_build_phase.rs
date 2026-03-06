@@ -115,9 +115,14 @@ impl Agent {
         let status_tx = ctx.status_tx;
 
         // Fetch recent history from canonical event stream.
-        // A limit of 40 queries 120 events (40*3), enough to cover sessions with
-        // heavy tool usage (~5 tasks × 12 tool calls each = 60 events per task).
-        let mut recent_history = self.load_recent_history(session_id, 40).await?;
+        // Base limit of 40 queries (120 events), scaled up for long-running tasks
+        // so that early tool calls from the current task are not pushed out of the
+        // window by their own later iterations.  Each iteration generates ~3
+        // messages (assistant, tool result(s), sometimes parallel calls), so
+        // iteration*3 covers the current task plus old-pair trimming removes the
+        // rest.  Capped at 120 to avoid loading entire sessions.
+        let history_limit = 40_usize.max(iteration.saturating_mul(3).min(120));
+        let mut recent_history = self.load_recent_history(session_id, history_limit).await?;
 
         // Guarantee the current user message is always present in history.
         // In sessions with heavy prior tool use, the 120-event window may not
@@ -125,9 +130,16 @@ impl Agent {
         // last_user_pos=None triggers the safe-collapse fallback which degrades
         // context quality. Appending it ensures the collapse boundary is always
         // correctly placed at the current task's user message.
-        let user_msg_present = recent_history
-            .iter()
-            .any(|m| m.role == "user" && m.content.as_deref() == Some(user_text));
+        // Check if the current user message is ALREADY in history as the LAST user
+        // message. We must check it's the last, not just any match: when the same
+        // prompt is sent multiple times, an old instance with identical text would
+        // falsely satisfy a content-only check. This causes rposition to find the
+        // OLD instance as the collapse boundary, keeping the old attempt's entire
+        // tool chain as "current interaction" — the model then thinks the task is
+        // already done and produces confused responses like "Did you mean to send something?".
+        let last_user_msg = recent_history.iter().rev().find(|m| m.role == "user");
+        let user_msg_present =
+            last_user_msg.is_some_and(|m| m.content.as_deref() == Some(user_text));
         if !user_msg_present && !user_text.is_empty() {
             recent_history.push(Message {
                 id: format!("synthetic-user-{}", uuid::Uuid::new_v4()),
@@ -320,6 +332,45 @@ impl Agent {
             trimmed
         } else {
             deduped_msgs
+        };
+
+        // Remove duplicate old user messages that have identical content to the
+        // current user message. When the same prompt is sent multiple times (e.g.,
+        // retrying after a failed response), the old instances with truncated/failed
+        // responses confuse the model into thinking the task was already handled.
+        // Also remove the assistant response immediately following each duplicate.
+        let deduped_msgs: Vec<&Message> = {
+            let boundary = deduped_msgs
+                .iter()
+                .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
+                .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
+            if let Some(boundary) = boundary {
+                let mut skip_indices = std::collections::HashSet::new();
+                for (i, m) in deduped_msgs.iter().enumerate() {
+                    if i < boundary && m.role == "user" && m.content.as_deref() == Some(user_text) {
+                        skip_indices.insert(i);
+                        // Also remove the assistant response immediately after
+                        if i + 1 < boundary && deduped_msgs[i + 1].role == "assistant" {
+                            skip_indices.insert(i + 1);
+                        }
+                    }
+                }
+                if !skip_indices.is_empty() {
+                    info!(
+                        session_id,
+                        duplicates_removed = skip_indices.len(),
+                        "Removed duplicate old user messages matching current prompt"
+                    );
+                }
+                deduped_msgs
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| !skip_indices.contains(i))
+                    .map(|(_, m)| m)
+                    .collect()
+            } else {
+                deduped_msgs
+            }
         };
 
         let old_interaction_assistant_ids: std::collections::HashSet<&str> = if let Some(boundary) =

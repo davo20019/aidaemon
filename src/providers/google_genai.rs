@@ -712,19 +712,40 @@ impl ModelProvider for GoogleGenAiProvider {
                     .header("x-goog-api-key", &self.api_key),
             )
             .json(&body);
-        let resp = match request.send().await {
-            Ok(r) => r,
-            Err(e) => {
+
+        // Safety-net timeout independent of reqwest's client-level timeout.
+        const LLM_CALL_HARD_TIMEOUT: Duration = Duration::from_secs(360);
+
+        let (status_code, text) = match tokio::time::timeout(LLM_CALL_HARD_TIMEOUT, async {
+            let resp = request.send().await.map_err(|e| {
                 error!("Google GenAI HTTP request failed: {}", e);
-                return Err(ProviderError::network(&e).into());
+                anyhow::Error::from(ProviderError::network(&e))
+            })?;
+            let status = resp.status();
+            let text = resp.text().await.map_err(|e| {
+                error!("Failed to read response body: {}", e);
+                anyhow::Error::from(ProviderError::network(&e))
+            })?;
+            Ok::<(u16, String), anyhow::Error>((status.as_u16(), text))
+        })
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                error!(
+                    model,
+                    timeout_secs = LLM_CALL_HARD_TIMEOUT.as_secs(),
+                    "Google GenAI API call exceeded hard timeout"
+                );
+                return Err(ProviderError::timeout_msg(
+                    "Google GenAI API call timed out (hard wall-clock limit)",
+                )
+                .into());
             }
         };
 
-        let status = resp.status();
-        let text = resp.text().await.map_err(|e| {
-            error!("Failed to read response body: {}", e);
-            ProviderError::network(&e)
-        })?;
+        let status = reqwest::StatusCode::from_u16(status_code).unwrap_or(reqwest::StatusCode::OK);
 
         if !status.is_success() {
             if status.as_u16() == 400 && is_missing_thought_signature_error(&text) {
@@ -746,19 +767,35 @@ impl ModelProvider for GoogleGenAiProvider {
                                 .header("x-goog-api-key", &self.api_key),
                         )
                         .json(&retry_body);
-                    let retry_resp = match retry_request.send().await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            error!("Google GenAI retry HTTP request failed: {}", e);
-                            return Err(ProviderError::network(&e).into());
-                        }
-                    };
-
-                    let retry_status = retry_resp.status();
-                    let retry_text = retry_resp.text().await.map_err(|e| {
-                        error!("Failed to read retry response body: {}", e);
-                        ProviderError::network(&e)
-                    })?;
+                    let (retry_status, retry_text) =
+                        match tokio::time::timeout(LLM_CALL_HARD_TIMEOUT, async {
+                            let retry_resp = retry_request.send().await.map_err(|e| {
+                                error!("Google GenAI retry HTTP request failed: {}", e);
+                                anyhow::Error::from(ProviderError::network(&e))
+                            })?;
+                            let status = retry_resp.status();
+                            let text = retry_resp.text().await.map_err(|e| {
+                                error!("Failed to read retry response body: {}", e);
+                                anyhow::Error::from(ProviderError::network(&e))
+                            })?;
+                            Ok::<(reqwest::StatusCode, String), anyhow::Error>((status, text))
+                        })
+                        .await
+                        {
+                            Ok(Ok(result)) => result,
+                            Ok(Err(e)) => return Err(e),
+                            Err(_elapsed) => {
+                                error!(
+                                    model,
+                                    timeout_secs = LLM_CALL_HARD_TIMEOUT.as_secs(),
+                                    "Google GenAI retry call exceeded hard timeout"
+                                );
+                                return Err(ProviderError::timeout_msg(
+                                    "Google GenAI retry call timed out (hard wall-clock limit)",
+                                )
+                                .into());
+                            }
+                        };
                     if retry_status.is_success() {
                         let data: Value = serde_json::from_str(&retry_text).map_err(|e| {
                             error!("Failed to parse Google GenAI retry response JSON: {}", e);

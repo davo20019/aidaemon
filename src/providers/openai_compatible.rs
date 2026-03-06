@@ -285,19 +285,43 @@ impl ModelProvider for OpenAiCompatibleProvider {
             .with_auth_headers(self.client.post(&url))
             .header("Content-Type", "application/json")
             .json(&body);
-        let resp = match request.send().await {
-            Ok(r) => r,
-            Err(e) => {
+
+        // Safety-net timeout independent of reqwest's client-level timeout.
+        // reqwest's timeout can be bypassed when the server trickles data
+        // (e.g. keep-alive pings, chunked encoding). This hard wall-clock
+        // cap ensures we never block the agent loop indefinitely.
+        const LLM_CALL_HARD_TIMEOUT: Duration = Duration::from_secs(360);
+
+        let (resp, text) = match tokio::time::timeout(LLM_CALL_HARD_TIMEOUT, async {
+            let resp = request.send().await.map_err(|e| {
                 error!("HTTP request failed: {}", e);
-                return Err(ProviderError::network(&e).into());
+                anyhow::Error::from(ProviderError::network(&e))
+            })?;
+            let status = resp.status();
+            let text = resp.text().await.map_err(|e| {
+                error!("Failed to read response body: {}", e);
+                anyhow::Error::from(ProviderError::network(&e))
+            })?;
+            Ok::<(u16, String), anyhow::Error>((status.as_u16(), text))
+        })
+        .await
+        {
+            Ok(Ok((status_code, text))) => (status_code, text),
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                error!(
+                    model,
+                    timeout_secs = LLM_CALL_HARD_TIMEOUT.as_secs(),
+                    "LLM API call exceeded hard timeout"
+                );
+                return Err(ProviderError::timeout_msg(
+                    "LLM API call timed out (hard wall-clock limit)",
+                )
+                .into());
             }
         };
 
-        let status = resp.status();
-        let text = resp.text().await.map_err(|e| {
-            error!("Failed to read response body: {}", e);
-            ProviderError::network(&e)
-        })?;
+        let status = reqwest::StatusCode::from_u16(resp).unwrap_or(reqwest::StatusCode::OK);
 
         if !status.is_success() {
             error!(status = %status, "Provider API error: {}", text);

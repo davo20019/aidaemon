@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.16] - 2026-03-06
+
+### Added
+
+- **LLM hard wall-clock timeout**: All providers (OpenAI-compatible, Anthropic, Google GenAI) now enforce a 360-second `tokio::time::timeout` safety net around API calls, preventing indefinite hangs when servers trickle data past reqwest's built-in timeout.
+- **`ProviderError::timeout_msg()`**: New constructor for custom timeout error messages.
+- **Background process lifecycle modes**: Three distinct modes for background processes — task-owned (killed on task-end), background with notifier (survives task-end, notifier delivers result), and detached (survives everything). Controlled via `notifier_active` field on `RunningProcess`.
+- **Duplicate prompt deduplication**: Message build phase now removes old user messages with identical content to the current prompt (and their assistant responses), preventing the model from thinking a retried task was already completed.
+- **Force-text fast-path in consultant completion**: When the model is in force-text mode after 3+ successful tool calls, all tool-requiring guards (file-recheck, deferred-action, tool-required) are bypassed to prevent deadlocks.
+
+### Changed
+
+- **Background handoff responses**: Stopping phase now includes an activity summary of tool calls performed before the background task started, not just the technical "moved to background" message.
+- **Background notification promise**: `build_background_detach_ack()` and system messages now only promise completion notifications when the notifier is actually active, based on tool result content rather than assuming all background processes have notifications.
+- **Telegram consecutive Thinking suppression**: Status updates now track `last_was_thinking` and suppress consecutive "Thinking..." messages, sending a typing indicator instead.
+- **History window scaling**: Message build phase scales the history event limit based on iteration count (up to 120) so long-running tasks don't lose early tool calls from the current task.
+- **`latest_non_system_tool_result` boundary fix**: Now stops at user message boundaries to avoid leaking tool results from previous interactions.
+- **File re-check guard in force-text**: Clears the guard instead of blocking when tools are unavailable or force-text is active.
+
+### Fixed
+
+- **Background process notification broken**: `on_task_end` was killing all task-owned background processes AND suppressing their notifications. Processes with active notifiers are now disowned instead of killed, preserving the completion notification promise.
+- **Read_file output recovery in multi-tool sessions**: When the latest tool is `read_file` but multiple tools ran, skips raw file dump recovery in favor of the activity summary.
+- **Integration test time sensitivity**: Scheduler test changed from "today at 11:09pm" to "tomorrow at 11:09pm" to avoid flaky failures near midnight.
+
 ## [0.9.15] - 2026-03-05
 
 ### Added

@@ -129,13 +129,27 @@ impl Agent {
         // self-documenting.  Wrapping them with "Here is the latest tool output:"
         // creates confusing debugging-style messages.  When only low-info tools
         // ran, return None so the LLM's natural response passes through instead.
-        history.iter().rev().find_map(|msg| {
+        //
+        // IMPORTANT: Stop at the first `user` message boundary to avoid leaking
+        // tool results from previous interactions into the current response.
+        let mut hit_user_boundary = false;
+        for msg in history.iter().rev() {
+            if msg.role == "user" {
+                hit_user_boundary = true;
+            }
+            if hit_user_boundary && msg.role == "tool" {
+                // This tool result is from a previous interaction — stop.
+                break;
+            }
             let tool_name = msg.tool_name.as_deref().unwrap_or("");
             if LOW_INFO_TOOLS.contains(&tool_name) {
-                return None;
+                continue;
             }
-            clean_tool_content(msg)
-        })
+            if let Some(result) = clean_tool_content(msg) {
+                return Some(result);
+            }
+        }
+        None
     }
 
     pub(super) async fn latest_non_system_tool_output_excerpt(
@@ -213,6 +227,13 @@ impl Agent {
 
         if self.depth == 0 {
             if let Some(background_ack) = pending_background_ack.take() {
+                info!(
+                    session_id,
+                    iteration,
+                    total_successful_tool_calls,
+                    tool_calls = learning_ctx.tool_calls.len(),
+                    "Background handoff: stopping loop and returning summary"
+                );
                 self.emit_decision_point(
                     emitter,
                     task_id,
@@ -226,11 +247,28 @@ impl Agent {
                 )
                 .await;
 
+                // Build a richer response that includes an activity summary
+                // so the user knows what was accomplished before the background
+                // task was started, not just the technical "moved to background" text.
+                let reply = if learning_ctx.tool_calls.is_empty() {
+                    background_ack.clone()
+                } else {
+                    let actions: Vec<&str> =
+                        learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
+                    let mut summary =
+                        String::from("Here's what I did before the background task started:\n");
+                    for (i, call) in actions.iter().enumerate() {
+                        summary.push_str(&format!("{}. {}\n", i + 1, call));
+                    }
+                    summary.push_str(&format!("\n{}", background_ack));
+                    summary
+                };
+
                 let assistant_msg = Message {
                     id: Uuid::new_v4().to_string(),
                     session_id: session_id.to_string(),
                     role: "assistant".to_string(),
-                    content: Some(background_ack.clone()),
+                    content: Some(reply.clone()),
                     tool_call_id: None,
                     tool_name: None,
                     tool_calls_json: None,
@@ -254,11 +292,11 @@ impl Agent {
                     iteration,
                     learning_ctx.tool_calls.len(),
                     None,
-                    Some(background_ack.chars().take(200).collect()),
+                    Some(reply.chars().take(200).collect()),
                 )
                 .await;
                 commit_state!();
-                return Ok(StoppingPhaseOutcome::Return(Ok(background_ack)));
+                return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
             }
         }
 

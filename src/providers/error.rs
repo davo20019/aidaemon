@@ -72,6 +72,16 @@ impl ProviderError {
         }
     }
 
+    pub fn timeout_msg(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProviderErrorKind::Timeout,
+            status: None,
+            message: message.into(),
+            malformed_reason: None,
+            retry_after_secs: None,
+        }
+    }
+
     pub fn network(err: &reqwest::Error) -> Self {
         let kind = if err.is_timeout() {
             ProviderErrorKind::Timeout

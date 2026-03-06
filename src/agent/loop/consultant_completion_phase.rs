@@ -218,19 +218,51 @@ impl Agent {
                 );
             }
 
-            if should_enforce_no_tool_text_when_tools_required(
+            // Force-text fast-path: when the model can't use tools, all guards
+            // that require tool execution (file-recheck, tool-required, deferred-
+            // action) are pointless — they would block the reply and return
+            // ContinueLoop, but the next iteration strips tools again, creating
+            // a deadlock.  Skip directly to completion.  If the reply is empty or
+            // low-signal, upgrade it to an activity summary.
+            if force_text_response && self.depth == 0 && total_successful_tool_calls >= 3 {
+                if reply.trim().is_empty()
+                    || is_low_signal_task_lead_reply(&reply)
+                    || looks_like_deferred_action_response(&reply)
+                {
+                    let actions: Vec<&str> =
+                        learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
+                    if !actions.is_empty() {
+                        reply = build_activity_summary_reply(&actions);
+                    }
+                }
+                require_file_recheck_before_answer = false;
+                info!(
+                    session_id,
+                    iteration,
+                    total_successful_tool_calls,
+                    reply_len = reply.len(),
+                    "Force-text fast-path: bypassing all tool-requiring guards"
+                );
+                // Fall through to the normal completion path (sanitize + return)
+            } else if should_enforce_no_tool_text_when_tools_required(
                 &reply,
                 needs_tools_for_turn,
                 learning_ctx.tool_calls.len(),
                 self.depth,
             ) {
-                if tool_defs.is_empty() {
+                if tool_defs.is_empty() || force_text_response {
+                    if !force_text_response {
+                        // Only show the "no tools available" message when tools are genuinely
+                        // absent. In force-text mode the model already has a reply — let it through.
+                        reply = "I can't complete that request in this context because it requires running tools, but no tools are currently available. Please retry in a tool-enabled context."
+                            .to_string();
+                    }
                     warn!(
                         session_id,
-                        iteration, "Tool-required response blocked, but no tools are available"
+                        iteration,
+                        force_text_response,
+                        "Tool-required response bypassed: tools unavailable or force-text active"
                     );
-                    reply = "I can't complete that request in this context because it requires running tools, but no tools are currently available. Please retry in a tool-enabled context."
-                        .to_string();
                 } else {
                     deferred_no_tool_streak = deferred_no_tool_streak.saturating_add(1);
                     stall_count = 0;
@@ -303,6 +335,16 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
                             session_id,
                             iteration,
                             "Recovered completion reply after send_file with shared closeout"
+                        );
+                    } else if tool_name == "read_file" && learning_ctx.tool_calls.len() > 1 {
+                        // When the latest tool is read_file and there were multiple tool
+                        // calls, the activity summary is more useful than a raw file dump.
+                        // Skip tool-output recovery so the activity summary branch fires.
+                        info!(
+                            session_id,
+                            iteration,
+                            tool_call_count = learning_ctx.tool_calls.len(),
+                            "Skipping read_file output recovery in favor of activity summary"
                         );
                     } else if let Some(tool_reply) =
                         build_tool_output_completion_reply(&tool_output)
@@ -492,14 +534,16 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
             }
 
             if require_file_recheck_before_answer {
-                if tool_defs.is_empty() {
+                if tool_defs.is_empty() || force_text_response {
                     warn!(
                         session_id,
                         iteration,
-                        "File re-check required but no tools available; returning explicit blocker"
+                        force_text_response,
+                        "File re-check required but tools unavailable (empty or force-text); clearing guard"
                     );
-                    reply = "I found conflicting file evidence from prior tool results, and I can't re-check now because no file tools are available in this context. Please retry in a tool-enabled context."
-                        .to_string();
+                    // In force-text mode the model can't use tools, so blocking
+                    // on file re-check is a deadlock. Clear the guard and let
+                    // the response through.
                     require_file_recheck_before_answer = false;
                 } else {
                     stall_count = stall_count.saturating_add(1);

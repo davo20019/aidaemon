@@ -4345,6 +4345,7 @@ impl TelegramChannel {
             let min_interval = Duration::from_secs(3);
             let mut sent_thinking = false;
             let mut dm_status_count: u32 = 0;
+            let mut last_was_thinking = false;
             const MAX_DM_STATUS_MESSAGES: u32 = 6;
             while let Some(update) = status_rx.recv().await {
                 // In non-DM channels: only send one "Thinking..." then suppress
@@ -4384,6 +4385,14 @@ impl TelegramChannel {
                     continue;
                 }
                 if !has_url && !is_budget_ext && now.duration_since(last_sent) < min_interval {
+                    continue;
+                }
+                // Suppress consecutive "Thinking..." — only send if the last visible
+                // status was a non-Thinking update (tool start, progress, etc.).
+                if matches!(&update, StatusUpdate::Thinking(_)) && last_was_thinking {
+                    let _ = status_bot
+                        .send_chat_action(status_chat_id, ChatAction::Typing)
+                        .await;
                     continue;
                 }
                 let text = match &update {
@@ -4517,6 +4526,7 @@ impl TelegramChannel {
                         )
                     }
                 };
+                last_was_thinking = matches!(&update, StatusUpdate::Thinking(_));
                 let _ = status_bot.send_message(status_chat_id, text).await;
                 dm_status_count += 1;
                 // Re-send typing indicator immediately after each status message.
@@ -4692,6 +4702,7 @@ impl TelegramChannel {
                         let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
                         let min_interval = Duration::from_secs(3);
                         let mut sent_thinking = false;
+                        let mut last_was_thinking = false;
                         while let Some(update) = new_status_rx.recv().await {
                             // In non-DM channels: only send one "Thinking..." then suppress
                             // (except BudgetExtended which must always reach the user)
@@ -4720,6 +4731,10 @@ impl TelegramChannel {
                             if !is_budget_ext && now.duration_since(last_sent) < min_interval {
                                 continue;
                             }
+                            // Suppress consecutive "Thinking..." messages
+                            if matches!(&update, StatusUpdate::Thinking(_)) && last_was_thinking {
+                                continue;
+                            }
                             let text = match &update {
                                 StatusUpdate::Thinking(_) => "Thinking...".to_string(),
                                 StatusUpdate::ToolStart { name, summary } => {
@@ -4742,6 +4757,7 @@ impl TelegramChannel {
                                 }
                                 _ => continue, // Skip other status updates for queued messages
                             };
+                            last_was_thinking = matches!(&update, StatusUpdate::Thinking(_));
                             let _ = status_bot.send_message(chat_id, text).await;
                             last_sent = tokio::time::Instant::now();
                         }

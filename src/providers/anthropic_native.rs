@@ -327,19 +327,39 @@ impl ModelProvider for AnthropicNativeProvider {
                     .header("content-type", "application/json"),
             )
             .json(&body);
-        let resp = match request.send().await {
-            Ok(r) => r,
-            Err(e) => {
+
+        // Safety-net timeout independent of reqwest's client-level timeout.
+        const LLM_CALL_HARD_TIMEOUT: Duration = Duration::from_secs(360);
+
+        let (status_code, text) = match tokio::time::timeout(LLM_CALL_HARD_TIMEOUT, async {
+            let resp = request.send().await.map_err(|e| {
                 error!("Anthropic HTTP request failed: {}", e);
-                return Err(ProviderError::network(&e).into());
+                anyhow::Error::from(ProviderError::network(&e))
+            })?;
+            let status = resp.status();
+            let text = resp.text().await.map_err(|e| {
+                error!("Failed to read response body: {}", e);
+                anyhow::Error::from(ProviderError::network(&e))
+            })?;
+            Ok::<(u16, String), anyhow::Error>((status.as_u16(), text))
+        })
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                error!(
+                    timeout_secs = LLM_CALL_HARD_TIMEOUT.as_secs(),
+                    "Anthropic API call exceeded hard timeout"
+                );
+                return Err(ProviderError::timeout_msg(
+                    "Anthropic API call timed out (hard wall-clock limit)",
+                )
+                .into());
             }
         };
 
-        let status = resp.status();
-        let text = resp.text().await.map_err(|e| {
-            error!("Failed to read response body: {}", e);
-            ProviderError::network(&e)
-        })?;
+        let status = reqwest::StatusCode::from_u16(status_code).unwrap_or(reqwest::StatusCode::OK);
 
         if !status.is_success() {
             error!(status = %status, "Anthropic API error: {}", text);

@@ -50,6 +50,12 @@ pub struct ApprovalRequest {
 }
 
 /// A background process being tracked after it exceeded the initial timeout.
+///
+/// Process lifecycle modes:
+/// 1. **Task-owned** (`detached=false`, `notifier_active=false`): killed on task-end.
+/// 2. **Background with notifier** (`detached=false`, `notifier_active=true`): survives
+///    task-end so the notifier can deliver the result. Killed when the notifier finishes.
+/// 3. **Detached** (`detached=true`): survives task-end and notifier. Requires explicit kill.
 struct RunningProcess {
     command: String,
     dedupe_key: Option<String>,
@@ -61,6 +67,10 @@ struct RunningProcess {
     reader_handle: JoinHandle<Option<i32>>,
     child_id: u32,
     notify_on_completion: Arc<AtomicBool>,
+    /// True only when the background notifier tokio task was actually spawned
+    /// and is actively monitoring this process for completion/progress delivery.
+    /// Used by `cleanup_task_processes` to decide whether to kill or disown.
+    notifier_active: bool,
 }
 
 /// Finalized background process output retained briefly so `action="check"`
@@ -887,12 +897,37 @@ impl TerminalTool {
         }
 
         let mut to_cleanup = Vec::new();
+        let mut to_disown = Vec::new();
         {
             let mut running = self.running.lock().await;
             for pid in cleaned_pids {
                 if let Some(proc) = running.remove(&pid) {
-                    to_cleanup.push((pid, proc));
+                    // If the background notifier task was actually spawned and is actively
+                    // monitoring this process, the user was promised completion notifications.
+                    // Don't kill it — just disown it from the task and let the notifier
+                    // handle delivery when the process finishes naturally.
+                    if proc.notifier_active {
+                        to_disown.push((pid, proc));
+                    } else {
+                        to_cleanup.push((pid, proc));
+                    }
                 }
+            }
+        }
+
+        // Re-insert disowned processes so the notifier can still track them.
+        // Clear owner_task_id so `check` no longer reports them as task-owned.
+        if !to_disown.is_empty() {
+            let mut running = self.running.lock().await;
+            for (pid, mut proc) in to_disown {
+                info!(
+                    pid,
+                    task_id,
+                    command = %proc.command,
+                    "Disowning background process from task (notifier active, will deliver completion)"
+                );
+                proc.owner_task_id = None;
+                running.insert(pid, proc);
             }
         }
 
@@ -1192,6 +1227,7 @@ impl TerminalTool {
                     reader_handle,
                     child_id: pid,
                     notify_on_completion: notify_on_completion.clone(),
+                    notifier_active: false,
                 };
 
                 self.running.lock().await.insert(pid, proc);
@@ -1205,6 +1241,7 @@ impl TerminalTool {
 
                 // Deterministic completion delivery: notify user when background command finishes
                 // even if the agent loop ends before an explicit `action="check"` call.
+                let mut notifier_started = false;
                 let state_for_notify = self.state.clone();
                 let hub_for_notify = self.get_hub();
                 if state_for_notify.is_some() || hub_for_notify.is_some() {
@@ -1232,6 +1269,7 @@ impl TerminalTool {
                                     command = %command_for_notify,
                                     "Terminal background notifier skipped enqueue due to empty session id"
                                 );
+                                notify_on_completion.store(false, Ordering::Relaxed);
                                 return;
                             }
                             let command_summary = truncate_str(
@@ -1454,12 +1492,19 @@ impl TerminalTool {
                                 }
                             }
                         });
+                        notifier_started = true;
+                        // Mark the process so cleanup_task_processes knows the notifier
+                        // is actively monitoring it and will deliver the result.
+                        if let Some(proc) = self.running.lock().await.get_mut(&pid) {
+                            proc.notifier_active = true;
+                        }
                     } else {
                         warn!(
                             pid,
                             command = %command,
                             "Terminal background notifier not started because process buffers were unavailable"
                         );
+                        notify_on_completion.store(false, Ordering::Relaxed);
                     }
                 } else {
                     warn!(
@@ -1467,6 +1512,7 @@ impl TerminalTool {
                         command = %command,
                         "Terminal background notifier disabled: neither state queue nor channel hub is configured"
                     );
+                    notify_on_completion.store(false, Ordering::Relaxed);
                 }
 
                 let mut msg = format!(
@@ -1479,6 +1525,10 @@ impl TerminalTool {
                 if detach {
                     msg.push_str(
                         "\n\nDetached mode is enabled: this process will not be auto-killed at task end.",
+                    );
+                } else if notifier_started {
+                    msg.push_str(
+                        "\n\nCompletion notifications are enabled. The user will be notified when this process finishes.",
                     );
                 } else {
                     msg.push_str(
@@ -1550,6 +1600,8 @@ impl TerminalTool {
                 output.push_str("\n[mode: detached]");
             } else if let Some(task_id) = proc.owner_task_id.as_deref() {
                 output.push_str(&format!("\n[mode: task-owned, task_id={}]", task_id));
+            } else if proc.notifier_active {
+                output.push_str("\n[mode: background, notifications active]");
             }
             if !stdout_tail.is_empty() {
                 output.push_str(&format!("\n\nRecent stdout:\n{}", stdout_tail));
@@ -1679,7 +1731,7 @@ impl Tool for TerminalTool {
     fn schema(&self) -> Value {
         json!({
             "name": "terminal",
-            "description": "Execute any command available on this system — shell commands, CLI tools (python, node, claude, gemini, cargo, docker, git, etc.), scripts, and anything else installed. If a command is not pre-approved, the user may be asked to authorize it in real time.\n\nLong-running commands: if execution exceeds the timeout, it is tracked in background with a pid. By default (`detach=false`), that background process is task-owned and is auto-killed when the task ends. Set `detach=true` only when intentional long-lived execution is required.\n\nIMPORTANT: Do not use heredoc (cat <<EOF), echo-redirect, or printf patterns to create files. Always use the `write_file` tool for file creation — it handles content atomically without shell quoting issues.",
+            "description": "Execute any command available on this system — shell commands, CLI tools (python, node, claude, gemini, cargo, docker, git, etc.), scripts, and anything else installed. If a command is not pre-approved, the user may be asked to authorize it in real time.\n\nLong-running commands: if execution exceeds the timeout, it is tracked in background with a pid. When completion notifications are available, the process continues running and the user is notified automatically when it finishes. Otherwise, `detach=false` processes are task-owned and auto-killed at task end. Set `detach=true` for intentional long-lived execution (daemons, servers) that should survive indefinitely.\n\nIMPORTANT: Do not use heredoc (cat <<EOF), echo-redirect, or printf patterns to create files. Always use the `write_file` tool for file creation — it handles content atomically without shell quoting issues.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1694,7 +1746,7 @@ impl Tool for TerminalTool {
                     },
                     "detach": {
                         "type": "boolean",
-                        "description": "For action=\"run\": if true, allows a timed-out command to keep running beyond task end. Default false."
+                        "description": "For action=\"run\": if true, the process survives indefinitely (for daemons/servers). Default false: timed-out processes survive with notifications when available, otherwise auto-killed at task end."
                     },
                     "pid": {
                         "type": "integer",
@@ -2576,6 +2628,78 @@ mod tests {
             check.contains("No tracked process"),
             "expected task-end cleanup to remove process tracking, got: {}",
             check
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_end_disowns_background_process_with_active_notifier() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state.clone() as Arc<dyn StateStore>);
+
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"sleep 3; echo disown-ok","_session_id":"sess_disown","_task_id":"task-disown","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(response.contains("Moved to background (pid="));
+        let pid = extract_pid_from_background_message(&response);
+
+        // Task ends — but the notifier is active, so the process should be disowned, not killed.
+        tool.on_task_end("task-disown", "sess_disown")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Process should still be tracked (disowned, not removed).
+        let check = tool
+            .call(&format!(
+                r#"{{"action":"check","pid":{},"_session_id":"sess_disown","_user_role":"Owner"}}"#,
+                pid
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !check.contains("No tracked process"),
+            "expected process to survive task-end when notifier is active, got: {}",
+            check
+        );
+
+        // Wait for the process to complete and the notification to be enqueued.
+        let mut found = false;
+        for _ in 0..50 {
+            let pending = state.get_pending_notifications(20).await.unwrap();
+            if pending.iter().any(|entry| {
+                entry.session_id == "sess_disown"
+                    && entry.message.contains("Background terminal command")
+                    && entry.message.contains("disown-ok")
+            }) {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        assert!(
+            found,
+            "expected background completion notification after task-end disown"
         );
     }
 

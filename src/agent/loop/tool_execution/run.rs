@@ -178,10 +178,17 @@ fn build_background_detach_ack(tool_name: &str, result_text: &str) -> String {
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with("[SYSTEM]"))
         .unwrap_or(default_prefix);
-    format!(
-        "{} Completion notifications are enabled, and the final result will be sent automatically when it finishes.",
-        first_line
-    )
+    // Only promise notifications if the tool result confirms they're actually enabled.
+    // Detached mode is a separate state — detached processes don't necessarily have a notifier.
+    let notifications_active = result_text.contains("Completion notifications are enabled");
+    if notifications_active {
+        format!(
+            "{} Completion notifications are enabled, and the final result will be sent automatically when it finishes.",
+            first_line
+        )
+    } else {
+        first_line.to_string()
+    }
 }
 
 fn run_command_policy_block_requires_terminal(result_text: &str) -> bool {
@@ -778,9 +785,17 @@ Continue with tools that directly match the user request.",
             if background_detached {
                 pending_background_ack = Some(build_background_detach_ack(&tc.name, &result_text));
                 force_text_response = true;
-                let system_msg = "[SYSTEM] A background task is now running and completion notifications are enabled. \
+                let notifications_active =
+                    result_text.contains("Completion notifications are enabled");
+                let system_msg = if notifications_active {
+                    "[SYSTEM] A background task is now running and completion notifications are enabled. \
 Do NOT call additional tools or poll status in this turn. Reply to the user now that work continues in background and results will be sent automatically."
-                    .to_string();
+                        .to_string()
+                } else {
+                    "[SYSTEM] A background task was moved to the background. \
+Do NOT call additional tools or poll status in this turn. Reply to the user now with the current status."
+                        .to_string()
+                };
                 pending_system_messages.push(system_msg.clone());
                 result_text = format!("{}\n\n{}", result_text, system_msg);
             }
@@ -1191,11 +1206,20 @@ mod tests {
 
     #[test]
     fn builds_deterministic_background_ack_from_tool_result() {
+        // With notifications enabled — should promise automatic delivery.
         let ack = build_background_detach_ack(
             "terminal",
-            "Command still running after 30s. Moved to background (pid=123).\n\n[SYSTEM] ...",
+            "Command still running after 30s. Moved to background (pid=123).\n\nCompletion notifications are enabled. The user will be notified when this process finishes.\n\n[SYSTEM] ...",
         );
         assert!(ack.contains("Moved to background (pid=123)"));
         assert!(ack.contains("final result will be sent automatically"));
+
+        // Without notifications — should NOT promise automatic delivery.
+        let ack_no_notify = build_background_detach_ack(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=456).\n\nThis process is task-owned and will be auto-killed when the current task ends.",
+        );
+        assert!(ack_no_notify.contains("Moved to background (pid=456)"));
+        assert!(!ack_no_notify.contains("final result will be sent automatically"));
     }
 }
