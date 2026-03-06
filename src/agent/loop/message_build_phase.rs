@@ -266,7 +266,13 @@ impl Agent {
         // interaction needs to avoid re-exploring from scratch.
         // However, when the current message is a clearly NEW task (very different from
         // the prior user message), the old handoff context is harmful — truncate it too.
-        let collapse_boundary = deduped_msgs.iter().rposition(|m| m.role == "user");
+        // Anchor to the current user message by content (not just any last user message).
+        // Without content matching, stray user messages from race conditions can shift
+        // the boundary and cause wrong assistant messages to survive truncation.
+        let collapse_boundary = deduped_msgs
+            .iter()
+            .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
+            .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
 
         // Use the sticky is_new_task flag from TurnContext (computed once at loop start).
         // This prevents mid-loop reclassification: when the agent loop runs 10+ iterations,
@@ -316,36 +322,40 @@ impl Agent {
             deduped_msgs
         };
 
-        let old_interaction_assistant_ids: std::collections::HashSet<&str> =
-            if let Some(boundary) = deduped_msgs.iter().rposition(|m| m.role == "user") {
-                // Find the immediately-prior assistant message (right before boundary).
-                // Exempt it from truncation ONLY for follow-up messages in the same task.
-                let prior_assistant_id: Option<&str> = if is_new_task {
-                    None // new task: truncate all old assistants including handoff
-                } else {
-                    (0..boundary)
-                        .rev()
-                        .find(|&i| deduped_msgs[i].role == "assistant")
-                        .map(|i| deduped_msgs[i].id.as_str())
-                };
-
-                deduped_msgs
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, m)| {
-                        *i < boundary
-                            && m.role == "assistant"
-                            && Some(m.id.as_str()) != prior_assistant_id
-                            && !m
-                                .content
-                                .as_deref()
-                                .is_some_and(text_relates_to_critical_identity)
-                    })
-                    .map(|(_, m)| m.id.as_str())
-                    .collect()
+        let old_interaction_assistant_ids: std::collections::HashSet<&str> = if let Some(boundary) =
+            deduped_msgs
+                .iter()
+                .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
+                .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"))
+        {
+            // Find the immediately-prior assistant message (right before boundary).
+            // Exempt it from truncation ONLY for follow-up messages in the same task.
+            let prior_assistant_id: Option<&str> = if is_new_task {
+                None // new task: truncate all old assistants including handoff
             } else {
-                std::collections::HashSet::new()
+                (0..boundary)
+                    .rev()
+                    .find(|&i| deduped_msgs[i].role == "assistant")
+                    .map(|i| deduped_msgs[i].id.as_str())
             };
+
+            deduped_msgs
+                .iter()
+                .enumerate()
+                .filter(|(i, m)| {
+                    *i < boundary
+                        && m.role == "assistant"
+                        && Some(m.id.as_str()) != prior_assistant_id
+                        && !m
+                            .content
+                            .as_deref()
+                            .is_some_and(text_relates_to_critical_identity)
+                })
+                .map(|(_, m)| m.id.as_str())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
 
         // Collect tool result ids present in this context window (tool_call_id on tool-role
         // messages with a non-empty tool name). Used to drop assistant tool_calls that would
@@ -501,7 +511,11 @@ impl Agent {
         // (i.e., multiple independent tasks in the same chat session), inject a
         // system separator before the current user message so the LLM knows which
         // task is current. Without this, models confuse old tasks with the new one.
-        if iteration <= 2 {
+        // Injected on ALL iterations (not just early ones) because on iteration 3+
+        // old user messages can mislead the model into responding to them instead of
+        // the current task — especially after tool calls push the current user message
+        // further up the context.
+        {
             let user_positions: Vec<usize> = messages
                 .iter()
                 .enumerate()
@@ -509,17 +523,34 @@ impl Agent {
                 .map(|(i, _)| i)
                 .collect();
             if user_positions.len() >= 2 {
-                // Find the position of the *current* user message (last user message).
-                if let Some(&current_pos) = user_positions.last() {
-                    let prev_user_content = user_positions.iter().rev().skip(1).find_map(|&pos| {
-                        messages[pos]
-                            .get("content")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string())
-                    });
-                    // Only inject if the current task differs from the previous one.
-                    let is_new_task = prev_user_content.as_deref() != Some(user_text);
-                    if is_new_task {
+                // Find the position of the *current* user message — match by content,
+                // not just "last user message", so we correctly anchor even when
+                // stray user messages from other interactions appear after ours.
+                let current_pos = user_positions
+                    .iter()
+                    .copied()
+                    .rev()
+                    .find(|&pos| {
+                        messages[pos].get("content").and_then(|c| c.as_str()) == Some(user_text)
+                    })
+                    .or_else(|| user_positions.last().copied());
+
+                if let Some(current_pos) = current_pos {
+                    let prev_user_content = user_positions
+                        .iter()
+                        .copied()
+                        .filter(|&pos| pos != current_pos)
+                        .rev()
+                        .find_map(|pos| {
+                            messages[pos]
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .map(|s| s.to_string())
+                        });
+                    // Only inject if a different task exists in context.
+                    let has_different_task = prev_user_content.as_deref() != Some(user_text)
+                        && prev_user_content.is_some();
+                    if has_different_task {
                         let marker = json!({
                             "role": "system",
                             "content": "[TASK BOUNDARY] The user has started a NEW, UNRELATED task below. \
@@ -536,6 +567,52 @@ impl Agent {
                             iteration,
                             user_messages = user_positions.len(),
                             "Task boundary marker injected before current user message"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Guard against context interleaving: if another user message arrived in
+        // this session while the agent was processing (race condition between task
+        // registration and queuing), it may appear after the current task's tool
+        // chain. Such stray user messages confuse the model into responding to them
+        // instead of the current task. Remove them.
+        {
+            let current_task_pos = messages.iter().rposition(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
+            });
+            if let Some(task_pos) = current_task_pos {
+                // Find the end of the current task's tool chain (last assistant/tool after task_pos)
+                let chain_end = messages
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(i, m)| {
+                        *i > task_pos
+                            && matches!(
+                                m.get("role").and_then(|r| r.as_str()),
+                                Some("assistant") | Some("tool")
+                            )
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(task_pos);
+
+                // Check for user messages after the tool chain
+                let stray_start = chain_end + 1;
+                if stray_start < messages.len() {
+                    let stray_count = messages[stray_start..]
+                        .iter()
+                        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                        .count();
+                    if stray_count > 0 {
+                        messages.truncate(stray_start);
+                        info!(
+                            session_id,
+                            iteration,
+                            stray_user_messages = stray_count,
+                            "Truncated stray messages after current task's tool chain"
                         );
                     }
                 }

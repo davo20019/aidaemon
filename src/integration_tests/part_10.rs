@@ -1,3 +1,89 @@
+// ==================== Task Boundary on Multi-Turn Tasks ====================
+
+/// Regression: When a second turn runs after a previous interaction, old user messages
+/// from prior interactions must not confuse the model. The task boundary marker
+/// should be injected to separate old context from the current task.
+///
+/// Scenario: Turn 1 asks "Why?", Turn 2 asks to find a file.
+/// Turn 2's LLM calls should see a [TASK BOUNDARY] marker separating the old "Why?"
+/// from the current request, preventing the model from responding to old context.
+#[tokio::test]
+async fn test_task_boundary_injected_between_turns() {
+    let provider = MockProvider::with_responses(vec![
+        // Turn 1: consultant pass → can answer now
+        MockProvider::text_response(
+            "[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false}",
+        ),
+        // Turn 2: consultant pass → needs tools, then tool call, then answer
+        MockProvider::text_response(
+            "[INTENT_GATE] {\"complexity\":\"simple\",\"can_answer_now\":false,\"needs_tools\":true}",
+        ),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("Found the Spanish resume."),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    // Turn 1: simple question
+    let _r1 = harness
+        .agent
+        .handle_message(
+            "boundary_test",
+            "Why?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Turn 2: different task
+    let _r2 = harness
+        .agent
+        .handle_message(
+            "boundary_test",
+            "Send me the resume in Spanish now.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Verify: any LLM call for Turn 2 that includes old "Why?" context
+    // must also have a [TASK BOUNDARY] marker separating old from new.
+    let call_log = harness.provider.call_log.lock().await;
+    assert!(
+        call_log.len() >= 2,
+        "Expected at least 2 LLM calls (one per turn), got {}",
+        call_log.len()
+    );
+
+    // Check all calls after Turn 1
+    let turn2_calls_ok = call_log.iter().skip(1).all(|call| {
+        let has_old_user = call.messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("Why?"))
+        });
+        let has_boundary = call.messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("system")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("[TASK BOUNDARY]"))
+        });
+        // If old context is present, boundary must be too. If old context was dropped, that's fine.
+        !has_old_user || has_boundary
+    });
+    assert!(
+        turn2_calls_ok,
+        "All Turn 2 LLM calls must have [TASK BOUNDARY] when old user context is present"
+    );
+}
+
 // ==================== Orchestrator Tool Presence Regression Tests ====================
 
 #[tokio::test]

@@ -1183,10 +1183,7 @@ mod tests {
         let history = vec![
             msg(
                 "user",
-                &format!(
-                    "Please work in {} and inspect async functions.",
-                    dir_path
-                ),
+                &format!("Please work in {} and inspect async functions.", dir_path),
             ),
             msg("assistant", "Should I proceed with a full scan?"),
         ];

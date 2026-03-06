@@ -181,6 +181,7 @@ impl Agent {
             "manage_people",
             "web_search",
             "web_fetch",
+            "send_file",
         ];
 
         // Stable prioritization: essential tools first, then read-only + idempotent.
