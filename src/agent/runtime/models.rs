@@ -63,8 +63,6 @@ impl Agent {
         config: &crate::config::AppConfig,
     ) -> anyhow::Result<String> {
         let bundle = crate::startup::provider_router::build_provider_router(config)?;
-        let new_router = crate::llm_runtime::router_from_models(config.provider.models.clone());
-        let new_kind = config.provider.kind;
         let new_primary = bundle.primary_model.clone();
         let new_fallback = config
             .provider
@@ -83,9 +81,13 @@ impl Agent {
             }
         };
 
-        let old_runtime =
-            self.llm_runtime
-                .swap(bundle.provider, new_router, new_kind, new_primary.clone());
+        let old_runtime = self.llm_runtime.swap(
+            bundle.provider,
+            bundle.router,
+            bundle.provider_kind,
+            new_primary.clone(),
+            bundle.failover_targets,
+        );
 
         {
             let mut model = tokio::time::timeout(Duration::from_secs(2), self.model.write())
@@ -108,7 +110,7 @@ impl Agent {
 
         info!(
             old_provider = ?old_runtime.provider_kind(),
-            new_provider = ?new_kind,
+            new_provider = ?config.provider.kind,
             old_model = %old_model,
             new_model = %new_primary,
             new_fallback = %new_fallback,
@@ -118,7 +120,7 @@ impl Agent {
         Ok(format!(
             "Provider: {:?} -> {:?}. Model: {} -> {}. Auto-routing re-enabled.",
             old_runtime.provider_kind(),
-            new_kind,
+            config.provider.kind,
             old_model,
             new_primary
         ))

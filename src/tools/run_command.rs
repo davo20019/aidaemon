@@ -314,11 +314,13 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
         s.to_string()
     } else {
         let half = max_chars / 2;
+        let front_end = crate::utils::floor_char_boundary(s, half);
+        let back_start = crate::utils::floor_char_boundary(s, s.len() - half);
         format!(
             "{}\n\n... ({} chars truncated) ...\n\n{}",
-            &s[..half],
+            &s[..front_end],
             s.len() - max_chars,
-            &s[s.len() - half..]
+            &s[back_start..]
         )
     }
 }

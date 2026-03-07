@@ -36,6 +36,25 @@ primary = "openai/gpt-4o"
 fast = "openai/gpt-4o-mini"
 smart = "anthropic/claude-sonnet-4"
 
+# Optional direct-provider fallback chain. These entries are tried in order
+# after the primary provider's own model fallback list is exhausted.
+# Keychain secret names use `provider_fallback_<index>_...`, for example:
+# `provider_fallback_0_api_key`, `provider_fallback_0_gateway_token`.
+#
+# [[provider.fallbacks]]
+# kind = "anthropic"
+# api_key = "keychain"
+# # api_key = "${ANTHROPIC_API_KEY}"
+# [provider.fallbacks.models]
+# default = "claude-sonnet-4-20250514"
+#
+# [[provider.fallbacks]]
+# kind = "xai_native"
+# api_key = "keychain"
+# # api_key = "${XAI_API_KEY}"
+# [provider.fallbacks.models]
+# default = "grok-4"
+
 [telegram]
 bot_token = "keychain"
 # bot_token = "${TELOXIDE_TOKEN}"

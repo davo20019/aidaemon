@@ -217,6 +217,34 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
     },
 ];
 
+#[derive(Clone)]
+struct ResolvedProviderSelection {
+    preset: &'static ProviderPreset,
+    api_key: String,
+    base_url: String,
+    primary_model: String,
+    fast_model: String,
+    smart_model: String,
+    gateway_token: Option<String>,
+}
+
+impl ResolvedProviderSelection {
+    fn fallback_models(&self) -> Vec<String> {
+        let mut models = Vec::new();
+        for candidate in [&self.smart_model, &self.fast_model] {
+            let trimmed = candidate.trim();
+            if trimmed.is_empty()
+                || trimmed == self.primary_model
+                || models.iter().any(|existing: &String| existing == trimmed)
+            {
+                continue;
+            }
+            models.push(trimmed.to_string());
+        }
+        models
+    }
+}
+
 pub struct ConfigManagerTool {
     config_path: PathBuf,
     approval_tx: mpsc::Sender<ApprovalRequest>,
@@ -375,7 +403,7 @@ impl ConfigManagerTool {
         let mut lines = vec![
             "Provider presets:".to_string(),
             "".to_string(),
-            "Use action='switch_provider' with provider + api_key (and base_url when needed)."
+            "Use action='switch_provider' to change the primary provider, or action='add_failover_provider' to append a fallback provider."
                 .to_string(),
             "".to_string(),
         ];
@@ -411,6 +439,10 @@ impl ConfigManagerTool {
             "Example: {\"action\":\"switch_provider\",\"provider\":\"moonshot\",\"api_key\":\"YOUR_KEY\"}"
                 .to_string(),
         );
+        lines.push(
+            "Failover example: {\"action\":\"add_failover_provider\",\"provider\":\"anthropic\",\"api_key\":\"YOUR_KEY\"}"
+                .to_string(),
+        );
 
         lines.join("\n")
     }
@@ -437,17 +469,20 @@ impl ConfigManagerTool {
         }
     }
 
-    async fn switch_provider(&self, args: &ConfigArgs) -> anyhow::Result<String> {
+    fn resolve_provider_selection(
+        args: &ConfigArgs,
+        action_name: &str,
+    ) -> Result<ResolvedProviderSelection, String> {
         let provider_name = args.provider.trim();
         if provider_name.is_empty() {
-            return Ok(
-                "Error: 'provider' is required for action='switch_provider'. Use action='list_provider_presets' to see valid options."
-                    .to_string(),
-            );
+            return Err(format!(
+                "Error: 'provider' is required for action='{}'. Use action='list_provider_presets' to see valid options.",
+                action_name
+            ));
         }
 
         let Some(preset) = Self::find_provider_preset(provider_name) else {
-            return Ok(format!(
+            return Err(format!(
                 "Unknown provider '{}'. Use action='list_provider_presets' to see valid options.",
                 provider_name
             ));
@@ -455,9 +490,9 @@ impl ConfigManagerTool {
 
         let api_key = args.api_key.trim();
         if preset.needs_api_key && api_key.is_empty() {
-            return Ok(format!(
-                "Missing API key for {}. Provide `api_key` and retry.\n\nExample: {{\"action\":\"switch_provider\",\"provider\":\"{}\",\"api_key\":\"YOUR_KEY\"}}",
-                preset.display_name, preset.id
+            return Err(format!(
+                "Missing API key for {}. Provide `api_key` and retry.\n\nExample: {{\"action\":\"{}\",\"provider\":\"{}\",\"api_key\":\"YOUR_KEY\"}}",
+                preset.display_name, action_name, preset.id
             ));
         }
 
@@ -466,31 +501,31 @@ impl ConfigManagerTool {
             base_url = preset.base_url.to_string();
         }
         if preset.requires_custom_base_url && base_url.trim().is_empty() {
-            return Ok(format!(
-                "Provider {} requires `base_url`. Example:\n{{\"action\":\"switch_provider\",\"provider\":\"{}\",\"base_url\":\"https://api.example.com/v1\",\"api_key\":\"YOUR_KEY\"}}",
-                preset.display_name, preset.id
+            return Err(format!(
+                "Provider {} requires `base_url`. Example:\n{{\"action\":\"{}\",\"provider\":\"{}\",\"base_url\":\"https://api.example.com/v1\",\"api_key\":\"YOUR_KEY\"}}",
+                preset.display_name, action_name, preset.id
             ));
         }
         if preset.id == "cloudflare_gateway"
             && (base_url.contains("<ACCOUNT_ID>") || base_url.contains("<GATEWAY_ID>"))
         {
-            return Ok(
+            return Err(
                 "Cloudflare AI Gateway requires your real gateway URL. Replace `<ACCOUNT_ID>` and `<GATEWAY_ID>` in `base_url` and retry."
                     .to_string(),
             );
         }
 
-        let primary = if args.primary_model.trim().is_empty() {
+        let primary_model = if args.primary_model.trim().is_empty() {
             preset.primary.to_string()
         } else {
             args.primary_model.trim().to_string()
         };
-        let fast = if args.fast_model.trim().is_empty() {
+        let fast_model = if args.fast_model.trim().is_empty() {
             preset.fast.to_string()
         } else {
             args.fast_model.trim().to_string()
         };
-        let smart = if args.smart_model.trim().is_empty() {
+        let smart_model = if args.smart_model.trim().is_empty() {
             preset.smart.to_string()
         } else {
             args.smart_model.trim().to_string()
@@ -503,18 +538,722 @@ impl ConfigManagerTool {
                 None
             };
 
+        Ok(ResolvedProviderSelection {
+            preset,
+            api_key: api_key.to_string(),
+            base_url,
+            primary_model,
+            fast_model,
+            smart_model,
+            gateway_token,
+        })
+    }
+
+    fn fallback_key_prefix(index: usize) -> String {
+        format!("provider_fallback_{}", index)
+    }
+
+    fn keychain_field_name(prefix: Option<&str>, field: &str) -> String {
+        prefix
+            .map(|prefix| format!("{}_{}", prefix, field))
+            .unwrap_or_else(|| field.to_string())
+    }
+
+    fn normalized_header_key(header_name: &str) -> String {
+        header_name
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
+    }
+
+    fn header_keychain_field_name(prefix: Option<&str>, header_name: &str) -> String {
+        let normalized = Self::normalized_header_key(header_name);
+        prefix
+            .map(|prefix| format!("{}_header_{}", prefix, normalized))
+            .unwrap_or_else(|| format!("provider_header_{}", normalized))
+    }
+
+    fn build_models_table(selection: &ResolvedProviderSelection) -> toml::Table {
+        let mut models = toml::Table::new();
+        models.insert(
+            "default".to_string(),
+            toml::Value::String(selection.primary_model.clone()),
+        );
+
+        let fallback_models = selection.fallback_models();
+        if !fallback_models.is_empty() {
+            models.insert(
+                "fallback".to_string(),
+                toml::Value::Array(
+                    fallback_models
+                        .into_iter()
+                        .map(toml::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+
+        models.insert(
+            "primary".to_string(),
+            toml::Value::String(selection.primary_model.clone()),
+        );
+        models.insert(
+            "fast".to_string(),
+            toml::Value::String(selection.fast_model.clone()),
+        );
+        models.insert(
+            "smart".to_string(),
+            toml::Value::String(selection.smart_model.clone()),
+        );
+        models
+    }
+
+    fn apply_provider_selection(
+        provider_table: &mut toml::Table,
+        selection: &ResolvedProviderSelection,
+        key_prefix: Option<&str>,
+        save_secrets_to_keychain: bool,
+        notes: &mut Vec<String>,
+        note_prefix: &str,
+    ) {
+        provider_table.insert(
+            "kind".to_string(),
+            toml::Value::String(selection.preset.kind.to_string()),
+        );
+
+        let api_key_value = if selection.preset.needs_api_key {
+            let (value, stored, note) = Self::resolve_secret_config_value(
+                &Self::keychain_field_name(key_prefix, "api_key"),
+                &selection.api_key,
+                save_secrets_to_keychain,
+            );
+            if stored {
+                notes.push(if note_prefix.is_empty() {
+                    "API key stored in OS keychain.".to_string()
+                } else {
+                    format!("{} API key stored in OS keychain.", note_prefix)
+                });
+            }
+            if let Some(note) = note {
+                notes.push(note);
+            }
+            value
+        } else {
+            toml::Value::String(if selection.api_key.is_empty() {
+                "ollama".to_string()
+            } else {
+                selection.api_key.clone()
+            })
+        };
+        provider_table.insert("api_key".to_string(), api_key_value);
+
+        if selection.base_url.trim().is_empty() {
+            provider_table.remove("base_url");
+        } else {
+            provider_table.insert(
+                "base_url".to_string(),
+                toml::Value::String(selection.base_url.clone()),
+            );
+        }
+
+        provider_table.insert(
+            "models".to_string(),
+            toml::Value::Table(Self::build_models_table(selection)),
+        );
+
+        if let Some(token) = selection.gateway_token.as_deref() {
+            let (token_value, stored, note) = Self::resolve_secret_config_value(
+                &Self::keychain_field_name(key_prefix, "gateway_token"),
+                token,
+                save_secrets_to_keychain,
+            );
+            if stored {
+                notes.push(if note_prefix.is_empty() {
+                    "Gateway token stored in OS keychain.".to_string()
+                } else {
+                    format!("{} gateway token stored in OS keychain.", note_prefix)
+                });
+            }
+            if let Some(note) = note {
+                notes.push(note);
+            }
+            provider_table.insert("gateway_token".to_string(), token_value);
+        } else {
+            provider_table.remove("gateway_token");
+        }
+    }
+
+    fn summarize_provider_table(index: usize, provider_table: &toml::Table) -> String {
+        let kind = provider_table
+            .get("kind")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("(missing)");
+        let base_url = provider_table
+            .get("base_url")
+            .and_then(toml::Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or("(not set)");
+        let api_key_state = match provider_table.get("api_key").and_then(toml::Value::as_str) {
+            Some("keychain") => "keychain",
+            Some(value) if !value.trim().is_empty() => "inline",
+            _ => "missing",
+        };
+        let gateway_token_state = match provider_table
+            .get("gateway_token")
+            .and_then(toml::Value::as_str)
+        {
+            Some("keychain") => "keychain",
+            Some(value) if !value.trim().is_empty() => "inline",
+            _ => "not set",
+        };
+
+        let (default_model, fallback_models) = provider_table
+            .get("models")
+            .and_then(toml::Value::as_table)
+            .map(Self::model_summary_from_table)
+            .unwrap_or_else(|| ("(missing)".to_string(), Vec::new()));
+        let fallback_summary = if fallback_models.is_empty() {
+            "(none)".to_string()
+        } else {
+            fallback_models.join(", ")
+        };
+
+        format!(
+            "[{}] kind=`{}`, base_url=`{}`, default=`{}`, fallback=`{}`, api_key=`{}`, gateway_token=`{}`",
+            index,
+            kind,
+            base_url,
+            default_model,
+            fallback_summary,
+            api_key_state,
+            gateway_token_state
+        )
+    }
+
+    fn model_summary_from_table(models: &toml::Table) -> (String, Vec<String>) {
+        let default_model = models
+            .get("default")
+            .and_then(toml::Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                models
+                    .get("primary")
+                    .and_then(toml::Value::as_str)
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .unwrap_or("(missing)")
+            .to_string();
+
+        let mut fallback_models = Vec::new();
+        if let Some(array) = models.get("fallback").and_then(toml::Value::as_array) {
+            for value in array {
+                let Some(model) = value.as_str() else {
+                    continue;
+                };
+                let trimmed = model.trim();
+                if trimmed.is_empty()
+                    || trimmed == default_model
+                    || fallback_models
+                        .iter()
+                        .any(|existing: &String| existing == trimmed)
+                {
+                    continue;
+                }
+                fallback_models.push(trimmed.to_string());
+            }
+        } else {
+            for key in ["smart", "fast"] {
+                let Some(model) = models.get(key).and_then(toml::Value::as_str) else {
+                    continue;
+                };
+                let trimmed = model.trim();
+                if trimmed.is_empty()
+                    || trimmed == default_model
+                    || fallback_models
+                        .iter()
+                        .any(|existing: &String| existing == trimmed)
+                {
+                    continue;
+                }
+                fallback_models.push(trimmed.to_string());
+            }
+        }
+
+        (default_model, fallback_models)
+    }
+
+    fn get_failover_array(
+        provider_table: &toml::Table,
+    ) -> anyhow::Result<Option<&Vec<toml::Value>>> {
+        match (
+            provider_table.get("fallbacks"),
+            provider_table.get("failover"),
+        ) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("Config contains both `provider.fallbacks` and `provider.failover`")
+            }
+            (Some(value), None) => value
+                .as_array()
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("`provider.fallbacks` is not an array")),
+            (None, Some(value)) => value
+                .as_array()
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("`provider.failover` is not an array")),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn normalize_failover_array_mut(
+        provider_table: &mut toml::Table,
+    ) -> anyhow::Result<&mut Vec<toml::Value>> {
+        if provider_table.contains_key("fallbacks") && provider_table.contains_key("failover") {
+            anyhow::bail!("Config contains both `provider.fallbacks` and `provider.failover`");
+        }
+        if !provider_table.contains_key("fallbacks") {
+            if let Some(value) = provider_table.remove("failover") {
+                provider_table.insert("fallbacks".to_string(), value);
+            }
+        } else {
+            provider_table.remove("failover");
+        }
+        provider_table
+            .entry("fallbacks")
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("`provider.fallbacks` is not an array"))
+    }
+
+    fn normalize_failover_array_mut_if_present(
+        provider_table: &mut toml::Table,
+    ) -> anyhow::Result<Option<&mut Vec<toml::Value>>> {
+        if provider_table.contains_key("fallbacks") && provider_table.contains_key("failover") {
+            anyhow::bail!("Config contains both `provider.fallbacks` and `provider.failover`");
+        }
+        if !provider_table.contains_key("fallbacks") {
+            if let Some(value) = provider_table.remove("failover") {
+                provider_table.insert("fallbacks".to_string(), value);
+            }
+        } else {
+            provider_table.remove("failover");
+        }
+        Ok(provider_table
+            .get_mut("fallbacks")
+            .and_then(toml::Value::as_array_mut))
+    }
+
+    fn migrate_secret_string(
+        provider_table: &mut toml::Table,
+        field_name: &str,
+        old_key: &str,
+        new_key: &str,
+        cleanup_keys: &mut Vec<String>,
+        notes: &mut Vec<String>,
+    ) -> anyhow::Result<()> {
+        if old_key == new_key {
+            return Ok(());
+        }
+
+        let Some(current_value) = provider_table.get(field_name).and_then(toml::Value::as_str)
+        else {
+            return Ok(());
+        };
+        if current_value != "keychain" {
+            return Ok(());
+        }
+
+        let secret = crate::config::resolve_from_keychain(old_key)?;
+        let (new_value, _stored, note) = Self::resolve_secret_config_value(new_key, &secret, true);
+        provider_table.insert(field_name.to_string(), new_value);
+        cleanup_keys.push(old_key.to_string());
+        if let Some(note) = note {
+            notes.push(note);
+        }
+        Ok(())
+    }
+
+    fn migrate_secret_headers(
+        provider_table: &mut toml::Table,
+        old_prefix: &str,
+        new_prefix: &str,
+        cleanup_keys: &mut Vec<String>,
+        notes: &mut Vec<String>,
+    ) -> anyhow::Result<()> {
+        if old_prefix == new_prefix {
+            return Ok(());
+        }
+
+        let Some(headers) = provider_table
+            .get_mut("extra_headers")
+            .and_then(toml::Value::as_table_mut)
+        else {
+            return Ok(());
+        };
+
+        for (header_name, header_value) in headers.iter_mut() {
+            let Some(current_value) = header_value.as_str() else {
+                continue;
+            };
+            if current_value != "keychain" {
+                continue;
+            }
+
+            let old_key = Self::header_keychain_field_name(Some(old_prefix), header_name);
+            let new_key = Self::header_keychain_field_name(Some(new_prefix), header_name);
+            if old_key == new_key {
+                continue;
+            }
+
+            let secret = crate::config::resolve_from_keychain(&old_key)?;
+            let (new_value, _stored, note) =
+                Self::resolve_secret_config_value(&new_key, &secret, true);
+            *header_value = new_value;
+            cleanup_keys.push(old_key);
+            if let Some(note) = note {
+                notes.push(note);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn rekey_provider_table(
+        provider_table: &toml::Table,
+        old_prefix: &str,
+        new_prefix: &str,
+        cleanup_keys: &mut Vec<String>,
+        notes: &mut Vec<String>,
+    ) -> anyhow::Result<toml::Table> {
+        let mut migrated = provider_table.clone();
+
+        Self::migrate_secret_string(
+            &mut migrated,
+            "api_key",
+            &Self::keychain_field_name(Some(old_prefix), "api_key"),
+            &Self::keychain_field_name(Some(new_prefix), "api_key"),
+            cleanup_keys,
+            notes,
+        )?;
+        Self::migrate_secret_string(
+            &mut migrated,
+            "gateway_token",
+            &Self::keychain_field_name(Some(old_prefix), "gateway_token"),
+            &Self::keychain_field_name(Some(new_prefix), "gateway_token"),
+            cleanup_keys,
+            notes,
+        )?;
+        Self::migrate_secret_headers(&mut migrated, old_prefix, new_prefix, cleanup_keys, notes)?;
+
+        if let Some(fallbacks) = Self::normalize_failover_array_mut_if_present(&mut migrated)? {
+            for (idx, value) in fallbacks.iter_mut().enumerate() {
+                let nested = value
+                    .as_table()
+                    .ok_or_else(|| anyhow::anyhow!("fallback provider entry is not a table"))?
+                    .clone();
+                let old_nested_prefix = format!("{}_fallback_{}", old_prefix, idx);
+                let new_nested_prefix = format!("{}_fallback_{}", new_prefix, idx);
+                *value = toml::Value::Table(Self::rekey_provider_table(
+                    &nested,
+                    &old_nested_prefix,
+                    &new_nested_prefix,
+                    cleanup_keys,
+                    notes,
+                )?);
+            }
+        }
+
+        Ok(migrated)
+    }
+
+    async fn list_failover_providers(&self) -> anyhow::Result<String> {
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let doc: toml::Table = content.parse()?;
+        let Some(provider_table) = doc.get("provider").and_then(toml::Value::as_table) else {
+            return Ok("Config has no [provider] section.".to_string());
+        };
+
+        let Some(fallbacks) = Self::get_failover_array(provider_table)? else {
+            return Ok("No failover providers configured.".to_string());
+        };
+        if fallbacks.is_empty() {
+            return Ok("No failover providers configured.".to_string());
+        }
+
+        let mut lines = vec![
+            format!("{} failover provider(s) configured:", fallbacks.len()),
+            String::new(),
+        ];
+        for (idx, value) in fallbacks.iter().enumerate() {
+            let provider_table = value
+                .as_table()
+                .ok_or_else(|| anyhow::anyhow!("fallback provider entry is not a table"))?;
+            lines.push(Self::summarize_provider_table(idx, provider_table));
+        }
+        lines.push(String::new());
+        lines.push(
+            "Use action='add_failover_provider' to append another, or action='remove_failover_provider' with `failover_index` to remove one."
+                .to_string(),
+        );
+        Ok(lines.join("\n"))
+    }
+
+    async fn add_failover_provider(&self, args: &ConfigArgs) -> anyhow::Result<String> {
+        let selection = match Self::resolve_provider_selection(args, "add_failover_provider") {
+            Ok(selection) => selection,
+            Err(message) => return Ok(message),
+        };
+
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let mut doc: toml::Table = content.parse()?;
+        let provider_table = doc
+            .entry("provider")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("`provider` is not a table"))?;
+        let next_index = Self::get_failover_array(provider_table)?
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+
         let approval_description = format!(
-            "Switch provider to {} (kind={}, base_url={}, models={}/{}/{})",
-            preset.display_name,
-            preset.kind,
-            if base_url.is_empty() {
+            "Add failover provider #{}: {} (kind={}, base_url={}, models={}/{}/{})",
+            next_index,
+            selection.preset.display_name,
+            selection.preset.kind,
+            if selection.base_url.is_empty() {
                 "(not used)"
             } else {
-                base_url.as_str()
+                selection.base_url.as_str()
             },
-            primary,
-            fast,
-            smart
+            selection.primary_model,
+            selection.fast_model,
+            selection.smart_model
+        );
+        match self
+            .request_approval(&args._session_id, &approval_description)
+            .await
+        {
+            Ok(ApprovalResponse::AllowOnce)
+            | Ok(ApprovalResponse::AllowSession)
+            | Ok(ApprovalResponse::AllowAlways) => {}
+            Ok(ApprovalResponse::Deny) => {
+                return Ok("Failover provider addition denied by user.".to_string());
+            }
+            Err(e) => {
+                return Ok(format!("Could not get approval: {}", e));
+            }
+        }
+
+        let mut notes = Vec::new();
+        let mut new_provider = toml::Table::new();
+        let key_prefix = Self::fallback_key_prefix(next_index);
+        Self::apply_provider_selection(
+            &mut new_provider,
+            &selection,
+            Some(&key_prefix),
+            args.save_secrets_to_keychain,
+            &mut notes,
+            "Failover",
+        );
+
+        Self::normalize_failover_array_mut(provider_table)?.push(toml::Value::Table(new_provider));
+
+        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
+        if let Err(e) = Self::validate_config(&new_content) {
+            return Ok(format!(
+                "Refused to save failover provider: {}.\n\nThe config was NOT modified.",
+                e
+            ));
+        }
+
+        if let Err(e) = self.create_backup().await {
+            warn!("Failed to create backup: {}", e);
+        }
+
+        tokio::fs::write(&self.config_path, &new_content).await?;
+        set_owner_only_permissions(&self.config_path);
+
+        let mut response = vec![
+            format!(
+                "Added failover provider #{}: {}.",
+                next_index, selection.preset.display_name
+            ),
+            format!("- kind: `{}`", selection.preset.kind),
+            format!(
+                "- base_url: `{}`",
+                if selection.base_url.is_empty() {
+                    "(not set)"
+                } else {
+                    &selection.base_url
+                }
+            ),
+            format!(
+                "- models: `{}` / `{}` / `{}`",
+                selection.primary_model, selection.fast_model, selection.smart_model
+            ),
+        ];
+        if !notes.is_empty() {
+            response.push(String::new());
+            response.push("Notes:".to_string());
+            for note in notes {
+                response.push(format!("- {}", note));
+            }
+        }
+        response.push(String::new());
+        response.push("Config validated and saved. Run `/reload` to apply.".to_string());
+
+        Ok(response.join("\n"))
+    }
+
+    async fn remove_failover_provider(&self, args: &ConfigArgs) -> anyhow::Result<String> {
+        let Some(index) = args.failover_index else {
+            return Ok(
+                "Error: 'failover_index' is required for action='remove_failover_provider'."
+                    .to_string(),
+            );
+        };
+
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let mut doc: toml::Table = content.parse()?;
+        let provider_table = doc
+            .get_mut("provider")
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(|| anyhow::anyhow!("`provider` is not a table"))?;
+        let (current_entries_len, removed_summary, existing_tables) = {
+            let current_entries = match Self::get_failover_array(provider_table)? {
+                Some(entries) => entries,
+                None => return Ok("No failover providers configured.".to_string()),
+            };
+            if current_entries.is_empty() {
+                return Ok("No failover providers configured.".to_string());
+            }
+            if index >= current_entries.len() {
+                return Ok(format!(
+                    "Failover provider index {} is out of range. Current count: {}.",
+                    index,
+                    current_entries.len()
+                ));
+            }
+
+            let removed_summary = current_entries[index]
+                .as_table()
+                .map(|table| Self::summarize_provider_table(index, table))
+                .unwrap_or_else(|| format!("[{}] (invalid provider entry)", index));
+            let existing_tables: Vec<toml::Table> = current_entries
+                .iter()
+                .map(|value| {
+                    value
+                        .as_table()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("fallback provider entry is not a table"))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            (current_entries.len(), removed_summary, existing_tables)
+        };
+        let approval_description = format!("Remove failover provider {}", removed_summary);
+        match self
+            .request_approval(&args._session_id, &approval_description)
+            .await
+        {
+            Ok(ApprovalResponse::AllowOnce)
+            | Ok(ApprovalResponse::AllowSession)
+            | Ok(ApprovalResponse::AllowAlways) => {}
+            Ok(ApprovalResponse::Deny) => {
+                return Ok("Failover provider removal denied by user.".to_string());
+            }
+            Err(e) => {
+                return Ok(format!("Could not get approval: {}", e));
+            }
+        }
+
+        let mut notes = Vec::new();
+        let mut cleanup_keys = Vec::new();
+        let mut remaining_entries = Vec::new();
+        for (old_index, table) in existing_tables.into_iter().enumerate() {
+            if old_index == index {
+                continue;
+            }
+            let new_index = remaining_entries.len();
+            let migrated = if old_index == new_index {
+                table
+            } else {
+                Self::rekey_provider_table(
+                    &table,
+                    &Self::fallback_key_prefix(old_index),
+                    &Self::fallback_key_prefix(new_index),
+                    &mut cleanup_keys,
+                    &mut notes,
+                )?
+            };
+            remaining_entries.push(toml::Value::Table(migrated));
+        }
+
+        if remaining_entries.is_empty() {
+            provider_table.remove("fallbacks");
+            provider_table.remove("failover");
+        } else {
+            *Self::normalize_failover_array_mut(provider_table)? = remaining_entries;
+        }
+
+        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
+        if let Err(e) = Self::validate_config(&new_content) {
+            return Ok(format!(
+                "Refused to remove failover provider: {}.\n\nThe config was NOT modified.",
+                e
+            ));
+        }
+
+        if let Err(e) = self.create_backup().await {
+            warn!("Failed to create backup: {}", e);
+        }
+
+        tokio::fs::write(&self.config_path, &new_content).await?;
+        set_owner_only_permissions(&self.config_path);
+
+        cleanup_keys.sort();
+        cleanup_keys.dedup();
+        for key in cleanup_keys {
+            if let Err(e) = crate::config::delete_from_keychain(&key) {
+                warn!(key = %key, error = %e, "Failed to delete stale failover keychain entry");
+            }
+        }
+
+        let mut response = vec![format!("Removed failover provider #{}.", index)];
+        response.push(format!("- removed: {}", removed_summary));
+        if index < current_entries_len - 1 {
+            response.push("- remaining failover secret references were reindexed.".to_string());
+        }
+        if !notes.is_empty() {
+            response.push(String::new());
+            response.push("Notes:".to_string());
+            for note in notes {
+                response.push(format!("- {}", note));
+            }
+        }
+        response.push(String::new());
+        response.push("Config validated and saved. Run `/reload` to apply.".to_string());
+
+        Ok(response.join("\n"))
+    }
+
+    async fn switch_provider(&self, args: &ConfigArgs) -> anyhow::Result<String> {
+        let selection = match Self::resolve_provider_selection(args, "switch_provider") {
+            Ok(selection) => selection,
+            Err(message) => return Ok(message),
+        };
+
+        let approval_description = format!(
+            "Switch provider to {} (kind={}, base_url={}, models={}/{}/{})",
+            selection.preset.display_name,
+            selection.preset.kind,
+            if selection.base_url.is_empty() {
+                "(not used)"
+            } else {
+                selection.base_url.as_str()
+            },
+            selection.primary_model,
+            selection.fast_model,
+            selection.smart_model
         );
         match self
             .request_approval(&args._session_id, &approval_description)
@@ -535,77 +1274,19 @@ impl ConfigManagerTool {
         let mut doc: toml::Table = content.parse()?;
 
         let mut notes: Vec<String> = Vec::new();
-
-        let provider_api_key_value = if preset.needs_api_key {
-            let (value, stored, note) = Self::resolve_secret_config_value(
-                "api_key",
-                api_key,
-                args.save_secrets_to_keychain,
-            );
-            if stored {
-                notes.push("API key stored in OS keychain.".to_string());
-            }
-            if let Some(n) = note {
-                notes.push(n);
-            }
-            value
-        } else {
-            toml::Value::String(if api_key.is_empty() {
-                "ollama".to_string()
-            } else {
-                api_key.to_string()
-            })
-        };
-
-        set_toml_value(
-            &mut doc,
-            "provider.kind",
-            toml::Value::String(preset.kind.to_string()),
-        )?;
-        set_toml_value(&mut doc, "provider.api_key", provider_api_key_value)?;
-
-        if base_url.trim().is_empty() {
-            remove_toml_value(&mut doc, "provider.base_url")?;
-        } else {
-            set_toml_value(
-                &mut doc,
-                "provider.base_url",
-                toml::Value::String(base_url.clone()),
-            )?;
-        }
-
-        set_toml_value(
-            &mut doc,
-            "provider.models.primary",
-            toml::Value::String(primary.clone()),
-        )?;
-        set_toml_value(
-            &mut doc,
-            "provider.models.fast",
-            toml::Value::String(fast.clone()),
-        )?;
-        set_toml_value(
-            &mut doc,
-            "provider.models.smart",
-            toml::Value::String(smart.clone()),
-        )?;
-
-        if let Some(token) = gateway_token.as_deref() {
-            let (token_value, stored, note) = Self::resolve_secret_config_value(
-                "gateway_token",
-                token,
-                args.save_secrets_to_keychain,
-            );
-            if stored {
-                notes.push("Gateway token stored in OS keychain.".to_string());
-            }
-            if let Some(n) = note {
-                notes.push(n);
-            }
-            set_toml_value(&mut doc, "provider.gateway_token", token_value)?;
-        } else {
-            remove_toml_value(&mut doc, "provider.gateway_token")?;
-        }
+        let provider_table = doc
+            .entry("provider")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("`provider` is not a table"))?;
+        Self::apply_provider_selection(
+            provider_table,
+            &selection,
+            None,
+            args.save_secrets_to_keychain,
+            &mut notes,
+            "",
+        );
 
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
 
@@ -624,17 +1305,20 @@ impl ConfigManagerTool {
         set_owner_only_permissions(&self.config_path);
 
         let mut response = vec![
-            format!("Switched provider to {}.", preset.display_name),
-            format!("- kind: `{}`", preset.kind),
+            format!("Switched provider to {}.", selection.preset.display_name),
+            format!("- kind: `{}`", selection.preset.kind),
             format!(
                 "- base_url: `{}`",
-                if base_url.is_empty() {
+                if selection.base_url.is_empty() {
                     "(not set)"
                 } else {
-                    &base_url
+                    &selection.base_url
                 }
             ),
-            format!("- models: `{}` / `{}` / `{}`", primary, fast, smart),
+            format!(
+                "- models: `{}` / `{}` / `{}`",
+                selection.primary_model, selection.fast_model, selection.smart_model
+            ),
         ];
         if !notes.is_empty() {
             response.push(String::new());
@@ -671,6 +1355,8 @@ struct ConfigArgs {
     fast_model: String,
     #[serde(default)]
     smart_model: String,
+    #[serde(default)]
+    failover_index: Option<usize>,
     #[serde(default = "default_true")]
     save_secrets_to_keychain: bool,
     /// Session ID for routing approval requests (injected by agent).
@@ -689,20 +1375,20 @@ impl Tool for ConfigManagerTool {
     }
 
     fn description(&self) -> &str {
-        "Read or update aidaemon's own config.toml, including guided provider switching. Automatically backs up before changes and validates before saving."
+        "Read or update aidaemon's own config.toml, including guided primary-provider and failover-provider changes. Automatically backs up before changes and validates before saving."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "manage_config",
-            "description": "Read or update aidaemon's own config.toml. Backs up before writing and validates changes. Use 'restore' to rollback if something goes wrong. Use 'switch_provider' for guided provider changes. After updating, tell the user to run /reload.",
+            "description": "Read or update aidaemon's own config.toml. Backs up before writing and validates changes. Use 'restore' to rollback if something goes wrong. Use 'switch_provider' for the primary provider, or 'list_failover_providers' / 'add_failover_provider' / 'remove_failover_provider' for cross-provider failover setup. After updating, tell the user to run /reload.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["read", "get", "set", "restore", "list_provider_presets", "switch_provider"],
-                        "description": "'read' = full config, 'get' = read key, 'set' = update key (auto-backup + validate), 'restore' = rollback to last backup, 'list_provider_presets' = show guided provider options, 'switch_provider' = guided provider switch with minimal fields"
+                        "enum": ["read", "get", "set", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider"],
+                        "description": "'read' = full config, 'get' = read key, 'set' = update key (auto-backup + validate), 'restore' = rollback to last backup, 'list_provider_presets' = show guided provider options, 'switch_provider' = guided primary-provider switch, 'list_failover_providers' = inspect configured fallback providers, 'add_failover_provider' = append one, 'remove_failover_provider' = delete one by index"
                     },
                     "key": {
                         "type": "string",
@@ -714,31 +1400,35 @@ impl Tool for ConfigManagerTool {
                     },
                     "provider": {
                         "type": "string",
-                        "description": "Provider preset for switch_provider (e.g. openai, xai, moonshot, minimax, cloudflare_gateway, custom_openai_compatible)."
+                        "description": "Provider preset for switch_provider or add_failover_provider (e.g. openai, xai, moonshot, minimax, cloudflare_gateway, custom_openai_compatible)."
                     },
                     "api_key": {
                         "type": "string",
-                        "description": "Provider API key for switch_provider."
+                        "description": "Provider API key for switch_provider or add_failover_provider."
                     },
                     "base_url": {
                         "type": "string",
-                        "description": "Optional override base URL for switch_provider. Required for cloudflare_gateway and custom_openai_compatible."
+                        "description": "Optional override base URL for switch_provider or add_failover_provider. Required for cloudflare_gateway and custom_openai_compatible."
                     },
                     "gateway_token": {
                         "type": "string",
-                        "description": "Optional Cloudflare gateway token for switch_provider."
+                        "description": "Optional Cloudflare gateway token for switch_provider or add_failover_provider."
                     },
                     "primary_model": {
                         "type": "string",
-                        "description": "Optional primary model override for switch_provider."
+                        "description": "Optional default/primary model override for switch_provider or add_failover_provider."
                     },
                     "fast_model": {
                         "type": "string",
-                        "description": "Optional fast model override for switch_provider."
+                        "description": "Optional fast fallback model override for switch_provider or add_failover_provider."
                     },
                     "smart_model": {
                         "type": "string",
-                        "description": "Optional smart model override for switch_provider."
+                        "description": "Optional smart fallback model override for switch_provider or add_failover_provider."
+                    },
+                    "failover_index": {
+                        "type": "integer",
+                        "description": "0-based failover provider index for remove_failover_provider."
                     },
                     "save_secrets_to_keychain": {
                         "type": "boolean",
@@ -767,6 +1457,9 @@ impl Tool for ConfigManagerTool {
         match args.action.as_str() {
             "list_provider_presets" => Ok(Self::list_provider_presets_message()),
             "switch_provider" => self.switch_provider(&args).await,
+            "list_failover_providers" => self.list_failover_providers().await,
+            "add_failover_provider" => self.add_failover_provider(&args).await,
+            "remove_failover_provider" => self.remove_failover_provider(&args).await,
             "read" => {
                 let content = tokio::fs::read_to_string(&self.config_path).await?;
                 let mut doc: toml::Value = content.parse()?;
@@ -869,7 +1562,7 @@ impl Tool for ConfigManagerTool {
                 Err(e) => Ok(format!("Restore failed: {}", e)),
             },
             _ => Ok(format!(
-                "Unknown action: {}. Use 'read', 'get', 'set', 'restore', 'list_provider_presets', or 'switch_provider'.",
+                "Unknown action: {}. Use 'read', 'get', 'set', 'restore', 'list_provider_presets', 'switch_provider', 'list_failover_providers', 'add_failover_provider', or 'remove_failover_provider'.",
                 args.action
             )),
         }
@@ -907,6 +1600,7 @@ fn set_toml_value(table: &mut toml::Table, path: &str, value: toml::Value) -> an
 }
 
 /// Remove a value from a TOML table at a dotted key path. Missing paths are ignored.
+#[cfg(test)]
 fn remove_toml_value(table: &mut toml::Table, path: &str) -> anyhow::Result<()> {
     let parts: Vec<&str> = path.split('.').collect();
     if parts.is_empty() {
@@ -956,8 +1650,10 @@ fn redact_secrets(value: &mut toml::Value) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
+    use tempfile::TempDir;
     use tokio::sync::mpsc;
 
     use super::*;
@@ -975,6 +1671,7 @@ mod tests {
             fast_model: String::new(),
             smart_model: String::new(),
             save_secrets_to_keychain: true,
+            failover_index: None,
             _session_id: "test-session".to_string(),
         }
     }
@@ -982,6 +1679,23 @@ mod tests {
     fn test_tool() -> ConfigManagerTool {
         let (tx, _rx) = mpsc::channel(1);
         ConfigManagerTool::new(PathBuf::from("/tmp/nonexistent-config.toml"), tx)
+    }
+
+    fn write_temp_config(contents: &str) -> (TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, contents).expect("write temp config");
+        (dir, path)
+    }
+
+    fn approving_tool(config_path: PathBuf) -> ConfigManagerTool {
+        let (tx, mut rx) = mpsc::channel::<ApprovalRequest>(4);
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
+            }
+        });
+        ConfigManagerTool::new(config_path, tx)
     }
 
     #[test]
@@ -1011,6 +1725,7 @@ mod tests {
         assert!(msg.contains("cloudflare_gateway"));
         assert!(msg.contains("custom_openai_compatible"));
         assert!(msg.contains("\"action\":\"switch_provider\""));
+        assert!(msg.contains("\"action\":\"add_failover_provider\""));
     }
 
     #[test]
@@ -1072,5 +1787,125 @@ fast = "gpt-4o-mini"
 
         let reply = tool.switch_provider(&args).await.unwrap();
         assert!(reply.contains("requires your real gateway URL"));
+    }
+
+    #[tokio::test]
+    async fn remove_failover_provider_requires_index() {
+        let tool = test_tool();
+        let mut args = test_args();
+        args.action = "remove_failover_provider".to_string();
+        let reply = tool.remove_failover_provider(&args).await.unwrap();
+        assert!(reply.contains("'failover_index' is required"));
+    }
+
+    #[tokio::test]
+    async fn add_failover_provider_appends_config() {
+        let (_dir, path) = write_temp_config(
+            r#"
+[provider]
+kind = "openai_compatible"
+api_key = "primary-key"
+
+[provider.models]
+default = "primary-model"
+"#,
+        );
+        let tool = approving_tool(path.clone());
+        let mut args = test_args();
+        args.action = "add_failover_provider".to_string();
+        args.provider = "anthropic".to_string();
+        args.api_key = "secondary-key".to_string();
+        args.save_secrets_to_keychain = false;
+
+        let reply = tool.add_failover_provider(&args).await.unwrap();
+        assert!(reply.contains("Added failover provider #0"));
+
+        let saved = fs::read_to_string(&path).expect("read saved config");
+        let cfg: AppConfig = toml::from_str(&saved).expect("parse saved config");
+        assert_eq!(cfg.provider.fallbacks.len(), 1);
+        assert_eq!(
+            cfg.provider.fallbacks[0].kind,
+            crate::config::ProviderKind::Anthropic
+        );
+        assert_eq!(cfg.provider.fallbacks[0].api_key, "secondary-key");
+        assert_eq!(
+            cfg.provider.fallbacks[0].models.default_model,
+            "claude-sonnet-4-20250514"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_failover_providers_reads_alias_entries() {
+        let (_dir, path) = write_temp_config(
+            r#"
+[provider]
+kind = "openai_compatible"
+api_key = "primary-key"
+
+[provider.models]
+default = "primary-model"
+
+[[provider.failover]]
+kind = "anthropic"
+api_key = "secondary-key"
+base_url = "https://api.anthropic.com/v1"
+
+[provider.failover.models]
+default = "claude-sonnet-4-20250514"
+fallback = ["claude-haiku-4-20250414"]
+"#,
+        );
+        let tool = approving_tool(path);
+
+        let reply = tool.list_failover_providers().await.unwrap();
+        assert!(reply.contains("1 failover provider(s) configured"));
+        assert!(reply.contains("[0] kind=`anthropic`"));
+        assert!(reply.contains("default=`claude-sonnet-4-20250514`"));
+        assert!(reply.contains("api_key=`inline`"));
+    }
+
+    #[tokio::test]
+    async fn remove_failover_provider_removes_selected_entry() {
+        let (_dir, path) = write_temp_config(
+            r#"
+[provider]
+kind = "openai_compatible"
+api_key = "primary-key"
+
+[provider.models]
+default = "primary-model"
+
+[[provider.fallbacks]]
+kind = "anthropic"
+api_key = "first-key"
+
+[provider.fallbacks.models]
+default = "claude-sonnet-4-20250514"
+
+[[provider.fallbacks]]
+kind = "xai_native"
+api_key = "second-key"
+
+[provider.fallbacks.models]
+default = "grok-4"
+"#,
+        );
+        let tool = approving_tool(path.clone());
+        let mut args = test_args();
+        args.action = "remove_failover_provider".to_string();
+        args.failover_index = Some(0);
+
+        let reply = tool.remove_failover_provider(&args).await.unwrap();
+        assert!(reply.contains("Removed failover provider #0."));
+
+        let saved = fs::read_to_string(&path).expect("read saved config");
+        let cfg: AppConfig = toml::from_str(&saved).expect("parse saved config");
+        assert_eq!(cfg.provider.fallbacks.len(), 1);
+        assert_eq!(
+            cfg.provider.fallbacks[0].kind,
+            crate::config::ProviderKind::XaiNative
+        );
+        assert_eq!(cfg.provider.fallbacks[0].api_key, "second-key");
+        assert_eq!(cfg.provider.fallbacks[0].models.default_model, "grok-4");
     }
 }

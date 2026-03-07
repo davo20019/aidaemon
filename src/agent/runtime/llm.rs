@@ -42,8 +42,9 @@ impl Agent {
         None
     }
 
-    /// Try up to 2 different fallback models after retries are exhausted.
-    /// On success, returns the response for this call only (no persistent model downgrade).
+    /// Try provider-local model fallbacks first, then configured alternate
+    /// providers and their model chains. On success, returns the response for
+    /// this call only (no persistent provider/model downgrade).
     #[allow(clippy::too_many_arguments)]
     async fn cascade_fallback(
         &self,
@@ -56,35 +57,78 @@ impl Agent {
         last_err: &ProviderError,
     ) -> anyhow::Result<crate::traits::ProviderResponse> {
         let mut tried: Vec<String> = vec![failed_model.to_string()];
+        let mut final_err = last_err.clone();
+        let mut attempt = 1;
+        let runtime_snapshot = self.llm_runtime.snapshot();
+        let primary_provider_kind = runtime_snapshot.provider_kind();
+        let failover_targets = runtime_snapshot.failover_targets();
 
-        for attempt in 1..=2 {
+        loop {
             let exclude_refs: Vec<&str> = tried.iter().map(|s| s.as_str()).collect();
             let fallback = match self
                 .pick_fallback_excluding(failed_model, &exclude_refs, router)
                 .await
             {
-                Some(f) => f,
-                None => break, // no more candidates
+                Some(fallback_model) => fallback_model,
+                None => break,
             };
 
             warn!(
-                fallback = %fallback,
+                provider_kind = ?primary_provider_kind,
+                model = %fallback,
                 attempt,
-                "Cascade fallback attempt"
+                "Primary-provider fallback attempt"
             );
 
             match provider
                 .chat_with_options(&fallback, messages, tool_defs, options)
                 .await
             {
-                Ok(resp) => return Ok(resp),
-                Err(_) => {
-                    tried.push(fallback);
+                Ok(resp) => {
+                    self.stamp_lastgood().await;
+                    return Ok(resp);
+                }
+                Err(retry_err) => match retry_err.downcast::<ProviderError>() {
+                    Ok(provider_err) => {
+                        final_err = provider_err;
+                        tried.push(fallback);
+                        attempt += 1;
+                    }
+                    Err(other) => return Err(other),
+                },
+            }
+        }
+
+        for target in failover_targets {
+            for model in target.all_models_ordered() {
+                warn!(
+                    provider_kind = ?target.provider_kind(),
+                    model = %model,
+                    attempt,
+                    "Provider failover attempt"
+                );
+
+                match target
+                    .provider()
+                    .chat_with_options(&model, messages, tool_defs, options)
+                    .await
+                {
+                    Ok(resp) => {
+                        self.stamp_lastgood().await;
+                        return Ok(resp);
+                    }
+                    Err(retry_err) => match retry_err.downcast::<ProviderError>() {
+                        Ok(provider_err) => {
+                            final_err = provider_err;
+                            attempt += 1;
+                        }
+                        Err(other) => return Err(other),
+                    },
                 }
             }
         }
 
-        Err(anyhow::anyhow!("{}", last_err.user_message()))
+        Err(anyhow::anyhow!("{}", final_err.recovery_failed_message()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -132,7 +176,10 @@ impl Agent {
                         record_llm_payload_invalid_metric(provider_label, model, retry_reason);
                         continue;
                     }
-                    return Err(anyhow::anyhow!("{}", retry_provider_err.user_message()));
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        retry_provider_err.recovery_failed_message()
+                    ));
                 }
             }
         }
@@ -147,6 +194,10 @@ impl Agent {
     /// - MalformedResponse(Shape/Unknown) → single retry (no cascade fallback)
     /// - NotFound → cascade fallback immediately
     /// - Auth/Billing → return user-facing error immediately
+    ///
+    /// Cascade fallback now means:
+    /// 1. Other models on the current provider
+    /// 2. Configured failover providers and their model chains
     pub(super) async fn call_llm_with_recovery(
         &self,
         provider: Arc<dyn ModelProvider>,
@@ -373,5 +424,121 @@ impl Agent {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use tokio::sync::Mutex;
+
+    use crate::llm_runtime::ProviderRuntimeTarget;
+    use crate::providers::ProviderError;
+    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::traits::{ChatOptions, ModelProvider, ProviderResponse};
+
+    struct ScriptedProvider {
+        responses: Mutex<Vec<anyhow::Result<ProviderResponse>>>,
+        models_called: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedProvider {
+        fn with_results(responses: Vec<anyhow::Result<ProviderResponse>>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+                models_called: Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn models_called(&self) -> Vec<String> {
+            self.models_called.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ScriptedProvider {
+        async fn chat(
+            &self,
+            model: &str,
+            messages: &[Value],
+            tools: &[Value],
+        ) -> anyhow::Result<ProviderResponse> {
+            self.chat_with_options(model, messages, tools, &ChatOptions::default())
+                .await
+        }
+
+        async fn chat_with_options(
+            &self,
+            model: &str,
+            _messages: &[Value],
+            _tools: &[Value],
+            _options: &ChatOptions,
+        ) -> anyhow::Result<ProviderResponse> {
+            self.models_called.lock().await.push(model.to_string());
+            let mut responses = self.responses.lock().await;
+            if responses.is_empty() {
+                return Err(ProviderError::from_status(500, "script exhausted").into());
+            }
+            responses.remove(0)
+        }
+
+        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+            Ok(vec!["scripted-model".to_string()])
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_can_failover_to_another_provider() {
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+
+        let primary_provider = Arc::new(ScriptedProvider::with_results(vec![
+            Err(ProviderError::from_status(500, "primary-1").into()),
+            Err(ProviderError::from_status(500, "primary-2").into()),
+            Err(ProviderError::from_status(500, "primary-3").into()),
+            Err(ProviderError::from_status(500, "primary-4").into()),
+        ]));
+        let alternate_provider = Arc::new(ScriptedProvider::with_results(vec![Ok(
+            MockProvider::text_response("Recovered via failover provider"),
+        )]));
+
+        harness.agent.llm_runtime.swap(
+            primary_provider.clone() as Arc<dyn ModelProvider>,
+            None,
+            crate::config::ProviderKind::OpenaiCompatible,
+            "primary-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                alternate_provider.clone() as Arc<dyn ModelProvider>,
+                None,
+                crate::config::ProviderKind::Anthropic,
+                "secondary-model".to_string(),
+            )],
+        );
+
+        let resp = harness
+            .agent
+            .call_llm_with_recovery(
+                primary_provider as Arc<dyn ModelProvider>,
+                None,
+                "primary-model",
+                &[],
+                &[],
+                &ChatOptions::default(),
+            )
+            .await
+            .expect("recover via alternate provider");
+
+        assert_eq!(
+            resp.content.as_deref(),
+            Some("Recovered via failover provider")
+        );
+        assert_eq!(
+            alternate_provider.models_called().await,
+            vec!["secondary-model".to_string()]
+        );
     }
 }

@@ -9,6 +9,18 @@ pub struct GoalTokenBudgetStatus {
     pub tokens_used_today: i64,
 }
 
+/// Persisted runtime state for an active scheduled run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledRunState {
+    pub goal_id: String,
+    pub root_task_id: String,
+    pub effective_budget_per_check: i64,
+    pub tokens_used: i64,
+    pub budget_extensions_count: usize,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 // ==================== Goals + Tasks Data Model ====================
 
 /// A goal — a tracked, potentially long-running objective.
@@ -171,8 +183,8 @@ impl Goal {
             context: None,
             resources: None,
             // Apply defaults if caller omitted budgets.
-            budget_per_check: budget_per_check.or(Some(50_000)),
-            budget_daily: budget_daily.or(Some(200_000)),
+            budget_per_check: budget_per_check.or(Some(100_000)),
+            budget_daily: budget_daily.or(Some(500_000)),
             tokens_used_today: 0,
             tokens_used_day: day,
             last_useful_action: None,

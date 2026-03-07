@@ -497,7 +497,7 @@ impl Agent {
                     tool_calls_json: None,
                     created_at: Utc::now(),
                     importance: 0.5,
-                    embedding: None,
+                    ..Message::runtime_defaults()
                 };
                 self.append_assistant_message_with_event(
                     emitter,
@@ -542,7 +542,7 @@ impl Agent {
                     tool_calls_json: None,
                     created_at: Utc::now(),
                     importance: 0.5,
-                    embedding: None,
+                    ..Message::runtime_defaults()
                 };
                 self.append_assistant_message_with_event(
                     emitter,

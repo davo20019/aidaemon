@@ -818,6 +818,27 @@ pub trait GoalStore: Send + Sync {
         Ok(None)
     }
 
+    /// Persist runtime state for an active scheduled run.
+    async fn upsert_scheduled_run_state(
+        &self,
+        _state: &super::ScheduledRunState,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Load persisted runtime state for an active scheduled run.
+    async fn get_scheduled_run_state(
+        &self,
+        _goal_id: &str,
+    ) -> anyhow::Result<Option<super::ScheduledRunState>> {
+        Ok(None)
+    }
+
+    /// Delete persisted runtime state for an active scheduled run.
+    async fn delete_scheduled_run_state(&self, _goal_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Get pending tasks ordered by priority, filtering out those with unmet dependencies.
     async fn get_pending_tasks_by_priority(&self, _limit: i64) -> anyhow::Result<Vec<super::Task>> {
         Ok(vec![])

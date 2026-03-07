@@ -141,8 +141,12 @@ impl Agent {
 
         if let Some(injected_dir) = ctx.injected_project_dir {
             result_text = format!(
-                "{}\n\n[SYSTEM] Path was auto-injected from known project context: {}",
-                result_text, injected_dir
+                "{}\n\n{}",
+                result_text,
+                ToolResultNotice::PathAutoInjectedFromProjectContext {
+                    injected_dir: injected_dir.to_string(),
+                }
+                .render()
             );
         }
 
@@ -244,8 +248,12 @@ impl Agent {
                     "read_file probe failed, but direct file read succeeded"
                 };
                 Some(format!(
-                    "{}\n\n[SYSTEM] Internal edit_file recovery succeeded: {}. Retried once with exact on-disk text matched via whitespace-tolerant mapping.",
-                    retry_output, read_note
+                    "{}\n\n{}",
+                    retry_output,
+                    ToolResultNotice::InternalEditFileRecoverySucceeded {
+                        read_note: read_note.to_string(),
+                    }
+                    .render()
                 ))
             }
             Err(e) => {

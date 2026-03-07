@@ -25,7 +25,7 @@ fn test_scoring_heuristic() {
         tool_calls_json: None,
         created_at: Utc::now(),
         importance: 0.0,
-        embedding: None,
+        ..Message::runtime_defaults()
     };
 
     // Short message "hello" gets penalty (-0.2)

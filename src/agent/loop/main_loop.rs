@@ -207,19 +207,15 @@ impl Agent {
         let mut budget_warning_sent = false;
         let mut effective_task_budget = self.task_token_budget;
         let mut effective_daily_budget = self.daily_token_budget;
-        // Runtime-only override for goal daily budget extensions.
-        // We intentionally do NOT persist auto-extensions to DB to avoid ratcheting.
-        let mut effective_goal_daily_budget: Option<i64> = None;
         let mut budget_extensions_count: usize = 0;
         const MAX_BUDGET_EXTENSIONS: usize = 3;
         const HARD_TOKEN_CAP: i64 = 2_000_000;
-        let mut pending_system_messages: Vec<String> = Vec::new();
+        const SCHEDULED_MAX_BUDGET_EXTENSIONS: usize = 12;
+        const SCHEDULED_HARD_TOKEN_CAP: i64 = 20_000_000;
+        let mut pending_system_messages: Vec<SystemDirective> = Vec::new();
         if route_failsafe_active {
             consultant_pass_active = false;
-            pending_system_messages.push(
-                "[SYSTEM] Route fail-safe is active for this session. Use explicit tools/results, avoid direct-return shortcuts, and prioritize concrete execution evidence."
-                    .to_string(),
-            );
+            pending_system_messages.push(SystemDirective::RouteFailsafeActive);
         }
         // Track recent tool names for alternating pattern detection (A-B-A-B cycles)
         let mut recent_tool_names: VecDeque<String> = VecDeque::new();
@@ -247,10 +243,12 @@ impl Agent {
         // Track identity-attack prefill so we can prepend it to the final reply.
         let mut identity_prefill_text: Option<String> = None;
         // Best-effort project directory hint (seeded from user text, refined by tool calls).
-        let mut known_project_dir = turn_context
-            .primary_project_scope
-            .clone()
-            .or_else(|| super::tool_execution_phase::extract_project_dir_hint(user_text));
+        let mut known_project_dir = turn_context.primary_project_scope.clone().or_else(|| {
+            super::tool_execution_phase::extract_project_dir_hint_with_aliases(
+                user_text,
+                &self.path_aliases.projects,
+            )
+        });
         // Cross-iteration directory evidence tracking for contradiction detection.
         let mut dirs_with_project_inspect_file_evidence: HashSet<String> = HashSet::new();
         let mut dirs_with_search_no_matches: HashSet<String> = HashSet::new();
@@ -261,7 +259,7 @@ impl Agent {
         let mut needs_tools_for_turn = route_failsafe_active;
 
         // Determine iteration limit behavior
-        let (hard_cap, soft_threshold, soft_warn_at) = match &self.iteration_config {
+        let (mut hard_cap, mut soft_threshold, mut soft_warn_at) = match &self.iteration_config {
             IterationLimitConfig::Unlimited => (Some(HARD_ITERATION_CAP), None, None),
             IterationLimitConfig::Soft { threshold, warn_at } => {
                 (Some(HARD_ITERATION_CAP), Some(*threshold), Some(*warn_at))
@@ -294,6 +292,151 @@ impl Agent {
                     None
                 }
             }
+        } else {
+            None
+        };
+        let is_scheduled_goal = if let Some(goal_id) = resolved_goal_id.as_deref() {
+            goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await
+        } else {
+            false
+        };
+        let is_root_scheduled_run = if self.task_id.is_none() {
+            is_scheduled_goal
+        } else {
+            task_has_scheduled_provenance(&self.state, self.task_id.as_deref()).await
+        };
+        let scheduled_goal_budget_per_check = if let Some(goal_id) = resolved_goal_id.as_deref() {
+            self.state
+                .get_goal(goal_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|g| g.budget_per_check)
+        } else {
+            None
+        };
+        let active_scheduled_root_task_id = if let Some(goal_id) = resolved_goal_id.as_deref() {
+            if is_scheduled_goal {
+                active_scheduled_root_task_id(&self.state, goal_id).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if is_scheduled_goal {
+            hard_cap = None;
+            soft_threshold = None;
+            soft_warn_at = None;
+            if let Some(registry) = self.goal_token_registry.as_ref() {
+                if let Some(goal_id) = resolved_goal_id.as_deref() {
+                    if is_root_scheduled_run {
+                        let persisted_state = self
+                            .state
+                            .get_scheduled_run_state(goal_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        let restored = if let Some(state) = persisted_state.as_ref() {
+                            if Some(state.root_task_id.as_str())
+                                == active_scheduled_root_task_id.as_deref()
+                            {
+                                registry
+                                    .restore_run_budget(
+                                        goal_id,
+                                        state.effective_budget_per_check,
+                                        state.tokens_used,
+                                        state.budget_extensions_count,
+                                    )
+                                    .await
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if restored.is_none() {
+                            registry
+                                .start_run_budget(goal_id, scheduled_goal_budget_per_check)
+                                .await;
+                            if let Some(status) = registry.get_run_budget(goal_id).await {
+                                persist_scheduled_run_state(
+                                    &self.state,
+                                    goal_id,
+                                    active_scheduled_root_task_id.as_deref(),
+                                    &status,
+                                )
+                                .await;
+                            } else {
+                                clear_scheduled_run_state(&self.state, goal_id).await;
+                            }
+                        }
+                    } else if registry.get_run_budget(goal_id).await.is_none() {
+                        if let Some(state) = self
+                            .state
+                            .get_scheduled_run_state(goal_id)
+                            .await
+                            .ok()
+                            .flatten()
+                        {
+                            let _ = registry
+                                .restore_run_budget(
+                                    goal_id,
+                                    state.effective_budget_per_check,
+                                    state.tokens_used,
+                                    state.budget_extensions_count,
+                                )
+                                .await;
+                        } else {
+                            registry
+                                .start_run_budget(goal_id, scheduled_goal_budget_per_check)
+                                .await;
+                            if let Some(status) = registry.get_run_budget(goal_id).await {
+                                persist_scheduled_run_state(
+                                    &self.state,
+                                    goal_id,
+                                    active_scheduled_root_task_id.as_deref(),
+                                    &status,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(per_check_budget) =
+                scheduled_goal_budget_per_check.and_then(|v| u64::try_from(v).ok())
+            {
+                effective_task_budget = Some(
+                    effective_task_budget
+                        .map(|budget| budget.max(per_check_budget))
+                        .unwrap_or(per_check_budget),
+                );
+            }
+        }
+        let effective_task_timeout = if is_scheduled_goal {
+            None
+        } else {
+            self.task_timeout
+        };
+        let max_budget_extensions = if is_scheduled_goal {
+            SCHEDULED_MAX_BUDGET_EXTENSIONS
+        } else {
+            MAX_BUDGET_EXTENSIONS
+        };
+        let hard_token_cap = if is_scheduled_goal {
+            SCHEDULED_HARD_TOKEN_CAP
+        } else {
+            HARD_TOKEN_CAP
+        };
+        // Runtime-only override for goal daily budget extensions.
+        // Shared via GoalTokenRegistry so task-leads/executors for the same goal
+        // can inherit the same temporary budget without persisting it to SQLite.
+        let mut effective_goal_daily_budget: Option<i64> = if let (Some(goal_id), Some(registry)) = (
+            resolved_goal_id.as_deref(),
+            self.goal_token_registry.as_ref(),
+        ) {
+            registry.get_effective_daily_budget(goal_id).await
         } else {
             None
         };
@@ -343,7 +486,7 @@ impl Agent {
                         tool_calls_json: None,
                         created_at: Utc::now(),
                         importance: 0.3,
-                        embedding: None,
+                        ..Message::runtime_defaults()
                     };
                     let _ = self
                         .append_assistant_message_with_event(
@@ -407,6 +550,7 @@ impl Agent {
                     task_start,
                     learning_ctx: &mut learning_ctx,
                     hard_cap,
+                    effective_task_timeout,
                     task_tokens_used,
                     effective_task_budget: &mut effective_task_budget,
                     budget_warning_sent: &mut budget_warning_sent,
@@ -422,6 +566,7 @@ impl Agent {
                     pending_background_ack: &mut pending_background_ack,
                     status_tx: &status_tx,
                     resolved_goal_id: &resolved_goal_id,
+                    is_scheduled_goal,
                     effective_daily_budget: &mut effective_daily_budget,
                     effective_goal_daily_budget: &mut effective_goal_daily_budget,
                     successful_send_file_keys: &successful_send_file_keys,
@@ -438,8 +583,8 @@ impl Agent {
                     llm_router: &llm_router,
                     last_escalation_iteration: &mut last_escalation_iteration,
                     consecutive_clean_iterations: &mut consecutive_clean_iterations,
-                    max_budget_extensions: MAX_BUDGET_EXTENSIONS,
-                    hard_token_cap: HARD_TOKEN_CAP,
+                    max_budget_extensions,
+                    hard_token_cap,
                 })
                 .await?;
             match stopping_outcome {
@@ -531,6 +676,7 @@ impl Agent {
                     tool_defs: &tool_defs,
                     status_tx: &status_tx,
                     resolved_goal_id: &resolved_goal_id,
+                    is_scheduled_goal,
                     effective_goal_daily_budget: &mut effective_goal_daily_budget,
                     budget_extensions_count: &mut budget_extensions_count,
                     evidence_gain_count,
@@ -543,8 +689,8 @@ impl Agent {
                     empty_response_retry_note: &mut empty_response_retry_note,
                     identity_prefill_text: &mut identity_prefill_text,
                     deferred_no_tool_streak,
-                    max_budget_extensions: MAX_BUDGET_EXTENSIONS,
-                    hard_token_cap: HARD_TOKEN_CAP,
+                    max_budget_extensions,
+                    hard_token_cap,
                 })
                 .await?
             {

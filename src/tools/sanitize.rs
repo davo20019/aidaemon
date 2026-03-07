@@ -192,11 +192,21 @@ pub fn sanitize_external_content(content: &str) -> String {
 }
 
 /// Strip a narrow set of agent-internal control markers from terminal output
-/// while preserving the rest of the text.
+/// while preserving the rest of the text. Content inside fenced code blocks
+/// is preserved verbatim.
 pub fn strip_internal_control_markers(content: &str) -> String {
-    let mut result = INVISIBLE_CHARS.replace_all(content, "").to_string();
-    for marker in INTERNAL_CONTROL_MARKERS.iter() {
-        result = marker.replace_all(&result, "").to_string();
+    let segments = split_preserving_code_blocks(content);
+    let mut result = String::with_capacity(content.len());
+    for (text, is_code) in &segments {
+        if *is_code {
+            result.push_str(text);
+        } else {
+            let mut cleaned = INVISIBLE_CHARS.replace_all(text, "").to_string();
+            for marker in INTERNAL_CONTROL_MARKERS.iter() {
+                cleaned = marker.replace_all(&cleaned, "").to_string();
+            }
+            result.push_str(&cleaned);
+        }
     }
     result
 }
@@ -209,21 +219,57 @@ pub fn strip_internal_control_markers(content: &str) -> String {
 /// Only call this on **final user-facing replies** — not on internal tool
 /// results or agent-to-agent messages where the LLM needs the diagnostics.
 pub fn strip_diagnostic_blocks(content: &str) -> String {
-    let mut result = content.to_string();
-    for pattern in DIAGNOSTIC_BLOCK_PATTERNS.iter() {
-        result = pattern.replace_all(&result, "").to_string();
+    // Split into code-block vs non-code-block segments so we only strip
+    // diagnostic markers from prose, preserving literal content in code fences.
+    let segments = split_preserving_code_blocks(content);
+    let mut result = String::with_capacity(content.len());
+    for (text, is_code) in &segments {
+        if *is_code {
+            result.push_str(text);
+        } else {
+            let mut cleaned = text.to_string();
+            for pattern in DIAGNOSTIC_BLOCK_PATTERNS.iter() {
+                cleaned = pattern.replace_all(&cleaned, "").to_string();
+            }
+            static INLINE_XML_TOOL_TAGS: Lazy<Regex> =
+                Lazy::new(|| Regex::new(r"</?(?:tool_call|arg_(?:key|value))>").unwrap());
+            cleaned = INLINE_XML_TOOL_TAGS.replace_all(&cleaned, "").to_string();
+            result.push_str(&cleaned);
+        }
     }
-    // Safety-net: strip any remaining bare XML-style tool/arg tags that survived
-    // the line-anchored block patterns above. These tags can appear mid-line
-    // (e.g. "import task</arg_value>") when the LLM embeds partial tool markup
-    // inside otherwise normal text during force-text mode.
-    static INLINE_XML_TOOL_TAGS: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"</?(?:tool_call|arg_(?:key|value))>").unwrap());
-    result = INLINE_XML_TOOL_TAGS.replace_all(&result, "").to_string();
     // Collapse runs of 3+ newlines left by removed blocks into double newlines.
     static EXCESS_NEWLINES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
     result = EXCESS_NEWLINES.replace_all(&result, "\n\n").to_string();
     result.trim().to_string()
+}
+
+/// Split text into segments of (text, is_code_block).
+/// Fenced code blocks (``` delimited) are preserved as-is.
+fn split_preserving_code_blocks(content: &str) -> Vec<(String, bool)> {
+    let mut segments = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("```") {
+        // Everything before the fence is prose
+        if start > 0 {
+            segments.push((rest[..start].to_string(), false));
+        }
+        // Find the closing fence
+        let after_open = &rest[start + 3..];
+        if let Some(end) = after_open.find("```") {
+            // Include both fences and everything between
+            let block_end = start + 3 + end + 3;
+            segments.push((rest[start..block_end].to_string(), true));
+            rest = &rest[block_end..];
+        } else {
+            // Unclosed code block — treat the rest as code to be safe
+            segments.push((rest[start..].to_string(), true));
+            rest = "";
+        }
+    }
+    if !rest.is_empty() {
+        segments.push((rest.to_string(), false));
+    }
+    segments
 }
 
 /// Sanitize output for public channels by redacting secret patterns.
@@ -869,6 +915,52 @@ mod tests {
         assert!(
             result2.contains("Let me fix this."),
             "surrounding text preserved"
+        );
+    }
+
+    #[test]
+    fn test_strip_diagnostic_blocks_preserves_code_blocks() {
+        // Literal marker content inside code blocks should NOT be stripped
+        let input = "Here is the file content:\n\n```\nHere are some sample log lines:\n[SYSTEM] This is a normal log entry\n[DIAGNOSTIC] CPU usage at 45%\n[TOOL STATS] Execution took 2.3s\nNormal text continues here.\n```\n\nThat's the file.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(
+            result.contains("[SYSTEM] This is a normal log entry"),
+            "SYSTEM inside code block should be preserved: {result}"
+        );
+        assert!(
+            result.contains("[DIAGNOSTIC] CPU usage at 45%"),
+            "DIAGNOSTIC inside code block should be preserved: {result}"
+        );
+        assert!(
+            result.contains("[TOOL STATS] Execution took 2.3s"),
+            "TOOL STATS inside code block should be preserved: {result}"
+        );
+        assert!(
+            result.contains("Here is the file content:"),
+            "surrounding text preserved"
+        );
+        assert!(
+            result.contains("That's the file."),
+            "trailing text preserved"
+        );
+    }
+
+    #[test]
+    fn test_strip_diagnostic_blocks_strips_outside_code_blocks() {
+        // Real diagnostic markers outside code blocks should still be stripped
+        let input = "Result:\n\n```\n[SYSTEM] preserved inside code\n```\n\n[SYSTEM] This should be stripped\n[DIAGNOSTIC] This too";
+        let result = strip_diagnostic_blocks(input);
+        assert!(
+            result.contains("[SYSTEM] preserved inside code"),
+            "inside code block preserved: {result}"
+        );
+        assert!(
+            !result.contains("This should be stripped"),
+            "outside code block stripped: {result}"
+        );
+        assert!(
+            !result.contains("This too"),
+            "outside code block stripped: {result}"
         );
     }
 

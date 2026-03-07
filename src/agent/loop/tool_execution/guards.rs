@@ -70,47 +70,32 @@ impl Agent {
                 // For read-only tools, replay cached content so the model can
                 // act on it despite context truncation dropping earlier results.
                 if let Some(cached) = tool_result_cache.get(&call_hash) {
-                    format!(
-                        "[SYSTEM] You already read this content {} times. Here it is again — \
-                         do NOT read it again. Use `write_file` to apply your fixes NOW.\n\n\
-                         --- CACHED CONTENT ---\n{}\n--- END CACHED CONTENT ---\n\n\
-                         IMPORTANT: You have the file content above. Analyze the bugs and \
-                         write the corrected version using `write_file`. Do not call `{}` again.",
-                        repetitive_count, cached, tc.name
-                    )
+                    ToolResultNotice::RepeatedReadCached {
+                        repetitive_count,
+                        cached_content: cached.clone(),
+                        tool_name: tc.name.clone(),
+                    }
+                    .render()
                 } else {
-                    format!(
-                        "[SYSTEM] BLOCKED: You already called `{}` with these exact same arguments {} times. \
-                         The file content should be in your conversation history. \
-                         Use `write_file` to apply your fixes based on what you already know.\n\n\
-                         You MUST use `write_file` now — do not try to read the file again.",
-                        tc.name, repetitive_count
-                    )
+                    ToolResultNotice::RepeatedReadBlocked {
+                        tool_name: tc.name.clone(),
+                        repetitive_count,
+                    }
+                    .render()
                 }
             } else {
                 // Check if the agent has been editing files — if so, guide toward
                 // edit_file rather than generic "change approach" advice.
                 let has_edited = recent_tool_names.iter().any(|n| n == "edit_file");
                 if has_edited && tc.name == "terminal" {
-                    format!(
-                        "[SYSTEM] BLOCKED: You already ran this exact terminal command {} times. \
-                         Re-running tests will NOT fix bugs — you must edit the code first.\n\n\
-                         NEXT STEP: Use `edit_file` to fix the next bug, THEN run tests once to verify.\n\
-                         Look at the test failure output you already have and identify which file and line needs fixing.",
-                        repetitive_count
-                    )
+                    ToolResultNotice::RepeatedTerminalBlockedAfterEdits { repetitive_count }
+                        .render()
                 } else {
-                    format!(
-                        "[SYSTEM] BLOCKED: You already called `{}` with these exact same arguments {} times \
-                                 and got the same result. Repeating it will NOT produce a different outcome.\n\n\
-                                 You MUST change your approach. Options:\n\
-                                 - Use DIFFERENT arguments or a different command\n\
-                                 - If you're missing information (URL, credentials, deployment method), \
-                                 ASK the user instead of guessing\n\
-                                 - If this sub-task is blocked, skip it and tell the user what you \
-                                 accomplished and what still needs their input",
-                        tc.name, repetitive_count
-                    )
+                    ToolResultNotice::RepetitiveToolBlocked {
+                        tool_name: tc.name.clone(),
+                        repetitive_count,
+                    }
+                    .render()
                 }
             };
             let tool_msg = Message {
@@ -123,7 +108,7 @@ impl Agent {
                 tool_calls_json: None,
                 created_at: Utc::now(),
                 importance: 0.3,
-                embedding: None,
+                ..Message::runtime_defaults()
             };
             self.append_tool_message_with_result_event(
                 emitter,

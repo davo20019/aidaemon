@@ -305,18 +305,58 @@ pub(super) fn graceful_budget_response(
     summary
 }
 
+/// Graceful response when a scheduled run hits its per-run budget.
+pub(super) fn graceful_scheduled_run_budget_response(
+    learning_ctx: &LearningContext,
+    tokens_used: i64,
+    budget_per_check: i64,
+) -> String {
+    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let mut summary = format!(
+        "This scheduled run hit its per-run processing budget (used {} / {} tokens). \
+            Here's what I accomplished so far:\n\n{}\
+            The run stopped because it no longer looked productive enough to keep extending automatically. \
+            If this task legitimately needs more room, raise `budget_per_check`.",
+        tokens_used, budget_per_check, activity,
+    );
+    if summary.len() > 1500 {
+        let mut t = 1500;
+        while t > 0 && !summary.is_char_boundary(t) {
+            t -= 1;
+        }
+        summary.truncate(t);
+        summary.push('…');
+    }
+    summary
+}
+
 /// Graceful response when a goal hits its daily token budget.
 pub(super) fn graceful_goal_daily_budget_response(
     learning_ctx: &LearningContext,
-    _tokens_used_today: i64,
-    _budget_daily: i64,
+    tokens_used_today: i64,
+    budget_daily: i64,
+    is_scheduled_goal: bool,
 ) -> String {
     let tool_count = learning_ctx.tool_calls.len();
     let error_count = learning_ctx.errors.len();
-    let mut msg = String::from("I've reached my processing limit for this task today. ");
+    let next_reset = Utc::now()
+        .date_naive()
+        .succ_opt()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.format("%B %-d, %Y 00:00 UTC").to_string())
+        .unwrap_or_else(|| "the next UTC day boundary".to_string());
+    let scope = if is_scheduled_goal {
+        "This scheduled goal hit its daily processing budget"
+    } else {
+        "This goal hit its daily processing budget"
+    };
+    let mut msg = format!(
+        "{} (used {} / {} tokens). The budget resets at {}. ",
+        scope, tokens_used_today, budget_daily, next_reset
+    );
     if tool_count > 0 || error_count > 0 {
         msg.push_str(&format!(
-            "Here's what I accomplished: {} steps completed",
+            "Here's what I accomplished so far: {} steps completed",
             tool_count
         ));
         if error_count > 0 {
@@ -324,7 +364,13 @@ pub(super) fn graceful_goal_daily_budget_response(
         }
         msg.push_str(".\n\n");
     }
-    msg.push_str("You can ask me to continue this later, or I'll pick it up when my limit resets.");
+    if is_scheduled_goal {
+        msg.push_str(
+            "To prevent this, raise the scheduled goal's `budget_daily` or reduce how often it runs.",
+        );
+    } else {
+        msg.push_str("You can ask me to continue this later, or increase the goal's daily budget.");
+    }
     msg
 }
 
@@ -782,6 +828,31 @@ mod tests {
         };
         let result = graceful_budget_response(&ctx, 500_000);
         assert!(result.len() <= 1502); // 1500 + "…"
+    }
+
+    #[test]
+    fn test_graceful_goal_daily_budget_response_mentions_budget_and_reset() {
+        let ctx = LearningContext {
+            user_text: "run the scheduled build".to_string(),
+            intent_domains: vec![],
+            tool_calls: vec![
+                "system_info({})".to_string(),
+                "write_file(index.html)".to_string(),
+            ],
+            errors: vec![("temporary issue".to_string(), false)],
+            first_error: None,
+            recovery_actions: vec![],
+            start_time: Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+        };
+
+        let result = graceful_goal_daily_budget_response(&ctx, 60, 60, true);
+        assert!(result.contains("scheduled goal hit its daily processing budget"));
+        assert!(result.contains("used 60 / 60 tokens"));
+        assert!(result.contains("00:00 UTC"));
+        assert!(result.contains("budget_daily"));
     }
 
     #[test]

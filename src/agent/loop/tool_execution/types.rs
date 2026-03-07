@@ -59,7 +59,7 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub consecutive_same_tool: &'a mut (String, usize),
     pub consecutive_same_tool_arg_hashes: &'a mut HashSet<u64>,
     pub force_text_response: &'a mut bool,
-    pub pending_system_messages: &'a mut Vec<String>,
+    pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub recent_tool_names: &'a mut VecDeque<String>,
     pub successful_send_file_keys: &'a mut HashSet<String>,
     pub cli_agent_boundary_injected: &'a mut bool,

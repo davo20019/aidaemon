@@ -1813,7 +1813,7 @@ async fn test_message_scoring_keywords() {
         tool_calls_json: None,
         created_at: Utc::now(),
         importance: 0.0,
-        embedding: None,
+        ..Message::runtime_defaults()
     };
 
     let score_high = score_message(&msg);

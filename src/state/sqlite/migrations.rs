@@ -1254,7 +1254,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
                     {
                         ("finite", "medium", Some(100_000i64), Some(500_000i64))
                     } else {
-                        ("continuous", "low", Some(50_000i64), Some(200_000i64))
+                        ("continuous", "low", Some(100_000i64), Some(500_000i64))
                     };
 
                     let status = if legacy_is_paused { "paused" } else { "active" };
@@ -1439,6 +1439,20 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS scheduled_run_state (
+            goal_id TEXT PRIMARY KEY REFERENCES goals(id) ON DELETE CASCADE,
+            root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            effective_budget_per_check INTEGER NOT NULL,
+            tokens_used INTEGER NOT NULL DEFAULT 0,
+            budget_extensions_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     // Columns on goals added via ALTER for older migrated databases.
     let _ =
         sqlx::query("ALTER TABLE goals ADD COLUMN domain TEXT NOT NULL DEFAULT 'orchestration'")
@@ -1502,6 +1516,12 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_goal_schedules_next_run
          ON goal_schedules(next_run_at) WHERE is_paused = 0",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_scheduled_run_state_root_task
+         ON scheduled_run_state(root_task_id)",
     )
     .execute(pool)
     .await;
@@ -1576,16 +1596,33 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .await;
 
     // Migration: scheduled continuous goals were historically created with incorrect
-    // 5K/20K budgets. Bump them to the standard continuous defaults (50K/200K).
+    // 5K/20K budgets. Bump them to the current continuous defaults (100K/500K).
     // Safe + idempotent.
     let _ = sqlx::query(
         "UPDATE goals
-         SET budget_per_check = 50000,
-             budget_daily = 200000
+         SET budget_per_check = 100000,
+             budget_daily = 500000
          WHERE domain = 'orchestration'
            AND goal_type = 'continuous'
            AND budget_per_check = 5000
            AND budget_daily = 20000
+           AND EXISTS (SELECT 1 FROM goal_schedules s WHERE s.goal_id = goals.id)",
+    )
+    .execute(pool)
+    .await;
+
+    // Migration: raise previously standard scheduled continuous defaults
+    // (50K/200K) to the newer defaults (100K/500K). This only touches goals
+    // still at the exact historical defaults, so explicit user-set budgets are
+    // preserved.
+    let _ = sqlx::query(
+        "UPDATE goals
+         SET budget_per_check = 100000,
+             budget_daily = 500000
+         WHERE domain = 'orchestration'
+           AND goal_type = 'continuous'
+           AND budget_per_check = 50000
+           AND budget_daily = 200000
            AND EXISTS (SELECT 1 FROM goal_schedules s WHERE s.goal_id = goals.id)",
     )
     .execute(pool)
@@ -1603,15 +1640,23 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await;
 
-    // Fix: reset inflated goal budgets caused by the auto-extension bug that
-    // persisted doubled budgets to DB. Any budget_daily above 500K was almost
-    // certainly ratcheted up by the auto-extension logic (standard defaults are
-    // 200K for continuous goals). Cap them back to 500K.
-    // Safe + idempotent — only touches goals with unreasonably high budgets.
+    let _ = sqlx::query(
+        "DELETE FROM scheduled_run_state
+         WHERE goal_id IN (
+            SELECT id FROM goals WHERE status IN ('cancelled', 'completed', 'failed')
+         )",
+    )
+    .execute(pool)
+    .await;
+
+    // Fix: reset obviously inflated goal budgets caused by the historical
+    // auto-extension bug that persisted doubled budgets to DB. Keep legitimate
+    // manual budgets intact by only capping values above the supported tool/API
+    // maximum.
     let _ = sqlx::query(
         "UPDATE goals
-         SET budget_daily = 500000
-         WHERE budget_daily > 500000
+         SET budget_daily = 2000000
+         WHERE budget_daily > 2000000
            AND status IN ('active', 'pending', 'pending_confirmation')",
     )
     .execute(pool)

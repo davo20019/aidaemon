@@ -90,7 +90,7 @@ pub(super) struct ConsultantCompletionCtx<'a> {
     pub iteration: usize,
     pub task_start: Instant,
     pub learning_ctx: &'a mut LearningContext,
-    pub pending_system_messages: &'a mut Vec<String>,
+    pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub tool_defs: &'a mut Vec<Value>,
     pub base_tool_defs: &'a mut Vec<Value>,
     pub available_capabilities: &'a mut HashMap<String, ToolCapabilities>,
@@ -286,11 +286,7 @@ impl Agent {
                         deferred_no_tool_streak = 0;
                         // Fall through to normal completion path
                     } else {
-                        pending_system_messages.push(
-                            "[SYSTEM] ROUTING CONTRACT ENFORCEMENT: This turn requires tool execution. \
-Ignore prior-turn outputs, run the required tool call(s) for the current user message, and then answer with concrete results."
-                                .to_string(),
-                        );
+                        pending_system_messages.push(SystemDirective::RoutingContractEnforcement);
                         self.emit_decision_point(
                             emitter,
                             task_id,
@@ -501,7 +497,7 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
                         tool_calls_json: None,
                         created_at: Utc::now(),
                         importance: 0.5,
-                        embedding: None,
+                        ..Message::runtime_defaults()
                     };
                     self.append_assistant_message_with_event(
                         emitter,
@@ -548,11 +544,8 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
                 } else {
                     stall_count = stall_count.saturating_add(1);
                     consecutive_clean_iterations = 0;
-                    pending_system_messages.push(
-                        "[SYSTEM] Contradictory file evidence was detected (one tool found files while another reported no matches). \
-                         Before answering, you MUST run at least one file re-check tool with an explicit path (e.g. search_files or project_inspect with path)."
-                            .to_string(),
-                    );
+                    pending_system_messages
+                        .push(SystemDirective::ContradictoryFileEvidenceRecheckRequired);
                     warn!(
                         session_id,
                         iteration,
@@ -669,13 +662,9 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
                     );
 
                     let deferred_nudge = if total_successful_tool_calls == 0 {
-                        "[SYSTEM] HARD REQUIREMENT: your next reply MUST include at least one tool call. \
-                     Do NOT return planning text like \"I'll do X\". Text-only replies are invalid for this request."
-                            .to_string()
+                        SystemDirective::DeferredToolCallRequired
                     } else {
-                        "[SYSTEM] You narrated future work instead of providing results. \
-                     Execute any remaining required tools, or return concrete outcomes and blockers now."
-                        .to_string()
+                        SystemDirective::DeferredProvideConcreteResults
                     };
 
                     pending_system_messages.push(deferred_nudge);
@@ -739,10 +728,7 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
                                 .fetch_add(1, Ordering::Relaxed);
                             // Strategy changed, give the new model a fresh stall budget.
                             stall_count = 0;
-                            pending_system_messages.push(
-                            "[SYSTEM] Recovery mode: a model switch was applied because prior replies kept promising actions without tool calls. Call the required tools now and return concrete results."
-                                .to_string(),
-                        );
+                            pending_system_messages.push(SystemDirective::RecoveryModeModelSwitch);
                         }
                     }
 
@@ -782,7 +768,7 @@ Ignore prior-turn outputs, run the required tool call(s) for the current user me
                 tool_calls_json: None,
                 created_at: Utc::now(),
                 importance: 0.5,
-                embedding: None,
+                ..Message::runtime_defaults()
             };
             self.append_assistant_message_with_event(
                 emitter,

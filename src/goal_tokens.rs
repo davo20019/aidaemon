@@ -18,9 +18,31 @@ use crate::traits::Goal;
 #[derive(Clone)]
 pub struct GoalTokenRegistry {
     tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    budget_overrides: Arc<RwLock<HashMap<String, GoalBudgetOverride>>>,
+    run_budgets: Arc<RwLock<HashMap<String, GoalRunBudgetState>>>,
     // Best-effort in-memory guard to avoid spawning duplicate task leads/heartbeats
     // for the same goal_id within a single daemon process.
     active_runs: Arc<Mutex<HashSet<String>>>,
+}
+
+#[derive(Clone)]
+struct GoalBudgetOverride {
+    budget_daily: i64,
+    day_anchor: String,
+}
+
+#[derive(Clone)]
+struct GoalRunBudgetState {
+    effective_budget_per_check: i64,
+    tokens_used: i64,
+    budget_extensions_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalRunBudgetStatus {
+    pub effective_budget_per_check: i64,
+    pub tokens_used: i64,
+    pub budget_extensions_count: usize,
 }
 
 /// Guard object returned by `GoalTokenRegistry::try_acquire_run`.
@@ -42,6 +64,8 @@ impl GoalTokenRegistry {
     pub fn new() -> Self {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
+            budget_overrides: Arc::new(RwLock::new(HashMap::new())),
+            run_budgets: Arc::new(RwLock::new(HashMap::new())),
             active_runs: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -91,6 +115,8 @@ impl GoalTokenRegistry {
     /// Remove a goal's token (after goal completes/fails).
     pub async fn remove(&self, goal_id: &str) {
         self.tokens.write().await.remove(goal_id);
+        self.budget_overrides.write().await.remove(goal_id);
+        self.run_budgets.write().await.remove(goal_id);
     }
 
     /// Rebuild registry from a list of active goals (for startup recovery).
@@ -101,6 +127,130 @@ impl GoalTokenRegistry {
                 tokens.insert(goal.id.clone(), CancellationToken::new());
             }
         }
+    }
+
+    /// Persist a runtime-only daily budget override for the current UTC day.
+    ///
+    /// This is shared across task-leads/executors for the same goal, but never
+    /// written to SQLite, so manual budgets do not ratchet upward permanently.
+    pub async fn set_effective_daily_budget(&self, goal_id: &str, budget_daily: i64) {
+        let day_anchor = chrono::Utc::now().date_naive().to_string();
+        self.budget_overrides.write().await.insert(
+            goal_id.to_string(),
+            GoalBudgetOverride {
+                budget_daily,
+                day_anchor,
+            },
+        );
+    }
+
+    /// Get the runtime-only daily budget override for the current UTC day.
+    pub async fn get_effective_daily_budget(&self, goal_id: &str) -> Option<i64> {
+        let day_anchor = chrono::Utc::now().date_naive().to_string();
+        let overrides = self.budget_overrides.read().await;
+        overrides.get(goal_id).and_then(|entry| {
+            if entry.day_anchor == day_anchor {
+                Some(entry.budget_daily)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Initialize the runtime-only per-run budget for an active scheduled run.
+    pub async fn start_run_budget(&self, goal_id: &str, budget_per_check: Option<i64>) {
+        let mut budgets = self.run_budgets.write().await;
+        if let Some(budget_per_check) = budget_per_check.filter(|b| *b > 0) {
+            budgets.insert(
+                goal_id.to_string(),
+                GoalRunBudgetState {
+                    effective_budget_per_check: budget_per_check,
+                    tokens_used: 0,
+                    budget_extensions_count: 0,
+                },
+            );
+        } else {
+            budgets.remove(goal_id);
+        }
+    }
+
+    pub async fn restore_run_budget(
+        &self,
+        goal_id: &str,
+        effective_budget_per_check: i64,
+        tokens_used: i64,
+        budget_extensions_count: usize,
+    ) -> Option<GoalRunBudgetStatus> {
+        if effective_budget_per_check <= 0 {
+            self.run_budgets.write().await.remove(goal_id);
+            return None;
+        }
+
+        self.run_budgets.write().await.insert(
+            goal_id.to_string(),
+            GoalRunBudgetState {
+                effective_budget_per_check,
+                tokens_used: tokens_used.max(0),
+                budget_extensions_count,
+            },
+        );
+
+        self.get_run_budget(goal_id).await
+    }
+
+    pub async fn get_run_budget(&self, goal_id: &str) -> Option<GoalRunBudgetStatus> {
+        let budgets = self.run_budgets.read().await;
+        budgets.get(goal_id).map(|state| GoalRunBudgetStatus {
+            effective_budget_per_check: state.effective_budget_per_check,
+            tokens_used: state.tokens_used,
+            budget_extensions_count: state.budget_extensions_count,
+        })
+    }
+
+    pub async fn add_run_tokens(
+        &self,
+        goal_id: &str,
+        delta_tokens: i64,
+    ) -> Option<GoalRunBudgetStatus> {
+        let mut budgets = self.run_budgets.write().await;
+        let state = budgets.get_mut(goal_id)?;
+        state.tokens_used = state.tokens_used.saturating_add(delta_tokens).max(0);
+        Some(GoalRunBudgetStatus {
+            effective_budget_per_check: state.effective_budget_per_check,
+            tokens_used: state.tokens_used,
+            budget_extensions_count: state.budget_extensions_count,
+        })
+    }
+
+    pub async fn auto_extend_run_budget(
+        &self,
+        goal_id: &str,
+        new_budget: i64,
+    ) -> Option<GoalRunBudgetStatus> {
+        let mut budgets = self.run_budgets.write().await;
+        let state = budgets.get_mut(goal_id)?;
+        state.effective_budget_per_check = new_budget;
+        state.budget_extensions_count = state.budget_extensions_count.saturating_add(1);
+        Some(GoalRunBudgetStatus {
+            effective_budget_per_check: state.effective_budget_per_check,
+            tokens_used: state.tokens_used,
+            budget_extensions_count: state.budget_extensions_count,
+        })
+    }
+
+    pub async fn set_run_budget(
+        &self,
+        goal_id: &str,
+        new_budget: i64,
+    ) -> Option<GoalRunBudgetStatus> {
+        let mut budgets = self.run_budgets.write().await;
+        let state = budgets.get_mut(goal_id)?;
+        state.effective_budget_per_check = new_budget;
+        Some(GoalRunBudgetStatus {
+            effective_budget_per_check: state.effective_budget_per_check,
+            tokens_used: state.tokens_used,
+            budget_extensions_count: state.budget_extensions_count,
+        })
     }
 }
 
@@ -148,8 +298,13 @@ mod tests {
     async fn test_remove() {
         let registry = GoalTokenRegistry::new();
         registry.register("goal-3").await;
+        registry.set_effective_daily_budget("goal-3", 123_456).await;
         registry.remove("goal-3").await;
         assert!(registry.child_token("goal-3").await.is_none());
+        assert!(registry
+            .get_effective_daily_budget("goal-3")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -187,5 +342,69 @@ mod tests {
             registry.try_acquire_run("goal-1").is_some(),
             "acquire should succeed again after guard drop"
         );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_daily_budget_override_round_trips() {
+        let registry = GoalTokenRegistry::new();
+        assert!(registry
+            .get_effective_daily_budget("goal-4")
+            .await
+            .is_none());
+
+        registry.set_effective_daily_budget("goal-4", 400_000).await;
+
+        assert_eq!(
+            registry.get_effective_daily_budget("goal-4").await,
+            Some(400_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_budget_round_trips_and_extends() {
+        let registry = GoalTokenRegistry::new();
+        assert!(registry.get_run_budget("goal-5").await.is_none());
+
+        registry.start_run_budget("goal-5", Some(100_000)).await;
+        assert_eq!(
+            registry.get_run_budget("goal-5").await,
+            Some(GoalRunBudgetStatus {
+                effective_budget_per_check: 100_000,
+                tokens_used: 0,
+                budget_extensions_count: 0,
+            })
+        );
+
+        let after_tokens = registry.add_run_tokens("goal-5", 12_345).await.unwrap();
+        assert_eq!(after_tokens.tokens_used, 12_345);
+
+        let after_extend = registry
+            .auto_extend_run_budget("goal-5", 180_000)
+            .await
+            .unwrap();
+        assert_eq!(after_extend.effective_budget_per_check, 180_000);
+        assert_eq!(after_extend.budget_extensions_count, 1);
+
+        let after_manual = registry.set_run_budget("goal-5", 220_000).await.unwrap();
+        assert_eq!(after_manual.effective_budget_per_check, 220_000);
+        assert_eq!(after_manual.budget_extensions_count, 1);
+
+        registry.start_run_budget("goal-5", Some(90_000)).await;
+        assert_eq!(
+            registry.get_run_budget("goal-5").await,
+            Some(GoalRunBudgetStatus {
+                effective_budget_per_check: 90_000,
+                tokens_used: 0,
+                budget_extensions_count: 0,
+            })
+        );
+
+        let restored = registry
+            .restore_run_budget("goal-5", 180_000, 77_000, 2)
+            .await
+            .unwrap();
+        assert_eq!(restored.effective_budget_per_check, 180_000);
+        assert_eq!(restored.tokens_used, 77_000);
+        assert_eq!(restored.budget_extensions_count, 2);
     }
 }

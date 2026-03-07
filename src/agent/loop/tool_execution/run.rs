@@ -2,9 +2,9 @@ use super::budget_blocking::{DuplicateSendFileNoopCtx, ToolBlockKind, ToolBudget
 use super::execution_io::ToolExecutionIoCtx;
 use super::guards::LoopPatternGuardOutcome;
 use super::project_dir::{
-    extract_project_dir_hint, extract_project_dirs_from_tool_args, is_file_recheck_tool,
-    maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args, scope_allows_project_dir,
-    tool_call_includes_project_path,
+    extract_project_dir_hint_with_aliases, extract_project_dirs_from_tool_args,
+    is_file_recheck_tool, is_recognized_project_root, maybe_inject_project_dir_into_tool_args,
+    project_dir_from_tool_args, scope_allows_project_dir, tool_call_includes_project_path,
 };
 use super::result_learning::{ResultLearningEnv, ResultLearningState};
 use super::types::{ToolExecutionCtx, ToolExecutionOutcome};
@@ -130,7 +130,9 @@ fn project_scope_violation_for_tool_call(
     let violations: Vec<String> = candidate_dirs
         .iter()
         .filter(|dir| {
-            !scope_allows_project_dir(allowed_scope, dir) && !allow_scaffold_parent_dir(dir)
+            !scope_allows_project_dir(allowed_scope, dir)
+                && !allow_scaffold_parent_dir(dir)
+                && !is_recognized_project_root(dir)
         })
         .cloned()
         .collect();
@@ -166,21 +168,22 @@ fn tool_result_indicates_background_detach(
         || result_text.contains("spawned in background")
 }
 
-fn build_background_detach_ack(tool_name: &str, result_text: &str) -> String {
+fn build_background_detach_ack(
+    tool_name: &str,
+    result_text: &str,
+    metadata: &crate::traits::ToolCallMetadata,
+) -> String {
     let default_prefix = match tool_name {
         "terminal" => "The command is running in the background.",
         "cli_agent" => "The CLI agent task is running in the background.",
         "spawn_agent" => "The spawned sub-agent is running in the background.",
         _ => "The task is running in the background.",
     };
-    let first_line = result_text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with("[SYSTEM]"))
-        .unwrap_or(default_prefix);
-    // Only promise notifications if the tool result confirms they're actually enabled.
-    // Detached mode is a separate state — detached processes don't necessarily have a notifier.
-    let notifications_active = result_text.contains("Completion notifications are enabled");
+    let first_line = crate::traits::first_primary_message_line(result_text, &[])
+        .unwrap_or(default_prefix.to_string());
+    // Use structured tool metadata rather than inferring notification semantics
+    // from rendered tool output text.
+    let notifications_active = metadata.completion_notifications_enabled;
     if notifications_active {
         format!(
             "{} Completion notifications are enabled, and the final result will be sent automatically when it finishes.",
@@ -350,7 +353,8 @@ impl Agent {
         }
 
         if known_project_dir.is_none() {
-            known_project_dir = extract_project_dir_hint(_user_text);
+            known_project_dir =
+                extract_project_dir_hint_with_aliases(_user_text, &self.path_aliases.projects);
         }
 
         let mut successful_tool_calls = 0;
@@ -371,16 +375,8 @@ impl Agent {
                 )
             {
                 force_text_response = true;
-                pending_system_messages.push(format!(
-                    "[SYSTEM] Hard tool budget reached ({} calls). No more tool calls available.\n\n\
-                     You MUST now respond with a concise summary:\n\
-                     1. What you accomplished (files modified, bugs fixed, features added)\n\
-                     2. What remains unfinished and why\n\
-                     3. Any test results or verification status\n\n\
-                     Do NOT restate the original task or say what you would do next. \
-                     Focus only on concrete results and outcomes.",
-                    policy_tool_budget
-                ));
+                pending_system_messages
+                    .push(SystemDirective::HardPolicyToolBudgetReached { policy_tool_budget });
                 self.emit_decision_point(
                     emitter,
                     task_id,
@@ -398,11 +394,11 @@ impl Agent {
                     }),
                 )
                 .await;
-                let result_text = format!(
-                    "[SYSTEM] Hard tool budget reached: {} calls allowed per turn for this policy profile. \
-                     This call to `{}` was blocked. Synthesize and answer now.",
-                    policy_tool_budget, tc.name
-                );
+                let result_text = ToolResultNotice::HardPolicyToolBudgetBlocked {
+                    policy_tool_budget,
+                    tool_name: tc.name.clone(),
+                }
+                .render();
                 let tool_msg = Message {
                     id: Uuid::new_v4().to_string(),
                     session_id: session_id.to_string(),
@@ -413,7 +409,7 @@ impl Agent {
                     tool_calls_json: None,
                     created_at: Utc::now(),
                     importance: 0.2,
-                    embedding: None,
+                    ..Message::runtime_defaults()
                 };
                 self.append_tool_message_with_result_event(
                     emitter,
@@ -436,12 +432,10 @@ impl Agent {
 
             if restrict_to_personal_memory_tools {
                 if !is_personal_memory_tool_call {
-                    let result_text = format!(
-                            "[SYSTEM] Personal-memory recall should only use `manage_people` / `manage_memories` \
-                             unless the user explicitly requested broader verification. \
-                             Do not call `{}` for this query.",
-                            tc.name
-                        );
+                    let result_text = ToolResultNotice::PersonalMemoryToolsOnly {
+                        tool_name: tc.name.clone(),
+                    }
+                    .render();
                     let tool_msg = Message {
                         id: Uuid::new_v4().to_string(),
                         session_id: session_id.to_string(),
@@ -452,7 +446,7 @@ impl Agent {
                         tool_calls_json: None,
                         created_at: Utc::now(),
                         importance: 0.1,
-                        embedding: None,
+                        ..Message::runtime_defaults()
                     };
                     self.append_tool_message_with_result_event(
                         emitter,
@@ -468,11 +462,8 @@ impl Agent {
 
                 if personal_memory_tool_calls >= personal_memory_tool_call_cap {
                     force_text_response = true;
-                    pending_system_messages.push(
-                        "[SYSTEM] You already performed the allowed targeted memory re-check(s). \
-                             Stop calling tools and answer directly with what you know."
-                            .to_string(),
-                    );
+                    pending_system_messages
+                        .push(SystemDirective::PersonalMemoryRecheckLimitReached);
                     let result_text =
                             "Targeted personal-memory re-check limit reached. No further tool calls are allowed for this question."
                                 .to_string();
@@ -486,7 +477,7 @@ impl Agent {
                         tool_calls_json: None,
                         created_at: Utc::now(),
                         importance: 0.2,
-                        embedding: None,
+                        ..Message::runtime_defaults()
                     };
                     self.append_tool_message_with_result_event(
                         emitter,
@@ -544,10 +535,11 @@ impl Agent {
                     .cross_scope_blocked_total
                     .fetch_add(1, Ordering::Relaxed);
                 *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
-                let result_text = format!(
-                    "[SYSTEM] Scope lock blocked `{}`: {}. Continue with tools that stay inside the active request scope.",
-                    tc.name, scope_reason
-                );
+                let result_text = ToolResultNotice::ScopeLockBlockedResult {
+                    tool_name: tc.name.clone(),
+                    reason: scope_reason.clone(),
+                }
+                .render();
                 let tool_msg = Message {
                     id: Uuid::new_v4().to_string(),
                     session_id: session_id.to_string(),
@@ -558,7 +550,7 @@ impl Agent {
                     tool_calls_json: None,
                     created_at: Utc::now(),
                     importance: 0.2,
-                    embedding: None,
+                    ..Message::runtime_defaults()
                 };
                 self.append_tool_message_with_result_event(
                     emitter,
@@ -569,10 +561,10 @@ impl Agent {
                     Some(task_id),
                 )
                 .await?;
-                pending_system_messages.push(format!(
-                    "[SYSTEM] The previous `{}` tool call was blocked by deterministic scope locks ({}). Use paths/tool args aligned with the current request scope.",
-                    tc.name, scope_reason
-                ));
+                pending_system_messages.push(SystemDirective::ScopeLockBlocked {
+                    tool_name: tc.name.clone(),
+                    reason: scope_reason,
+                });
                 iteration_had_tool_failures = true;
                 continue;
             }
@@ -581,11 +573,11 @@ impl Agent {
                 deterministic_tool_contract_violation(&tc.name, &effective_arguments)
             {
                 *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
-                let result_text = format!(
-                    "[SYSTEM] Blocked `{}` by deterministic argument contract: {}. \
-Continue with tools that directly match the user request.",
-                    tc.name, contract_violation.reason
-                );
+                let result_text = ToolResultNotice::DeterministicArgumentContractBlocked {
+                    tool_name: tc.name.clone(),
+                    reason: contract_violation.reason.clone(),
+                }
+                .render();
                 let tool_msg = Message {
                     id: Uuid::new_v4().to_string(),
                     session_id: session_id.to_string(),
@@ -596,7 +588,7 @@ Continue with tools that directly match the user request.",
                     tool_calls_json: None,
                     created_at: Utc::now(),
                     importance: 0.2,
-                    embedding: None,
+                    ..Message::runtime_defaults()
                 };
                 self.append_tool_message_with_result_event(
                     emitter,
@@ -607,10 +599,11 @@ Continue with tools that directly match the user request.",
                     Some(task_id),
                 )
                 .await?;
-                pending_system_messages.push(format!(
-                    "[SYSTEM] The previous `{}` tool call was blocked ({}). {}",
-                    tc.name, contract_violation.reason, contract_violation.coaching
-                ));
+                pending_system_messages.push(SystemDirective::ArgumentContractBlocked {
+                    tool_name: tc.name.clone(),
+                    reason: contract_violation.reason.to_string(),
+                    coaching: contract_violation.coaching.to_string(),
+                });
                 iteration_had_tool_failures = true;
                 continue;
             }
@@ -644,16 +637,7 @@ Continue with tools that directly match the user request.",
                     // strips all tools and forces a text response. Without this,
                     // weak models keep retrying the same blocked tool indefinitely.
                     force_text_response = true;
-                    pending_system_messages.push(
-                        "[SYSTEM] Tool limit reached. No more tool calls available.\n\n\
-                         You MUST now respond with a concise summary:\n\
-                         1. What you accomplished (files modified, bugs fixed, features added)\n\
-                         2. What remains unfinished and why\n\
-                         3. Any test results or verification status\n\n\
-                         Do NOT restate the original task or say what you would do next. \
-                         Focus only on concrete results and outcomes."
-                            .to_string(),
-                    );
+                    pending_system_messages.push(SystemDirective::HardToolLimitReached);
                     continue;
                 }
             }
@@ -758,16 +742,15 @@ Continue with tools that directly match the user request.",
                     let fallback_duration =
                         fallback_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                     tool_duration_ms = tool_duration_ms.saturating_add(fallback_duration);
-                    let fallback_note =
-                        "[SYSTEM] run_command was blocked by policy; auto-routed to `terminal`.";
+                    let fallback_note = ToolResultNotice::RunCommandPolicyAutoRoutedToTerminal;
                     result_text = match terminal_result {
                         Ok(outcome) => {
                             result_metadata = outcome.metadata;
-                            format!("{}\n\n{}", outcome.output, fallback_note)
+                            format!("{}\n\n{}", outcome.output, fallback_note.render())
                         }
                         Err(e) => {
                             result_metadata.transport_error = Some(e.to_string());
-                            format!("Error: {}\n\n{}", e, fallback_note)
+                            format!("Error: {}\n\n{}", e, fallback_note.render())
                         }
                     };
                     if self.context_window_config.enabled {
@@ -783,21 +766,18 @@ Continue with tools that directly match the user request.",
                 tool_result_indicates_background_detach(&tc.name, &result_text, &result_metadata);
 
             if background_detached {
-                pending_background_ack = Some(build_background_detach_ack(&tc.name, &result_text));
+                pending_background_ack = Some(build_background_detach_ack(
+                    &tc.name,
+                    &result_text,
+                    &result_metadata,
+                ));
                 force_text_response = true;
-                let notifications_active =
-                    result_text.contains("Completion notifications are enabled");
-                let system_msg = if notifications_active {
-                    "[SYSTEM] A background task is now running and completion notifications are enabled. \
-Do NOT call additional tools or poll status in this turn. Reply to the user now that work continues in background and results will be sent automatically."
-                        .to_string()
-                } else {
-                    "[SYSTEM] A background task was moved to the background. \
-Do NOT call additional tools or poll status in this turn. Reply to the user now with the current status."
-                        .to_string()
+                let notifications_active = result_metadata.completion_notifications_enabled;
+                let system_msg = SystemDirective::BackgroundHandoff {
+                    notifications_active,
                 };
                 pending_system_messages.push(system_msg.clone());
-                result_text = format!("{}\n\n{}", result_text, system_msg);
+                result_text = format!("{}\n\n{}", result_text, system_msg.render());
             }
 
             // Track total calls per tool
@@ -813,23 +793,25 @@ Do NOT call additional tools or poll status in this turn. Reply to the user now 
                 let cache_hash = hash_tool_call(&tc.name, &tc.arguments);
                 // Cap cached content at 8KB to avoid bloating the redirect msg
                 let max_cache_chars = 8000;
-                if result_text.len() <= max_cache_chars
+                let primary_result_text =
+                    crate::traits::extract_primary_message_content(&result_text, &[]);
+                if primary_result_text.len() <= max_cache_chars
                     && !result_text.starts_with("Error")
-                    && !result_text.starts_with("[SYSTEM]")
+                    && !crate::traits::message_content_is_structural_only(&result_text, &[])
                 {
-                    tool_result_cache.insert(cache_hash, result_text.clone());
-                } else if result_text.len() > max_cache_chars {
+                    tool_result_cache.insert(cache_hash, primary_result_text.into_owned());
+                } else if primary_result_text.len() > max_cache_chars {
                     // Store a truncated version rather than nothing
                     let mut boundary = max_cache_chars;
-                    while boundary > 0 && !result_text.is_char_boundary(boundary) {
+                    while boundary > 0 && !primary_result_text.is_char_boundary(boundary) {
                         boundary -= 1;
                     }
                     tool_result_cache.insert(
                         cache_hash,
                         format!(
                             "{}…\n[truncated — {} total chars]",
-                            &result_text[..boundary],
-                            result_text.len()
+                            &primary_result_text[..boundary],
+                            primary_result_text.len()
                         ),
                     );
                 }
@@ -929,16 +911,11 @@ Do NOT call additional tools or poll status in this turn. Reply to the user now 
             }
 
             let tool_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
-                role: "tool".to_string(),
                 content: Some(result_text.clone()),
                 tool_call_id: Some(tc.id.clone()),
                 tool_name: Some(tc.name.clone()),
-                tool_calls_json: None,
-                created_at: Utc::now(),
                 importance: 0.3, // Tool outputs default to lower importance
-                embedding: None,
+                ..Message::new_runtime(Uuid::new_v4().to_string(), session_id, "tool")
             };
             self.append_tool_message_with_result_event(
                 emitter,
@@ -1206,10 +1183,17 @@ mod tests {
 
     #[test]
     fn builds_deterministic_background_ack_from_tool_result() {
+        let with_notify = crate::traits::ToolCallMetadata {
+            completion_notifications_enabled: true,
+            ..Default::default()
+        };
+        let without_notify = crate::traits::ToolCallMetadata::default();
+
         // With notifications enabled — should promise automatic delivery.
         let ack = build_background_detach_ack(
             "terminal",
             "Command still running after 30s. Moved to background (pid=123).\n\nCompletion notifications are enabled. The user will be notified when this process finishes.\n\n[SYSTEM] ...",
+            &with_notify,
         );
         assert!(ack.contains("Moved to background (pid=123)"));
         assert!(ack.contains("final result will be sent automatically"));
@@ -1218,8 +1202,32 @@ mod tests {
         let ack_no_notify = build_background_detach_ack(
             "terminal",
             "Command still running after 30s. Moved to background (pid=456).\n\nThis process is task-owned and will be auto-killed when the current task ends.",
+            &without_notify,
         );
         assert!(ack_no_notify.contains("Moved to background (pid=456)"));
+        assert!(!ack_no_notify.contains("final result will be sent automatically"));
+    }
+
+    #[test]
+    fn background_ack_uses_structured_notification_metadata_not_text() {
+        let with_notify = crate::traits::ToolCallMetadata {
+            completion_notifications_enabled: true,
+            ..Default::default()
+        };
+        let without_notify = crate::traits::ToolCallMetadata::default();
+
+        let ack = build_background_detach_ack(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=123).",
+            &with_notify,
+        );
+        assert!(ack.contains("final result will be sent automatically"));
+
+        let ack_no_notify = build_background_detach_ack(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=456).\n\nCompletion notifications are enabled. The user will be notified when this process finishes.",
+            &without_notify,
+        );
         assert!(!ack_no_notify.contains("final result will be sent automatically"));
     }
 }

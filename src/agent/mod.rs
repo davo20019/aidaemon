@@ -23,7 +23,7 @@ use crate::events::{
     ToolResultData,
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
-use crate::goal_tokens::GoalTokenRegistry;
+use crate::goal_tokens::{GoalRunBudgetStatus, GoalTokenRegistry};
 use crate::llm_markers::{CONSULTANT_TEXT_ONLY_MARKER, INTENT_GATE_MARKER};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
@@ -33,8 +33,8 @@ use crate::skills::{self, MemoryContext};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::VerificationTracker;
 use crate::traits::{
-    AgentRole, ChatOptions, Goal, Message, ModelProvider, StateStore, Task, TaskActivity, Tool,
-    ToolCall, ToolCapabilities, ToolChoiceMode, ToolRole,
+    AgentRole, ChatOptions, Goal, Message, ModelProvider, ScheduledRunState, StateStore, Task,
+    TaskActivity, Tool, ToolCall, ToolCapabilities, ToolChoiceMode, ToolRole,
 };
 use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
 // Re-export StatusUpdate from types for backwards compatibility
@@ -159,6 +159,8 @@ mod resume;
 mod spawn;
 #[path = "loop/stopping_phase.rs"]
 mod stopping_phase;
+#[path = "loop/system_directives.rs"]
+mod system_directives;
 #[path = "runtime/system_prompt.rs"]
 mod system_prompt;
 #[path = "tools/tool_defs.rs"]
@@ -169,10 +171,14 @@ mod tool_exec;
 mod tool_execution_phase;
 #[path = "loop/tool_prelude_phase.rs"]
 mod tool_prelude_phase;
+#[path = "loop/tool_result_notices.rs"]
+mod tool_result_notices;
 
+pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
 #[cfg(test)]
 use system_prompt::{build_consultant_system_prompt, ConsultantPromptStyle};
 use system_prompt::{build_tool_loop_system_prompt, format_goal_context, ToolLoopPromptStyle};
+pub(in crate::agent) use tool_result_notices::ToolResultNotice;
 
 #[cfg(test)]
 use system_prompt::strip_markdown_section;
@@ -1525,6 +1531,125 @@ pub fn is_group_session(session_id: &str) -> bool {
     crate::session::is_group_session(session_id)
 }
 
+fn is_scheduled_task_description(text: &str) -> bool {
+    let trimmed = text.trim_start().to_ascii_lowercase();
+    trimmed.starts_with("execute scheduled goal:")
+        || trimmed.starts_with("scheduled check:")
+        || trimmed.starts_with("manual scheduled run:")
+}
+
+async fn task_has_scheduled_provenance(state: &Arc<dyn StateStore>, task_id: Option<&str>) -> bool {
+    if let Some(tid) = task_id {
+        if let Ok(Some(task)) = state.get_task(tid).await {
+            return is_scheduled_task_description(&task.description);
+        }
+    }
+
+    false
+}
+
+async fn active_scheduled_root_task_id(
+    state: &Arc<dyn StateStore>,
+    goal_id: &str,
+) -> Option<String> {
+    let tasks = state.get_tasks_for_goal(goal_id).await.ok()?;
+    tasks
+        .into_iter()
+        .filter(|task| is_scheduled_task_description(&task.description))
+        .filter(|task| {
+            !matches!(
+                task.status.as_str(),
+                "completed" | "failed" | "cancelled" | "skipped"
+            )
+        })
+        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+        .map(|task| task.id)
+}
+
+async fn goal_has_scheduled_provenance(
+    state: &Arc<dyn StateStore>,
+    goal_id: &str,
+    task_id: Option<&str>,
+) -> bool {
+    if task_has_scheduled_provenance(state, task_id).await {
+        return true;
+    }
+
+    if let Ok(schedules) = state.get_schedules_for_goal(goal_id).await {
+        if !schedules.is_empty() {
+            return true;
+        }
+    }
+
+    if let Ok(tasks) = state.get_tasks_for_goal(goal_id).await {
+        if tasks
+            .iter()
+            .any(|task| is_scheduled_task_description(&task.description))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+async fn persist_scheduled_run_state(
+    state: &Arc<dyn StateStore>,
+    goal_id: &str,
+    root_task_id_hint: Option<&str>,
+    status: &GoalRunBudgetStatus,
+) {
+    let existing = state.get_scheduled_run_state(goal_id).await.ok().flatten();
+    let existing_created_at = existing.as_ref().map(|record| record.created_at.clone());
+    let root_task_id = if let Some(record) = existing.as_ref() {
+        Some(record.root_task_id.clone())
+    } else if let Some(root_task_id) = root_task_id_hint {
+        Some(root_task_id.to_string())
+    } else {
+        active_scheduled_root_task_id(state, goal_id).await
+    };
+
+    let Some(root_task_id) = root_task_id else {
+        return;
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let record = ScheduledRunState {
+        goal_id: goal_id.to_string(),
+        root_task_id,
+        effective_budget_per_check: status.effective_budget_per_check,
+        tokens_used: status.tokens_used,
+        budget_extensions_count: status.budget_extensions_count,
+        created_at: existing_created_at.unwrap_or_else(|| now.clone()),
+        updated_at: now,
+    };
+    let _ = state.upsert_scheduled_run_state(&record).await;
+}
+
+async fn clear_scheduled_run_state(state: &Arc<dyn StateStore>, goal_id: &str) {
+    let _ = state.delete_scheduled_run_state(goal_id).await;
+}
+
+async fn effective_goal_daily_budget(
+    goal: &Goal,
+    registry: Option<&GoalTokenRegistry>,
+) -> Option<i64> {
+    let shared = if let Some(registry) = registry {
+        registry.get_effective_daily_budget(&goal.id).await
+    } else {
+        None
+    };
+    shared.or(goal.budget_daily)
+}
+
+fn is_processing_limit_reply(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("I've reached my processing limit")
+        || trimmed.starts_with("This goal hit its daily processing budget")
+        || trimmed.starts_with("This scheduled goal hit its daily processing budget")
+        || trimmed.starts_with("This scheduled run hit its per-run processing budget")
+}
+
 /// Detect low-signal task-lead replies that should not be sent as the
 /// primary user-facing result when richer goal/task outputs are available.
 fn is_low_signal_task_lead_reply(text: &str) -> bool {
@@ -1939,6 +2064,8 @@ pub fn spawn_background_task_lead(
         // unblock dependent tasks that weren't dispatchable in the previous pass.
         {
             let max_dispatch_rounds = 4; // safety limit — keep low to bound token usage
+            const AUTO_DISPATCH_MAX_BUDGET_EXTENSIONS: usize = 12;
+            const AUTO_DISPATCH_HARD_TOKEN_CAP: i64 = 20_000_000;
             let mut budget_exhausted = false;
             for _round in 0..max_dispatch_rounds {
                 let all_tasks: Vec<crate::traits::Task> =
@@ -1987,9 +2114,73 @@ pub fn spawn_background_task_lead(
                 );
 
                 for task in &dispatch_batch {
-                    // Stop dispatching as soon as the goal hits its daily token budget.
+                    // Stop dispatching when the active run has exhausted its
+                    // shared per-run budget, or when a non-scheduled goal hits
+                    // its daily budget.
                     if let Ok(Some(g)) = state.get_goal(&goal_id).await {
-                        if let Some(budget_daily) = g.budget_daily {
+                        let is_scheduled =
+                            goal_has_scheduled_provenance(&state, &goal_id, Some(&task.id)).await;
+                        if is_scheduled {
+                            let run_budget = if let Some(registry) = goal_token_registry.as_ref() {
+                                registry.get_run_budget(&goal_id).await
+                            } else {
+                                None
+                            };
+                            if let Some(run_budget) = run_budget {
+                                if run_budget.tokens_used >= run_budget.effective_budget_per_check {
+                                    let old_budget = run_budget.effective_budget_per_check;
+                                    let new_budget = old_budget
+                                        .saturating_mul(2)
+                                        .max(run_budget.tokens_used.saturating_add(old_budget / 2))
+                                        .min(AUTO_DISPATCH_HARD_TOKEN_CAP);
+                                    let can_extend = run_budget.budget_extensions_count
+                                        < AUTO_DISPATCH_MAX_BUDGET_EXTENSIONS
+                                        && old_budget < AUTO_DISPATCH_HARD_TOKEN_CAP
+                                        && new_budget > run_budget.tokens_used;
+                                    if can_extend {
+                                        if let Some(registry) = goal_token_registry.as_ref() {
+                                            if let Some(updated) = registry
+                                                .auto_extend_run_budget(&goal_id, new_budget)
+                                                .await
+                                            {
+                                                persist_scheduled_run_state(
+                                                    &state, &goal_id, None, &updated,
+                                                )
+                                                .await;
+                                                info!(
+                                                    goal_id = %goal_id,
+                                                    tokens_used = updated.tokens_used,
+                                                    old_budget,
+                                                    new_budget,
+                                                    extension = updated.budget_extensions_count,
+                                                    "Auto-extended scheduled run budget during auto-dispatch"
+                                                );
+                                            } else {
+                                                budget_exhausted = true;
+                                                info!(
+                                                    goal_id = %goal_id,
+                                                    tokens_used = run_budget.tokens_used,
+                                                    budget = run_budget.effective_budget_per_check,
+                                                    "Stopping auto-dispatch — scheduled run budget exhausted"
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        budget_exhausted = true;
+                                        info!(
+                                            goal_id = %goal_id,
+                                            tokens_used = run_budget.tokens_used,
+                                            budget = run_budget.effective_budget_per_check,
+                                            "Stopping auto-dispatch — scheduled run budget exhausted"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        } else if let Some(budget_daily) =
+                            effective_goal_daily_budget(&g, goal_token_registry.as_ref()).await
+                        {
                             if g.tokens_used_today >= budget_daily {
                                 budget_exhausted = true;
                                 info!(
@@ -2079,9 +2270,19 @@ pub fn spawn_background_task_lead(
                                     }
                                 }
                             }
-                            updated.status = "completed".to_string();
                             updated.result = Some(response);
                             updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                            if updated
+                                .result
+                                .as_deref()
+                                .is_some_and(is_processing_limit_reply)
+                            {
+                                updated.status = "blocked".to_string();
+                                updated.blocker = updated.result.clone();
+                            } else {
+                                updated.status = "completed".to_string();
+                                updated.blocker = None;
+                            }
                         }
                         Err(e) => {
                             updated.status = "failed".to_string();
@@ -2129,9 +2330,25 @@ pub fn spawn_background_task_lead(
                 _ => goal,
             };
 
-            let goal_budget_exhausted = updated_goal
-                .budget_daily
-                .is_some_and(|b| updated_goal.tokens_used_today >= b);
+            let scheduled_goal_active = goal_has_scheduled_provenance(&state, &goal_id, None).await;
+            let scheduled_run_budget_exhausted = if scheduled_goal_active {
+                if let Some(registry) = goal_token_registry.as_ref() {
+                    registry
+                        .get_run_budget(&goal_id)
+                        .await
+                        .is_some_and(|status| {
+                            status.tokens_used >= status.effective_budget_per_check
+                        })
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let effective_goal_budget =
+                effective_goal_daily_budget(&updated_goal, goal_token_registry.as_ref()).await;
+            let goal_budget_exhausted = !scheduled_goal_active
+                && effective_goal_budget.is_some_and(|b| updated_goal.tokens_used_today >= b);
 
             // For finite goals: detect when no tasks were completed after
             // the task lead finished — fail immediately since there's no
@@ -2145,6 +2362,12 @@ pub fn spawn_background_task_lead(
                 updated_goal.status = "completed".to_string();
                 updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
                 updated_goal.dispatch_failures = 0;
+            } else if scheduled_run_budget_exhausted {
+                updated_goal.dispatch_failures = 0;
+                info!(
+                    goal_id = %goal_id,
+                    "Goal dispatch paused: scheduled run budget exhausted"
+                );
             } else if goal_budget_exhausted {
                 // Budget exhausted is a safety stop, not "no progress". Keep the goal active
                 // and avoid stalling it; it can resume after budgets reset.
@@ -2152,7 +2375,7 @@ pub fn spawn_background_task_lead(
                 info!(
                     goal_id = %goal_id,
                     tokens_used = updated_goal.tokens_used_today,
-                    budget = updated_goal.budget_daily.unwrap_or(0),
+                    budget = effective_goal_budget.unwrap_or(0),
                     "Goal dispatch paused: daily token budget exhausted"
                 );
             } else if no_tasks_completed_finite {
@@ -2703,6 +2926,17 @@ impl Agent {
     }
 
     #[cfg(test)]
+    pub fn set_test_iteration_config(&mut self, config: IterationLimitConfig) {
+        self.iteration_config = config;
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn set_test_task_timeout(&mut self, timeout: Option<Duration>) {
+        self.task_timeout = timeout;
+    }
+
+    #[cfg(test)]
     pub fn set_test_goal_id(&mut self, goal_id: Option<String>) {
         self.goal_id = goal_id;
     }
@@ -2924,6 +3158,23 @@ impl Agent {
         channel_ctx: ChannelContext,
         heartbeat: Option<Arc<AtomicU64>>,
     ) -> anyhow::Result<String> {
+        let scheduled_goal_to_clear = if let Some(goal_id) = self.goal_id.as_deref() {
+            let is_scheduled_goal =
+                goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await;
+            let is_root_scheduled_run = if self.task_id.is_none() {
+                is_scheduled_goal
+            } else {
+                task_has_scheduled_provenance(&self.state, self.task_id.as_deref()).await
+            };
+            if is_root_scheduled_run {
+                Some(goal_id.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let reply = self
             .handle_message_impl(
                 session_id,
@@ -2933,7 +3184,13 @@ impl Agent {
                 channel_ctx,
                 heartbeat,
             )
-            .await?;
+            .await;
+
+        if let Some(goal_id) = scheduled_goal_to_clear.as_deref() {
+            clear_scheduled_run_state(&self.state, goal_id).await;
+        }
+
+        let reply = reply?;
 
         // Strip control markers that may have leaked through model echoing.
         let reply = Self::sanitize_final_reply_markers(&reply);
@@ -2971,6 +3228,7 @@ impl Agent {
             if let Some(ref registry) = self.goal_token_registry {
                 registry.cancel(&goal.id).await;
             }
+            clear_scheduled_run_state(&self.state, &goal.id).await;
 
             let mut updated = goal.clone();
             updated.status = "cancelled".to_string();

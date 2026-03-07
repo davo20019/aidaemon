@@ -33,7 +33,7 @@ pub(super) struct DuplicateSendFileNoopCtx<'a> {
     pub iteration: usize,
     pub effective_arguments: &'a str,
     pub force_text_response: &'a mut bool,
-    pub pending_system_messages: &'a mut Vec<String>,
+    pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub successful_tool_calls: &'a mut usize,
     pub total_successful_tool_calls: &'a mut usize,
     pub tool_call_count: &'a mut HashMap<String, usize>,
@@ -61,11 +61,11 @@ impl Agent {
 
         if let Some(until_iteration) = ctx.tool_cooldown_until_iteration.get(&tc.name).copied() {
             if ctx.iteration <= until_iteration {
-                let result_text = format!(
-                    "[SYSTEM] Tool '{}' is in transient-failure cooldown until iteration {}. \
-                     Do not call it yet; use a different approach first.",
-                    tc.name, until_iteration
-                );
+                let result_text = ToolResultNotice::ToolCooldownBlocked {
+                    tool_name: tc.name.clone(),
+                    until_iteration,
+                }
+                .render();
                 let tool_msg = Message {
                     id: Uuid::new_v4().to_string(),
                     session_id: ctx.session_id.to_string(),
@@ -76,7 +76,7 @@ impl Agent {
                     tool_calls_json: None,
                     created_at: Utc::now(),
                     importance: 0.1,
-                    embedding: None,
+                    ..Message::runtime_defaults()
                 };
                 self.append_tool_message_with_result_event(
                     ctx.emitter,
@@ -101,48 +101,32 @@ impl Agent {
         let failure_limit = semantic_failure_limit(&tc.name);
         let blocked = if ctx.unknown_tools.contains(&tc.name) {
             // Tool doesn't exist — block immediately, no retries.
-            Some(format!(
-                "[SYSTEM] '{}' is not a real tool. It does NOT exist. \
-                 You MUST use one of the actual available tools or respond with text. \
-                 Do NOT invent tool names.",
-                tc.name
-            ))
+            Some(
+                ToolResultNotice::UnknownToolInvented {
+                    tool_name: tc.name.clone(),
+                }
+                .render(),
+            )
         } else if prior_signature_failures >= failure_limit {
-            Some(format!(
-                "[SYSTEM] Tool '{}' has hit the repeated semantic error limit ({}x same failure signature) \
-                 (and {} transient failures). \
-                 Do not call it again. Use a different approach or \
-                 answer the user with what you have.",
-                tc.name, prior_signature_failures, prior_transient_failures
-            ))
+            Some(
+                ToolResultNotice::SemanticErrorLimitBlocked {
+                    tool_name: tc.name.clone(),
+                    prior_signature_failures,
+                    prior_transient_failures,
+                }
+                .render(),
+            )
         } else if tc.name == "web_search" && prior_calls >= 3 {
-            Some(format!(
-                "[SYSTEM] You have already called web_search {} times. \
-                 Synthesize your answer from the results you have.",
-                prior_calls
-            ))
+            Some(ToolResultNotice::WebSearchBudgetBlocked { prior_calls }.render())
         } else if (tc.name == "web_search" || tc.name == "web_fetch") && combined_web_calls >= 6 {
-            Some(format!(
-                "[SYSTEM] You have made {} combined web calls (web_search + web_fetch). \
-                 Stop searching and synthesize your answer from the results you already have.",
-                combined_web_calls
-            ))
+            Some(ToolResultNotice::CombinedWebBudgetBlocked { combined_web_calls }.render())
         } else if tc.name == "web_fetch" && prior_calls >= 4 {
-            Some(format!(
-                "[SYSTEM] You have already called web_fetch {} times. \
-                 Synthesize your answer from the pages you have already fetched.",
-                prior_calls
-            ))
+            Some(ToolResultNotice::WebFetchBudgetBlocked { prior_calls }.render())
         } else if tc.name == "spawn_agent" && prior_calls >= 15 {
             // spawn_agent gets a higher cap than generic tools since task leads
             // legitimately spawn many executors, but it must still be bounded
             // to prevent runaway LLM agent spawns.
-            Some(format!(
-                "[SYSTEM] You have already spawned {} sub-agents this turn. \
-                 This is the maximum. Synthesize results from the agents you \
-                 have already spawned and respond to the user.",
-                prior_calls
-            ))
+            Some(ToolResultNotice::SpawnAgentBudgetBlocked { prior_calls }.render())
         } else if prior_calls >= 8
             && !matches!(
                 tc.name.as_str(),
@@ -160,37 +144,18 @@ impl Agent {
         // MCP tools (prefix__name)
         {
             if tc.name == "web_search" && prior_signature_failures == 0 {
-                Some(format!(
-                    "[SYSTEM] web_search returned no useful results {} times. \
-                     The DuckDuckGo backend is likely blocked.\n\n\
-                     Tell the user web search is not working and suggest they set up Brave Search:\n\
-                     1. Get a free API key at https://brave.com/search/api/ (free tier = 2000 queries/month)\n\
-                     2. Paste the API key in this chat\n\n\
-                     When the user provides a Brave API key, use manage_config to:\n\
-                     - set search.backend to '\"brave\"'\n\
-                     - set search.api_key to '\"THEIR_KEY\"'\n\
-                     Then tell them to type /reload to apply the changes.",
-                    prior_calls
-                ))
+                Some(ToolResultNotice::WebSearchBackendSetupHint { prior_calls }.render())
             } else if tc.name == "project_inspect" {
-                Some(format!(
-                    "[SYSTEM] You have already called project_inspect {} times this turn. \
-                     Do not call project_inspect again now.\n\n\
-                     Move forward by synthesizing what you already learned, then:\n\
-                     - use search_files/read_file on the most relevant directories\n\
-                     - ask the user to narrow scope if many folders remain\n\
-                     - if you need many directories in one pass next turn, call project_inspect \
-                       once with {{\"paths\":[\"/dir1\",\"/dir2\",...]}}.",
-                    prior_calls
-                ))
+                Some(ToolResultNotice::ProjectInspectBudgetBlocked { prior_calls }.render())
             } else {
                 // terminal is expected to be called many times; others are suspicious
-                Some(format!(
-                    "[SYSTEM] You have already called '{}' {} times this turn. \
-                     Do not call it again. Use the results you already have to \
-                     answer the user's question now.",
-                    tc.name, prior_calls
-                ))
+                Some(
+                    ToolResultNotice::GenericToolBudgetBlocked {
+                        tool_name: tc.name.clone(),
+                        prior_calls,
+                    }
+                    .render(),
+                )
             }
         } else {
             None
@@ -231,7 +196,7 @@ impl Agent {
             tool_calls_json: None,
             created_at: Utc::now(),
             importance: 0.1,
-            embedding: None,
+            ..Message::runtime_defaults()
         };
 
         self.append_tool_message_with_result_event(
@@ -280,10 +245,8 @@ impl Agent {
         // a file-delivery loop. Force the remainder of this task into text-only
         // mode so it closes out instead of re-emitting more file sends.
         *ctx.force_text_response = true;
-        ctx.pending_system_messages.push(
-            "[SYSTEM] The requested file was already sent in this task. Stop calling send_file and reply with plain text only."
-                .to_string(),
-        );
+        ctx.pending_system_messages
+            .push(SystemDirective::DuplicateSendFileAlreadySent);
 
         // Count as a successful no-op so stall detection doesn't
         // treat idempotency suppression as lack of progress.
@@ -329,7 +292,7 @@ impl Agent {
             tool_calls_json: None,
             created_at: Utc::now(),
             importance: 0.3,
-            embedding: None,
+            ..Message::runtime_defaults()
         };
         self.append_tool_message_with_result_event(
             ctx.emitter,

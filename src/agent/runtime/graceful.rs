@@ -20,8 +20,9 @@ pub(super) struct GoalBudgetControlCtx<'a> {
     pub consecutive_same_tool_count: usize,
     pub consecutive_same_tool_unique_args: usize,
     pub total_successful_tool_calls: usize,
-    pub pending_system_messages: &'a mut Vec<String>,
+    pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
+    pub is_scheduled_goal: bool,
     pub effective_goal_daily_budget: &'a mut Option<i64>,
     pub budget_extensions_count: &'a mut usize,
     pub max_budget_extensions: usize,
@@ -34,6 +35,33 @@ pub(super) enum GoalBudgetControlOutcome {
     Exhausted {
         tokens_used_today: i64,
         budget_daily: i64,
+    },
+}
+
+pub(super) struct ScheduledRunBudgetControlCtx<'a> {
+    pub emitter: &'a crate::events::EventEmitter,
+    pub task_id: &'a str,
+    pub session_id: &'a str,
+    pub iteration: usize,
+    pub goal_id: &'a str,
+    pub status: &'a crate::goal_tokens::GoalRunBudgetStatus,
+    pub user_role: UserRole,
+    pub learning_ctx: &'a LearningContext,
+    pub evidence_gain_count: usize,
+    pub stall_count: usize,
+    pub consecutive_same_tool_count: usize,
+    pub consecutive_same_tool_unique_args: usize,
+    pub total_successful_tool_calls: usize,
+    pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
+    pub max_budget_extensions: usize,
+    pub hard_token_cap: i64,
+}
+
+pub(super) enum ScheduledRunBudgetControlOutcome {
+    Continue,
+    Exhausted {
+        tokens_used: i64,
+        budget_per_check: i64,
     },
 }
 
@@ -131,7 +159,15 @@ impl Agent {
         let Some(db_budget_daily) = ctx.status.budget_daily else {
             return GoalBudgetControlOutcome::Continue;
         };
-        let budget_daily = ctx.effective_goal_daily_budget.unwrap_or(db_budget_daily);
+        let shared_budget_daily = if let Some(registry) = &self.goal_token_registry {
+            registry.get_effective_daily_budget(ctx.goal_id).await
+        } else {
+            None
+        };
+        let budget_daily = (*ctx.effective_goal_daily_budget)
+            .or(shared_budget_daily)
+            .unwrap_or(db_budget_daily);
+        *ctx.effective_goal_daily_budget = Some(budget_daily);
         if budget_daily <= 0 || ctx.status.tokens_used_today < budget_daily {
             return GoalBudgetControlOutcome::Continue;
         }
@@ -142,14 +178,19 @@ impl Agent {
             .max(ctx.status.tokens_used_today.saturating_add(old_gbudget / 2))
             .min(ctx.hard_token_cap);
 
-        let productive = ctx.evidence_gain_count >= 2
-            && post_task::is_productive(
-                ctx.learning_ctx,
-                ctx.stall_count,
-                ctx.consecutive_same_tool_count,
-                ctx.consecutive_same_tool_unique_args,
-                ctx.total_successful_tool_calls,
-            );
+        let productive = if ctx.is_scheduled_goal {
+            (ctx.total_successful_tool_calls >= 1 || ctx.evidence_gain_count >= 1)
+                && ctx.stall_count == 0
+        } else {
+            ctx.evidence_gain_count >= 2
+                && post_task::is_productive(
+                    ctx.learning_ctx,
+                    ctx.stall_count,
+                    ctx.consecutive_same_tool_count,
+                    ctx.consecutive_same_tool_unique_args,
+                    ctx.total_successful_tool_calls,
+                )
+        };
 
         let (auto_condition, manual_condition, source_label) = match ctx.source {
             GoalBudgetCheckSource::PreCheck => (
@@ -171,6 +212,11 @@ impl Agent {
         {
             *ctx.budget_extensions_count += 1;
             *ctx.effective_goal_daily_budget = Some(new_gbudget);
+            if let Some(registry) = &self.goal_token_registry {
+                registry
+                    .set_effective_daily_budget(ctx.goal_id, new_gbudget)
+                    .await;
+            }
             info!(
                 ctx.session_id,
                 goal_id = %ctx.goal_id,
@@ -180,11 +226,13 @@ impl Agent {
                 source = source_label,
                 "Auto-extended goal daily token budget in-memory"
             );
-            ctx.pending_system_messages.push(format!(
-                "[SYSTEM] Goal daily token budget auto-extended from {} to {} ({}/{} extensions). \
-                 Continue working.",
-                old_gbudget, new_gbudget, *ctx.budget_extensions_count, ctx.max_budget_extensions
-            ));
+            ctx.pending_system_messages
+                .push(SystemDirective::GoalDailyBudgetAutoExtended {
+                    old_budget: old_gbudget,
+                    new_budget: new_gbudget,
+                    extension: *ctx.budget_extensions_count,
+                    max_extensions: ctx.max_budget_extensions,
+                });
             send_status(
                 ctx.status_tx,
                 StatusUpdate::BudgetExtended {
@@ -230,11 +278,16 @@ impl Agent {
 
         if approved_extension {
             *ctx.effective_goal_daily_budget = Some(new_gbudget);
-            ctx.pending_system_messages.push(format!(
-                "[SYSTEM] Goal daily token budget extension approved by owner: {} -> {}. \
-                 Continue working.",
-                old_gbudget, new_gbudget
-            ));
+            if let Some(registry) = &self.goal_token_registry {
+                registry
+                    .set_effective_daily_budget(ctx.goal_id, new_gbudget)
+                    .await;
+            }
+            ctx.pending_system_messages
+                .push(SystemDirective::GoalDailyBudgetExtensionApproved {
+                    old_budget: old_gbudget,
+                    new_budget: new_gbudget,
+                });
             self.emit_decision_point(
                 ctx.emitter,
                 ctx.task_id,
@@ -259,6 +312,165 @@ impl Agent {
         }
     }
 
+    fn scheduled_run_is_clearly_unproductive(
+        learning_ctx: &LearningContext,
+        stall_count: usize,
+        consecutive_same_tool_count: usize,
+        consecutive_same_tool_unique_args: usize,
+        total_successful_tool_calls: usize,
+        evidence_gain_count: usize,
+    ) -> bool {
+        if stall_count > 1 {
+            return true;
+        }
+
+        let diverse_limit = MAX_CONSECUTIVE_SAME_TOOL + 4;
+        if consecutive_same_tool_count >= diverse_limit {
+            return true;
+        }
+        if consecutive_same_tool_count >= MAX_CONSECUTIVE_SAME_TOOL {
+            let is_diverse = consecutive_same_tool_unique_args * 2 > consecutive_same_tool_count;
+            if !is_diverse {
+                return true;
+            }
+        }
+
+        let unrecovered = learning_ctx
+            .errors
+            .iter()
+            .filter(|(_, recovered)| !recovered)
+            .count();
+
+        if total_successful_tool_calls == 0 {
+            return unrecovered > 0 && evidence_gain_count == 0;
+        }
+
+        unrecovered >= total_successful_tool_calls
+    }
+
+    pub(super) async fn enforce_scheduled_run_budget_control(
+        &self,
+        ctx: &mut ScheduledRunBudgetControlCtx<'_>,
+    ) -> ScheduledRunBudgetControlOutcome {
+        let budget_per_check = ctx.status.effective_budget_per_check;
+        if budget_per_check <= 0 || ctx.status.tokens_used < budget_per_check {
+            return ScheduledRunBudgetControlOutcome::Continue;
+        }
+
+        let old_budget = budget_per_check;
+        let new_budget = old_budget
+            .saturating_mul(2)
+            .max(ctx.status.tokens_used.saturating_add(old_budget / 2))
+            .min(ctx.hard_token_cap);
+
+        let clearly_unproductive = Self::scheduled_run_is_clearly_unproductive(
+            ctx.learning_ctx,
+            ctx.stall_count,
+            ctx.consecutive_same_tool_count,
+            ctx.consecutive_same_tool_unique_args,
+            ctx.total_successful_tool_calls,
+            ctx.evidence_gain_count,
+        );
+
+        if ctx.status.budget_extensions_count < ctx.max_budget_extensions
+            && old_budget < ctx.hard_token_cap
+            && new_budget > ctx.status.tokens_used
+            && !clearly_unproductive
+        {
+            if let Some(registry) = &self.goal_token_registry {
+                let updated = registry
+                    .auto_extend_run_budget(ctx.goal_id, new_budget)
+                    .await;
+                if let Some(status) = updated.as_ref() {
+                    persist_scheduled_run_state(&self.state, ctx.goal_id, None, status).await;
+                }
+                let extension = updated
+                    .as_ref()
+                    .map(|status| status.budget_extensions_count)
+                    .unwrap_or_else(|| ctx.status.budget_extensions_count.saturating_add(1));
+                info!(
+                    ctx.session_id,
+                    goal_id = %ctx.goal_id,
+                    old_budget,
+                    new_budget,
+                    extension,
+                    "Auto-extended scheduled run budget"
+                );
+                send_status(
+                    ctx.status_tx,
+                    StatusUpdate::BudgetExtended {
+                        old_budget,
+                        new_budget,
+                        extension,
+                        max_extensions: ctx.max_budget_extensions,
+                    },
+                );
+                self.emit_decision_point(
+                    ctx.emitter,
+                    ctx.task_id,
+                    ctx.iteration,
+                    DecisionType::BudgetAutoExtension,
+                    "Auto-extended scheduled run budget on continued progress".to_string(),
+                    json!({
+                        "condition": "scheduled_run_budget_extension",
+                        "goal_id": ctx.goal_id,
+                        "old_budget": old_budget,
+                        "new_budget": new_budget,
+                        "extension": extension,
+                        "max_extensions": ctx.max_budget_extensions,
+                        "tokens_used": ctx.status.tokens_used,
+                    }),
+                )
+                .await;
+                return ScheduledRunBudgetControlOutcome::Continue;
+            }
+        }
+
+        let approved_extension =
+            if old_budget < ctx.hard_token_cap && new_budget > ctx.status.tokens_used {
+                self.request_budget_continue_approval(
+                    ctx.session_id,
+                    ctx.user_role,
+                    "scheduled run",
+                    ctx.status.tokens_used,
+                    old_budget,
+                    new_budget,
+                )
+                .await
+            } else {
+                false
+            };
+
+        if approved_extension {
+            if let Some(registry) = &self.goal_token_registry {
+                if let Some(status) = registry.set_run_budget(ctx.goal_id, new_budget).await {
+                    persist_scheduled_run_state(&self.state, ctx.goal_id, None, &status).await;
+                }
+            }
+            self.emit_decision_point(
+                ctx.emitter,
+                ctx.task_id,
+                ctx.iteration,
+                DecisionType::BudgetAutoExtension,
+                "Extended scheduled run budget via owner approval".to_string(),
+                json!({
+                    "condition": "scheduled_run_budget_extension_manual",
+                    "goal_id": ctx.goal_id,
+                    "old_budget": old_budget,
+                    "new_budget": new_budget,
+                    "tokens_used": ctx.status.tokens_used,
+                }),
+            )
+            .await;
+            return ScheduledRunBudgetControlOutcome::Continue;
+        }
+
+        ScheduledRunBudgetControlOutcome::Exhausted {
+            tokens_used: ctx.status.tokens_used,
+            budget_per_check,
+        }
+    }
+
     async fn append_graceful_assistant_summary(
         &self,
         emitter: &crate::events::EventEmitter,
@@ -275,7 +487,7 @@ impl Agent {
             tool_calls_json: None,
             created_at: Utc::now(),
             importance: 0.5,
-            embedding: None,
+            ..Message::runtime_defaults()
         };
         self.append_assistant_message_with_event(emitter, &assistant_msg, "system", None, None)
             .await?;
@@ -308,6 +520,24 @@ impl Agent {
             .await
     }
 
+    /// Graceful response when a scheduled run hits its per-run budget.
+    pub(super) async fn graceful_scheduled_run_budget_response(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        session_id: &str,
+        learning_ctx: &LearningContext,
+        tokens_used: i64,
+        budget_per_check: i64,
+    ) -> anyhow::Result<String> {
+        let summary = post_task::graceful_scheduled_run_budget_response(
+            learning_ctx,
+            tokens_used,
+            budget_per_check,
+        );
+        self.append_graceful_assistant_summary(emitter, session_id, summary)
+            .await
+    }
+
     /// Graceful response when a goal hits its daily token budget.
     pub(super) async fn graceful_goal_daily_budget_response(
         &self,
@@ -316,11 +546,13 @@ impl Agent {
         learning_ctx: &LearningContext,
         tokens_used_today: i64,
         budget_daily: i64,
+        is_scheduled_goal: bool,
     ) -> anyhow::Result<String> {
         let summary = post_task::graceful_goal_daily_budget_response(
             learning_ctx,
             tokens_used_today,
             budget_daily,
+            is_scheduled_goal,
         );
         self.append_graceful_assistant_summary(emitter, session_id, summary)
             .await

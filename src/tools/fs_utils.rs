@@ -45,6 +45,33 @@ pub const SENSITIVE_PATTERNS: &[&str] = &[
     "id_ed25519",
 ];
 
+/// Files/directories that strongly indicate a project/workspace root.
+pub const PROJECT_ROOT_MARKERS: &[&str] = &[
+    ".git",
+    "Cargo.toml",
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "yarn.lock",
+    "pyproject.toml",
+    "requirements.txt",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Gemfile",
+    "composer.json",
+    "CMakeLists.txt",
+    "deno.json",
+    "deno.jsonc",
+    "bun.lockb",
+    "wrangler.toml",
+    "mix.exs",
+    "pubspec.yaml",
+    "Package.swift",
+];
+
 /// Resolves `~` and validates path safety. Returns canonical path.
 pub fn validate_path(path: &str) -> anyhow::Result<PathBuf> {
     let expanded = shellexpand::tilde(path).to_string();
@@ -68,6 +95,262 @@ pub fn validate_path(path: &str) -> anyhow::Result<PathBuf> {
     }
 
     Ok(normalized)
+}
+
+/// Returns true if the first directory component after root exists on disk.
+/// `/tmp/notes_api` -> checks `/tmp` (exists) -> true
+/// `/api/notes` -> checks `/api` (doesn't exist) -> false
+pub fn first_dir_component_exists(path: &Path) -> bool {
+    use std::path::Component;
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::RootDir) => {}
+        _ => return true, // relative paths are assumed valid
+    }
+    match components.next() {
+        Some(comp) => Path::new("/").join(comp).exists(),
+        None => true, // bare "/" is fine
+    }
+}
+
+/// Returns true when a path string likely refers to a file rather than a directory.
+pub fn path_points_to_file(raw_path: &str) -> bool {
+    Path::new(raw_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name.contains('.') && !name.starts_with('.') && !name.ends_with('.'))
+}
+
+fn path_root_looks_like_project(dir: &Path) -> bool {
+    PROJECT_ROOT_MARKERS
+        .iter()
+        .any(|marker| dir.join(marker).exists())
+}
+
+/// Find the nearest ancestor that looks like a project root.
+pub fn find_nearest_project_root(path: &Path) -> Option<PathBuf> {
+    let mut current = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    if !current.exists() {
+        return None;
+    }
+
+    loop {
+        if path_root_looks_like_project(&current) {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Normalize a user/tool-supplied scope path.
+/// If the path points into an existing project subtree, promote it to the nearest
+/// recognizable project root so builds/deploys can reach repo-level files.
+pub fn normalize_project_scope_path(path: &str) -> anyhow::Result<PathBuf> {
+    let mut normalized = validate_path(path)?;
+    if !first_dir_component_exists(&normalized) {
+        anyhow::bail!(
+            "Path does not look like a real filesystem location: {}",
+            path
+        );
+    }
+
+    let trimmed = path.trim_end_matches('/');
+    if normalized.is_file() || (!normalized.exists() && path_points_to_file(trimmed)) {
+        if let Some(parent) = normalized.parent() {
+            normalized = parent.to_path_buf();
+        }
+    }
+
+    if normalized.exists() {
+        if let Some(root) = find_nearest_project_root(&normalized) {
+            normalized = root;
+        }
+    }
+
+    Ok(normalized)
+}
+
+pub fn token_is_absolute_like(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let looks_windows_abs = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    token.starts_with('/')
+        || token.starts_with("~/")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || looks_windows_abs
+}
+
+fn push_unique_search_root(roots: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if candidate.is_dir() && !roots.iter().any(|existing| existing == &candidate) {
+        roots.push(candidate);
+    }
+}
+
+pub fn project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for raw_root in alias_roots {
+        let Ok(root) = validate_path(raw_root) else {
+            continue;
+        };
+        push_unique_search_root(&mut roots, root);
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.file_name().is_some_and(|name| name == "projects") {
+            push_unique_search_root(&mut roots, cwd.clone());
+        }
+        push_unique_search_root(&mut roots, cwd.join("projects"));
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        push_unique_search_root(&mut roots, home.join("projects"));
+    }
+
+    roots
+}
+
+pub fn resolve_projects_folder_alias(raw_path: &str, alias_roots: &[String]) -> Option<PathBuf> {
+    let trimmed = raw_path.trim();
+    if token_is_absolute_like(trimmed) {
+        return None;
+    }
+    let relative = trimmed
+        .strip_prefix("./")
+        .unwrap_or(trimmed)
+        .trim_start_matches('/');
+    let starts_with_projects =
+        relative.starts_with("projects/") || relative.starts_with("projects\\");
+    if !starts_with_projects {
+        return None;
+    }
+
+    let suffix = relative
+        .strip_prefix("projects/")
+        .or_else(|| relative.strip_prefix("projects\\"))
+        .unwrap_or("");
+    for root in project_search_roots(alias_roots) {
+        let candidate = if suffix.is_empty() {
+            root
+        } else {
+            root.join(suffix.replace('\\', "/"))
+        };
+        if candidate.parent().is_some_and(|parent| parent.is_dir()) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn token_looks_like_named_project(raw: &str) -> bool {
+    let token = raw
+        .trim_matches(|c: char| c.is_ascii_whitespace() || c == '`' || c == '\'' || c == '"')
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.')
+        .trim_end_matches(['.', '!', '?'])
+        .to_ascii_lowercase();
+    if token.is_empty()
+        || token.contains("://")
+        || token.contains('/')
+        || token.contains('\\')
+        || token.len() < 3
+    {
+        return false;
+    }
+    if !token.chars().any(|c| c.is_ascii_alphabetic()) || token.chars().all(|c| c.is_ascii_digit())
+    {
+        return false;
+    }
+    token.contains('.')
+        || token.contains('-')
+        || token.contains('_')
+        || token.contains("project")
+        || token.starts_with("app")
+        || token.ends_with("app")
+}
+
+pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Option<PathBuf> {
+    let token = raw_name
+        .trim_matches(|c: char| c.is_ascii_whitespace() || c == '`' || c == '\'' || c == '"')
+        .trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'))
+        .trim_end_matches(['.', '!', '?'])
+        .trim();
+    if !token_looks_like_named_project(token) {
+        return None;
+    }
+
+    let target = token.to_ascii_lowercase();
+    for root in project_search_roots(alias_roots) {
+        let direct = root.join(token);
+        if direct.is_dir() {
+            if let Ok(normalized) = normalize_project_scope_path(direct.to_string_lossy().as_ref())
+            {
+                return Some(normalized);
+            }
+        }
+
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name != target {
+                continue;
+            }
+            if let Ok(normalized) = normalize_project_scope_path(path.to_string_lossy().as_ref()) {
+                return Some(normalized);
+            }
+        }
+    }
+    None
+}
+
+pub fn resolve_project_scope_reference(raw: &str, alias_roots: &[String]) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let looks_path_like =
+        token_is_absolute_like(trimmed) || trimmed.contains('/') || trimmed.contains('\\');
+    if looks_path_like {
+        let path_for_resolution = if token_is_absolute_like(trimmed) {
+            trimmed.to_string()
+        } else {
+            let cwd_relative = validate_path(trimmed).ok();
+            if let Some(candidate) = cwd_relative {
+                if candidate.exists() {
+                    candidate.to_string_lossy().to_string()
+                } else if let Some(alias_candidate) =
+                    resolve_projects_folder_alias(trimmed, alias_roots)
+                {
+                    alias_candidate.to_string_lossy().to_string()
+                } else {
+                    candidate.to_string_lossy().to_string()
+                }
+            } else if let Some(alias_candidate) =
+                resolve_projects_folder_alias(trimmed, alias_roots)
+            {
+                alias_candidate.to_string_lossy().to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        return normalize_project_scope_path(&path_for_resolution).ok();
+    }
+
+    resolve_named_project_root(trimmed, alias_roots)
 }
 
 /// Returns true if the path matches any sensitive pattern.
@@ -354,6 +637,103 @@ mod tests {
             "validate_path(\"src/.\") should not end with trailing dot, got: {}",
             result_str
         );
+    }
+
+    #[test]
+    fn test_first_dir_component_exists() {
+        assert!(first_dir_component_exists(Path::new("/tmp/test")));
+        assert!(!first_dir_component_exists(Path::new("/api/notes")));
+        assert!(first_dir_component_exists(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn test_path_points_to_file() {
+        assert!(path_points_to_file("src/main.rs"));
+        assert!(path_points_to_file("/tmp/app/package.json"));
+        assert!(!path_points_to_file("/tmp/app/src"));
+        assert!(!path_points_to_file(".hidden"));
+    }
+
+    #[test]
+    fn test_find_nearest_project_root_prefers_nearest_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let app = root.join("apps").join("web");
+        let src = app.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(root.join("pnpm-workspace.yaml"), "packages:\n  - apps/*\n").unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name":"web"}"#).unwrap();
+
+        let found = find_nearest_project_root(&src).expect("nearest project root");
+        assert_eq!(found, app);
+    }
+
+    #[test]
+    fn test_normalize_project_scope_path_promotes_existing_subdir_to_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(root.join("package.json"), r#"{"name":"demo"}"#).unwrap();
+
+        let normalized =
+            normalize_project_scope_path(src.to_string_lossy().as_ref()).expect("normalized");
+        assert_eq!(normalized, root);
+    }
+
+    #[test]
+    fn test_normalize_project_scope_path_keeps_non_project_target_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("new-site");
+        let normalized =
+            normalize_project_scope_path(target.to_string_lossy().as_ref()).expect("normalized");
+        assert_eq!(normalized, target);
+    }
+
+    #[test]
+    fn test_normalize_project_scope_path_preserves_existing_dotted_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("blog.aidaemon.ai");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("wrangler.toml"), "name = \"blog\"\n").unwrap();
+
+        let normalized =
+            normalize_project_scope_path(target.to_string_lossy().as_ref()).expect("normalized");
+        assert_eq!(normalized, target);
+    }
+
+    #[test]
+    fn test_resolve_named_project_root_from_alias_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias_root = dir.path().join("projects");
+        let project = alias_root.join("blog.aidaemon.ai");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("wrangler.toml"), "name = \"blog\"\n").unwrap();
+
+        let resolved = resolve_named_project_root(
+            "blog.aidaemon.ai",
+            &[alias_root.to_string_lossy().to_string()],
+        )
+        .expect("resolved");
+        assert_eq!(resolved, project);
+    }
+
+    #[test]
+    fn test_resolve_project_scope_reference_handles_named_and_projects_alias_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias_root = dir.path().join("projects");
+        let project = alias_root.join("blog.aidaemon.ai");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("wrangler.toml"), "name = \"blog\"\n").unwrap();
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        let named = resolve_project_scope_reference("blog.aidaemon.ai", &alias_roots)
+            .expect("named project");
+        assert_eq!(named, project);
+
+        let aliased = resolve_project_scope_reference("projects/blog.aidaemon.ai", &alias_roots)
+            .expect("aliased project");
+        assert_eq!(aliased, project);
     }
 
     #[test]

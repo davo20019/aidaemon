@@ -4,23 +4,11 @@ use std::hash::{Hash, Hasher};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use tracing::warn;
 
-pub(super) fn strip_appended_diagnostics(raw: &str) -> &str {
-    // Keep only the "core" tool output so pattern extraction and retrieval don't
-    // get polluted by injected meta blocks.
-    const MARKERS: [&str; 3] = ["\n\n[DIAGNOSTIC]", "\n\n[TOOL STATS]", "\n\n[SYSTEM]"];
-    let mut cut_at: Option<usize> = None;
-    for m in MARKERS {
-        if let Some(idx) = raw.find(m) {
-            cut_at = Some(cut_at.map(|c| c.min(idx)).unwrap_or(idx));
-        }
-    }
-    let trimmed = match cut_at {
-        Some(idx) => &raw[..idx],
-        None => raw,
-    };
-    trimmed.trim()
+pub(super) fn strip_appended_diagnostics(raw: &str) -> Cow<'_, str> {
+    crate::traits::extract_primary_message_content(raw, &[])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,7 +268,8 @@ fn extract_httpbin_status_hint_from_command(command: &str) -> Option<u16> {
 }
 
 fn looks_like_empty_tool_output(text: &str) -> bool {
-    let cleaned = strip_appended_diagnostics(text).trim();
+    let cleaned = strip_appended_diagnostics(text);
+    let cleaned = cleaned.trim();
     cleaned.is_empty() || cleaned.eq_ignore_ascii_case("(no output)")
 }
 
@@ -356,7 +345,7 @@ fn extract_nonzero_exit_code(text: &str) -> Option<i32> {
 fn is_data_content_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "read_file" | "search_files" | "read_channel_history" | "web_search"
+        "read_file" | "search_files" | "read_channel_history" | "web_search" | "policy_metrics"
     )
 }
 
@@ -364,7 +353,8 @@ pub(super) fn classify_tool_result_failure(
     tool_name: &str,
     result_text: &str,
 ) -> Option<ToolFailureClass> {
-    let cleaned = strip_appended_diagnostics(result_text).trim();
+    let cleaned = strip_appended_diagnostics(result_text);
+    let cleaned = cleaned.trim();
     if cleaned.is_empty() {
         return None;
     }
@@ -731,6 +721,18 @@ mod tool_error_detection_tests {
         let result = r#"{"error":"invalid arguments: missing required field"}"#;
         let classified = classify_tool_result_failure("manage_memories", result);
         assert_eq!(classified, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn policy_metrics_output_not_classified_as_error() {
+        // policy_metrics returns JSON with field names like "tokens_failed_tasks_total"
+        // and "llm_payload_invalid_total" — these should NOT be classified as errors.
+        let result = r#"{"metrics":{"tokens_failed_tasks_total":0,"llm_payload_invalid_total":0,"no_progress_iterations_total":0},"derived":{"consultant_total":5}}"#;
+        let classified = classify_tool_result_failure("policy_metrics", result);
+        assert_eq!(
+            classified, None,
+            "policy_metrics output should not be classified as an error"
+        );
     }
 
     #[test]

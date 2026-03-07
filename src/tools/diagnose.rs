@@ -2179,6 +2179,7 @@ mod tests {
                 model: "mock-fast".to_string(),
                 input_tokens: None,
                 output_tokens: None,
+                annotations: Vec::new(),
             },
             Some("parent-1"),
         )
@@ -2261,6 +2262,7 @@ mod tests {
                 duration_ms: 10,
                 error: None,
                 task_id: Some("t1".to_string()),
+                annotations: Vec::new(),
             },
             Some("t1"),
         )

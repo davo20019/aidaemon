@@ -15,12 +15,19 @@ mod tools;
 mod trigger_event;
 
 pub use channels::{Channel, ChannelCapabilities};
-pub use conversation::{ConversationSummary, Message, ToolCall};
+#[allow(unused_imports)]
+pub use conversation::{
+    extract_primary_message_content, first_primary_message_line, infer_message_annotations,
+    message_content_is_structural_only, ConversationSummary, Message, MessageAnnotation, ToolCall,
+};
 pub use dynamic::{
     CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
     OAuthConnection, SkillDraft,
 };
-pub use goals::{Goal, GoalSchedule, GoalTokenBudgetStatus, NotificationEntry, Task, TaskActivity};
+pub use goals::{
+    Goal, GoalSchedule, GoalTokenBudgetStatus, NotificationEntry, ScheduledRunState, Task,
+    TaskActivity,
+};
 pub use memory::{
     BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Procedure, UserProfile,
 };

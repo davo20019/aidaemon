@@ -466,8 +466,8 @@ async fn test_orchestration_scheduled_recurring_creates_pending_confirmation() {
     assert_eq!(goals.len(), 1);
     assert_eq!(goals[0].goal_type, "continuous");
     assert_eq!(goals[0].status, "pending_confirmation");
-    assert_eq!(goals[0].budget_per_check, Some(50_000));
-    assert_eq!(goals[0].budget_daily, Some(200_000));
+    assert_eq!(goals[0].budget_per_check, Some(100_000));
+    assert_eq!(goals[0].budget_daily, Some(500_000));
     let schedules = harness
         .state
         .get_schedules_for_goal(&goals[0].id)

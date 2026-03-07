@@ -273,7 +273,21 @@ fn classify_followup_mode(
     (FollowupMode::NewTask, reasons)
 }
 
-fn has_project_scope_divergence(prev_user_text: &str, current: &str) -> bool {
+fn has_project_scope_divergence_with_aliases(
+    prev_user_text: &str,
+    current: &str,
+    alias_roots: &[String],
+) -> bool {
+    let mut prev_scopes = Vec::new();
+    let mut current_scopes = Vec::new();
+    extract_project_scopes_from_text(prev_user_text, &mut prev_scopes, 6, alias_roots);
+    extract_project_scopes_from_text(current, &mut current_scopes, 6, alias_roots);
+    if !prev_scopes.is_empty() && !current_scopes.is_empty() {
+        return !current_scopes
+            .iter()
+            .any(|scope| prev_scopes.iter().any(|prev| prev == scope));
+    }
+
     let mut prev_hints = Vec::new();
     let mut current_hints = Vec::new();
     extract_project_hints_from_text(prev_user_text, &mut prev_hints, 6, false);
@@ -408,61 +422,6 @@ fn token_looks_like_filesystem_path(token: &str) -> bool {
         || token.contains('/')
         || token.contains('\\')
         || looks_windows_abs
-}
-
-fn token_is_absolute_like(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    let looks_windows_abs = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/');
-    token.starts_with('/')
-        || token.starts_with("~/")
-        || token.starts_with("./")
-        || token.starts_with("../")
-        || looks_windows_abs
-}
-
-fn resolve_projects_folder_alias(raw_path: &str, alias_roots: &[String]) -> Option<String> {
-    if alias_roots.is_empty() {
-        return None;
-    }
-    let trimmed = raw_path.trim();
-    if token_is_absolute_like(trimmed) {
-        return None;
-    }
-    let relative = trimmed
-        .strip_prefix("./")
-        .unwrap_or(trimmed)
-        .trim_start_matches('/');
-    let starts_with_projects =
-        relative.starts_with("projects/") || relative.starts_with("projects\\");
-    if !starts_with_projects {
-        return None;
-    }
-
-    let suffix = relative
-        .strip_prefix("projects/")
-        .or_else(|| relative.strip_prefix("projects\\"))
-        .unwrap_or("");
-    for root in alias_roots {
-        let Ok(root_path) = crate::tools::fs_utils::validate_path(root) else {
-            continue;
-        };
-        if !root_path.is_dir() {
-            continue;
-        }
-        let candidate = if suffix.is_empty() {
-            root_path.clone()
-        } else {
-            root_path.join(suffix.replace('\\', "/"))
-        };
-        let parent_exists = candidate.parent().is_some_and(|parent| parent.is_dir());
-        if parent_exists {
-            return Some(candidate.to_string_lossy().to_string());
-        }
-    }
-    None
 }
 
 fn is_common_path_segment(token: &str) -> bool {
@@ -651,72 +610,8 @@ fn normalize_project_scope_path_with_aliases(
     raw_path: &str,
     alias_roots: &[String],
 ) -> Option<String> {
-    let trimmed = raw_path.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // Precedence:
-    // 1) explicit absolute/anchored path (always honor as-is)
-    // 2) existing relative path resolved from current working directory
-    // 3) configured alias roots for "projects/..."
-    let path_for_resolution = if token_is_absolute_like(trimmed) {
-        trimmed.to_string()
-    } else {
-        let cwd_relative = crate::tools::fs_utils::validate_path(trimmed).ok();
-        if let Some(candidate) = cwd_relative {
-            if candidate.exists() {
-                candidate.to_string_lossy().to_string()
-            } else if let Some(alias_candidate) =
-                resolve_projects_folder_alias(trimmed, alias_roots)
-            {
-                alias_candidate
-            } else {
-                candidate.to_string_lossy().to_string()
-            }
-        } else if let Some(alias_candidate) = resolve_projects_folder_alias(trimmed, alias_roots) {
-            alias_candidate
-        } else {
-            trimmed.to_string()
-        }
-    };
-    let mut normalized = crate::tools::fs_utils::validate_path(&path_for_resolution).ok()?;
-
-    // Reject paths whose first directory component doesn't exist on disk.
-    // This filters out API endpoint paths like /api/notes that aren't real
-    // filesystem locations.
-    if !first_dir_component_exists(&normalized) {
-        return None;
-    }
-
-    let trimmed = raw_path.trim_end_matches('/');
-    let file_name_looks_like_file = std::path::Path::new(trimmed)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .is_some_and(|name| name.contains('.') && !name.starts_with('.') && !name.ends_with('.'));
-    if file_name_looks_like_file || normalized.is_file() {
-        if let Some(parent) = normalized.parent() {
-            normalized = parent.to_path_buf();
-        }
-    }
-
-    Some(normalized.to_string_lossy().to_string())
-}
-
-/// Returns true if the first directory component after root exists on disk.
-/// `/tmp/notes_api` -> checks `/tmp` (exists) -> true
-/// `/api/notes` -> checks `/api` (doesn't exist) -> false
-fn first_dir_component_exists(path: &std::path::Path) -> bool {
-    use std::path::Component;
-    let mut components = path.components();
-    // Skip RootDir "/"
-    match components.next() {
-        Some(Component::RootDir) => {}
-        _ => return true, // relative paths are assumed valid
-    }
-    match components.next() {
-        Some(comp) => std::path::Path::new("/").join(comp).exists(),
-        None => true, // bare "/" is fine
-    }
+    crate::tools::fs_utils::resolve_project_scope_reference(raw_path, alias_roots)
+        .map(|path| path.to_string_lossy().to_string())
 }
 
 fn push_project_scope(scopes: &mut Vec<String>, scope: String, max_scopes: usize) {
@@ -758,10 +653,16 @@ fn extract_project_scopes_from_text(
                     )
             })
             .trim();
-        if token.is_empty() || token.contains("://") || !token_looks_like_filesystem_path(token) {
+        if token.is_empty() || token.contains("://") {
             continue;
         }
-        if let Some(scope) = normalize_project_scope_path_with_aliases(token, alias_roots) {
+        let scope = if token_looks_like_filesystem_path(token) {
+            normalize_project_scope_path_with_aliases(token, alias_roots)
+        } else {
+            crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
+                .map(|path| path.to_string_lossy().to_string())
+        };
+        if let Some(scope) = scope {
             push_project_scope(scopes, scope, max_scopes);
         }
     }
@@ -821,9 +722,13 @@ impl Agent {
 
         let mut goal_user_text = current.to_string();
         if followup_mode != FollowupMode::NewTask {
-            let mismatch_preflight_drop = prev_user
-                .as_deref()
-                .is_some_and(|prev| has_project_scope_divergence(prev, current));
+            let mismatch_preflight_drop = prev_user.as_deref().is_some_and(|prev| {
+                has_project_scope_divergence_with_aliases(
+                    prev,
+                    current,
+                    &self.path_aliases.projects,
+                )
+            });
             if mismatch_preflight_drop {
                 followup_mode = FollowupMode::NewTask;
                 reasons.push(TurnContextReason::FollowupOverrideMismatchPreflight);
@@ -905,13 +810,15 @@ impl Agent {
         channel_ctx: &ChannelContext,
         has_attachments: bool,
     ) -> anyhow::Result<()> {
+        let normalized_msg = msg.with_inferred_annotations();
         emitter
             .emit(
                 EventType::UserMessage,
                 json!({
-                    "content": msg.content.clone().unwrap_or_default(),
-                    "message_id": msg.id.clone(),
+                    "content": normalized_msg.content.clone().unwrap_or_default(),
+                    "message_id": normalized_msg.id.clone(),
                     "has_attachments": has_attachments,
+                    "annotations": normalized_msg.annotations.clone(),
                     // Provenance for downstream projections/consolidation.
                     "channel_visibility": channel_ctx.visibility.to_string(),
                     "channel_id": channel_ctx.channel_id.clone(),
@@ -920,7 +827,8 @@ impl Agent {
                 }),
             )
             .await?;
-        self.append_message_canonical(msg).await?;
+        self.append_message_canonical(normalized_msg.as_ref())
+            .await?;
         Ok(())
     }
 
@@ -932,7 +840,8 @@ impl Agent {
         input_tokens: Option<u32>,
         output_tokens: Option<u32>,
     ) -> anyhow::Result<()> {
-        let tool_calls = msg.tool_calls_json.as_ref().and_then(|raw| {
+        let normalized_msg = msg.with_inferred_annotations();
+        let tool_calls = normalized_msg.tool_calls_json.as_ref().and_then(|raw| {
             serde_json::from_str::<Vec<ToolCall>>(raw)
                 .ok()
                 .map(|calls| {
@@ -952,16 +861,18 @@ impl Agent {
             .emit(
                 EventType::AssistantResponse,
                 AssistantResponseData {
-                    message_id: Some(msg.id.clone()),
-                    content: msg.content.clone(),
+                    message_id: Some(normalized_msg.id.clone()),
+                    content: normalized_msg.content.clone(),
                     model: model.to_string(),
                     tool_calls,
                     input_tokens,
                     output_tokens,
+                    annotations: normalized_msg.annotations.clone(),
                 },
             )
             .await?;
-        self.append_message_canonical(msg).await?;
+        self.append_message_canonical(normalized_msg.as_ref())
+            .await?;
         Ok(())
     }
 
@@ -974,25 +885,31 @@ impl Agent {
         error: Option<String>,
         task_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        let normalized_msg = msg.with_inferred_annotations();
         emitter
             .emit(
                 EventType::ToolResult,
                 ToolResultData {
-                    message_id: Some(msg.id.clone()),
-                    tool_call_id: msg.tool_call_id.clone().unwrap_or_else(|| msg.id.clone()),
-                    name: msg
+                    message_id: Some(normalized_msg.id.clone()),
+                    tool_call_id: normalized_msg
+                        .tool_call_id
+                        .clone()
+                        .unwrap_or_else(|| normalized_msg.id.clone()),
+                    name: normalized_msg
                         .tool_name
                         .clone()
                         .unwrap_or_else(|| "system".to_string()),
-                    result: msg.content.clone().unwrap_or_default(),
+                    result: normalized_msg.content.clone().unwrap_or_default(),
                     success,
                     duration_ms,
                     error,
                     task_id: task_id.map(str::to_string),
+                    annotations: normalized_msg.annotations.clone(),
                 },
             )
             .await?;
-        self.append_message_canonical(msg).await?;
+        self.append_message_canonical(normalized_msg.as_ref())
+            .await?;
         Ok(())
     }
 
@@ -1064,7 +981,7 @@ mod tests {
             tool_calls_json: None,
             created_at: Utc::now(),
             importance: 0.5,
-            embedding: None,
+            ..Message::runtime_defaults()
         }
     }
 
@@ -1243,6 +1160,62 @@ mod tests {
     }
 
     #[test]
+    fn project_scope_normalization_promotes_existing_src_paths_to_repo_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("blog");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).expect("create src");
+        std::fs::write(root.join("wrangler.toml"), "name = \"blog\"\n").expect("wrangler");
+        std::fs::write(src.join("posts.js"), "export default [];\n").expect("posts");
+
+        let normalized = normalize_project_scope_path_with_aliases(
+            src.join("posts.js").to_string_lossy().as_ref(),
+            &[],
+        )
+        .expect("normalized");
+        assert_eq!(normalized, root.to_string_lossy());
+    }
+
+    #[test]
+    fn project_scope_extraction_resolves_named_project_roots() {
+        let history = vec![];
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects-root");
+        let project = alias_root.join("blog.aidaemon.ai");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"blog\"\n").expect("wrangler");
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        let scopes = extract_project_scopes_from_history(
+            &history,
+            "Deploy blog.aidaemon.ai",
+            4,
+            false,
+            &alias_roots,
+        );
+        assert_eq!(scopes, vec![project.to_string_lossy().to_string()]);
+    }
+
+    #[test]
+    fn named_project_scope_divergence_breaks_followup_carryover() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects-root");
+        let dogs = alias_root.join("dogs-project");
+        let blog = alias_root.join("blog.aidaemon.ai");
+        std::fs::create_dir_all(&dogs).expect("create dogs");
+        std::fs::create_dir_all(&blog).expect("create blog");
+        std::fs::write(dogs.join("package.json"), r#"{"name":"dogs"}"#).expect("dogs package");
+        std::fs::write(blog.join("wrangler.toml"), "name = \"blog\"\n").expect("blog wrangler");
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        assert!(has_project_scope_divergence_with_aliases(
+            "Deploy dogs-project",
+            "Now deploy blog.aidaemon.ai",
+            &alias_roots,
+        ));
+    }
+
+    #[test]
     fn recent_parent_messages_strip_intent_gate_payload() {
         let history = vec![
             msg("user", "Build a site"),
@@ -1322,12 +1295,12 @@ mod tests {
 
     #[test]
     fn first_dir_component_exists_filters_correctly() {
-        assert!(first_dir_component_exists(std::path::Path::new(
-            "/tmp/test"
-        )));
-        assert!(!first_dir_component_exists(std::path::Path::new(
-            "/api/notes"
-        )));
+        assert!(crate::tools::fs_utils::first_dir_component_exists(
+            std::path::Path::new("/tmp/test")
+        ));
+        assert!(!crate::tools::fs_utils::first_dir_component_exists(
+            std::path::Path::new("/api/notes")
+        ));
     }
 
     #[test]

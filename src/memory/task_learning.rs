@@ -50,7 +50,10 @@ pub async fn extract_task_knowledge(
                 let args_preview = act
                     .tool_args
                     .as_deref()
-                    .map(|a| &a[..a.len().min(200)])
+                    .map(|a| {
+                        let end = crate::utils::floor_char_boundary(a, 200);
+                        &a[..end]
+                    })
                     .unwrap_or("");
                 format!("TOOL_CALL: {} args={}\n", name, args_preview)
             }
@@ -60,7 +63,10 @@ pub async fn extract_task_knowledge(
                 let result_preview = act
                     .result
                     .as_deref()
-                    .map(|r| &r[..r.len().min(300)])
+                    .map(|r| {
+                        let end = crate::utils::floor_char_boundary(r, 300);
+                        &r[..end]
+                    })
                     .unwrap_or("");
                 format!(
                     "TOOL_RESULT: {} success={} result={}\n",

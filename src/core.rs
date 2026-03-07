@@ -11,7 +11,7 @@ use crate::config::AppConfig;
 use crate::daemon;
 
 use crate::health::HealthProbeManager;
-use crate::llm_runtime::{router_from_models, SharedLlmRuntime};
+use crate::llm_runtime::SharedLlmRuntime;
 use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
 use crate::queue_telemetry::QueueTelemetry;
 use crate::skills;
@@ -121,13 +121,16 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     let provider_router::ProviderRouterBundle {
         provider,
         primary_model: model,
-        ..
+        router,
+        provider_kind,
+        failover_targets,
     } = provider_router::build_provider_router(&config)?;
-    let llm_runtime = SharedLlmRuntime::new(
+    let llm_runtime = SharedLlmRuntime::new_with_failovers(
         provider.clone(),
-        router_from_models(config.provider.models.clone()),
-        config.provider.kind,
+        router,
+        provider_kind,
         model.clone(),
+        failover_targets,
     );
 
     let memory_pipeline::MemoryPipelineBundle {
@@ -1672,7 +1675,7 @@ information lookups should use memory first, then ask the user.
 | Trace tool activity directly (alias) | tool_trace | terminal (sqlite), browser |
 | Diagnose why a task failed (root cause + evidence) | self_diagnose | terminal/sqlite log forensics |
 | Read or change aidaemon config | manage_config | terminal (editing config.toml) |
-| Switch LLM provider with guided presets | manage_config (action=`switch_provider`) | manual multi-key config edits |
+| Switch primary or failover LLM providers with guided actions | manage_config (`switch_provider`, `list_failover_providers`, `add_failover_provider`, `remove_failover_provider`) | manual multi-key config edits |
 {send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_oauth_table_row}
 
 ## Tools
@@ -1702,7 +1705,8 @@ user (personal info), preference (tool/workflow prefs), project (current work), 
 add owner IDs (`set` key `users.owner_ids.telegram` etc.), change model names, \
 update API keys, toggle features, configure project path aliases (`set` key `path_aliases.projects`). \
 Use this tool directly for config operations. \
-For provider changes, prefer `action='switch_provider'` (guided, asks for minimal details). \
+For primary provider changes, prefer `action='switch_provider'` (guided, asks for minimal details). \
+For provider failover setup, use `action='list_failover_providers'`, `action='add_failover_provider'`, and `action='remove_failover_provider'`. \
 Use `action='list_provider_presets'` first when the user is unsure.
 - `scheduled_goal_runs`: Run and debug scheduled-goal executions without terminal/sqlite. \
 ONLY for recurring/scheduled goals and run diagnostics. Do NOT use for learning or storing facts. \
@@ -1729,6 +1733,7 @@ do not over-research.
 Telegram, Discord, and Slack are built into your binary. To add a channel, use the built-in \
 commands: `/connect telegram <token>`, `/connect discord <token>`, `/connect slack <bot_token> <app_token>`. \
 To edit config: use `manage_config`. For provider switches, prefer `manage_config(action='switch_provider')`. \
+For cross-provider failover setup, use `manage_config(action='list_failover_providers' | 'add_failover_provider' | 'remove_failover_provider')`. \
 After changes: tell user to run `/restart` (`!restart` in Slack). \
 In Slack, use `!` prefix for commands (e.g., `!restart`, `!reload`) since `/` is reserved by Slack.
 

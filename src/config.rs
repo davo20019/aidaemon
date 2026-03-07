@@ -412,6 +412,10 @@ pub struct ProviderConfig {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub models: ModelsConfig,
+    /// Ordered cross-provider fallback chain.
+    /// TOML key: `[[provider.fallbacks]]`
+    #[serde(default, alias = "failover")]
+    pub fallbacks: Vec<ProviderConfig>,
 }
 
 impl fmt::Debug for ProviderConfig {
@@ -430,7 +434,58 @@ impl fmt::Debug for ProviderConfig {
             )
             .field("max_tokens", &self.max_tokens)
             .field("models", &self.models)
+            .field("fallback_provider_count", &self.fallbacks.len())
             .finish()
+    }
+}
+
+impl ProviderConfig {
+    pub fn apply_model_defaults_recursive(&mut self) {
+        self.models.apply_defaults(&self.kind);
+        for fallback in &mut self.fallbacks {
+            fallback.apply_model_defaults_recursive();
+        }
+    }
+
+    fn resolve_secrets_recursive(&mut self, key_prefix: Option<&str>) -> anyhow::Result<()> {
+        let api_key_key = key_prefix
+            .map(|prefix| format!("{}_api_key", prefix))
+            .unwrap_or_else(|| "api_key".to_string());
+        if self.api_key == "keychain" {
+            self.api_key = resolve_from_keychain(&api_key_key)?;
+        }
+
+        let gateway_token_key = key_prefix
+            .map(|prefix| format!("{}_gateway_token", prefix))
+            .unwrap_or_else(|| "gateway_token".to_string());
+        if self.gateway_token.as_deref() == Some("keychain") {
+            self.gateway_token = Some(resolve_from_keychain(&gateway_token_key)?);
+        }
+
+        if let Some(headers) = self.extra_headers.as_mut() {
+            for (name, value) in headers.iter_mut() {
+                if value == "keychain" {
+                    let normalized_name = name
+                        .to_ascii_lowercase()
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                        .collect::<String>();
+                    let key = key_prefix
+                        .map(|prefix| format!("{}_header_{}", prefix, normalized_name))
+                        .unwrap_or_else(|| format!("provider_header_{}", normalized_name));
+                    *value = resolve_from_keychain(&key)?;
+                }
+            }
+        }
+
+        for (idx, fallback) in self.fallbacks.iter_mut().enumerate() {
+            let nested_prefix = key_prefix
+                .map(|prefix| format!("{}_fallback_{}", prefix, idx))
+                .unwrap_or_else(|| format!("provider_fallback_{}", idx));
+            fallback.resolve_secrets_recursive(Some(&nested_prefix))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -2254,7 +2309,7 @@ impl AppConfig {
         let content = std::fs::read_to_string(path)?;
         let expanded = expand_env_vars(&content)?;
         let mut config: AppConfig = toml::from_str(&expanded)?;
-        config.provider.models.apply_defaults(&config.provider.kind);
+        config.provider.apply_model_defaults_recursive();
         config.daemon.queue_policy = config.daemon.queue_policy.normalized();
         config.resolve_secrets()?;
         Ok(config)
@@ -2320,26 +2375,7 @@ impl AppConfig {
 
     /// Resolve fields set to `"keychain"` by reading them from the OS credential store.
     fn resolve_secrets(&mut self) -> anyhow::Result<()> {
-        if self.provider.api_key == "keychain" {
-            self.provider.api_key = resolve_from_keychain("api_key")?;
-        }
-        if self.provider.gateway_token.as_deref() == Some("keychain") {
-            self.provider.gateway_token = Some(resolve_from_keychain("gateway_token")?);
-        }
-        if let Some(headers) = self.provider.extra_headers.as_mut() {
-            for (name, value) in headers.iter_mut() {
-                if value == "keychain" {
-                    let key = format!(
-                        "provider_header_{}",
-                        name.to_ascii_lowercase()
-                            .chars()
-                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                            .collect::<String>()
-                    );
-                    *value = resolve_from_keychain(&key)?;
-                }
-            }
-        }
+        self.provider.resolve_secrets_recursive(None)?;
 
         // Legacy telegram config
         if let Some(ref mut telegram) = self.telegram {
@@ -2852,6 +2888,94 @@ fallback = ["mistral-nemo", "gpt-4o-mini"]
         assert_eq!(
             models.fallback_models,
             vec!["smart-model".to_string(), "fast-model".to_string()]
+        );
+    }
+
+    #[test]
+    fn provider_fallback_configs_parse() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "primary-key"
+
+[provider.models]
+default = "primary-model"
+fallback = ["primary-backup"]
+
+[[provider.fallbacks]]
+kind = "anthropic"
+api_key = "secondary-key"
+
+[provider.fallbacks.models]
+default = "claude-sonnet-4-20250514"
+fallback = ["claude-3-5-haiku-latest"]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        assert_eq!(cfg.provider.fallbacks.len(), 1);
+        assert_eq!(cfg.provider.fallbacks[0].kind, ProviderKind::Anthropic);
+        assert_eq!(cfg.provider.fallbacks[0].api_key, "secondary-key");
+        assert_eq!(
+            cfg.provider.fallbacks[0].models.default_model,
+            "claude-sonnet-4-20250514"
+        );
+    }
+
+    #[test]
+    fn provider_failover_alias_still_parses() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "primary-key"
+
+[provider.models]
+default = "primary-model"
+
+[[provider.failover]]
+kind = "xai_native"
+api_key = "secondary-key"
+
+[provider.failover.models]
+default = "grok-4"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        assert_eq!(cfg.provider.fallbacks.len(), 1);
+        assert_eq!(cfg.provider.fallbacks[0].kind, ProviderKind::XaiNative);
+        assert_eq!(cfg.provider.fallbacks[0].models.default_model, "grok-4");
+    }
+
+    #[test]
+    fn provider_fallback_model_defaults_apply_recursively() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "primary-key"
+
+[provider.models]
+primary = "primary-model"
+fast = "primary-fast"
+
+[[provider.fallbacks]]
+kind = "anthropic"
+api_key = "secondary-key"
+
+[provider.fallbacks.models]
+primary = "claude-sonnet-4-20250514"
+smart = "claude-3-5-haiku-latest"
+"#;
+        let mut cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        cfg.provider.apply_model_defaults_recursive();
+        assert_eq!(cfg.provider.models.default_model, "primary-model");
+        assert_eq!(
+            cfg.provider.models.fallback_models,
+            vec!["primary-fast".to_string()]
+        );
+        assert_eq!(
+            cfg.provider.fallbacks[0].models.default_model,
+            "claude-sonnet-4-20250514"
+        );
+        assert_eq!(
+            cfg.provider.fallbacks[0].models.fallback_models,
+            vec!["claude-3-5-haiku-latest".to_string()]
         );
     }
 

@@ -50,7 +50,7 @@ impl Agent {
             tool_calls_json: Some(serde_json::to_string(&resp.tool_calls)?),
             created_at: Utc::now(),
             importance: 0.5,
-            embedding: None,
+            ..Message::runtime_defaults()
         };
         self.append_assistant_message_with_event(
             emitter,
@@ -87,7 +87,7 @@ impl Agent {
                     tool_calls_json: None,
                     created_at: Utc::now(),
                     importance: 0.3,
-                    embedding: None,
+                    ..Message::runtime_defaults()
                 };
                 self.append_tool_message_with_result_event(
                     emitter,
@@ -134,7 +134,7 @@ impl Agent {
                     tool_calls_json: None,
                     created_at: Utc::now(),
                     importance: 0.5,
-                    embedding: None,
+                    ..Message::runtime_defaults()
                 };
                 self.append_assistant_message_with_event(
                     emitter,

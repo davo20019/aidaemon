@@ -106,7 +106,7 @@ impl Agent {
             tool_calls_json: None,
             created_at: Utc::now(),
             importance: 0.5,
-            embedding: None,
+            ..Message::runtime_defaults()
         };
         self.append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
             .await?;
@@ -168,7 +168,7 @@ impl Agent {
             tool_calls_json: None,
             created_at: Utc::now(),
             importance: 0.5,
-            embedding: None,
+            ..Message::runtime_defaults()
         };
         self.append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
             .await?;
@@ -256,7 +256,7 @@ impl Agent {
             tool_calls_json: None,
             created_at: Utc::now(),
             importance: 0.5,
-            embedding: None,
+            ..Message::runtime_defaults()
         };
         self.append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
             .await?;
@@ -460,9 +460,8 @@ impl Agent {
             // Non-owners cannot create scheduled goals — load tools and
             // fall through to agent loop so the request is handled directly.
             self.ensure_orchestrator_tools_loaded(ctx).await?;
-            ctx.pending_system_messages.push(
-                "[SYSTEM] Scheduling goals is owner-only. Handle this request directly without creating a goal.".to_string(),
-            );
+            ctx.pending_system_messages
+                .push(SystemDirective::SchedulingOwnerOnly);
             return Ok(consultant_fallthrough());
         }
 
@@ -478,7 +477,7 @@ impl Agent {
                 tool_calls_json: None,
                 created_at: Utc::now(),
                 importance: 0.5,
-                embedding: None,
+                ..Message::runtime_defaults()
             };
             self.append_assistant_message_with_event(
                 ctx.emitter,
@@ -1115,11 +1114,8 @@ impl Agent {
         ctx: &mut ConsultantOrchestrationCtx<'_>,
     ) -> anyhow::Result<ConsultantPhaseOutcome> {
         self.ensure_orchestrator_tools_loaded(ctx).await?;
-        ctx.pending_system_messages.push(
-            "[SYSTEM] Consultant classified this turn as knowledge. Provide the best direct answer now. \
-             Use tools only if needed to verify or retrieve missing facts."
-                .to_string(),
-        );
+        ctx.pending_system_messages
+            .push(SystemDirective::KnowledgeIntentDirectAnswer);
         info!(
             ctx.session_id,
             "Knowledge intent — classifier-only pass; continuing to execution loop"
@@ -1168,21 +1164,16 @@ impl Agent {
                 *ctx.base_tool_defs = filter_tool_defs_for_delegation(ctx.base_tool_defs);
                 ctx.available_capabilities
                     .retain(|name, _| !is_delegation_blocked_tool(name));
-                ctx.pending_system_messages.push(
-                    "[SYSTEM] Delegation mode active. Use `cli_agent` for execution tasks. \
-                     `terminal`, `browser`, and `run_command` are hidden in this turn."
-                        .to_string(),
-                );
+                ctx.pending_system_messages
+                    .push(SystemDirective::DelegationModeActive);
                 info!(
                     ctx.session_id,
                     tool_count = ctx.tool_defs.len(),
                     "Complex non-owner request: filtered competing execution tools for delegation mode"
                 );
             }
-            ctx.pending_system_messages.push(
-                "[SYSTEM] Creating goals is owner-only. Handle this request directly without creating a goal."
-                    .to_string(),
-            );
+            ctx.pending_system_messages
+                .push(SystemDirective::GoalCreationOwnerOnly);
             return Ok(consultant_fallthrough());
         }
 
@@ -1198,7 +1189,7 @@ impl Agent {
                 tool_calls_json: None,
                 created_at: Utc::now(),
                 importance: 0.5,
-                embedding: None,
+                ..Message::runtime_defaults()
             };
             self.append_assistant_message_with_event(
                 ctx.emitter,
@@ -1321,7 +1312,7 @@ impl Agent {
                         tool_calls_json: None,
                         created_at: Utc::now(),
                         importance: 0.5,
-                        embedding: None,
+                        ..Message::runtime_defaults()
                     };
                     let _ = self
                         .append_assistant_message_with_event(
@@ -1365,7 +1356,7 @@ impl Agent {
                         tool_calls_json: None,
                         created_at: Utc::now(),
                         importance: 0.5,
-                        embedding: None,
+                        ..Message::runtime_defaults()
                     };
                     let _ = self
                         .append_assistant_message_with_event(
@@ -1448,7 +1439,7 @@ impl Agent {
             tool_calls_json: None,
             created_at: Utc::now(),
             importance: 0.5,
-            embedding: None,
+            ..Message::runtime_defaults()
         };
         let _ = self
             .append_assistant_message_with_event(ctx.emitter, &assistant_msg, ctx.model, None, None)

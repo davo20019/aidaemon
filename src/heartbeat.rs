@@ -19,6 +19,13 @@ use crate::goal_tokens::GoalTokenRegistry;
 use crate::traits::{GoalSchedule, StateStore};
 use crate::types::{ChannelContext, UserRole};
 
+fn is_scheduled_task_description(text: &str) -> bool {
+    let trimmed = text.trim_start().to_ascii_lowercase();
+    trimmed.starts_with("execute scheduled goal:")
+        || trimmed.starts_with("scheduled check:")
+        || trimmed.starts_with("manual scheduled run:")
+}
+
 /// Runtime snapshot of a heartbeat background job.
 #[derive(Debug, Clone, Serialize)]
 pub struct HeartbeatJobSnapshot {
@@ -602,16 +609,28 @@ impl HeartbeatCoordinator {
                 continue;
             }
 
-            // Skip dispatch if the goal is already over its daily budget.
-            if let Some(budget_daily) = goal.budget_daily {
-                if goal.tokens_used_today >= budget_daily {
-                    tracing::info!(
-                        goal_id = %goal.id,
-                        tokens_used = goal.tokens_used_today,
-                        budget = budget_daily,
-                        "Skipping pending-task dispatch — goal daily budget exhausted"
-                    );
-                    continue;
+            let is_scheduled_goal =
+                if let Ok(schedules) = self.state.get_schedules_for_goal(goal_id).await {
+                    !schedules.is_empty()
+                } else {
+                    tasks
+                        .iter()
+                        .any(|task| is_scheduled_task_description(&task.description))
+                };
+
+            // Daily budget is admission control for scheduled runs, not a reason
+            // to abandon already-pending scheduled work.
+            if !is_scheduled_goal {
+                if let Some(budget_daily) = goal.budget_daily {
+                    if goal.tokens_used_today >= budget_daily {
+                        tracing::info!(
+                            goal_id = %goal.id,
+                            tokens_used = goal.tokens_used_today,
+                            budget = budget_daily,
+                            "Skipping pending-task dispatch — goal daily budget exhausted"
+                        );
+                        continue;
+                    }
                 }
             }
 

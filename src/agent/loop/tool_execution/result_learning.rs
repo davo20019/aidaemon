@@ -9,6 +9,11 @@ use crate::agent::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+fn append_tool_result_notice(result_text: &mut String, notice: &ToolResultNotice) {
+    result_text.push_str("\n\n");
+    result_text.push_str(&notice.render());
+}
+
 pub(super) struct ResultLearningEnv<'a> {
     pub attempted_required_file_recheck: bool,
     pub send_file_key: Option<String>,
@@ -38,7 +43,7 @@ pub(super) struct ResultLearningState<'a> {
     pub last_tool_failure: &'a mut Option<(String, String)>,
     pub in_session_learned: &'a mut HashSet<(String, String)>,
     pub force_text_response: &'a mut bool,
-    pub pending_system_messages: &'a mut Vec<String>,
+    pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub successful_tool_calls: &'a mut usize,
     pub total_successful_tool_calls: &'a mut usize,
     pub successful_send_file_keys: &'a mut HashSet<String>,
@@ -213,11 +218,11 @@ impl Agent {
                 *transient_count += 1;
                 if should_skip_transient_cooldown(&tc.name, &base_error) {
                     state.tool_cooldown_until_iteration.remove(&tc.name);
-                    *result_text = format!(
-                        "{}\n\n[SYSTEM] Recoverable file/path miss for `{}`. \
-This did NOT consume semantic lockout budget. Recheck the target path first \
-(project_inspect/search_files/read_file) and retry with the exact path.",
-                        result_text, tc.name
+                    append_tool_result_notice(
+                        result_text,
+                        &ToolResultNotice::RecoverableFilePathMiss {
+                            tool_name: tc.name.clone(),
+                        },
                     );
                 } else {
                     let cooldown_iters = 2usize;
@@ -225,11 +230,13 @@ This did NOT consume semantic lockout budget. Recheck the target path first \
                     state
                         .tool_cooldown_until_iteration
                         .insert(tc.name.clone(), cooldown_until);
-                    *result_text = format!(
-                        "{}\n\n[SYSTEM] Detected transient failure for `{}` (timeouts/network/rate limits). \
-Avoid retrying this tool until iteration {} (cooldown {} iterations). Use another approach for now. \
-Only report attempts that were actually executed; do not describe retries that were blocked or skipped.",
-                        result_text, tc.name, cooldown_until, cooldown_iters
+                    append_tool_result_notice(
+                        result_text,
+                        &ToolResultNotice::TransientFailureCooldown {
+                            tool_name: tc.name.clone(),
+                            cooldown_until,
+                            cooldown_iters,
+                        },
                     );
                 }
             } else {
@@ -244,19 +251,13 @@ Only report attempts that were actually executed; do not describe retries that w
                     let likely_fact_storage =
                         user_looks_like_fact_storage_request(&state.learning_ctx.user_text);
                     let coach = if likely_fact_storage {
-                        "[SYSTEM] The previous tool call was off-target for this request. \
-The user appears to be asking you to learn/remember/save facts. Use `remember_fact` (batch with `facts` when needed) and do NOT call scheduled-goal tools."
+                        ToolResultNotice::OffTargetFactStorageRequest
                     } else if tc.name == "manage_memories" {
-                        "[SYSTEM] The previous `manage_memories` call was underspecified (`goal_id` missing). \
-Do NOT retry the same action blindly. Switch to `manage_memories(action='list_scheduled')` \
-to retrieve exact IDs (or ask the user for the goal ID), then retry the intended action with `goal_id`."
+                        ToolResultNotice::MissingGoalIdManageMemories
                     } else {
-                        "[SYSTEM] The previous tool call was underspecified (`goal_id` missing). \
-Do NOT retry the same call. If this is scheduled-goal run forensics, first call \
-`manage_memories(action='list_scheduled')` to get a concrete `goal_id`, then retry. \
-If the user is asking to store facts, use `remember_fact` instead."
+                        ToolResultNotice::MissingGoalIdGeneric
                     };
-                    *result_text = format!("{}\n\n{}", result_text, coach);
+                    append_tool_result_notice(result_text, &coach);
                 }
 
                 // write_file JSON escaping recovery: when write_file fails with
@@ -277,15 +278,9 @@ If the user is asking to store facts, use `remember_fact` instead."
                                 .map(|s| s.to_string())
                         })
                         .unwrap_or_else(|| "<target file>".to_string());
-                    *result_text = format!(
-                        "{}\n\n[SYSTEM] write_file recovery: The file content has characters that broke \
-JSON encoding in the tool call arguments (backslashes, quotes, etc.). \
-Retry write_file but carefully escape ALL backslashes (\\\\) and quotes (\\\") in the content string. \
-For code with many special chars (regex, JSON), double-check each backslash is escaped as \\\\. \
-If write_file fails again, use terminal with a SHORT heredoc:\n\
-cat > {} << 'PYEOF'\n<content here>\nPYEOF\n\
-Keep heredoc commands under 3000 chars to avoid approval message truncation.",
-                        result_text, write_path
+                    append_tool_result_notice(
+                        result_text,
+                        &ToolResultNotice::WriteFileJsonRecovery { path: write_path },
                     );
                 }
 
@@ -307,30 +302,27 @@ Keep heredoc commands under 3000 chars to avoid approval message truncation.",
                         || base_error.contains("invalid escape")
                         || base_error.contains("control character")
                     {
-                        *result_text = format!(
-                            "{}\n\n[SYSTEM] edit_file recovery: The edit content has characters that broke \
-JSON encoding (backslashes, quotes, unicode escapes). Do NOT retry edit_file with the same content. \
-Instead, use the terminal tool with `sed` for small targeted fixes:\n\
-  sed -i '' 's/old_pattern/new_pattern/' {}\n\
-Or rewrite the entire file using a QUOTED heredoc:\n\
-  cat > {} << 'PYEOF'\n<full corrected file>\nPYEOF\n\
-The single-quoted delimiter prevents shell expansion.",
-                            result_text, edit_path, edit_path
+                        append_tool_result_notice(
+                            result_text,
+                            &ToolResultNotice::EditFileJsonRecovery {
+                                path: edit_path.clone(),
+                            },
                         );
                     } else if base_error.contains("Text not found in ") {
-                        *result_text = format!(
-                            "{}\n\n[SYSTEM] edit_file recovery: do NOT ask the user for file contents yet. \
-Call read_file(path=\"{}\") now, then retry edit_file with exact copied old_text. \
-If the user asked for a full rewrite, use write_file for full content replacement.",
-                            result_text, edit_path
+                        append_tool_result_notice(
+                            result_text,
+                            &ToolResultNotice::EditFileTextNotFoundRecovery {
+                                path: edit_path.clone(),
+                            },
                         );
                     } else if base_error.contains("Set replace_all=true")
                         || base_error.contains("occurrences of the text")
                     {
-                        *result_text = format!(
-                            "{}\n\n[SYSTEM] edit_file recovery: disambiguate by either setting replace_all=true \
-or expanding old_text with nearby unique context from read_file(path=\"{}\").",
-                            result_text, edit_path
+                        append_tool_result_notice(
+                            result_text,
+                            &ToolResultNotice::EditFileReplaceAllRecovery {
+                                path: edit_path.clone(),
+                            },
                         );
                     }
                 }
@@ -447,7 +439,7 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
                     // so it can't miss it, and tell it to adapt.
                     let key_line = extract_key_error_line(&base_error);
                     if let Some(coaching) = format_error_coaching(&key_line) {
-                        *result_text = format!("{}\n\n{}", result_text, coaching);
+                        append_tool_result_notice(result_text, &coaching);
                     }
                 }
 
@@ -472,7 +464,7 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
 
                     let key_line = extract_key_error_line(&base_error);
                     let coaching = format_semantic_failure_coaching(semantic_count, &key_line);
-                    *result_text = format!("{}\n\n{}", result_text, coaching);
+                    append_tool_result_notice(result_text, &coaching);
                 }
             }
 
@@ -486,9 +478,7 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
 
         if env.attempted_required_file_recheck {
             *state.require_file_recheck_before_answer = false;
-            result_text.push_str(
-                "\n\n[SYSTEM] Required file re-check completed. You may now synthesize findings.",
-            );
+            append_tool_result_notice(result_text, &ToolResultNotice::RequiredFileRecheckCompleted);
         }
 
         if !env.attempted_required_file_recheck {
@@ -518,18 +508,15 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
             }
             if let Some(dir) = contradiction_dir {
                 *state.require_file_recheck_before_answer = true;
-                let guardrail = format!(
-                    "[SYSTEM] Contradictory file evidence detected for {}: one tool found files while another reported no matches. \
-                     You MUST run an explicit-path re-check (search_files/project_inspect) before answering.",
-                    dir
-                );
+                let guardrail =
+                    SystemDirective::ContradictoryFileEvidenceExplicitPath { dir: dir.clone() };
                 state.pending_system_messages.push(guardrail.clone());
-                *result_text = format!("{}\n\n{}", result_text, guardrail);
+                *result_text = format!("{}\n\n{}", result_text, guardrail.render());
             }
         }
 
         let no_evidence_result =
-            tool_result_indicates_no_evidence(strip_appended_diagnostics(result_text));
+            tool_result_indicates_no_evidence(&strip_appended_diagnostics(result_text));
         if no_evidence_result {
             *state.no_evidence_result_streak = state.no_evidence_result_streak.saturating_add(1);
             state.no_evidence_tools_seen.insert(tc.name.clone());
@@ -560,7 +547,7 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
                 tool_calls_json: None,
                 created_at: Utc::now(),
                 importance: 0.5,
-                embedding: None,
+                ..Message::runtime_defaults()
             };
             self.append_assistant_message_with_event(
                 env.emitter,
@@ -589,11 +576,9 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
             && state.no_evidence_tools_seen.len() >= 5
         {
             *state.force_text_response = true;
-            state.pending_system_messages.push(
-                "[SYSTEM] You have searched across multiple tools and keep finding no evidence. \
-                 Stop searching and respond with what is known/unknown."
-                    .to_string(),
-            );
+            state
+                .pending_system_messages
+                .push(SystemDirective::NoEvidenceRespondKnownUnknown);
         }
 
         *state.successful_tool_calls += 1;
@@ -605,9 +590,9 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
             // Strongly bias the model to finish immediately after a
             // successful file delivery instead of continuing to
             // explore and risking follow-up path drift errors.
-            *result_text = format!(
-                "{}\n\n[SYSTEM] send_file succeeded. Unless the user explicitly requested additional files or modifications, stop calling tools and reply to the user now.",
-                result_text
+            append_tool_result_notice(
+                result_text,
+                &ToolResultNotice::SendFileSucceededStopAndReply,
             );
         }
 
@@ -625,31 +610,24 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
             state.recent_tool_names.clear();
 
             if cli_result_is_substantive(result_text) {
-                let present_results_msg = "[SYSTEM] The CLI agent completed successfully and returned substantive results. \
-Present those results to the user directly now. Do NOT claim you cannot complete the request."
-                    .to_string();
+                let present_results_msg = SystemDirective::CliAgentPresentResults;
                 state
                     .pending_system_messages
                     .push(present_results_msg.clone());
-                *result_text = format!("{}\n\n{}", result_text, present_results_msg);
+                *result_text = format!("{}\n\n{}", result_text, present_results_msg.render());
             }
 
             if self.depth == 0 && !*state.cli_agent_boundary_injected {
                 let task_hint = build_task_boundary_hint(&state.learning_ctx.user_text, 120);
-                *result_text = format!(
-                    "{}\n\n[SYSTEM] cli_agent completed. USER REQUEST SUMMARY (untrusted): {}. \
-                     Unless the user explicitly asked for more work, stop calling tools and \
-                     reply to the user now with what was completed. Do NOT explore other \
-                     projects or start unrelated tasks.",
-                    result_text, task_hint
+                append_tool_result_notice(
+                    result_text,
+                    &ToolResultNotice::CliAgentInlineBoundary {
+                        task_hint: task_hint.clone(),
+                    },
                 );
-                state.pending_system_messages.push(format!(
-                    "[SYSTEM] TASK BOUNDARY: cli_agent delegation is complete. \
-                     USER REQUEST SUMMARY (untrusted): {}. Review whether the request is \
-                     already satisfied. If yes, reply with a concise completion summary. \
-                     Do not start unrelated work.",
-                    task_hint
-                ));
+                state
+                    .pending_system_messages
+                    .push(SystemDirective::CliAgentTaskBoundary { task_hint });
                 *state.cli_agent_boundary_injected = true;
             }
         }
@@ -721,33 +699,22 @@ Present those results to the user directly now. Do NOT claim you cannot complete
 
 /// Build the first-failure coaching message that quotes the key error line.
 /// Returns `None` if key_line is empty (no extractable error).
-fn format_error_coaching(key_line: &str) -> Option<String> {
+fn format_error_coaching(key_line: &str) -> Option<ToolResultNotice> {
     if key_line.is_empty() {
         return None;
     }
-    Some(format!(
-        "[SYSTEM] IMPORTANT — The error says: \"{}\"\n\
-         Do NOT repeat the same command. Analyze what this error means and use a DIFFERENT approach.\n\
-         If the error indicates something doesn't exist or isn't available, \
-         research alternatives before trying again.",
-        key_line
-    ))
+    Some(ToolResultNotice::ErrorCoaching {
+        key_line: key_line.to_string(),
+    })
 }
 
 /// Build the semantic-failure coaching message (tool errored N times).
 /// Includes the error context when key_line is non-empty.
-fn format_semantic_failure_coaching(semantic_count: usize, key_line: &str) -> String {
-    let error_context = if key_line.is_empty() {
-        String::new()
-    } else {
-        format!(" The error was: \"{}\".", key_line)
-    };
-    format!(
-        "[SYSTEM] This tool has errored {} semantic times.{} \
-         Do NOT retry this tool. Use a DIFFERENT tool or approach, \
-         or respond to the user with what you know.",
-        semantic_count, error_context
-    )
+fn format_semantic_failure_coaching(semantic_count: usize, key_line: &str) -> ToolResultNotice {
+    ToolResultNotice::SemanticFailureCoaching {
+        semantic_count,
+        key_line: key_line.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -883,7 +850,7 @@ mod tests {
     fn test_error_coaching_quotes_key_line() {
         let coaching = format_error_coaching("command not found: drush");
         assert!(coaching.is_some());
-        let msg = coaching.unwrap();
+        let msg = coaching.unwrap().render();
         assert!(msg.contains("[SYSTEM] IMPORTANT"));
         assert!(msg.contains("command not found: drush"));
         assert!(msg.contains("DIFFERENT approach"));
@@ -896,7 +863,7 @@ mod tests {
 
     #[test]
     fn test_semantic_failure_coaching_includes_error_context() {
-        let msg = format_semantic_failure_coaching(3, "Error: ENOENT");
+        let msg = format_semantic_failure_coaching(3, "Error: ENOENT").render();
         assert!(msg.contains("errored 3 semantic times"));
         assert!(msg.contains("The error was: \"Error: ENOENT\"."));
         assert!(msg.contains("DIFFERENT tool"));
@@ -904,7 +871,7 @@ mod tests {
 
     #[test]
     fn test_semantic_failure_coaching_omits_context_when_empty() {
-        let msg = format_semantic_failure_coaching(2, "");
+        let msg = format_semantic_failure_coaching(2, "").render();
         assert!(msg.contains("errored 2 semantic times"));
         assert!(!msg.contains("The error was"));
     }

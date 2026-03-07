@@ -311,10 +311,9 @@ async fn test_task_budget_stops_when_not_productive() {
     );
 }
 
-/// Goal daily budget auto-extends in-memory but is NOT persisted to the database.
-/// With the tightened is_productive threshold (8+ successful calls), a low-call
-/// scenario should stop at the budget without extending.
-/// This test verifies the budget is NOT ratcheted up in the DB.
+/// Non-scheduled goals keep the stricter productivity threshold for automatic
+/// goal-budget extension. Low-call runs should still stop at the budget, and
+/// the DB budget must not be ratcheted upward.
 #[tokio::test]
 async fn test_goal_budget_auto_extends_and_persists() {
     let provider = MockProvider::with_responses(vec![
@@ -356,7 +355,7 @@ async fn test_goal_budget_auto_extends_and_persists() {
 
     // With only 3 successful tool calls, is_productive returns false → budget stops execution
     assert!(
-        response.contains("processing limit"),
+        response.contains("daily processing budget"),
         "Expected budget-exceeded message, got: {}",
         response
     );
@@ -368,6 +367,391 @@ async fn test_goal_budget_auto_extends_and_persists() {
         60,
         "Budget should NOT be ratcheted up in DB — expected 60, got {:?}",
         updated_goal.budget_daily
+    );
+}
+
+/// Scheduled goals relax the auto-extension threshold so a productive scheduled
+/// run is less likely to be cut off mid-task, but the DB budget still must not
+/// be ratcheted upward.
+#[tokio::test]
+async fn test_scheduled_goal_daily_budget_is_backstop_only_during_active_run() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", r#"{"verbose": true}"#),
+        MockProvider::tool_call_response("system_info", r#"{"check": "os"}"#),
+        MockProvider::tool_call_response("system_info", r#"{"check": "mem"}"#),
+        MockProvider::text_response("Goal task completed."),
+    ]);
+
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    harness.agent.set_test_executor_mode();
+
+    let mut goal = Goal::new_continuous("Scheduled build task", "scheduled_goal_budget_session", None, None);
+    goal.status = "active".to_string();
+    goal.budget_daily = Some(60);
+    goal.budget_per_check = Some(500);
+    harness.state.create_goal(&goal).await.unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = crate::traits::GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 * * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("hourly".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    harness.state.create_goal_schedule(&schedule).await.unwrap();
+
+    harness.agent.set_test_goal_id(Some(goal.id.clone()));
+
+    let (status_tx, status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(64);
+
+    let response = harness
+        .agent
+        .handle_message(
+            "scheduled_goal_budget_session",
+            "Execute the scheduled goal task",
+            Some(status_tx),
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Goal task completed.");
+
+    let updates = collect_status_updates(status_rx).await;
+    assert!(
+        !updates
+            .iter()
+            .any(|u| matches!(u, StatusUpdate::BudgetExtended { .. })),
+        "Daily backstop should not trigger an in-run budget extension for scheduled goals"
+    );
+
+    let updated_goal = harness.state.get_goal(&goal.id).await.unwrap().unwrap();
+    assert_eq!(
+        updated_goal.budget_daily,
+        Some(60),
+        "The daily backstop should remain unchanged in the database"
+    );
+}
+
+/// Scheduled goals should use the per-run budget as the active limiter.
+/// If the run is clearly unproductive, it should stop even when the daily
+/// budget still has room left.
+#[tokio::test]
+async fn test_scheduled_goal_run_budget_stops_unproductive_run() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("no_such_tool", "{}"),
+        MockProvider::text_response("Should not reach this."),
+    ]);
+
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    harness.agent.set_test_executor_mode();
+
+    let mut goal = Goal::new_continuous(
+        "Scheduled noisy task",
+        "scheduled_goal_run_budget_session",
+        Some(10),
+        Some(500),
+    );
+    goal.status = "active".to_string();
+    harness.state.create_goal(&goal).await.unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = crate::traits::GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 * * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("hourly".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    harness.state.create_goal_schedule(&schedule).await.unwrap();
+
+    harness.agent.set_test_goal_id(Some(goal.id.clone()));
+
+    let response = harness
+        .agent
+        .handle_message(
+            "scheduled_goal_run_budget_session",
+            "Execute the scheduled goal task",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("per-run processing budget"),
+        "Expected scheduled run budget stop message, got: {}",
+        response
+    );
+
+    let updated_goal = harness.state.get_goal(&goal.id).await.unwrap().unwrap();
+    assert_eq!(updated_goal.budget_per_check, Some(10));
+    assert_eq!(updated_goal.budget_daily, Some(500));
+}
+
+/// Each scheduled run should get a fresh per-run budget even when the goal stays active.
+#[tokio::test]
+async fn test_scheduled_goal_run_budget_resets_between_runs() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("no_such_tool", "{}"),
+        MockProvider::text_response("Should not reach the first run."),
+        MockProvider::text_response("Second scheduled run completed."),
+    ]);
+
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    harness.agent.set_test_executor_mode();
+
+    let mut goal = Goal::new_continuous(
+        "Scheduled repeated task",
+        "scheduled_goal_reset_session",
+        Some(10),
+        Some(500),
+    );
+    goal.status = "active".to_string();
+    harness.state.create_goal(&goal).await.unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = crate::traits::GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 * * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("hourly".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    harness.state.create_goal_schedule(&schedule).await.unwrap();
+
+    harness.agent.set_test_goal_id(Some(goal.id.clone()));
+
+    let first_response = harness
+        .agent
+        .handle_message(
+            "scheduled_goal_reset_session",
+            "Execute the scheduled goal task",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        first_response.contains("per-run processing budget"),
+        "Expected first run to stop on per-run budget, got: {}",
+        first_response
+    );
+
+    let second_response = harness
+        .agent
+        .handle_message(
+            "scheduled_goal_reset_session",
+            "Execute the scheduled goal task",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(second_response, "Second scheduled run completed.");
+}
+
+/// Scheduled runs should not be cut off by the generic hard iteration cap.
+#[tokio::test]
+async fn test_scheduled_goal_ignores_hard_iteration_cap() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", r#"{"verbose": true}"#),
+        MockProvider::text_response("Scheduled run finished after multiple steps."),
+    ]);
+
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    harness.agent.set_test_executor_mode();
+    harness
+        .agent
+        .set_test_iteration_config(crate::config::IterationLimitConfig::Hard {
+            initial: 1,
+            cap: 1,
+        });
+
+    let mut goal = Goal::new_continuous(
+        "Scheduled iterative task",
+        "scheduled_goal_iteration_session",
+        Some(500),
+        Some(5000),
+    );
+    goal.status = "active".to_string();
+    harness.state.create_goal(&goal).await.unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = crate::traits::GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 * * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("hourly".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    harness.state.create_goal_schedule(&schedule).await.unwrap();
+
+    harness.agent.set_test_goal_id(Some(goal.id.clone()));
+
+    let response = harness
+        .agent
+        .handle_message(
+            "scheduled_goal_iteration_session",
+            "Execute the scheduled goal task",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Scheduled run finished after multiple steps.");
+}
+
+/// If the daemon restarts mid-run, the next scheduled task lead should restore
+/// the persisted per-run budget state instead of silently starting from zero.
+#[tokio::test]
+async fn test_scheduled_goal_restores_run_state_after_restart_like_resume() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("no_such_tool", "{}"),
+        MockProvider::text_response("Should not reach this."),
+    ]);
+
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    harness.agent.set_test_executor_mode();
+
+    let mut goal = Goal::new_continuous(
+        "Scheduled resumed task",
+        "scheduled_goal_resume_session",
+        Some(100),
+        Some(500),
+    );
+    goal.status = "active".to_string();
+    harness.state.create_goal(&goal).await.unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = crate::traits::GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 * * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("hourly".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    harness.state.create_goal_schedule(&schedule).await.unwrap();
+
+    let root_task = crate::traits::Task {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        description:
+            "Execute scheduled goal: Scheduled resumed task [SYSTEM: already scheduled and firing now; do not reschedule.]"
+                .to_string(),
+        status: "pending".to_string(),
+        priority: "low".to_string(),
+        task_order: 0,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: true,
+        retry_count: 0,
+        max_retries: 1,
+        created_at: now.clone(),
+        started_at: None,
+        completed_at: None,
+    };
+    harness.state.create_task(&root_task).await.unwrap();
+
+    harness
+        .state
+        .upsert_scheduled_run_state(&crate::traits::ScheduledRunState {
+            goal_id: goal.id.clone(),
+            root_task_id: root_task.id.clone(),
+            effective_budget_per_check: 20,
+            tokens_used: 15,
+            budget_extensions_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+    harness.agent.set_test_goal_id(Some(goal.id.clone()));
+
+    let response = harness
+        .agent
+        .handle_message(
+            "scheduled_goal_resume_session",
+            "Execute the scheduled goal task",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("per-run processing budget"),
+        "Expected restored scheduled run state to stop the resumed run, got: {}",
+        response
+    );
+
+    assert!(
+        harness
+            .state
+            .get_scheduled_run_state(&goal.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "Scheduled run state should be cleared after the resumed run exits"
     );
 }
 

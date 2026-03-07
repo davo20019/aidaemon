@@ -882,6 +882,67 @@ fn resolve_daemon_bot_tokens(config: &AppConfig) -> Vec<String> {
     out
 }
 
+fn merge_daemon_bot_tokens(
+    configured_tokens: &[String],
+    dynamic_bots: &[crate::traits::DynamicBot],
+    user_id: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in configured_tokens {
+        let trimmed = token.trim();
+        if trimmed.is_empty()
+            || out
+                .iter()
+                .any(|existing: &String| existing.as_str() == trimmed)
+        {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+
+    for bot in dynamic_bots {
+        if bot.channel_type != "telegram" {
+            continue;
+        }
+        if !bot.allowed_user_ids.is_empty()
+            && !bot
+                .allowed_user_ids
+                .iter()
+                .any(|allowed| allowed.trim() == user_id)
+        {
+            continue;
+        }
+        let token = bot.bot_token.trim();
+        if token.is_empty()
+            || out
+                .iter()
+                .any(|existing: &String| existing.as_str() == token)
+        {
+            continue;
+        }
+        out.push(token.to_string());
+    }
+
+    out
+}
+
+async fn resolve_runtime_daemon_bot_tokens(
+    configured_tokens: &[String],
+    state: &dyn StateStore,
+    user_id: &str,
+) -> Vec<String> {
+    match state.get_dynamic_bots().await {
+        Ok(dynamic_bots) => merge_daemon_bot_tokens(configured_tokens, &dynamic_bots, user_id),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to load dynamic Telegram bots for daemon bootstrap auth"
+            );
+            configured_tokens.to_vec()
+        }
+    }
+}
+
 fn daemon_connect_token_mint_url(ws_url: &str) -> anyhow::Result<String> {
     let mut url = reqwest::Url::parse(ws_url)?;
     match url.scheme() {
@@ -1318,6 +1379,62 @@ fn should_skip_review_stream_replay(
         return true;
     }
     resume_from_review_stream_seq == 0 && replay_len > REATTACH_REVIEW_REPLAY_CAP_FRAMES
+}
+
+fn build_skipped_stdout_replay_status_message(
+    resume_from_seq: u64,
+    oldest_seq: u64,
+    frames: &[(u64, String)],
+) -> Option<String> {
+    if !should_skip_stdout_replay(resume_from_seq, oldest_seq, frames) {
+        return None;
+    }
+    let blank_terminal_hint =
+        "If the terminal appears blank, press Enter or send a command to refresh live output.";
+    let reason = if resume_from_seq.saturating_add(1) < oldest_seq {
+        "buffered history was unavailable"
+    } else {
+        "buffered output was too noisy to replay cleanly"
+    };
+    Some(format!(
+        "Connection recovered. Skipped replaying {} buffered output frame(s) because {}. Session is still active. {}",
+        frames.len(),
+        reason,
+        blank_terminal_hint
+    ))
+}
+
+fn build_skipped_review_stream_replay_status_message(
+    resume_from_review_stream_seq: u64,
+    oldest_review_stream_seq: u64,
+    replay_len: usize,
+) -> Option<String> {
+    if !should_skip_review_stream_replay(
+        resume_from_review_stream_seq,
+        oldest_review_stream_seq,
+        replay_len,
+    ) {
+        return None;
+    }
+    let reason = if resume_from_review_stream_seq.saturating_add(1) < oldest_review_stream_seq {
+        "buffered review history was unavailable"
+    } else {
+        "the buffered review stream was too large to replay cleanly"
+    };
+    Some(format!(
+        "Connection recovered. Skipped replaying {} buffered review stream chunk(s) because {}.",
+        replay_len, reason
+    ))
+}
+
+fn build_connection_notice_payload(message: String, tone: &str, scope: &str, ttl_ms: u64) -> Value {
+    json!({
+        "kind": "connection_notice",
+        "message": message,
+        "tone": tone,
+        "scope": scope,
+        "ttl_ms": ttl_ms,
+    })
 }
 
 fn escaped_control_token_len(data: &str) -> Option<usize> {
@@ -2880,6 +2997,7 @@ async fn load_or_create_key_material() -> anyhow::Result<KeyMaterial> {
 
 async fn resolve_connect_token(
     auth: BridgeAuth,
+    state: std::sync::Arc<dyn StateStore>,
     user_id: String,
     device_id: String,
     http_client: reqwest::Client,
@@ -2891,10 +3009,23 @@ async fn resolve_connect_token(
             bot_tokens,
             fallback_static_token,
         } => {
+            let resolved_bot_tokens =
+                resolve_runtime_daemon_bot_tokens(&bot_tokens, state.as_ref(), &user_id).await;
+            if resolved_bot_tokens.is_empty() {
+                if let Some(static_token) = fallback_static_token {
+                    warn!(
+                        "No configured or dynamic Telegram bot tokens available; falling back to static daemon token"
+                    );
+                    return Ok(static_token);
+                }
+                return Err(anyhow::anyhow!(
+                    "no Telegram bot token available for daemon bootstrap auth"
+                ));
+            }
             match mint_connect_token_from_bot_proof(
                 &http_client,
                 &mint_url,
-                &bot_tokens,
+                &resolved_bot_tokens,
                 &user_id,
                 &device_id,
             )
@@ -3569,7 +3700,8 @@ impl TerminalBridge {
             let user_id = self.cfg.user_id.clone();
             let device_id = self.cfg.device_id.clone();
             let http_client = self.http_client.clone();
-            resolve_connect_token(auth, user_id, device_id, http_client).await?
+            let state = self.state.clone();
+            resolve_connect_token(auth, state, user_id, device_id, http_client).await?
         };
         let mut ws_url = reqwest::Url::parse(&self.cfg.ws_url)?;
         ws_url
@@ -4469,10 +4601,8 @@ impl TerminalBridge {
     {
         let (
             oldest_seq,
-            newest_seq,
             frames,
             oldest_review_stream_seq,
-            newest_review_stream_seq,
             review_stream_frames,
             last_review_progress,
             last_review_result,
@@ -4482,7 +4612,6 @@ impl TerminalBridge {
                 return Ok(());
             };
             let oldest = active.replay.front().map(|f| f.seq).unwrap_or(0);
-            let newest = active.replay.back().map(|f| f.seq).unwrap_or(0);
             let frames = active
                 .replay
                 .iter()
@@ -4492,11 +4621,6 @@ impl TerminalBridge {
             let oldest_review = active
                 .review_stream_replay
                 .front()
-                .map(|f| f.seq)
-                .unwrap_or(0);
-            let newest_review = active
-                .review_stream_replay
-                .back()
                 .map(|f| f.seq)
                 .unwrap_or(0);
             let review_stream_frames = active
@@ -4514,10 +4638,8 @@ impl TerminalBridge {
                 .collect::<Vec<_>>();
             (
                 oldest,
-                newest,
                 frames,
                 oldest_review,
-                newest_review,
                 review_stream_frames,
                 active.last_review_progress.clone(),
                 active.last_review_result.clone(),
@@ -4526,29 +4648,18 @@ impl TerminalBridge {
         };
 
         let skipped_stdout_replay = should_skip_stdout_replay(resume_from_seq, oldest_seq, &frames);
-        let blank_terminal_hint =
-            "If the terminal appears blank, press Enter or send a command to refresh live output.";
         if !frames.is_empty() {
             if skipped_stdout_replay {
-                let reason = if resume_from_seq.saturating_add(1) < oldest_seq {
-                    "buffered history was unavailable"
-                } else {
-                    "buffered output was too noisy to replay cleanly"
-                };
-                self.send_encrypted_json_for_session(
-                    session_id,
-                    ws_write,
-                    json!({
-                        "kind":"status",
-                        "message": format!(
-                            "Connection recovered. Skipped replaying {} buffered output frame(s) because {}. Session is still active. {}",
-                            frames.len(),
-                            reason,
-                            blank_terminal_hint
-                        )
-                    }),
-                )
-                .await?;
+                if let Some(message) =
+                    build_skipped_stdout_replay_status_message(resume_from_seq, oldest_seq, &frames)
+                {
+                    self.send_encrypted_json_for_session(
+                        session_id,
+                        ws_write,
+                        build_connection_notice_payload(message, "warn", "terminal", 5200),
+                    )
+                    .await?;
+                }
             } else {
                 for (seq, chunk) in &frames {
                     self.send_encrypted_json_for_session(
@@ -4558,35 +4669,7 @@ impl TerminalBridge {
                     )
                     .await?;
                 }
-
-                self.send_encrypted_json_for_session(
-                    session_id,
-                    ws_write,
-                    json!({
-                        "kind":"status",
-                        "message": format!(
-                            "Replayed {} buffered output frame(s) (seq {}..{}).",
-                            frames.len(),
-                            frames.first().map(|(seq, _)| *seq).unwrap_or(oldest_seq),
-                            newest_seq
-                        )
-                    }),
-                )
-                .await?;
             }
-        } else if resume_from_seq > 0 {
-            self.send_encrypted_json_for_session(
-                session_id,
-                ws_write,
-                json!({
-                    "kind":"status",
-                    "message": format!(
-                        "Connection recovered. Session is still active. No buffered output needed replay. {}",
-                        blank_terminal_hint
-                    )
-                }),
-            )
-            .await?;
         }
 
         let skipped_review_stream_replay = should_skip_review_stream_replay(
@@ -4596,25 +4679,18 @@ impl TerminalBridge {
         );
         if !review_stream_frames.is_empty() {
             if skipped_review_stream_replay {
-                let reason =
-                    if resume_from_review_stream_seq.saturating_add(1) < oldest_review_stream_seq {
-                        "buffered review history was unavailable"
-                    } else {
-                        "the buffered review stream was too large to replay cleanly"
-                    };
-                self.send_encrypted_json_for_session(
-                    session_id,
-                    ws_write,
-                    json!({
-                        "kind":"status",
-                        "message": format!(
-                            "Connection recovered. Skipped replaying {} buffered review stream chunk(s) because {}.",
-                            review_stream_frames.len(),
-                            reason
-                        )
-                    }),
-                )
-                .await?;
+                if let Some(message) = build_skipped_review_stream_replay_status_message(
+                    resume_from_review_stream_seq,
+                    oldest_review_stream_seq,
+                    review_stream_frames.len(),
+                ) {
+                    self.send_encrypted_json_for_session(
+                        session_id,
+                        ws_write,
+                        build_connection_notice_payload(message, "warn", "review", 5200),
+                    )
+                    .await?;
+                }
             } else {
                 for (seq, request_id, stream, data) in &review_stream_frames {
                     self.send_encrypted_json_for_session(
@@ -4630,23 +4706,6 @@ impl TerminalBridge {
                     )
                     .await?;
                 }
-                self.send_encrypted_json_for_session(
-                    session_id,
-                    ws_write,
-                    json!({
-                        "kind":"status",
-                        "message": format!(
-                            "Replayed {} buffered review stream chunk(s) (seq {}..{}).",
-                            review_stream_frames.len(),
-                            review_stream_frames
-                                .first()
-                                .map(|(seq, _, _, _)| *seq)
-                                .unwrap_or(oldest_review_stream_seq),
-                            newest_review_stream_seq
-                        )
-                    }),
-                )
-                .await?;
             }
         }
 
@@ -6040,6 +6099,73 @@ pub fn run_local_start_cli(
     run_local_attach_interactive(reader, writer, first_value, "Started")
 }
 
+pub async fn request_local_start_session(
+    agent: &str,
+    cwd: Option<&str>,
+    agent_args: &[String],
+) -> anyhow::Result<String> {
+    let Some(agent) = normalize_agent(Some(agent)) else {
+        anyhow::bail!(
+            "Unknown agent `{}`. Supported: codex, claude, gemini, opencode.",
+            agent
+        );
+    };
+    let (agent_args, _) = crate::normalize_terminal_agent_permission_aliases(
+        Some(agent.as_str()),
+        agent_args.to_vec(),
+    );
+
+    let endpoint = load_local_attach_endpoint()?;
+    let address = format!("{}:{}", endpoint.host, endpoint.port);
+    let stream = TcpStream::connect(&address).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to connect to local attach endpoint at {}: {}. Is aidaemon running?",
+            address,
+            e
+        )
+    })?;
+    stream.set_nodelay(true).ok();
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    write_json_line(
+        &mut write_half,
+        &json!({
+            "type":"start",
+            "secret": endpoint.secret,
+            "agent": agent,
+            "cwd": cwd.unwrap_or(""),
+            "agent_args": agent_args,
+        }),
+    )
+    .await?;
+
+    let mut line = String::new();
+    let read = reader.read_line(&mut line).await?;
+    if read == 0 {
+        anyhow::bail!("Local attach endpoint closed before startup handshake completed");
+    }
+    let payload: Value = serde_json::from_str(line.trim())
+        .map_err(|e| anyhow::anyhow!("invalid local start response: {}", e))?;
+    match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "attached" => payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .ok_or_else(|| anyhow::anyhow!("local start response missing session_id")),
+        "error" => {
+            let message = payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("local start failed");
+            anyhow::bail!("{}", message);
+        }
+        _ => anyhow::bail!("Unexpected start response from local endpoint"),
+    }
+}
+
 pub fn run_local_share_cli(session_id: Option<&str>) -> anyhow::Result<()> {
     let endpoint = load_local_attach_endpoint()?;
     let address = format!("{}:{}", endpoint.host, endpoint.port);
@@ -6173,6 +6299,56 @@ mod tests {
     #[test]
     fn test_daemon_connect_token_mint_url_rejects_insecure_ws() {
         assert!(daemon_connect_token_mint_url("ws://terminal.aidaemon.ai/v1/ws/daemon").is_err());
+    }
+
+    #[test]
+    fn test_merge_daemon_bot_tokens_includes_dynamic_telegram_bots_for_active_user() {
+        let dynamic_bots = vec![
+            crate::traits::DynamicBot {
+                id: 1,
+                channel_type: "telegram".to_string(),
+                bot_token: "dynamic-user-token".to_string(),
+                app_token: None,
+                allowed_user_ids: vec!["301753035".to_string()],
+                extra_config: String::new(),
+                created_at: String::new(),
+            },
+            crate::traits::DynamicBot {
+                id: 2,
+                channel_type: "telegram".to_string(),
+                bot_token: "other-user-token".to_string(),
+                app_token: None,
+                allowed_user_ids: vec!["999".to_string()],
+                extra_config: String::new(),
+                created_at: String::new(),
+            },
+            crate::traits::DynamicBot {
+                id: 3,
+                channel_type: "slack".to_string(),
+                bot_token: "xoxb-not-telegram".to_string(),
+                app_token: Some("xapp-ignored".to_string()),
+                allowed_user_ids: vec!["301753035".to_string()],
+                extra_config: String::new(),
+                created_at: String::new(),
+            },
+        ];
+
+        let merged = merge_daemon_bot_tokens(
+            &[
+                "configured-token".to_string(),
+                "dynamic-user-token".to_string(),
+            ],
+            &dynamic_bots,
+            "301753035",
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                "configured-token".to_string(),
+                "dynamic-user-token".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -6609,6 +6785,42 @@ mod tests {
     }
 
     #[test]
+    fn test_build_skipped_stdout_replay_status_message_omits_clean_resume_noise() {
+        let frames = vec![(8, "line one\n".to_string()), (9, "line two\n".to_string())];
+        assert_eq!(
+            build_skipped_stdout_replay_status_message(7, 8, &frames),
+            None
+        );
+        assert_eq!(build_skipped_stdout_replay_status_message(7, 8, &[]), None);
+    }
+
+    #[test]
+    fn test_build_skipped_stdout_replay_status_message_mentions_recovery_only_when_skipped() {
+        let frames = (1..=20)
+            .map(|seq| (seq, format!("progress {}\r", seq)))
+            .collect::<Vec<_>>();
+        let message = build_skipped_stdout_replay_status_message(0, 1, &frames)
+            .expect("skipped replay status");
+        assert!(message.contains("Connection recovered."));
+        assert!(message.contains("Skipped replaying 20 buffered output frame(s)"));
+        assert!(message.contains("If the terminal appears blank"));
+    }
+
+    #[test]
+    fn test_build_connection_notice_payload_marks_out_of_band_notice() {
+        let payload = build_connection_notice_payload(
+            "Connection recovered.".to_string(),
+            "warn",
+            "terminal",
+            5200,
+        );
+        assert_eq!(payload["kind"].as_str(), Some("connection_notice"));
+        assert_eq!(payload["tone"].as_str(), Some("warn"));
+        assert_eq!(payload["scope"].as_str(), Some("terminal"));
+        assert_eq!(payload["ttl_ms"].as_u64(), Some(5200));
+    }
+
+    #[test]
     fn test_should_skip_review_stream_replay_when_gap_detected() {
         assert!(should_skip_review_stream_replay(4, 20, 3));
     }
@@ -6616,6 +6828,27 @@ mod tests {
     #[test]
     fn test_should_not_skip_review_stream_replay_for_small_resume() {
         assert!(!should_skip_review_stream_replay(12, 13, 4));
+    }
+
+    #[test]
+    fn test_build_skipped_review_stream_replay_status_message_omits_clean_resume_noise() {
+        assert_eq!(
+            build_skipped_review_stream_replay_status_message(12, 13, 4),
+            None
+        );
+        assert_eq!(
+            build_skipped_review_stream_replay_status_message(12, 13, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn test_build_skipped_review_stream_replay_status_message_mentions_recovery_only_when_skipped()
+    {
+        let message = build_skipped_review_stream_replay_status_message(4, 20, 3)
+            .expect("skipped review replay status");
+        assert!(message.contains("Connection recovered."));
+        assert!(message.contains("Skipped replaying 3 buffered review stream chunk(s)"));
     }
 
     #[test]

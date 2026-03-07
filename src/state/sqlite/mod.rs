@@ -9,8 +9,8 @@ use tokio::sync::RwLock;
 
 use crate::traits::{
     BehaviorPattern, ConversationSummary, Episode, ErrorSolution, Expertise, Fact, Goal,
-    GoalSchedule, GoalTokenBudgetStatus, Message, Procedure, Task, TaskActivity, TokenUsage,
-    TokenUsageRecord, UserProfile,
+    GoalSchedule, GoalTokenBudgetStatus, Message, Procedure, ScheduledRunState, Task, TaskActivity,
+    TokenUsage, TokenUsageRecord, UserProfile,
 };
 use crate::types::{ChannelVisibility, FactPrivacy};
 

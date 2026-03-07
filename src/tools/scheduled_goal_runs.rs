@@ -69,15 +69,6 @@ impl ScheduledGoalRunsTool {
             goal.budget_daily = Some(v);
         }
 
-        if let (Some(per_check), Some(daily)) = (goal.budget_per_check, goal.budget_daily) {
-            if per_check > daily {
-                return Ok(format!(
-                    "Invalid budgets: budget_per_check ({}) cannot exceed budget_daily ({}).",
-                    per_check, daily
-                ));
-            }
-        }
-
         self.state
             .set_goal_budgets(&goal.id, budget_per_check, budget_daily)
             .await?;
@@ -89,7 +80,7 @@ impl ScheduledGoalRunsTool {
         if let Some(budget_daily) = goal.budget_daily {
             if goal.tokens_used_today >= budget_daily {
                 out.push_str(&format!(
-                    "\nNote: tokens_used_today={} already exceeds the new budget_daily={}, so runs may stop until the daily reset.",
+                    "\nNote: tokens_used_today={} already exceeds the new budget_daily={}, so new scheduled runs may be skipped until the UTC daily reset.",
                     goal.tokens_used_today, budget_daily
                 ));
             }
@@ -298,6 +289,15 @@ impl ScheduledGoalRunsTool {
         let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
         if schedules.is_empty() {
             return Ok("Only scheduled goals can be run with scheduled_goal_runs.".to_string());
+        }
+
+        if let Some(budget_daily) = goal.budget_daily {
+            if goal.tokens_used_today >= budget_daily {
+                return Ok(format!(
+                    "Skipped run_now for {}: daily budget exhausted (used {} / limit {}). Wait for the UTC daily reset or raise `budget_daily`.",
+                    resolved_goal_id, goal.tokens_used_today, budget_daily
+                ));
+            }
         }
 
         match goal.status.as_str() {
@@ -1077,7 +1077,7 @@ mod tests {
             .unwrap();
         assert!(too_large.contains("max"));
 
-        let invalid_relation = tool
+        let allowed_relation = tool
             .call(
                 &json!({
                     "action": "set_budget",
@@ -1090,6 +1090,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(invalid_relation.contains("cannot exceed"));
+        assert!(allowed_relation.contains("Updated budget"));
+
+        let updated = state.get_goal(&goal_id).await.unwrap().unwrap();
+        assert_eq!(updated.budget_per_check, Some(200));
+        assert_eq!(updated.budget_daily, Some(100));
     }
 }

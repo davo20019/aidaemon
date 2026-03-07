@@ -26,7 +26,7 @@ pub(super) struct PostToolIterationInputs<'a> {
 pub(super) struct PostToolIterationState<'a> {
     pub total_successful_tool_calls: &'a mut usize,
     pub force_text_response: &'a mut bool,
-    pub pending_system_messages: &'a mut Vec<String>,
+    pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub tool_defs: &'a mut Vec<Value>,
     pub stall_count: &'a mut usize,
     pub deferred_no_tool_streak: &'a mut usize,
@@ -38,7 +38,7 @@ impl Agent {
     fn apply_read_saturation_controls(
         &self,
         session_id: &str,
-        pending_system_messages: &mut Vec<String>,
+        pending_system_messages: &mut Vec<SystemDirective>,
         tool_defs: &mut Vec<Value>,
         base_tool_defs: &[Value],
         recent_tool_names: &VecDeque<String>,
@@ -109,17 +109,7 @@ impl Agent {
             } else {
                 format!("{} read-only calls in a row", consecutive_reads)
             };
-            pending_system_messages.push(format!(
-                "[SYSTEM] CRITICAL: {} \
-                 without making meaningful changes. Read tools have been REMOVED.\n\n\
-                 You MUST act NOW with one of these tools:\n\
-                 - `write_file` to rewrite the file with all your fixes applied\n\
-                 - `edit_file` to apply a specific fix to the code\n\
-                 - `terminal` to run tests or commands\n\n\
-                 You already have enough information from your previous reads. \
-                 Write the corrected code NOW.",
-                read_desc
-            ));
+            pending_system_messages.push(SystemDirective::ReadSaturationCritical { read_desc });
             info!(
                 session_id,
                 consecutive_reads,
@@ -132,14 +122,8 @@ impl Agent {
         }
 
         if consecutive_reads >= READ_SATURATION_THRESHOLD {
-            pending_system_messages.push(format!(
-                "[SYSTEM] WARNING: You have called read-only tools {} times in a row. \
-                 STOP reading and ACT NOW.\n\n\
-                 You MUST use `edit_file`, `write_file`, or `terminal` as your NEXT tool call. \
-                 Do NOT call read_file again — you already have the information you need. \
-                 If you read again, your read tools will be removed.",
-                consecutive_reads
-            ));
+            pending_system_messages
+                .push(SystemDirective::ReadSaturationWarning { consecutive_reads });
             info!(
                 session_id,
                 consecutive_reads, "Read-saturation nudge injected"
@@ -165,7 +149,7 @@ impl Agent {
     fn apply_terminal_after_edit_nudge(
         &self,
         session_id: &str,
-        pending_system_messages: &mut Vec<String>,
+        pending_system_messages: &mut Vec<SystemDirective>,
         recent_tool_names: &VecDeque<String>,
     ) {
         // Terminal-after-edit nudge: if the agent has made edits but then runs
@@ -183,17 +167,9 @@ impl Agent {
             .filter(|name| name.as_str() == "terminal")
             .count();
         if consecutive_terminals >= TERMINAL_AFTER_EDIT_THRESHOLD {
-            pending_system_messages.push(format!(
-                "[SYSTEM] You have run terminal commands {} times since your last edit \
-                 without making any new edits. If tests are still failing:\n\n\
-                 1. Look at the FAILING TEST NAMES — they tell you which file has the bug\n\
-                 2. Read THAT file (not one you already fixed)\n\
-                 3. Compare expected vs actual values in the test output to identify the fix\n\
-                 4. Use `edit_file` to fix it, then run tests ONCE to verify\n\n\
-                 IMPORTANT: If you already fixed bugs in one file but other tests still fail, \
-                 the remaining bugs are in DIFFERENT files. Move on to those files.",
-                consecutive_terminals
-            ));
+            pending_system_messages.push(SystemDirective::TerminalAfterEdit {
+                consecutive_terminals,
+            });
             info!(
                 session_id,
                 consecutive_terminals, "Terminal-after-edit nudge injected"
@@ -262,29 +238,20 @@ impl Agent {
             } else {
                 format!("\nCurrent task: {}", task_hint)
             };
-            let urgency = if total_tool_calls_attempted >= critical_threshold {
-                format!(
-                    "[SYSTEM] CRITICAL: You have used {} tokens across {} tool calls. \
-                     Stop immediately and respond to the user about THEIR REQUEST \
-                     before the hard limit ({} calls). No more exploration.{}",
-                    task_tokens_used, total_tool_calls_attempted, force_text_at, task_anchor
-                )
+            let severity = if total_tool_calls_attempted >= critical_threshold {
+                EarlyStopSeverity::Critical
             } else if total_tool_calls_attempted >= important_threshold {
-                format!(
-                    "[SYSTEM] IMPORTANT: You have used {} tokens in {} tool calls. \
-                     You MUST stop calling tools soon and respond about the user's request. \
-                     Hard limit for this task is {} tool calls.{}",
-                    task_tokens_used, total_tool_calls_attempted, force_text_at, task_anchor
-                )
+                EarlyStopSeverity::Important
             } else {
-                format!(
-                    "[SYSTEM] You have used {} tokens in {} tool calls. If you have \
-                     enough information, stop calling tools and respond now with your \
-                     findings about the user's request (hard limit: {} calls).{}",
-                    task_tokens_used, total_tool_calls_attempted, force_text_at, task_anchor
-                )
+                EarlyStopSeverity::Normal
             };
-            pending_system_messages.push(urgency);
+            pending_system_messages.push(SystemDirective::EarlyStopUrgency {
+                task_tokens_used,
+                total_tool_calls_attempted,
+                force_text_at,
+                task_anchor,
+                severity,
+            });
             info!(
                 session_id,
                 total_tool_calls_attempted, "Early-stop nudge injected (escalating)"
@@ -310,18 +277,11 @@ impl Agent {
             } else {
                 format!("User's request: {}\n\n", force_task_hint)
             };
-            pending_system_messages.push(format!(
-                "[SYSTEM] Tool limit reached ({} calls). No more tool calls available.\n\
-                 {}{}\
-                 You MUST now respond with a concise summary:\n\
-                 1. What you accomplished (files modified, bugs fixed, features added)\n\
-                 2. What remains unfinished and why\n\
-                 3. Any test results or verification status\n\n\
-                 Do NOT restate the original task or say what you would do next. \
-                 Do NOT answer questions from old conversation history. \
-                 Focus only on concrete results and outcomes for the CURRENT task.",
-                force_text_at, force_task_anchor, activity_section
-            ));
+            pending_system_messages.push(SystemDirective::ForceTextToolLimitReached {
+                force_text_at,
+                force_task_anchor,
+                activity_section,
+            });
             warn!(
                 session_id,
                 total_tool_calls_attempted,
@@ -421,7 +381,7 @@ impl Agent {
     fn apply_edit_stall_write_hint(
         &self,
         session_id: &str,
-        pending_system_messages: &mut Vec<String>,
+        pending_system_messages: &mut Vec<SystemDirective>,
         recent_tool_names: &VecDeque<String>,
         iteration_had_tool_failures: bool,
     ) {
@@ -438,14 +398,7 @@ impl Agent {
             .take_while(|name| name.as_str() == "edit_file")
             .count();
         if consecutive_edits >= 3 {
-            pending_system_messages.push(
-                "[SYSTEM] You have failed edit_file 3+ times in a row. The old_text is not \
-                 matching the actual file content. STOP using edit_file. Instead:\n\
-                 1. Use `read_file` to see the CURRENT file content\n\
-                 2. Use `write_file` to rewrite the ENTIRE file with all your changes applied\n\n\
-                 write_file is more reliable than edit_file when the file has been modified."
-                    .to_string(),
-            );
+            pending_system_messages.push(SystemDirective::EditStallWriteFileHint);
             info!(
                 session_id,
                 consecutive_edits, "Edit-stall write_file hint injected"

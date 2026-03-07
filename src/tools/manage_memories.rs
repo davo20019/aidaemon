@@ -2329,8 +2329,8 @@ mod tests {
         assert_eq!(goal.status, "pending_confirmation");
         assert_eq!(goal.domain, "orchestration");
         assert_eq!(goal.goal_type, "continuous");
-        assert_eq!(goal.budget_per_check, Some(50_000));
-        assert_eq!(goal.budget_daily, Some(200_000));
+        assert_eq!(goal.budget_per_check, Some(100_000));
+        assert_eq!(goal.budget_daily, Some(500_000));
 
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         assert_eq!(schedules.len(), 1);

@@ -77,6 +77,7 @@ struct RunningProcess {
 /// can still return results after automatic reaping.
 struct CompletedProcess {
     output: String,
+    metadata: ToolCallMetadata,
     completed_at: Instant,
 }
 
@@ -1088,6 +1089,7 @@ impl TerminalTool {
                 pid,
                 CompletedProcess {
                     output,
+                    metadata: tracked_background_metadata(proc.detached, false, exit_code),
                     completed_at: Instant::now(),
                 },
             );
@@ -1105,15 +1107,15 @@ impl TerminalTool {
         task_id: Option<&str>,
         detach: bool,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ToolCallOutcome> {
         let dedupe_key =
             Self::dedupe_key_for_run(command, notify_session_id, notify_goal_id, task_id);
         if let Some(existing_pid) = self.resolve_duplicate_running_pid(&dedupe_key).await {
-            return Ok(format!(
+            return Ok(ToolCallOutcome::from_output(format!(
                 "Equivalent command is already running in this scope (pid={}). \
                  Use action=\"check\" pid={} to inspect progress or action=\"kill\" pid={} to stop it.",
                 existing_pid, existing_pid, existing_pid
-            ));
+            )));
         }
 
         let mut cmd = tokio::process::Command::new("sh");
@@ -1170,7 +1172,10 @@ impl TerminalTool {
                         output.push_str(&format!("\n[exit code: {}]", code));
                     }
                 }
-                Ok(output)
+                Ok(ToolCallOutcome {
+                    metadata: foreground_terminal_metadata(exit_code),
+                    output,
+                })
             }
             Err(_) => {
                 // Timeout — check if this is a daemon/background command where the
@@ -1191,13 +1196,23 @@ impl TerminalTool {
                     let output =
                         format_output(&partial_stdout, &partial_stderr, self.max_output_chars);
                     reader_handle.abort();
-                    return Ok(format!(
+                    let output = format!(
                         "Detached background command launched (pid={}).\n\
                          The process is running independently and is not task-owned.\n\
                          This detached daemonized process is not tracked by action=\"check\"/\"kill\".\n\n\
                          Initial output:\n{}",
                         pid, output
-                    ));
+                    );
+                    return Ok(ToolCallOutcome {
+                        metadata: ToolCallMetadata {
+                            background_started: true,
+                            detached: true,
+                            timed_out: false,
+                            completion_notifications_enabled: false,
+                            ..ToolCallMetadata::default()
+                        },
+                        output,
+                    });
                 }
 
                 // Non-daemon command: move process to background tracking.
@@ -1538,25 +1553,37 @@ impl TerminalTool {
                 if !partial_stdout.is_empty() {
                     msg.push_str(&format!("\n\nPartial output so far:\n{}", partial_stdout));
                 }
-                Ok(msg)
+                Ok(ToolCallOutcome {
+                    metadata: ToolCallMetadata {
+                        background_started: true,
+                        timed_out: true,
+                        detached: detach,
+                        completion_notifications_enabled: !detach && notifier_started,
+                        ..ToolCallMetadata::default()
+                    },
+                    output: msg,
+                })
             }
         }
     }
 
     /// Check on a background process: return partial output or final result.
-    async fn handle_check(&self, pid: u32) -> anyhow::Result<String> {
+    async fn handle_check(&self, pid: u32) -> anyhow::Result<ToolCallOutcome> {
         let mut running = self.running.lock().await;
 
         let Some(proc) = running.get(&pid) else {
             drop(running);
             let mut completed = self.completed.lock().await;
             if let Some(done) = completed.remove(&pid) {
-                return Ok(done.output);
+                return Ok(ToolCallOutcome {
+                    output: done.output,
+                    metadata: done.metadata,
+                });
             }
-            return Ok(format!(
+            return Ok(ToolCallOutcome::from_output(format!(
                 "No tracked process with pid={}. It may have already finished and been reaped.",
                 pid
-            ));
+            )));
         };
 
         if proc.reader_handle.is_finished() {
@@ -1578,7 +1605,10 @@ impl TerminalTool {
                     output.push_str(&format!("\n[exit code: {}]", code));
                 }
             }
-            Ok(output)
+            Ok(ToolCallOutcome {
+                output,
+                metadata: tracked_background_metadata(proc.detached, false, exit_code),
+            })
         } else {
             // Still running — return tail of buffer.
             let elapsed = proc.started_at.elapsed().as_secs();
@@ -1613,26 +1643,39 @@ impl TerminalTool {
                 "\n\nUse action=\"check\" pid={} to check again, or action=\"kill\" pid={} to stop.",
                 pid, pid
             ));
-            Ok(output)
+            Ok(ToolCallOutcome {
+                output,
+                metadata: tracked_background_metadata(
+                    proc.detached,
+                    proc.notifier_active && !proc.detached,
+                    None,
+                ),
+            })
         }
     }
 
     /// Kill a background process: SIGTERM, wait 2s, SIGKILL if needed.
-    async fn handle_kill(&self, pid: u32) -> anyhow::Result<String> {
+    async fn handle_kill(&self, pid: u32) -> anyhow::Result<ToolCallOutcome> {
         let mut running = self.running.lock().await;
 
         let Some(proc) = running.remove(&pid) else {
-            return Ok(format!(
+            return Ok(ToolCallOutcome::from_output(format!(
                 "No tracked process with pid={}. It may have already finished.",
                 pid
-            ));
+            )));
         };
         drop(running);
         self.remove_indexes_for_process(pid, &proc).await;
         self.completed.lock().await.remove(&pid);
 
-        self.terminate_running_process(pid, proc, "manual kill")
-            .await
+        let detached = proc.detached;
+        let output = self
+            .terminate_running_process(pid, proc, "manual kill")
+            .await?;
+        Ok(ToolCallOutcome {
+            output,
+            metadata: tracked_background_metadata(detached, false, None),
+        })
     }
 }
 
@@ -1696,24 +1739,28 @@ fn extract_terminal_exit_code(output: &str) -> Option<i32> {
     }
 }
 
-fn terminal_output_indicates_background_started(output: &str) -> bool {
-    output.contains("Moved to background")
-        || output.contains("Detached background command launched")
-        || output.contains("still running after")
-        || output.contains("[mode: detached]")
+fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
+    ToolCallMetadata {
+        exit_code,
+        timed_out: false,
+        background_started: false,
+        detached: false,
+        completion_notifications_enabled: false,
+        transport_error: None,
+    }
 }
 
-fn infer_terminal_metadata_from_output(output: &str, detach_requested: bool) -> ToolCallMetadata {
-    let background_started = terminal_output_indicates_background_started(output);
-    let detached = output.contains("Detached background command launched")
-        || output.contains("[mode: detached]")
-        || output.contains("Detached mode is enabled")
-        || (detach_requested && background_started);
+fn tracked_background_metadata(
+    detached: bool,
+    completion_notifications_enabled: bool,
+    exit_code: Option<i32>,
+) -> ToolCallMetadata {
     ToolCallMetadata {
-        exit_code: extract_terminal_exit_code(output),
-        timed_out: output.contains("still running after"),
-        background_started,
+        exit_code,
+        timed_out: true,
+        background_started: true,
         detached,
+        completion_notifications_enabled,
         transport_error: None,
     }
 }
@@ -1810,13 +1857,13 @@ impl Tool for TerminalTool {
                 let pid = args
                     .pid
                     .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"check\""))?;
-                ToolCallOutcome::from_output(self.handle_check(pid).await?)
+                self.handle_check(pid).await?
             }
             "kill" => {
                 let pid = args
                     .pid
                     .ok_or_else(|| anyhow::anyhow!("pid is required for action=\"kill\""))?;
-                ToolCallOutcome::from_output(self.handle_kill(pid).await?)
+                self.handle_kill(pid).await?
             }
             "trust_all" => {
                 ToolCallOutcome::from_output(self.handle_trust_all(&args._session_id).await?)
@@ -2089,33 +2136,20 @@ impl Tool for TerminalTool {
                     }
                 }
 
-                ToolCallOutcome::from_output(
-                    self.handle_run(
-                        command,
-                        &notify_session_id,
-                        args._goal_id.as_deref(),
-                        args._task_id.as_deref(),
-                        args.detach,
-                        status_tx,
-                    )
-                    .await?,
+                self.handle_run(
+                    command,
+                    &notify_session_id,
+                    args._goal_id.as_deref(),
+                    args._task_id.as_deref(),
+                    args.detach,
+                    status_tx,
                 )
+                .await?
             }
         };
 
-        if outcome.metadata == ToolCallMetadata::default() {
-            outcome.metadata = infer_terminal_metadata_from_output(&outcome.output, args.detach);
-        } else {
-            // Preserve any structured values if a future branch sets them directly,
-            // while still backfilling missing fields from the canonical output format.
-            if outcome.metadata.exit_code.is_none() {
-                outcome.metadata.exit_code = extract_terminal_exit_code(&outcome.output);
-            }
-            outcome.metadata.background_started |=
-                terminal_output_indicates_background_started(&outcome.output);
-            outcome.metadata.timed_out |= outcome.output.contains("still running after");
-            outcome.metadata.detached |=
-                infer_terminal_metadata_from_output(&outcome.output, args.detach).detached;
+        if outcome.metadata.exit_code.is_none() {
+            outcome.metadata.exit_code = extract_terminal_exit_code(&outcome.output);
         }
 
         Ok(outcome)
@@ -2157,25 +2191,95 @@ mod tests {
     }
 
     #[test]
-    fn infer_terminal_metadata_extracts_exit_code() {
-        let metadata = infer_terminal_metadata_from_output(
-            "[Process pid=123 finished after 2s]\nall done\n[exit code: 42]",
-            false,
+    fn extract_terminal_exit_code_parses_marker() {
+        assert_eq!(
+            extract_terminal_exit_code(
+                "[Process pid=123 finished after 2s]\nall done\n[exit code: 42]"
+            ),
+            Some(42)
         );
-        assert_eq!(metadata.exit_code, Some(42));
-        assert!(!metadata.background_started);
-        assert!(!metadata.detached);
     }
 
     #[test]
-    fn infer_terminal_metadata_marks_background_and_detached() {
-        let metadata = infer_terminal_metadata_from_output(
-            "Command still running after 30s. Moved to background (pid=11).\n\nDetached mode is enabled: this process will not be auto-killed at task end.",
-            true,
-        );
+    fn tracked_background_metadata_marks_background_and_detached() {
+        let metadata = tracked_background_metadata(true, false, None);
         assert!(metadata.background_started);
         assert!(metadata.timed_out);
         assert!(metadata.detached);
+        assert!(!metadata.completion_notifications_enabled);
+    }
+
+    #[tokio::test]
+    async fn timed_out_background_run_sets_notification_metadata_when_available() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state as Arc<dyn StateStore>);
+
+        let outcome = tool
+            .call_with_status_outcome(
+                r#"{"action":"run","command":"sleep 2; echo notify-meta","_session_id":"sess_meta","_user_role":"Owner"}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.output.contains("Moved to background (pid="));
+        assert!(outcome.metadata.background_started);
+        assert!(outcome.metadata.timed_out);
+        assert!(!outcome.metadata.detached);
+        assert!(outcome.metadata.completion_notifications_enabled);
+    }
+
+    #[tokio::test]
+    async fn timed_out_background_run_clears_notification_metadata_when_unavailable() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let outcome = tool
+            .call_with_status_outcome(
+                r#"{"action":"run","command":"sleep 2; echo no-notify-meta","_session_id":"sess_meta2","_user_role":"Owner"}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.output.contains("Moved to background (pid="));
+        assert!(outcome.metadata.background_started);
+        assert!(outcome.metadata.timed_out);
+        assert!(!outcome.metadata.detached);
+        assert!(!outcome.metadata.completion_notifications_enabled);
     }
 
     // ── contains_shell_operator tests ──

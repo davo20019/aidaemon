@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::traits::{Message, ToolCall};
+use crate::traits::{Message, MessageAnnotation, ToolCall};
 
 use super::ToolCallInfo;
 
@@ -17,6 +17,7 @@ pub struct ConversationTurn {
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
     pub tool_calls: Option<Vec<ToolCallInfo>>,
+    pub annotations: Vec<MessageAnnotation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,13 @@ fn tool_calls_from_assistant_response(data: &Value) -> Option<Vec<ToolCallInfo>>
     Some(mapped)
 }
 
+fn annotations_from_event_data(data: &Value) -> Vec<MessageAnnotation> {
+    data.get("annotations")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<MessageAnnotation>>(value).ok())
+        .unwrap_or_default()
+}
+
 /// Project a single canonical conversation event into an event-native turn.
 pub fn turn_from_event(
     event_id: i64,
@@ -101,6 +109,7 @@ pub fn turn_from_event(
             tool_call_id: None,
             tool_name: None,
             tool_calls: None,
+            annotations: annotations_from_event_data(data),
         }),
         "assistant_response" => Some(ConversationTurn {
             event_id,
@@ -115,6 +124,7 @@ pub fn turn_from_event(
             tool_call_id: None,
             tool_name: None,
             tool_calls: tool_calls_from_assistant_response(data),
+            annotations: annotations_from_event_data(data),
         }),
         "tool_result" => Some(ConversationTurn {
             event_id,
@@ -141,6 +151,7 @@ pub fn turn_from_event(
                     .to_string(),
             ),
             tool_calls: None,
+            annotations: annotations_from_event_data(data),
         }),
         _ => None,
     }
@@ -173,8 +184,65 @@ impl ConversationTurn {
             tool_name: self.tool_name,
             tool_calls_json,
             created_at: self.created_at,
+            annotations: self.annotations,
             importance: 0.5,
             embedding: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+
+    #[test]
+    fn tool_result_projection_round_trips_annotations() {
+        let turn = turn_from_event(
+            42,
+            "session-1",
+            "tool_result",
+            &json!({
+                "message_id": "msg-1",
+                "tool_call_id": "call-1",
+                "name": "terminal",
+                "result": "cargo test\n\n[SYSTEM] Do not retry.",
+                "annotations": [{"type": "appended_system_notice"}]
+            }),
+            Utc::now(),
+        )
+        .expect("tool_result should project");
+
+        let msg = turn.into_message();
+        assert_eq!(
+            msg.annotations,
+            vec![MessageAnnotation::AppendedSystemNotice]
+        );
+        assert_eq!(msg.primary_content().as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn tool_result_projection_legacy_messages_infer_annotations() {
+        let turn = turn_from_event(
+            43,
+            "session-1",
+            "tool_result",
+            &json!({
+                "message_id": "msg-2",
+                "tool_call_id": "call-2",
+                "name": "system",
+                "result": "[SYSTEM] Before executing tools, narrate the plan."
+            }),
+            Utc::now(),
+        )
+        .expect("tool_result should project");
+
+        let msg = turn.into_message();
+        assert!(
+            msg.annotations.is_empty(),
+            "legacy rows should not require backfill"
+        );
+        assert!(msg.is_structural_only());
     }
 }

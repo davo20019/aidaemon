@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use super::TaskStatus;
+use crate::traits::MessageAnnotation;
 
 // =============================================================================
 // Session Events
@@ -61,6 +62,9 @@ pub struct UserMessageData {
     /// Whether this message has attachments
     #[serde(default)]
     pub has_attachments: bool,
+    /// Structured annotations attached to the rendered content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<MessageAnnotation>,
 }
 
 /// Data for AssistantResponse event
@@ -83,6 +87,9 @@ pub struct AssistantResponseData {
     /// Output tokens used
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
+    /// Structured annotations attached to the rendered content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<MessageAnnotation>,
 }
 
 /// Tool call information (subset of ToolCall for storage)
@@ -151,6 +158,9 @@ pub struct ToolResultData {
     /// Associated task ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Structured annotations attached to the rendered content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<MessageAnnotation>,
 }
 
 // =============================================================================

@@ -6,8 +6,13 @@ use std::sync::{Arc, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use base64::Engine;
+use hmac::{Hmac, Mac};
 use once_cell::sync::Lazy;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use regex::Regex;
+use sha2::Sha256;
 use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -107,11 +112,51 @@ const TELEGRAM_EXPANDABLE_MAX_ESCAPED_CHARS: usize =
 const TELEGRAM_WEBAPP_TYPE_AGENT_MESSAGE: &str = "aidaemon.telegram.agent_message.v1";
 const TELEGRAM_WEBAPP_TYPE_CONTINUE_COMPUTER: &str = "aidaemon.telegram.open_on_computer.v1";
 const TELEGRAM_WEBAPP_MAX_TEXT_CHARS: usize = 2_000;
+const TERMINAL_TENANT_BOT_BOOTSTRAP_DEVICE_ID: &str = "tenant-bot-bootstrap";
 static LOW_LATENCY_RESTART_SCHEDULED: AtomicBool = AtomicBool::new(false);
+type HmacSha256 = Hmac<Sha256>;
 
 enum TelegramWebAppAction {
     AgentMessage(String),
     ContinueOnComputer { relay_session_id: Option<String> },
+}
+
+fn random_terminal_bootstrap_nonce(num_bytes: usize) -> String {
+    let mut bytes = vec![0u8; num_bytes.max(1)];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn terminal_tenant_bot_bootstrap_signing_input(user_id: u64, ts: i64, nonce: &str) -> String {
+    format!(
+        "v1\nuser_id={}\ndevice_id={}\nts={}\nnonce={}",
+        user_id, TERMINAL_TENANT_BOT_BOOTSTRAP_DEVICE_ID, ts, nonce
+    )
+}
+
+fn sign_terminal_tenant_bot_bootstrap_proof(
+    bot_token: &str,
+    user_id: u64,
+    ts: i64,
+    nonce: &str,
+) -> Result<String, String> {
+    let input = terminal_tenant_bot_bootstrap_signing_input(user_id, ts, nonce);
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(bot_token.as_bytes())
+        .map_err(|_| "invalid HMAC key".to_string())?;
+    mac.update(input.as_bytes());
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+fn terminal_tenant_bot_bootstrap_url(terminal_web_app_url: &str) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(terminal_web_app_url.trim())
+        .map_err(|err| format!("invalid terminal web app URL: {}", err))?;
+    if url.scheme() != "https" {
+        return Err("terminal web app URL must use HTTPS".to_string());
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_path("/v1/tenant/bot-token/bootstrap");
+    Ok(url)
 }
 
 /// All commands available in the Telegram channel (shared + Telegram-specific).
@@ -315,6 +360,102 @@ impl TelegramChannel {
         }
     }
 
+    fn cached_bot_label(&self) -> Option<String> {
+        let guard = self
+            .bot_username
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let username = guard.trim();
+        if username.is_empty() || username == "telegram" {
+            None
+        } else {
+            Some(username.to_string())
+        }
+    }
+
+    async fn sync_terminal_tenant_bot_token(
+        &self,
+        bot_token: &str,
+        user_id: u64,
+        label: Option<&str>,
+    ) -> Result<(), String> {
+        let url = terminal_tenant_bot_bootstrap_url(&self.terminal_web_app_url)?;
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| format!("failed to read system clock: {}", err))?
+            .as_secs() as i64;
+        let nonce = random_terminal_bootstrap_nonce(16);
+        let sig = sign_terminal_tenant_bot_bootstrap_proof(bot_token, user_id, ts, &nonce)?;
+        let mut payload = serde_json::json!({
+            "user_id": user_id,
+            "bot_token": bot_token,
+            "ts": ts,
+            "nonce": nonce,
+            "sig": sig,
+        });
+        if let Some(label) = label
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(map) = payload.as_object_mut() {
+                map.insert(
+                    "label".to_string(),
+                    serde_json::Value::String(label.to_string()),
+                );
+            }
+        }
+
+        let client = reqwest::Client::builder()
+            .user_agent("aidaemon-terminal-bot-bootstrap/1.0")
+            .timeout(Duration::from_secs(8))
+            .build()
+            .map_err(|err| format!("failed to build HTTP client: {}", err))?;
+        let response = client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|err| format!("terminal bot sync request failed: {}", err))?;
+        let status = response.status();
+        let parsed: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|err| format!("terminal bot sync returned invalid JSON: {}", err))?;
+        if status.is_success() && parsed.get("ok").and_then(|value| value.as_bool()) == Some(true) {
+            return Ok(());
+        }
+
+        let message = parsed
+            .get("message")
+            .and_then(|value| value.as_str())
+            .or_else(|| parsed.get("error").and_then(|value| value.as_str()))
+            .unwrap_or("unknown error");
+        Err(format!(
+            "terminal bot sync failed (status {}): {}",
+            status, message
+        ))
+    }
+
+    async fn sync_terminal_tenant_bot_token_for_allowed_users(&self, label: Option<&str>) {
+        let allowed_user_ids = self
+            .allowed_user_ids
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for user_id in allowed_user_ids {
+            if let Err(err) = self
+                .sync_terminal_tenant_bot_token(&self.bot_token, user_id, label)
+                .await
+            {
+                warn!(
+                    error = %err,
+                    user_id,
+                    "Failed to auto-sync Telegram bot token during channel startup"
+                );
+            }
+        }
+    }
+
     /// Build the session ID for a chat, prefixing with bot username.
     /// Uses a stable namespace to avoid mid-run session ID drift.
     async fn session_id(&self, chat_id: i64) -> String {
@@ -402,6 +543,8 @@ impl TelegramChannel {
     pub async fn start(self: Arc<Self>) {
         let bot_username = self.get_bot_username().await;
         info!(name = %bot_username, "Starting Telegram channel");
+        self.sync_terminal_tenant_bot_token_for_allowed_users(Some(bot_username.as_str()))
+            .await;
 
         // Register commands with Telegram so they appear in the "/" menu.
         let bot_commands: Vec<BotCommand> = telegram_commands()
@@ -1477,6 +1620,55 @@ impl TelegramChannel {
         } else {
             Some(cwd_parts.join(" "))
         };
+        let has_launch_intent = agent.is_some() || cwd.is_some() || !agent_args.is_empty();
+        #[cfg(not(feature = "terminal-bridge"))]
+        let _ = has_launch_intent;
+
+        let current_bot_label = self.cached_bot_label();
+        let mini_app_sync_warning = match self
+            .sync_terminal_tenant_bot_token(&self.bot_token, user_id, current_bot_label.as_deref())
+            .await
+        {
+            Ok(()) => None,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    user_id,
+                    invoked_cmd,
+                    "Failed to auto-sync Telegram bot token before opening Mini App"
+                );
+                Some(
+                    "Mini App auth sync did not complete. If Telegram shows an auth mismatch, retry once or save the token in the app."
+                        .to_string(),
+                )
+            }
+        };
+
+        #[cfg(feature = "terminal-bridge")]
+        let prestarted_relay_session_id = if invoked_cmd == "/agent" && has_launch_intent {
+            match crate::terminal_bridge::request_local_start_session(
+                agent.as_deref().unwrap_or(DEFAULT_TERMINAL_AGENT),
+                cwd.as_deref(),
+                &agent_args,
+            )
+            .await
+            {
+                Ok(session_id) => Some(session_id),
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        chat_id = msg.chat.id.0,
+                        invoked_cmd,
+                        "Failed to pre-start local bridge session for Telegram Mini App"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "terminal-bridge"))]
+        let prestarted_relay_session_id: Option<String> = None;
 
         let mut web_app_url = match reqwest::Url::parse(self.terminal_web_app_url.trim()) {
             Ok(url) => url,
@@ -1518,6 +1710,9 @@ impl TelegramChannel {
                 if !cwd.trim().is_empty() {
                     query.append_pair("cwd", cwd);
                 }
+            }
+            if let Some(relay_session_id) = prestarted_relay_session_id.as_deref() {
+                query.append_pair("relay_session_id", relay_session_id);
             }
             for arg in &agent_args {
                 query.append_pair("arg", arg);
@@ -1585,6 +1780,12 @@ impl TelegramChannel {
                 );
             }
         }
+        if prestarted_relay_session_id.is_some() {
+            summary_lines.push(
+                "Prepared a local relay session in advance so the Mini App can attach immediately."
+                    .to_string(),
+            );
+        }
         summary_lines.push(String::new());
         summary_lines.push(
             if invoked_cmd == "/agent" {
@@ -1594,6 +1795,9 @@ impl TelegramChannel {
             }
             .to_string(),
         );
+        if let Some(warning) = mini_app_sync_warning.as_deref() {
+            summary_lines.push(warning.to_string());
+        }
         if invoked_cmd == "/agent" {
             summary_lines.push(
                 "💻 Continue on Computer sends a one-time resume code (expires in about 5 minutes)."
@@ -3165,6 +3369,25 @@ impl TelegramChannel {
             "New Telegram bot connected"
         );
 
+        let mini_app_sync_warning = match self
+            .sync_terminal_tenant_bot_token(token, user_id, Some(bot_username.as_str()))
+            .await
+        {
+            Ok(()) => None,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    bot = %bot_username,
+                    added_by = user_id,
+                    "Failed to auto-sync Telegram bot token with terminal mini app backend"
+                );
+                Some(
+                    "Mini App auth sync failed. If you hit a Telegram auth mismatch, run /agent from this bot once or save the token manually in the Mini App."
+                        .to_string(),
+                )
+            }
+        };
+
         // Try to spawn the bot immediately if we have a hub reference
         let hub_ref = self.channel_hub.read().ok().and_then(|g| g.clone());
         if let Some(weak_hub) = hub_ref {
@@ -3206,8 +3429,12 @@ impl TelegramChannel {
                 return format!(
                     "✓ Bot @{} connected and started!\n\n\
                     The bot is now active and ready to receive messages.\n\
-                    Use /bots to see all connected bots.",
-                    bot_username
+                    Use /bots to see all connected bots.{}",
+                    bot_username,
+                    mini_app_sync_warning
+                        .as_deref()
+                        .map(|value| format!("\n\n{}", value))
+                        .unwrap_or_default()
                 );
             }
         }
@@ -3216,8 +3443,12 @@ impl TelegramChannel {
         format!(
             "✓ Bot @{} connected!\n\n\
             Run /restart to activate the new bot.\n\
-            Use /bots to see all connected bots.",
-            bot_username
+            Use /bots to see all connected bots.{}",
+            bot_username,
+            mini_app_sync_warning
+                .as_deref()
+                .map(|value| format!("\n\n{}", value))
+                .unwrap_or_default()
         )
     }
 
@@ -3845,6 +4076,26 @@ impl TelegramChannel {
             return;
         }
 
+        let current_bot_label = self.cached_bot_label();
+        let mini_app_sync_warning = match self
+            .sync_terminal_tenant_bot_token(&self.bot_token, user_id, current_bot_label.as_deref())
+            .await
+        {
+            Ok(()) => None,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    user_id,
+                    relay_session_id = %relay_session_id,
+                    "Failed to auto-sync Telegram bot token before /agent resume"
+                );
+                Some(
+                    "If Telegram reports an auth mismatch, retry once or save the token manually in the Mini App."
+                        .to_string(),
+                )
+            }
+        };
+
         let mut web_app_url = match reqwest::Url::parse(&self.terminal_web_app_url) {
             Ok(url) => url,
             Err(err) => {
@@ -3882,8 +4133,12 @@ impl TelegramChannel {
             .send_message(
                 chat_id,
                 format!(
-                    "✅ <b>Resume Code Accepted</b>\n\nSession: <code>{}</code>\nTap Open in Mini App to continue on your phone.",
-                    html_escape(&relay_session_id)
+                    "✅ <b>Resume Code Accepted</b>\n\nSession: <code>{}</code>\nTap Open in Mini App to continue on your phone.{}",
+                    html_escape(&relay_session_id),
+                    mini_app_sync_warning
+                        .as_deref()
+                        .map(|value| format!("\n\n{}", html_escape(value)))
+                        .unwrap_or_default()
                 ),
             )
             .parse_mode(ParseMode::Html)
@@ -5575,6 +5830,30 @@ mod tests {
         let text = "Low-latency webhook config applied (local config only).\nBackup: config.toml.lowlatency.bak\n";
         let stripped = TelegramChannel::strip_low_latency_next_steps(text);
         assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn terminal_tenant_bot_bootstrap_url_targets_worker_endpoint() {
+        let url = terminal_tenant_bot_bootstrap_url(
+            "https://terminal.aidaemon.ai/app?tgWebAppData=abc#fragment",
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://terminal.aidaemon.ai/v1/tenant/bot-token/bootstrap"
+        );
+    }
+
+    #[test]
+    fn terminal_tenant_bot_bootstrap_signature_is_stable() {
+        let sig = sign_terminal_tenant_bot_bootstrap_proof(
+            "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd",
+            301753035,
+            1_700_000_000,
+            "deadbeefcafebabe",
+        )
+        .unwrap();
+        assert_eq!(sig, "wdb3Oj1hWbvz373tj4nBZrudZKP_nFsmf8LZvWMwvOo");
     }
 
     #[tokio::test]

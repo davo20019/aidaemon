@@ -2,7 +2,7 @@ use std::fmt;
 
 /// Classified provider error — tells the caller *why* the LLM call failed
 /// so it can pick the right recovery strategy.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub status: Option<u16>,
@@ -156,6 +156,33 @@ impl ProviderError {
         }
     }
 
+    /// User-facing summary for cases where recovery has already failed and
+    /// there are no more retries/fallbacks left to attempt.
+    pub fn recovery_failed_message(&self) -> String {
+        match self.kind {
+            ProviderErrorKind::RateLimit => {
+                "The LLM provider remained rate limited during recovery. Try again shortly."
+                    .to_string()
+            }
+            ProviderErrorKind::NotFound => {
+                "The configured LLM model could not be used, and fallback recovery did not succeed. Check model settings."
+                    .to_string()
+            }
+            ProviderErrorKind::Timeout => {
+                "LLM requests kept timing out during recovery. Try again shortly.".to_string()
+            }
+            ProviderErrorKind::Network => {
+                "Could not reach the LLM provider during recovery. Check connectivity or try again shortly."
+                    .to_string()
+            }
+            ProviderErrorKind::ServerError => {
+                "The LLM provider kept returning server errors during recovery. Try again later or switch providers."
+                    .to_string()
+            }
+            _ => self.user_message(),
+        }
+    }
+
     /// Whether this error is worth retrying (same request, same model).
     #[allow(dead_code)]
     pub fn is_retryable(&self) -> bool {
@@ -214,4 +241,40 @@ fn truncate_body(body: &str) -> String {
         end -= 1;
     }
     format!("{}...", &body[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_server_error_message_mentions_retry() {
+        let err = ProviderError::from_status(
+            500,
+            "{\"error\":{\"message\":\"Internal Server Error\",\"code\":500}}",
+        );
+        assert_eq!(
+            err.user_message(),
+            "LLM provider is experiencing issues (server error). Will retry."
+        );
+    }
+
+    #[test]
+    fn terminal_server_error_message_does_not_promise_retry() {
+        let err = ProviderError::from_status(
+            500,
+            "{\"error\":{\"message\":\"Internal Server Error\",\"code\":500}}",
+        );
+        let msg = err.recovery_failed_message();
+        assert!(msg.contains("server errors during recovery"));
+        assert!(!msg.contains("Will retry"));
+    }
+
+    #[test]
+    fn terminal_rate_limit_message_does_not_promise_retry() {
+        let err = ProviderError::from_status(429, "{\"error\":{\"retry_after\":5}}");
+        let msg = err.recovery_failed_message();
+        assert!(msg.contains("remained rate limited during recovery"));
+        assert!(!msg.contains("Retrying"));
+    }
 }

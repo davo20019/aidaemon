@@ -1029,6 +1029,64 @@ impl crate::traits::GoalStore for SqliteStateStore {
         }))
     }
 
+    async fn upsert_scheduled_run_state(&self, state: &ScheduledRunState) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO scheduled_run_state (
+                goal_id, root_task_id, effective_budget_per_check, tokens_used,
+                budget_extensions_count, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(goal_id) DO UPDATE SET
+                root_task_id = excluded.root_task_id,
+                effective_budget_per_check = excluded.effective_budget_per_check,
+                tokens_used = excluded.tokens_used,
+                budget_extensions_count = excluded.budget_extensions_count,
+                updated_at = excluded.updated_at",
+        )
+        .bind(&state.goal_id)
+        .bind(&state.root_task_id)
+        .bind(state.effective_budget_per_check)
+        .bind(state.tokens_used)
+        .bind(state.budget_extensions_count as i64)
+        .bind(&state.created_at)
+        .bind(&state.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_scheduled_run_state(
+        &self,
+        goal_id: &str,
+    ) -> anyhow::Result<Option<ScheduledRunState>> {
+        let row = sqlx::query(
+            "SELECT goal_id, root_task_id, effective_budget_per_check, tokens_used,
+                    budget_extensions_count, created_at, updated_at
+             FROM scheduled_run_state
+             WHERE goal_id = ?",
+        )
+        .bind(goal_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| ScheduledRunState {
+            goal_id: r.get("goal_id"),
+            root_task_id: r.get("root_task_id"),
+            effective_budget_per_check: r.get("effective_budget_per_check"),
+            tokens_used: r.get("tokens_used"),
+            budget_extensions_count: r.get::<i64, _>("budget_extensions_count") as usize,
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    async fn delete_scheduled_run_state(&self, goal_id: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query("DELETE FROM scheduled_run_state WHERE goal_id = ?")
+            .bind(goal_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn get_pending_tasks_by_priority(&self, limit: i64) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
             "SELECT t.id, t.goal_id, t.description, t.status, t.priority, t.task_order,

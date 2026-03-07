@@ -19,7 +19,7 @@ pub(super) struct LlmPhaseCtx<'a> {
     pub task_start: Instant,
     pub task_tokens_used: &'a mut u64,
     pub learning_ctx: &'a mut LearningContext,
-    pub pending_system_messages: &'a mut Vec<String>,
+    pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub llm_provider: Arc<dyn ModelProvider>,
     pub llm_router: Option<Router>,
     pub model: &'a str,
@@ -27,6 +27,7 @@ pub(super) struct LlmPhaseCtx<'a> {
     pub tool_defs: &'a [Value],
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
     pub resolved_goal_id: &'a Option<String>,
+    pub is_scheduled_goal: bool,
     pub effective_goal_daily_budget: &'a mut Option<i64>,
     pub budget_extensions_count: &'a mut usize,
     pub evidence_gain_count: usize,
@@ -67,6 +68,7 @@ impl Agent {
         let tool_defs = ctx.tool_defs;
         let status_tx = ctx.status_tx;
         let resolved_goal_id = ctx.resolved_goal_id;
+        let is_scheduled_goal = ctx.is_scheduled_goal;
         let effective_goal_daily_budget = &mut *ctx.effective_goal_daily_budget;
         let budget_extensions_count = &mut *ctx.budget_extensions_count;
         let evidence_gain_count = ctx.evidence_gain_count;
@@ -280,8 +282,9 @@ impl Agent {
                 warn!(session_id, error = %e, "Failed to record token usage");
             }
 
-            // Goal budget accounting: increment tokens_used_today and stop immediately
-            // before tool execution if the goal's daily budget is exhausted.
+            // Goal budget accounting: increment tokens_used_today for daily
+            // admission control. Scheduled runs use a separate per-run budget
+            // once they have started.
             if let Some(goal_id) = resolved_goal_id.as_ref() {
                 let delta_tokens = (usage.input_tokens + usage.output_tokens) as i64;
                 match self
@@ -290,104 +293,219 @@ impl Agent {
                     .await
                 {
                     Ok(Some(status)) => {
-                        let mut goal_budget_ctx = graceful::GoalBudgetControlCtx {
-                            emitter,
-                            task_id,
-                            session_id,
-                            iteration,
-                            goal_id,
-                            status: &status,
-                            user_role,
-                            learning_ctx,
-                            evidence_gain_count,
-                            stall_count: *stall_count,
-                            consecutive_same_tool_count: consecutive_same_tool.1,
-                            consecutive_same_tool_unique_args: consecutive_same_tool_arg_hashes
-                                .len(),
-                            total_successful_tool_calls,
-                            pending_system_messages,
-                            status_tx,
-                            effective_goal_daily_budget,
-                            budget_extensions_count,
-                            max_budget_extensions,
-                            hard_token_cap,
-                            source: graceful::GoalBudgetCheckSource::PostLlm,
-                        };
-                        if let graceful::GoalBudgetControlOutcome::Exhausted {
-                            tokens_used_today,
-                            budget_daily,
-                        } = self
-                            .enforce_goal_daily_budget_control(&mut goal_budget_ctx)
-                            .await
-                        {
-                            warn!(
-                                session_id,
-                                iteration,
-                                goal_id = %goal_id,
-                                delta_tokens,
-                                tokens_used_today,
-                                budget_daily,
-                                "Goal daily token budget exhausted after LLM call"
-                            );
-                            self.emit_decision_point(
-                                emitter,
-                                task_id,
-                                iteration,
-                                DecisionType::StoppingCondition,
-                                "Stopping condition fired: goal daily token budget exhausted"
-                                    .to_string(),
-                                json!({
-                                    "condition":"goal_daily_token_budget",
-                                    "goal_id": goal_id,
-                                    "budget_daily": budget_daily,
-                                    "tokens_used_today": tokens_used_today,
-                                    "delta_tokens": delta_tokens
-                                }),
-                            )
-                            .await;
-                            let alert_msg = format!(
-                                "Token alert: goal '{}' hit daily token budget (used {} / limit {}). Execution was stopped to prevent overspending.",
-                                goal_id, tokens_used_today, budget_daily
-                            );
-                            self.fanout_token_alert(
-                                Some(goal_id.as_str()),
-                                session_id,
-                                &alert_msg,
-                                Some(session_id),
-                            )
-                            .await;
-                            let result = self
-                                .graceful_goal_daily_budget_response(
-                                    emitter,
-                                    session_id,
-                                    learning_ctx,
-                                    tokens_used_today,
-                                    budget_daily,
+                        if is_scheduled_goal {
+                            let run_budget_status =
+                                if let Some(registry) = &self.goal_token_registry {
+                                    registry.add_run_tokens(goal_id, delta_tokens).await
+                                } else {
+                                    None
+                                };
+                            if let Some(run_budget_status) = run_budget_status {
+                                persist_scheduled_run_state(
+                                    &self.state,
+                                    goal_id,
+                                    None,
+                                    &run_budget_status,
                                 )
                                 .await;
-                            let (status, error, summary) = match &result {
-                                Ok(reply) => (
-                                    TaskStatus::Completed,
-                                    None,
-                                    Some(reply.chars().take(200).collect()),
-                                ),
-                                Err(e) => (TaskStatus::Failed, Some(e.to_string()), None),
-                            };
-                            if status == TaskStatus::Failed {
-                                record_failed_task_tokens(*task_tokens_used);
+                                let mut run_budget_ctx = graceful::ScheduledRunBudgetControlCtx {
+                                    emitter,
+                                    task_id,
+                                    session_id,
+                                    iteration,
+                                    goal_id,
+                                    status: &run_budget_status,
+                                    user_role,
+                                    learning_ctx,
+                                    evidence_gain_count,
+                                    stall_count: *stall_count,
+                                    consecutive_same_tool_count: consecutive_same_tool.1,
+                                    consecutive_same_tool_unique_args:
+                                        consecutive_same_tool_arg_hashes.len(),
+                                    total_successful_tool_calls,
+                                    status_tx,
+                                    max_budget_extensions,
+                                    hard_token_cap,
+                                };
+                                if let graceful::ScheduledRunBudgetControlOutcome::Exhausted {
+                                    tokens_used,
+                                    budget_per_check,
+                                } = self
+                                    .enforce_scheduled_run_budget_control(&mut run_budget_ctx)
+                                    .await
+                                {
+                                    warn!(
+                                        session_id,
+                                        iteration,
+                                        goal_id = %goal_id,
+                                        delta_tokens,
+                                        tokens_used,
+                                        budget_per_check,
+                                        "Scheduled run budget exhausted after LLM call"
+                                    );
+                                    self.emit_decision_point(
+                                        emitter,
+                                        task_id,
+                                        iteration,
+                                        DecisionType::StoppingCondition,
+                                        "Stopping condition fired: scheduled run budget exhausted"
+                                            .to_string(),
+                                        json!({
+                                            "condition":"scheduled_run_budget",
+                                            "goal_id": goal_id,
+                                            "budget_per_check": budget_per_check,
+                                            "tokens_used": tokens_used,
+                                            "delta_tokens": delta_tokens
+                                        }),
+                                    )
+                                    .await;
+                                    let alert_msg = format!(
+                                        "Token alert: scheduled run for goal '{}' hit per-run budget (used {} / limit {}). Execution was stopped because the run no longer appeared productive.",
+                                        goal_id, tokens_used, budget_per_check
+                                    );
+                                    self.fanout_token_alert(
+                                        Some(goal_id.as_str()),
+                                        session_id,
+                                        &alert_msg,
+                                        Some(session_id),
+                                    )
+                                    .await;
+                                    let result = self
+                                        .graceful_scheduled_run_budget_response(
+                                            emitter,
+                                            session_id,
+                                            learning_ctx,
+                                            tokens_used,
+                                            budget_per_check,
+                                        )
+                                        .await;
+                                    let (status, error, summary) = match &result {
+                                        Ok(reply) => (
+                                            TaskStatus::Completed,
+                                            None,
+                                            Some(reply.chars().take(200).collect()),
+                                        ),
+                                        Err(e) => (TaskStatus::Failed, Some(e.to_string()), None),
+                                    };
+                                    if status == TaskStatus::Failed {
+                                        record_failed_task_tokens(*task_tokens_used);
+                                    }
+                                    self.emit_task_end(
+                                        emitter,
+                                        task_id,
+                                        status,
+                                        task_start,
+                                        iteration,
+                                        learning_ctx.tool_calls.len(),
+                                        error,
+                                        summary,
+                                    )
+                                    .await;
+                                    return Ok(LlmPhaseOutcome::Return(result));
+                                }
                             }
-                            self.emit_task_end(
+                        } else {
+                            let mut goal_budget_ctx = graceful::GoalBudgetControlCtx {
                                 emitter,
                                 task_id,
-                                status,
-                                task_start,
+                                session_id,
                                 iteration,
-                                learning_ctx.tool_calls.len(),
-                                error,
-                                summary,
-                            )
-                            .await;
-                            return Ok(LlmPhaseOutcome::Return(result));
+                                goal_id,
+                                status: &status,
+                                user_role,
+                                learning_ctx,
+                                evidence_gain_count,
+                                stall_count: *stall_count,
+                                consecutive_same_tool_count: consecutive_same_tool.1,
+                                consecutive_same_tool_unique_args: consecutive_same_tool_arg_hashes
+                                    .len(),
+                                total_successful_tool_calls,
+                                pending_system_messages,
+                                status_tx,
+                                is_scheduled_goal,
+                                effective_goal_daily_budget,
+                                budget_extensions_count,
+                                max_budget_extensions,
+                                hard_token_cap,
+                                source: graceful::GoalBudgetCheckSource::PostLlm,
+                            };
+                            if let graceful::GoalBudgetControlOutcome::Exhausted {
+                                tokens_used_today,
+                                budget_daily,
+                            } = self
+                                .enforce_goal_daily_budget_control(&mut goal_budget_ctx)
+                                .await
+                            {
+                                warn!(
+                                    session_id,
+                                    iteration,
+                                    goal_id = %goal_id,
+                                    delta_tokens,
+                                    tokens_used_today,
+                                    budget_daily,
+                                    "Goal daily token budget exhausted after LLM call"
+                                );
+                                self.emit_decision_point(
+                                    emitter,
+                                    task_id,
+                                    iteration,
+                                    DecisionType::StoppingCondition,
+                                    "Stopping condition fired: goal daily token budget exhausted"
+                                        .to_string(),
+                                    json!({
+                                        "condition":"goal_daily_token_budget",
+                                        "goal_id": goal_id,
+                                        "budget_daily": budget_daily,
+                                        "tokens_used_today": tokens_used_today,
+                                        "delta_tokens": delta_tokens
+                                    }),
+                                )
+                                .await;
+                                let alert_msg = format!(
+                                    "Token alert: goal '{}' hit daily token budget (used {} / limit {}). Execution was stopped to prevent overspending.",
+                                    goal_id, tokens_used_today, budget_daily
+                                );
+                                self.fanout_token_alert(
+                                    Some(goal_id.as_str()),
+                                    session_id,
+                                    &alert_msg,
+                                    Some(session_id),
+                                )
+                                .await;
+                                let result = self
+                                    .graceful_goal_daily_budget_response(
+                                        emitter,
+                                        session_id,
+                                        learning_ctx,
+                                        tokens_used_today,
+                                        budget_daily,
+                                        is_scheduled_goal,
+                                    )
+                                    .await;
+                                let (status, error, summary) = match &result {
+                                    Ok(reply) => (
+                                        TaskStatus::Completed,
+                                        None,
+                                        Some(reply.chars().take(200).collect()),
+                                    ),
+                                    Err(e) => (TaskStatus::Failed, Some(e.to_string()), None),
+                                };
+                                if status == TaskStatus::Failed {
+                                    record_failed_task_tokens(*task_tokens_used);
+                                }
+                                self.emit_task_end(
+                                    emitter,
+                                    task_id,
+                                    status,
+                                    task_start,
+                                    iteration,
+                                    learning_ctx.tool_calls.len(),
+                                    error,
+                                    summary,
+                                )
+                                .await;
+                                return Ok(LlmPhaseOutcome::Return(result));
+                            }
                         }
                     }
                     Ok(None) => {}
@@ -457,13 +575,7 @@ impl Agent {
                 iteration,
                 "Response truncated at token limit with no usable output — injecting retry nudge"
             );
-            pending_system_messages.push(
-                "[SYSTEM] Your previous response was cut off because it exceeded the maximum output \
-                 token limit. Do NOT generate long content inline. Instead, use the write_file tool \
-                 to save long content (articles, code, etc.) to a file, then summarize what you wrote \
-                 in a short reply. Keep your direct response brief."
-                    .to_string(),
-            );
+            pending_system_messages.push(SystemDirective::TruncationRecoveryUseWriteFile);
             *stall_count += 1;
             return Ok(LlmPhaseOutcome::ContinueLoop);
         }
@@ -481,11 +593,7 @@ impl Agent {
             if has_non_empty_content {
                 resp.tool_calls.clear();
             } else {
-                pending_system_messages.push(
-                    "[SYSTEM] Tool mode is disabled for this turn. Respond with plain text only. \
-                         Do NOT emit tool calls."
-                        .to_string(),
-                );
+                pending_system_messages.push(SystemDirective::ToolModeDisabledPlainText);
                 *stall_count += 1;
                 return Ok(LlmPhaseOutcome::ContinueLoop);
             }

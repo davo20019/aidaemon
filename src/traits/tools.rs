@@ -55,6 +55,10 @@ pub struct ToolCallMetadata {
     /// True when the process is detached and intentionally long-lived.
     #[serde(default)]
     pub detached: bool,
+    /// True when the tool guarantees automatic completion delivery for a
+    /// backgrounded operation in the current run.
+    #[serde(default)]
+    pub completion_notifications_enabled: bool,
     /// Transport/runtime failure outside normal tool semantics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_error: Option<String>,

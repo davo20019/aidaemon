@@ -479,7 +479,10 @@ impl ManageGoalTasksTool {
             let result_suffix = task
                 .result
                 .as_deref()
-                .map(|r| format!(" → {}", &r[..200.min(r.len())]))
+                .map(|r| {
+                    let end = crate::utils::floor_char_boundary(r, 200);
+                    format!(" → {}", &r[..end])
+                })
                 .unwrap_or_default();
 
             output.push_str(&format!(
@@ -684,7 +687,10 @@ impl ManageGoalTasksTool {
         let result_summary = task
             .result
             .as_deref()
-            .map(|r| &r[..r.len().min(500)])
+            .map(|r| {
+                let end = crate::utils::floor_char_boundary(r, 500);
+                &r[..end]
+            })
             .unwrap_or("");
 
         let entry = json!({

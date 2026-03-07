@@ -817,7 +817,7 @@ impl EventStore {
 
             let raw_error = tr.error.as_deref().unwrap_or(&tr.result);
             let normalized = normalize_tool_error_text(raw_error);
-            let pattern = crate::memory::procedures::extract_error_pattern(normalized);
+            let pattern = crate::memory::procedures::extract_error_pattern(&normalized);
             if !pattern.trim().is_empty() {
                 *error_counts.entry(pattern).or_insert(0) += 1;
             }
@@ -1141,23 +1141,15 @@ fn to_u64(value: i64) -> u64 {
     }
 }
 
-fn normalize_tool_error_text(raw: &str) -> &str {
-    let diag = raw.find("\n\n[DIAGNOSTIC]");
-    let stats = raw.find("\n\n[TOOL STATS]");
-    let sys = raw.find("\n\n[SYSTEM]");
-    let cut_at = [diag, stats, sys].into_iter().flatten().min();
-    let trimmed = match cut_at {
-        Some(idx) => &raw[..idx],
-        None => raw,
-    };
-    trimmed.trim()
+fn normalize_tool_error_text(raw: &str) -> std::borrow::Cow<'_, str> {
+    crate::traits::extract_primary_message_content(raw, &[])
 }
 
 fn is_synthetic_tool_result(tr: &ToolResultData) -> bool {
     tr.success
         && tr.duration_ms == 0
         && tr.error.is_none()
-        && tr.result.trim_start().starts_with("[SYSTEM]")
+        && crate::traits::message_content_is_structural_only(&tr.result, &tr.annotations)
 }
 
 /// Builder for emitting events with a consistent session context

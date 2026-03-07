@@ -75,16 +75,9 @@ impl Agent {
 
         // 1. Persist the user message
         let user_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "user".to_string(),
             content: Some(user_text.to_string()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
             importance: 0.5, // Will be updated by score_message below
-            embedding: None,
+            ..Message::new_runtime(Uuid::new_v4().to_string(), session_id, "user")
         };
         // Calculate heuristic score immediately
         let score = crate::memory::scoring::score_message(&user_msg);

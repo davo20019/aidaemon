@@ -1924,7 +1924,9 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::testing::MockProvider;
     use crate::traits::store_prelude::*;
+    use crate::traits::MessageAnnotation;
     use chrono::Utc;
+    use serde_json::json;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -2017,5 +2019,114 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cnt, 0);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_session_messages_since_last_episode_supports_legacy_annotations() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let store = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                consolidated_at TEXT,
+                task_id TEXT,
+                tool_name TEXT
+            )
+            "#,
+        )
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        let session_id = "legacy_annotations_session";
+        let legacy_data = json!({
+            "message_id": "legacy-msg",
+            "tool_call_id": "call-legacy",
+            "name": "system",
+            "result": "[SYSTEM] Legacy internal note"
+        });
+        let annotated_data = json!({
+            "message_id": "annotated-msg",
+            "tool_call_id": "call-annotated",
+            "name": "terminal",
+            "result": "cargo test\n\n[SYSTEM] Do not retry.",
+            "annotations": [{"type": "appended_system_notice"}]
+        });
+
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind("tool_result")
+        .bind(legacy_data.to_string())
+        .bind((Utc::now() - chrono::Duration::minutes(2)).to_rfc3339())
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind("tool_result")
+        .bind(annotated_data.to_string())
+        .bind((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339())
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        let provider = Arc::new(MockProvider::new());
+        let llm_runtime = SharedLlmRuntime::new(
+            provider,
+            None,
+            ProviderKind::OpenaiCompatible,
+            "mock".to_string(),
+        );
+        let mgr = MemoryManager::new(
+            store.pool(),
+            embedding_service,
+            llm_runtime,
+            Duration::from_secs(60),
+            None,
+        )
+        .with_state(store);
+
+        let messages = mgr
+            .fetch_session_messages_since_last_episode(session_id, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 2);
+
+        let legacy = &messages[0];
+        assert!(legacy.annotations.is_empty());
+        assert_eq!(
+            legacy.effective_annotations().as_ref(),
+            [MessageAnnotation::EntireSystemNotice]
+        );
+        assert!(legacy.primary_content().is_none());
+
+        let annotated = &messages[1];
+        assert_eq!(
+            annotated.annotations,
+            vec![MessageAnnotation::AppendedSystemNotice]
+        );
+        assert_eq!(annotated.primary_content().as_deref(), Some("cargo test"));
     }
 }

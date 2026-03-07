@@ -15,7 +15,15 @@ const PATH_ARGUMENT_KEYS: &[&str] = &[
     "to",
 ];
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn extract_project_dir_hint(text: &str) -> Option<String> {
+    extract_project_dir_hint_with_aliases(text, &[])
+}
+
+pub(crate) fn extract_project_dir_hint_with_aliases(
+    text: &str,
+    alias_roots: &[String],
+) -> Option<String> {
     let mut best: Option<(usize, String)> = None;
 
     for raw in text.split_whitespace() {
@@ -47,11 +55,13 @@ pub(crate) fn extract_project_dir_hint(text: &str) -> Option<String> {
             || token.starts_with("./")
             || token.starts_with("../")
             || looks_windows_abs;
-        if !looks_path {
-            continue;
-        }
-
-        let Some(normalized) = normalize_project_dir(token) else {
+        let normalized = if looks_path {
+            normalize_project_dir(token)
+        } else {
+            crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
+                .map(|path| path.to_string_lossy().to_string())
+        };
+        let Some(normalized) = normalized else {
             continue;
         };
         let score = normalized.matches('/').count() + usize::from(token.starts_with('/'));
@@ -67,41 +77,9 @@ pub(crate) fn extract_project_dir_hint(text: &str) -> Option<String> {
 }
 
 fn normalize_project_dir(raw_path: &str) -> Option<String> {
-    let mut normalized = crate::tools::fs_utils::validate_path(raw_path).ok()?;
-
-    // Reject paths whose first directory component doesn't exist on disk.
-    // This filters out API endpoint paths like /api/notes that aren't real
-    // filesystem locations.
-    if !first_dir_component_exists(&normalized) {
-        return None;
-    }
-
-    let trimmed = raw_path.trim_end_matches('/');
-    let file_name_looks_like_file = std::path::Path::new(trimmed)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .is_some_and(|name| name.contains('.') && !name.starts_with('.') && !name.ends_with('.'));
-    if file_name_looks_like_file || normalized.is_file() {
-        if let Some(parent) = normalized.parent() {
-            normalized = parent.to_path_buf();
-        }
-    }
-
-    Some(normalized.to_string_lossy().to_string())
-}
-
-/// Returns true if the first directory component after root exists on disk.
-fn first_dir_component_exists(path: &std::path::Path) -> bool {
-    use std::path::Component;
-    let mut components = path.components();
-    match components.next() {
-        Some(Component::RootDir) => {}
-        _ => return true,
-    }
-    match components.next() {
-        Some(comp) => std::path::Path::new("/").join(comp).exists(),
-        None => true,
-    }
+    crate::tools::fs_utils::normalize_project_scope_path(raw_path)
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
 }
 
 fn push_unique_project_dir(collected: &mut Vec<String>, candidate: String) {
@@ -133,6 +111,24 @@ fn extract_terminal_cd_dirs(command: &str) -> Vec<String> {
         }
     }
     dirs
+}
+
+fn quote_shell_token(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+fn resolve_injected_working_dir(project_dir: &str) -> String {
+    let resolved = crate::tools::fs_utils::validate_path(project_dir).ok();
+    if let Some(path) = resolved {
+        if !path.is_dir() {
+            if let Some(parent) = path.parent() {
+                if parent.is_dir() {
+                    return parent.to_string_lossy().to_string();
+                }
+            }
+        }
+    }
+    project_dir.to_string()
 }
 
 fn collect_project_dirs_from_value(
@@ -181,6 +177,12 @@ pub(super) fn extract_project_dirs_from_tool_args(tool_name: &str, args_json: &s
 
     let mut dirs = Vec::new();
     if tool_name == "terminal" {
+        if let Some(cwd) = parsed.get("cwd") {
+            collect_project_dirs_from_value(cwd, Some("cwd"), &mut dirs);
+        }
+        if let Some(working_dir) = parsed.get("working_dir") {
+            collect_project_dirs_from_value(working_dir, Some("working_dir"), &mut dirs);
+        }
         if let Some(command) = parsed.get("command").and_then(|v| v.as_str()) {
             for dir in extract_terminal_cd_dirs(command) {
                 push_unique_project_dir(&mut dirs, dir);
@@ -227,7 +229,6 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
     args_json: &str,
     known_project_dir: Option<&str>,
 ) -> Option<(String, String)> {
-    let key = project_dir_arg_key_for_tool(tool_name)?;
     let project_dir = known_project_dir?.trim();
     if project_dir.is_empty() {
         return None;
@@ -235,6 +236,32 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
 
     let mut parsed = serde_json::from_str::<Value>(args_json).ok()?;
     let obj = parsed.as_object_mut()?;
+    if tool_name == "terminal" {
+        if obj
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return None;
+        }
+        let command = obj.get("command").and_then(|v| v.as_str())?.trim();
+        if command.is_empty() || !extract_terminal_cd_dirs(command).is_empty() {
+            return None;
+        }
+        let injected_dir = resolve_injected_working_dir(project_dir);
+        obj.insert(
+            "command".to_string(),
+            json!(format!(
+                "cd {} && {}",
+                quote_shell_token(&injected_dir),
+                command
+            )),
+        );
+        let updated = serde_json::to_string(&parsed).ok()?;
+        return Some((updated, injected_dir));
+    }
+
+    let key = project_dir_arg_key_for_tool(tool_name)?;
     if tool_name == "project_inspect"
         && obj
             .get("paths")
@@ -258,24 +285,7 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
     let injected_dir = if tool_name == "run_command" {
         // Scaffolding flow: if the target project dir doesn't exist yet, use
         // the nearest existing parent as working_dir so creation commands can run.
-        let resolved = crate::tools::fs_utils::validate_path(project_dir).ok();
-        if let Some(path) = resolved {
-            if !path.is_dir() {
-                if let Some(parent) = path.parent() {
-                    if parent.is_dir() {
-                        parent.to_string_lossy().to_string()
-                    } else {
-                        project_dir.to_string()
-                    }
-                } else {
-                    project_dir.to_string()
-                }
-            } else {
-                project_dir.to_string()
-            }
-        } else {
-            project_dir.to_string()
-        }
+        resolve_injected_working_dir(project_dir)
     } else {
         project_dir.to_string()
     };
@@ -283,6 +293,22 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
     obj.insert(key.to_string(), json!(injected_dir));
     let updated = serde_json::to_string(&parsed).ok()?;
     Some((updated, injected_dir))
+}
+
+/// Returns true when the candidate path is an existing directory that looks
+/// like a project root (contains a recognized project marker such as
+/// `package.json`, `Cargo.toml`, `wrangler.toml`, etc.).
+///
+/// Used to relax the project scope lock: when the bot intentionally navigates
+/// to a *different* but legitimate project, the scope lock should not block it.
+pub(super) fn is_recognized_project_root(candidate_path: &str) -> bool {
+    let Ok(path) = crate::tools::fs_utils::validate_path(candidate_path) else {
+        return false;
+    };
+    if !path.is_dir() {
+        return false;
+    }
+    crate::tools::fs_utils::find_nearest_project_root(&path).is_some_and(|root| root == path)
 }
 
 pub(super) fn scope_allows_project_dir(scope_path: &str, candidate_path: &str) -> bool {
@@ -377,6 +403,22 @@ mod tests {
     }
 
     #[test]
+    fn extracts_named_project_hint_with_alias_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alias_root = dir.path().join("projects");
+        let project = alias_root.join("blog.aidaemon.ai");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"blog\"\n").expect("wrangler");
+
+        let hint = extract_project_dir_hint_with_aliases(
+            "Deploy blog.aidaemon.ai",
+            &[alias_root.to_string_lossy().to_string()],
+        )
+        .expect("project hint");
+        assert_eq!(hint, project.to_string_lossy());
+    }
+
+    #[test]
     fn injects_project_dir_when_path_missing() {
         let args = r#"{"glob":"*.html"}"#;
         let (updated, injected) =
@@ -451,6 +493,33 @@ mod tests {
     }
 
     #[test]
+    fn injects_terminal_project_dir_when_command_has_no_explicit_cd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("myproj");
+        std::fs::create_dir_all(&project).expect("create project");
+        let args = r#"{"command":"pwd && ls dist"}"#;
+        let (updated, injected) = maybe_inject_project_dir_into_tool_args(
+            "terminal",
+            args,
+            Some(project.to_string_lossy().as_ref()),
+        )
+        .expect("injection");
+        assert_eq!(injected, project.to_string_lossy());
+        assert!(updated.contains(&format!(
+            "cd '{}' && pwd && ls dist",
+            project.to_string_lossy()
+        )));
+    }
+
+    #[test]
+    fn does_not_override_terminal_command_with_explicit_cd() {
+        let args = r#"{"command":"cd /tmp/explicit && npm run build"}"#;
+        let updated =
+            maybe_inject_project_dir_into_tool_args("terminal", args, Some("/tmp/inferred"));
+        assert!(updated.is_none());
+    }
+
+    #[test]
     fn scope_allows_only_descendant_paths() {
         assert!(scope_allows_project_dir("/tmp/a", "/tmp/a/src"));
         assert!(!scope_allows_project_dir("/tmp/a", "/tmp/b/src"));
@@ -505,20 +574,132 @@ mod tests {
 
     #[test]
     fn first_dir_component_exists_for_real_paths() {
-        assert!(first_dir_component_exists(std::path::Path::new("/tmp/foo")));
-        assert!(first_dir_component_exists(std::path::Path::new("/usr/bin")));
-        assert!(!first_dir_component_exists(std::path::Path::new(
-            "/api/notes"
-        )));
-        assert!(!first_dir_component_exists(std::path::Path::new(
-            "/v1/status"
-        )));
+        assert!(crate::tools::fs_utils::first_dir_component_exists(
+            std::path::Path::new("/tmp/foo")
+        ));
+        assert!(crate::tools::fs_utils::first_dir_component_exists(
+            std::path::Path::new("/usr/bin")
+        ));
+        assert!(!crate::tools::fs_utils::first_dir_component_exists(
+            std::path::Path::new("/api/notes")
+        ));
+        assert!(!crate::tools::fs_utils::first_dir_component_exists(
+            std::path::Path::new("/v1/status")
+        ));
         // Relative paths always pass
-        assert!(first_dir_component_exists(std::path::Path::new(
-            "src/main.rs"
-        )));
+        assert!(crate::tools::fs_utils::first_dir_component_exists(
+            std::path::Path::new("src/main.rs")
+        ));
         // Root itself passes
-        assert!(first_dir_component_exists(std::path::Path::new("/")));
+        assert!(crate::tools::fs_utils::first_dir_component_exists(
+            std::path::Path::new("/")
+        ));
+    }
+
+    #[test]
+    fn normalizes_existing_src_file_scope_to_repo_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("blog");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).expect("create src");
+        std::fs::write(root.join("package.json"), r#"{"name":"blog"}"#).expect("package");
+        std::fs::write(src.join("posts.js"), "export default [];\n").expect("posts");
+
+        let hint = normalize_project_dir(src.join("posts.js").to_string_lossy().as_ref())
+            .expect("project hint");
+        assert_eq!(hint, root.to_string_lossy());
+    }
+
+    #[test]
+    fn extracts_tool_arg_scope_at_repo_root_when_marker_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("blog");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).expect("create src");
+        std::fs::write(root.join("package.json"), r#"{"name":"blog"}"#).expect("package");
+        std::fs::write(src.join("posts.js"), "export default [];\n").expect("posts");
+
+        let args = format!(
+            r#"{{"file_path":"{}"}}"#,
+            src.join("posts.js").to_string_lossy()
+        );
+        let extracted = project_dir_from_tool_args("edit_file", &args).expect("project dir");
+        assert_eq!(extracted, root.to_string_lossy());
+    }
+
+    #[test]
+    fn is_recognized_project_root_allows_real_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_a = dir.path().join("project-a");
+        let project_b = dir.path().join("project-b");
+        std::fs::create_dir_all(&project_a).expect("create project-a");
+        std::fs::create_dir_all(&project_b).expect("create project-b");
+        // project-a has Cargo.toml
+        std::fs::write(project_a.join("Cargo.toml"), "[package]\nname = \"a\"\n").expect("write");
+        // project-b has package.json
+        std::fs::write(project_b.join("package.json"), r#"{"name":"b"}"#).expect("write");
+
+        assert!(is_recognized_project_root(
+            project_a.to_string_lossy().as_ref()
+        ));
+        assert!(is_recognized_project_root(
+            project_b.to_string_lossy().as_ref()
+        ));
+
+        // A random dir without project markers is NOT recognized
+        let random_dir = dir.path().join("random");
+        std::fs::create_dir_all(&random_dir).expect("create random");
+        assert!(!is_recognized_project_root(
+            random_dir.to_string_lossy().as_ref()
+        ));
+
+        // A non-existent dir is NOT recognized
+        let nonexistent = dir.path().join("nonexistent");
+        assert!(!is_recognized_project_root(
+            nonexistent.to_string_lossy().as_ref()
+        ));
+    }
+
+    #[test]
+    fn scope_violation_allows_switch_to_recognized_project_root() {
+        // Simulate: primary scope is project-a, bot tries to cd to project-b
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_a = dir.path().join("project-a");
+        let project_b = dir.path().join("project-b");
+        std::fs::create_dir_all(&project_a).expect("create project-a");
+        std::fs::create_dir_all(&project_b).expect("create project-b");
+        std::fs::write(project_a.join("Cargo.toml"), "[package]\nname = \"a\"\n").expect("write");
+        std::fs::write(project_b.join("package.json"), r#"{"name":"b"}"#).expect("write");
+
+        // project-b is outside project-a's scope
+        assert!(!scope_allows_project_dir(
+            project_a.to_string_lossy().as_ref(),
+            project_b.to_string_lossy().as_ref()
+        ));
+
+        // but project-b IS a recognized project root, so scope violation should not fire
+        assert!(is_recognized_project_root(
+            project_b.to_string_lossy().as_ref()
+        ));
+    }
+
+    #[test]
+    fn scope_violation_still_blocks_non_project_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_a = dir.path().join("project-a");
+        let random = dir.path().join("random-dir");
+        std::fs::create_dir_all(&project_a).expect("create project-a");
+        std::fs::create_dir_all(&random).expect("create random");
+        std::fs::write(project_a.join("Cargo.toml"), "[package]\nname = \"a\"\n").expect("write");
+        // random has no project markers
+
+        assert!(!scope_allows_project_dir(
+            project_a.to_string_lossy().as_ref(),
+            random.to_string_lossy().as_ref()
+        ));
+        assert!(!is_recognized_project_root(
+            random.to_string_lossy().as_ref()
+        ));
     }
 
     proptest! {

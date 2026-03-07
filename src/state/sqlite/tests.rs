@@ -47,7 +47,7 @@ fn make_message(session_id: &str, role: &str, content: &str) -> Message {
         tool_calls_json: None,
         created_at: Utc::now(),
         importance: 0.5,
-        embedding: None,
+        ..Message::runtime_defaults()
     }
 }
 
@@ -2841,8 +2841,8 @@ async fn test_migrate_fixup_scheduled_goal_budgets() {
     migrations::migrate_state(&store.pool()).await.unwrap();
 
     let after = store.get_goal(&goal.id).await.unwrap().unwrap();
-    assert_eq!(after.budget_per_check, Some(50_000));
-    assert_eq!(after.budget_daily, Some(200_000));
+    assert_eq!(after.budget_per_check, Some(100_000));
+    assert_eq!(after.budget_daily, Some(500_000));
 }
 
 #[tokio::test]

@@ -307,6 +307,7 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
     );
+    let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
     let mut agent = Agent::new(
         llm_runtime,
@@ -325,13 +326,13 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         20,                                              // max_facts
         None,                                            // daily_token_budget
         IterationLimitConfig::Unlimited,
-        None, // task_timeout_secs
-        None, // task_token_budget
-        None, // llm_call_timeout_secs
-        None, // mcp_registry
-        None, // goal_token_registry
-        None, // hub
-        true, // record_decision_points
+        None,                      // task_timeout_secs
+        None,                      // task_token_budget
+        None,                      // llm_call_timeout_secs
+        None,                      // mcp_registry
+        Some(goal_token_registry), // goal_token_registry
+        None,                      // hub
+        true,                      // record_decision_points
         crate::config::ContextWindowConfig {
             progressive_facts: false,
             ..Default::default()
@@ -402,6 +403,7 @@ pub async fn setup_test_agent_with_models(
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
     );
+    let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
     let agent = Agent::new(
         llm_runtime,
@@ -420,13 +422,13 @@ pub async fn setup_test_agent_with_models(
         20,   // max_facts
         None, // daily_token_budget
         IterationLimitConfig::Unlimited,
-        None, // task_timeout_secs
-        None, // task_token_budget
-        None, // llm_call_timeout_secs
-        None, // mcp_registry
-        None, // goal_token_registry
-        None, // hub
-        true, // record_decision_points
+        None,                      // task_timeout_secs
+        None,                      // task_token_budget
+        None,                      // llm_call_timeout_secs
+        None,                      // mcp_registry
+        Some(goal_token_registry), // goal_token_registry
+        None,                      // hub
+        true,                      // record_decision_points
         crate::config::ContextWindowConfig {
             progressive_facts: false,
             ..Default::default()
@@ -485,6 +487,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
     );
+    let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
     let agent = Agent::new(
         llm_runtime,
@@ -503,13 +506,13 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         20,   // max_facts
         None, // daily_token_budget
         IterationLimitConfig::Unlimited,
-        None, // task_timeout_secs
-        None, // task_token_budget
-        None, // llm_call_timeout_secs
-        None, // mcp_registry
-        None, // goal_token_registry
-        None, // hub
-        true, // record_decision_points
+        None,                      // task_timeout_secs
+        None,                      // task_token_budget
+        None,                      // llm_call_timeout_secs
+        None,                      // mcp_registry
+        Some(goal_token_registry), // goal_token_registry
+        None,                      // hub
+        true,                      // record_decision_points
         crate::config::ContextWindowConfig {
             progressive_facts: false,
             ..Default::default()
@@ -714,6 +717,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         ProviderKind::OpenaiCompatible,
         models_config.primary.clone(),
     );
+    let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
     let mut agent = Agent::new(
         llm_runtime,
@@ -732,13 +736,13 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         20,   // max_facts
         None, // daily_token_budget
         IterationLimitConfig::Unlimited,
-        None, // task_timeout_secs
-        None, // task_token_budget
-        None, // llm_call_timeout_secs
-        None, // mcp_registry
-        None, // goal_token_registry
-        None, // hub
-        true, // record_decision_points
+        None,                      // task_timeout_secs
+        None,                      // task_token_budget
+        None,                      // llm_call_timeout_secs
+        None,                      // mcp_registry
+        Some(goal_token_registry), // goal_token_registry
+        None,                      // hub
+        true,                      // record_decision_points
         crate::config::ContextWindowConfig {
             progressive_facts: false,
             ..Default::default()

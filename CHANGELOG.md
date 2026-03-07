@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.17] - 2026-03-07
+
+### Added
+
+- **Cross-provider failover chain**: `[[provider.fallbacks]]` in config.toml defines ordered alternate providers with independent API keys, models, and base URLs. On primary provider failure, the agent cascades through local model fallbacks first, then alternate providers and their model chains.
+- **`add_failover_provider` config action**: `ConfigManagerTool` gains a new action to append failover providers at runtime, with keychain storage for API keys and full preset support.
+- **Scheduled run per-check budget**: New `scheduled_run_state` SQLite table and `GoalRunBudgetState` in `GoalTokenRegistry` track token usage per scheduled run independently from the daily budget, with persistence across task-lead/executor restarts.
+- **`SystemDirective` enum**: Replaces raw `String` system messages with typed, structured directives (`RouteFailsafeActive`, `TaskTokenBudgetWarning`, `ForceTextToolLimitReached`, `EditStallWriteFileHint`, etc.) for cleaner agent loop control.
+- **`ToolResultNotice` enum**: Structured post-tool-result notices replacing ad-hoc string messages.
+- **`MessageAnnotation` system**: Structured annotations for conversation messages (`EntireSystemNotice`, `AppendedDiagnostic`, `WrappedUntrustedExternalData`, etc.) with inference from legacy marker text and primary content extraction.
+- **Project root detection**: `fs_utils.rs` gains `PROJECT_ROOT_MARKERS`, `find_nearest_project_root()`, and `normalize_project_scope_path()` for promoting subdirectory paths to their project root.
+- **Path alias support**: `extract_project_dir_hint_with_aliases()` resolves user-defined path aliases (e.g., "projects" → "~/projects") when detecting project directories from user text.
+- **`ProviderError::recovery_failed_message()`**: Terminal error messages that don't promise retries when all recovery attempts have been exhausted.
+- **Terminal bridge dynamic bot merging**: `merge_daemon_bot_tokens()` combines configured and dynamic Telegram bots for daemon bootstrap auth.
+- **Skipped replay status messages**: `build_skipped_stdout_replay_status_message()` and review-stream equivalents inform users when buffered output is skipped on reconnection.
+
+### Changed
+
+- **Scheduled goal budget defaults raised**: Continuous scheduled goals now default to 100K per-check / 500K daily (up from 50K/200K), with a migration to bump existing goals at the old defaults.
+- **Scheduled goal iteration limits removed**: Scheduled goals no longer enforce hard/soft iteration caps or warn-at thresholds; budget control is entirely token-based.
+- **Scheduled goal budget extensions**: Relaxed productivity check for scheduled goals (1 tool call or 1 evidence gain + 0 stalls), with higher extension limits (12 vs 3) and hard token cap (20M vs 2M).
+- **Cascade fallback improvements**: `cascade_fallback()` now iterates all provider-local fallback models, then all failover provider targets and their model chains, with `ProviderError` propagation at each stage.
+- **`ProviderError` is now `Clone`**: Enables error propagation through fallback chains.
+- **Sanitization preserves code blocks**: `strip_internal_control_markers()` and `strip_diagnostic_blocks()` now split content at fenced code block boundaries and only strip markers from prose segments.
+- **Config secret resolution recursive**: `resolve_secrets()` recurses into `provider.fallbacks[]` with indexed keychain key prefixes (`provider_fallback_0_api_key`, etc.).
+- **History window further refined**: Message build phase checks that the current user message is the LAST user message (not just any match) to prevent false boundary detection on retried prompts.
+
+### Fixed
+
+- **Clippy warnings**: Elided unnecessary lifetimes in `get_failover_array()` and removed needless `Ok()?` wrap in `normalize_failover_array_mut()`.
+
 ## [0.9.16] - 2026-03-06
 
 ### Added

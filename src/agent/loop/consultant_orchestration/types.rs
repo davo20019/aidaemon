@@ -9,7 +9,7 @@ pub(in crate::agent) struct ConsultantOrchestrationCtx<'a> {
     pub iteration: usize,
     pub task_start: Instant,
     pub task_tokens_used: u64,
-    pub pending_system_messages: &'a mut Vec<String>,
+    pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub tool_defs: &'a mut Vec<Value>,
     pub base_tool_defs: &'a mut Vec<Value>,
     pub available_capabilities: &'a mut HashMap<String, ToolCapabilities>,

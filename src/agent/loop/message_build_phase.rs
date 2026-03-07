@@ -14,7 +14,7 @@ pub(super) struct MessageBuildCtx<'a> {
     pub tool_defs: &'a [Value],
     pub policy_bundle: &'a PolicyBundle,
     pub session_summary: &'a Option<ConversationSummary>,
-    pub pending_system_messages: &'a mut Vec<String>,
+    pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub empty_response_retry_pending: bool,
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
     /// Sticky flag computed once at the start of the agent loop from
@@ -151,7 +151,7 @@ impl Agent {
                 tool_calls_json: None,
                 created_at: chrono::Utc::now(),
                 importance: 1.0,
-                embedding: None,
+                ..Message::runtime_defaults()
             });
             info!(
                 session_id,
@@ -456,6 +456,9 @@ impl Agent {
                             )
                             || t.starts_with("I seem to be stuck on this task.")
                             || t.starts_with("I've reached my processing limit")
+                            || t.starts_with("This goal hit its daily processing budget")
+                            || t.starts_with("This scheduled goal hit its daily processing budget")
+                            || t.starts_with("This scheduled run hit its per-run processing budget")
                             || t.starts_with("I sent the requested file(s), but ran into issues")
                             || t.starts_with(
                                 "I completed the main deliverable but wasn't able to finish",
@@ -758,21 +761,16 @@ impl Agent {
                 })
                 .count();
             if non_system_non_user_count == 0 {
-                pending_system_messages.push(
-                    "This is a fresh conversation context. There are no previous tasks. \
-                     Focus exclusively on the current user request. Do not reference \
-                     or repeat tool calls from any prior context."
-                        .to_string(),
-                );
+                pending_system_messages.push(SystemDirective::FreshConversationContext);
             }
         }
 
         // System nudges (budget warnings, loop-stop reminders, etc.): inject for a single
         // LLM call so they influence the model without polluting stored history.
-        for content in pending_system_messages.drain(..) {
+        for directive in pending_system_messages.drain(..) {
             messages.push(json!({
                 "role": "system",
-                "content": content,
+                "content": directive.render(),
             }));
         }
 
@@ -782,7 +780,7 @@ impl Agent {
         if empty_response_retry_pending && !is_trigger_session(session_id) {
             messages.push(json!({
                 "role": "system",
-                "content": "[SYSTEM] Your previous reply was empty (no text and no tool calls). This retry is running with reduced conversation history to recover. You MUST either (1) call the required tools, or (2) reply with a concrete blocker and the missing info. Do NOT return an empty response."
+                "content": SystemDirective::EmptyResponseRetry.render()
             }));
         }
 
