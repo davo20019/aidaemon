@@ -105,6 +105,12 @@ impl Tool for CheckEnvironmentTool {
 
         let mut output = String::new();
 
+        if let Some(runtime_context) = format_daemon_runtime_context(|key| std::env::var(key)) {
+            output.push_str("## Daemon Runtime Context\n\n");
+            output.push_str(&runtime_context);
+            output.push('\n');
+        }
+
         // Check tools in parallel
         output.push_str("## Available Tools\n\n");
 
@@ -158,6 +164,45 @@ fn pad_right(s: &str, width: usize) -> String {
         s.to_string()
     } else {
         format!("{}{}", s, " ".repeat(width - s.len()))
+    }
+}
+
+fn format_daemon_runtime_context<F>(mut lookup: F) -> Option<String>
+where
+    F: FnMut(&str) -> Result<String, std::env::VarError>,
+{
+    let mut lines = Vec::new();
+
+    if let Ok(workdir) = lookup(crate::RUNTIME_WORKDIR_ENV_KEY) {
+        if !workdir.trim().is_empty() {
+            lines.push(format!("  Working dir         {}", workdir));
+        }
+    }
+
+    if let Ok(config_path) = lookup(crate::RUNTIME_CONFIG_PATH_ENV_KEY) {
+        if !config_path.trim().is_empty() {
+            lines.push(format!("  Config path         {}", config_path));
+        }
+    }
+
+    if let Ok(env_path) = lookup(crate::RUNTIME_ENV_FILE_ENV_KEY) {
+        if !env_path.trim().is_empty() {
+            lines.push(format!("  Env file            {}", env_path));
+        }
+    }
+
+    let secret_backend = match lookup("AIDAEMON_NO_KEYCHAIN") {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Some("env-file / environment"),
+        _ => Some("OS keychain"),
+    };
+    if let Some(backend) = secret_backend {
+        lines.push(format!("  Secret backend      {}", backend));
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(format!("{}\n", lines.join("\n")))
     }
 }
 
@@ -258,6 +303,35 @@ mod tests {
         assert!(result.contains(".nvmrc"));
         assert!(result.contains("18.17.0"));
         assert!(result.contains("Dockerfile"));
+    }
+
+    #[test]
+    fn test_format_daemon_runtime_context() {
+        let vars = std::collections::HashMap::from([
+            (
+                crate::RUNTIME_WORKDIR_ENV_KEY.to_string(),
+                "/daemon/root".to_string(),
+            ),
+            (
+                crate::RUNTIME_CONFIG_PATH_ENV_KEY.to_string(),
+                "/daemon/root/config.toml".to_string(),
+            ),
+            (
+                crate::RUNTIME_ENV_FILE_ENV_KEY.to_string(),
+                "/daemon/root/.env".to_string(),
+            ),
+            ("AIDAEMON_NO_KEYCHAIN".to_string(), "1".to_string()),
+        ]);
+
+        let rendered = format_daemon_runtime_context(|key| {
+            vars.get(key).cloned().ok_or(std::env::VarError::NotPresent)
+        })
+        .expect("runtime context");
+
+        assert!(rendered.contains("/daemon/root"));
+        assert!(rendered.contains("/daemon/root/config.toml"));
+        assert!(rendered.contains("/daemon/root/.env"));
+        assert!(rendered.contains("env-file / environment"));
     }
 
     #[tokio::test]

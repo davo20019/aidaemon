@@ -121,6 +121,19 @@ impl OAuthGateway {
         providers.get(name).cloned()
     }
 
+    fn callback_url(&self) -> String {
+        Self::normalize_callback_url(&self.callback_base_url)
+    }
+
+    fn normalize_callback_url(callback_base_url: &str) -> String {
+        let trimmed = callback_base_url.trim().trim_end_matches('/');
+        if trimmed.ends_with("/oauth/callback") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/oauth/callback")
+        }
+    }
+
     /// Generate a PKCE code verifier (43-128 chars, URL-safe).
     fn generate_code_verifier() -> String {
         use rand::Rng;
@@ -191,7 +204,7 @@ impl OAuthGateway {
         let code_verifier = Self::generate_code_verifier();
         let code_challenge = Self::generate_code_challenge(&code_verifier);
 
-        let callback_url = format!("{}/oauth/callback", self.callback_base_url);
+        let callback_url = self.callback_url();
         let scopes = provider.scopes.join(" ");
 
         let authorize_url = format!(
@@ -257,7 +270,7 @@ impl OAuthGateway {
 
         // Exchange code for tokens
         let (client_id, client_secret) = Self::get_credentials(&flow.provider_name)?;
-        let callback_url = format!("{}/oauth/callback", self.callback_base_url);
+        let callback_url = self.callback_url();
 
         let mut params = HashMap::new();
         params.insert("grant_type", "authorization_code".to_string());
@@ -593,6 +606,22 @@ mod tests {
         assert_eq!(
             urlencoded("https://example.com"),
             "https%3A%2F%2Fexample.com"
+        );
+    }
+
+    #[test]
+    fn test_callback_url_accepts_base_url() {
+        assert_eq!(
+            OAuthGateway::normalize_callback_url("http://localhost:8080"),
+            "http://localhost:8080/oauth/callback"
+        );
+    }
+
+    #[test]
+    fn test_callback_url_accepts_full_callback_url() {
+        assert_eq!(
+            OAuthGateway::normalize_callback_url("http://localhost:8080/oauth/callback"),
+            "http://localhost:8080/oauth/callback"
         );
     }
 }

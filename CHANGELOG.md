@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.18] - 2026-03-07
+
+### Added
+
+- **Connected API intent classification**: New `intent_routing.rs` module with `classify_connected_api_intent()` that detects runtime capability validation ("Are you connected to GitHub?"), read actions ("List my open GitHub issues"), and write actions ("Create a GitHub issue") across 30+ external service targets. Forces tool-loop routing for connected API work.
+- **Connected API tool pinning**: `ensure_connected_api_tools_exposed()` pins `manage_oauth` and `http_request` tools to the top of the tool list when connected API intent is detected, ensuring they survive policy filtering.
+- **`http_request` hardening**: Auth-header detection (`header_name_looks_like_auth`, `header_value_looks_like_auth`), embedded JSON query param recovery, session-scoped approval cache, and credential-in-URL stripping. Major rewrite of request validation and sanitization.
+- **External action timeout ack**: `finalize_external_action_timeout_ack()` in `llm_phase.rs` handles graceful completion when external actions (OAuth flows, HTTP requests) exceed the LLM call timeout.
+- **Daemon runtime context in `check_environment`**: Shows working dir, config path, env file path, and other daemon runtime info.
+- **OAuth callback URL normalization**: `normalize_callback_url()` accepts both base URLs and full callback URLs, preventing double `/oauth/callback` suffixes.
+
+### Changed
+
+- **`http_request` and `manage_oauth` added to `ESSENTIAL_TOOLS`**: Always available regardless of risk/policy filtering.
+- **Connected API intent overrides intent gate**: `infer_intent_gate()` now forces `needs_tools=true` when connected API intent is detected, bypassing consultant text-only routing.
+- **Intent routing verb refinements**: Removed "open" from connected API write verbs (false positive on "open issues" meaning "not-closed"), removed "read" from read verbs (false positive on "read the docs").
+- **Runtime capability validation expanded**: Added "are you connected to" and "are you hooked up to" as direct phrase triggers.
+
+### Fixed
+
+- **Clippy too-many-arguments**: Added `#[allow]` on `finalize_external_action_timeout_ack`.
+- **Connected API false positives**: "Write a GitHub Actions workflow" no longer classified as a write action; "Read the GitHub Actions docs" no longer classified as a read action.
+
 ## [0.9.17] - 2026-03-07
 
 ### Added

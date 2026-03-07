@@ -333,6 +333,8 @@ impl Agent {
                 policy_bundle.risk_score,
                 false,
             );
+            let shadow_filtered =
+                self.ensure_connected_api_tools_exposed(user_text, &shadow_filtered, &tool_defs);
             POLICY_METRICS
                 .tool_exposure_samples
                 .fetch_add(1, Ordering::Relaxed);
@@ -476,6 +478,8 @@ impl Agent {
                     policy_bundle.risk_score,
                     false,
                 );
+                tool_defs =
+                    self.ensure_connected_api_tools_exposed(user_text, &tool_defs, &base_tool_defs);
             }
             warn!(
                 session_id,

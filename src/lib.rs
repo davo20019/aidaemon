@@ -60,25 +60,78 @@ use tracing_subscriber::EnvFilter;
 const SUPPORTED_TERMINAL_AGENTS: &[&str] = &["codex", "claude", "gemini", "opencode"];
 const MAX_AGENT_LAUNCH_ARGS: usize = 24;
 const MAX_AGENT_LAUNCH_ARG_CHARS: usize = 256;
+pub(crate) const RUNTIME_CONFIG_PATH_ENV_KEY: &str = "AIDAEMON_RUNTIME_CONFIG_PATH";
+pub(crate) const RUNTIME_ENV_FILE_ENV_KEY: &str = "AIDAEMON_RUNTIME_ENV_FILE";
+pub(crate) const RUNTIME_WORKDIR_ENV_KEY: &str = "AIDAEMON_RUNTIME_WORKDIR";
+
+fn runtime_working_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn absolutize_path(path: &Path, base_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn resolve_runtime_env_file_path(working_dir: &Path) -> PathBuf {
+    if let Ok(path) = std::env::var("AIDAEMON_ENV_FILE") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return absolutize_path(Path::new(trimmed), working_dir);
+        }
+    }
+    working_dir.join(".env")
+}
+
+fn export_runtime_context(config_path: &Path, env_file_path: &Path, working_dir: &Path) {
+    std::env::set_var(
+        RUNTIME_CONFIG_PATH_ENV_KEY,
+        config_path.to_string_lossy().to_string(),
+    );
+    std::env::set_var(
+        RUNTIME_ENV_FILE_ENV_KEY,
+        env_file_path.to_string_lossy().to_string(),
+    );
+    std::env::set_var(
+        RUNTIME_WORKDIR_ENV_KEY,
+        working_dir.to_string_lossy().to_string(),
+    );
+}
+
+fn load_startup_env_file(env_file_path: &Path) {
+    let explicit_override = std::env::var("AIDAEMON_ENV_FILE")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+
+    if env_file_path.exists() {
+        if let Err(e) = dotenvy::from_path(env_file_path) {
+            eprintln!(
+                "Warning: failed to load env file '{}': {}",
+                env_file_path.display(),
+                e
+            );
+        }
+    } else if explicit_override {
+        eprintln!(
+            "Warning: AIDAEMON_ENV_FILE points to missing file '{}'",
+            env_file_path.display()
+        );
+    }
+}
 
 pub fn run() -> anyhow::Result<()> {
+    let working_dir = runtime_working_dir();
+    let config_path = working_dir.join("config.toml");
+    let env_file_path = resolve_runtime_env_file_path(&working_dir);
+
     // Load environment file.
-    // - Default: .env discovered from current working directory and parents.
+    // - Default: .env in the daemon working directory.
     // - Override: AIDAEMON_ENV_FILE=/absolute/path/to/envfile
-    if let Ok(path) = std::env::var("AIDAEMON_ENV_FILE") {
-        if !path.trim().is_empty() {
-            if let Err(e) = dotenvy::from_path(&path) {
-                eprintln!(
-                    "Warning: failed to load AIDAEMON_ENV_FILE '{}': {}",
-                    path, e
-                );
-            }
-        } else {
-            let _ = dotenvy::dotenv();
-        }
-    } else {
-        let _ = dotenvy::dotenv();
-    }
+    export_runtime_context(&config_path, &env_file_path, &working_dir);
+    load_startup_env_file(&env_file_path);
 
     // Tracing
     tracing_subscriber::fmt()
@@ -90,8 +143,6 @@ pub fn run() -> anyhow::Result<()> {
             }
         }))
         .init();
-
-    let config_path = PathBuf::from("config.toml");
 
     // Handle CLI arguments
     let args: Vec<String> = std::env::args().collect();

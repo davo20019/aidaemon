@@ -10,6 +10,10 @@ use super::result_learning::{ResultLearningEnv, ResultLearningState};
 use super::types::{ToolExecutionCtx, ToolExecutionOutcome};
 use crate::agent::recall_guardrails::is_personal_memory_tool;
 use crate::agent::*;
+use crate::utils::{truncate_str, truncate_with_note};
+
+const TOOL_COMPLETE_SUMMARY_MAX_CHARS: usize = 140;
+const EXTERNAL_ACTION_ACK_MAX_CHARS: usize = 500;
 
 fn raw_internal_scope_violation(
     raw_arguments: &str,
@@ -246,6 +250,47 @@ fn build_terminal_fallback_arguments_from_run_command(raw_arguments: &str) -> Op
     )
 }
 
+fn is_trivial_success_excerpt(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    lower.is_empty()
+        || lower == "ok"
+        || lower == "done"
+        || lower == "success"
+        || lower == "completed"
+        || lower == "completed successfully"
+        || lower == "request completed successfully"
+}
+
+fn summarize_completed_tool_result(result_text: &str) -> String {
+    let summary = crate::traits::first_primary_message_line(result_text, &[])
+        .filter(|line| !line.trim().is_empty())
+        .unwrap_or_else(|| "Completed".to_string());
+    truncate_str(summary.trim(), TOOL_COMPLETE_SUMMARY_MAX_CHARS)
+}
+
+fn build_external_action_completion_ack(result_text: &str) -> String {
+    let primary = crate::traits::extract_primary_message_content(result_text, &[]);
+    let excerpt = primary.trim();
+    if excerpt.is_empty() || is_trivial_success_excerpt(excerpt) {
+        "The requested action completed successfully.".to_string()
+    } else {
+        format!(
+            "The requested action completed successfully.\n\nLatest result:\n{}",
+            truncate_with_note(excerpt, EXTERNAL_ACTION_ACK_MAX_CHARS)
+        )
+    }
+}
+
+fn should_build_external_action_ack(result_text: &str) -> bool {
+    let primary = crate::traits::extract_primary_message_content(result_text, &[]);
+    let lower = primary.trim_start().to_ascii_lowercase();
+    !lower.starts_with("request blocked:")
+        && !lower.starts_with("blocked:")
+        && !lower.starts_with("[system] blocked:")
+        && !lower.starts_with("error:")
+        && !lower.starts_with("failed to ")
+}
+
 impl Agent {
     pub(in crate::agent) async fn run_tool_execution_phase(
         &self,
@@ -300,6 +345,7 @@ impl Agent {
         let mut successful_send_file_keys = std::mem::take(ctx.successful_send_file_keys);
         let mut cli_agent_boundary_injected = *ctx.cli_agent_boundary_injected;
         let mut pending_background_ack = std::mem::take(ctx.pending_background_ack);
+        let mut pending_external_action_ack: Option<String> = None;
         let mut stall_count = *ctx.stall_count;
         let mut deferred_no_tool_streak = *ctx.deferred_no_tool_streak;
         let mut consecutive_clean_iterations = *ctx.consecutive_clean_iterations;
@@ -339,6 +385,7 @@ impl Agent {
                 *ctx.successful_send_file_keys = successful_send_file_keys;
                 *ctx.cli_agent_boundary_injected = cli_agent_boundary_injected;
                 *ctx.pending_background_ack = pending_background_ack;
+                *ctx.pending_external_action_ack = pending_external_action_ack;
                 *ctx.stall_count = stall_count;
                 *ctx.deferred_no_tool_streak = deferred_no_tool_streak;
                 *ctx.consecutive_clean_iterations = consecutive_clean_iterations;
@@ -908,6 +955,30 @@ impl Agent {
             {
                 commit_state!();
                 return Ok(outcome);
+            }
+
+            if !is_error {
+                send_status(
+                    &status_tx,
+                    StatusUpdate::ToolComplete {
+                        name: tc.name.clone(),
+                        summary: summarize_completed_tool_result(&result_text),
+                    },
+                );
+                let caps = available_capabilities
+                    .get(&tc.name)
+                    .copied()
+                    .unwrap_or_default();
+                if !background_detached
+                    && !caps.read_only
+                    && caps.external_side_effect
+                    && should_build_external_action_ack(&result_text)
+                {
+                    pending_external_action_ack =
+                        Some(build_external_action_completion_ack(&result_text));
+                }
+            } else {
+                pending_external_action_ack = None;
             }
 
             let tool_msg = Message {

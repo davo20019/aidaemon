@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::{HashMap, HashSet};
 
 fn validate_required_fields_contract(parameters: &Value) -> Result<(), String> {
     let properties = parameters
@@ -149,6 +150,56 @@ impl Agent {
             .and_then(|n| n.as_str())
     }
 
+    fn connected_api_tools_to_pin(user_message: &str) -> Option<&'static [&'static str]> {
+        match crate::agent::intent_routing::classify_connected_api_intent(user_message) {
+            Some(crate::agent::intent_routing::ConnectedApiIntent::RuntimeCapabilityValidation)
+            | Some(crate::agent::intent_routing::ConnectedApiIntent::ReadAction)
+            | Some(crate::agent::intent_routing::ConnectedApiIntent::WriteAction) => {
+                Some(&["manage_oauth", "http_request"])
+            }
+            None => None,
+        }
+    }
+
+    pub(super) fn ensure_connected_api_tools_exposed(
+        &self,
+        user_message: &str,
+        filtered_defs: &[Value],
+        base_defs: &[Value],
+    ) -> Vec<Value> {
+        let Some(pinned_names) = Self::connected_api_tools_to_pin(user_message) else {
+            return filtered_defs.to_vec();
+        };
+        let base_by_name: HashMap<String, Value> = base_defs
+            .iter()
+            .filter_map(|def| {
+                let name = Self::tool_name_from_definition(def)?.to_string();
+                Some((name, def.clone()))
+            })
+            .collect();
+
+        let mut exposed: Vec<Value> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for name in pinned_names {
+            if let Some(def) = base_by_name.get(*name) {
+                seen.insert((*name).to_string());
+                exposed.push(def.clone());
+            }
+        }
+
+        for def in filtered_defs {
+            let Some(name) = Self::tool_name_from_definition(def) else {
+                continue;
+            };
+            if seen.insert(name.to_string()) {
+                exposed.push(def.clone());
+            }
+        }
+
+        exposed
+    }
+
     pub(super) fn filter_tool_definitions_for_policy(
         &self,
         defs: &[Value],
@@ -181,6 +232,8 @@ impl Agent {
             "manage_people",
             "web_search",
             "web_fetch",
+            "http_request",
+            "manage_oauth",
             "send_file",
         ];
 
@@ -285,6 +338,7 @@ impl Agent {
         let base_defs = defs.clone();
         if enforce_filter {
             defs = self.filter_tool_definitions_for_policy(&defs, &caps, policy, risk_score, false);
+            defs = self.ensure_connected_api_tools_exposed(user_message, &defs, &base_defs);
         }
 
         (defs, base_defs, caps)
@@ -333,10 +387,14 @@ mod tests {
     }
 
     fn valid_tool_def() -> Value {
+        named_tool_def("demo_tool")
+    }
+
+    fn named_tool_def(name: &str) -> Value {
         json!({
             "type": "function",
             "function": {
-                "name": "demo_tool",
+                "name": name,
                 "description": "demo",
                 "parameters": {
                     "type": "object",
@@ -400,5 +458,179 @@ mod tests {
         assert!(caps.contains_key("web_search"));
         assert!(!caps.contains_key("cli_agent"));
         assert!(!harness.agent.has_cli_agents_available());
+    }
+
+    #[tokio::test]
+    async fn runtime_validation_queries_pin_connected_api_tools() {
+        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
+            .await
+            .unwrap();
+
+        let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
+        let base = vec![
+            named_tool_def("search_files"),
+            named_tool_def("http_request"),
+            named_tool_def("manage_oauth"),
+            named_tool_def("terminal"),
+        ];
+
+        let exposed = harness.agent.ensure_connected_api_tools_exposed(
+            "Can you verify whether you can post to Twitter/X right now before answering?",
+            &filtered,
+            &base,
+        );
+        let names: Vec<String> = exposed
+            .iter()
+            .filter_map(Agent::tool_name_from_definition)
+            .map(ToString::to_string)
+            .collect();
+
+        assert!(names.contains(&"http_request".to_string()));
+        assert!(names.contains(&"manage_oauth".to_string()));
+        assert_eq!(names.first().map(String::as_str), Some("manage_oauth"));
+    }
+
+    #[tokio::test]
+    async fn connected_api_write_queries_pin_connected_api_tools() {
+        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
+            .await
+            .unwrap();
+
+        let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
+        let base = vec![
+            named_tool_def("search_files"),
+            named_tool_def("http_request"),
+            named_tool_def("manage_oauth"),
+            named_tool_def("terminal"),
+        ];
+
+        let exposed = harness.agent.ensure_connected_api_tools_exposed(
+            "Create a GitHub issue for this regression.",
+            &filtered,
+            &base,
+        );
+        let names: Vec<String> = exposed
+            .iter()
+            .filter_map(Agent::tool_name_from_definition)
+            .map(ToString::to_string)
+            .collect();
+
+        assert!(names.contains(&"http_request".to_string()));
+        assert!(names.contains(&"manage_oauth".to_string()));
+    }
+
+    #[tokio::test]
+    async fn connected_api_read_queries_pin_connected_api_tools() {
+        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
+            .await
+            .unwrap();
+
+        let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
+        let base = vec![
+            named_tool_def("search_files"),
+            named_tool_def("http_request"),
+            named_tool_def("manage_oauth"),
+            named_tool_def("terminal"),
+        ];
+
+        let exposed = harness.agent.ensure_connected_api_tools_exposed(
+            "List my open GitHub issues.",
+            &filtered,
+            &base,
+        );
+
+        let names: Vec<String> = exposed
+            .iter()
+            .filter_map(Agent::tool_name_from_definition)
+            .map(ToString::to_string)
+            .collect();
+
+        assert!(names.contains(&"http_request".to_string()));
+        assert!(names.contains(&"manage_oauth".to_string()));
+    }
+
+    #[tokio::test]
+    async fn non_connected_api_queries_do_not_pin_connected_api_tools() {
+        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
+            .await
+            .unwrap();
+
+        let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
+        let base = vec![
+            named_tool_def("search_files"),
+            named_tool_def("http_request"),
+            named_tool_def("manage_oauth"),
+            named_tool_def("terminal"),
+        ];
+
+        let exposed = harness.agent.ensure_connected_api_tools_exposed(
+            "What's your twitter account?",
+            &filtered,
+            &base,
+        );
+        let names: Vec<String> = exposed
+            .iter()
+            .filter_map(Agent::tool_name_from_definition)
+            .map(ToString::to_string)
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["search_files".to_string(), "terminal".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_filter_keeps_connected_api_tools_exposed() {
+        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
+            .await
+            .unwrap();
+
+        let defs = vec![
+            named_tool_def("search_files"),
+            named_tool_def("read_file"),
+            named_tool_def("http_request"),
+            named_tool_def("manage_oauth"),
+        ];
+        let capabilities: HashMap<String, ToolCapabilities> = HashMap::from([
+            ("search_files".to_string(), ToolCapabilities::default()),
+            ("read_file".to_string(), ToolCapabilities::default()),
+            (
+                "http_request".to_string(),
+                ToolCapabilities {
+                    read_only: false,
+                    external_side_effect: true,
+                    needs_approval: true,
+                    idempotent: false,
+                    high_impact_write: false,
+                },
+            ),
+            (
+                "manage_oauth".to_string(),
+                ToolCapabilities {
+                    read_only: false,
+                    external_side_effect: true,
+                    needs_approval: true,
+                    idempotent: false,
+                    high_impact_write: true,
+                },
+            ),
+        ]);
+
+        let filtered = harness.agent.filter_tool_definitions_for_policy(
+            &defs,
+            &capabilities,
+            &ExecutionPolicy::for_profile(ModelProfile::Cheap),
+            0.2,
+            false,
+        );
+        let names: Vec<String> = filtered
+            .iter()
+            .filter_map(Agent::tool_name_from_definition)
+            .map(ToString::to_string)
+            .collect();
+
+        assert!(names.contains(&"http_request".to_string()));
+        assert!(names.contains(&"manage_oauth".to_string()));
     }
 }

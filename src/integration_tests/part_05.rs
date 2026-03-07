@@ -292,6 +292,9 @@ async fn test_full_stack_status_updates_received() {
     let has_tool_start = updates
         .iter()
         .any(|u| matches!(u, StatusUpdate::ToolStart { name, .. } if name == "terminal"));
+    let has_tool_complete = updates
+        .iter()
+        .any(|u| matches!(u, StatusUpdate::ToolComplete { name, .. } if name == "terminal"));
     let has_thinking = updates
         .iter()
         .any(|u| matches!(u, StatusUpdate::Thinking(_)));
@@ -306,9 +309,114 @@ async fn test_full_stack_status_updates_received() {
         "Should have received at least one Thinking update. Updates: {:?}",
         updates
     );
-    // ToolComplete may or may not be captured depending on timing — the key
-    // verification is that ToolStart fires before execution and Thinking fires
-    // for subsequent iterations.
+    assert!(
+        has_tool_complete,
+        "Should have received ToolComplete for terminal. Updates: {:?}",
+        updates
+    );
+}
+
+struct ExternalActionTool;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for ExternalActionTool {
+    fn name(&self) -> &str {
+        "external_action"
+    }
+
+    fn description(&self) -> &str {
+        "Writes to an external service for testing."
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "external_action",
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        })
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok("Created remote record id=abc123".to_string())
+    }
+}
+
+#[tokio::test]
+async fn test_successful_external_action_timeout_returns_deterministic_completion() {
+    let responses = vec![
+        {
+            let mut resp = MockProvider::tool_call_response("external_action", "{}");
+            resp.content = Some("I'll handle that.".to_string());
+            resp
+        },
+        MockProvider::text_response("This reply should time out before it is used."),
+    ];
+
+    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_delayed_responses(
+            responses,
+            vec![std::time::Duration::ZERO, std::time::Duration::from_secs(2)],
+        ),
+        vec![Arc::new(ExternalActionTool)],
+        Some(1),
+    )
+    .await
+    .unwrap();
+
+    let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(64);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        harness.agent.handle_message(
+            "external_action_timeout",
+            "Create the remote record.",
+            Some(status_tx),
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        ),
+    )
+    .await
+    .expect("request should not hang")
+    .unwrap();
+
+    assert!(
+        response.contains("The requested action completed successfully."),
+        "response should use deterministic completion ack: {}",
+        response
+    );
+    assert!(
+        response.contains("Created remote record id=abc123"),
+        "response should include the latest external action result: {}",
+        response
+    );
+
+    let mut updates = Vec::new();
+    while let Ok(update) = status_rx.try_recv() {
+        updates.push(update);
+    }
+
+    assert!(
+        updates.iter().any(|update| matches!(
+            update,
+            StatusUpdate::ToolComplete { name, summary }
+                if name == "external_action" && summary.contains("Created remote record id=abc123")
+        )),
+        "expected ToolComplete status update for external_action, got: {:?}",
+        updates
+    );
 }
 
 /// Full-stack regression: duplicate identical send_file calls in one task

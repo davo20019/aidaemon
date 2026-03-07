@@ -111,6 +111,7 @@ pub(super) struct ConsultantCompletionCtx<'a> {
     pub empty_response_retry_note: &'a mut Option<String>,
     pub identity_prefill_text: &'a mut Option<String>,
     pub pending_background_ack: &'a mut Option<String>,
+    pub pending_external_action_ack: &'a mut Option<String>,
     pub require_file_recheck_before_answer: &'a mut bool,
     pub needs_tools_for_turn: bool,
     pub force_text_response: bool,
@@ -150,6 +151,7 @@ impl Agent {
         let mut empty_response_retry_note = ctx.empty_response_retry_note.clone();
         let mut identity_prefill_text = ctx.identity_prefill_text.clone();
         let mut pending_background_ack = std::mem::take(ctx.pending_background_ack);
+        let mut pending_external_action_ack = std::mem::take(ctx.pending_external_action_ack);
         let mut require_file_recheck_before_answer = *ctx.require_file_recheck_before_answer;
         let needs_tools_for_turn = ctx.needs_tools_for_turn;
         let force_text_response = ctx.force_text_response;
@@ -168,6 +170,7 @@ impl Agent {
                 *ctx.empty_response_retry_note = empty_response_retry_note.clone();
                 *ctx.identity_prefill_text = identity_prefill_text.clone();
                 *ctx.pending_background_ack = pending_background_ack.clone();
+                *ctx.pending_external_action_ack = pending_external_action_ack.clone();
                 *ctx.require_file_recheck_before_answer = require_file_recheck_before_answer;
             };
         }
@@ -200,6 +203,22 @@ impl Agent {
                         iteration, "Background detach acknowledgement enforced"
                     );
                     reply = background_ack;
+                }
+            }
+
+            if self.depth == 0
+                && should_recover_completion_from_tool_output(
+                    &reply,
+                    self.depth,
+                    total_successful_tool_calls,
+                )
+            {
+                if let Some(external_action_ack) = pending_external_action_ack.take() {
+                    info!(
+                        session_id,
+                        iteration, "Successful external-action acknowledgement enforced"
+                    );
+                    reply = external_action_ack;
                 }
             }
 

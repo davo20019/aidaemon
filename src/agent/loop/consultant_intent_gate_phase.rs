@@ -72,6 +72,40 @@ struct ConsultantRoutingContractDecision {
     outcome: ConsultantRoutingContractOutcome,
 }
 
+fn user_asks_runtime_capability_question(user_text: &str) -> bool {
+    matches!(
+        crate::agent::intent_routing::classify_connected_api_intent(user_text),
+        Some(crate::agent::intent_routing::ConnectedApiIntent::RuntimeCapabilityValidation)
+    )
+}
+
+fn looks_like_capability_denial_response(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    [
+        "i can't",
+        "i cannot",
+        "i don't have access",
+        "i do not have access",
+        "i don't have the ability",
+        "i do not have the ability",
+        "i'm unable to",
+        "i am unable to",
+        "i'm not able to",
+        "i am not able to",
+        "i don't currently have",
+        "i do not currently have",
+        "i don't have an active connection",
+        "i do not have an active connection",
+        "not currently connected",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+}
+
 fn evaluate_consultant_routing_contract(
     user_text: &str,
     intent_gate: &IntentGateDecision,
@@ -203,6 +237,8 @@ impl Agent {
         // strong evidence the LLM needs tools.
         let had_hallucinated_tool_calls = !resp.tool_calls.is_empty();
         let analysis_defers_execution = looks_like_deferred_action_response(&analysis);
+        let analysis_denies_capability = looks_like_capability_denial_response(&analysis);
+        let user_asks_capability_question = user_asks_runtime_capability_question(user_text);
 
         let (mut can_answer_now, mut needs_tools, needs_clarification) = if user_references_fs_path
         {
@@ -223,6 +259,12 @@ impl Agent {
             info!(
                 session_id,
                 "Consultant pass: user explicitly requested external verification — forcing tools mode"
+            );
+            (false, true, false)
+        } else if analysis_denies_capability && user_asks_capability_question {
+            info!(
+                session_id,
+                "Consultant pass: blocked unverified capability-denial reply — forcing tools mode"
             );
             (false, true, false)
         } else if had_hallucinated_tool_calls {
@@ -256,7 +298,7 @@ impl Agent {
         {
             info!(
                 session_id,
-                "Consultant pass: deterministic local-execution signal detected — forcing tools mode"
+                "Consultant pass: deterministic tool-required signal detected — forcing tools mode"
             );
             can_answer_now = false;
             needs_tools = true;
@@ -843,6 +885,35 @@ mod tests {
                 text
             );
         }
+    }
+
+    #[test]
+    fn runtime_capability_question_helper_detects_access_checks() {
+        assert!(user_asks_runtime_capability_question(
+            "Can you check if you can post to Twitter right now?"
+        ));
+        assert!(user_asks_runtime_capability_question(
+            "Are you connected to GitHub?"
+        ));
+        assert!(!user_asks_runtime_capability_question(
+            "Can you rewrite this paragraph?"
+        ));
+        assert!(!user_asks_runtime_capability_question(
+            "Write a tweet about Rust"
+        ));
+    }
+
+    #[test]
+    fn capability_denial_helper_detects_unverified_denials() {
+        assert!(looks_like_capability_denial_response(
+            "I don't have the ability to post through my available tools."
+        ));
+        assert!(looks_like_capability_denial_response(
+            "I'm unable to access that integration right now."
+        ));
+        assert!(!looks_like_capability_denial_response(
+            "I can post after I verify the connection."
+        ));
     }
 
     proptest! {

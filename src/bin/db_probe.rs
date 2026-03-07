@@ -1,7 +1,27 @@
 use anyhow::Context;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Row, SqlitePool};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+
+fn runtime_working_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn resolve_runtime_env_file_path(working_dir: &Path) -> PathBuf {
+    if let Ok(path) = std::env::var("AIDAEMON_ENV_FILE") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            let candidate = PathBuf::from(trimmed);
+            return if candidate.is_absolute() {
+                candidate
+            } else {
+                working_dir.join(candidate)
+            };
+        }
+    }
+    working_dir.join(".env")
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,7 +70,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(7)
         .clamp(1, 720);
 
-    let _ = dotenvy::dotenv();
+    let env_path = resolve_runtime_env_file_path(&runtime_working_dir());
+    if env_path.exists() {
+        let _ = dotenvy::from_path(&env_path);
+    }
 
     let db_path = std::env::var("AIDAEMON_DB_PATH").unwrap_or_else(|_| "aidaemon.db".to_string());
     let key = std::env::var("AIDAEMON_ENCRYPTION_KEY")

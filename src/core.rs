@@ -1397,6 +1397,10 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         with the service name (e.g., auth_profile=\"twitter\"). Do NOT call `manage_oauth connect` again \
         if the service is already connected. When the user asks to use an API, check `manage_oauth list` \
         first to see if it's already connected, then use `http_request` with that profile name. \
+        \n  If an OAuth connection was removed or expired, do NOT assume the app credentials are gone. \
+        Use `manage_oauth providers` first to see whether client credentials are already stored. \
+        Only ask the user for client ID/secret if the provider actually reports that credentials are needed. \
+        Do NOT ask the user where their .env or keychain entries are located unless they explicitly asked for config help. \
         \n  Use plain language with the user — say \"connect your Twitter account\" not \"configure OAuth credentials.\""
     } else {
         ""

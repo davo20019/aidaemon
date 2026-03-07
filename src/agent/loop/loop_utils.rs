@@ -369,6 +369,9 @@ pub(super) fn classify_tool_result_failure(
     if cleaned.starts_with("ERROR:")
         || cleaned.starts_with("Error:")
         || cleaned.starts_with("Failed to ")
+        || cleaned.starts_with("Request blocked:")
+        || cleaned.starts_with("Blocked:")
+        || cleaned.starts_with("[SYSTEM] BLOCKED:")
     {
         return Some(classify_text_error(&lower));
     }
@@ -714,6 +717,14 @@ mod tool_error_detection_tests {
         let result = "Error: request timed out while connecting to api";
         let classified = classify_tool_result_failure("http_request", result);
         assert_eq!(classified, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn detects_request_blocked_as_semantic_error() {
+        let result =
+            "Request blocked: tool-only parameters were embedded in the URL (auth_profile, body).";
+        let classified = classify_tool_result_failure("http_request", result);
+        assert_eq!(classified, Some(ToolFailureClass::Semantic));
     }
 
     #[test]

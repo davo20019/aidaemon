@@ -35,6 +35,7 @@ pub(super) struct LlmPhaseCtx<'a> {
     pub consecutive_same_tool: &'a (String, usize),
     pub consecutive_same_tool_arg_hashes: &'a HashSet<u64>,
     pub total_successful_tool_calls: usize,
+    pub pending_external_action_ack: &'a mut Option<String>,
     pub heartbeat: &'a Option<Arc<AtomicU64>>,
     pub empty_response_retry_pending: &'a mut bool,
     pub empty_response_retry_note: &'a mut Option<String>,
@@ -45,6 +46,56 @@ pub(super) struct LlmPhaseCtx<'a> {
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_external_action_timeout_ack(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        session_id: &str,
+        iteration: usize,
+        task_start: Instant,
+        learning_ctx: &mut LearningContext,
+        model: &str,
+        reply: String,
+    ) -> anyhow::Result<String> {
+        let assistant_msg = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: "assistant".to_string(),
+            content: Some(reply.clone()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.5,
+            ..Message::runtime_defaults()
+        };
+        self.append_assistant_message_with_event(emitter, &assistant_msg, model, None, None)
+            .await?;
+        self.emit_task_end(
+            emitter,
+            task_id,
+            TaskStatus::Completed,
+            task_start,
+            iteration,
+            learning_ctx.tool_calls.len(),
+            None,
+            Some(reply.chars().take(200).collect()),
+        )
+        .await;
+
+        learning_ctx.completed_naturally = true;
+        let learning_ctx_for_task = learning_ctx.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
+                warn!("Learning failed: {}", e);
+            }
+        });
+
+        Ok(reply)
+    }
+
     pub(super) async fn run_llm_phase(
         &self,
         ctx: &mut LlmPhaseCtx<'_>,
@@ -76,6 +127,7 @@ impl Agent {
         let consecutive_same_tool = ctx.consecutive_same_tool;
         let consecutive_same_tool_arg_hashes = ctx.consecutive_same_tool_arg_hashes;
         let total_successful_tool_calls = ctx.total_successful_tool_calls;
+        let pending_external_action_ack = &mut *ctx.pending_external_action_ack;
         let heartbeat = ctx.heartbeat;
         let empty_response_retry_pending = &mut *ctx.empty_response_retry_pending;
         let empty_response_retry_note = &mut *ctx.empty_response_retry_note;
@@ -83,6 +135,7 @@ impl Agent {
         let deferred_no_tool_streak = ctx.deferred_no_tool_streak;
         let max_budget_extensions = ctx.max_budget_extensions;
         let hard_token_cap = ctx.hard_token_cap;
+        let timeout_after_external_action = Duration::from_secs(20);
 
         // Identity manipulation detection: if the user's message contains obvious
         // injection patterns, prepend a strong system reminder to the messages so
@@ -210,7 +263,16 @@ impl Agent {
             );
         }
 
-        let mut resp = match self.llm_call_timeout {
+        let effective_llm_timeout = if pending_external_action_ack.is_some() {
+            Some(
+                self.llm_call_timeout
+                    .map(|timeout| timeout.min(timeout_after_external_action))
+                    .unwrap_or(timeout_after_external_action),
+            )
+        } else {
+            self.llm_call_timeout
+        };
+        let mut resp = match effective_llm_timeout {
             Some(timeout_dur) => {
                 match tokio::time::timeout(
                     timeout_dur,
@@ -247,6 +309,30 @@ impl Agent {
                             format!("LLM call timed out after {}s", timeout_dur.as_secs()),
                             false,
                         ));
+                        if let Some(reply) = pending_external_action_ack.take() {
+                            if let Some(last_error) = learning_ctx.errors.last_mut() {
+                                last_error.1 = true;
+                            }
+                            info!(
+                                session_id,
+                                iteration,
+                                timeout_secs = timeout_dur.as_secs(),
+                                "Returning deterministic completion after post-action LLM timeout"
+                            );
+                            let result = self
+                                .finalize_external_action_timeout_ack(
+                                    emitter,
+                                    task_id,
+                                    session_id,
+                                    iteration,
+                                    task_start,
+                                    learning_ctx,
+                                    model,
+                                    reply,
+                                )
+                                .await;
+                            return Ok(LlmPhaseOutcome::Return(result));
+                        }
                         *stall_count += 1;
                         return Ok(LlmPhaseOutcome::ContinueLoop);
                     }

@@ -240,6 +240,9 @@ impl Agent {
         let mut cli_agent_boundary_injected = false;
         // Deterministic top-level acknowledgement when a tool detaches to background.
         let mut pending_background_ack: Option<String> = None;
+        // Deterministic fallback acknowledgement when a successful external write
+        // completes but the follow-up LLM summary stalls.
+        let mut pending_external_action_ack: Option<String> = None;
         // Track identity-attack prefill so we can prepend it to the final reply.
         let mut identity_prefill_text: Option<String> = None;
         // Best-effort project directory hint (seeded from user text, refined by tool calls).
@@ -684,6 +687,7 @@ impl Agent {
                     consecutive_same_tool: &consecutive_same_tool,
                     consecutive_same_tool_arg_hashes: &consecutive_same_tool_arg_hashes,
                     total_successful_tool_calls,
+                    pending_external_action_ack: &mut pending_external_action_ack,
                     heartbeat: &heartbeat,
                     empty_response_retry_pending: &mut empty_response_retry_pending,
                     empty_response_retry_note: &mut empty_response_retry_note,
@@ -738,6 +742,7 @@ impl Agent {
                     empty_response_retry_note: &mut empty_response_retry_note,
                     identity_prefill_text: &mut identity_prefill_text,
                     pending_background_ack: &mut pending_background_ack,
+                    pending_external_action_ack: &mut pending_external_action_ack,
                     require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
                     turn_context: &turn_context,
                     needs_tools_for_turn: &mut needs_tools_for_turn,
@@ -818,6 +823,7 @@ impl Agent {
                     successful_send_file_keys: &mut successful_send_file_keys,
                     cli_agent_boundary_injected: &mut cli_agent_boundary_injected,
                     pending_background_ack: &mut pending_background_ack,
+                    pending_external_action_ack: &mut pending_external_action_ack,
                     stall_count: &mut stall_count,
                     deferred_no_tool_streak: &mut deferred_no_tool_streak,
                     consecutive_clean_iterations: &mut consecutive_clean_iterations,

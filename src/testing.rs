@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -45,6 +46,7 @@ pub struct MockChatCall {
 /// Mock LLM provider that returns scripted responses.
 pub struct MockProvider {
     responses: Mutex<Vec<ProviderResponse>>,
+    response_delays: Mutex<Vec<Duration>>,
     pub call_log: Mutex<Vec<MockChatCall>>,
     reject_non_default_options: bool,
 }
@@ -54,6 +56,7 @@ impl MockProvider {
     pub fn new() -> Self {
         Self {
             responses: Mutex::new(Vec::new()),
+            response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
         }
@@ -63,6 +66,20 @@ impl MockProvider {
     pub fn with_responses(responses: Vec<ProviderResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
+            response_delays: Mutex::new(Vec::new()),
+            call_log: Mutex::new(Vec::new()),
+            reject_non_default_options: false,
+        }
+    }
+
+    /// Create a provider with scripted responses and per-call delays.
+    pub fn with_delayed_responses(
+        responses: Vec<ProviderResponse>,
+        response_delays: Vec<Duration>,
+    ) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+            response_delays: Mutex::new(response_delays),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
         }
@@ -145,6 +162,18 @@ impl ModelProvider for MockProvider {
 
         if self.reject_non_default_options && *options != ChatOptions::default() {
             return Err(ProviderError::from_status(400, "unsupported chat options").into());
+        }
+
+        let delay = {
+            let mut response_delays = self.response_delays.lock().await;
+            if response_delays.is_empty() {
+                None
+            } else {
+                Some(response_delays.remove(0))
+            }
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
 
         // Return next scripted response, or a default
@@ -266,6 +295,15 @@ pub struct TestHarness {
 ///
 /// Each call creates an isolated database, so tests can run in parallel.
 pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarness> {
+    setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![], None).await
+}
+
+/// Build a test agent with extra tools and an optional per-LLM-call timeout.
+pub async fn setup_test_agent_with_extra_tools_and_llm_timeout(
+    provider: MockProvider,
+    extra_tools: Vec<Arc<dyn Tool>>,
+    llm_call_timeout_secs: Option<u64>,
+) -> anyhow::Result<TestHarness> {
     // Temp file for SQLite (pool needs a real file, not :memory:)
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();
@@ -286,12 +324,13 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
     let provider = Arc::new(provider);
 
     // Tools — SystemInfoTool + RememberFactTool (no side effects, no approval)
-    let tools: Vec<Arc<dyn Tool>> = vec![
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(SystemInfoTool),
         Arc::new(RememberFactTool::new(
             state.clone() as Arc<dyn crate::traits::StateStore>
         )),
     ];
+    tools.extend(extra_tools);
 
     // Models config (all tiers point to "mock-model")
     let models_config = ModelsConfig {
@@ -328,7 +367,7 @@ pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarn
         IterationLimitConfig::Unlimited,
         None,                      // task_timeout_secs
         None,                      // task_token_budget
-        None,                      // llm_call_timeout_secs
+        llm_call_timeout_secs,     // llm_call_timeout_secs
         None,                      // mcp_registry
         Some(goal_token_registry), // goal_token_registry
         None,                      // hub

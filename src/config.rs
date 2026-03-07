@@ -54,6 +54,11 @@ fn keychain_disabled() -> bool {
 }
 
 fn resolve_env_file_path() -> PathBuf {
+    if let Ok(path) = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY) {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
     if let Ok(path) = std::env::var("AIDAEMON_ENV_FILE") {
         if !path.trim().is_empty() {
             return PathBuf::from(path);
@@ -2663,6 +2668,22 @@ mod tests {
         restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
         restore_env_var("AIDAEMON_ENV_FILE", old_env_file);
         restore_env_var("OAUTH_TWITTER_CLIENT_ID", old_client_id);
+    }
+
+    #[test]
+    #[serial_test::serial(env_vars)]
+    fn resolve_env_file_path_prefers_runtime_resolved_path() {
+        let _guard = KEYCHAIN_ENV_FILE_LOCK.lock().unwrap();
+        let old_runtime_env_file = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        let old_env_file = std::env::var("AIDAEMON_ENV_FILE").ok();
+
+        std::env::set_var(crate::RUNTIME_ENV_FILE_ENV_KEY, "/daemon/root/.env");
+        std::env::set_var("AIDAEMON_ENV_FILE", "/some/other/.env");
+
+        assert_eq!(resolve_env_file_path(), PathBuf::from("/daemon/root/.env"));
+
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env_file);
+        restore_env_var("AIDAEMON_ENV_FILE", old_env_file);
     }
 
     #[test]

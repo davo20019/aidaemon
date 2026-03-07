@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +36,7 @@ const MAX_TIMEOUT_SECS: u64 = 120;
 pub struct HttpRequestTool {
     profiles: Arc<RwLock<HashMap<String, HttpAuthProfile>>>,
     approval_tx: mpsc::Sender<ApprovalRequest>,
+    session_approvals: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
 
 impl HttpRequestTool {
@@ -46,6 +47,7 @@ impl HttpRequestTool {
         Self {
             profiles,
             approval_tx,
+            session_approvals: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -59,6 +61,372 @@ impl HttpRequestTool {
             return true;
         }
         req.ends_with(&format!(".{}", allow))
+    }
+
+    /// Normalize a header name for case-insensitive comparison.
+    fn normalize_header_name(name: &str) -> String {
+        name.chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect()
+    }
+
+    /// Detect custom headers that are likely carrying credentials.
+    /// Those must go through auth profiles so approval and policy checks apply.
+    fn header_name_looks_like_auth(name: &str) -> bool {
+        let normalized = Self::normalize_header_name(name);
+        match normalized.as_str() {
+            "authorization" | "proxyauthorization" | "cookie" | "setcookie" | "apikey"
+            | "xapikey" | "authtoken" | "xauthtoken" | "accesstoken" | "xaccesstoken"
+            | "sessiontoken" | "xsessiontoken" | "privatetoken" | "xprivatetoken" => true,
+            _ => {
+                normalized.ends_with("apikey")
+                    || normalized.ends_with("authtoken")
+                    || normalized.ends_with("accesstoken")
+                    || normalized.ends_with("sessiontoken")
+            }
+        }
+    }
+
+    fn header_value_looks_like_auth(value: &str) -> bool {
+        let trimmed = value.trim_start();
+        ["bearer ", "basic ", "digest ", "token "]
+            .iter()
+            .any(|prefix| {
+                trimmed.len() > prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+            })
+    }
+
+    fn query_value_looks_like_embedded_json(value: &str) -> bool {
+        let trimmed = value.trim();
+        trimmed.starts_with('{') || trimmed.starts_with('[')
+    }
+
+    fn rebuild_query_pairs(url: &mut reqwest::Url, retained_pairs: &[(String, String)]) {
+        url.set_query(None);
+        if retained_pairs.is_empty() {
+            return;
+        }
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in retained_pairs {
+                pairs.append_pair(key, value);
+            }
+        }
+    }
+
+    fn recover_embedded_tool_params_from_url(
+        args: &mut Value,
+        url: &mut reqwest::Url,
+    ) -> anyhow::Result<Vec<String>> {
+        let Some(map) = args.as_object_mut() else {
+            return Ok(Vec::new());
+        };
+
+        let mut retained_pairs: Vec<(String, String)> = Vec::new();
+        let mut recovered: Vec<String> = Vec::new();
+        let mut stripped_any = false;
+
+        for (key, value) in url.query_pairs() {
+            let key_owned = key.into_owned();
+            let value_owned = value.into_owned();
+            let normalized = key_owned.to_ascii_lowercase();
+            let mut strip_from_url = false;
+
+            match normalized.as_str() {
+                "auth_profile" | "content_type" => {
+                    strip_from_url = true;
+                    if !map.contains_key(normalized.as_str()) {
+                        map.insert(normalized.clone(), Value::String(value_owned.clone()));
+                        recovered.push(normalized);
+                    }
+                }
+                "follow_redirects" => {
+                    strip_from_url = true;
+                    if !map.contains_key("follow_redirects") {
+                        if let Ok(parsed) = value_owned.parse::<bool>() {
+                            map.insert("follow_redirects".to_string(), Value::Bool(parsed));
+                            recovered.push("follow_redirects".to_string());
+                        }
+                    }
+                }
+                "timeout_secs" | "max_response_bytes" => {
+                    strip_from_url = true;
+                    if !map.contains_key(normalized.as_str()) {
+                        if let Ok(parsed) = value_owned.parse::<u64>() {
+                            map.insert(normalized.clone(), Value::Number(parsed.into()));
+                            recovered.push(normalized);
+                        }
+                    }
+                }
+                "headers" => {
+                    let looks_embedded = Self::query_value_looks_like_embedded_json(&value_owned);
+                    if looks_embedded {
+                        strip_from_url = true;
+                        if !map.contains_key("headers") {
+                            let parsed = serde_json::from_str::<Value>(&value_owned)?;
+                            if parsed.is_object() {
+                                map.insert("headers".to_string(), parsed);
+                                recovered.push("headers".to_string());
+                            }
+                        }
+                    }
+                }
+                "body" => {
+                    let looks_embedded = Self::query_value_looks_like_embedded_json(&value_owned);
+                    if looks_embedded {
+                        strip_from_url = true;
+                        if !map.contains_key("body") {
+                            map.insert("body".to_string(), Value::String(value_owned.clone()));
+                            recovered.push("body".to_string());
+                        }
+                    }
+                }
+                "_session_id"
+                | "_task_id"
+                | "_goal_id"
+                | "_channel_visibility"
+                | "_trusted_session"
+                | "_user_role" => {
+                    strip_from_url = true;
+                }
+                _ => {}
+            }
+
+            if !strip_from_url {
+                retained_pairs.push((key_owned, value_owned));
+            } else {
+                stripped_any = true;
+            }
+        }
+
+        if stripped_any {
+            recovered.sort();
+            recovered.dedup();
+            Self::rebuild_query_pairs(url, &retained_pairs);
+        }
+
+        Ok(recovered)
+    }
+
+    fn embedded_tool_params_in_url(url: &reqwest::Url) -> Vec<String> {
+        let mut leaked: Vec<String> = Vec::new();
+
+        for (key, value) in url.query_pairs() {
+            let normalized = key.to_ascii_lowercase();
+            let is_reserved_tool_param = matches!(
+                normalized.as_str(),
+                "auth_profile"
+                    | "content_type"
+                    | "follow_redirects"
+                    | "timeout_secs"
+                    | "max_response_bytes"
+                    | "_session_id"
+                    | "_task_id"
+                    | "_goal_id"
+                    | "_channel_visibility"
+                    | "_trusted_session"
+                    | "_user_role"
+            );
+            let looks_like_serialized_tool_payload =
+                matches!(normalized.as_str(), "headers" | "body")
+                    && Self::query_value_looks_like_embedded_json(&value);
+
+            if is_reserved_tool_param || looks_like_serialized_tool_payload {
+                leaked.push(key.into_owned());
+            }
+        }
+
+        let lowered_path = url.path().to_ascii_lowercase();
+        for needle in [
+            "auth_profile=",
+            "content_type=",
+            "follow_redirects=",
+            "timeout_secs=",
+            "max_response_bytes=",
+            "_session_id=",
+            "_task_id=",
+            "_goal_id=",
+            "_channel_visibility=",
+            "_trusted_session=",
+            "_user_role=",
+            "headers=",
+            "body=",
+        ] {
+            if lowered_path.contains(needle) {
+                leaked.push(needle.trim_end_matches('=').to_string());
+            }
+        }
+
+        leaked.sort();
+        leaked.dedup();
+        leaked
+    }
+
+    fn approval_scope_key(
+        method: &str,
+        url: &reqwest::Url,
+        auth_profile_name: Option<&str>,
+        content_type: Option<&str>,
+    ) -> String {
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let port = url
+            .port_or_known_default()
+            .map(|p| format!(":{}", p))
+            .unwrap_or_default();
+        let auth = auth_profile_name.unwrap_or("-");
+        let content_type = content_type.unwrap_or("-");
+        format!(
+            "{} {}://{}{}{} [auth:{}] [content-type:{}]",
+            method,
+            url.scheme().to_ascii_lowercase(),
+            host,
+            port,
+            url.path(),
+            auth,
+            content_type
+        )
+    }
+
+    async fn is_session_approved(&self, session_id: &str, approval_key: &str) -> bool {
+        self.session_approvals
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(|approved| approved.contains(approval_key))
+    }
+
+    async fn remember_session_approval(&self, session_id: &str, approval_key: &str) {
+        self.session_approvals
+            .write()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(approval_key.to_string());
+    }
+
+    fn blocked_manual_auth_headers(
+        headers: Option<&serde_json::Map<String, Value>>,
+    ) -> Vec<String> {
+        let mut blocked: Vec<String> = headers
+            .into_iter()
+            .flat_map(|map| map.iter())
+            .filter_map(|(name, value)| {
+                let looks_like_auth = Self::header_name_looks_like_auth(name)
+                    || value
+                        .as_str()
+                        .is_some_and(Self::header_value_looks_like_auth);
+                looks_like_auth.then(|| name.to_string())
+            })
+            .collect();
+        blocked.sort();
+        blocked.dedup();
+        blocked
+    }
+
+    fn same_origin(original: &reqwest::Url, candidate: &reqwest::Url) -> bool {
+        original.scheme().eq_ignore_ascii_case(candidate.scheme())
+            && original
+                .host_str()
+                .unwrap_or("")
+                .eq_ignore_ascii_case(candidate.host_str().unwrap_or(""))
+            && original.port_or_known_default() == candidate.port_or_known_default()
+    }
+
+    fn redirect_behavior(method: &str, status_code: u16, has_body: bool) -> (String, bool) {
+        match status_code {
+            301..=303 => ("GET".to_string(), false),
+            307 | 308 => (method.to_string(), has_body),
+            _ => (method.to_string(), false),
+        }
+    }
+
+    fn append_chunk_with_limit(
+        collected: &mut Vec<u8>,
+        observed_bytes: &mut u64,
+        chunk: &[u8],
+        max_response_bytes: u64,
+    ) -> bool {
+        *observed_bytes = observed_bytes.saturating_add(chunk.len() as u64);
+
+        let remaining = (max_response_bytes as usize).saturating_sub(collected.len());
+        if remaining > 0 {
+            let to_copy = remaining.min(chunk.len());
+            collected.extend_from_slice(&chunk[..to_copy]);
+        }
+
+        *observed_bytes > max_response_bytes
+    }
+
+    fn is_binary_content_type(content_type: &str) -> bool {
+        content_type.starts_with("image/")
+            || content_type.starts_with("audio/")
+            || content_type.starts_with("video/")
+            || content_type.contains("octet-stream")
+    }
+
+    fn append_truncation_notice(text: &str, max_response_bytes: u64) -> String {
+        if text.is_empty() {
+            format!(
+                "[Truncated: response exceeded {} bytes limit]",
+                max_response_bytes
+            )
+        } else {
+            format!(
+                "{}\n\n[Truncated: response exceeded {} bytes limit]",
+                text, max_response_bytes
+            )
+        }
+    }
+
+    fn format_response_body(
+        bytes: &[u8],
+        content_type: &str,
+        observed_bytes: u64,
+        max_response_bytes: u64,
+        truncated: bool,
+    ) -> String {
+        if Self::is_binary_content_type(content_type) {
+            if truncated {
+                return format!(
+                    "[Binary response truncated at {} bytes limit, content-type: {}]",
+                    max_response_bytes, content_type
+                );
+            }
+            return format!(
+                "[Binary response: {} bytes, content-type: {}]",
+                observed_bytes, content_type
+            );
+        }
+
+        match String::from_utf8(bytes.to_vec()) {
+            Ok(text) => {
+                if truncated {
+                    Self::append_truncation_notice(&text, max_response_bytes)
+                } else {
+                    text
+                }
+            }
+            Err(err) => {
+                if truncated && err.utf8_error().error_len().is_none() {
+                    let valid_up_to = err.utf8_error().valid_up_to();
+                    let valid_text = std::str::from_utf8(&bytes[..valid_up_to]).unwrap_or("");
+                    return Self::append_truncation_notice(valid_text, max_response_bytes);
+                }
+
+                if truncated {
+                    format!(
+                        "[Non-UTF8 response truncated at {} bytes limit, content-type: {}]",
+                        max_response_bytes, content_type
+                    )
+                } else {
+                    format!(
+                        "[Non-UTF8 response: {} bytes, content-type: {}]",
+                        observed_bytes, content_type
+                    )
+                }
+            }
+        }
     }
 
     /// Build an OAuth 1.0a Authorization header value (RFC 5849).
@@ -365,7 +733,7 @@ impl Tool for HttpRequestTool {
     fn schema(&self) -> Value {
         json!({
             "name": "http_request",
-            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only. Write operations require user approval.",
+            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only. Pass only the real endpoint URL in `url`; keep `auth_profile`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Write operations require user approval.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -376,27 +744,27 @@ impl Tool for HttpRequestTool {
                     },
                     "url": {
                         "type": "string",
-                        "description": "Full HTTPS URL"
+                        "description": "Full HTTPS endpoint URL only. Do NOT append tool arguments like auth_profile, headers, body, content_type, timeout_secs, follow_redirects, or max_response_bytes to this URL."
                     },
                     "auth_profile": {
                         "type": "string",
-                        "description": "Name of configured auth profile (e.g. 'twitter', 'stripe')"
+                        "description": "Top-level auth profile name (e.g. 'twitter', 'stripe'). Do not embed this in the URL."
                     },
                     "headers": {
                         "type": "object",
-                        "description": "Additional request headers"
+                        "description": "Top-level additional non-auth request headers"
                     },
                     "body": {
                         "type": "string",
-                        "description": "Request body (JSON string, form data, etc.)"
+                        "description": "Top-level request body (JSON string, form data, etc.). Do not embed this in the URL."
                     },
                     "content_type": {
                         "type": "string",
-                        "description": "Content-Type header (auto-detected if omitted)"
+                        "description": "Top-level Content-Type header (auto-detected if omitted)"
                     },
                     "query_params": {
                         "type": "object",
-                        "description": "Query parameters appended to URL"
+                        "description": "Actual remote query parameters appended to the URL. Do not place tool control args here."
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -428,7 +796,7 @@ impl Tool for HttpRequestTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments)?;
+        let mut args: Value = serde_json::from_str(arguments)?;
 
         // Parse parameters
         let method = args["method"]
@@ -438,6 +806,22 @@ impl Tool for HttpRequestTool {
         let url_str = args["url"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: url"))?;
+
+        // Build URL with query params
+        let mut parsed_url =
+            reqwest::Url::parse(url_str).map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
+        let recovered_tool_params =
+            Self::recover_embedded_tool_params_from_url(&mut args, &mut parsed_url)?;
+        if let Some(qp) = args["query_params"].as_object() {
+            for (k, v) in qp {
+                let val_owned = v
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| v.to_string());
+                parsed_url.query_pairs_mut().append_pair(k, &val_owned);
+            }
+        }
+        let url = parsed_url.to_string();
         let auth_profile_name = args["auth_profile"].as_str();
         let body = args["body"].as_str();
         let content_type_param = args["content_type"].as_str();
@@ -450,20 +834,7 @@ impl Tool for HttpRequestTool {
             .as_u64()
             .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES)
             .min(ABSOLUTE_MAX_RESPONSE_BYTES);
-
-        // Build URL with query params
-        let mut parsed_url =
-            reqwest::Url::parse(url_str).map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
-        if let Some(qp) = args["query_params"].as_object() {
-            for (k, v) in qp {
-                let val_owned = v
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| v.to_string());
-                parsed_url.query_pairs_mut().append_pair(k, &val_owned);
-            }
-        }
-        let url = parsed_url.to_string();
+        let custom_headers = args["headers"].as_object();
 
         // Step 1: HTTPS enforcement
         if parsed_url.scheme() != "https" {
@@ -475,7 +846,32 @@ impl Tool for HttpRequestTool {
             return Ok(format!("Request blocked: {}", reason));
         }
 
-        // Step 3: Resolve auth profile and check domain
+        // Step 3: Catch malformed tool calls where tool-only args were stuffed into the URL.
+        let leaked_tool_params = Self::embedded_tool_params_in_url(&parsed_url);
+        if !leaked_tool_params.is_empty() {
+            return Ok(format!(
+                "Request blocked: tool-only parameters were embedded in the URL ({}). Put them in the top-level `http_request` arguments instead of `url`.",
+                leaked_tool_params.join(", ")
+            ));
+        }
+        if !recovered_tool_params.is_empty() {
+            warn!(
+                recovered = ?recovered_tool_params,
+                endpoint = %parsed_url,
+                "Recovered embedded http_request tool parameters from URL"
+            );
+        }
+
+        // Step 4: Block manual credential headers so auth always flows through profiles.
+        let blocked_headers = Self::blocked_manual_auth_headers(custom_headers);
+        if !blocked_headers.is_empty() {
+            return Ok(format!(
+                "Request blocked: credential-bearing headers are not allowed in `headers` ({}). Configure an auth_profile instead.",
+                blocked_headers.join(", ")
+            ));
+        }
+
+        // Step 5: Resolve auth profile and check domain
         let profiles_guard = self.profiles.read().await;
         let profile = if let Some(name) = auth_profile_name {
             let p = profiles_guard
@@ -499,18 +895,17 @@ impl Tool for HttpRequestTool {
             None
         };
 
-        // Step 4: Auto-detect content type
+        // Step 6: Auto-detect content type
         let content_type = content_type_param
             .map(|s| s.to_string())
             .or_else(|| body.map(|b| Self::detect_content_type(b).to_string()));
 
-        // Step 5: Scan for secrets in outbound data
+        // Step 7: Scan for secrets in outbound data
         let check_parts = format!(
             "{} {} {}",
             url,
             body.unwrap_or(""),
-            args["headers"]
-                .as_object()
+            custom_headers
                 .map(|h| serde_json::to_string(h).unwrap_or_default())
                 .unwrap_or_default()
         );
@@ -523,11 +918,17 @@ impl Tool for HttpRequestTool {
             );
         }
 
-        // Step 6: Classify risk and request approval
+        // Step 8: Classify risk and request approval
         let risk = Self::classify_risk(&method, profile.is_some());
         let session_id = args["_session_id"].as_str().unwrap_or("unknown");
+        let approval_key = Self::approval_scope_key(
+            &method,
+            &parsed_url,
+            auth_profile_name,
+            content_type.as_deref(),
+        );
 
-        if risk != RiskLevel::Safe {
+        if risk != RiskLevel::Safe && !self.is_session_approved(session_id, &approval_key).await {
             let mut desc = format!("{} {}", method, url);
             if let Some(name) = auth_profile_name {
                 desc.push_str(&format!(" [auth: {}]", name));
@@ -550,16 +951,18 @@ impl Tool for HttpRequestTool {
                 .request_approval(session_id, &desc, risk, warnings)
                 .await?
             {
-                ApprovalResponse::AllowOnce | ApprovalResponse::AllowSession => {}
-                // For http_request, we treat AllowAlways same as AllowOnce (Cautious mode)
-                ApprovalResponse::AllowAlways => {}
+                ApprovalResponse::AllowOnce => {}
+                ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways => {
+                    self.remember_session_approval(session_id, &approval_key)
+                        .await;
+                }
                 ApprovalResponse::Deny => {
                     return Ok("Request denied by user".to_string());
                 }
             }
         }
 
-        // Step 7: Execute request with manual redirect loop
+        // Step 9: Execute request with manual redirect loop
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .redirect(reqwest::redirect::Policy::none())
@@ -568,10 +971,11 @@ impl Tool for HttpRequestTool {
 
         let mut current_url = url.clone();
         let mut current_method = method.clone();
-        let original_host = parsed_url.host_str().unwrap_or("").to_string();
+        let original_url = parsed_url.clone();
         let mut redirect_count = 0;
+        let mut resend_body = false;
 
-        let response = loop {
+        let mut response = loop {
             let mut builder = match current_method.as_str() {
                 "GET" => client.get(&current_url),
                 "POST" => client.post(&current_url),
@@ -586,14 +990,13 @@ impl Tool for HttpRequestTool {
                 builder = builder.header("Content-Type", ct.as_str());
             }
             if let Some(b) = body {
-                // Only send body on first request (not redirects)
-                if redirect_count == 0 {
+                if redirect_count == 0 || resend_body {
                     builder = builder.body(b.to_string());
                 }
             }
 
             // Add custom headers
-            if let Some(headers) = args["headers"].as_object() {
+            if let Some(headers) = custom_headers {
                 for (k, v) in headers {
                     if let Some(val) = v.as_str() {
                         builder = builder.header(k.as_str(), val);
@@ -603,8 +1006,7 @@ impl Tool for HttpRequestTool {
 
             // Apply auth (only if same origin)
             let current_parsed = reqwest::Url::parse(&current_url).unwrap_or(parsed_url.clone());
-            let current_host = current_parsed.host_str().unwrap_or("").to_string();
-            let same_origin = current_host == original_host;
+            let same_origin = Self::same_origin(&original_url, &current_parsed);
 
             if let Some(p) = profile {
                 if same_origin {
@@ -613,7 +1015,11 @@ impl Tool for HttpRequestTool {
                         p,
                         &current_method,
                         &current_url,
-                        if redirect_count == 0 { body } else { None },
+                        if redirect_count == 0 || resend_body {
+                            body
+                        } else {
+                            None
+                        },
                         content_type.as_deref(),
                     )
                     .map_err(|e| {
@@ -628,7 +1034,7 @@ impl Tool for HttpRequestTool {
                 } else {
                     warn!(
                         "Auth stripped on cross-origin redirect: {} -> {}",
-                        original_host, current_host
+                        original_url, current_parsed
                     );
                 }
             }
@@ -678,10 +1084,13 @@ impl Tool for HttpRequestTool {
                     }
 
                     current_url = next_url;
-                    // 301/302/303 redirects change method to GET
-                    if matches!(resp.status().as_u16(), 301..=303) {
-                        current_method = "GET".to_string();
-                    }
+                    let (next_method, next_resend_body) = Self::redirect_behavior(
+                        &current_method,
+                        resp.status().as_u16(),
+                        body.is_some(),
+                    );
+                    current_method = next_method;
+                    resend_body = next_resend_body;
                     continue;
                 } else {
                     return Ok(format!(
@@ -694,7 +1103,7 @@ impl Tool for HttpRequestTool {
             break resp;
         };
 
-        // Step 8: Format response
+        // Step 9: Format response
         let status = response.status();
         let resp_headers: HashMap<String, String> = response
             .headers()
@@ -707,50 +1116,33 @@ impl Tool for HttpRequestTool {
             .cloned()
             .unwrap_or_default();
 
-        let bytes = response.bytes().await.map_err(|e| {
+        let mut collected_body = Vec::new();
+        let mut observed_bytes = 0u64;
+        let mut truncated = false;
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
             anyhow::anyhow!(
                 "{}",
                 Self::strip_credentials_from_error_with(&profiles_guard, &e.to_string())
             )
-        })?;
-
-        // Binary detection: non-UTF8 returns metadata only
-        let body_str = if content_type_resp.starts_with("image/")
-            || content_type_resp.starts_with("audio/")
-            || content_type_resp.starts_with("video/")
-            || content_type_resp.contains("octet-stream")
-        {
-            format!(
-                "[Binary response: {} bytes, content-type: {}]",
-                bytes.len(),
-                content_type_resp
-            )
-        } else {
-            match String::from_utf8(bytes.to_vec()) {
-                Ok(text) => {
-                    if text.len() > max_response_bytes as usize {
-                        let mut end = max_response_bytes as usize;
-                        while end > 0 && !text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        format!(
-                            "{}\n\n[Truncated: {} bytes total]",
-                            &text[..end],
-                            text.len()
-                        )
-                    } else {
-                        text
-                    }
-                }
-                Err(_) => {
-                    format!(
-                        "[Non-UTF8 response: {} bytes, content-type: {}]",
-                        bytes.len(),
-                        content_type_resp
-                    )
-                }
+        })? {
+            truncated = Self::append_chunk_with_limit(
+                &mut collected_body,
+                &mut observed_bytes,
+                &chunk,
+                max_response_bytes,
+            );
+            if truncated {
+                break;
             }
-        };
+        }
+
+        let body_str = Self::format_response_body(
+            &collected_body,
+            &content_type_resp,
+            observed_bytes,
+            max_response_bytes,
+            truncated,
+        );
 
         // Sanitize response content (strip prompt injection)
         let sanitized_body = sanitize_external_content(&body_str);
@@ -896,8 +1288,16 @@ mod tests {
         let schema = tool.schema();
         assert_eq!(schema["name"], "http_request");
         assert!(schema["description"].as_str().unwrap().len() > 10);
+        assert!(schema["description"]
+            .as_str()
+            .unwrap()
+            .contains("never inside the URL"));
         assert!(schema["parameters"]["properties"]["method"].is_object());
         assert!(schema["parameters"]["properties"]["url"].is_object());
+        assert!(schema["parameters"]["properties"]["url"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Do NOT append tool arguments"));
         let required = schema["parameters"]["required"].as_array().unwrap();
         assert!(required.contains(&json!("method")));
         assert!(required.contains(&json!("url")));
@@ -956,6 +1356,94 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_header_detection_by_name() {
+        assert!(HttpRequestTool::header_name_looks_like_auth(
+            "Authorization"
+        ));
+        assert!(HttpRequestTool::header_name_looks_like_auth("X-API-Key"));
+        assert!(HttpRequestTool::header_name_looks_like_auth("X-Auth-Token"));
+        assert!(!HttpRequestTool::header_name_looks_like_auth("Accept"));
+        assert!(!HttpRequestTool::header_name_looks_like_auth(
+            "X-API-Version"
+        ));
+    }
+
+    #[test]
+    fn test_auth_header_detection_by_value() {
+        assert!(HttpRequestTool::header_value_looks_like_auth(
+            "Bearer secret-token"
+        ));
+        assert!(HttpRequestTool::header_value_looks_like_auth(
+            "Basic dXNlcjpwYXNz"
+        ));
+        assert!(!HttpRequestTool::header_value_looks_like_auth(
+            "application/json"
+        ));
+    }
+
+    #[test]
+    fn test_same_origin_requires_matching_port() {
+        let original = reqwest::Url::parse("https://api.example.com/resource").unwrap();
+        let default_https = reqwest::Url::parse("https://api.example.com:443/other").unwrap();
+        let different_port = reqwest::Url::parse("https://api.example.com:8443/other").unwrap();
+
+        assert!(HttpRequestTool::same_origin(&original, &default_https));
+        assert!(!HttpRequestTool::same_origin(&original, &different_port));
+    }
+
+    #[test]
+    fn test_redirect_behavior_drops_body_for_302() {
+        let (method, resend_body) = HttpRequestTool::redirect_behavior("POST", 302, true);
+        assert_eq!(method, "GET");
+        assert!(!resend_body);
+    }
+
+    #[test]
+    fn test_redirect_behavior_preserves_body_for_307_and_308() {
+        let (method_307, resend_307) = HttpRequestTool::redirect_behavior("POST", 307, true);
+        let (method_308, resend_308) = HttpRequestTool::redirect_behavior("PATCH", 308, true);
+
+        assert_eq!(method_307, "POST");
+        assert!(resend_307);
+        assert_eq!(method_308, "PATCH");
+        assert!(resend_308);
+    }
+
+    #[test]
+    fn test_append_chunk_with_limit_stops_at_configured_size() {
+        let mut collected = Vec::new();
+        let mut observed = 0;
+
+        let first =
+            HttpRequestTool::append_chunk_with_limit(&mut collected, &mut observed, b"hello", 7);
+        assert!(!first);
+        assert_eq!(collected, b"hello");
+        assert_eq!(observed, 5);
+
+        let second =
+            HttpRequestTool::append_chunk_with_limit(&mut collected, &mut observed, b"world", 7);
+        assert!(second);
+        assert_eq!(collected, b"hellowo");
+        assert_eq!(observed, 10);
+    }
+
+    #[test]
+    fn test_format_response_body_handles_truncated_utf8_prefix() {
+        let bytes = vec![0xC3, 0xA9, 0xC3];
+        let formatted = HttpRequestTool::format_response_body(&bytes, "text/plain", 4, 3, true);
+        assert!(formatted.starts_with("é"));
+        assert!(formatted.contains("response exceeded 3 bytes limit"));
+        assert!(!formatted.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn test_format_response_body_reports_binary_truncation() {
+        let formatted = HttpRequestTool::format_response_body(b"\x89PNG", "image/png", 10, 4, true);
+        assert!(formatted.contains("Binary response truncated"));
+        assert!(formatted.contains("image/png"));
+    }
+
+    #[test]
     fn test_oauth1a_signing_produces_valid_header() {
         let profile = make_oauth_profile();
         let result = HttpRequestTool::build_oauth1a_header(
@@ -1010,6 +1498,66 @@ mod tests {
             HttpRequestTool::detect_content_type("just some text"),
             "text/plain"
         );
+    }
+
+    #[test]
+    fn test_embedded_tool_params_detects_reserved_fields() {
+        let url = reqwest::Url::parse(
+            "https://api.twitter.com/2/tweets?auth_profile=twitter&headers=%7B%22Content-Type%22:%22application/json%22%7D",
+        )
+        .unwrap();
+        let leaked = HttpRequestTool::embedded_tool_params_in_url(&url);
+        assert!(leaked.contains(&"auth_profile".to_string()));
+        assert!(leaked.contains(&"headers".to_string()));
+    }
+
+    #[test]
+    fn test_recover_embedded_tool_params_moves_fields_out_of_url() {
+        let mut args = json!({
+            "method": "POST",
+            "url": "https://api.twitter.com/2/tweets?auth_profile=twitter&body=%7B%22text%22%3A%22hello%22%7D&content_type=application%2Fjson&keep=1"
+        });
+        let mut url = reqwest::Url::parse(args["url"].as_str().unwrap()).unwrap();
+
+        let recovered =
+            HttpRequestTool::recover_embedded_tool_params_from_url(&mut args, &mut url).unwrap();
+
+        assert_eq!(args["auth_profile"], "twitter");
+        assert_eq!(args["body"], "{\"text\":\"hello\"}");
+        assert_eq!(args["content_type"], "application/json");
+        assert!(recovered.contains(&"auth_profile".to_string()));
+        assert!(recovered.contains(&"body".to_string()));
+        assert!(recovered.contains(&"content_type".to_string()));
+        assert_eq!(url.as_str(), "https://api.twitter.com/2/tweets?keep=1");
+    }
+
+    #[tokio::test]
+    async fn test_session_approval_scope_ignores_query_and_body_values() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let first_url = reqwest::Url::parse("https://api.twitter.com/2/tweets?text=first").unwrap();
+        let second_url =
+            reqwest::Url::parse("https://api.twitter.com/2/tweets?text=second").unwrap();
+        let first_key = HttpRequestTool::approval_scope_key(
+            "POST",
+            &first_url,
+            Some("twitter"),
+            Some("application/json"),
+        );
+        let second_key = HttpRequestTool::approval_scope_key(
+            "POST",
+            &second_url,
+            Some("twitter"),
+            Some("application/json"),
+        );
+
+        assert_eq!(first_key, second_key);
+        assert!(!tool.is_session_approved("telegram:test", &first_key).await);
+
+        tool.remember_session_approval("telegram:test", &first_key)
+            .await;
+
+        assert!(tool.is_session_approved("telegram:test", &second_key).await);
     }
 
     #[test]
@@ -1141,6 +1689,88 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("not in the allowed domains"));
+    }
+
+    #[tokio::test]
+    async fn test_manual_authorization_header_is_blocked() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let result = tool
+            .call(
+                r#"{
+                    "method": "GET",
+                    "url": "https://example.com/api",
+                    "headers": {
+                        "Authorization": "Basic dXNlcjpwYXNz"
+                    }
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("credential-bearing headers are not allowed"));
+        assert!(result.contains("Authorization"));
+    }
+
+    #[tokio::test]
+    async fn test_embedded_tool_params_are_recovered_before_profile_resolution() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let err = tool
+            .call(
+                r#"{
+                    "method": "POST",
+                    "url": "https://api.twitter.com/2/tweets?auth_profile=twitter&headers=%7B%22Content-Type%22%3A%22application/json%22%7D",
+                    "body": "{\"text\":\"hello\"}",
+                    "_session_id": "telegram:test"
+                }"#,
+            )
+            .await
+            .expect_err("recovered call should reach normal auth-profile validation");
+
+        assert!(err.to_string().contains("Unknown auth profile: 'twitter'"));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_manual_api_key_header_is_blocked() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let result = tool
+            .call(
+                r#"{
+                    "method": "GET",
+                    "url": "https://example.com/api",
+                    "headers": {
+                        "X-API-Key": "super-secret-value"
+                    }
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("credential-bearing headers are not allowed"));
+        assert!(result.contains("X-API-Key"));
+    }
+
+    #[tokio::test]
+    async fn test_non_auth_headers_are_not_blocked_by_manual_auth_guard() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let result = tool
+            .call(
+                r#"{
+                    "method": "GET",
+                    "url": "http://example.com/api",
+                    "headers": {
+                        "Accept": "application/json"
+                    }
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("only HTTPS"));
     }
 
     #[tokio::test]

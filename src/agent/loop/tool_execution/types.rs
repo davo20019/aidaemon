@@ -64,6 +64,7 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub successful_send_file_keys: &'a mut HashSet<String>,
     pub cli_agent_boundary_injected: &'a mut bool,
     pub pending_background_ack: &'a mut Option<String>,
+    pub pending_external_action_ack: &'a mut Option<String>,
     pub stall_count: &'a mut usize,
     pub deferred_no_tool_streak: &'a mut usize,
     pub consecutive_clean_iterations: &'a mut usize,

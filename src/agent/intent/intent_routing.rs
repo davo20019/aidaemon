@@ -22,6 +22,13 @@ pub(super) enum IntentComplexity {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConnectedApiIntent {
+    RuntimeCapabilityValidation,
+    ReadAction,
+    WriteAction,
+}
+
 /// Check if a phrase appears as complete words in text (word-boundary matching).
 /// Splits on whitespace, trims surrounding punctuation (preserving apostrophes),
 /// then checks for consecutive word matches. Case-insensitive.
@@ -167,11 +174,16 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
     // Deterministic tool-need overrides:
     // 1) explicit filesystem paths
     // 2) explicit local-environment execution/inspection requests
+    // 3) connected external API/integration work:
+    //    - runtime capability validation
+    //    - connected API reads
+    //    - connected API writes
     //
     // These requests cannot be satisfied by text-only consultant output and
     // must run through the tool loop, regardless of model intent-gate output.
     if super::user_text_references_filesystem_path(user_text)
         || user_text_requires_local_tool_execution(user_text)
+        || classify_connected_api_intent(user_text).is_some()
     {
         return IntentGateDecision {
             can_answer_now: Some(false),
@@ -260,6 +272,277 @@ fn user_text_requires_local_tool_execution(user_text: &str) -> bool {
         || local_scope_request
         || installed_version_query
         || quoted_command_execution
+}
+
+fn contains_any_as_words(text: &str, keywords: &[&str]) -> bool {
+    keywords
+        .iter()
+        .any(|kw| contains_keyword_as_words(text, kw))
+}
+
+pub(super) fn user_text_requests_runtime_capability_validation(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    // Narrow deterministic trigger: only fire when the user explicitly asks
+    // for a live check/verification of current capability or connection state.
+    for phrase in [
+        "check if you can",
+        "check whether you can",
+        "see if you can",
+        "see whether you can",
+        "verify you can",
+        "verify if you can",
+        "verify whether you can",
+        "test if you can",
+        "test whether you can",
+        "confirm you can",
+        "confirm whether you can",
+        "make sure you can",
+        "check if you have access",
+        "check whether you have access",
+        "verify you have access",
+        "check if you're connected",
+        "check whether you're connected",
+        "verify you're connected",
+        "see if you're connected",
+        "see whether you're connected",
+        "check if it is connected",
+        "check whether it is connected",
+        "check if this is connected",
+        "check whether this is connected",
+        "are you connected to",
+        "are you hooked up to",
+    ] {
+        if contains_keyword_as_words(&lower, phrase) {
+            return true;
+        }
+    }
+
+    let has_validation_verb = ["check", "verify", "test", "confirm", "validate", "see"]
+        .iter()
+        .any(|kw| contains_keyword_as_words(&lower, kw));
+    let asks_about_current_access_or_connection = [
+        "do you have access",
+        "you have access",
+        "are you connected",
+        "you're connected",
+        "it is connected",
+        "this is connected",
+        "whether you can",
+    ]
+    .iter()
+    .any(|kw| contains_keyword_as_words(&lower, kw));
+
+    has_validation_verb && asks_about_current_access_or_connection
+}
+
+fn mentions_connected_api_target(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    const TARGET_MARKERS: &[&str] = &[
+        "api",
+        "apis",
+        "oauth",
+        "webhook",
+        "connected account",
+        "connected service",
+        "service account",
+        "integration",
+        "github",
+        "gitlab",
+        "jira",
+        "linear",
+        "notion",
+        "slack",
+        "discord",
+        "twitter",
+        "bluesky",
+        "mastodon",
+        "linkedin",
+        "reddit",
+        "gmail",
+        "email",
+        "calendar",
+        "google calendar",
+        "google drive",
+        "google docs",
+        "google sheets",
+        "drive",
+        "stripe",
+        "airtable",
+        "salesforce",
+        "hubspot",
+        "shopify",
+        "zendesk",
+        "intercom",
+        "confluence",
+        "trello",
+        "asana",
+        "clickup",
+        "dropbox",
+        "youtube",
+        "figma",
+    ];
+
+    contains_any_as_words(&lower, TARGET_MARKERS)
+}
+
+fn mentions_connected_api_resource(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    const RESOURCE_MARKERS: &[&str] = &[
+        "issue",
+        "issues",
+        "pull request",
+        "pull requests",
+        "pr",
+        "prs",
+        "ticket",
+        "tickets",
+        "task",
+        "tasks",
+        "comment",
+        "comments",
+        "reply",
+        "replies",
+        "message",
+        "messages",
+        "email",
+        "emails",
+        "draft",
+        "drafts",
+        "inbox",
+        "calendar event",
+        "calendar events",
+        "event",
+        "events",
+        "page",
+        "pages",
+        "document",
+        "documents",
+        "doc",
+        "docs",
+        "sheet",
+        "sheets",
+        "record",
+        "records",
+        "row",
+        "rows",
+        "database",
+        "file",
+        "files",
+        "folder",
+        "folders",
+        "repository",
+        "repositories",
+        "repo",
+        "repos",
+        "post",
+        "posts",
+        "tweet",
+        "tweets",
+        "thread",
+        "threads",
+        "invoice",
+        "invoices",
+        "customer",
+        "customers",
+        "contact",
+        "contacts",
+        "lead",
+        "leads",
+    ];
+
+    contains_any_as_words(&lower, RESOURCE_MARKERS)
+}
+
+fn mentions_connected_api_account_scope(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    contains_any_as_words(
+        &lower,
+        &[
+            "my", "our", "for me", "from my", "to my", "in my", "on my", "with my",
+        ],
+    )
+}
+
+pub(super) fn user_text_requests_connected_api_write_action(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    if !mentions_connected_api_target(&lower) {
+        return false;
+    }
+
+    let has_strong_write_verb = contains_any_as_words(
+        &lower,
+        &[
+            "post", "publish", "send", "reply", "comment", "share", "upload", "submit", "tweet",
+            "retweet", "message", "dm",
+        ],
+    );
+    // "open" is excluded — it conflicts with "open issues" (adjective meaning
+    // "not-closed") and "open GitHub" (launch).  It rarely signals a write action.
+    let has_scoped_write_verb = contains_any_as_words(
+        &lower,
+        &[
+            "create", "update", "edit", "modify", "delete", "remove", "close", "reopen", "merge",
+            "archive", "schedule", "cancel",
+        ],
+    ) && mentions_connected_api_resource(&lower);
+
+    has_strong_write_verb || has_scoped_write_verb
+}
+
+pub(super) fn user_text_requests_connected_api_read_action(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    if !mentions_connected_api_target(&lower) {
+        return false;
+    }
+
+    // "read" is excluded — it conflicts with "read the docs" (local reading)
+    // and is rarely used for API fetching ("list my issues", not "read my issues").
+    let has_read_verb = contains_any_as_words(
+        &lower,
+        &[
+            "check", "list", "show", "fetch", "get", "view", "inspect", "look up", "lookup",
+            "find", "search", "pull", "sync",
+        ],
+    );
+
+    has_read_verb
+        && (mentions_connected_api_account_scope(&lower) || mentions_connected_api_resource(&lower))
+}
+
+pub(super) fn classify_connected_api_intent(user_text: &str) -> Option<ConnectedApiIntent> {
+    if user_text_requests_runtime_capability_validation(user_text) {
+        Some(ConnectedApiIntent::RuntimeCapabilityValidation)
+    } else if user_text_requests_connected_api_write_action(user_text) {
+        Some(ConnectedApiIntent::WriteAction)
+    } else if user_text_requests_connected_api_read_action(user_text) {
+        Some(ConnectedApiIntent::ReadAction)
+    } else {
+        None
+    }
 }
 
 /// Classify user intent complexity for orchestration routing.
@@ -468,6 +751,83 @@ mod intent_routing_path_override_tests {
             d.needs_tools.is_none(),
             "expected needs_tools=None for non-local installed wording, got {:?}",
             d.needs_tools
+        );
+    }
+
+    #[test]
+    fn infer_intent_gate_forces_tools_for_runtime_capability_validation() {
+        let d = infer_intent_gate("Can you check if you can post to Twitter right now?", "");
+        assert_eq!(d.needs_tools, Some(true));
+        assert_eq!(d.can_answer_now, Some(false));
+    }
+
+    #[test]
+    fn infer_intent_gate_forces_tools_for_connection_state_validation() {
+        let d = infer_intent_gate(
+            "Please verify you're connected to GitHub before answering.",
+            "",
+        );
+        assert_eq!(d.needs_tools, Some(true));
+        assert_eq!(d.can_answer_now, Some(false));
+    }
+
+    #[test]
+    fn infer_intent_gate_does_not_force_tools_for_generic_capability_question() {
+        let d = infer_intent_gate("Can you help me write a tweet?", "");
+        assert!(
+            d.needs_tools.is_none(),
+            "expected needs_tools=None for generic capability question, got {:?}",
+            d.needs_tools
+        );
+    }
+
+    #[test]
+    fn classify_connected_api_intent_detects_runtime_validation() {
+        assert_eq!(
+            classify_connected_api_intent(
+                "Please check whether you're connected to GitHub before you answer."
+            ),
+            Some(ConnectedApiIntent::RuntimeCapabilityValidation)
+        );
+    }
+
+    #[test]
+    fn classify_connected_api_intent_detects_write_actions() {
+        assert_eq!(
+            classify_connected_api_intent("Create a GitHub issue for this regression."),
+            Some(ConnectedApiIntent::WriteAction)
+        );
+        assert_eq!(
+            classify_connected_api_intent("Post this update to LinkedIn."),
+            Some(ConnectedApiIntent::WriteAction)
+        );
+    }
+
+    #[test]
+    fn classify_connected_api_intent_detects_read_actions() {
+        assert_eq!(
+            classify_connected_api_intent("List my open GitHub issues."),
+            Some(ConnectedApiIntent::ReadAction)
+        );
+        assert_eq!(
+            classify_connected_api_intent("Check my calendar events for tomorrow."),
+            Some(ConnectedApiIntent::ReadAction)
+        );
+    }
+
+    #[test]
+    fn classify_connected_api_intent_avoids_local_or_implementation_prompts() {
+        assert_eq!(
+            classify_connected_api_intent("Can you rewrite this paragraph?"),
+            None
+        );
+        assert_eq!(
+            classify_connected_api_intent("Write a GitHub Actions workflow for this repo."),
+            None
+        );
+        assert_eq!(
+            classify_connected_api_intent("Read the GitHub Actions docs and summarize them."),
+            None
         );
     }
 }
