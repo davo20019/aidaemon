@@ -71,6 +71,9 @@ pub(in crate::agent) enum ToolResultNotice {
         tool_name: String,
         until_iteration: usize,
     },
+    ToolNotCurrentlyExposed {
+        tool_name: String,
+    },
     UnknownToolInvented {
         tool_name: String,
     },
@@ -292,6 +295,11 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
                      Do not call it yet; use a different approach first.",
                 tool_name, until_iteration
             ),
+            Self::ToolNotCurrentlyExposed { tool_name } => format!(
+                "[SYSTEM] '{}' exists, but it is not available in your current tool list for this turn. \
+                 Only call tools that are currently exposed. Do NOT guess or force hidden tool names.",
+                tool_name
+            ),
             Self::UnknownToolInvented { tool_name } => format!(
                 "[SYSTEM] '{}' is not a real tool. It does NOT exist. \
                  You MUST use one of the actual available tools or respond with text. \
@@ -418,5 +426,16 @@ mod tests {
             .render(),
             "[SYSTEM] Hard tool budget reached: 12 calls allowed per turn for this policy profile. This call to `web_search` was blocked. Synthesize and answer now."
         );
+    }
+
+    #[test]
+    fn tool_not_currently_exposed_render_mentions_current_tool_list() {
+        let rendered = ToolResultNotice::ToolNotCurrentlyExposed {
+            tool_name: "cli_agent".to_string(),
+        }
+        .render();
+        assert!(rendered.contains("'cli_agent' exists"));
+        assert!(rendered.contains("current tool list"));
+        assert!(rendered.contains("Do NOT guess or force hidden tool names"));
     }
 }

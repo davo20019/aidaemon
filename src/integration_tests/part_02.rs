@@ -355,6 +355,69 @@ async fn test_memory_failure_patterns_injected_into_prompt() {
     );
 }
 
+/// Failure patterns are operational and should still load outside private
+/// personal-memory contexts.
+#[tokio::test]
+async fn test_memory_failure_patterns_injected_into_public_prompt() {
+    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+
+    let pattern = BehaviorPattern {
+        id: 0,
+        pattern_type: "failure".to_string(),
+        description:
+            "After repeated web_search calls with no progress, switch tools or summarize the blocker earlier."
+                .to_string(),
+        trigger_context: Some("repetitive_call_detection:web_search".to_string()),
+        action: Some("pivot_to_alternate_tool_or_strategy".to_string()),
+        confidence: 0.82,
+        occurrence_count: 6,
+        last_seen_at: Some(Utc::now()),
+        created_at: Utc::now(),
+    };
+    harness
+        .state
+        .insert_behavior_pattern(&pattern)
+        .await
+        .unwrap();
+
+    harness
+        .agent
+        .handle_message(
+            "public_failure_pattern_session",
+            "help me debug this search workflow",
+            None,
+            UserRole::Owner,
+            ChannelContext {
+                visibility: ChannelVisibility::Public,
+                platform: "test".to_string(),
+                channel_name: Some("#eng".to_string()),
+                channel_id: Some("test:eng".to_string()),
+                sender_name: Some("Alice".to_string()),
+                sender_id: None,
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
+                trusted: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    let sys = call_log[0]
+        .messages
+        .iter()
+        .find(|m| m["role"] == "system")
+        .unwrap();
+    let content = sys["content"].as_str().unwrap();
+    assert!(
+        content.contains("Failure Patterns To Avoid")
+            && content.contains("repeated web_search calls"),
+        "Public-channel system prompt should still include operational failure patterns. Tail: ...{}",
+        &content[content.len().saturating_sub(800)..]
+    );
+}
+
 /// User profile: communication preferences affect the system prompt.
 #[tokio::test]
 async fn test_memory_user_profile_affects_prompt() {
@@ -752,4 +815,3 @@ async fn test_tool_schemas_gemini_compatible() {
 
     assert_no_schema(&json!(converted.unwrap()), "gemini_tools");
 }
-

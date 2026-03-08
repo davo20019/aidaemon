@@ -102,8 +102,8 @@ async fn test_orchestration_complex_creates_goal() {
         .await
         .unwrap();
     assert_eq!(goals.len(), 1, "Complex request should create a goal");
-    // Task leads are always-on, so the goal is completed after the task lead succeeds
-    assert_eq!(goals[0].status, "completed");
+    // Text-only task-lead replies must not auto-complete the goal without finished tasks.
+    assert_eq!(goals[0].status, "active");
     assert!(goals[0]
         .description
         .contains("Analyze the requirements"));

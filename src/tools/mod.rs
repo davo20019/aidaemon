@@ -3,6 +3,7 @@ pub mod browser;
 #[cfg(feature = "slack")]
 mod channel_history;
 mod cli_agent;
+pub(crate) mod command_semantics;
 mod config_manager;
 mod diagnose;
 mod goal_trace;
@@ -61,6 +62,7 @@ mod use_skill;
 mod manage_cli_agents;
 pub use manage_cli_agents::ManageCliAgentsTool;
 pub mod manage_goal_tasks;
+pub(crate) use manage_goal_tasks::goal_completion_summary_indicates_not_finished;
 pub use manage_goal_tasks::ManageGoalTasksTool;
 pub mod report_blocker;
 pub use manage_mcp::ManageMcpTool;

@@ -295,41 +295,78 @@ impl Agent {
 
         // Trim old conversation pairs to prevent context pollution.
         // Two modes:
-        // - New task (is_new_task): keep at most 1 old user-assistant pair
-        // - Follow-up (!is_new_task): keep at most 3 old user-assistant pairs
-        // Without this cap, old pairs accumulate and crowd out current-task tool calls,
-        // causing the model to lose track of its in-progress work.
-        let max_old_pairs: usize = if is_new_task { 1 } else { 3 };
+        // - New task (is_new_task): keep only the immediately prior user/assistant
+        //   turn as carryover, plus identity-critical snippets. This preserves
+        //   short clarifications even when follow-up classification misses.
+        // - Follow-up (!is_new_task): keep at most 3 old user-assistant pairs.
+        // Without this isolation, prior user/assistant turns leak into unrelated
+        // tasks in the same chat session and the model "answers across tasks".
         let deduped_msgs: Vec<&Message> = if let Some(boundary) = collapse_boundary {
-            // Find all user positions before boundary
-            let old_user_positions: Vec<usize> = deduped_msgs
-                .iter()
-                .enumerate()
-                .filter(|(i, m)| *i < boundary && m.role == "user")
-                .map(|(i, _)| i)
-                .collect();
-            // Keep at most `max_old_pairs` old user-assistant pairs
-            let keep_from = if old_user_positions.len() > max_old_pairs {
-                old_user_positions[old_user_positions.len() - max_old_pairs]
+            if is_new_task {
+                let mut carryover_indices = std::collections::HashSet::new();
+                if let Some(previous_user_idx) = deduped_msgs[..boundary]
+                    .iter()
+                    .rposition(|m| m.role == "user")
+                {
+                    carryover_indices.insert(previous_user_idx);
+                    for (idx, message) in deduped_msgs
+                        .iter()
+                        .enumerate()
+                        .take(boundary)
+                        .skip(previous_user_idx + 1)
+                    {
+                        if message.role == "assistant" {
+                            carryover_indices.insert(idx);
+                        }
+                    }
+                }
+                let trimmed: Vec<&Message> = deduped_msgs
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        *i >= boundary
+                            || identity_preserve_indices.contains(i)
+                            || carryover_indices.contains(i)
+                    })
+                    .map(|(_, m)| m)
+                    .collect();
+                if trimmed.len() < pre_collapse_len {
+                    info!(
+                        session_id,
+                        old_messages_trimmed = pre_collapse_len - trimmed.len(),
+                        "Dropped stale pre-boundary conversation for new task"
+                    );
+                }
+                trimmed
             } else {
-                0
-            };
-            let trimmed: Vec<&Message> = deduped_msgs
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _m)| *i >= keep_from)
-                .map(|(_, m)| m)
-                .collect();
-            if trimmed.len() < pre_collapse_len {
-                info!(
-                    session_id,
-                    old_pairs_trimmed = pre_collapse_len - trimmed.len(),
-                    max_old_pairs,
-                    is_new_task,
-                    "Trimmed old conversation pairs to protect current-task context"
-                );
+                let max_old_pairs = 3usize;
+                let old_user_positions: Vec<usize> = deduped_msgs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, m)| *i < boundary && m.role == "user")
+                    .map(|(i, _)| i)
+                    .collect();
+                let keep_from = if old_user_positions.len() > max_old_pairs {
+                    old_user_positions[old_user_positions.len() - max_old_pairs]
+                } else {
+                    0
+                };
+                let trimmed: Vec<&Message> = deduped_msgs
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i >= keep_from)
+                    .map(|(_, m)| m)
+                    .collect();
+                if trimmed.len() < pre_collapse_len {
+                    info!(
+                        session_id,
+                        old_pairs_trimmed = pre_collapse_len - trimmed.len(),
+                        max_old_pairs,
+                        "Trimmed old conversation pairs to protect current-task context"
+                    );
+                }
+                trimmed
             }
-            trimmed
         } else {
             deduped_msgs
         };
@@ -380,15 +417,12 @@ impl Agent {
                 .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"))
         {
             // Find the immediately-prior assistant message (right before boundary).
-            // Exempt it from truncation ONLY for follow-up messages in the same task.
-            let prior_assistant_id: Option<&str> = if is_new_task {
-                None // new task: truncate all old assistants including handoff
-            } else {
-                (0..boundary)
-                    .rev()
-                    .find(|&i| deduped_msgs[i].role == "assistant")
-                    .map(|i| deduped_msgs[i].id.as_str())
-            };
+            // Always exempt it from truncation: it is the single highest-value
+            // carryover message when the user sends a terse follow-up like "why?".
+            let prior_assistant_id: Option<&str> = (0..boundary)
+                .rev()
+                .find(|&i| deduped_msgs[i].role == "assistant")
+                .map(|i| deduped_msgs[i].id.as_str());
 
             deduped_msgs
                 .iter()
@@ -876,6 +910,22 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
+    fn msg(role: &str, content: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: "test-session".to_string(),
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.5,
+            ..Message::runtime_defaults()
+        }
+    }
 
     #[test]
     fn empty_retry_preserves_parent_pair_and_current_user() {
@@ -899,5 +949,101 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0]["role"], "user");
         assert_eq!(recovered[0]["content"].as_str(), Some("help"));
+    }
+
+    #[tokio::test]
+    async fn new_task_message_build_keeps_only_immediately_prior_turn() {
+        use crate::execution_policy::PolicyBundle;
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{ConversationSummary, MessageStore};
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .state
+            .append_message(&msg("user", "Older task"))
+            .await
+            .expect("append oldest user");
+        harness
+            .state
+            .append_message(&msg("assistant", "Older answer"))
+            .await
+            .expect("append oldest assistant");
+        harness
+            .state
+            .append_message(&msg(
+                "user",
+                "Please work in ~/projects/blog.aidaemon.ai/src/content/posts",
+            ))
+            .await
+            .expect("append prior user");
+        harness
+            .state
+            .append_message(&msg("assistant", "Which posts should I update?"))
+            .await
+            .expect("append prior assistant");
+        harness
+            .state
+            .append_message(&msg("user", "Why?"))
+            .await
+            .expect("append current user");
+
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let pinned_memories: Vec<Message> = Vec::new();
+        let tool_defs: Vec<Value> = Vec::new();
+        let session_summary: Option<ConversationSummary> = None;
+        let mut pending_system_messages = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+
+        let mut ctx = MessageBuildCtx {
+            session_id: "test-session",
+            iteration: 1,
+            user_text: "Why?",
+            model: "mock-model",
+            system_prompt: "You are a helpful test assistant.",
+            consultant_pass_active: false,
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            session_summary: &session_summary,
+            pending_system_messages: &mut pending_system_messages,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+            is_new_task: true,
+        };
+
+        let built = harness
+            .agent
+            .run_message_build_phase(&mut ctx)
+            .await
+            .expect("message build");
+        let serialized = serde_json::to_string(&built.messages).expect("serialize messages");
+
+        assert!(
+            serialized.contains("blog.aidaemon.ai"),
+            "new-task prompt should retain the immediately prior user turn: {}",
+            serialized
+        );
+        assert!(
+            serialized.contains("Which posts should I update?"),
+            "new-task prompt should retain the immediately prior assistant turn: {}",
+            serialized
+        );
+        assert!(
+            !serialized.contains("Older task"),
+            "new-task prompt should drop older pre-boundary turns: {}",
+            serialized
+        );
+        assert!(
+            !serialized.contains("Older answer"),
+            "new-task prompt should drop older pre-boundary assistant turns: {}",
+            serialized
+        );
+        assert!(
+            serialized.contains("Why?"),
+            "current user message should remain present: {}",
+            serialized
+        );
     }
 }

@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 
-use crate::traits::{Tool, ToolCapabilities};
+use crate::traits::{
+    Tool, ToolCallSemantics, ToolCapabilities, ToolTargetHintKind, ToolVerificationMode,
+};
 
 const DEFAULT_MAX_CHARS: usize = 20_000;
 const MAX_MAX_CHARS: usize = 50_000;
@@ -278,6 +280,21 @@ impl Tool for WebFetchTool {
             idempotent: true,
             high_impact_write: false,
         }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let url = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                args.get("url")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+
+        ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent)
+            .with_target_hint(ToolTargetHintKind::Url, url)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

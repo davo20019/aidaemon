@@ -11,7 +11,9 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
 use crate::config::BrowserConfig;
-use crate::traits::{Tool, ToolCapabilities};
+use crate::traits::{
+    Tool, ToolCallSemantics, ToolCapabilities, ToolTargetHintKind, ToolVerificationMode,
+};
 use crate::types::{MediaKind, MediaMessage};
 
 pub struct BrowserTool {
@@ -514,16 +516,6 @@ impl Tool for BrowserTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
 
@@ -560,6 +552,44 @@ impl Tool for BrowserTool {
                 warn!(action, error = %err_text, "Browser action failed");
                 Ok(format!("Error: {}", err_text))
             }
+        }
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let action = args
+            .as_ref()
+            .and_then(|value| value.get("action"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_ascii_lowercase());
+        let url = args
+            .as_ref()
+            .and_then(|value| value.get("url"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        match action.as_deref() {
+            Some("navigate") => {
+                ToolCallSemantics::observation().with_target_hint(ToolTargetHintKind::Url, url)
+            }
+            Some("get_text") => ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent),
+            Some("wait") => ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent),
+            Some("screenshot") => ToolCallSemantics::observation(),
+            Some("click" | "fill" | "execute_js") => ToolCallSemantics::mutation(),
+            Some("close" | "set_mode") => ToolCallSemantics::administrative(),
+            _ => ToolCallSemantics::mutation(),
         }
     }
 }

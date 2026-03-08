@@ -47,6 +47,9 @@ pub(in crate::agent) enum SystemDirective {
         dir: String,
     },
     ContradictoryFileEvidenceRecheckRequired,
+    CompletionVerificationRequired {
+        target_hint: Option<String>,
+    },
     DeferredToolCallRequired,
     DeferredProvideConcreteResults,
     RecoveryModeModelSwitch,
@@ -171,6 +174,17 @@ impl SystemDirective {
                 dir
             ),
             Self::ContradictoryFileEvidenceRecheckRequired => "[SYSTEM] Contradictory file evidence was detected (one tool found files while another reported no matches). Before answering, you MUST run at least one file re-check tool with an explicit path (e.g. search_files or project_inspect with path).".to_string(),
+            Self::CompletionVerificationRequired { target_hint } => {
+                let target = target_hint
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!(" against {}", value))
+                    .unwrap_or_default();
+                format!(
+                    "[SYSTEM] You have not yet verified the requested outcome{}. Before answering, run a read-only verification step that checks the actual result. If you changed something, re-check after the change. Do NOT claim success until that verification is done.",
+                    target
+                )
+            }
             Self::DeferredToolCallRequired => "[SYSTEM] HARD REQUIREMENT: your next reply MUST include at least one tool call. Do NOT return planning text like \"I'll do X\". Text-only replies are invalid for this request.".to_string(),
             Self::DeferredProvideConcreteResults => "[SYSTEM] You narrated future work instead of providing results. Execute any remaining required tools, or return concrete outcomes and blockers now.".to_string(),
             Self::RecoveryModeModelSwitch => "[SYSTEM] Recovery mode: a model switch was applied because prior replies kept promising actions without tool calls. Call the required tools now and return concrete results.".to_string(),

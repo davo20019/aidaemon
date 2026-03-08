@@ -308,7 +308,7 @@ impl Agent {
             match condition {
                 StoppingCondition::HardIterationCap { cap, .. } => {
                     warn!(session_id, iteration, cap, "Hard iteration cap reached");
-                    self.emit_decision_point(
+                    self.emit_warning_decision_point(
                         emitter,
                         task_id,
                         iteration,
@@ -351,7 +351,7 @@ impl Agent {
                 } => {
                     let elapsed = Duration::from_secs(elapsed_secs);
                     warn!(session_id, elapsed_secs, "Task timeout reached");
-                    self.emit_decision_point(
+                    self.emit_warning_decision_point(
                         emitter,
                         task_id,
                         iteration,
@@ -438,6 +438,20 @@ impl Agent {
                     pct,
                     task_anchor,
                 });
+                self.emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::StoppingCondition,
+                    "Task token budget warning threshold reached".to_string(),
+                    json!({
+                        "condition":"task_token_budget_warning",
+                        "budget": budget,
+                        "task_tokens_used": task_tokens_used,
+                        "pct": pct
+                    }),
+                )
+                .await;
             }
 
             if budget > 0 && task_tokens_used >= budget {
@@ -550,7 +564,7 @@ impl Agent {
                     budget,
                     "Task token budget exhausted"
                 );
-                self.emit_decision_point(
+                self.emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -649,7 +663,7 @@ impl Agent {
                             budget_per_check,
                             "Scheduled run budget exhausted"
                         );
-                        self.emit_decision_point(
+                        self.emit_warning_decision_point(
                             emitter,
                             task_id,
                             iteration,
@@ -757,7 +771,7 @@ impl Agent {
                                     budget_daily,
                                     "Goal daily token budget exhausted"
                                 );
-                                self.emit_decision_point(
+                                self.emit_warning_decision_point(
                                     emitter,
                                     task_id,
                                     iteration,
@@ -886,7 +900,7 @@ impl Agent {
                         return Ok(StoppingPhaseOutcome::ContinueLoop);
                     }
 
-                    self.emit_decision_point(
+                    self.emit_warning_decision_point(
                         emitter,
                         task_id,
                         iteration,
@@ -959,7 +973,7 @@ impl Agent {
                 session_id,
                 decision_streak, "Pre-tool deferral threshold reached"
             );
-            self.emit_decision_point(
+            self.emit_warning_decision_point(
                 emitter,
                 task_id,
                 iteration,
@@ -1015,7 +1029,7 @@ impl Agent {
             let stall_mode = mode.as_code();
             if !successful_send_file_keys.is_empty() && learning_ctx.errors.is_empty() {
                 let reply = Self::send_file_completion_reply().to_string();
-                self.emit_decision_point(
+                self.emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -1084,7 +1098,7 @@ impl Agent {
                     unrecovered_errors,
                     "Agent stalled after meaningful progress"
                 );
-                self.emit_decision_point(
+                self.emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -1199,7 +1213,7 @@ impl Agent {
                     .await
                 {
                     let reply = format!("Done. Here is the output:\n\n{}", tool_output);
-                    self.emit_decision_point(
+                    self.emit_warning_decision_point(
                         emitter,
                         task_id,
                         iteration,
@@ -1257,7 +1271,7 @@ impl Agent {
                 session_id,
                 detected_stall_count, "Agent stalled - no progress detected"
             );
-            self.emit_decision_point(
+            self.emit_warning_decision_point(
                 emitter,
                 task_id,
                 iteration,
@@ -1352,7 +1366,7 @@ impl Agent {
         if let (Some(threshold), Some(warn_at)) = (soft_threshold, soft_warn_at) {
             if iteration >= warn_at && !soft_limit_warned {
                 soft_limit_warned = true;
-                self.emit_decision_point(
+                self.emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,

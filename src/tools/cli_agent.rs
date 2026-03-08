@@ -2177,41 +2177,53 @@ struct CliAgentArgs {
     /// Injected by agent - goal context for routing async/timeout notifications.
     #[serde(default)]
     _goal_id: Option<String>,
+    /// Injected by agent - current task context for delegated task recovery.
+    #[serde(default)]
+    _task_id: Option<String>,
     /// Injected by agent for role-aware safeguards.
     #[serde(default)]
     _user_role: Option<String>,
 }
 
+fn non_empty_prompt_field(value: Option<&str>) -> Option<String> {
+    let trimmed = value?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn compose_delegated_prompt(mission: Option<String>, task: Option<String>) -> Option<String> {
+    if mission.is_none() && task.is_none() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if let Some(mission) = mission {
+        parts.push(format!("Mission: {}", mission));
+    }
+    if let Some(task) = task {
+        parts.push(format!("Task: {}", task));
+    }
+    Some(parts.join("\n"))
+}
+
 impl CliAgentArgs {
     fn run_prompt(&self) -> Option<String> {
-        fn non_empty(value: Option<&str>) -> Option<String> {
-            let trimmed = value?.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-
-        if let Some(prompt) = non_empty(self.prompt.as_deref()) {
+        if let Some(prompt) = non_empty_prompt_field(self.prompt.as_deref()) {
             return Some(prompt);
         }
 
-        let mission = non_empty(self.mission.as_deref());
-        let task = non_empty(self.task.as_deref());
-        if mission.is_some() || task.is_some() {
-            let mut parts = Vec::new();
-            if let Some(mission) = mission {
-                parts.push(format!("Mission: {}", mission));
-            }
-            if let Some(task) = task {
-                parts.push(format!("Task: {}", task));
-            }
-            return Some(parts.join("\n"));
+        if let Some(prompt) = compose_delegated_prompt(
+            non_empty_prompt_field(self.mission.as_deref()),
+            non_empty_prompt_field(self.task.as_deref()),
+        ) {
+            return Some(prompt);
         }
 
-        let description = non_empty(self.description.as_deref());
-        let command = non_empty(self.command.as_deref());
+        let description = non_empty_prompt_field(self.description.as_deref());
+        let command = non_empty_prompt_field(self.command.as_deref());
         if description.is_some() || command.is_some() {
             let mut parts = Vec::new();
             if let Some(description) = description {
@@ -2227,6 +2239,34 @@ impl CliAgentArgs {
         }
 
         None
+    }
+
+    async fn contextual_run_prompt(&self, state: &Arc<dyn StateStore>) -> Option<String> {
+        let delegated_task = match self._task_id.as_deref() {
+            Some(task_id) if !task_id.trim().is_empty() => {
+                state.get_task(task_id).await.ok().flatten()
+            }
+            _ => None,
+        };
+        let delegated_goal_id = self
+            ._goal_id
+            .clone()
+            .or_else(|| delegated_task.as_ref().map(|task| task.goal_id.clone()));
+        let delegated_goal = match delegated_goal_id.as_deref() {
+            Some(goal_id) if !goal_id.trim().is_empty() => {
+                state.get_goal(goal_id).await.ok().flatten()
+            }
+            _ => None,
+        };
+
+        compose_delegated_prompt(
+            delegated_goal
+                .as_ref()
+                .and_then(|goal| non_empty_prompt_field(Some(goal.description.as_str()))),
+            delegated_task
+                .as_ref()
+                .and_then(|task| non_empty_prompt_field(Some(task.description.as_str()))),
+        )
     }
 }
 
@@ -2554,33 +2594,16 @@ impl Tool for CliAgentTool {
     }
 
     fn schema(&self) -> Value {
-        // Read from RwLock (sync) — this is fine because std::sync::RwLock doesn't need .await
-        let tools = self.tools.read().unwrap();
         let tool_names = self.tool_names.read().unwrap();
 
-        let tool_descriptions: Vec<String> = tool_names
-            .iter()
-            .filter_map(|name| {
-                tools.get(name).map(|entry| {
-                    if entry.description.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{} — {}", name, entry.description)
-                    }
-                })
-            })
-            .collect();
-
-        let tools_help = tool_descriptions.join(", ");
+        let tools_help = tool_names.join(", ");
         let names_vec: Vec<Value> = tool_names.iter().map(|n| json!(n)).collect();
 
         json!({
             "name": "cli_agent",
             "description": format!(
-                "Delegate a task to a CLI-based AI coding agent. Available agents: {}. \
-                 These are full AI agents that can read/write files, run commands, and solve complex coding tasks. \
-                 Use this for substantial coding work, refactoring, debugging, or any task that benefits from a \
-                 specialized AI coding tool. Do NOT use this for scheduling goals or manipulating aidaemon's internal SQLite/SQLCipher database; use the manage_memories tool instead. Long-running tasks move to background and can be checked/cancelled.",
+                "Delegate substantial coding work to an installed CLI agent. Available agents: {}. \
+                 Use manage_memories for scheduling, not this tool. Long tasks can run in background and be checked or cancelled.",
                 tools_help
             ),
             "parameters": {
@@ -2589,32 +2612,32 @@ impl Tool for CliAgentTool {
                     "action": {
                         "type": "string",
                         "enum": ["run", "check", "cancel", "list"],
-                        "description": "Action to perform: \"run\" (default) starts a CLI agent, \"check\" shows output of a background task, \"cancel\" stops a background task, \"list\" shows all running tasks"
+                        "description": "run, check, cancel, or list"
                     },
                     "tool": {
                         "type": "string",
                         "enum": names_vec,
-                        "description": "Which CLI agent to use. Optional for action=run: if omitted, a default installed agent is selected automatically (priority: claude, gemini, codex, copilot, aider)."
+                        "description": "CLI agent name; optional for run"
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "The task or prompt to send to the CLI agent. Be specific and detailed."
+                        "description": "Task for the CLI agent"
                     },
                     "working_dir": {
                         "type": "string",
-                        "description": "Working directory for the CLI agent (absolute path). IMPORTANT: Always specify this — omitting it disables directory conflict detection and task deduplication, risking two agents clobbering the same files."
+                        "description": "Absolute working directory; strongly recommended for conflict detection"
                     },
                     "task_id": {
                         "type": "string",
-                        "description": "Task ID for check/cancel actions (returned when a task moves to background)"
+                        "description": "Task ID for check/cancel"
                     },
                     "system_instruction": {
                         "type": "string",
-                        "description": "Optional expert instruction to shape the CLI agent into a specialist (e.g. 'You are a security auditor'). When provided, the prompt is enriched with conversation context and relevant facts."
+                        "description": "Optional specialist instruction"
                     },
                     "async_mode": {
                         "type": "boolean",
-                        "description": "If true, starts the task in background immediately and returns a task_id. Use for parallel dispatch of multiple CLI agents."
+                        "description": "Start in background immediately"
                     }
                 },
                 "required": ["action"],
@@ -2700,9 +2723,32 @@ impl Tool for CliAgentTool {
                     .clone()
                     .or_else(|| self.default_tool_name())
                     .ok_or_else(|| anyhow::anyhow!("No CLI agents available for action=run"))?;
-                let prompt = args
-                    .run_prompt()
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter for action=run"))?;
+                let prompt = if let Some(prompt) = args.run_prompt() {
+                    prompt
+                } else if let Some(prompt) = args.contextual_run_prompt(&self.state).await {
+                    warn!(
+                        task_id = ?args._task_id,
+                        goal_id = ?args._goal_id,
+                        working_dir = ?args.working_dir,
+                        "cli_agent run omitted prompt; synthesized delegated prompt from stored task/goal context"
+                    );
+                    prompt
+                } else {
+                    warn!(
+                        task_id = ?args._task_id,
+                        goal_id = ?args._goal_id,
+                        has_prompt = args.prompt.as_ref().is_some_and(|s| !s.trim().is_empty()),
+                        has_mission = args.mission.as_ref().is_some_and(|s| !s.trim().is_empty()),
+                        has_task = args.task.as_ref().is_some_and(|s| !s.trim().is_empty()),
+                        has_description = args
+                            .description
+                            .as_ref()
+                            .is_some_and(|s| !s.trim().is_empty()),
+                        has_command = args.command.as_ref().is_some_and(|s| !s.trim().is_empty()),
+                        "cli_agent run missing prompt and had no recoverable delegated context"
+                    );
+                    anyhow::bail!("Missing 'prompt' parameter for action=run");
+                };
 
                 let mut daemon_hits = detect_daemonization_primitives(&prompt);
                 if let Some(system_instruction) = args.system_instruction.as_deref() {
@@ -2802,6 +2848,7 @@ mod tests {
     use crate::testing::MockProvider;
     use crate::traits::store_prelude::*;
     use crate::traits::Tool;
+    use crate::traits::{Goal, Task};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -3476,6 +3523,62 @@ mod tests {
         assert!(
             result.contains("Task: Open Gmail and summarize the inbox"),
             "Expected synthesized task in output, got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_recovers_prompt_from_task_and_goal_context() {
+        let (tool, _db) = setup_echo_tool().await;
+        let goal = Goal::new_finite(
+            "Review the latest aidaemon service logs and make the smallest safe fix",
+            "sess-ctx",
+        );
+        tool.state.create_goal(&goal).await.unwrap();
+
+        let task = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description:
+                "Inspect the recent log failures and patch the root cause in /Users/davidloor/projects/aidaemon"
+                    .to_string(),
+            status: "claimed".to_string(),
+            priority: "high".to_string(),
+            task_order: 1,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: Some("task-lead".to_string()),
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        tool.state.create_task(&task).await.unwrap();
+
+        let result = tool
+            .call(&format!(
+                r#"{{"action":"run","tool":"echo","working_dir":"/Users/davidloor/projects/aidaemon","_goal_id":"{}","_task_id":"{}"}}"#,
+                goal.id, task.id
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            result.contains(
+                "Mission: Review the latest aidaemon service logs and make the smallest safe fix"
+            ),
+            "Expected synthesized mission from goal context, got: {}",
+            result
+        );
+        assert!(
+            result.contains("Task: Inspect the recent log failures and patch the root cause in /Users/davidloor/projects/aidaemon"),
+            "Expected synthesized task from task context, got: {}",
             result
         );
     }

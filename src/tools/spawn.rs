@@ -249,6 +249,31 @@ struct SpawnArgs {
     /// Goal ID injected by execute_tool for task-lead → executor spawning.
     #[serde(default)]
     _goal_id: Option<String>,
+    /// Explicit trust flag injected by execute_tool for trusted scheduled runs.
+    #[serde(default)]
+    _trusted_session: Option<bool>,
+    /// Parent project scope injected by execute_tool for child scope inheritance.
+    #[serde(default)]
+    _project_scope: Option<String>,
+}
+
+fn build_child_channel_context(args: &SpawnArgs) -> ChannelContext {
+    let visibility = args
+        ._channel_visibility
+        .as_deref()
+        .map(ChannelVisibility::from_str_lossy)
+        .unwrap_or(ChannelVisibility::Internal);
+    ChannelContext {
+        visibility,
+        platform: "internal".to_string(),
+        channel_name: None,
+        channel_id: None,
+        sender_name: None,
+        sender_id: None,
+        channel_member_names: vec![],
+        user_id_map: std::collections::HashMap::new(),
+        trusted: args._trusted_session.unwrap_or(false),
+    }
 }
 
 #[async_trait]
@@ -329,25 +354,8 @@ impl Tool for SpawnAgentTool {
             "spawn_agent tool invoked"
         );
 
-        // Reconstruct channel context from injected visibility string
-        let channel_ctx = {
-            let visibility = args
-                ._channel_visibility
-                .as_deref()
-                .map(ChannelVisibility::from_str_lossy)
-                .unwrap_or(ChannelVisibility::Internal);
-            ChannelContext {
-                visibility,
-                platform: "internal".to_string(),
-                channel_name: None,
-                channel_id: None,
-                sender_name: None,
-                sender_id: None,
-                channel_member_names: vec![],
-                user_id_map: std::collections::HashMap::new(),
-                trusted: false,
-            }
-        };
+        // Preserve execution context that was injected by the parent agent.
+        let channel_ctx = build_child_channel_context(&args);
 
         // Propagate parent's user role to prevent privilege escalation.
         // Default to Guest (least privilege) if not provided.
@@ -440,6 +448,7 @@ impl Tool for SpawnAgentTool {
                     child_role,
                     goal_id_ref.as_deref(),
                     task_id_ref.as_deref(),
+                    args._project_scope.as_deref(),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -466,6 +475,7 @@ impl Tool for SpawnAgentTool {
                     child_role,
                     goal_id_ref.as_deref(),
                     task_id_ref.as_deref(),
+                    args._project_scope.as_deref(),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -488,6 +498,7 @@ impl Tool for SpawnAgentTool {
                         child_role,
                         goal_id_ref.as_deref(),
                         task_id_ref.as_deref(),
+                        args._project_scope.as_deref(),
                     )
                     .await;
                 if let Some(ref task_id) = executor_task_id {
@@ -523,6 +534,7 @@ impl Tool for SpawnAgentTool {
                     child_role,
                     goal_id_ref.as_deref(),
                     task_id_ref.as_deref(),
+                    args._project_scope.as_deref(),
                 ),
             ));
             let result = loop {
@@ -625,6 +637,7 @@ impl SpawnAgentTool {
         child_role: Option<AgentRole>,
         goal_id: Option<&str>,
         task_id: Option<&str>,
+        project_scope: Option<&str>,
     ) -> anyhow::Result<String> {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
         let result = tokio::time::timeout(
@@ -638,6 +651,7 @@ impl SpawnAgentTool {
                 child_role,
                 goal_id,
                 task_id,
+                project_scope,
             ),
         )
         .await;
@@ -757,6 +771,15 @@ mod tests {
         let json = r#"{"mission": "test", "task": "do stuff", "_channel_visibility": "public"}"#;
         let args: SpawnArgs = serde_json::from_str(json).unwrap();
         assert_eq!(args._channel_visibility.as_deref(), Some("public"));
+    }
+
+    #[test]
+    fn spawn_args_with_trusted_session() {
+        let json = r#"{"mission":"test","task":"do stuff","_trusted_session":true,"_channel_visibility":"internal"}"#;
+        let args: SpawnArgs = serde_json::from_str(json).unwrap();
+        let channel_ctx = build_child_channel_context(&args);
+        assert_eq!(channel_ctx.visibility, ChannelVisibility::Internal);
+        assert!(channel_ctx.trusted);
     }
 
     #[test]

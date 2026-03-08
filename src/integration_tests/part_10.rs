@@ -558,8 +558,8 @@ async fn test_old_interaction_assistant_content_truncated() {
 #[tokio::test]
 async fn test_old_short_assistant_response_preserved_unmodified() {
     let provider = MockProvider::with_responses(vec![
-        // Turn 1: short response about files
-        MockProvider::text_response("Here are 20 .rs files in the tools directory."),
+        // Turn 1: short direct answer
+        MockProvider::text_response("It is 4."),
         // Turn 2: different topic
         MockProvider::text_response("Rust 1.82.0"),
     ]);
@@ -571,7 +571,7 @@ async fn test_old_short_assistant_response_preserved_unmodified() {
         .agent
         .handle_message(
             "prior_turn_no_marker",
-            "List files in src/tools",
+            "What is 2 + 2?",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -604,7 +604,7 @@ async fn test_old_short_assistant_response_preserved_unmodified() {
             m.get("role").and_then(|r| r.as_str()) == Some("assistant")
                 && m.get("content")
                     .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.contains("files"))
+                    .is_some_and(|s| s == "It is 4.")
         })
         .collect();
 
@@ -623,7 +623,7 @@ async fn test_old_short_assistant_response_preserved_unmodified() {
         content
     );
     assert_eq!(
-        content, "Here are 20 .rs files in the tools directory.",
+        content, "It is 4.",
         "Short old assistant content should be preserved unmodified"
     );
 }

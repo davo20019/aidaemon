@@ -13,6 +13,7 @@ pub(super) struct ToolExecutionIoResult {
 pub(super) struct ToolExecutionIoCtx<'a> {
     pub effective_arguments: &'a str,
     pub injected_project_dir: Option<&'a str>,
+    pub project_scope: Option<&'a str>,
     pub session_id: &'a str,
     pub task_id: &'a str,
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
@@ -96,6 +97,7 @@ impl Agent {
                     status_tx: ctx.status_tx.clone(),
                     channel_visibility: ctx.channel_ctx.visibility,
                     channel_id: ctx.channel_ctx.channel_id.as_deref(),
+                    project_scope: ctx.project_scope,
                     trusted: ctx.channel_ctx.trusted,
                     user_role: ctx.user_role,
                 },
@@ -211,6 +213,7 @@ impl Agent {
             status_tx: ctx.status_tx.clone(),
             channel_visibility: ctx.channel_ctx.visibility,
             channel_id: ctx.channel_ctx.channel_id.as_deref(),
+            project_scope: ctx.project_scope,
             trusted: ctx.channel_ctx.trusted,
             user_role: ctx.user_role,
         };

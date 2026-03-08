@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
+use once_cell::sync::Lazy;
 use tokio::io::AsyncReadExt;
 
 use super::process_control::{configure_command_for_process_group, terminate_process_tree};
@@ -195,6 +198,54 @@ fn push_unique_search_root(roots: &mut Vec<PathBuf>, candidate: PathBuf) {
     }
 }
 
+const PROJECT_ROOT_CATALOG_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct CachedProjectRootCatalog {
+    scanned_at: std::time::Instant,
+    entries: Vec<(String, PathBuf)>,
+}
+
+static PROJECT_ROOT_CATALOG_CACHE: Lazy<Mutex<HashMap<PathBuf, CachedProjectRootCatalog>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn project_root_directory_entries(root: &Path) -> Vec<(String, PathBuf)> {
+    if let Ok(cache) = PROJECT_ROOT_CATALOG_CACHE.lock() {
+        if let Some(cached) = cache.get(root) {
+            if cached.scanned_at.elapsed() <= PROJECT_ROOT_CATALOG_TTL {
+                return cached.entries.clone();
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    let Ok(dir_entries) = std::fs::read_dir(root) else {
+        return entries;
+    };
+    for entry in dir_entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        entries.push((
+            entry.file_name().to_string_lossy().to_ascii_lowercase(),
+            path,
+        ));
+    }
+
+    if let Ok(mut cache) = PROJECT_ROOT_CATALOG_CACHE.lock() {
+        cache.insert(
+            root.to_path_buf(),
+            CachedProjectRootCatalog {
+                scanned_at: std::time::Instant::now(),
+                entries: entries.clone(),
+            },
+        );
+    }
+
+    entries
+}
+
 pub fn project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for raw_root in alias_roots {
@@ -296,15 +347,7 @@ pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Opt
             }
         }
 
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        for (name, path) in project_root_directory_entries(&root) {
             if name != target {
                 continue;
             }
@@ -314,6 +357,59 @@ pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Opt
         }
     }
     None
+}
+
+pub fn resolve_contextual_project_nickname(
+    raw_name: &str,
+    alias_roots: &[String],
+) -> Option<PathBuf> {
+    let token = raw_name
+        .trim_matches(|c: char| c.is_ascii_whitespace() || c == '`' || c == '\'' || c == '"')
+        .trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'))
+        .trim_end_matches(['.', '!', '?'])
+        .trim()
+        .to_ascii_lowercase();
+    if token.len() < 3
+        || token.contains("://")
+        || token.contains('/')
+        || token.contains('\\')
+        || !token.chars().any(|c| c.is_ascii_alphabetic())
+        || token.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let mut matches = Vec::new();
+    let dotted = format!("{token}.");
+    let dashed = format!("{token}-");
+    let underscored = format!("{token}_");
+    for root in project_search_roots(alias_roots) {
+        for (name, path) in project_root_directory_entries(&root) {
+            if name != token
+                && !name.starts_with(&dotted)
+                && !name.starts_with(&dashed)
+                && !name.starts_with(&underscored)
+            {
+                continue;
+            }
+            let Ok(normalized) = normalize_project_scope_path(path.to_string_lossy().as_ref())
+            else {
+                continue;
+            };
+            if find_nearest_project_root(&normalized).is_none_or(|root| root != normalized) {
+                continue;
+            }
+            if !matches.iter().any(|existing| existing == &normalized) {
+                matches.push(normalized);
+            }
+        }
+    }
+
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
 }
 
 pub fn resolve_project_scope_reference(raw: &str, alias_roots: &[String]) -> Option<PathBuf> {

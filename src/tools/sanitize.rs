@@ -51,7 +51,7 @@ static INVISIBLE_CHARS: Lazy<Regex> = Lazy::new(|| {
 /// they appear in otherwise trusted terminal output.
 static INTERNAL_CONTROL_MARKERS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)\[(?:SYSTEM|DIAGNOSTIC|TOOL STATS|UNTRUSTED)\]").unwrap(),
+        Regex::new(r"(?i)\[(?:SYSTEM|DIAGNOSTIC|TOOL STATS|UNTRUSTED)(?::[^\]]*)?\]").unwrap(),
         Regex::new(r"(?i)\[UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
         Regex::new(r"(?i)\[END UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
     ]
@@ -68,8 +68,9 @@ static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"(?m)\[DIAGNOSTIC\][^\n]*(?:\n(?:[ \t]|-)[^\n]*)*").unwrap(),
         // [TOOL STATS] ... plus indented sub-lines (e.g. "  - 2x: ...")
         Regex::new(r"(?m)\[TOOL STATS\][^\n]*(?:\n[ \t]+[^\n]*)*").unwrap(),
-        // [SYSTEM] ... single line (no continuation)
-        Regex::new(r"(?m)\[SYSTEM\][^\n]*").unwrap(),
+        // [SYSTEM] ... single line (no continuation), including inline payloads
+        // such as "[SYSTEM: already scheduled and firing now; do not reschedule.]".
+        Regex::new(r"(?m)\[SYSTEM(?::[^\]]*)?\][^\n]*").unwrap(),
         // [UNTRUSTED EXTERNAL DATA ...] block through [END UNTRUSTED ...]
         Regex::new(
             r"(?si)\[UNTRUSTED EXTERNAL DATA[^\]]*\].*?\[END UNTRUSTED EXTERNAL DATA\][^\n]*",
@@ -96,6 +97,11 @@ static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         // "<arg_value>/tmp/bank/bank.py</arg_value>").
         // Leaked when force-text mode strips tools and the LLM emits raw argument markup.
         Regex::new(r"(?m)^[^\S\n]*</?arg_(?:key|value)>[^\n]*$").unwrap(),
+        // XML-style function call blocks used by some models/providers:
+        // <function_calls> ... <invoke name="terminal"> ... </function_calls>
+        Regex::new(r"(?si)<function_calls>\s*.*?</function_calls>").unwrap(),
+        Regex::new(r"(?m)^[^\S\n]*</?(?:function_calls|invoke)\b[^>]*>[^\n]*$").unwrap(),
+        Regex::new(r"(?m)^[^\S\n]*<parameter\b[^>]*>.*?</parameter>[^\n]*$").unwrap(),
         // Raw function call markers (e.g. "functions.terminal:0 {...}").
         // Whole-line and inline variants.
         Regex::new(r"(?m)^[^\S\n]*functions\.\w+:\d+[^\n]*$").unwrap(),
@@ -241,6 +247,19 @@ pub fn strip_diagnostic_blocks(content: &str) -> String {
     static EXCESS_NEWLINES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
     result = EXCESS_NEWLINES.replace_all(&result, "\n\n").to_string();
     result.trim().to_string()
+}
+
+/// Sanitize text before it is shown to end users.
+pub fn sanitize_user_facing_reply(reply: &str) -> String {
+    let prior_turn_cleaned = reply
+        .replace(" [prior turn, truncated]", "")
+        .replace(" [prior turn]", "")
+        .replace("[prior turn, truncated]", "")
+        .replace("[prior turn]", "");
+    let blocks_cleaned = strip_diagnostic_blocks(&prior_turn_cleaned);
+    let control_cleaned = strip_internal_control_markers(&blocks_cleaned);
+    let identity_cleaned = strip_model_identity_leaks(&control_cleaned);
+    strip_tool_name_references(&identity_cleaned)
 }
 
 /// Split text into segments of (text, is_code_block).
@@ -579,6 +598,15 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_internal_control_markers_with_inline_payload() {
+        let input =
+            "Working on [SYSTEM: already scheduled and firing now; do not reschedule.] next";
+        let result = strip_internal_control_markers(input);
+        assert!(!result.contains("[SYSTEM:"));
+        assert_eq!(result, "Working on  next");
+    }
+
+    #[test]
     fn test_strip_internal_control_markers_preserves_normal_brackets() {
         let input = "[INFO] regular bracket tag";
         let result = strip_internal_control_markers(input);
@@ -821,6 +849,18 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_system_block_with_inline_payload() {
+        let input =
+            "Working on: Post tweet [SYSTEM: already scheduled and firing now; do not reschedule.]";
+        let result = strip_diagnostic_blocks(input);
+        assert!(
+            !result.contains("[SYSTEM:"),
+            "SYSTEM payload leaked: {result}"
+        );
+        assert_eq!(result, "Working on: Post tweet");
+    }
+
+    #[test]
     fn test_strip_diagnostic_blocks_preserves_normal_text() {
         let input = "Here is the answer to your question: 42.";
         let result = strip_diagnostic_blocks(input);
@@ -922,6 +962,18 @@ mod tests {
             result2.contains("Let me fix this."),
             "surrounding text preserved"
         );
+    }
+
+    #[test]
+    fn test_strip_xml_style_function_call_block() {
+        let input = "I'll read the most recent 300 lines from that log file.\n\n<function_calls>\n<invoke name=\"terminal\">\n<parameter name=\"command\">tail -n 300 ~/Library/Logs/aidaemon/stdout.log</parameter>\n</invoke>\n</function_calls>\n\nHere's what I found.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(!result.contains("<function_calls>"));
+        assert!(!result.contains("<invoke"));
+        assert!(!result.contains("<parameter"));
+        assert!(!result.contains("tail -n 300"));
+        assert!(result.contains("I'll read the most recent 300 lines"));
+        assert!(result.contains("Here's what I found."));
     }
 
     #[test]

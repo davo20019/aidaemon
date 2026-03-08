@@ -140,6 +140,10 @@ impl Agent {
             .any(|tool| tool.name() == tool_name && tool.is_available())
     }
 
+    pub(super) fn has_registered_tool(&self, tool_name: &str) -> bool {
+        self.tools.iter().any(|tool| tool.name() == tool_name)
+    }
+
     pub(super) fn has_cli_agents_available(&self) -> bool {
         self.has_available_tool("cli_agent")
     }
@@ -242,11 +246,18 @@ impl Agent {
             "manage_oauth",
             "send_file",
         ];
+        let role_required_tools: &[&str] = match self.role() {
+            // Task leads must retain their delegation surface after policy pruning.
+            AgentRole::TaskLead => &["spawn_agent", "cli_agent", "manage_goal_tasks"],
+            _ => &[],
+        };
+        let is_policy_essential =
+            |name: &str| ESSENTIAL_TOOLS.contains(&name) || role_required_tools.contains(&name);
 
         // Stable prioritization: essential tools first, then read-only + idempotent.
         // Essential tools must sort before truncation cuts them off.
         ordered.sort_by_key(|(_, name, caps)| {
-            let is_essential = ESSENTIAL_TOOLS.contains(&name.as_str());
+            let is_essential = is_policy_essential(name);
             (
                 !is_essential, // essential tools first
                 !caps.read_only,
@@ -268,7 +279,7 @@ impl Agent {
             // Start with essential tools (always available) + read-only tools.
             let mut keep: Vec<_> = filtered
                 .iter()
-                .filter(|(_, name, c)| c.read_only || ESSENTIAL_TOOLS.contains(&name.as_str()))
+                .filter(|(_, name, c)| c.read_only || is_policy_essential(name))
                 .cloned()
                 .collect();
             // Fill up to a minimum of 5 with remaining tools from the sorted list.
@@ -292,18 +303,14 @@ impl Agent {
         match policy.model_profile {
             ModelProfile::Cheap => {
                 filtered.retain(|(_, name, caps)| {
-                    ESSENTIAL_TOOLS.contains(&name.as_str())
-                        || caps.read_only
-                        || !caps.high_impact_write
+                    is_policy_essential(name) || caps.read_only || !caps.high_impact_write
                 });
                 filtered.truncate(16);
             }
             ModelProfile::Balanced => {
                 if risk_score < 0.55 {
                     filtered.retain(|(_, name, caps)| {
-                        ESSENTIAL_TOOLS.contains(&name.as_str())
-                            || caps.read_only
-                            || !caps.high_impact_write
+                        is_policy_essential(name) || caps.read_only || !caps.high_impact_write
                     });
                 }
                 filtered.truncate(20);
@@ -316,7 +323,7 @@ impl Agent {
 
         if matches!(policy.approval_mode, ApprovalMode::Auto) {
             filtered.retain(|(_, name, caps)| {
-                ESSENTIAL_TOOLS.contains(&name.as_str()) || caps.read_only || !caps.needs_approval
+                is_policy_essential(name) || caps.read_only || !caps.needs_approval
             });
         }
 
@@ -683,5 +690,145 @@ mod tests {
         assert!(names.contains(&"http_request".to_string()));
         assert!(names.contains(&"manage_http_auth".to_string()));
         assert!(names.contains(&"manage_oauth".to_string()));
+    }
+
+    #[tokio::test]
+    async fn task_lead_policy_filter_keeps_delegation_tools_exposed() {
+        let mut harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
+            .await
+            .unwrap();
+        harness.agent.set_test_task_lead_mode();
+
+        let defs = vec![
+            named_tool_def("system_info"),
+            named_tool_def("remember_fact"),
+            named_tool_def("policy_metrics"),
+            named_tool_def("project_inspect"),
+            named_tool_def("git_info"),
+            named_tool_def("check_environment"),
+            named_tool_def("service_status"),
+            named_tool_def("manage_goal_tasks"),
+            named_tool_def("cli_agent"),
+            named_tool_def("spawn_agent"),
+        ];
+        let capabilities: HashMap<String, ToolCapabilities> = HashMap::from([
+            (
+                "system_info".to_string(),
+                ToolCapabilities {
+                    read_only: true,
+                    external_side_effect: false,
+                    needs_approval: false,
+                    idempotent: true,
+                    high_impact_write: false,
+                },
+            ),
+            (
+                "remember_fact".to_string(),
+                ToolCapabilities {
+                    read_only: false,
+                    external_side_effect: false,
+                    needs_approval: false,
+                    idempotent: false,
+                    high_impact_write: false,
+                },
+            ),
+            (
+                "policy_metrics".to_string(),
+                ToolCapabilities {
+                    read_only: true,
+                    external_side_effect: false,
+                    needs_approval: false,
+                    idempotent: true,
+                    high_impact_write: false,
+                },
+            ),
+            (
+                "project_inspect".to_string(),
+                ToolCapabilities {
+                    read_only: true,
+                    external_side_effect: false,
+                    needs_approval: false,
+                    idempotent: true,
+                    high_impact_write: false,
+                },
+            ),
+            (
+                "git_info".to_string(),
+                ToolCapabilities {
+                    read_only: true,
+                    external_side_effect: false,
+                    needs_approval: false,
+                    idempotent: true,
+                    high_impact_write: false,
+                },
+            ),
+            (
+                "check_environment".to_string(),
+                ToolCapabilities {
+                    read_only: true,
+                    external_side_effect: false,
+                    needs_approval: false,
+                    idempotent: true,
+                    high_impact_write: false,
+                },
+            ),
+            (
+                "service_status".to_string(),
+                ToolCapabilities {
+                    read_only: true,
+                    external_side_effect: false,
+                    needs_approval: false,
+                    idempotent: true,
+                    high_impact_write: false,
+                },
+            ),
+            (
+                "manage_goal_tasks".to_string(),
+                ToolCapabilities {
+                    read_only: false,
+                    external_side_effect: false,
+                    needs_approval: false,
+                    idempotent: false,
+                    high_impact_write: false,
+                },
+            ),
+            (
+                "cli_agent".to_string(),
+                ToolCapabilities {
+                    read_only: false,
+                    external_side_effect: true,
+                    needs_approval: true,
+                    idempotent: false,
+                    high_impact_write: true,
+                },
+            ),
+            (
+                "spawn_agent".to_string(),
+                ToolCapabilities {
+                    read_only: false,
+                    external_side_effect: false,
+                    needs_approval: false,
+                    idempotent: false,
+                    high_impact_write: true,
+                },
+            ),
+        ]);
+
+        let filtered = harness.agent.filter_tool_definitions_for_policy(
+            &defs,
+            &capabilities,
+            &ExecutionPolicy::for_profile(ModelProfile::Balanced),
+            0.3419,
+            false,
+        );
+        let names: Vec<String> = filtered
+            .iter()
+            .filter_map(Agent::tool_name_from_definition)
+            .map(ToString::to_string)
+            .collect();
+
+        assert!(names.contains(&"manage_goal_tasks".to_string()));
+        assert!(names.contains(&"cli_agent".to_string()));
+        assert!(names.contains(&"spawn_agent".to_string()));
     }
 }

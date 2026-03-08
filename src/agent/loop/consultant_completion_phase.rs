@@ -58,6 +58,32 @@ fn build_activity_summary_reply(tool_calls: &[&str]) -> String {
     summary
 }
 
+fn build_verification_pending_reply(
+    turn_context: &TurnContext,
+    learning_ctx: &LearningContext,
+) -> String {
+    let target = turn_context
+        .completion_contract
+        .primary_target_hint()
+        .map(|value| format!(" against {}", value))
+        .unwrap_or_default();
+    let mut reply = format!(
+        "I completed part of the request, but I haven't verified the final outcome{} yet.",
+        target
+    );
+    if !learning_ctx.tool_calls.is_empty() {
+        let actions: Vec<&str> = learning_ctx
+            .tool_calls
+            .iter()
+            .map(|call| call.as_str())
+            .collect();
+        reply.push_str("\n\n");
+        reply.push_str(&build_activity_summary_reply(&actions));
+        reply.push_str("\n\nI need a final read-only check before I can claim success.");
+    }
+    reply
+}
+
 fn should_recover_completion_from_tool_output(
     reply: &str,
     depth: usize,
@@ -79,6 +105,23 @@ fn should_enforce_no_tool_text_when_tools_required(
         return false;
     }
     !reply.trim().is_empty()
+}
+
+fn completion_verification_still_required(
+    turn_context: &TurnContext,
+    completion_progress: &CompletionProgress,
+) -> bool {
+    let contract = &turn_context.completion_contract;
+    let has_concrete_verification_reason = contract.explicit_verification_requested
+        || !contract.verification_targets.is_empty()
+        || matches!(
+            contract.task_kind,
+            CompletionTaskKind::Diagnose | CompletionTaskKind::Monitor
+        );
+
+    contract.requires_observation
+        && completion_progress.verification_pending
+        && has_concrete_verification_reason
 }
 
 pub(super) struct ConsultantCompletionCtx<'a> {
@@ -113,6 +156,8 @@ pub(super) struct ConsultantCompletionCtx<'a> {
     pub pending_background_ack: &'a mut Option<String>,
     pub pending_external_action_ack: &'a mut Option<String>,
     pub require_file_recheck_before_answer: &'a mut bool,
+    pub completion_progress: &'a mut CompletionProgress,
+    pub turn_context: &'a TurnContext,
     pub needs_tools_for_turn: bool,
     pub force_text_response: bool,
 }
@@ -153,6 +198,8 @@ impl Agent {
         let mut pending_background_ack = std::mem::take(ctx.pending_background_ack);
         let mut pending_external_action_ack = std::mem::take(ctx.pending_external_action_ack);
         let mut require_file_recheck_before_answer = *ctx.require_file_recheck_before_answer;
+        let mut completion_progress = ctx.completion_progress.clone();
+        let turn_context = ctx.turn_context;
         let needs_tools_for_turn = ctx.needs_tools_for_turn;
         let force_text_response = ctx.force_text_response;
 
@@ -172,6 +219,7 @@ impl Agent {
                 *ctx.pending_background_ack = pending_background_ack.clone();
                 *ctx.pending_external_action_ack = pending_external_action_ack.clone();
                 *ctx.require_file_recheck_before_answer = require_file_recheck_before_answer;
+                *ctx.completion_progress = completion_progress.clone();
             };
         }
         // === NATURAL COMPLETION: No tool calls ===
@@ -207,6 +255,7 @@ impl Agent {
             }
 
             if self.depth == 0
+                && !completion_verification_still_required(turn_context, &completion_progress)
                 && should_recover_completion_from_tool_output(
                     &reply,
                     self.depth,
@@ -243,7 +292,11 @@ impl Agent {
             // ContinueLoop, but the next iteration strips tools again, creating
             // a deadlock.  Skip directly to completion.  If the reply is empty or
             // low-signal, upgrade it to an activity summary.
-            if force_text_response && self.depth == 0 && total_successful_tool_calls >= 3 {
+            if force_text_response
+                && self.depth == 0
+                && total_successful_tool_calls >= 3
+                && !completion_verification_still_required(turn_context, &completion_progress)
+            {
                 if reply.trim().is_empty()
                     || is_low_signal_task_lead_reply(&reply)
                     || looks_like_deferred_action_response(&reply)
@@ -329,6 +382,69 @@ impl Agent {
                         commit_state!();
                         return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
                     }
+                }
+            }
+
+            if self.depth == 0
+                && total_successful_tool_calls == 0
+                && !used_identity_prefill
+                && looks_like_deferred_action_response(&reply)
+                && !is_substantive_text_response(&reply, 200)
+            {
+                if tool_defs.is_empty() {
+                    warn!(
+                        session_id,
+                        iteration,
+                        "Deferred-action reply with no available tools; returning explicit blocker"
+                    );
+                    reply = "I wasn't able to complete that request because no execution tools are available in this context. Please try again in a context with tool access."
+                        .to_string();
+                } else if deferred_no_tool_streak >= DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
+                    && is_substantive_text_response(&reply, 50)
+                {
+                    info!(
+                        session_id,
+                        iteration,
+                        deferred_no_tool_streak,
+                        reply_len = reply.len(),
+                        "Accepting substantive text-only response after repeated deferred-no-tool retries"
+                    );
+                    deferred_no_tool_streak = 0;
+                } else {
+                    deferred_no_tool_streak = deferred_no_tool_streak.saturating_add(1);
+                    consecutive_clean_iterations = 0;
+                    pending_system_messages.push(SystemDirective::DeferredToolCallRequired);
+                    warn!(
+                        session_id,
+                        iteration,
+                        deferred_no_tool_streak,
+                        "Deferred-action reply before first tool call; continuing loop"
+                    );
+
+                    if deferred_no_tool_streak >= DEFERRED_NO_TOOL_SWITCH_THRESHOLD
+                        && deferred_no_tool_model_switches < MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES
+                    {
+                        if let Some(next_model) = self
+                            .pick_fallback_excluding(&model, &[], llm_router.as_ref())
+                            .await
+                        {
+                            info!(
+                                session_id,
+                                iteration,
+                                from_model = %model,
+                                to_model = %next_model,
+                                "Deferred/no-tool recovery: switching model for one retry window"
+                            );
+                            model = next_model;
+                            deferred_no_tool_model_switches += 1;
+                            POLICY_METRICS
+                                .deferred_no_tool_model_switch_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    commit_state!();
+                    return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
                 }
             }
 
@@ -576,6 +692,36 @@ impl Agent {
                 }
             }
 
+            if completion_verification_still_required(turn_context, &completion_progress) {
+                if tool_defs.is_empty() || force_text_response {
+                    warn!(
+                        session_id,
+                        iteration,
+                        force_text_response,
+                        "Completion verification required but tools unavailable (empty or force-text); clearing guard"
+                    );
+                    reply = build_verification_pending_reply(turn_context, learning_ctx);
+                    pending_external_action_ack = None;
+                    // Avoid deadlocks when tools cannot run in this phase, but
+                    // preserve the fact that verification did not happen in the reply itself.
+                    completion_progress.verification_pending = false;
+                } else {
+                    stall_count = stall_count.saturating_add(1);
+                    consecutive_clean_iterations = 0;
+                    pending_system_messages.push(SystemDirective::CompletionVerificationRequired {
+                        target_hint: turn_context.completion_contract.primary_target_hint(),
+                    });
+                    warn!(
+                        session_id,
+                        iteration,
+                        stall_count,
+                        "Blocking completion until request outcome verification is performed"
+                    );
+                    commit_state!();
+                    return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
+                }
+            }
+
             // Guardrail: don't accept "I'll do X" / workflow narration as
             // completion text. Either keep the loop alive (if tools exist)
             // or return an explicit blocker (if no tools are available).
@@ -599,7 +745,6 @@ impl Agent {
             };
             let reply_is_substantive =
                 !has_structural_markers && is_substantive_text_response(&reply, 200);
-
             if self.depth == 0
                 && !used_identity_prefill
                 && looks_like_deferred_action_response(&reply)
@@ -903,9 +1048,15 @@ impl Agent {
 mod tests {
     use super::{
         build_activity_summary_reply, build_tool_output_completion_reply,
-        should_enforce_no_tool_text_when_tools_required,
+        build_verification_pending_reply, should_enforce_no_tool_text_when_tools_required,
         should_recover_completion_from_tool_output,
     };
+    use crate::agent::post_task::LearningContext;
+    use crate::agent::{
+        history::CompletionTaskKind, CompletionContract, TurnContext, VerificationTarget,
+        VerificationTargetKind,
+    };
+    use chrono::Utc;
 
     #[test]
     fn tool_output_reply_is_result_focused() {
@@ -947,6 +1098,39 @@ mod tests {
         assert!(reply.contains("write_file("));
         assert!(reply.contains("1."));
         assert!(reply.contains("2."));
+    }
+
+    #[test]
+    fn verification_pending_reply_mentions_target_and_actions() {
+        let turn_context = TurnContext {
+            completion_contract: CompletionContract {
+                task_kind: CompletionTaskKind::Diagnose,
+                requires_observation: true,
+                verification_targets: vec![VerificationTarget {
+                    kind: VerificationTargetKind::Url,
+                    value: "https://blog.aidaemon.ai".to_string(),
+                }],
+                ..CompletionContract::default()
+            },
+            ..TurnContext::default()
+        };
+        let learning_ctx = LearningContext {
+            user_text: "I still don't see the posts.".to_string(),
+            intent_domains: Vec::new(),
+            tool_calls: vec!["terminal(vite build)".to_string()],
+            errors: Vec::new(),
+            first_error: None,
+            recovery_actions: Vec::new(),
+            start_time: Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+        };
+
+        let reply = build_verification_pending_reply(&turn_context, &learning_ctx);
+        assert!(reply.contains("haven't verified"));
+        assert!(reply.contains("https://blog.aidaemon.ai"));
+        assert!(reply.contains("terminal(vite build)"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use super::result_learning::{ResultLearningEnv, ResultLearningState};
 use super::types::{ToolExecutionCtx, ToolExecutionOutcome};
 use crate::agent::recall_guardrails::is_personal_memory_tool;
 use crate::agent::*;
+use crate::traits::{ToolCallSemantics, ToolTargetHint, ToolTargetHintKind};
 use crate::utils::{truncate_str, truncate_with_note};
 
 const TOOL_COMPLETE_SUMMARY_MAX_CHARS: usize = 140;
@@ -95,6 +96,15 @@ fn deterministic_tool_contract_violation(
         "scheduled_goal_runs" => scheduled_goal_runs_missing_goal_id_violation(raw_arguments),
         _ => None,
     }
+}
+
+fn tool_is_currently_exposed(tool_defs: &[Value], tool_name: &str) -> bool {
+    tool_defs.iter().any(|def| {
+        def.get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(|name| name.as_str())
+            .is_some_and(|exposed_name| exposed_name == tool_name)
+    })
 }
 
 fn blocked_for_untrusted_external_reference_message(
@@ -310,6 +320,122 @@ fn should_build_external_action_ack(result_text: &str) -> bool {
         && !lower.starts_with("failed to ")
 }
 
+fn tool_result_contains_verifiable_evidence(
+    semantics: &ToolCallSemantics,
+    result_text: &str,
+) -> bool {
+    if !semantics.can_verify_with_result_content() {
+        return false;
+    }
+
+    let primary = crate::traits::extract_primary_message_content(result_text, &[]);
+    let primary = primary.trim();
+    !primary.is_empty()
+        && !matches!(
+            primary.to_ascii_lowercase().as_str(),
+            "ok" | "done" | "success" | "completed" | "completed successfully"
+        )
+}
+
+fn normalized_target_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(['.', ',', ';'])
+        .to_ascii_lowercase()
+}
+
+fn tool_target_hint_matches_contract_target(
+    target_hint: &ToolTargetHint,
+    contract_target: &VerificationTarget,
+) -> bool {
+    let compatible_kind = matches!(
+        (target_hint.kind, contract_target.kind),
+        (ToolTargetHintKind::Url, VerificationTargetKind::Url)
+            | (ToolTargetHintKind::Path, VerificationTargetKind::Path)
+            | (
+                ToolTargetHintKind::ProjectScope,
+                VerificationTargetKind::ProjectScope
+            )
+            | (
+                ToolTargetHintKind::Path,
+                VerificationTargetKind::ProjectScope
+            )
+            | (
+                ToolTargetHintKind::ProjectScope,
+                VerificationTargetKind::Path
+            )
+    );
+    if !compatible_kind {
+        return false;
+    }
+
+    let hint = normalized_target_value(&target_hint.value);
+    let contract = normalized_target_value(&contract_target.value);
+    if hint.is_empty() || contract.is_empty() {
+        return false;
+    }
+
+    hint == contract || hint.contains(&contract) || contract.contains(&hint)
+}
+
+fn verification_target_matches_haystack(target: &VerificationTarget, haystack: &str) -> bool {
+    let haystack = haystack.to_ascii_lowercase();
+    let needle = normalized_target_value(&target.value);
+    if needle.is_empty() {
+        return false;
+    }
+
+    if haystack.contains(&needle) {
+        return true;
+    }
+
+    match target.kind {
+        VerificationTargetKind::ProjectScope | VerificationTargetKind::Path => target
+            .value
+            .rsplit(['/', '\\'])
+            .find(|segment| !segment.is_empty())
+            .map(normalized_target_value)
+            .is_some_and(|tail| !tail.is_empty() && haystack.contains(&tail)),
+        VerificationTargetKind::Url => false,
+    }
+}
+
+fn observation_matches_completion_contract(
+    contract: &CompletionContract,
+    semantics: &ToolCallSemantics,
+    raw_arguments: &str,
+    result_text: &str,
+) -> bool {
+    if contract.verification_targets.is_empty() {
+        return true;
+    }
+
+    if semantics.target_hints.iter().any(|hint| {
+        contract
+            .verification_targets
+            .iter()
+            .any(|target| tool_target_hint_matches_contract_target(hint, target))
+    }) {
+        return true;
+    }
+
+    let mut haystacks = vec![
+        raw_arguments.to_string(),
+        crate::traits::extract_primary_message_content(result_text, &[]).to_string(),
+        result_text.to_string(),
+    ];
+    if let Some(command) = extract_command_from_args(raw_arguments) {
+        haystacks.push(command);
+    }
+
+    contract.verification_targets.iter().any(|target| {
+        haystacks
+            .iter()
+            .any(|haystack| verification_target_matches_haystack(target, haystack))
+    })
+}
+
 impl Agent {
     pub(in crate::agent) async fn run_tool_execution_phase(
         &self,
@@ -378,6 +504,7 @@ impl Agent {
             std::mem::take(ctx.dirs_with_project_inspect_file_evidence);
         let mut dirs_with_search_no_matches = std::mem::take(ctx.dirs_with_search_no_matches);
         let mut require_file_recheck_before_answer = *ctx.require_file_recheck_before_answer;
+        let mut completion_progress = ctx.completion_progress.clone();
         let mut tool_result_cache = std::mem::take(ctx.tool_result_cache);
 
         macro_rules! commit_state {
@@ -418,6 +545,7 @@ impl Agent {
                     dirs_with_project_inspect_file_evidence;
                 *ctx.dirs_with_search_no_matches = dirs_with_search_no_matches;
                 *ctx.require_file_recheck_before_answer = require_file_recheck_before_answer;
+                *ctx.completion_progress = completion_progress.clone();
                 *ctx.tool_result_cache = tool_result_cache;
             };
         }
@@ -571,6 +699,55 @@ impl Agent {
                     &tc.name,
                     active_untrusted_external_reference_skills,
                 );
+                let tool_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "tool".to_string(),
+                    content: Some(result_text),
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_name: Some(tc.name.clone()),
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.15,
+                    ..Message::runtime_defaults()
+                };
+                self.append_tool_message_with_result_event(
+                    emitter,
+                    &tool_msg,
+                    true,
+                    0,
+                    None,
+                    Some(task_id),
+                )
+                .await?;
+                iteration_had_tool_failures = true;
+                continue;
+            }
+
+            let tool_is_known_but_hidden = !tool_is_currently_exposed(&tool_defs, &tc.name)
+                && (tool_is_currently_exposed(base_tool_defs, &tc.name)
+                    || self.has_registered_tool(&tc.name));
+            if tool_is_known_but_hidden {
+                *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+                self.emit_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::ToolBudgetBlock,
+                    format!(
+                        "Blocked tool {} because it is not currently exposed",
+                        tc.name
+                    ),
+                    json!({
+                        "tool": tc.name,
+                        "reason": "tool_not_currently_exposed",
+                    }),
+                )
+                .await;
+                let result_text = ToolResultNotice::ToolNotCurrentlyExposed {
+                    tool_name: tc.name.clone(),
+                }
+                .render();
                 let tool_msg = Message {
                     id: Uuid::new_v4().to_string(),
                     session_id: session_id.to_string(),
@@ -806,6 +983,7 @@ impl Agent {
                     &ToolExecutionIoCtx {
                         effective_arguments: &effective_arguments,
                         injected_project_dir: injected_project_dir.as_deref(),
+                        project_scope: allowed_project_scope,
                         session_id,
                         task_id,
                         status_tx: &status_tx,
@@ -836,6 +1014,7 @@ impl Agent {
                                 status_tx: status_tx.clone(),
                                 channel_visibility: channel_ctx.visibility,
                                 channel_id: channel_ctx.channel_id.as_deref(),
+                                project_scope: allowed_project_scope,
                                 trusted: channel_ctx.trusted,
                                 user_role,
                             },
@@ -1024,8 +1203,28 @@ impl Agent {
                     .get(&tc.name)
                     .copied()
                     .unwrap_or_default();
-                if !background_detached
-                    && !caps.read_only
+                let semantics = &result_metadata.semantics;
+                if semantics.mutates_state() {
+                    completion_progress.mark_mutation(&turn_context.completion_contract);
+                }
+                if semantics.observes_state() {
+                    let can_verify =
+                        tool_result_contains_verifiable_evidence(semantics, &result_text);
+                    let matched_contract = observation_matches_completion_contract(
+                        &turn_context.completion_contract,
+                        semantics,
+                        &effective_arguments,
+                        &result_text,
+                    );
+                    completion_progress.mark_observation(
+                        &turn_context.completion_contract,
+                        can_verify && matched_contract,
+                    );
+                }
+                if completion_progress.verification_pending {
+                    pending_external_action_ack = None;
+                } else if !background_detached
+                    && semantics.mutates_state()
                     && caps.external_side_effect
                     && should_build_external_action_ack(&result_text)
                 {
@@ -1180,6 +1379,75 @@ mod tests {
         let args = r#"{"action":"run_history","goal_id":"goal-123"}"#;
         let violation = deterministic_tool_contract_violation("scheduled_goal_runs", args);
         assert!(violation.is_none());
+    }
+
+    #[test]
+    fn tool_is_currently_exposed_matches_current_tool_defs() {
+        let tool_defs = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "system_info",
+                    "description": "demo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "remember_fact",
+                    "description": "demo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                }
+            }),
+        ];
+
+        assert!(tool_is_currently_exposed(&tool_defs, "system_info"));
+        assert!(!tool_is_currently_exposed(&tool_defs, "cli_agent"));
+    }
+
+    #[test]
+    fn result_content_verification_requires_semantics_opt_in() {
+        let verifyable = ToolCallSemantics::observation()
+            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent);
+        let non_verifyable = ToolCallSemantics::observation();
+        assert!(tool_result_contains_verifiable_evidence(
+            &verifyable,
+            "Latest post title: Scheduled reflection"
+        ));
+        assert!(!tool_result_contains_verifiable_evidence(
+            &non_verifyable,
+            "Latest post title: Scheduled reflection"
+        ));
+    }
+
+    #[test]
+    fn semantics_target_hints_match_contract_targets() {
+        let contract = CompletionContract {
+            requires_observation: true,
+            verification_targets: vec![VerificationTarget {
+                kind: VerificationTargetKind::Url,
+                value: "https://blog.aidaemon.ai".to_string(),
+            }],
+            ..CompletionContract::default()
+        };
+        let semantics = ToolCallSemantics::observation()
+            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent)
+            .with_target_hint(ToolTargetHintKind::Url, "https://blog.aidaemon.ai");
+        assert!(observation_matches_completion_contract(
+            &contract,
+            &semantics,
+            "{}",
+            "Latest post title: Scheduled reflection"
+        ));
     }
 
     #[test]

@@ -268,6 +268,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         config.state.context_window.clone(),
         config.policy.clone(),
         config.path_aliases.clone(),
+        None,
     ));
 
     // Close the loop: give the spawn tool a weak reference to the agent.
@@ -1644,7 +1645,9 @@ After using tools, always include the actual results in your response.
 
 **Grounding Rule:** Before modifying files, running destructive commands, or deploying, \
 verify that referenced paths and services exist. This applies to actions only — \
-information lookups should use memory first, then ask the user.
+information lookups should use memory first, then ask the user. \
+When diagnosing from logs or file reads, check modification time and current service/process state before \
+treating an error as active — stale log lines may only describe a past failure.
 
 ## Expertise-Adjusted Behavior
 - **Expert/Proficient:** Be concise, skip obvious explanations, proceed confidently
@@ -1680,7 +1683,7 @@ information lookups should use memory first, then ask the user.
 {send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_api_table_row}{manage_http_auth_table_row}{manage_oauth_table_row}
 
 ## Tools
-- `read_file`: Read file contents with line numbers. Supports line ranges for large files. Use instead of terminal cat/head/tail.
+- `read_file`: Read file contents with line numbers plus basic metadata (size, modified time). Supports line ranges and `tail_lines` for large files/logs. Use instead of terminal cat/head/tail.
 - `write_file`: Write or create files with atomic writes and automatic backup. Use instead of terminal echo/cat/heredoc redirection. ALWAYS prefer write_file over `cat > file << 'EOF'` in terminal — heredoc commands trigger approval flow and may be too long.
 - `edit_file`: Find and replace text in files. Validates uniqueness, shows context around changes. Use instead of terminal sed/awk. If it fails with not-found/ambiguous text, call `read_file` for the same path and retry once before asking the user.
 - `search_files`: Search by filename glob and/or content regex. Auto-skips .git/node_modules/target. Use instead of terminal find/grep.

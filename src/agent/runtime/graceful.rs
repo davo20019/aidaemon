@@ -38,6 +38,13 @@ pub(super) enum GoalBudgetControlOutcome {
     },
 }
 
+struct DecisionPointEmission {
+    decision_type: DecisionType,
+    severity: crate::events::DiagnosticSeverity,
+    summary: String,
+    metadata: Value,
+}
+
 pub(super) struct ScheduledRunBudgetControlCtx<'a> {
     pub emitter: &'a crate::events::EventEmitter,
     pub task_id: &'a str,
@@ -844,18 +851,74 @@ impl Agent {
         summary: impl Into<String>,
         metadata: Value,
     ) {
+        self.emit_decision_point_with_severity(
+            emitter,
+            task_id,
+            iteration,
+            DecisionPointEmission {
+                decision_type,
+                severity: crate::events::DiagnosticSeverity::Info,
+                summary: summary.into(),
+                metadata,
+            },
+        )
+        .await;
+    }
+
+    pub(super) async fn emit_warning_decision_point(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        iteration: usize,
+        decision_type: DecisionType,
+        summary: impl Into<String>,
+        metadata: Value,
+    ) {
+        self.emit_decision_point_with_severity(
+            emitter,
+            task_id,
+            iteration,
+            DecisionPointEmission {
+                decision_type,
+                severity: crate::events::DiagnosticSeverity::Warning,
+                summary: summary.into(),
+                metadata,
+            },
+        )
+        .await;
+    }
+
+    async fn emit_decision_point_with_severity(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        iteration: usize,
+        emission: DecisionPointEmission,
+    ) {
         if !self.record_decision_points {
             return;
         }
+        let code = emission
+            .metadata
+            .as_object()
+            .and_then(|obj| {
+                ["condition", "route_reason", "reason"]
+                    .iter()
+                    .find_map(|key| obj.get(*key).and_then(Value::as_str))
+            })
+            .map(|value| value.to_string())
+            .or_else(|| Some(emission.decision_type.as_str().to_string()));
         let _ = emitter
             .emit(
                 EventType::DecisionPoint,
                 DecisionPointData {
-                    decision_type,
+                    decision_type: emission.decision_type,
                     task_id: task_id.to_string(),
                     iteration: iteration.min(u32::MAX as usize) as u32,
-                    metadata,
-                    summary: summary.into(),
+                    severity: emission.severity,
+                    code,
+                    metadata: emission.metadata,
+                    summary: emission.summary,
                 },
             )
             .await;

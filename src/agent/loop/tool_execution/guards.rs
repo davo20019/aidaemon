@@ -49,7 +49,7 @@ impl Agent {
                 repetitive_count,
                 "Redirecting repetitive tool call — coaching agent to adapt"
             );
-            self.emit_decision_point(
+            self.emit_warning_decision_point(
                 emitter,
                 task_id,
                 iteration,
@@ -132,7 +132,7 @@ impl Agent {
             // Wrap the entire graceful shutdown in a timeout to prevent
             // indefinite hangs from SQLite pool exhaustion or deadlocks.
             let graceful_fut = async {
-                self.emit_decision_point(
+                self.emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -228,7 +228,7 @@ impl Agent {
             // calls without switching tools indicates a stuck loop.
             let is_diverse = unique * 2 > total;
             let diverse_limit = MAX_CONSECUTIVE_SAME_TOOL + 4;
-            self.emit_decision_point(
+            self.emit_warning_decision_point(
                 emitter,
                 task_id,
                 iteration,
@@ -350,7 +350,7 @@ impl Agent {
                     if diversity_ratio <= 0.6 {
                         let tool_names: Vec<String> =
                             unique_tools.iter().map(|t| (*t).clone()).collect();
-                        self.emit_decision_point(
+                        self.emit_warning_decision_point(
                             emitter,
                             task_id,
                             iteration,

@@ -9,6 +9,9 @@ mod group_session_tests;
 #[path = "runtime/goal_delivery_tests.rs"]
 mod goal_delivery_tests;
 
+#[path = "runtime/goal_failure_tests.rs"]
+mod goal_failure_tests;
+
 #[path = "consultant/consultant_prompt_tests.rs"]
 mod consultant_prompt_tests;
 

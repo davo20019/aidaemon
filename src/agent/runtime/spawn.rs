@@ -1,6 +1,184 @@
 use super::*;
 
+struct TaskLeadSpec {
+    tools: Vec<Arc<dyn Tool>>,
+    system_prompt: String,
+    root_tools: Vec<Arc<dyn Tool>>,
+    input_text: String,
+}
+
 impl Agent {
+    fn collect_full_child_tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.root_tools
+            .as_ref()
+            .unwrap_or(&self.tools)
+            .iter()
+            .filter(|t| t.name() != "spawn_agent")
+            .cloned()
+            .collect()
+    }
+
+    async fn build_task_lead_spec(
+        &self,
+        full_tools: &[Arc<dyn Tool>],
+        goal_id: &str,
+        goal_description: &str,
+        child_depth: usize,
+        wrap_input: bool,
+    ) -> TaskLeadSpec {
+        let mut tools: Vec<Arc<dyn Tool>> = full_tools
+            .iter()
+            .filter(|t| matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal))
+            .cloned()
+            .collect();
+
+        let has_cli_agent = if let Some(cli_tool) = full_tools
+            .iter()
+            .find(|t| t.name() == "cli_agent" && t.is_available())
+        {
+            if !tools.iter().any(|t| t.name() == "cli_agent") {
+                tools.push(cli_tool.clone());
+            }
+            true
+        } else {
+            false
+        };
+
+        tools.push(Arc::new(crate::tools::ManageGoalTasksTool::new(
+            goal_id.to_string(),
+            self.state.clone(),
+        )));
+
+        let goal_context = self
+            .state
+            .get_goal(goal_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|g| g.context);
+
+        let system_prompt = Self::build_task_lead_prompt(
+            goal_id,
+            goal_description,
+            goal_context.as_deref(),
+            child_depth,
+            self.max_depth,
+            has_cli_agent,
+        );
+
+        let input_text = if wrap_input {
+            format!(
+                "Plan and execute this goal by creating tasks and delegating to executors:\n\n{}",
+                goal_description
+            )
+        } else {
+            goal_description.to_string()
+        };
+
+        TaskLeadSpec {
+            tools,
+            system_prompt,
+            root_tools: full_tools.to_vec(),
+            input_text,
+        }
+    }
+
+    async fn resolve_task_lead_cancel_token(
+        &self,
+        goal_id: &str,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        if let Some(ref registry) = self.goal_token_registry {
+            if let Some(token) = registry.child_token(goal_id).await {
+                return Some(token);
+            }
+        }
+
+        self.cancel_token.as_ref().map(|t| t.child_token())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_child_agent(
+        &self,
+        mut tools: Vec<Arc<dyn Tool>>,
+        model: String,
+        system_prompt: String,
+        child_depth: usize,
+        role: AgentRole,
+        task_id: Option<String>,
+        goal_id: Option<String>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        root_tools: Option<Vec<Arc<dyn Tool>>>,
+        add_spawn_tool: bool,
+        inherited_project_scope: Option<String>,
+    ) -> Arc<Agent> {
+        let spawn_tool = if add_spawn_tool {
+            Some(Arc::new(
+                crate::tools::spawn::SpawnAgentTool::new_deferred(
+                    self.max_response_chars,
+                    self.timeout_secs,
+                )
+                .with_state(self.state.clone()),
+            ))
+        } else {
+            None
+        };
+
+        if let Some(ref spawn_tool) = spawn_tool {
+            tools.push(spawn_tool.clone());
+        }
+
+        let hub = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                warn!("Timed out acquiring hub lock while spawning child agent");
+                None
+            }
+        };
+
+        let child = Arc::new(Agent::with_depth(
+            self.llm_runtime.clone(),
+            self.state.clone(),
+            self.event_store.clone(),
+            tools,
+            model,
+            system_prompt,
+            self.config_path.clone(),
+            self.skills_dir.clone(),
+            child_depth,
+            self.max_depth,
+            self.iteration_config.clone(),
+            self.max_iterations,
+            self.max_iterations_cap,
+            self.max_response_chars,
+            self.timeout_secs,
+            self.max_facts,
+            self.task_timeout,
+            self.task_token_budget,
+            self.llm_call_timeout,
+            self.mcp_registry.clone(),
+            self.verification_tracker.clone(),
+            role,
+            task_id,
+            goal_id,
+            cancel_token,
+            self.goal_token_registry.clone(),
+            hub,
+            self.schedule_approved_sessions.clone(),
+            self.record_decision_points,
+            self.context_window_config.clone(),
+            self.policy_config.clone(),
+            self.path_aliases.clone(),
+            inherited_project_scope,
+            root_tools,
+        ));
+
+        if let Some(spawn_tool) = spawn_tool {
+            spawn_tool.set_agent(Arc::downgrade(&child));
+        }
+
+        child
+    }
+
     /// Spawn a child agent with an incremented depth and a focused mission.
     ///
     /// The child runs its own agentic loop in a fresh session and returns the
@@ -23,6 +201,7 @@ impl Agent {
         child_role: Option<AgentRole>,
         goal_id: Option<&str>,
         task_id: Option<&str>,
+        inherited_project_scope: Option<&str>,
     ) -> anyhow::Result<String> {
         if self.depth >= self.max_depth {
             anyhow::bail!(
@@ -43,69 +222,44 @@ impl Agent {
         // Collect parent's non-spawn tools for the child.
         // Use root_tools if available (TaskLead spawning Executor needs the full
         // unfiltered set so Action tools aren't lost through double-filtering).
-        let full_tools: Vec<Arc<dyn Tool>> = self
-            .root_tools
-            .as_ref()
-            .unwrap_or(&self.tools)
-            .iter()
-            .filter(|t| t.name() != "spawn_agent")
-            .cloned()
-            .collect();
+        let full_tools = self.collect_full_child_tools();
 
         // Apply role-based tool scoping when child_role is specified.
         let (scoped_tools, child_system_prompt, child_root_tools) = if let Some(role) = child_role {
             match role {
                 AgentRole::TaskLead => {
-                    // Task leads get Management + Universal tools
-                    let mut tools: Vec<Arc<dyn Tool>> = full_tools
-                        .iter()
-                        .filter(|t| {
-                            matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal)
-                        })
-                        .cloned()
-                        .collect();
-                    // Give task leads direct cli_agent access when available.
-                    let has_cli_agent = if let Some(cli_tool) = full_tools
-                        .iter()
-                        .find(|t| t.name() == "cli_agent" && t.is_available())
-                    {
-                        if !tools.iter().any(|t| t.name() == "cli_agent") {
-                            tools.push(cli_tool.clone());
-                        }
-                        true
-                    } else {
-                        false
+                    let Some(goal_id) = goal_id else {
+                        anyhow::bail!("Cannot spawn task lead without goal_id");
                     };
-                    // Add ManageGoalTasksTool
-                    if let Some(gid) = goal_id {
-                        tools.push(Arc::new(crate::tools::ManageGoalTasksTool::new(
-                            gid.to_string(),
-                            self.state.clone(),
-                        )));
-                    }
-                    let goal_context = if let Some(gid) = goal_id {
-                        self.state
-                            .get_goal(gid)
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|g| g.context)
-                    } else {
-                        None
-                    };
-                    // SpawnAgentTool added below (for spawning executors)
-                    let prompt = Self::build_task_lead_prompt(
-                        goal_id.unwrap_or("unknown"),
-                        task,
-                        goal_context.as_deref(),
-                        child_depth,
-                        self.max_depth,
-                        has_cli_agent,
-                    );
-                    // Pass the full unfiltered tools as root_tools so that when
-                    // this TaskLead spawns Executor children, they can access
-                    // Action tools that were filtered out of the TaskLead's set.
-                    (tools, prompt, Some(full_tools.clone()))
+                    let TaskLeadSpec {
+                        tools,
+                        system_prompt,
+                        root_tools,
+                        input_text,
+                    } = self
+                        .build_task_lead_spec(&full_tools, goal_id, task, child_depth, false)
+                        .await;
+                    let cancel_token = self.resolve_task_lead_cancel_token(goal_id).await;
+                    return self
+                        .spawn_child_inner(
+                            &tools,
+                            model,
+                            system_prompt,
+                            child_depth,
+                            mission,
+                            &input_text,
+                            status_tx,
+                            channel_ctx,
+                            user_role,
+                            AgentRole::TaskLead,
+                            true,
+                            None,
+                            Some(goal_id.to_string()),
+                            Some(root_tools),
+                            cancel_token,
+                            inherited_project_scope,
+                        )
+                        .await;
                 }
                 AgentRole::Executor => {
                     let has_cli_agent = full_tools
@@ -151,8 +305,10 @@ impl Agent {
                             role,
                             false, // no spawn tool
                             task_id.map(|s| s.to_string()),
-                            None,
+                            goal_id.map(|s| s.to_string()),
                             None, // root_tools (executors don't spawn children)
+                            None, // cancel token override
+                            inherited_project_scope,
                         )
                         .await;
                 }
@@ -221,6 +377,8 @@ impl Agent {
             None,             // task_id (executor activity tracking)
             goal_for_child,   // goal_id (task lead context injection)
             child_root_tools, // root_tools for TaskLead → Executor inheritance
+            None,             // cancel token override
+            inherited_project_scope,
         )
         .await
     }
@@ -243,6 +401,8 @@ impl Agent {
         task_id: Option<String>,
         goal_id: Option<String>,
         root_tools: Option<Vec<Arc<dyn Tool>>>,
+        cancel_token_override: Option<tokio_util::sync::CancellationToken>,
+        inherited_project_scope: Option<&str>,
     ) -> anyhow::Result<String> {
         let child_session = format!("sub-{}-{}", child_depth, Uuid::new_v4());
 
@@ -276,134 +436,33 @@ impl Agent {
         let start = std::time::Instant::now();
         // Save task_id for post-completion knowledge extraction (Phase 4)
         let saved_task_id = task_id.clone();
-
-        let result = if add_spawn_tool {
-            let spawn_tool = Arc::new(
-                crate::tools::spawn::SpawnAgentTool::new_deferred(
-                    self.max_response_chars,
-                    self.timeout_secs,
-                )
-                .with_state(self.state.clone()),
-            );
-
-            let mut child_tools: Vec<Arc<dyn Tool>> = tools.to_vec();
-            child_tools.push(spawn_tool.clone());
-
-            // Derive child cancel token from parent
-            let child_cancel = self.cancel_token.as_ref().map(|t| t.child_token());
-
-            let child = Arc::new(Agent::with_depth(
-                self.llm_runtime.clone(),
-                self.state.clone(),
-                self.event_store.clone(),
-                child_tools,
-                model,
-                system_prompt,
-                self.config_path.clone(),
-                self.skills_dir.clone(),
-                child_depth,
-                self.max_depth,
-                self.iteration_config.clone(),
-                self.max_iterations,
-                self.max_iterations_cap,
-                self.max_response_chars,
-                self.timeout_secs,
-                self.max_facts,
-                self.task_timeout,
-                self.task_token_budget,
-                self.llm_call_timeout,
-                self.mcp_registry.clone(),
-                self.verification_tracker.clone(),
-                role,
-                task_id,
-                goal_id,
-                child_cancel,
-                self.goal_token_registry.clone(),
-                match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => {
-                        warn!("Timed out acquiring hub lock while spawning child agent");
-                        None
-                    }
-                },
-                self.schedule_approved_sessions.clone(),
-                self.record_decision_points,
-                self.context_window_config.clone(),
-                self.policy_config.clone(),
-                self.path_aliases.clone(),
-                root_tools,
-            ));
-
-            // Close the loop: give the spawn tool a weak ref to the child.
-            spawn_tool.set_agent(Arc::downgrade(&child));
-
-            child
-                .handle_message(
-                    &child_session,
-                    task,
-                    status_tx,
-                    user_role,
-                    channel_ctx,
-                    None,
-                )
-                .await
-        } else {
-            // Derive child cancel token from parent
-            let child_cancel = self.cancel_token.as_ref().map(|t| t.child_token());
-
-            let child = Arc::new(Agent::with_depth(
-                self.llm_runtime.clone(),
-                self.state.clone(),
-                self.event_store.clone(),
+        let cancel_token =
+            cancel_token_override.or_else(|| self.cancel_token.as_ref().map(|t| t.child_token()));
+        let child = self
+            .create_child_agent(
                 tools.to_vec(),
                 model,
                 system_prompt,
-                self.config_path.clone(),
-                self.skills_dir.clone(),
                 child_depth,
-                self.max_depth,
-                self.iteration_config.clone(),
-                self.max_iterations,
-                self.max_iterations_cap,
-                self.max_response_chars,
-                self.timeout_secs,
-                self.max_facts,
-                self.task_timeout,
-                self.task_token_budget,
-                self.llm_call_timeout,
-                self.mcp_registry.clone(),
-                self.verification_tracker.clone(),
                 role,
                 task_id,
                 goal_id,
-                child_cancel,
-                self.goal_token_registry.clone(),
-                match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => {
-                        warn!("Timed out acquiring hub lock while spawning child agent");
-                        None
-                    }
-                },
-                self.schedule_approved_sessions.clone(),
-                self.record_decision_points,
-                self.context_window_config.clone(),
-                self.policy_config.clone(),
-                self.path_aliases.clone(),
+                cancel_token,
                 root_tools,
-            ));
-
-            child
-                .handle_message(
-                    &child_session,
-                    task,
-                    status_tx,
-                    user_role,
-                    channel_ctx,
-                    None,
-                )
-                .await
-        };
+                add_spawn_tool,
+                inherited_project_scope.map(ToOwned::to_owned),
+            )
+            .await;
+        let result = child
+            .handle_message(
+                &child_session,
+                task,
+                status_tx,
+                user_role,
+                channel_ctx,
+                None,
+            )
+            .await;
 
         let duration = start.elapsed();
 
@@ -516,57 +575,15 @@ impl Agent {
                 }
             };
 
-            // Task leads get Management + Universal tools from parent
-            let mut tl_tools: Vec<Arc<dyn Tool>> = self
-                .tools
-                .iter()
-                .filter(|t| t.name() != "spawn_agent")
-                .filter(|t| matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal))
-                .cloned()
-                .collect();
-
-            // Give TaskLead direct cli_agent access for delegation.
-            let root_tools = self.root_tools.as_ref().unwrap_or(&self.tools);
-            let has_cli_agent = if let Some(cli_tool) = root_tools
-                .iter()
-                .find(|t| t.name() == "cli_agent" && t.is_available())
-            {
-                if !tl_tools.iter().any(|t| t.name() == "cli_agent") {
-                    tl_tools.push(cli_tool.clone());
-                }
-                true
-            } else {
-                false
-            };
-
-            // Add ManageGoalTasksTool scoped to this goal
-            tl_tools.push(Arc::new(crate::tools::ManageGoalTasksTool::new(
-                goal_id.to_string(),
-                self.state.clone(),
-            )));
-
-            // Read goal context for feed-forward (Phase 4)
-            let goal_context = self
-                .state
-                .get_goal(goal_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|g| g.context);
-
-            let system_prompt = Self::build_task_lead_prompt(
-                goal_id,
-                user_text,
-                goal_context.as_deref(),
-                child_depth,
-                self.max_depth,
-                has_cli_agent,
-            );
-
-            let task_text = format!(
-                "Plan and execute this goal by creating tasks and delegating to executors:\n\n{}",
-                user_text
-            );
+            let full_tools = self.collect_full_child_tools();
+            let TaskLeadSpec {
+                tools,
+                system_prompt,
+                root_tools,
+                input_text,
+            } = self
+                .build_task_lead_spec(&full_tools, goal_id, user_text, child_depth, true)
+                .await;
             let mission = format!(
                 "Task Lead for goal: {}",
                 &goal_description[..goal_description.len().min(100)]
@@ -593,7 +610,7 @@ impl Agent {
                         SubAgentSpawnData {
                             child_session_id: child_session.clone(),
                             mission: mission.clone(),
-                            task: task_text.chars().take(500).collect(),
+                            task: input_text.chars().take(500).collect(),
                             depth: child_depth as u32,
                             parent_task_id: None,
                         },
@@ -602,83 +619,27 @@ impl Agent {
             }
 
             let start = std::time::Instant::now();
-
-            // Task lead can spawn executors, so give it a SpawnAgentTool
-            let spawn_tool = Arc::new(
-                crate::tools::spawn::SpawnAgentTool::new_deferred(
-                    self.max_response_chars,
-                    self.timeout_secs,
+            let child_cancel_token = self.resolve_task_lead_cancel_token(goal_id).await;
+            let child = self
+                .create_child_agent(
+                    tools,
+                    model,
+                    system_prompt,
+                    child_depth,
+                    AgentRole::TaskLead,
+                    None,                      // task_id (task leads aren't executors)
+                    Some(goal_id.to_string()), // goal_id (context injection for child)
+                    child_cancel_token,
+                    Some(root_tools), // root_tools for Executor inheritance
+                    true,
+                    None,
                 )
-                .with_state(self.state.clone()),
-            );
-            tl_tools.push(spawn_tool.clone());
-
-            // Get a child cancellation token from the goal's token
-            let child_cancel_token = if let Some(ref registry) = self.goal_token_registry {
-                registry.child_token(goal_id).await
-            } else {
-                None
-            };
-
-            // Collect root tools (full unfiltered set) for Executor inheritance.
-            // Use parent's root_tools if available, otherwise parent's full tool set.
-            let root_tools_for_tl: Vec<Arc<dyn Tool>> = self
-                .root_tools
-                .as_ref()
-                .unwrap_or(&self.tools)
-                .iter()
-                .filter(|t| t.name() != "spawn_agent")
-                .cloned()
-                .collect();
-
-            let child = Arc::new(Agent::with_depth(
-                self.llm_runtime.clone(),
-                self.state.clone(),
-                self.event_store.clone(),
-                tl_tools,
-                model,
-                system_prompt,
-                self.config_path.clone(),
-                self.skills_dir.clone(),
-                child_depth,
-                self.max_depth,
-                self.iteration_config.clone(),
-                self.max_iterations,
-                self.max_iterations_cap,
-                self.max_response_chars,
-                self.timeout_secs,
-                self.max_facts,
-                self.task_timeout,
-                self.task_token_budget,
-                self.llm_call_timeout,
-                self.mcp_registry.clone(),
-                self.verification_tracker.clone(),
-                AgentRole::TaskLead,
-                None,                             // task_id (task leads aren't executors)
-                Some(goal_id.to_string()),        // goal_id (context injection for child)
-                child_cancel_token,               // cancel_token (derived from goal token)
-                self.goal_token_registry.clone(), // goal_token_registry
-                match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => {
-                        warn!("Timed out acquiring hub lock while spawning task lead");
-                        None
-                    }
-                }, // hub
-                self.schedule_approved_sessions.clone(),
-                self.record_decision_points,
-                self.context_window_config.clone(),
-                self.policy_config.clone(),
-                self.path_aliases.clone(),
-                Some(root_tools_for_tl), // root_tools for Executor inheritance
-            ));
-
-            spawn_tool.set_agent(Arc::downgrade(&child));
+                .await;
 
             let result = child
                 .handle_message(
                     &child_session,
-                    &task_text,
+                    &input_text,
                     status_tx,
                     user_role,
                     channel_ctx,
@@ -770,6 +731,9 @@ impl Agent {
                  You have direct access to `cli_agent` (a specialized coding/research agent running on this machine).\n\
                  Prefer `cli_agent` for execution-heavy tasks (coding, analysis, file work, command workflows).\n\
                  Use `spawn_agent` only when work specifically needs aidaemon-only tools like memory/people/MCP.\n\
+                 When calling `cli_agent`, use `action=\"run\"` and include a non-empty `prompt` describing the work.\n\
+                 Pass `working_dir` whenever the task targets a specific repo or directory.\n\
+                 Example: `cli_agent(action=\"run\", prompt=\"Inspect the latest service logs, patch the root cause, run cargo fmt, and run the narrowest relevant tests\", working_dir=\"/absolute/project/path\")`.\n\
                  Note: Executor sub-agents have `terminal`, `read_file`, `write_file`, `edit_file`, and `search_files` available alongside `cli_agent`.",
             );
         }
@@ -880,6 +844,7 @@ impl Agent {
         if has_cli_agent {
             prompt.push_str(
                 "\n- `cli_agent` is available for multi-step coding, research, and file work.\n\
+                 If you use it, always provide `action=\"run\"`, a concrete `prompt`, and `working_dir` when you know the repo path.\n\
                  For simple operations (single commands, file reads), prefer `terminal` directly.",
             );
         }
@@ -947,6 +912,8 @@ mod tests {
         let prompt = Agent::build_executor_prompt("refactor auth", "user request", 2, 4, true);
         assert!(prompt.contains("`cli_agent` is available"));
         assert!(prompt.contains("prefer `terminal` directly"));
+        assert!(prompt.contains("action=\"run\""));
+        assert!(prompt.contains("working_dir"));
     }
 
     #[test]
@@ -954,5 +921,7 @@ mod tests {
         let prompt = Agent::build_task_lead_prompt("goal_2", "build release", None, 1, 3, true);
         assert!(prompt.contains("## CLI Agent Delegation"));
         assert!(prompt.contains("Prefer `cli_agent`"));
+        assert!(prompt.contains("action=\"run\""));
+        assert!(prompt.contains("working_dir"));
     }
 }

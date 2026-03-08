@@ -766,7 +766,7 @@ impl Tool for ManageApiTool {
                     },
                     "service": {
                         "type": "string",
-                        "description": "Service/profile name"
+                        "description": "Service name"
                     },
                     "auth_mode": {
                         "type": "string",
@@ -780,11 +780,11 @@ impl Tool for ManageApiTool {
                     },
                     "header_name": {
                         "type": "string",
-                        "description": "Required for header auth"
+                        "description": "Header name for header auth"
                     },
                     "username": {
                         "type": "string",
-                        "description": "Required for basic auth"
+                        "description": "Username for basic auth"
                     },
                     "user_id": {
                         "type": "string",
@@ -817,33 +817,33 @@ impl Tool for ManageApiTool {
                     },
                     "connect": {
                         "type": "boolean",
-                        "description": "Run connect now (default true)"
+                        "description": "Connect now; default true"
                     },
                     "docs_url": {
                         "type": "string",
-                        "description": "Official HTTPS docs URL or bare API URL"
+                        "description": "HTTPS docs URL or API URL"
                     },
                     "openapi_url": {
                         "type": "string",
-                        "description": "Official HTTPS OpenAPI/Swagger URL"
+                        "description": "HTTPS OpenAPI or Swagger URL"
                     },
                     "learn_url": {
                         "type": "string",
-                        "description": "Generic HTTPS docs/spec/base URL"
+                        "description": "HTTPS docs, spec, or base URL"
                     },
                     "learn_kind": {
                         "type": "string",
                         "enum": ["auto", "openapi", "docs"],
-                        "description": "Force learning mode"
+                        "description": "Learning mode"
                     },
                     "verify_url": {
                         "type": "string",
-                        "description": "Optional safe read-only probe URL"
+                        "description": "Optional safe probe URL"
                     },
                     "verify_method": {
                         "type": "string",
                         "enum": ["GET", "HEAD"],
-                        "description": "Safe probe method"
+                        "description": "Probe method"
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -856,6 +856,10 @@ impl Tool for ManageApiTool {
         })
     }
 
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.call_with_status(arguments, None).await
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,
@@ -864,10 +868,6 @@ impl Tool for ManageApiTool {
             idempotent: false,
             high_impact_write: true,
         }
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.call_with_status(arguments, None).await
     }
 
     async fn call_with_status(

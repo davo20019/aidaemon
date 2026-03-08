@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::traits::{Tool, ToolCapabilities, ToolRole};
+use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind};
 
 use super::fs_utils;
 
@@ -57,6 +57,22 @@ impl Tool for WriteFileTool {
             idempotent: false,
             high_impact_write: true,
         }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let path = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                for key in ["path", "file_path", "file", "filename"] {
+                    if let Some(path) = args.get(key).and_then(|value| value.as_str()) {
+                        return Some(path.to_string());
+                    }
+                }
+                None
+            })
+            .unwrap_or_default();
+
+        ToolCallSemantics::mutation().with_target_hint(ToolTargetHintKind::Path, path)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

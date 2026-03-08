@@ -254,14 +254,14 @@ impl Tool for ManageMemoriesTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_memories",
-            "description": "Manage memories, goals, and scheduled goals. Prefer this over terminal/SQLite for scheduling.",
+            "description": "Manage memories, goals, and scheduled goals.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["list", "forget", "set_privacy", "search", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled"],
-                        "description": "Action. List scheduled goals first before schedule-specific changes."
+                        "description": "Action"
                     },
                     "limit": {
                         "type": "integer",
@@ -295,7 +295,7 @@ impl Tool for ManageMemoriesTool {
                     },
                     "goal_id": {
                         "type": "string",
-                        "description": "Goal ID; for cancel_scheduled also supports all/*"
+                        "description": "Goal ID; cancel_scheduled also accepts all/*"
                     },
                     "schedule_id": {
                         "type": "string",
@@ -328,16 +328,6 @@ impl Tool for ManageMemoriesTool {
                 "additionalProperties": false
             }
         })
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -1688,6 +1678,16 @@ impl Tool for ManageMemoriesTool {
                 Ok(out)
             }
             other => Ok(format!("Unknown action: '{}'. Use list, forget, set_privacy, search, create_personal_goal, list_goals, complete_goal, abandon_goal, create_scheduled_goal, list_scheduled, list_scheduled_matching, add_schedule, cancel_scheduled, pause_scheduled, resume_scheduled, retry_scheduled, retry_failed_scheduled, cancel_scheduled_matching, retry_scheduled_matching, or diagnose_scheduled.", other)),
+        }
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
         }
     }
 }

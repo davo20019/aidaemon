@@ -40,8 +40,10 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
             // Filter by channel: include episodes from same channel or legacy (no channel_id)
             let ep_channel_id: Option<String> = row.try_get("channel_id").unwrap_or(None);
             let include = match (&ep_channel_id, channel_id) {
-                (None, _) => true,                                      // Legacy episodes: include
-                (Some(ep_ch), Some(current_ch)) => ep_ch == current_ch, // Same channel
+                (None, _) => true, // Legacy episodes: include
+                (Some(ep_ch), Some(current_ch)) => {
+                    crate::session::stored_channel_matches_current(ep_ch, current_ch)
+                }
                 (Some(_), None) => false, // Has channel but no current: skip
             };
             if !include {

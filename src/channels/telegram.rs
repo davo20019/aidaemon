@@ -4364,6 +4364,7 @@ impl TelegramChannel {
 
         // Use chat ID as session ID, prefixed with bot name if multi-bot
         let session_id = self.session_id(msg.chat.id.0).await;
+        let channel_id = crate::session::derive_channel_id_from_session(&session_id);
 
         // Register this session with the channel hub so outbound messages
         // (approvals, media, notifications) route back to this Telegram bot.
@@ -4400,7 +4401,7 @@ impl TelegramChannel {
                 visibility,
                 platform: "telegram".to_string(),
                 channel_name: msg.chat.title().map(|s| s.to_string()),
-                channel_id: Some(format!("telegram:{}", msg.chat.id.0)),
+                channel_id,
                 sender_name: msg.from.as_ref().map(|u| match &u.last_name {
                     Some(last) => format!("{} {}", u.first_name, last),
                     None => u.first_name.clone(),

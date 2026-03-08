@@ -50,6 +50,7 @@ pub(super) struct ConsultantPhaseCtx<'a> {
     pub pending_background_ack: &'a mut Option<String>,
     pub pending_external_action_ack: &'a mut Option<String>,
     pub require_file_recheck_before_answer: &'a mut bool,
+    pub completion_progress: &'a mut CompletionProgress,
     pub turn_context: &'a TurnContext,
     pub needs_tools_for_turn: &'a mut bool,
     pub force_text_response: bool,
@@ -129,6 +130,8 @@ impl Agent {
                 pending_background_ack: &mut *ctx.pending_background_ack,
                 pending_external_action_ack: &mut *ctx.pending_external_action_ack,
                 require_file_recheck_before_answer: &mut *ctx.require_file_recheck_before_answer,
+                completion_progress: &mut *ctx.completion_progress,
+                turn_context: ctx.turn_context,
                 needs_tools_for_turn: *ctx.needs_tools_for_turn,
                 force_text_response: ctx.force_text_response,
             })

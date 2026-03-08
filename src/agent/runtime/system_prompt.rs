@@ -397,7 +397,9 @@ impl Agent {
                 .unwrap_or_default(),
         };
 
-        // Personal goals, patterns, profile: still DM-only (deeply personal)
+        // Personal goals/profile remain DM-only. Operational failure patterns are
+        // safe to use more broadly because they encode agent-side recovery guidance,
+        // not user-private preferences.
         let goals = if inject_personal {
             self.state
                 .get_active_personal_goals(20)
@@ -406,13 +408,21 @@ impl Agent {
         } else {
             vec![]
         };
-        let patterns = if inject_personal {
+        let patterns = if matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal) {
+            vec![]
+        } else if inject_personal {
             self.state
                 .get_behavior_patterns(0.5)
                 .await
                 .unwrap_or_default()
         } else {
-            vec![]
+            self.state
+                .get_behavior_patterns(0.5)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|pattern| pattern.pattern_type == "failure")
+                .collect()
         };
         // Procedures, error solutions, and expertise are operational — always load
         // (except on PublicExternal where we restrict everything)

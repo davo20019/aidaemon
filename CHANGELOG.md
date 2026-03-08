@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.20] - 2026-03-08
+
+### Added
+
+- **Completion contracts and verification targets**: `history.rs` now infers task kind, observation requirements, and verification targets (URLs, paths, project scopes) for each turn, allowing the loop to track when work still needs a final read-only confirmation step.
+- **Structured tool-call semantics**: New `ToolCallSemantics`, `ToolCallOutcome`, target hints, and verification modes let tools report whether a call observed state, mutated state, or both. Added shell-command semantics classification for `run_command` and `terminal`.
+- **Project-scope inheritance and enforcement**: Turn context now extracts and normalizes project scopes from user text/history, injects `_project_scope` into delegated agents, and blocks out-of-scope tool calls unless multi-project work was explicitly requested.
+- **Goal failure summaries**: `fail_goal` now persists a `failure_summary`, and the agent can build failure notifications from stored summaries or failed task details.
+- **Deferred-no-tool recovery metrics**: New policy counters track forced tool-call retries, deferred-action detections, fallback model switches, and terminal deferred-no-tool error markers.
+
+### Changed
+
+- **Completion gating tightened**: Consultant completion now blocks success responses until required verification happens, or returns an explicit "verification pending" reply when tools are unavailable in the current phase.
+- **Goal completion guardrails**: `manage_goal_tasks(action="complete_goal")` now refuses summaries that admit partial progress or pending verification, while still requiring every concrete task to be resolved first.
+- **Tool execution plumbing upgraded**: Tool execution now propagates structured semantics/metadata, merges fallback semantics for legacy plain-text tools, and uses those semantics to update completion progress.
+- **Project path normalization**: Project-scope resolution now promotes nested directories to project roots and resolves configured project aliases consistently across follow-ups and delegated runs.
+
+### Fixed
+
+- **False-success replies after writes**: Requests that mutate files, URLs, or project state no longer claim completion before a matching verification step.
+- **Delegation scope spoofing**: Executor-spawned `_project_scope` arguments are now overwritten with the trusted parent scope instead of honoring model-supplied values.
+- **Pre-tool deferral loops**: Repeated "I'll do it" text-only replies before the first tool call now trigger a hard tool-call directive, a fallback-model retry window, and clearer blocker text when no tools are available.
+
 ## [0.9.19] - 2026-03-08
 
 ### Added

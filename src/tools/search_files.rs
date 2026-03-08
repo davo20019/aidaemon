@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
 
-use crate::traits::{Tool, ToolCapabilities, ToolRole};
+use crate::traits::{
+    Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
+};
 
 use super::fs_utils;
 
@@ -66,6 +68,21 @@ impl Tool for SearchFilesTool {
             idempotent: true,
             high_impact_write: false,
         }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let path = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                args.get("path")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+
+        ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent)
+            .with_target_hint(ToolTargetHintKind::Path, path)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

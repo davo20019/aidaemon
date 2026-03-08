@@ -246,6 +246,19 @@ impl ManageOAuthTool {
         )
     }
 
+    fn callback_access_warning(callback_url: &str) -> Option<String> {
+        let parsed = reqwest::Url::parse(callback_url).ok()?;
+        let host = parsed.host_str()?.trim().trim_matches(['[', ']']);
+        let is_local = matches!(host, "localhost" | "127.0.0.1" | "::1");
+        if !is_local {
+            return None;
+        }
+
+        Some(
+            "callback_url points at localhost. This OAuth flow must be completed in a browser on the same machine running aidaemon. It will not finish from a phone or another device unless you expose the callback server and set `oauth.callback_url` to a reachable public URL.".to_string(),
+        )
+    }
+
     async fn handle_providers(&self) -> anyhow::Result<String> {
         let doc = self.load_config_doc().await?;
         let custom_names: std::collections::HashSet<String> = Self::providers_table(&doc)
@@ -307,6 +320,12 @@ impl ManageOAuthTool {
             "custom"
         };
         let (client_id_cmd, client_secret_cmd) = Self::credential_commands(service);
+        let callback_url = self.gateway.callback_url();
+        let callback_warning = if provider.auth_type == OAuthType::OAuth2ClientCredentials {
+            None
+        } else {
+            Self::callback_access_warning(&callback_url)
+        };
 
         let mut lines = vec![
             format!("OAuth provider `{}`", service),
@@ -327,7 +346,7 @@ impl ManageOAuthTool {
                 if provider.auth_type == OAuthType::OAuth2ClientCredentials {
                     "(not used)".to_string()
                 } else {
-                    self.gateway.callback_url()
+                    callback_url
                 }
             ),
             format!("- allowed_domains: {}", provider.allowed_domains.join(", ")),
@@ -344,6 +363,10 @@ impl ManageOAuthTool {
                 if has_creds { "stored" } else { "missing" }
             ),
         ];
+
+        if let Some(warning) = callback_warning {
+            lines.push(format!("- note: {}", warning));
+        }
 
         if !has_creds {
             lines.push(String::new());
@@ -414,9 +437,15 @@ impl ManageOAuthTool {
 
         let (authorize_url, result_rx) =
             self.gateway.start_oauth2_flow(service, session_id).await?;
+        let callback_warning = Self::callback_access_warning(&self.gateway.callback_url());
 
         if let Some(ref tx) = status_tx {
-            let msg = format!("Click this link to authorize:\n{}", authorize_url);
+            let mut parts = Vec::new();
+            if let Some(warning) = &callback_warning {
+                parts.push(format!("Note: {}", warning));
+            }
+            parts.push(format!("Click this link to authorize:\n{}", authorize_url));
+            let msg = parts.join("\n\n");
             let _ = tx
                 .send(StatusUpdate::ToolProgress {
                     name: "manage_oauth".to_string(),
@@ -426,11 +455,23 @@ impl ManageOAuthTool {
         }
 
         match tokio::time::timeout(OAuthGateway::flow_timeout(), result_rx).await {
-            Ok(Ok(result)) => Ok(result.message),
-            Ok(Err(_)) => Ok("OAuth flow was cancelled.".to_string()),
+            Ok(Ok(result)) => Ok(match callback_warning {
+                Some(warning) => format!("Note: {}\n\n{}", warning, result.message),
+                None => result.message,
+            }),
+            Ok(Err(_)) => Ok(match callback_warning {
+                Some(warning) => format!("Note: {}\n\nOAuth flow was cancelled.", warning),
+                None => "OAuth flow was cancelled.".to_string(),
+            }),
             Err(_) => {
                 warn!(service = %service, "OAuth flow timed out");
-                Ok("OAuth flow timed out (10 minutes). Please try again.".to_string())
+                Ok(match callback_warning {
+                    Some(warning) => format!(
+                        "Note: {}\n\nOAuth flow timed out (10 minutes). Please try again.",
+                        warning
+                    ),
+                    None => "OAuth flow timed out (10 minutes). Please try again.".to_string(),
+                })
             }
         }
     }
@@ -1063,5 +1104,41 @@ allowed_domains = ["api.linear.app"]
         let env_content = std::fs::read_to_string(env_file.path()).unwrap();
         assert!(!env_content.contains("OAUTH_LINEAR_CLIENT_ID"));
         assert!(!env_content.contains("OAUTH_LINEAR_CLIENT_SECRET"));
+    }
+
+    #[test]
+    fn callback_access_warning_detects_localhost_callback_urls() {
+        let warning =
+            ManageOAuthTool::callback_access_warning("http://localhost:8080/oauth/callback")
+                .expect("localhost warning");
+        assert!(warning.contains("same machine running aidaemon"));
+
+        let warning =
+            ManageOAuthTool::callback_access_warning("http://127.0.0.1:8080/oauth/callback")
+                .expect("loopback warning");
+        assert!(warning.contains("reachable public URL"));
+
+        assert!(ManageOAuthTool::callback_access_warning(
+            "https://auth.example.com/oauth/callback"
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn describe_provider_surfaces_localhost_callback_warning() {
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        let (tool, gateway) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        gateway
+            .register_provider(crate::oauth::providers::get_builtin_provider("twitter").unwrap())
+            .await;
+
+        let result = tool
+            .call(r#"{"action":"describe_provider","service":"twitter"}"#)
+            .await
+            .unwrap();
+
+        assert!(result.contains("callback_url: http://localhost:8080/oauth/callback"));
+        assert!(result.contains("same machine running aidaemon"));
     }
 }

@@ -36,8 +36,8 @@ async fn test_orchestration_task_lead_flag_off_uses_agent_loop() {
         .await
         .unwrap();
     assert_eq!(goals.len(), 1, "Complex request should create a goal");
-    // Goal should be completed (task lead always-on, succeeds)
-    assert_eq!(goals[0].status, "completed");
+    // Text-only task-lead replies must not auto-complete the goal without finished tasks.
+    assert_eq!(goals[0].status, "active");
 }
 
 #[tokio::test]
@@ -72,7 +72,7 @@ async fn test_orchestration_task_lead_spawns_for_complex() {
         response
     );
 
-    // Goal should be created and completed (task lead succeeded)
+    // Goal should be created but remain active because no concrete tasks were completed.
     let goals = harness
         .state
         .get_goals_for_session("test_session")
@@ -80,8 +80,8 @@ async fn test_orchestration_task_lead_spawns_for_complex() {
         .unwrap();
     assert_eq!(goals.len(), 1, "Complex request should create a goal");
     assert_eq!(
-        goals[0].status, "completed",
-        "Goal should be completed after task lead succeeds"
+        goals[0].status, "active",
+        "Goal should not be auto-completed from text alone"
     );
 }
 
@@ -152,10 +152,7 @@ async fn test_orchestration_task_lead_claims_before_dispatch() {
             r#"{"action":"create_task","description":"Research the topic","task_order":1,"idempotent":true}"#,
         ),
         // Task lead lists tasks to check state
-        MockProvider::tool_call_response(
-            "manage_goal_tasks",
-            r#"{"action":"list_tasks"}"#,
-        ),
+        MockProvider::tool_call_response("manage_goal_tasks", r#"{"action":"list_tasks"}"#),
         // Task lead completes goal
         MockProvider::tool_call_response(
             "manage_goal_tasks",
@@ -324,4 +321,3 @@ async fn test_task_id_passed_to_executor() {
     );
     assert_eq!(props["task_id"]["type"], "string");
 }
-

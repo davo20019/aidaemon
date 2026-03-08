@@ -53,6 +53,25 @@ fn low_signal_task_lead_reply_allows_concrete_multiline_results() {
 }
 
 #[test]
+fn goal_completion_response_detects_verification_pending_reply() {
+    let reply = "I completed part of the request, but I haven't verified the final outcome yet.\n\nI need a final read-only check before I can claim success.";
+    assert!(goal_completion_response_indicates_incomplete_work(reply));
+}
+
+#[test]
+fn goal_completion_response_detects_deferred_action_reply() {
+    assert!(goal_completion_response_indicates_incomplete_work(
+        "I'll start building the website."
+    ));
+}
+
+#[test]
+fn goal_completion_response_allows_concrete_finished_reply() {
+    let reply = "I audited the disk usage and found 1.2G in /Users/me/projects/aidaemon/target.";
+    assert!(!goal_completion_response_indicates_incomplete_work(reply));
+}
+
+#[test]
 fn goal_task_results_summary_includes_recent_tasks_and_omission_count() {
     let tasks = vec![
         completed_task("task_1", "Step 1", "Result one", "2026-02-17T09:00:00Z", 1),

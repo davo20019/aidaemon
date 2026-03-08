@@ -276,12 +276,14 @@ impl Agent {
                 "Consultant pass: LLM attempted tool calls — forcing tools mode"
             );
             (false, true, false)
-        } else if analysis_defers_execution && intent_gate.needs_tools.is_none() {
-            // Fallback: if the model omitted needs_tools but its analysis still promises
-            // concrete future actions, force tool mode rather than trusting missing fields.
+        } else if analysis_defers_execution {
+            // Strong semantic override: if the model's own analysis promises future
+            // concrete actions ("I'll search", "Let me inspect", "I will run"),
+            // trust the behavior over any no-tools classification.
             info!(
                 session_id,
-                "Consultant pass: deferred-action text but needs_tools was omitted — forcing tools mode"
+                model_needs_tools = ?intent_gate.needs_tools,
+                "Consultant pass: deferred-action text overrides no-tools classification — forcing tools mode"
             );
             (false, true, false)
         } else {

@@ -429,7 +429,12 @@ async fn test_scheduled_goal_tool_calls_are_marked_trusted() {
     .await
     .unwrap();
 
-    let mut goal = Goal::new_continuous("Scheduled trust test", "scheduled_trust_session", None, None);
+    let mut goal = Goal::new_continuous(
+        "Scheduled trust test",
+        "scheduled_trust_session",
+        None,
+        None,
+    );
     goal.status = "active".to_string();
     harness.state.create_goal(&goal).await.unwrap();
 
@@ -459,6 +464,178 @@ async fn test_scheduled_goal_tool_calls_are_marked_trusted() {
             None,
             UserRole::Owner,
             ChannelContext::internal(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "done");
+    assert_eq!(*seen.lock().await, vec![true]);
+}
+
+#[tokio::test]
+async fn test_scheduled_goal_executor_tool_calls_inherit_trust_from_goal() {
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("trust_probe", "{}"),
+        MockProvider::text_response("done"),
+    ]);
+
+    let mut harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(TrustProbeTool::new(seen.clone())) as Arc<dyn crate::traits::Tool>],
+        None,
+    )
+    .await
+    .unwrap();
+
+    harness.agent.set_test_executor_mode();
+
+    let mut goal = Goal::new_continuous(
+        "Scheduled executor trust test",
+        "scheduled_executor_trust_session",
+        None,
+        None,
+    );
+    goal.status = "active".to_string();
+    harness.state.create_goal(&goal).await.unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = crate::traits::GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 * * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("hourly".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    harness.state.create_goal_schedule(&schedule).await.unwrap();
+
+    let child_task = crate::traits::Task {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        description: "Post the composed tweet to Twitter/X".to_string(),
+        status: "pending".to_string(),
+        priority: "medium".to_string(),
+        task_order: 1,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: true,
+        retry_count: 0,
+        max_retries: 1,
+        created_at: now.clone(),
+        started_at: None,
+        completed_at: None,
+    };
+    harness.state.create_task(&child_task).await.unwrap();
+
+    harness.agent.set_test_goal_id(None);
+    harness.agent.set_test_task_id(Some(child_task.id.clone()));
+
+    let response = harness
+        .agent
+        .handle_message(
+            "scheduled_executor_trust_session",
+            "Run the executor task",
+            None,
+            UserRole::Owner,
+            ChannelContext::internal(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "done");
+    assert_eq!(*seen.lock().await, vec![true]);
+}
+
+#[tokio::test]
+async fn test_scheduled_goal_spawned_executor_tool_calls_inherit_trust_from_goal() {
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("trust_probe", "{}"),
+        MockProvider::text_response("done"),
+    ]);
+
+    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(TrustProbeTool::new(seen.clone())) as Arc<dyn crate::traits::Tool>],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut goal = Goal::new_continuous(
+        "Scheduled spawned executor trust test",
+        "scheduled_spawned_executor_trust_session",
+        None,
+        None,
+    );
+    goal.status = "active".to_string();
+    harness.state.create_goal(&goal).await.unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = crate::traits::GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 * * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("hourly".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    harness.state.create_goal_schedule(&schedule).await.unwrap();
+
+    let child_task = crate::traits::Task {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        description: "Post the composed tweet to Twitter/X".to_string(),
+        status: "pending".to_string(),
+        priority: "medium".to_string(),
+        task_order: 1,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: true,
+        retry_count: 0,
+        max_retries: 1,
+        created_at: now.clone(),
+        started_at: None,
+        completed_at: None,
+    };
+    harness.state.create_task(&child_task).await.unwrap();
+
+    let agent = Arc::new(harness.agent);
+    let response = agent
+        .spawn_child(
+            "Post the scheduled tweet",
+            "Post the scheduled tweet",
+            None,
+            ChannelContext::internal(),
+            UserRole::Owner,
+            Some(crate::traits::AgentRole::Executor),
+            Some(goal.id.as_str()),
+            Some(child_task.id.as_str()),
             None,
         )
         .await
@@ -519,7 +696,12 @@ async fn test_scheduled_goal_daily_budget_is_backstop_only_during_active_run() {
     let mut harness = setup_test_agent(provider).await.unwrap();
     harness.agent.set_test_executor_mode();
 
-    let mut goal = Goal::new_continuous("Scheduled build task", "scheduled_goal_budget_session", None, None);
+    let mut goal = Goal::new_continuous(
+        "Scheduled build task",
+        "scheduled_goal_budget_session",
+        None,
+        None,
+    );
     goal.status = "active".to_string();
     goal.budget_daily = Some(60);
     goal.budget_per_check = Some(500);

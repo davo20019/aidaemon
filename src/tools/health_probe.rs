@@ -82,7 +82,7 @@ impl Tool for HealthProbeTool {
                     },
                     "target": {
                         "type": "string",
-                        "description": "Target URL, host:port, command, or path"
+                        "description": "URL, host:port, command, or path"
                     },
                     "schedule": {
                         "type": "string",
@@ -106,7 +106,7 @@ impl Tool for HealthProbeTool {
                             },
                             "expected_body": {
                                 "type": "string",
-                                "description": "Expected body substring"
+                                "description": "Expected body text"
                             },
                             "method": {
                                 "type": "string",
@@ -118,7 +118,7 @@ impl Tool for HealthProbeTool {
                             },
                             "expected_exit_code": {
                                 "type": "integer",
-                                "description": "Expected command exit code"
+                                "description": "Expected exit code"
                             }
                         },
                         "additionalProperties": false
@@ -146,16 +146,6 @@ impl Tool for HealthProbeTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: HealthProbeArgs = serde_json::from_str(arguments)?;
 
@@ -171,6 +161,16 @@ impl Tool for HealthProbeTool {
                 "Unknown action '{}'. Use: create, list, delete, pause, resume, run_now, status",
                 other
             )),
+        }
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: false,
         }
     }
 }

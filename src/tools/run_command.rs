@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::traits::{Tool, ToolCapabilities, ToolRole};
+use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolRole};
 
+use super::command_semantics::classify_shell_command;
 use super::daemon_guard::detect_daemonization_primitives;
 use super::fs_utils;
 
@@ -149,6 +150,18 @@ impl Tool for RunCommandTool {
             idempotent: false,
             high_impact_write: true,
         }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("command")
+                    .and_then(|command| command.as_str())
+                    .map(classify_shell_command)
+            })
+            .unwrap_or_else(ToolCallSemantics::mutation)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

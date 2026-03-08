@@ -769,7 +769,9 @@ impl crate::traits::FactStore for SqliteStateStore {
                     }
                 }
                 FactPrivacy::Channel => match (channel_id, &f.channel_id) {
-                    (Some(current), Some(fact_ch)) => current == fact_ch,
+                    (Some(current), Some(fact_ch)) => {
+                        crate::session::stored_channel_matches_current(fact_ch, current)
+                    }
                     (None, None) => true,
                     _ => false,
                 },
@@ -894,10 +896,8 @@ impl crate::traits::FactStore for SqliteStateStore {
              WHERE superseded_at IS NULL
                AND privacy = 'channel'
                AND channel_id IS NOT NULL
-               AND channel_id != ?
              ORDER BY updated_at DESC",
         )
-        .bind(current_channel_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -905,7 +905,21 @@ impl crate::traits::FactStore for SqliteStateStore {
             return Ok(vec![]);
         }
 
-        let facts: Vec<Fact> = rows.iter().map(Self::row_to_fact).collect();
+        let filtered_rows: Vec<_> = rows
+            .into_iter()
+            .filter(|row| {
+                row.try_get::<Option<String>, _>("channel_id")
+                    .ok()
+                    .flatten()
+                    .is_some_and(|stored_channel| {
+                        !crate::session::stored_channel_matches_current(
+                            &stored_channel,
+                            current_channel_id,
+                        )
+                    })
+            })
+            .collect();
+        let facts: Vec<Fact> = filtered_rows.iter().map(Self::row_to_fact).collect();
 
         // Apply semantic filtering using stored embeddings
         let query_vec = match self.embedding_service.embed(query.to_string()).await {
@@ -914,7 +928,7 @@ impl crate::traits::FactStore for SqliteStateStore {
         };
 
         let mut scored: Vec<(usize, f32)> = Vec::new();
-        for (i, row) in rows.iter().enumerate() {
+        for (i, row) in filtered_rows.iter().enumerate() {
             let embedding: Option<Vec<u8>> = row.get("embedding");
             if let Some(blob) = embedding {
                 if let Ok(vec) = decode_embedding(&blob) {

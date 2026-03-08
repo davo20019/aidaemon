@@ -31,6 +31,7 @@ use crate::providers::{ProviderError, ProviderErrorKind};
 use crate::router::{self, Router};
 use crate::skills::{self, MemoryContext};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
+use crate::tools::goal_completion_summary_indicates_not_finished;
 use crate::tools::VerificationTracker;
 use crate::traits::{
     AgentRole, ChatOptions, Goal, Message, ModelProvider, ScheduledRunState, StateStore, Task,
@@ -141,8 +142,13 @@ mod consultant_phase;
 mod graceful;
 #[path = "runtime/history.rs"]
 mod history;
+pub(in crate::agent) use history::CompletionContract;
+pub(in crate::agent) use history::CompletionProgress;
+pub(in crate::agent) use history::CompletionTaskKind;
 pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::TurnContext;
+pub(in crate::agent) use history::VerificationTarget;
+pub(in crate::agent) use history::VerificationTargetKind;
 #[path = "runtime/llm.rs"]
 mod llm;
 #[path = "loop/llm_phase.rs"]
@@ -1462,6 +1468,8 @@ pub struct Agent {
     policy_config: PolicyConfig,
     /// Configured path alias roots (for example, `projects/...`).
     path_aliases: PathAliasConfig,
+    /// Parent scope carried into spawned child agents.
+    inherited_project_scope: Option<String>,
     /// Full tool list from the root agent — used by TaskLead when spawning
     /// Executor children so they can access Action tools that were filtered
     /// out of the TaskLead's own `tools` vec.
@@ -1613,6 +1621,37 @@ fn is_scheduled_task_description(text: &str) -> bool {
         || trimmed.starts_with("manual scheduled run:")
 }
 
+fn user_facing_task_description(description: &str) -> String {
+    static SCHEDULED_TASK_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?i)^\s*(?:execute scheduled goal:|scheduled check:|manual scheduled run:)\s*")
+            .expect("scheduled task prefix regex should compile")
+    });
+    static SCHEDULED_SYSTEM_SUFFIX_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?i)\s*\[system:[^\]]*\]\s*$")
+            .expect("scheduled task suffix regex should compile")
+    });
+
+    let mut cleaned = description.trim().to_string();
+    if is_scheduled_task_description(&cleaned) {
+        cleaned = SCHEDULED_SYSTEM_SUFFIX_RE
+            .replace(&cleaned, "")
+            .trim()
+            .to_string();
+        cleaned = SCHEDULED_TASK_PREFIX_RE
+            .replace(&cleaned, "")
+            .trim()
+            .to_string();
+    }
+
+    let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(&cleaned);
+    let collapsed = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        "current task".to_string()
+    } else {
+        collapsed
+    }
+}
+
 async fn task_has_scheduled_provenance(state: &Arc<dyn StateStore>, task_id: Option<&str>) -> bool {
     if let Some(tid) = task_id {
         if let Ok(Some(task)) = state.get_task(tid).await {
@@ -1752,14 +1791,108 @@ fn is_low_signal_task_lead_reply(text: &str) -> bool {
     false
 }
 
-fn truncate_goal_result_text(text: &str, max_chars: usize) -> String {
+pub(crate) fn goal_completion_response_indicates_incomplete_work(text: &str) -> bool {
     let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    goal_completion_summary_indicates_not_finished(trimmed)
+        || is_low_signal_task_lead_reply(trimmed)
+        || (looks_like_deferred_action_response(trimmed)
+            && !is_substantive_text_response(trimmed, 200))
+}
+
+fn truncate_goal_result_text(text: &str, max_chars: usize) -> String {
+    let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(text);
+    let trimmed = sanitized.trim();
     let truncated: String = trimmed.chars().take(max_chars).collect();
     if trimmed.chars().count() > max_chars {
         format!("{truncated}...")
     } else {
         truncated
     }
+}
+
+fn goal_failure_summary_from_context(goal: &Goal) -> Option<String> {
+    goal.context
+        .as_deref()
+        .and_then(|ctx| serde_json::from_str::<serde_json::Value>(ctx).ok())
+        .and_then(|ctx| {
+            ctx.get("failure_summary")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .map(|summary| summary.trim().to_string())
+        .filter(|summary| !summary.is_empty())
+}
+
+fn latest_problem_task_summary(tasks: &[Task]) -> Option<String> {
+    tasks
+        .iter()
+        .filter(|task| matches!(task.status.as_str(), "failed" | "blocked"))
+        .max_by(|a, b| {
+            let a_key = a
+                .completed_at
+                .as_deref()
+                .or(a.started_at.as_deref())
+                .unwrap_or(a.created_at.as_str());
+            let b_key = b
+                .completed_at
+                .as_deref()
+                .or(b.started_at.as_deref())
+                .unwrap_or(b.created_at.as_str());
+            a_key
+                .cmp(b_key)
+                .then_with(|| a.task_order.cmp(&b.task_order))
+                .then_with(|| a.id.cmp(&b.id))
+        })
+        .and_then(|task| {
+            let detail = task
+                .result
+                .as_deref()
+                .or(task.error.as_deref())
+                .or(task.blocker.as_deref())
+                .map(str::trim)
+                .filter(|detail| !detail.is_empty())?;
+            Some(format!(
+                "{}: {}",
+                task.description,
+                truncate_goal_result_text(detail, 1000)
+            ))
+        })
+}
+
+pub(crate) fn build_goal_failure_summary(
+    goal: Option<&Goal>,
+    tasks: &[Task],
+    task_lead_response: Option<&str>,
+    task_lead_error: Option<&str>,
+) -> String {
+    let mut summary = goal
+        .and_then(goal_failure_summary_from_context)
+        .or_else(|| {
+            task_lead_response
+                .map(str::trim)
+                .filter(|reply| !is_low_signal_task_lead_reply(reply))
+                .filter(|reply| !reply.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| latest_problem_task_summary(tasks))
+        .or_else(|| {
+            task_lead_error
+                .map(str::trim)
+                .filter(|err| !err.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| goal.map(|g| g.description.clone()))
+        .unwrap_or_else(|| "task lead exited without completing all tasks".to_string());
+
+    if summary.to_ascii_lowercase().starts_with("goal failed:") {
+        summary = summary["Goal failed:".len()..].trim().to_string();
+    }
+
+    truncate_goal_result_text(&summary, 3500)
 }
 
 /// Build a user-facing summary from successful task results.
@@ -1775,7 +1908,7 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
         .collect();
 
     if successful.is_empty() {
-        return fallback.chars().take(4000).collect();
+        return truncate_goal_result_text(fallback, 4000);
     }
 
     successful.sort_by(|a, b| {
@@ -1808,7 +1941,7 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
         .collect();
 
     if sections.is_empty() {
-        return fallback.chars().take(4000).collect();
+        return truncate_goal_result_text(fallback, 4000);
     }
 
     let omitted = successful.len().saturating_sub(selected.len());
@@ -1983,11 +2116,11 @@ pub fn spawn_background_task_lead(
                         .filter(|t| t.status == "claimed" || t.status == "running")
                         .count();
                     let total = tasks.len();
-                    let in_progress: Vec<&str> = tasks
+                    let in_progress: Vec<String> = tasks
                         .iter()
                         .filter(|t| t.status == "claimed" || t.status == "running")
                         .take(2)
-                        .map(|t| t.description.as_str())
+                        .map(|t| user_facing_task_description(&t.description))
                         .collect();
                     let progress_msg = if in_progress.is_empty() && completed == total {
                         format!("⏳ Progress: {}/{} steps completed", completed, total)
@@ -2115,6 +2248,7 @@ pub fn spawn_background_task_lead(
                 fallback_user_role,
                 Some(AgentRole::TaskLead),
                 Some(goal_id.as_str()),
+                None,
                 None,
             )
             .await;
@@ -2329,6 +2463,7 @@ pub fn spawn_background_task_lead(
                             Some(AgentRole::Executor),
                             Some(goal_id.as_str()),
                             Some(task.id.as_str()),
+                            None,
                         )
                         .await;
 
@@ -2690,11 +2825,15 @@ pub fn spawn_background_task_lead(
                     None, // no specific role — gets full tool access
                     None, // no goal_id — prevents goal re-entry
                     None,
+                    None,
                 )
                 .await;
 
             match fallback_result {
-                Ok(response) if !response.trim().is_empty() => {
+                Ok(response)
+                    if !response.trim().is_empty()
+                        && !goal_completion_response_indicates_incomplete_work(&response) =>
+                {
                     // Direct handling succeeded — update goal to completed
                     if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
                         g.status = "completed".to_string();
@@ -2707,7 +2846,20 @@ pub fn spawn_background_task_lead(
                         "completed",
                         format!(
                             "Goal completed: {}",
-                            response.chars().take(4000).collect::<String>()
+                            truncate_goal_result_text(&response, 4000)
+                        ),
+                    )
+                }
+                Ok(response) if !response.trim().is_empty() => {
+                    info!(
+                        goal_id = %goal_id,
+                        "Direct fallback returned an incomplete/unverified response"
+                    );
+                    (
+                        "failed",
+                        format!(
+                            "I made some progress, but I couldn't verify the final outcome:\n\n{}",
+                            truncate_goal_result_text(&response, 3500)
                         ),
                     )
                 }
@@ -2738,6 +2890,8 @@ pub fn spawn_background_task_lead(
                 }
             }
         } else {
+            let completed_tasks = state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
+            let task_lead_error = result.as_ref().err().map(|e| e.to_string());
             match status {
                 "completed" => {
                     if any_executor_results_sent {
@@ -2752,8 +2906,6 @@ pub fn spawn_background_task_lead(
                         ("completed", format!("Goal completed: {}", desc_preview))
                     } else {
                         // No inline results sent — include full task results in notification.
-                        let completed_tasks =
-                            state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
                         let fallback_summary = match &result {
                             Ok(r) => r.as_str(),
                             Err(_) => "All tasks completed.",
@@ -2806,6 +2958,18 @@ pub fn spawn_background_task_lead(
                         }
                     }
                 }
+                "failed" => (
+                    "failed",
+                    format!(
+                        "Goal failed: {}",
+                        build_goal_failure_summary(
+                            final_goal.as_ref().ok().and_then(|g| g.as_ref()),
+                            &completed_tasks,
+                            task_lead_response.as_deref(),
+                            task_lead_error.as_deref(),
+                        )
+                    ),
+                ),
                 "cancelled" => ("completed", "Goal was cancelled.".to_string()),
                 "stalled" => (
                     "failed",
@@ -2818,13 +2982,12 @@ pub fn spawn_background_task_lead(
                     "failed",
                     format!(
                         "Goal failed: {}",
-                        result
-                            .as_ref()
-                            .err()
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| {
-                                "task lead exited without completing all tasks".to_string()
-                            })
+                        build_goal_failure_summary(
+                            final_goal.as_ref().ok().and_then(|g| g.as_ref()),
+                            &completed_tasks,
+                            task_lead_response.as_deref(),
+                            task_lead_error.as_deref(),
+                        )
                     ),
                 ),
             }
@@ -2903,6 +3066,7 @@ impl Agent {
         context_window_config: crate::config::ContextWindowConfig,
         policy_config: PolicyConfig,
         path_aliases: PathAliasConfig,
+        inherited_project_scope: Option<String>,
     ) -> Self {
         init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
         let fallback = if let Some(router) = llm_runtime.router() {
@@ -2974,6 +3138,7 @@ impl Agent {
             context_window_config,
             policy_config,
             path_aliases,
+            inherited_project_scope,
             root_tools: None, // Root agent — its own tools ARE the root tools
             record_decision_points,
         }
@@ -2996,6 +3161,12 @@ impl Agent {
     }
 
     #[cfg(test)]
+    pub fn set_test_task_lead_mode(&mut self) {
+        self.depth = 1;
+        self.role = AgentRole::TaskLead;
+    }
+
+    #[cfg(test)]
     pub fn set_test_task_token_budget(&mut self, budget: Option<u64>) {
         self.task_token_budget = budget;
     }
@@ -3014,6 +3185,11 @@ impl Agent {
     #[cfg(test)]
     pub fn set_test_goal_id(&mut self, goal_id: Option<String>) {
         self.goal_id = goal_id;
+    }
+
+    #[cfg(test)]
+    pub fn set_test_task_id(&mut self, task_id: Option<String>) {
+        self.task_id = task_id;
     }
 
     #[cfg(test)]
@@ -3062,6 +3238,7 @@ impl Agent {
         context_window_config: crate::config::ContextWindowConfig,
         policy_config: PolicyConfig,
         path_aliases: PathAliasConfig,
+        inherited_project_scope: Option<String>,
         root_tools: Option<Vec<Arc<dyn Tool>>>,
     ) -> Self {
         let fallback = llm_runtime
@@ -3105,6 +3282,7 @@ impl Agent {
             context_window_config,
             policy_config,
             path_aliases,
+            inherited_project_scope,
             root_tools,
             record_decision_points,
         }
@@ -3210,18 +3388,7 @@ impl Agent {
     /// Channels pass `Some(heartbeat)` so the typing indicator can detect stalls;
     /// sub-agents, triggers, and tests pass `None`.
     fn sanitize_final_reply_markers(reply: &str) -> String {
-        let prior_turn_cleaned = reply
-            .replace(" [prior turn, truncated]", "")
-            .replace(" [prior turn]", "")
-            .replace("[prior turn, truncated]", "")
-            .replace("[prior turn]", "");
-        // First pass: strip entire diagnostic/control blocks (tag + content).
-        let blocks_cleaned = crate::tools::sanitize::strip_diagnostic_blocks(&prior_turn_cleaned);
-        // Second pass: catch any remaining bare marker tags the block pass missed.
-        let control_cleaned =
-            crate::tools::sanitize::strip_internal_control_markers(&blocks_cleaned);
-        let identity_cleaned = crate::tools::sanitize::strip_model_identity_leaks(&control_cleaned);
-        crate::tools::sanitize::strip_tool_name_references(&identity_cleaned)
+        crate::tools::sanitize::sanitize_user_facing_reply(reply)
     }
 
     pub async fn handle_message(
@@ -3346,7 +3513,7 @@ mod final_reply_marker_tests {
 
     use chrono::Utc;
 
-    use super::{post_task, Agent, LearningContext};
+    use super::{post_task, user_facing_task_description, Agent, LearningContext};
 
     #[test]
     fn strips_control_markers_from_final_reply() {
@@ -3460,6 +3627,26 @@ mod final_reply_marker_tests {
         assert!(!sanitized.contains("<|tool_calls_section_begin|>"));
         assert!(!sanitized.contains("functions.terminal:0"));
         assert!(sanitized.contains("command execution"));
+    }
+
+    #[test]
+    fn strips_xml_function_call_blocks_from_final_reply() {
+        let reply = "I'll read the most recent 300 lines from that log file.\n\n<function_calls>\n<invoke name=\"terminal\">\n<parameter name=\"command\">tail -n 300 ~/Library/Logs/aidaemon/stdout.log</parameter>\n</invoke>\n</function_calls>\n\nHere's what I found.";
+        let sanitized = Agent::sanitize_final_reply_markers(reply);
+        assert!(!sanitized.contains("<function_calls>"));
+        assert!(!sanitized.contains("<invoke"));
+        assert!(!sanitized.contains("<parameter"));
+        assert!(!sanitized.contains("tail -n 300"));
+        assert!(sanitized.contains("I'll read the most recent 300 lines"));
+        assert!(sanitized.contains("Here's what I found."));
+    }
+
+    #[test]
+    fn strips_internal_scheduler_annotations_from_progress_descriptions() {
+        let cleaned = user_facing_task_description(
+            "Scheduled check: Post evening tweet about aidaemon features [SYSTEM: already scheduled and firing now; do not reschedule.]",
+        );
+        assert_eq!(cleaned, "Post evening tweet about aidaemon features");
     }
 }
 

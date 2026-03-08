@@ -160,6 +160,7 @@ impl Agent {
             .iter()
             .map(|reason| reason.as_code())
             .collect();
+        let mut completion_progress = CompletionProgress::new(&turn_context.completion_contract);
         info!(
             session_id,
             followup_mode,
@@ -746,6 +747,7 @@ impl Agent {
                     pending_background_ack: &mut pending_background_ack,
                     pending_external_action_ack: &mut pending_external_action_ack,
                     require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
+                    completion_progress: &mut completion_progress,
                     turn_context: &turn_context,
                     needs_tools_for_turn: &mut needs_tools_for_turn,
                     force_text_response,
@@ -838,6 +840,7 @@ impl Agent {
                         &mut dirs_with_project_inspect_file_evidence,
                     dirs_with_search_no_matches: &mut dirs_with_search_no_matches,
                     require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
+                    completion_progress: &mut completion_progress,
                     turn_context: &turn_context,
                     resolved_goal_id: resolved_goal_id.as_deref(),
                     tool_result_cache: &mut tool_result_cache,

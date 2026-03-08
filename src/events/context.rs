@@ -9,8 +9,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use super::{
-    ErrorData, Event, EventStore, EventType, SubAgentSpawnData, TaskEndData, TaskStartData,
-    TaskStatus, ThinkingStartData, ToolCallData, ToolResultData,
+    DecisionPointData, ErrorData, Event, EventStore, EventType, SubAgentSpawnData, TaskEndData,
+    TaskStartData, TaskStatus, ThinkingStartData, ToolCallData, ToolResultData,
 };
 use crate::utils::truncate_str;
 
@@ -35,6 +35,10 @@ pub struct SessionContext {
     /// Recent tool calls (limited to last N)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_tools: Vec<RecentTool>,
+
+    /// Recent warning/error-level diagnostics (limited to last N)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_diagnostics: Vec<RecentDiagnostic>,
 
     /// Current thinking iteration (if task is running)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +94,14 @@ pub struct RecentTool {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RecentDiagnostic {
+    pub severity: String,
+    pub code: String,
+    pub summary: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ActiveSubAgent {
     pub child_session_id: String,
     pub mission: String,
@@ -104,6 +116,7 @@ impl SessionContext {
             && self.last_completed_task.is_none()
             && self.last_error.is_none()
             && self.recent_tools.is_empty()
+            && self.recent_diagnostics.is_empty()
             && self.active_sub_agents.is_empty()
     }
 
@@ -175,6 +188,19 @@ impl SessionContext {
                 })
                 .collect();
             lines.push(format!("- **Recent tools:** {}", tool_summary.join(", ")));
+        }
+
+        if !self.recent_diagnostics.is_empty() {
+            let diag_summary: Vec<String> = self
+                .recent_diagnostics
+                .iter()
+                .take(3)
+                .map(|d| format!("{}({})", truncate_str(&d.code, 40), d.severity))
+                .collect();
+            lines.push(format!(
+                "- **Recent diagnostics:** {}",
+                diag_summary.join(", ")
+            ));
         }
 
         // Active sub-agents
@@ -256,6 +282,7 @@ impl SessionContextCompiler {
 
         // Recent tools
         let mut recent_tools: Vec<RecentTool> = Vec::new();
+        let mut recent_diagnostics: Vec<RecentDiagnostic> = Vec::new();
 
         // Last error
         let mut last_error: Option<(Event, ErrorData)> = None;
@@ -298,6 +325,20 @@ impl SessionContextCompiler {
                 EventType::Error => {
                     if let Ok(data) = event.parse_data::<ErrorData>() {
                         last_error = Some((event.clone(), data));
+                    }
+                }
+                EventType::DecisionPoint => {
+                    if let Ok(data) = event.parse_data::<DecisionPointData>() {
+                        if data.severity.is_warning_or_higher() {
+                            recent_diagnostics.push(RecentDiagnostic {
+                                severity: data.severity.as_str().to_string(),
+                                code: data
+                                    .code
+                                    .unwrap_or_else(|| data.decision_type.as_str().to_string()),
+                                summary: truncate_str(&data.summary, 80).to_string(),
+                                timestamp: event.created_at,
+                            });
+                        }
                     }
                 }
                 EventType::SubAgentSpawn => {
@@ -369,6 +410,10 @@ impl SessionContextCompiler {
         recent_tools.truncate(10);
         context.recent_tools = recent_tools;
 
+        recent_diagnostics.reverse();
+        recent_diagnostics.truncate(5);
+        context.recent_diagnostics = recent_diagnostics;
+
         // Find active sub-agents
         for (child_session_id, (spawn_event, spawn_data)) in sub_agent_starts {
             if !completed_sub_agents.contains(&child_session_id) {
@@ -421,6 +466,12 @@ mod tests {
                 success: true,
                 timestamp: Utc::now(),
             }],
+            recent_diagnostics: vec![RecentDiagnostic {
+                severity: "warning".to_string(),
+                code: "soft_iteration_warning".to_string(),
+                summary: "Soft iteration warning threshold reached".to_string(),
+                timestamp: Utc::now(),
+            }],
             ..Default::default()
         };
 
@@ -429,5 +480,7 @@ mod tests {
         assert!(formatted.contains("Add blog posts"));
         assert!(formatted.contains("Recent error"));
         assert!(formatted.contains("terminal"));
+        assert!(formatted.contains("Recent diagnostics"));
+        assert!(formatted.contains("soft_iteration_warning"));
     }
 }

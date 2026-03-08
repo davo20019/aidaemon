@@ -894,9 +894,8 @@ impl HeartbeatCoordinator {
 
         for entry in &pending {
             let delivered = if let Some(hub) = self.hub.as_ref().and_then(|w| w.upgrade()) {
-                hub.send_text(&entry.session_id, &entry.message)
-                    .await
-                    .is_ok()
+                let message = crate::tools::sanitize::sanitize_user_facing_reply(&entry.message);
+                hub.send_text(&entry.session_id, &message).await.is_ok()
             } else {
                 false
             };

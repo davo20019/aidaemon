@@ -265,10 +265,42 @@ pub struct DecisionPointData {
     pub task_id: String,
     /// Iteration where this decision occurred (0 when outside loop).
     pub iteration: u32,
+    /// Severity of the persisted decision signal.
+    #[serde(default)]
+    pub severity: DiagnosticSeverity,
+    /// Stable machine-readable code for analytics/grouping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     /// Flexible structured data for this decision.
     pub metadata: JsonValue,
     /// Human-readable summary of the decision.
     pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    #[default]
+    Info,
+    Warning,
+    Error,
+}
+
+impl DiagnosticSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiagnosticSeverity::Info => "info",
+            DiagnosticSeverity::Warning => "warning",
+            DiagnosticSeverity::Error => "error",
+        }
+    }
+
+    pub fn is_warning_or_higher(self) -> bool {
+        matches!(
+            self,
+            DiagnosticSeverity::Warning | DiagnosticSeverity::Error
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +317,24 @@ pub enum DecisionType {
     StoppingCondition,
     InstructionsSnapshot,
     BudgetAutoExtension,
+}
+
+impl DecisionType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecisionType::SkillMatch => "skill_match",
+            DecisionType::MemoryRetrieval => "memory_retrieval",
+            DecisionType::IntentGate => "intent_gate",
+            DecisionType::RepetitiveCallDetection => "repetitive_call_detection",
+            DecisionType::ConsecutiveSameToolDetection => "consecutive_same_tool_detection",
+            DecisionType::AlternatingPatternDetection => "alternating_pattern_detection",
+            DecisionType::ToolBudgetBlock => "tool_budget_block",
+            DecisionType::RouteDriftAlert => "route_drift_alert",
+            DecisionType::StoppingCondition => "stopping_condition",
+            DecisionType::InstructionsSnapshot => "instructions_snapshot",
+            DecisionType::BudgetAutoExtension => "budget_auto_extension",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -641,6 +691,8 @@ mod tests {
             decision_type: DecisionType::IntentGate,
             task_id: "task-123".to_string(),
             iteration: 1,
+            severity: DiagnosticSeverity::Warning,
+            code: Some("intent_gate".to_string()),
             metadata: json!({"needs_tools": true, "can_answer_now": false}),
             summary: "Intent gate requested tool mode".to_string(),
         };
@@ -649,6 +701,23 @@ mod tests {
         assert_eq!(parsed.task_id, "task-123");
         assert_eq!(parsed.iteration, 1);
         assert_eq!(parsed.decision_type, DecisionType::IntentGate);
+        assert_eq!(parsed.severity, DiagnosticSeverity::Warning);
+        assert_eq!(parsed.code.as_deref(), Some("intent_gate"));
+    }
+
+    #[test]
+    fn decision_point_data_defaults_new_fields_for_older_rows() {
+        let data: DecisionPointData = serde_json::from_value(json!({
+            "decision_type": "intent_gate",
+            "task_id": "task-123",
+            "iteration": 1,
+            "metadata": {"needs_tools": true},
+            "summary": "Intent gate requested tool mode"
+        }))
+        .expect("deserialize DecisionPointData");
+
+        assert_eq!(data.severity, DiagnosticSeverity::Info);
+        assert!(data.code.is_none());
     }
 
     #[test]

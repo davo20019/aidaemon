@@ -1297,10 +1297,24 @@ impl Agent {
 
             match result {
                 Ok(response) => {
-                    let mut updated_goal = goal.clone();
-                    updated_goal.status = "completed".to_string();
-                    updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                    let _ = self.state.update_goal(&updated_goal).await;
+                    let tasks = self
+                        .state
+                        .get_tasks_for_goal(&goal.id)
+                        .await
+                        .unwrap_or_default();
+                    let tasks_fully_done = !tasks.is_empty()
+                        && tasks
+                            .iter()
+                            .all(|task| matches!(task.status.as_str(), "completed" | "skipped"));
+                    let should_auto_complete = tasks_fully_done
+                        && !goal_completion_response_indicates_incomplete_work(&response);
+
+                    if should_auto_complete {
+                        let mut updated_goal = goal.clone();
+                        updated_goal.status = "completed".to_string();
+                        updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        let _ = self.state.update_goal(&updated_goal).await;
+                    }
 
                     let assistant_msg = Message {
                         id: Uuid::new_v4().to_string(),

@@ -266,6 +266,13 @@ struct PendingUpload {
 struct UploadCommitResult {
     status_message: String,
     prompt_for_agent: Option<String>,
+    agent_status_message: Option<String>,
+}
+
+struct StoredUpload {
+    path: PathBuf,
+    saved_inside_session_workspace: bool,
+    fallback_reason: Option<String>,
 }
 
 struct ShellProcess {
@@ -2770,6 +2777,52 @@ fn build_upload_prompt(
     }
     prompt.push('\n');
     prompt
+}
+
+fn session_upload_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".aidaemon/files/inbox")
+}
+
+fn write_uploaded_image(dest_dir: &Path, filename: &str, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(dest_dir)?;
+    let prefix: String = uuid::Uuid::new_v4().to_string().chars().take(8).collect();
+    let dest_name = format!("{}_{}", prefix, filename);
+    let dest_path = dest_dir.join(dest_name);
+    std::fs::write(&dest_path, bytes)?;
+    Ok(dest_path)
+}
+
+fn store_uploaded_image(
+    session_cwd: &Path,
+    inbox_dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> anyhow::Result<StoredUpload> {
+    let preferred_dir = session_upload_dir(session_cwd);
+    match write_uploaded_image(&preferred_dir, filename, bytes) {
+        Ok(path) => Ok(StoredUpload {
+            path,
+            saved_inside_session_workspace: true,
+            fallback_reason: None,
+        }),
+        Err(err) => {
+            if preferred_dir == inbox_dir {
+                return Err(err);
+            }
+            warn!(
+                error = %err,
+                session_cwd = %session_cwd.display(),
+                fallback_inbox_dir = %inbox_dir.display(),
+                "Failed to save uploaded image inside session workspace; falling back to global inbox"
+            );
+            let fallback_path = write_uploaded_image(inbox_dir, filename, bytes)?;
+            Ok(StoredUpload {
+                path: fallback_path,
+                saved_inside_session_workspace: false,
+                fallback_reason: Some(err.to_string()),
+            })
+        }
+    }
 }
 
 fn payload_upload_id(payload: &Value) -> Option<String> {
@@ -5309,12 +5362,6 @@ impl TerminalBridge {
             );
         }
 
-        std::fs::create_dir_all(inbox_dir)?;
-        let prefix: String = uuid::Uuid::new_v4().to_string().chars().take(8).collect();
-        let dest_name = format!("{}_{}", prefix, upload.filename);
-        let dest_path = inbox_dir.join(dest_name);
-        std::fs::write(&dest_path, &upload.bytes)?;
-
         let final_caption = payload
             .get("caption")
             .and_then(|v| v.as_str())
@@ -5322,11 +5369,12 @@ impl TerminalBridge {
             .filter(|s| !s.is_empty())
             .or(upload.caption);
 
-        let prompt_for_agent = if active.crypto.bootstrapped_agent || active.crypto.agent.is_some()
-        {
+        let stored = store_uploaded_image(&active.cwd, inbox_dir, &upload.filename, &upload.bytes)?;
+        let has_active_agent = active.crypto.bootstrapped_agent || active.crypto.agent.is_some();
+        let prompt_for_agent = if has_active_agent && stored.saved_inside_session_workspace {
             Some(build_upload_prompt(
                 &upload.filename,
-                &dest_path,
+                &stored.path,
                 &upload.mime_type,
                 upload.bytes.len(),
                 final_caption.as_deref(),
@@ -5334,14 +5382,32 @@ impl TerminalBridge {
         } else {
             None
         };
+        let agent_status_message = if has_active_agent && !stored.saved_inside_session_workspace {
+            Some(
+                "Image was saved outside the session workspace, so it was not auto-sent to the active agent to avoid another sandbox permission error.".to_string(),
+            )
+        } else {
+            None
+        };
+        let status_message = if let Some(reason) = stored.fallback_reason.as_deref() {
+            format!(
+                "Image saved to {} ({}). Session workspace upload dir was unavailable, so a fallback inbox path was used: {}",
+                stored.path.display(),
+                format_size(upload.bytes.len()),
+                reason
+            )
+        } else {
+            format!(
+                "Image saved to {} ({}).",
+                stored.path.display(),
+                format_size(upload.bytes.len())
+            )
+        };
 
         Ok(UploadCommitResult {
-            status_message: format!(
-                "Image saved to {} ({}).",
-                dest_path.display(),
-                format_size(upload.bytes.len())
-            ),
+            status_message,
             prompt_for_agent,
+            agent_status_message,
         })
     }
 
@@ -5474,6 +5540,8 @@ impl TerminalBridge {
                                     err
                                 )),
                             }
+                        } else if let Some(agent_status_message) = result.agent_status_message {
+                            status_messages.push(agent_status_message);
                         } else {
                             status_messages.push(
                                 "Image saved. No active CLI agent detected, so it was not auto-sent."
@@ -6285,6 +6353,7 @@ fn run_local_attach_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_daemon_connect_token_mint_url_from_wss() {
@@ -6713,6 +6782,54 @@ mod tests {
         assert!(prompt.contains("screenshot.png"));
         assert!(prompt.contains("/tmp/inbox/abc_screenshot.png"));
         assert!(prompt.contains("error appears after login"));
+    }
+
+    #[test]
+    fn test_store_uploaded_image_prefers_session_workspace_path() {
+        let session_dir = tempdir().expect("session tempdir");
+        let fallback_dir = tempdir().expect("fallback tempdir");
+
+        let stored = store_uploaded_image(
+            session_dir.path(),
+            fallback_dir.path(),
+            "screenshot.png",
+            b"png-bytes",
+        )
+        .expect("stored upload");
+
+        assert!(stored.saved_inside_session_workspace);
+        assert!(stored.fallback_reason.is_none());
+        assert!(stored
+            .path
+            .starts_with(session_upload_dir(session_dir.path())));
+        assert_eq!(
+            std::fs::read(&stored.path).expect("read stored image"),
+            b"png-bytes"
+        );
+    }
+
+    #[test]
+    fn test_store_uploaded_image_falls_back_when_session_workspace_path_is_blocked() {
+        let session_dir = tempdir().expect("session tempdir");
+        let fallback_dir = tempdir().expect("fallback tempdir");
+        std::fs::write(session_dir.path().join(".aidaemon"), "not a directory")
+            .expect("block workspace upload dir");
+
+        let stored = store_uploaded_image(
+            session_dir.path(),
+            fallback_dir.path(),
+            "screenshot.png",
+            b"png-bytes",
+        )
+        .expect("stored upload with fallback");
+
+        assert!(!stored.saved_inside_session_workspace);
+        assert!(stored.fallback_reason.is_some());
+        assert!(stored.path.starts_with(fallback_dir.path()));
+        assert_eq!(
+            std::fs::read(&stored.path).expect("read fallback image"),
+            b"png-bytes"
+        );
     }
 
     #[test]

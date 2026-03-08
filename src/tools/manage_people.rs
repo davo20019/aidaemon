@@ -142,16 +142,6 @@ impl Tool for ManagePeopleTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManagePeopleArgs = serde_json::from_str(arguments)?;
 
@@ -187,6 +177,16 @@ impl Tool for ManagePeopleTool {
             "audit" => self.handle_audit(&args).await,
             "confirm" => self.handle_confirm(&args).await,
             other => Ok(format!("Unknown action: {}. Use: enable, disable, status, add, list, view, brief, upcoming, reconnect, update, remove, add_fact, remove_fact, link, export, purge, audit, confirm", other)),
+        }
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: false,
         }
     }
 }

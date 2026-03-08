@@ -4,7 +4,9 @@ use std::path::Path;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::traits::{Tool, ToolCapabilities, ToolRole};
+use crate::traits::{
+    Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
+};
 
 use super::fs_utils;
 
@@ -58,6 +60,29 @@ impl Tool for ProjectInspectTool {
             idempotent: true,
             high_impact_write: false,
         }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let mut semantics = ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent);
+        if let Some(path) = args
+            .as_ref()
+            .and_then(|value| value.get("path"))
+            .and_then(|value| value.as_str())
+        {
+            semantics = semantics.with_target_hint(ToolTargetHintKind::ProjectScope, path);
+        }
+        if let Some(paths) = args
+            .as_ref()
+            .and_then(|value| value.get("paths"))
+            .and_then(|value| value.as_array())
+        {
+            for path in paths.iter().filter_map(|value| value.as_str()) {
+                semantics = semantics.with_target_hint(ToolTargetHintKind::ProjectScope, path);
+            }
+        }
+        semantics
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

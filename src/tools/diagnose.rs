@@ -207,9 +207,14 @@ impl DiagnoseTool {
             }
             EventType::DecisionPoint => {
                 if let Ok(data) = event.parse_data::<DecisionPointData>() {
+                    let code = data
+                        .code
+                        .unwrap_or_else(|| data.decision_type.as_str().to_string());
                     format!(
-                        ">>> DECISION {:?} (iter {}) {}",
+                        ">>> DECISION {:?} [{}:{}] (iter {}) {}",
                         data.decision_type,
+                        data.severity.as_str(),
+                        code,
                         data.iteration,
                         truncate_str(&data.summary, 140)
                     )
@@ -1794,6 +1799,8 @@ mod tests {
                 decision_type: DecisionType::IntentGate,
                 task_id: "t1".to_string(),
                 iteration: 1,
+                severity: crate::events::DiagnosticSeverity::Info,
+                code: Some("intent_gate".to_string()),
                 metadata: json!({"needs_tools":true}),
                 summary: "intent gate forced tool mode".to_string(),
             },
@@ -1885,6 +1892,8 @@ mod tests {
                 decision_type: DecisionType::IntentGate,
                 task_id: "t1".to_string(),
                 iteration: 1,
+                severity: crate::events::DiagnosticSeverity::Info,
+                code: Some("tools_required".to_string()),
                 metadata: json!({
                     "needs_tools": true,
                     "route_reason": "tools_required",
@@ -1903,6 +1912,8 @@ mod tests {
                 decision_type: DecisionType::IntentGate,
                 task_id: "t1".to_string(),
                 iteration: 2,
+                severity: crate::events::DiagnosticSeverity::Info,
+                code: Some("acknowledgment_direct_reply".to_string()),
                 metadata: json!({
                     "needs_tools": false,
                     "route_reason": "acknowledgment_direct_reply",
@@ -2078,6 +2089,8 @@ mod tests {
                     decision_type: DecisionType::IntentGate,
                     task_id: "t1".to_string(),
                     iteration: (i + 1) as u32,
+                    severity: crate::events::DiagnosticSeverity::Info,
+                    code: Some(reason.to_string()),
                     metadata: json!({
                         "route_reason": reason,
                         "route_action": action,
@@ -2109,6 +2122,8 @@ mod tests {
                     decision_type: DecisionType::IntentGate,
                     task_id: "t1".to_string(),
                     iteration: (100 + i) as u32,
+                    severity: crate::events::DiagnosticSeverity::Info,
+                    code: Some(reason.to_string()),
                     metadata: json!({
                         "route_reason": reason,
                         "route_action": action,

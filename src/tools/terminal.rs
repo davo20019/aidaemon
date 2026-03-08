@@ -18,12 +18,16 @@ use crate::channels::ChannelHub;
 use crate::events::{
     ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, EventStore, EventType,
 };
-use crate::traits::{StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCapabilities};
+use crate::traits::{
+    StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolVerificationMode,
+};
 use crate::types::{ApprovalResponse, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
 use super::command_risk::{classify_command, hard_block_reason, PermissionMode, RiskLevel};
+use super::command_semantics::classify_shell_command;
 use super::daemon_guard::detect_daemonization_primitives;
 use super::process_control::{configure_command_for_process_group, send_sigkill, send_sigterm};
 
@@ -1747,6 +1751,7 @@ fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
         detached: false,
         completion_notifications_enabled: false,
         transport_error: None,
+        semantics: ToolCallSemantics::default(),
     }
 }
 
@@ -1762,6 +1767,7 @@ fn tracked_background_metadata(
         detached,
         completion_notifications_enabled,
         transport_error: None,
+        semantics: ToolCallSemantics::default(),
     }
 }
 
@@ -1778,26 +1784,26 @@ impl Tool for TerminalTool {
     fn schema(&self) -> Value {
         json!({
             "name": "terminal",
-            "description": "Execute any command available on this system — shell commands, CLI tools (python, node, claude, gemini, cargo, docker, git, etc.), scripts, and anything else installed. If a command is not pre-approved, the user may be asked to authorize it in real time.\n\nLong-running commands: if execution exceeds the timeout, it is tracked in background with a pid. When completion notifications are available, the process continues running and the user is notified automatically when it finishes. Otherwise, `detach=false` processes are task-owned and auto-killed at task end. Set `detach=true` for intentional long-lived execution (daemons, servers) that should survive indefinitely.\n\nIMPORTANT: Do not use heredoc (cat <<EOF), echo-redirect, or printf patterns to create files. Always use the `write_file` tool for file creation — it handles content atomically without shell quoting issues.",
+            "description": "Run shell commands on this machine. Commands may require user approval. Long-running commands can be checked or killed later; use write_file instead of shell redirection for file creation.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute. REQUIRED when action is \"run\"."
+                        "description": "Shell command for action=run"
                     },
                     "action": {
                         "type": "string",
                         "enum": ["run", "check", "kill", "trust_all"],
-                        "description": "Action to perform: \"run\" (default) executes a command — requires \"command\". \"check\" shows output of a background process — requires \"pid\". \"kill\" stops a background process — requires \"pid\". \"trust_all\" enables auto-approval for all commands."
+                        "description": "run, check, kill, or trust_all"
                     },
                     "detach": {
                         "type": "boolean",
-                        "description": "For action=\"run\": if true, the process survives indefinitely (for daemons/servers). Default false: timed-out processes survive with notifications when available, otherwise auto-killed at task end."
+                        "description": "Keep the process alive after the task ends"
                     },
                     "pid": {
                         "type": "integer",
-                        "description": "Process ID for check/kill actions (returned when a command moves to background)"
+                        "description": "Process ID for check/kill"
                     }
                 },
                 "required": ["action", "command"],
@@ -1813,6 +1819,29 @@ impl Tool for TerminalTool {
             needs_approval: true,
             idempotent: false,
             high_impact_write: true,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let action = args
+            .as_ref()
+            .and_then(|value| value.get("action"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "run".to_string());
+
+        match action.as_str() {
+            "check" => ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent),
+            "kill" => ToolCallSemantics::mutation(),
+            "trust_all" => ToolCallSemantics::administrative(),
+            _ => args
+                .as_ref()
+                .and_then(|value| value.get("command"))
+                .and_then(|value| value.as_str())
+                .map(classify_shell_command)
+                .unwrap_or_else(ToolCallSemantics::mutation),
         }
     }
 

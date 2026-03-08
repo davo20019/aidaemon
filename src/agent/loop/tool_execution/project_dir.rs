@@ -59,6 +59,9 @@ pub(crate) fn extract_project_dir_hint_with_aliases(
             normalize_project_dir(token)
         } else {
             crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
+                .or_else(|| {
+                    crate::tools::fs_utils::resolve_contextual_project_nickname(token, alias_roots)
+                })
                 .map(|path| path.to_string_lossy().to_string())
         };
         let Some(normalized) = normalized else {
@@ -209,7 +212,7 @@ fn project_dir_arg_key_for_tool(tool_name: &str) -> Option<&'static str> {
         "search_files" | "project_inspect" | "git_info" | "git_commit" | "check_environment" => {
             Some("path")
         }
-        "run_command" => Some("working_dir"),
+        "run_command" | "cli_agent" => Some("working_dir"),
         _ => None,
     }
 }
@@ -282,7 +285,7 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
         return None;
     }
 
-    let injected_dir = if tool_name == "run_command" {
+    let injected_dir = if matches!(tool_name, "run_command" | "cli_agent") {
         // Scaffolding flow: if the target project dir doesn't exist yet, use
         // the nearest existing parent as working_dir so creation commands can run.
         resolve_injected_working_dir(project_dir)
@@ -560,6 +563,24 @@ mod tests {
         .expect("injection");
 
         assert_eq!(injected, parent.to_string_lossy());
+        assert!(updated.contains(r#""working_dir":"#));
+    }
+
+    #[test]
+    fn injects_cli_agent_working_dir_when_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("aidaemon");
+        std::fs::create_dir_all(&project).expect("create project");
+        let args = r#"{"action":"run","prompt":"inspect the logs"}"#;
+
+        let (updated, injected) = maybe_inject_project_dir_into_tool_args(
+            "cli_agent",
+            args,
+            Some(project.to_string_lossy().as_ref()),
+        )
+        .expect("injection");
+
+        assert_eq!(injected, project.to_string_lossy());
         assert!(updated.contains(r#""working_dir":"#));
     }
 

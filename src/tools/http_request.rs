@@ -12,7 +12,9 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::sanitize::{sanitize_external_content, sanitize_output, wrap_untrusted_output};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::validate_url_for_ssrf;
-use crate::traits::{Tool, ToolCapabilities};
+use crate::traits::{
+    Tool, ToolCallSemantics, ToolCapabilities, ToolTargetHintKind, ToolVerificationMode,
+};
 use crate::types::ApprovalResponse;
 
 /// Timeout for approval requests (5 minutes).
@@ -793,16 +795,6 @@ impl Tool for HttpRequestTool {
         })
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let mut args: Value = serde_json::from_str(arguments)?;
 
@@ -1235,6 +1227,41 @@ impl Tool for HttpRequestTool {
 
         // Wrap as untrusted external data
         Ok(wrap_untrusted_output("http_request", &result))
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let method = args
+            .as_ref()
+            .and_then(|value| value.get("method"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_ascii_uppercase())
+            .unwrap_or_default();
+        let url = args
+            .as_ref()
+            .and_then(|value| value.get("url"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        match method.as_str() {
+            "GET" | "HEAD" | "OPTIONS" => ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent)
+                .with_target_hint(ToolTargetHintKind::Url, url),
+            "POST" | "PUT" | "PATCH" | "DELETE" => {
+                ToolCallSemantics::mutation().with_target_hint(ToolTargetHintKind::Url, url)
+            }
+            _ => ToolCallSemantics::mutation().with_target_hint(ToolTargetHintKind::Url, url),
+        }
     }
 }
 

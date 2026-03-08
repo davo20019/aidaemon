@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::traits::{Tool, ToolCapabilities};
+use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolTargetHintKind};
 use crate::types::{MediaKind, MediaMessage};
 
 /// Blocked path patterns for outbound file sends (security).
@@ -197,6 +197,19 @@ impl Tool for SendFileTool {
             idempotent: false,
             high_impact_write: false,
         }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let path = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                args.get("file_path")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+
+        ToolCallSemantics::mutation().with_target_hint(ToolTargetHintKind::Path, path)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

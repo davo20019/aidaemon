@@ -6,6 +6,7 @@ pub(super) struct ToolExecCtx<'a> {
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
     pub channel_visibility: ChannelVisibility,
     pub channel_id: Option<&'a str>,
+    pub project_scope: Option<&'a str>,
     pub trusted: bool,
     pub user_role: UserRole,
 }
@@ -73,7 +74,18 @@ impl Agent {
                 // Scheduled goal runs are user-confirmed automation, so treat
                 // their tool calls as trusted even when the execution context
                 // was recreated later by heartbeat/orphan dispatch.
-                goal_has_scheduled_provenance(&self.state, goal_id, task_id).await
+                goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await
+            } else if let Some(executor_task_id) = self.task_id.as_deref() {
+                if let Ok(Some(task)) = self.state.get_task(executor_task_id).await {
+                    goal_has_scheduled_provenance(
+                        &self.state,
+                        &task.goal_id,
+                        Some(executor_task_id),
+                    )
+                    .await
+                } else {
+                    task_has_scheduled_provenance(&self.state, Some(executor_task_id)).await
+                }
             } else if let Some(task_id) = task_id {
                 task_has_scheduled_provenance(&self.state, Some(task_id)).await
             } else {
@@ -133,6 +145,11 @@ impl Agent {
                         }
                     }
                 }
+                if name == "spawn_agent" {
+                    if let Some(project_scope) = ctx.project_scope {
+                        map.insert("_project_scope".to_string(), json!(project_scope));
+                    }
+                }
                 serde_json::to_string(&map)?
             }
             _ => arguments.to_string(),
@@ -158,7 +175,12 @@ impl Agent {
             if tool.name() == name {
                 let result = tool
                     .call_with_status_outcome(&enriched_args, ctx.status_tx.clone())
-                    .await;
+                    .await
+                    .map(|mut outcome| {
+                        let fallback = tool.call_semantics(&enriched_args);
+                        outcome.metadata.semantics.merge_missing_from(fallback);
+                        outcome
+                    });
 
                 // Post-execution: record seen paths from successful commands
                 if result.is_ok() {
@@ -188,7 +210,12 @@ impl Agent {
             if let Some(tool) = registry.find_tool(name).await {
                 return tool
                     .call_with_status_outcome(&enriched_args, ctx.status_tx.clone())
-                    .await;
+                    .await
+                    .map(|mut outcome| {
+                        let fallback = tool.call_semantics(&enriched_args);
+                        outcome.metadata.semantics.merge_missing_from(fallback);
+                        outcome
+                    });
             }
         }
 

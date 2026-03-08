@@ -395,6 +395,53 @@ impl crate::traits::Tool for PreWrappedExternalActionTool {
     }
 }
 
+struct UrlProbeTool;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for UrlProbeTool {
+    fn name(&self) -> &str {
+        "url_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Reads a URL for verification testing."
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "url_probe",
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: serde_json::Value = serde_json::from_str(arguments)?;
+        let url = args
+            .get("url")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing url"))?;
+        Ok(format!("Checked {} and confirmed the posts are visible.", url))
+    }
+}
+
 #[tokio::test]
 async fn test_successful_external_action_timeout_returns_deterministic_completion() {
     let responses = vec![
@@ -511,6 +558,62 @@ async fn test_prewrapped_external_action_timeout_keeps_latest_result() {
         !response.contains("UNTRUSTED EXTERNAL DATA"),
         "response should not leak wrapper markers into the final reply: {}",
         response
+    );
+}
+
+#[tokio::test]
+async fn test_visible_outcome_request_requires_matching_verification_before_completion() {
+    let responses = vec![
+        {
+            let mut resp = MockProvider::tool_call_response("external_action", "{}");
+            resp.content = Some("I'll fix that.".to_string());
+            resp
+        },
+        MockProvider::text_response("Done."),
+        MockProvider::tool_call_response(
+            "url_probe",
+            r#"{"url":"https://blog.aidaemon.ai"}"#,
+        ),
+        MockProvider::text_response(
+            "I checked https://blog.aidaemon.ai and the posts are now visible.",
+        ),
+    ];
+
+    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(responses),
+        vec![Arc::new(ExternalActionTool), Arc::new(UrlProbeTool)],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "visible_outcome_verification",
+            "I still don't see the posts here: https://blog.aidaemon.ai",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("posts are now visible"),
+        "final response should reflect a verified outcome: {}",
+        response
+    );
+    assert!(
+        !response.contains("The requested action completed successfully."),
+        "generic success ack should be blocked until verification completes: {}",
+        response
+    );
+    assert_eq!(
+        harness.provider.call_count().await,
+        4,
+        "agent should continue past the low-signal completion and perform verification"
     );
 }
 

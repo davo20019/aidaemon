@@ -26,15 +26,22 @@ fn find_platform_substring(session_id: &str) -> Option<(&'static str, &str)> {
 /// - "telegram:12345"
 /// - "{bot}:12345" (multi-bot Telegram sessions)
 /// - "bot:telegram:12345" (legacy pattern)
-pub fn telegram_chat_id_from_session(session_id: &str) -> Option<i64> {
-    // Prefer explicit marker forms.
+fn telegram_session_namespace_and_chat_id(session_id: &str) -> Option<(Option<&str>, i64)> {
     if let Some((marker, rest)) = find_platform_substring(session_id) {
         if marker != "telegram:" {
             return None;
         }
-        return rest
+        let marker_idx = session_id.rfind(marker)?;
+        let prefix = session_id[..marker_idx].trim_end_matches(':').trim();
+        let chat_id = rest
             .strip_prefix("telegram:")
-            .and_then(|s| s.trim().parse::<i64>().ok());
+            .and_then(|s| s.trim().parse::<i64>().ok())?;
+        let namespace = if prefix.is_empty() {
+            None
+        } else {
+            Some(prefix)
+        };
+        return Some((namespace, chat_id));
     }
 
     // Legacy: "bot:telegram:12345" or "bot:12345"
@@ -42,7 +49,7 @@ pub fn telegram_chat_id_from_session(session_id: &str) -> Option<i64> {
 
     // Plain numeric (legacy/default bot)
     if let Ok(chat_id) = stripped.trim().parse::<i64>() {
-        return Some(chat_id);
+        return Some((None, chat_id));
     }
 
     // Heuristic: multi-bot sessions commonly look like "{username}:{chat_id}".
@@ -52,10 +59,66 @@ pub fn telegram_chat_id_from_session(session_id: &str) -> Option<i64> {
     }
 
     let (prefix, suffix) = stripped.rsplit_once(':')?;
-    if prefix.trim().is_empty() {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
         return None;
     }
-    suffix.trim().parse::<i64>().ok()
+    let chat_id = suffix.trim().parse::<i64>().ok()?;
+    Some((Some(prefix), chat_id))
+}
+
+pub fn telegram_chat_id_from_session(session_id: &str) -> Option<i64> {
+    telegram_session_namespace_and_chat_id(session_id).map(|(_, chat_id)| chat_id)
+}
+
+fn telegram_channel_namespace_and_chat_id(channel_id: &str) -> Option<(Option<&str>, i64)> {
+    let stripped = channel_id.strip_prefix("telegram:")?;
+    if let Ok(chat_id) = stripped.trim().parse::<i64>() {
+        return Some((None, chat_id));
+    }
+
+    let (namespace, suffix) = stripped.rsplit_once(':')?;
+    let namespace = namespace.trim();
+    if namespace.is_empty() {
+        return None;
+    }
+    let chat_id = suffix.trim().parse::<i64>().ok()?;
+    Some((Some(namespace), chat_id))
+}
+
+/// Returns true when a stored channel id should be considered the same channel
+/// as the current one. This preserves reads for legacy Telegram facts/episodes
+/// (`telegram:{chat_id}`) after introducing namespaced multi-bot ids.
+pub fn stored_channel_matches_current(stored_channel_id: &str, current_channel_id: &str) -> bool {
+    if stored_channel_id == current_channel_id {
+        return true;
+    }
+
+    let Some((stored_namespace, stored_chat_id)) =
+        telegram_channel_namespace_and_chat_id(stored_channel_id)
+    else {
+        return false;
+    };
+    let Some((current_namespace, current_chat_id)) =
+        telegram_channel_namespace_and_chat_id(current_channel_id)
+    else {
+        return false;
+    };
+
+    stored_chat_id == current_chat_id && stored_namespace.is_none() && current_namespace.is_some()
+}
+
+/// Derive a Telegram channel_id that preserves multi-bot namespaces.
+///
+/// Returns:
+/// - "telegram:{CHAT_ID}" for legacy/single-bot sessions
+/// - "telegram:{BOT_NAMESPACE}:{CHAT_ID}" for multi-bot sessions
+pub fn telegram_channel_id_from_session(session_id: &str) -> Option<String> {
+    let (namespace, chat_id) = telegram_session_namespace_and_chat_id(session_id)?;
+    match namespace {
+        Some(prefix) => Some(format!("telegram:{}:{}", prefix, chat_id)),
+        None => Some(format!("telegram:{}", chat_id)),
+    }
 }
 
 /// Derive a canonical `channel_id` (used for memory scoping) from a session ID.
@@ -63,7 +126,7 @@ pub fn telegram_chat_id_from_session(session_id: &str) -> Option<i64> {
 /// Returns platform-scoped IDs:
 /// - Slack:   "slack:{CHANNEL_ID}"
 /// - Discord: "discord:dm:{ID}" / "discord:ch:{ID}"
-/// - Telegram: "telegram:{CHAT_ID}"
+/// - Telegram: "telegram:{CHAT_ID}" or "telegram:{BOT_NAMESPACE}:{CHAT_ID}"
 pub fn derive_channel_id_from_session(session_id: &str) -> Option<String> {
     if let Some((marker, rest)) = find_platform_substring(session_id) {
         match marker {
@@ -82,15 +145,14 @@ pub fn derive_channel_id_from_session(session_id: &str) -> Option<String> {
                 return Some(rest.to_string());
             }
             "telegram:" => {
-                let chat_id = telegram_chat_id_from_session(rest)?;
-                return Some(format!("telegram:{}", chat_id));
+                return telegram_channel_id_from_session(session_id);
             }
             _ => {}
         }
     }
 
     // Telegram fallback (numeric or "{bot}:{chat_id}")
-    telegram_chat_id_from_session(session_id).map(|id| format!("telegram:{}", id))
+    telegram_channel_id_from_session(session_id)
 }
 
 /// True if a session corresponds to a shared/group channel (vs a 1:1 DM).
@@ -175,8 +237,28 @@ mod tests {
         );
         assert_eq!(
             derive_channel_id_from_session("mybot:12345").as_deref(),
-            Some("telegram:12345")
+            Some("telegram:mybot:12345")
         );
+        assert_eq!(
+            derive_channel_id_from_session("mybot:telegram:12345").as_deref(),
+            Some("telegram:mybot:12345")
+        );
+    }
+
+    #[test]
+    fn stored_channel_match_restores_legacy_telegram_reads() {
+        assert!(stored_channel_matches_current(
+            "telegram:12345",
+            "telegram:mybot:12345"
+        ));
+        assert!(!stored_channel_matches_current(
+            "telegram:otherbot:12345",
+            "telegram:mybot:12345"
+        ));
+        assert!(!stored_channel_matches_current(
+            "telegram:mybot:12345",
+            "telegram:12345"
+        ));
     }
 
     #[test]

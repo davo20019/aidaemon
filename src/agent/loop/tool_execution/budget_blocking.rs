@@ -172,7 +172,7 @@ impl Agent {
             calls = prior_calls,
             "Blocking repeated tool call"
         );
-        self.emit_decision_point(
+        self.emit_warning_decision_point(
             ctx.emitter,
             ctx.task_id,
             ctx.iteration,

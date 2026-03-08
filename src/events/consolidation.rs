@@ -1,17 +1,20 @@
 //! Event consolidation system.
 //!
 //! Consolidation extracts learnings from raw events and stores them
-//! in long-term memory (procedures, error-solutions, expertise, episodes).
+//! in long-term memory (procedures, error-solutions, expertise, behavior
+//! patterns, episodes).
 //! After consolidation, events can be pruned to manage storage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use sqlx::Row;
 use tracing::{info, warn};
 
-use super::{ErrorData, TaskEndData, TaskStartData, ToolCallData, ToolResultData};
+use super::{
+    DecisionPointData, ErrorData, TaskEndData, TaskStartData, ToolCallData, ToolResultData,
+};
 use super::{Event, EventStore, EventType, TaskStatus};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::binary::encode_embedding;
@@ -27,6 +30,7 @@ pub struct ConsolidationResult {
     pub procedures_created: usize,
     pub error_solutions_created: usize,
     pub expertise_updated: usize,
+    pub behavior_patterns_recorded: usize,
     pub episodes_created: usize,
 }
 
@@ -41,8 +45,17 @@ impl ConsolidationResult {
         self.procedures_created += other.procedures_created;
         self.error_solutions_created += other.error_solutions_created;
         self.expertise_updated += other.expertise_updated;
+        self.behavior_patterns_recorded += other.behavior_patterns_recorded;
         self.episodes_created += other.episodes_created;
     }
+}
+
+#[derive(Debug, Clone)]
+struct FailurePatternObservation {
+    trigger_context: String,
+    action: String,
+    description: String,
+    confidence: f32,
 }
 
 /// Statistics from daily consolidation
@@ -216,7 +229,11 @@ impl Consolidator {
             }
         }
 
-        // 4. Mark events as consolidated
+        // 4. Mine warning/error decision points into durable failure patterns
+        result.behavior_patterns_recorded =
+            self.extract_failure_patterns_from_decisions(&events).await;
+
+        // 5. Mark events as consolidated
         // Note: Episode creation is handled exclusively by MemoryManager (LLM-quality episodes)
         let event_ids: Vec<i64> = events.iter().map(|e| e.id).collect();
         self.event_store.mark_consolidated(&event_ids).await?;
@@ -227,6 +244,7 @@ impl Consolidator {
             events = result.events_consolidated,
             procedures = result.procedures_created,
             error_solutions = result.error_solutions_created,
+            behavior_patterns = result.behavior_patterns_recorded,
             "Session consolidation complete"
         );
 
@@ -467,6 +485,81 @@ impl Consolidator {
         }
 
         updates
+    }
+
+    /// Mine operational warning/error decision points into durable failure patterns.
+    async fn extract_failure_patterns_from_decisions(&self, events: &[Event]) -> usize {
+        let Some(state) = self.state.as_ref() else {
+            return 0;
+        };
+
+        let mut task_events: HashMap<String, Vec<&Event>> = HashMap::new();
+        for event in events {
+            if let Some(task_id) = &event.task_id {
+                task_events.entry(task_id.clone()).or_default().push(event);
+            }
+        }
+
+        let mut recorded = 0usize;
+
+        for task_evts in task_events.into_values() {
+            let task_outcome = task_evts
+                .iter()
+                .rev()
+                .find(|event| event.event_type == EventType::TaskEnd)
+                .and_then(|event| event.parse_data::<TaskEndData>().ok())
+                .map(|data| data.status);
+            let mut seen_for_task: HashSet<(String, String)> = HashSet::new();
+
+            for (idx, event) in task_evts.iter().enumerate() {
+                if event.event_type != EventType::DecisionPoint {
+                    continue;
+                }
+
+                let Ok(decision) = event.parse_data::<DecisionPointData>() else {
+                    continue;
+                };
+                if !decision.severity.is_warning_or_higher() {
+                    continue;
+                }
+
+                let recovery_tool = next_successful_tool_after(&task_evts, idx);
+                let Some(pattern) = build_failure_pattern_observation(
+                    &decision,
+                    task_outcome,
+                    recovery_tool.as_deref(),
+                ) else {
+                    continue;
+                };
+
+                let dedup_key = (pattern.trigger_context.clone(), pattern.action.clone());
+                if !seen_for_task.insert(dedup_key) {
+                    continue;
+                }
+
+                match state
+                    .record_behavior_pattern(
+                        "failure",
+                        &pattern.description,
+                        Some(&pattern.trigger_context),
+                        Some(&pattern.action),
+                        pattern.confidence,
+                        1,
+                    )
+                    .await
+                {
+                    Ok(()) => recorded += 1,
+                    Err(e) => warn!(
+                        trigger_context = %pattern.trigger_context,
+                        action = %pattern.action,
+                        error = %e,
+                        "Failed to record failure pattern from decision point"
+                    ),
+                }
+            }
+        }
+
+        recorded
     }
 
     /// Infer the domain from tools used in a task
@@ -1024,9 +1117,282 @@ fn calculate_importance(messages: usize, tasks: usize, errors: usize) -> f32 {
     (base + message_factor + task_factor + error_factor).min(1.0)
 }
 
+fn next_successful_tool_after(task_events: &[&Event], start_idx: usize) -> Option<String> {
+    task_events.iter().skip(start_idx + 1).find_map(|event| {
+        if event.event_type != EventType::ToolResult {
+            return None;
+        }
+        let data = event.parse_data::<ToolResultData>().ok()?;
+        data.success.then_some(data.name)
+    })
+}
+
+fn build_failure_pattern_observation(
+    decision: &DecisionPointData,
+    task_outcome: Option<TaskStatus>,
+    recovery_tool: Option<&str>,
+) -> Option<FailurePatternObservation> {
+    let code = decision
+        .code
+        .as_deref()
+        .unwrap_or(decision.decision_type.as_str());
+    let metadata = &decision.metadata;
+    let recovery_suffix = recovery_tool
+        .map(|tool| format!(" Previous successful recoveries switched to {}.", tool))
+        .unwrap_or_default();
+    let with_confidence = |base: f32| failure_pattern_confidence(base, task_outcome, recovery_tool);
+
+    match code {
+        "repetitive_call_detection" => {
+            let tool = metadata
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_tool");
+            let count = metadata.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let action_kind = metadata
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("redirect");
+            let action = if action_kind == "hard_stop" {
+                "stop_retrying_identical_calls"
+            } else {
+                "pivot_to_alternate_tool_or_strategy"
+            };
+            let description = if count > 0 {
+                format!(
+                    "After {} repeated calls to {}, stop retrying the same operation and pivot to a different tool or summarize the blocker.{}",
+                    count, tool, recovery_suffix
+                )
+            } else {
+                format!(
+                    "Repeated calls to {} tend to become a dead-end loop; pivot to a different tool or summarize the blocker sooner.{}",
+                    tool, recovery_suffix
+                )
+            };
+            Some(FailurePatternObservation {
+                trigger_context: format!("{}:{}", code, tool),
+                action: action.to_string(),
+                description,
+                confidence: with_confidence(if action_kind == "hard_stop" { 0.74 } else { 0.62 }),
+            })
+        }
+        "consecutive_same_tool_detection" => {
+            let tool = metadata
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_tool");
+            let consecutive_count = metadata
+                .get("consecutive_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let unique_args = metadata
+                .get("unique_args")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let is_diverse = metadata
+                .get("is_diverse")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let description = if is_diverse {
+                format!(
+                    "Even varied {} calls can become a loop after {} consecutive uses; switch tools or summarize progress before continuing.{}",
+                    tool, consecutive_count, recovery_suffix
+                )
+            } else {
+                format!(
+                    "Long {} streaks with only {} distinct argument sets usually indicate a loop; change tools or adjust strategy before continuing.{}",
+                    tool, unique_args, recovery_suffix
+                )
+            };
+            Some(FailurePatternObservation {
+                trigger_context: format!("{}:{}", code, tool),
+                action: "switch_tools_before_long_streaks".to_string(),
+                description,
+                confidence: with_confidence(if is_diverse { 0.54 } else { 0.68 }),
+            })
+        }
+        "alternating_pattern_detection" => {
+            let mut tools: Vec<String> = metadata
+                .get("tools")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if tools.is_empty() {
+                tools.push("unknown_pair".to_string());
+            }
+            tools.sort();
+            let tool_pair = tools.join(" <-> ");
+            Some(FailurePatternObservation {
+                trigger_context: format!("{}:{}", code, tools.join("+")),
+                action: "break_alternating_tool_loops".to_string(),
+                description: format!(
+                    "Alternating between {} with low call diversity usually indicates a loop; commit to one path or choose a third tool instead of bouncing between them.{}",
+                    tool_pair, recovery_suffix
+                ),
+                confidence: with_confidence(0.72),
+            })
+        }
+        "tool_budget_block" => {
+            let tool = metadata
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_tool");
+            let semantic_failures = metadata
+                .get("prior_semantic_failures")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let prior_calls = metadata
+                .get("prior_calls")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let description = if semantic_failures > 0 {
+                format!(
+                    "Once {} has repeated the same semantic failure {} times, stop retrying it and switch strategy earlier.{}",
+                    tool, semantic_failures, recovery_suffix
+                )
+            } else {
+                format!(
+                    "After {} repeated {} calls without enough progress, stop retrying the blocked tool and switch strategy earlier.{}",
+                    prior_calls, tool, recovery_suffix
+                )
+            };
+            Some(FailurePatternObservation {
+                trigger_context: format!("{}:{}", code, tool),
+                action: "stop_retrying_blocked_tool".to_string(),
+                description,
+                confidence: with_confidence(if semantic_failures > 0 { 0.74 } else { 0.68 }),
+            })
+        }
+        "pre_tool_deferral_stall" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "ask_clarifying_question_or_take_next_tool_step".to_string(),
+            description: format!(
+                "Repeatedly deferring before taking any tool step leads to failure; ask one concrete clarification question or take the next tool action earlier.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.72),
+        }),
+        "stall" => {
+            let stall_mode = metadata
+                .get("stall_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("generic");
+            Some(FailurePatternObservation {
+                trigger_context: format!("{}:{}", code, stall_mode),
+                action: "summarize_progress_or_change_strategy".to_string(),
+                description: format!(
+                    "When iterations stop producing new evidence, stop looping, summarize what is known, and change strategy instead of continuing the same pattern.{}",
+                    recovery_suffix
+                ),
+                confidence: with_confidence(0.76),
+            })
+        }
+        "hard_iteration_cap" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "finish_before_hard_iteration_cap".to_string(),
+            description: format!(
+                "As the hard iteration cap approaches, stop repeating work and return the best partial answer or next concrete step earlier.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.60),
+        }),
+        "task_timeout" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "checkpoint_and_reduce_scope_before_timeout".to_string(),
+            description: format!(
+                "Long-running tasks that approach the timeout should checkpoint progress and reduce scope earlier instead of continuing the same loop.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.64),
+        }),
+        "task_token_budget" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "reduce_token_spend_and_checkpoint".to_string(),
+            description: format!(
+                "When task token spend stays high, reduce scope, checkpoint findings, or stop earlier instead of consuming the full task budget.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.68),
+        }),
+        "scheduled_run_budget" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "checkpoint_scheduled_run_before_budget_exhaustion".to_string(),
+            description: format!(
+                "Scheduled runs should bail out once progress slows; checkpoint the current state instead of burning the full per-run token budget.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.70),
+        }),
+        "goal_daily_token_budget" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "checkpoint_goal_work_before_daily_budget_exhaustion".to_string(),
+            description: format!(
+                "For recurring goal work, avoid spending the full daily budget in one pass; checkpoint progress and defer the rest earlier.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.70),
+        }),
+        "daily_token_budget" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "checkpoint_before_daily_budget_exhaustion".to_string(),
+            description: format!(
+                "When the session is nearing the daily token budget, checkpoint useful progress and stop earlier instead of exhausting the remaining budget.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.70),
+        }),
+        "task_token_budget_warning" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "reduce_token_spend_before_budget_warning".to_string(),
+            description: format!(
+                "High token-spend phases should trigger earlier summarization or scope reduction before the task budget is exhausted.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.45),
+        }),
+        "soft_iteration_warning" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "adjust_strategy_before_soft_iteration_warning".to_string(),
+            description: format!(
+                "When the soft iteration warning appears, summarize progress or change strategy instead of continuing the same loop.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.45),
+        }),
+        _ => None,
+    }
+}
+
+fn failure_pattern_confidence(
+    base: f32,
+    task_outcome: Option<TaskStatus>,
+    recovery_tool: Option<&str>,
+) -> f32 {
+    let outcome_bonus = match task_outcome {
+        Some(TaskStatus::Failed) => 0.08,
+        Some(TaskStatus::Cancelled) => 0.04,
+        Some(TaskStatus::Completed) => 0.0,
+        None => 0.0,
+    };
+    let recovery_bonus = if recovery_tool.is_some() { 0.03 } else { 0.0 };
+    (base + outcome_bonus + recovery_bonus).clamp(0.1, 0.96)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{DiagnosticSeverity, Event, EventType};
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::plans::PlanStore;
+    use crate::state::SqliteStateStore;
+    use crate::traits::StateStore;
+    use serde_json::json;
+    use std::sync::Arc;
 
     // ── truncate tests ──
 
@@ -1059,5 +1425,115 @@ mod tests {
         // total = 0.3 + 0.3 + 0.3 + 0.1 = 1.0, capped at 1.0
         let result = calculate_importance(100, 100, 100);
         assert!((result - 1.0).abs() < f32::EPSILON);
+    }
+
+    async fn setup_consolidator_test() -> (
+        Arc<SqliteStateStore>,
+        Arc<EventStore>,
+        Consolidator,
+        tempfile::NamedTempFile,
+    ) {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let db_path = db_file.path().to_str().expect("db path");
+        let embedding_service = Arc::new(EmbeddingService::new().expect("embedding service"));
+        let state = Arc::new(
+            SqliteStateStore::new(db_path, 100, None, embedding_service)
+                .await
+                .expect("state store"),
+        );
+        let event_store = Arc::new(EventStore::new(state.pool()).await.expect("event store"));
+        let plan_store = Arc::new(PlanStore::new(state.pool()).await.expect("plan store"));
+        let consolidator =
+            Consolidator::new(event_store.clone(), plan_store, state.pool(), None, None)
+                .with_state(state.clone() as Arc<dyn StateStore>);
+        (state, event_store, consolidator, db_file)
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_records_failure_patterns_from_warning_decisions() {
+        let (state, event_store, consolidator, _db_file) = setup_consolidator_test().await;
+
+        let task_id = "task-failure-pattern";
+        let mut task_start = Event::new(
+            "session-failure-pattern",
+            EventType::TaskStart,
+            json!({
+                "task_id": task_id,
+                "description": "debug repetitive terminal loop"
+            }),
+        );
+        task_start.created_at = Utc::now();
+        event_store
+            .append(task_start)
+            .await
+            .expect("append task start");
+
+        let mut decision = Event::new(
+            "session-failure-pattern",
+            EventType::DecisionPoint,
+            serde_json::to_value(DecisionPointData {
+                decision_type: crate::events::DecisionType::RepetitiveCallDetection,
+                task_id: task_id.to_string(),
+                iteration: 4,
+                severity: DiagnosticSeverity::Warning,
+                code: Some("repetitive_call_detection".to_string()),
+                metadata: json!({
+                    "tool": "terminal",
+                    "count": 4,
+                    "action": "hard_stop"
+                }),
+                summary: "Repetitive tool call hard-stopped for terminal (count=4)".to_string(),
+            })
+            .expect("serialize decision"),
+        );
+        decision.created_at = Utc::now();
+        event_store.append(decision).await.expect("append decision");
+
+        let mut task_end = Event::new(
+            "session-failure-pattern",
+            EventType::TaskEnd,
+            serde_json::to_value(TaskEndData {
+                task_id: task_id.to_string(),
+                status: TaskStatus::Failed,
+                duration_secs: 3,
+                iterations: 4,
+                tool_calls_count: 4,
+                error: Some("Repetitive tool calls".to_string()),
+                summary: Some("Agent stopped due to repetitive terminal loop".to_string()),
+            })
+            .expect("serialize task end"),
+        );
+        task_end.created_at = Utc::now();
+        event_store.append(task_end).await.expect("append task end");
+
+        let result = consolidator
+            .consolidate_session("session-failure-pattern")
+            .await
+            .expect("consolidate session");
+        assert_eq!(result.behavior_patterns_recorded, 1);
+
+        let patterns = state
+            .get_behavior_patterns(0.0)
+            .await
+            .expect("get behavior patterns");
+        let pattern = patterns
+            .iter()
+            .find(|pattern| {
+                pattern.trigger_context.as_deref() == Some("repetitive_call_detection:terminal")
+            })
+            .expect("repetitive failure pattern");
+        assert_eq!(pattern.pattern_type, "failure");
+        assert_eq!(
+            pattern.action.as_deref(),
+            Some("stop_retrying_identical_calls")
+        );
+        assert!(
+            pattern
+                .description
+                .contains("stop retrying the same operation"),
+            "pattern description was: {}",
+            pattern.description
+        );
+        assert!(pattern.confidence >= 0.8);
     }
 }

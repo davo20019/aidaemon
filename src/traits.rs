@@ -36,7 +36,11 @@ pub use provider::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord,
     ToolChoiceMode,
 };
-pub use tools::{AgentRole, Tool, ToolCallMetadata, ToolCallOutcome, ToolCapabilities, ToolRole};
+#[allow(unused_imports)]
+pub use tools::{
+    AgentRole, Tool, ToolCallEffect, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolRole, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+};
 pub use trigger_event::TriggerEvent;
 
 mod state_store;

@@ -122,6 +122,35 @@ impl ManageGoalTasksTool {
     }
 }
 
+pub(crate) fn goal_completion_summary_indicates_not_finished(summary: &str) -> bool {
+    let lower = summary.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    [
+        "i completed part of the request",
+        "haven't verified the final outcome",
+        "have not verified the final outcome",
+        "haven't verified yet",
+        "have not verified yet",
+        "not verified yet",
+        "not yet verified",
+        "verification pending",
+        "need a final read-only check",
+        "need a final read only check",
+        "before i can claim success",
+        "can't claim success",
+        "cannot claim success",
+        "still need to verify",
+        "still need a final check",
+        "partially completed",
+        "partial completion",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+}
+
 #[derive(Deserialize)]
 struct ManageGoalTasksArgs {
     action: String,
@@ -236,16 +265,6 @@ impl Tool for ManageGoalTasksTool {
         ToolRole::Management
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManageGoalTasksArgs = serde_json::from_str(arguments)?;
 
@@ -259,6 +278,16 @@ impl Tool for ManageGoalTasksTool {
             "complete_goal" => self.complete_goal(&args).await,
             "fail_goal" => self.fail_goal(&args).await,
             other => Ok(format!("Unknown action: {}. Use: create_task, list_tasks, update_task, claim_task, retry_task, resolve_blocker, complete_goal, fail_goal", other)),
+        }
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
         }
     }
 }
@@ -643,6 +672,34 @@ impl ManageGoalTasksTool {
     }
 
     async fn complete_goal(&self, args: &ManageGoalTasksArgs) -> anyhow::Result<String> {
+        let summary = args
+            .summary
+            .as_deref()
+            .unwrap_or("Goal completed successfully");
+        if goal_completion_summary_indicates_not_finished(summary) {
+            return Ok(
+                "Blocked: do not call manage_goal_tasks(action=\"complete_goal\") when the summary says verification is still pending or only partial progress is done. Keep the goal active, finish the final read-only check, then complete it; or use fail_goal if the work cannot be finished."
+                    .to_string(),
+            );
+        }
+
+        let tasks = self.state.get_tasks_for_goal(&self.goal_id).await?;
+        if tasks.is_empty() {
+            return Ok(
+                "Blocked: do not call manage_goal_tasks(action=\"complete_goal\") before creating and completing concrete tasks for this goal. Create the task plan first, then complete the goal only after the task list is actually done."
+                    .to_string(),
+            );
+        }
+        if let Some(task) = tasks
+            .iter()
+            .find(|task| !matches!(task.status.as_str(), "completed" | "skipped"))
+        {
+            return Ok(format!(
+                "Blocked: do not call manage_goal_tasks(action=\"complete_goal\") while tasks are still incomplete. '{}' is still {}. Finish or explicitly resolve every task first, or use fail_goal if the goal cannot be completed.",
+                task.description, task.status
+            ));
+        }
+
         let mut goal = self
             .state
             .get_goal(&self.goal_id)
@@ -656,10 +713,6 @@ impl ManageGoalTasksTool {
         self.state.update_goal(&goal).await?;
         info!(goal_id = %self.goal_id, "Goal completed");
 
-        let summary = args
-            .summary
-            .as_deref()
-            .unwrap_or("Goal completed successfully");
         let mut response = format!("Goal {} completed: {}", self.goal_id, summary);
         if let Some(excerpt) = self.build_completed_task_result_excerpt().await? {
             response.push_str("\n\n");
@@ -765,8 +818,24 @@ impl ManageGoalTasksTool {
             .get_goal(&self.goal_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Goal not found: {}", self.goal_id))?;
+        let summary = args.summary.as_deref().unwrap_or("Goal failed");
+
+        let mut context = goal
+            .context
+            .as_deref()
+            .and_then(|ctx| serde_json::from_str::<Value>(ctx).ok())
+            .unwrap_or_else(|| json!({}));
+        if !context.is_object() {
+            context = json!({
+                "prior_context_raw": goal.context.clone().unwrap_or_default(),
+            });
+        }
+        if let Some(obj) = context.as_object_mut() {
+            obj.insert("failure_summary".to_string(), json!(summary));
+        }
 
         goal.status = "failed".to_string();
+        goal.context = Some(context.to_string());
         goal.updated_at = chrono::Utc::now().to_rfc3339();
 
         self.state.update_goal(&goal).await?;
@@ -793,7 +862,6 @@ impl ManageGoalTasksTool {
             info!(goal_id = %self.goal_id, cancelled, "Cancelled pending tasks for failed goal");
         }
 
-        let summary = args.summary.as_deref().unwrap_or("Goal failed");
         Ok(format!(
             "Goal {} failed (cancelled {} pending tasks): {}",
             self.goal_id, cancelled, summary
@@ -936,9 +1004,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_goal_action() {
+    async fn test_complete_goal_requires_completed_tasks() {
         let (state, goal_id) = setup_test_state().await;
         let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
+
+        tool.call(
+            &json!({
+                "action": "create_task",
+                "description": "Do the work"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let task_id = state.get_tasks_for_goal(&goal_id).await.unwrap()[0]
+            .id
+            .clone();
+        tool.call(
+            &json!({
+                "action": "update_task",
+                "task_id": task_id,
+                "status": "completed",
+                "result": "All tasks done"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
 
         let result = tool
             .call(
@@ -1058,6 +1151,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_complete_goal_blocks_verification_pending_summary() {
+        let (state, goal_id) = setup_test_state().await;
+        let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "complete_goal",
+                    "summary": "I completed part of the request, but I haven't verified the final outcome against /Users/davidloor/Library/Logs/aidaemon yet.\n\nI need a final read-only check before I can claim success."
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Blocked:"));
+
+        let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
+        assert_eq!(goal.status, "active");
+        assert!(goal.completed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_complete_goal_blocks_when_tasks_are_not_done() {
+        let (state, goal_id) = setup_test_state().await;
+        let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
+
+        tool.call(
+            &json!({
+                "action": "create_task",
+                "description": "Run final verification"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "complete_goal",
+                    "summary": "Everything is finished"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Blocked:"));
+        assert!(result.contains("Run final verification"));
+
+        let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
+        assert_eq!(goal.status, "active");
+        assert!(goal.completed_at.is_none());
+    }
+
+    #[tokio::test]
     async fn test_fail_goal_action() {
         let (state, goal_id) = setup_test_state().await;
         let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
@@ -1078,6 +1228,17 @@ mod tests {
 
         let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
         assert_eq!(goal.status, "failed");
+        assert_eq!(
+            goal.context
+                .as_deref()
+                .and_then(|ctx| serde_json::from_str::<Value>(ctx).ok())
+                .and_then(|ctx| {
+                    ctx.get("failure_summary")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned)
+                }),
+            Some("Could not complete".to_string())
+        );
     }
 
     #[tokio::test]

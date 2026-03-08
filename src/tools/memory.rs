@@ -138,16 +138,6 @@ impl Tool for RememberFactTool {
         ToolRole::Universal
     }
 
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
-    }
-
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: RememberArgs = serde_json::from_str(arguments)?;
 
@@ -214,5 +204,15 @@ impl Tool for RememberFactTool {
         }
 
         Ok(results.join("\n"))
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
     }
 }
