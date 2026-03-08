@@ -21,12 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Goal completion guardrails**: `manage_goal_tasks(action="complete_goal")` now refuses summaries that admit partial progress or pending verification, while still requiring every concrete task to be resolved first.
 - **Tool execution plumbing upgraded**: Tool execution now propagates structured semantics/metadata, merges fallback semantics for legacy plain-text tools, and uses those semantics to update completion progress.
 - **Project path normalization**: Project-scope resolution now promotes nested directories to project roots and resolves configured project aliases consistently across follow-ups and delegated runs.
+- **OAuth reauthorization flow safety**: `manage_oauth connect` now keeps the existing connection active until the new OAuth flow completes, and agent guidance prefers reconnecting over removing a working connection first.
+- **Release automation hardening**: Release workflows now verify that the tag matches `Cargo.toml`, fail loudly on real crates.io publish errors, poll crates.io for the expected version, and flag release commits that reach `master` without a matching tag.
 
 ### Fixed
 
 - **False-success replies after writes**: Requests that mutate files, URLs, or project state no longer claim completion before a matching verification step.
 - **Delegation scope spoofing**: Executor-spawned `_project_scope` arguments are now overwritten with the trusted parent scope instead of honoring model-supplied values.
 - **Pre-tool deferral loops**: Repeated "I'll do it" text-only replies before the first tool call now trigger a hard tool-call directive, a fallback-model retry window, and clearer blocker text when no tools are available.
+- **OAuth disconnect footgun**: Removing an OAuth connection now requires explicit `confirm_disconnect=true` plus approval, reducing accidental token deletion during scope refreshes.
+- **Machine-specific CI test path**: The CLI-agent prompt-recovery test now uses a temporary working directory instead of a hardcoded local filesystem path, so Linux and macOS CI runners pass consistently.
 
 ## [0.9.19] - 2026-03-08
 

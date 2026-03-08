@@ -3530,6 +3530,8 @@ mod tests {
     #[tokio::test]
     async fn test_run_recovers_prompt_from_task_and_goal_context() {
         let (tool, _db) = setup_echo_tool().await;
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let working_dir = tmp_dir.path().to_string_lossy().to_string();
         let goal = Goal::new_finite(
             "Review the latest aidaemon service logs and make the smallest safe fix",
             "sess-ctx",
@@ -3539,9 +3541,10 @@ mod tests {
         let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
-            description:
-                "Inspect the recent log failures and patch the root cause in /Users/davidloor/projects/aidaemon"
-                    .to_string(),
+            description: format!(
+                "Inspect the recent log failures and patch the root cause in {}",
+                working_dir
+            ),
             status: "claimed".to_string(),
             priority: "high".to_string(),
             task_order: 1,
@@ -3563,8 +3566,8 @@ mod tests {
 
         let result = tool
             .call(&format!(
-                r#"{{"action":"run","tool":"echo","working_dir":"/Users/davidloor/projects/aidaemon","_goal_id":"{}","_task_id":"{}"}}"#,
-                goal.id, task.id
+                r#"{{"action":"run","tool":"echo","working_dir":"{}","_goal_id":"{}","_task_id":"{}"}}"#,
+                working_dir, goal.id, task.id
             ))
             .await
             .unwrap();
@@ -3577,7 +3580,10 @@ mod tests {
             result
         );
         assert!(
-            result.contains("Task: Inspect the recent log failures and patch the root cause in /Users/davidloor/projects/aidaemon"),
+            result.contains(&format!(
+                "Task: Inspect the recent log failures and patch the root cause in {}",
+                working_dir
+            )),
             "Expected synthesized task from task context, got: {}",
             result
         );

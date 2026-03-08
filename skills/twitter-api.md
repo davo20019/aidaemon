@@ -32,8 +32,8 @@ When working with the X (Twitter) API, use this knowledge to diagnose errors and
 |---|---|---|
 | "You attempted to reply to a Tweet that is deleted or not visible to you" | Free tier can't see other users' tweets | Need Basic tier ($200/mo) to reply to others |
 | "You are not allowed to create a Tweet with duplicate content" | Exact same tweet text posted recently | Change the text slightly |
-| "Forbidden" (generic) | App permissions set to "Read" only | Change to "Read and Write" in X Developer Portal, then re-do OAuth flow |
-| 403 after changing permissions | Old OAuth token has stale scopes | Remove and reconnect OAuth: `manage_oauth` remove twitter, then connect |
+| "Forbidden" (generic) | App permissions set to "Read" only | Change to "Read and Write" in X Developer Portal, then start a fresh OAuth connect flow |
+| 403 after changing permissions | Old OAuth token has stale scopes | Run `manage_oauth` connect for twitter again. Do not remove the existing connection first |
 
 ### Replying to a Tweet
 
@@ -62,4 +62,5 @@ POST https://api.twitter.com/2/tweets
 - aidaemon uses OAuth 2.0 PKCE for X authentication
 - Scopes requested: tweet.read, tweet.write, users.read, offline.access
 - Tokens stored in OS keychain as `oauth_twitter_access_token`
-- After changing app permissions in X Developer Portal, you MUST remove and reconnect the OAuth connection to get a new token with updated scopes
+- After changing app permissions in X Developer Portal, start a new OAuth connect flow to get a token with updated scopes
+- Do not remove the old Twitter connection first; if reconnect fails or times out, you want the current connection to remain available

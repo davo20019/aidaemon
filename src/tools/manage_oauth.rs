@@ -28,6 +28,7 @@ struct ManageOAuthArgs {
     token_url: Option<String>,
     scopes: Option<Vec<String>>,
     allowed_domains: Option<Vec<String>>,
+    confirm_disconnect: Option<bool>,
     #[serde(default)]
     _session_id: String,
 }
@@ -259,6 +260,20 @@ impl ManageOAuthTool {
         )
     }
 
+    fn reconnect_preserves_existing_connection_note(service: &str) -> String {
+        format!(
+            "An existing OAuth connection for '{}' will stay active unless the new authorization flow completes successfully.",
+            service
+        )
+    }
+
+    fn disconnect_confirmation_message(service: &str) -> String {
+        format!(
+            "Refusing to disconnect '{}' without `confirm_disconnect=true`. Use `connect` to refresh permissions or replace tokens without dropping the current connection first.",
+            service
+        )
+    }
+
     async fn handle_providers(&self) -> anyhow::Result<String> {
         let doc = self.load_config_doc().await?;
         let custom_names: std::collections::HashSet<String> = Self::providers_table(&doc)
@@ -420,6 +435,11 @@ impl ManageOAuthTool {
         session_id: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<String> {
+        let has_existing_connection = self
+            .state_store
+            .get_oauth_connection(service)
+            .await?
+            .is_some();
         if let Some(provider) = self.gateway.get_provider(service).await {
             match provider.auth_type {
                 OAuthType::OAuth1a => {
@@ -438,9 +458,14 @@ impl ManageOAuthTool {
         let (authorize_url, result_rx) =
             self.gateway.start_oauth2_flow(service, session_id).await?;
         let callback_warning = Self::callback_access_warning(&self.gateway.callback_url());
+        let reconnect_note = has_existing_connection
+            .then(|| Self::reconnect_preserves_existing_connection_note(service));
 
         if let Some(ref tx) = status_tx {
             let mut parts = Vec::new();
+            if let Some(note) = &reconnect_note {
+                parts.push(note.clone());
+            }
             if let Some(warning) = &callback_warning {
                 parts.push(format!("Note: {}", warning));
             }
@@ -454,32 +479,61 @@ impl ManageOAuthTool {
                 .await;
         }
 
+        let compose_result = |body: String| {
+            let mut parts = Vec::new();
+            if let Some(note) = &reconnect_note {
+                parts.push(note.clone());
+            }
+            if let Some(warning) = &callback_warning {
+                parts.push(format!("Note: {}", warning));
+            }
+            parts.push(body);
+            parts.join("\n\n")
+        };
+
         match tokio::time::timeout(OAuthGateway::flow_timeout(), result_rx).await {
-            Ok(Ok(result)) => Ok(match callback_warning {
-                Some(warning) => format!("Note: {}\n\n{}", warning, result.message),
-                None => result.message,
-            }),
-            Ok(Err(_)) => Ok(match callback_warning {
-                Some(warning) => format!("Note: {}\n\nOAuth flow was cancelled.", warning),
-                None => "OAuth flow was cancelled.".to_string(),
-            }),
+            Ok(Ok(result)) => Ok(compose_result(result.message)),
+            Ok(Err(_)) => Ok(compose_result("OAuth flow was cancelled.".to_string())),
             Err(_) => {
                 warn!(service = %service, "OAuth flow timed out");
-                Ok(match callback_warning {
-                    Some(warning) => format!(
-                        "Note: {}\n\nOAuth flow timed out (10 minutes). Please try again.",
-                        warning
-                    ),
-                    None => "OAuth flow timed out (10 minutes). Please try again.".to_string(),
-                })
+                Ok(compose_result(
+                    "OAuth flow timed out (10 minutes). Please try again.".to_string(),
+                ))
             }
         }
     }
 
-    async fn handle_remove(&self, service: &str) -> anyhow::Result<String> {
+    async fn handle_remove(
+        &self,
+        service: &str,
+        confirm_disconnect: bool,
+        session_id: &str,
+    ) -> anyhow::Result<String> {
         let conn = self.state_store.get_oauth_connection(service).await?;
         if conn.is_none() {
             return Ok(format!("No OAuth connection found for '{}'", service));
+        }
+        if !confirm_disconnect {
+            return Ok(Self::disconnect_confirmation_message(service));
+        }
+        let approval_description = format!("Disconnect OAuth service '{}'", service);
+        match self
+            .request_approval(
+                session_id,
+                &approval_description,
+                vec![
+                    "Deletes the stored OAuth connection and tokens".to_string(),
+                    "Leaves the service unavailable until it is connected again".to_string(),
+                ],
+            )
+            .await?
+        {
+            ApprovalResponse::AllowOnce
+            | ApprovalResponse::AllowSession
+            | ApprovalResponse::AllowAlways => {}
+            ApprovalResponse::Deny => {
+                return Ok("OAuth disconnection denied by user.".to_string());
+            }
         }
         self.gateway.remove_connection(service).await
     }
@@ -796,12 +850,16 @@ impl Tool for ManageOAuthTool {
                     "scopes": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional scopes"
+                        "description": "Optional scopes for register_provider. Ignored for built-in providers and connect/list/remove actions."
                     },
                     "allowed_domains": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Allowed API domains"
+                        "description": "Allowed API domains for register_provider."
+                    },
+                    "confirm_disconnect": {
+                        "type": "boolean",
+                        "description": "Required with true when action='remove'. Use remove only for intentional disconnection; use connect to refresh or replace tokens."
                     }
                 },
                 "required": ["action"],
@@ -860,7 +918,17 @@ impl Tool for ManageOAuthTool {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("'remove' requires 'service' parameter"))?,
                 )?;
-                self.handle_remove(&service).await
+                let session_id = if args._session_id.is_empty() {
+                    "unknown"
+                } else {
+                    args._session_id.as_str()
+                };
+                self.handle_remove(
+                    &service,
+                    args.confirm_disconnect.unwrap_or(false),
+                    session_id,
+                )
+                .await
             }
             "register_provider" => {
                 let service = Self::validate_service_name(
@@ -1140,5 +1208,99 @@ allowed_domains = ["api.linear.app"]
 
         assert!(result.contains("callback_url: http://localhost:8080/oauth/callback"));
         assert!(result.contains("same machine running aidaemon"));
+    }
+
+    #[tokio::test]
+    async fn remove_requires_explicit_confirmation() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config_file = NamedTempFile::new().unwrap();
+        let env_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var(
+            crate::RUNTIME_ENV_FILE_ENV_KEY,
+            env_file.path().to_string_lossy().to_string(),
+        );
+        let (tool, _gateway) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+
+        tool.state_store
+            .save_oauth_connection(&crate::traits::OAuthConnection {
+                id: 0,
+                service: "twitter".to_string(),
+                auth_type: "oauth2_pkce".to_string(),
+                username: None,
+                scopes: r#"["tweet.read","tweet.write","users.read","offline.access"]"#.to_string(),
+                token_expires_at: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        let result = tool
+            .call(r#"{"action":"remove","service":"twitter","_session_id":"test"}"#)
+            .await
+            .unwrap();
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
+
+        assert!(result.contains("confirm_disconnect=true"));
+        assert!(tool
+            .state_store
+            .get_oauth_connection("twitter")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn remove_with_explicit_confirmation_disconnects_service() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config_file = NamedTempFile::new().unwrap();
+        let env_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var(
+            crate::RUNTIME_ENV_FILE_ENV_KEY,
+            env_file.path().to_string_lossy().to_string(),
+        );
+        let (tool, _gateway) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+
+        tool.state_store
+            .save_oauth_connection(&crate::traits::OAuthConnection {
+                id: 0,
+                service: "twitter".to_string(),
+                auth_type: "oauth2_pkce".to_string(),
+                username: None,
+                scopes: r#"["tweet.read","tweet.write","users.read","offline.access"]"#.to_string(),
+                token_expires_at: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        let result = tool
+            .call(
+                r#"{"action":"remove","service":"twitter","confirm_disconnect":true,"_session_id":"test"}"#,
+            )
+            .await
+            .unwrap();
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
+
+        assert!(result.contains("Disconnected from twitter"));
+        assert!(tool
+            .state_store
+            .get_oauth_connection("twitter")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

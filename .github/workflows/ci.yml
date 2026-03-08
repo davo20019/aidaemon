@@ -10,6 +10,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  release-tag-guard:
+    name: Release tag guard
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure release commits are tagged
+        run: |
+          set -euo pipefail
+
+          SUBJECT="$(git log -1 --pretty=%s "$GITHUB_SHA")"
+          TAG_NAME="$(printf '%s\n' "$SUBJECT" | sed -nE 's/^release: (v[0-9]+\.[0-9]+\.[0-9]+).*/\1/p')"
+
+          if [ -z "$TAG_NAME" ]; then
+            echo "HEAD commit is not a release commit; skipping tag guard."
+            exit 0
+          fi
+
+          if git tag --points-at "$GITHUB_SHA" | grep -Fxq "$TAG_NAME"; then
+            echo "Found matching tag ${TAG_NAME} on ${GITHUB_SHA}."
+            exit 0
+          fi
+
+          echo "::error::Release commit '${SUBJECT}' reached master without matching tag '${TAG_NAME}' pointing at ${GITHUB_SHA}."
+          echo "Tags currently pointing at ${GITHUB_SHA}:"
+          git tag --points-at "$GITHUB_SHA" || true
+          exit 1
+
   check:
     name: Check (fmt + clippy)
     runs-on: ubuntu-latest

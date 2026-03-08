@@ -409,6 +409,20 @@ static TOOL_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         .join("|");
 
     vec![
+        // ── slash-prefixed command forms ────────────────────────────────
+        // "`/manage_oauth list`"
+        Regex::new(&format!(r"`/(?:{names})(?:\s+[^`\n]+)?`")).unwrap(),
+        // A standalone command line like "/manage_oauth connect twitter"
+        Regex::new(&format!(
+            r"(?im)^\s*/(?:{names})(?:[ \t]+[^\n\r`]+)?\s*$"
+        ))
+        .unwrap(),
+        // "type /manage_oauth list" / "run /manage_oauth connect twitter"
+        Regex::new(&format!(
+            r"(?i)(?:type|enter|use|using|run|running|try|call|calling|invoke|invoking)\s+/(?:{names})(?:\s+[A-Za-z0-9_.:-]+)*"
+        ))
+        .unwrap(),
+
         // ── backtick-wrapped with surrounding phrasing ──────────────────
         // "I couldn't find a `tool` tool"  /  "find a `tool`"  /  "find the `tool` tool"
         Regex::new(&format!(
@@ -721,6 +735,49 @@ mod tests {
         assert!(
             !result.contains("spawn_agent"),
             "spawn_agent leaked: {result}"
+        );
+    }
+
+    #[test]
+    fn test_strip_backtick_slash_prefixed_tool_command() {
+        let input = "Type `/manage_oauth connect twitter` to reconnect the account.";
+        let result = strip_tool_name_references(input);
+        assert!(
+            !result.contains("manage_oauth"),
+            "manage_oauth leaked: {result}"
+        );
+        assert!(
+            !result.contains("/manage_oauth"),
+            "slash tool command leaked: {result}"
+        );
+        assert!(!result.contains('`'), "backticks leaked: {result}");
+    }
+
+    #[test]
+    fn test_strip_standalone_slash_prefixed_tool_command_line() {
+        let input = "If you want to inspect OAuth connections:\n/manage_oauth list\nThis shows the current status.";
+        let result = strip_tool_name_references(input);
+        assert!(
+            !result.contains("manage_oauth"),
+            "manage_oauth leaked: {result}"
+        );
+        assert!(
+            !result.contains("/manage_oauth"),
+            "slash tool command leaked: {result}"
+        );
+    }
+
+    #[test]
+    fn test_strip_inline_slash_prefixed_tool_command_with_context() {
+        let input = "Run /manage_oauth list first, then tell me what you see.";
+        let result = strip_tool_name_references(input);
+        assert!(
+            !result.contains("manage_oauth"),
+            "manage_oauth leaked: {result}"
+        );
+        assert!(
+            !result.contains("/manage_oauth"),
+            "slash tool command leaked: {result}"
         );
     }
 

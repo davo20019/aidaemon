@@ -1429,6 +1429,8 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         \n  **After connecting, use `http_request` directly** — an auth profile is automatically created \
         with the service name (for example `auth_profile=\"twitter\"` or `auth_profile=\"linear\"`). \
         Do NOT reconnect if the service is already connected; check `list` first. \
+        If you do need to reauthorize or refresh scopes, use `connect` again; it replaces the stored connection only after the new OAuth flow succeeds. \
+        Do NOT call `remove` first unless the user explicitly wants the service disconnected. \
         If a connection was removed or expired, do NOT assume the app credentials are gone. \
         Use `providers` or `describe_provider` first to see whether credentials are already stored. \
         Only ask the user for client ID/secret if the provider actually reports that credentials are missing. \
