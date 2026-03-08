@@ -1381,58 +1381,58 @@ impl Tool for ConfigManagerTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_config",
-            "description": "Read or update aidaemon's own config.toml. Backs up before writing and validates changes. Use 'restore' to rollback if something goes wrong. Use 'switch_provider' for the primary provider, or 'list_failover_providers' / 'add_failover_provider' / 'remove_failover_provider' for cross-provider failover setup. After updating, tell the user to run /reload.",
+            "description": "Read or update aidaemon config.toml with backup and validation.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["read", "get", "set", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider"],
-                        "description": "'read' = full config, 'get' = read key, 'set' = update key (auto-backup + validate), 'restore' = rollback to last backup, 'list_provider_presets' = show guided provider options, 'switch_provider' = guided primary-provider switch, 'list_failover_providers' = inspect configured fallback providers, 'add_failover_provider' = append one, 'remove_failover_provider' = delete one by index"
+                        "description": "Config action"
                     },
                     "key": {
                         "type": "string",
-                        "description": "TOML key path, e.g. 'provider.models.primary'. Required for get/set."
+                        "description": "TOML key path for get/set"
                     },
                     "value": {
                         "type": "string",
-                        "description": "New value (TOML literal, e.g. '\"gemini-2.0-flash\"' or '[\"ls\", \"git\"]'). Required for set."
+                        "description": "New TOML literal for set"
                     },
                     "provider": {
                         "type": "string",
-                        "description": "Provider preset for switch_provider or add_failover_provider (e.g. openai, xai, moonshot, minimax, cloudflare_gateway, custom_openai_compatible)."
+                        "description": "Provider preset"
                     },
                     "api_key": {
                         "type": "string",
-                        "description": "Provider API key for switch_provider or add_failover_provider."
+                        "description": "Provider API key"
                     },
                     "base_url": {
                         "type": "string",
-                        "description": "Optional override base URL for switch_provider or add_failover_provider. Required for cloudflare_gateway and custom_openai_compatible."
+                        "description": "Optional provider base URL"
                     },
                     "gateway_token": {
                         "type": "string",
-                        "description": "Optional Cloudflare gateway token for switch_provider or add_failover_provider."
+                        "description": "Optional gateway token"
                     },
                     "primary_model": {
                         "type": "string",
-                        "description": "Optional default/primary model override for switch_provider or add_failover_provider."
+                        "description": "Optional primary model override"
                     },
                     "fast_model": {
                         "type": "string",
-                        "description": "Optional fast fallback model override for switch_provider or add_failover_provider."
+                        "description": "Optional fast model override"
                     },
                     "smart_model": {
                         "type": "string",
-                        "description": "Optional smart fallback model override for switch_provider or add_failover_provider."
+                        "description": "Optional smart model override"
                     },
                     "failover_index": {
                         "type": "integer",
-                        "description": "0-based failover provider index for remove_failover_provider."
+                        "description": "Failover index for removal"
                     },
                     "save_secrets_to_keychain": {
                         "type": "boolean",
-                        "description": "When true (default), API keys are stored in OS keychain and config uses \"keychain\" sentinel."
+                        "description": "Store API keys in keychain"
                     }
                 },
                 "required": ["action"],

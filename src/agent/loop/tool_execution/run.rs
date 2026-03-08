@@ -97,6 +97,25 @@ fn deterministic_tool_contract_violation(
     }
 }
 
+fn blocked_for_untrusted_external_reference_message(
+    tool_name: &str,
+    active_skills: &[String],
+) -> String {
+    let scope = if active_skills.is_empty() {
+        "an untrusted external API guide reference".to_string()
+    } else {
+        format!(
+            "untrusted external API guide skill(s): {}",
+            active_skills.join(", ")
+        )
+    };
+    format!(
+        "Blocked: `{}` is unavailable while using {}. \
+Use API/auth tools directly, or ask explicitly for local file or repository inspection if you want me to read local files or inspect the local environment.",
+        tool_name, scope
+    )
+}
+
 fn project_scope_violation_for_tool_call(
     tool_name: &str,
     effective_arguments: &str,
@@ -306,6 +325,10 @@ impl Agent {
         let task_tokens_used = ctx.task_tokens_used;
         let _user_text = ctx.user_text;
         let restrict_to_personal_memory_tools = ctx.restrict_to_personal_memory_tools;
+        let active_untrusted_external_reference_skills =
+            ctx.active_untrusted_external_reference_skills;
+        let restrict_untrusted_external_reference_tools =
+            ctx.restrict_untrusted_external_reference_tools;
         let is_reaffirmation_challenge_turn = ctx.is_reaffirmation_challenge_turn;
         let personal_memory_tool_call_cap = ctx.personal_memory_tool_call_cap;
         let base_tool_defs = ctx.base_tool_defs;
@@ -539,6 +562,38 @@ impl Agent {
                 }
 
                 personal_memory_tool_calls = personal_memory_tool_calls.saturating_add(1);
+            }
+
+            if restrict_untrusted_external_reference_tools
+                && crate::agent::is_untrusted_external_reference_blocked_tool(&tc.name)
+            {
+                let result_text = blocked_for_untrusted_external_reference_message(
+                    &tc.name,
+                    active_untrusted_external_reference_skills,
+                );
+                let tool_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "tool".to_string(),
+                    content: Some(result_text),
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_name: Some(tc.name.clone()),
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.15,
+                    ..Message::runtime_defaults()
+                };
+                self.append_tool_message_with_result_event(
+                    emitter,
+                    &tool_msg,
+                    true,
+                    0,
+                    None,
+                    Some(task_id),
+                )
+                .await?;
+                iteration_had_tool_failures = true;
+                continue;
             }
 
             let mut effective_arguments = tc.arguments.clone();
@@ -1300,5 +1355,17 @@ mod tests {
             &without_notify,
         );
         assert!(!ack_no_notify.contains("final result will be sent automatically"));
+    }
+
+    #[test]
+    fn blocked_for_untrusted_external_reference_message_mentions_skill_names() {
+        let message = blocked_for_untrusted_external_reference_message(
+            "read_file",
+            &["widgets-api".to_string(), "linear-api".to_string()],
+        );
+        assert!(message.contains("read_file"));
+        assert!(message.contains("widgets-api"));
+        assert!(message.contains("linear-api"));
+        assert!(message.contains("explicitly for local file or repository inspection"));
     }
 }

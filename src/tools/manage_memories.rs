@@ -254,74 +254,74 @@ impl Tool for ManageMemoriesTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_memories",
-            "description": "List, search, forget, or change privacy of stored memories and goals. Also create/list/manage personal goals, and list/create/add/cancel/pause/resume/retry/diagnose scheduled goals. IMPORTANT for scheduled-goal management: first call action='list_scheduled' or 'list_scheduled_matching' to get exact goal IDs (and schedule IDs), then call add_schedule/cancel_scheduled/pause_scheduled/resume_scheduled/retry_scheduled/diagnose_scheduled with goal_id (and optionally schedule_id). Use create_scheduled_goal to create a new scheduled goal from scratch. Use retry_failed_scheduled for one-shot recovery of failed goals (optionally filtered by query). Do not use terminal/sqlite for scheduled-goal management when this tool can do it. Protected system maintenance goals cannot be cancelled.",
+            "description": "Manage memories, goals, and scheduled goals. Prefer this over terminal/SQLite for scheduling.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["list", "forget", "set_privacy", "search", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled"],
-                        "description": "Action to perform. For schedule operations: use list_scheduled or list_scheduled_matching first, then add_schedule/cancel_scheduled/pause_scheduled/resume_scheduled/retry_scheduled/diagnose_scheduled with exact goal_id (and optionally schedule_id). For bulk operations, use retry_failed_scheduled (all failed, optionally filtered), cancel_scheduled_matching, or retry_scheduled_matching with query."
+                        "description": "Action. List scheduled goals first before schedule-specific changes."
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Optional max items for list/search/list_goals/list_scheduled/list_scheduled_matching (default varies by action, max 200)."
+                        "description": "Optional max items"
                     },
                     "category": {
                         "type": "string",
-                        "description": "Optional category filter (for list/forget/set_privacy)"
+                        "description": "Category filter"
                     },
                     "key": {
                         "type": "string",
-                        "description": "Fact key (for forget/set_privacy)"
+                        "description": "Fact key"
                     },
                     "privacy": {
                         "type": "string",
                         "enum": ["global", "channel", "private"],
-                        "description": "Target privacy level (for set_privacy)"
+                        "description": "Target privacy"
                     },
                     "query": {
                         "type": "string",
-                        "description": "Search term (for search action). For scheduled bulk operations, this matches goal ID prefix or description text."
+                        "description": "Search term or scheduled-goal matcher"
                     },
                     "goal": {
                         "type": "string",
-                        "description": "Goal description for create_personal_goal or create_scheduled_goal."
+                        "description": "Goal description"
                     },
                     "priority": {
                         "type": "string",
                         "enum": ["low", "medium", "high", "critical"],
-                        "description": "Optional priority for create_personal_goal (default medium)."
+                        "description": "Goal priority"
                     },
                     "goal_id": {
                         "type": "string",
-                        "description": "Goal ID for goal/schedule actions. Retrieve via list_goals/list_scheduled first. For action='cancel_scheduled', use 'all' or '*' to cancel all cancellable scheduled goals in the current session."
+                        "description": "Goal ID; for cancel_scheduled also supports all/*"
                     },
                     "schedule_id": {
                         "type": "string",
-                        "description": "Optional schedule ID for schedule-specific pause/resume/cancel operations. Retrieve via list_scheduled first."
+                        "description": "Schedule ID for schedule-specific actions"
                     },
                     "schedule": {
                         "type": "string",
-                        "description": "Schedule string for add_schedule or create_scheduled_goal. Accepts natural text (e.g. 'daily at 9am', 'every day at 6am, 12pm, 6pm', 'every 6h') or a 5-field cron expression."
+                        "description": "Natural-language schedule or 5-field cron"
                     },
                     "schedules": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional list of schedules for create_scheduled_goal. Use when the user needs multiple schedules with different minutes (e.g. 8:05, 13:10, 21:30)."
+                        "description": "Optional list of schedules"
                     },
                     "fire_policy": {
                         "type": "string",
                         "enum": ["coalesce", "always_fire"],
-                        "description": "Optional schedule fire policy (default 'coalesce'). coalesce: skip if open tasks exist; always_fire: enqueue even if open tasks exist (capped)."
+                        "description": "Schedule fire policy"
                     },
                     "is_one_shot": {
                         "type": "boolean",
-                        "description": "Optional. When true, the schedule is deleted after it fires once."
+                        "description": "Delete after first fire"
                     },
                     "is_paused": {
                         "type": "boolean",
-                        "description": "Optional. When true, the new schedule starts paused."
+                        "description": "Start paused"
                     }
                 },
                 "required": ["action"],

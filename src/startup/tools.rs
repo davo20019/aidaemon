@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::config::AppConfig;
@@ -19,12 +18,12 @@ use crate::tools::BrowserTool;
 use crate::tools::ReadChannelHistoryTool;
 use crate::tools::{
     CheckEnvironmentTool, CliAgentTool, ConfigManagerTool, DiagnoseTool, EditFileTool,
-    GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool,
-    ManageCliAgentsTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool,
-    PolicyMetricsTool, ProjectInspectTool, ReadFileTool, RememberFactTool, RunCommandTool,
-    ScheduledGoalRunsTool, SearchFilesTool, SendFileTool, ServiceStatusTool, ShareMemoryTool,
-    SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool, WebSearchTool,
-    WriteFileTool,
+    GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool, ManageApiTool,
+    ManageCliAgentsTool, ManageHttpAuthTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool,
+    ManagePeopleTool, PolicyMetricsTool, ProjectInspectTool, ReadFileTool, RememberFactTool,
+    RunCommandTool, ScheduledGoalRunsTool, SearchFilesTool, SendFileTool, ServiceStatusTool,
+    ShareMemoryTool, SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool,
+    WebSearchTool, WriteFileTool,
 };
 use crate::traits::store_prelude::*;
 use crate::traits::Tool;
@@ -173,7 +172,9 @@ enum RuntimeToolId {
     ManageMcp,
     ManagePeople,
     HttpRequest,
+    ManageHttpAuth,
     ManageOauth,
+    ManageApi,
     SpawnAgent,
 }
 
@@ -183,7 +184,9 @@ impl RuntimeToolId {
             RuntimeToolId::ManageMcp => "manage_mcp",
             RuntimeToolId::ManagePeople => "manage_people",
             RuntimeToolId::HttpRequest => "http_request",
+            RuntimeToolId::ManageHttpAuth => "manage_http_auth",
             RuntimeToolId::ManageOauth => "manage_oauth",
+            RuntimeToolId::ManageApi => "manage_api",
             RuntimeToolId::SpawnAgent => "spawn_agent",
         }
     }
@@ -205,12 +208,12 @@ fn runtime_enabled_always(_: &AppConfig) -> bool {
     true
 }
 
-fn runtime_enabled_http_request(config: &AppConfig) -> bool {
-    !config.http_auth.is_empty() || config.oauth.enabled
+fn runtime_enabled_http_request(_: &AppConfig) -> bool {
+    true
 }
 
-fn runtime_enabled_oauth(config: &AppConfig) -> bool {
-    config.oauth.enabled
+fn runtime_enabled_oauth(_: &AppConfig) -> bool {
+    true
 }
 
 fn runtime_enabled_spawn(config: &AppConfig) -> bool {
@@ -234,9 +237,19 @@ const RUNTIME_TOOL_MANIFEST: &[RuntimeToolSpec] = &[
         depends_on: &[],
     },
     RuntimeToolSpec {
+        id: RuntimeToolId::ManageHttpAuth,
+        enabled_if: runtime_enabled_always,
+        depends_on: &[RuntimeToolId::HttpRequest],
+    },
+    RuntimeToolSpec {
         id: RuntimeToolId::ManageOauth,
         enabled_if: runtime_enabled_oauth,
         depends_on: &[RuntimeToolId::HttpRequest],
+    },
+    RuntimeToolSpec {
+        id: RuntimeToolId::ManageApi,
+        enabled_if: runtime_enabled_always,
+        depends_on: &[RuntimeToolId::HttpRequest, RuntimeToolId::ManageOauth],
     },
     RuntimeToolSpec {
         id: RuntimeToolId::SpawnAgent,
@@ -452,14 +465,14 @@ pub async fn register_optional_tools(
 pub async fn register_runtime_tools(
     tools: &mut Vec<Arc<dyn Tool>>,
     config: &AppConfig,
+    config_path: &Path,
+    http_profiles: crate::oauth::SharedHttpProfiles,
     state: Arc<SqliteStateStore>,
     mcp_registry: McpRegistry,
     approval_tx: mpsc::Sender<ApprovalRequest>,
 ) -> anyhow::Result<RuntimeToolsOutcome> {
     validate_runtime_manifest(RUNTIME_TOOL_MANIFEST)?;
 
-    let http_profiles: crate::oauth::SharedHttpProfiles =
-        Arc::new(RwLock::new(config.http_auth.clone()));
     let mut oauth_gateway: Option<crate::oauth::OAuthGateway> = None;
     let mut spawn_tool: Option<Arc<SpawnAgentTool>> = None;
     let mut registered_runtime_tools: std::collections::HashSet<RuntimeToolId> =
@@ -493,6 +506,7 @@ pub async fn register_runtime_tools(
             spec.id,
             tools,
             config,
+            config_path,
             state.clone(),
             mcp_registry.clone(),
             approval_tx.clone(),
@@ -520,6 +534,7 @@ async fn register_runtime_tool_by_id(
     tool_id: RuntimeToolId,
     tools: &mut Vec<Arc<dyn Tool>>,
     config: &AppConfig,
+    config_path: &Path,
     state: Arc<SqliteStateStore>,
     mcp_registry: McpRegistry,
     approval_tx: mpsc::Sender<ApprovalRequest>,
@@ -551,6 +566,14 @@ async fn register_runtime_tool_by_id(
         RuntimeToolId::HttpRequest => {
             tools.push(Arc::new(HttpRequestTool::new(http_profiles, approval_tx)));
         }
+        RuntimeToolId::ManageHttpAuth => {
+            tools.push(Arc::new(ManageHttpAuthTool::new(
+                config_path.to_path_buf(),
+                http_profiles,
+                approval_tx,
+                state as Arc<dyn crate::traits::StateStore>,
+            )));
+        }
         RuntimeToolId::ManageOauth => {
             let callback_url = config
                 .oauth
@@ -577,8 +600,39 @@ async fn register_runtime_tool_by_id(
             // Restore existing connections from DB + keychain.
             gateway.restore_connections().await;
 
-            tools.push(Arc::new(ManageOAuthTool::new(gateway.clone(), state)));
+            tools.push(Arc::new(ManageOAuthTool::new(
+                gateway.clone(),
+                state.clone() as Arc<dyn crate::traits::StateStore>,
+                config_path.to_path_buf(),
+                approval_tx,
+            )));
             *oauth_gateway = Some(gateway);
+        }
+        RuntimeToolId::ManageApi => {
+            let gateway = oauth_gateway.clone().ok_or_else(|| {
+                anyhow::anyhow!("manage_api requires manage_oauth to be initialized first")
+            })?;
+            let skills_dir = if config.skills.enabled {
+                let dir = config_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(&config.skills.dir);
+                std::fs::create_dir_all(&dir).ok();
+                Some(dir)
+            } else {
+                None
+            };
+
+            tools.push(Arc::new(ManageApiTool::new(
+                config_path.to_path_buf(),
+                skills_dir,
+                config.skills.registries.clone(),
+                config.search.clone(),
+                http_profiles,
+                approval_tx,
+                state.clone() as Arc<dyn crate::traits::StateStore>,
+                gateway,
+            )));
         }
         RuntimeToolId::SpawnAgent => {
             let st = Arc::new(
@@ -788,9 +842,13 @@ mod tests {
         .await?;
 
         let mcp_registry = McpRegistry::new(state.clone() as Arc<dyn StateStore>);
+        let http_profiles: crate::oauth::SharedHttpProfiles =
+            Arc::new(tokio::sync::RwLock::new(config.http_auth.clone()));
         let _runtime = register_runtime_tools(
             &mut bundle.tools,
             &config,
+            config_file.path(),
+            http_profiles,
             state.clone(),
             mcp_registry,
             bundle.approval_tx.clone(),
@@ -852,7 +910,9 @@ mod tests {
                 "manage_mcp",
                 "manage_people",
                 "http_request",
+                "manage_http_auth",
                 "manage_oauth",
+                "manage_api",
                 "spawn_agent",
             ]
         );
@@ -951,6 +1011,23 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn generic_api_tools_register_without_existing_profiles() {
+        let schemas = build_tool_schemas_for_contract_validation(true, true, true)
+            .await
+            .unwrap();
+        let names: Vec<String> = schemas
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .map(ToString::to_string)
+            .collect();
+
+        assert!(names.contains(&"manage_api".to_string()));
+        assert!(names.contains(&"http_request".to_string()));
+        assert!(names.contains(&"manage_http_auth".to_string()));
+        assert!(names.contains(&"manage_oauth".to_string()));
     }
 
     proptest! {

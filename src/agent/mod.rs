@@ -1286,6 +1286,81 @@ fn user_text_references_filesystem_path(user_text: &str) -> bool {
     false
 }
 
+fn user_explicitly_requests_local_file_inspection(user_text: &str) -> bool {
+    if user_text_references_filesystem_path(user_text) {
+        return true;
+    }
+
+    let lower = user_text.to_ascii_lowercase();
+    let mentions_local_subject = [
+        "file",
+        "files",
+        "repo",
+        "repository",
+        "codebase",
+        "directory",
+        "folder",
+        "workspace",
+        "local file",
+        "local files",
+        "current repo",
+        "this repo",
+        "the repo",
+    ]
+    .iter()
+    .any(|kw| contains_keyword_as_words(&lower, kw));
+    let mentions_inspection_verb = [
+        "read", "open", "inspect", "look in", "look at", "search", "scan", "check", "review",
+        "show", "list", "find", "grep", "compare",
+    ]
+    .iter()
+    .any(|kw| contains_keyword_as_words(&lower, kw));
+
+    mentions_local_subject && mentions_inspection_verb
+}
+
+fn matched_untrusted_external_reference_skill_names(
+    skills_snapshot: &[skills::Skill],
+    user_text: &str,
+    user_role: UserRole,
+    visibility: ChannelVisibility,
+) -> Vec<String> {
+    skills::match_skills(skills_snapshot, user_text, user_role, visibility)
+        .skills
+        .into_iter()
+        .filter(|skill| skills::is_untrusted_external_reference_skill(skill))
+        .map(|skill| skill.name.clone())
+        .collect()
+}
+
+fn is_untrusted_external_reference_blocked_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file"
+            | "search_files"
+            | "project_inspect"
+            | "check_environment"
+            | "web_fetch"
+            | "web_search"
+            | "browser"
+            | "send_file"
+            | "skill_resources"
+    )
+}
+
+fn filter_tool_defs_for_untrusted_external_reference(defs: &[Value]) -> Vec<Value> {
+    defs.iter()
+        .filter(|def| {
+            let name = def
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str());
+            !name.is_some_and(is_untrusted_external_reference_blocked_tool)
+        })
+        .cloned()
+        .collect()
+}
+
 fn merge_intent_gate_decision(
     model_decision: Option<IntentGateDecision>,
     inferred: IntentGateDecision,

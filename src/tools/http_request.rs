@@ -54,7 +54,7 @@ impl HttpRequestTool {
     /// Check if a request domain is allowed by the profile's allowed_domains.
     /// Supports exact match and subdomain match (api.twitter.com matches twitter.com)
     /// but NOT suffix tricks (evil-twitter.com does NOT match twitter.com).
-    fn domain_matches(request_domain: &str, allowed: &str) -> bool {
+    pub(crate) fn domain_matches(request_domain: &str, allowed: &str) -> bool {
         let req = request_domain.to_lowercase();
         let allow = allowed.to_lowercase();
         if req == allow {
@@ -286,6 +286,14 @@ impl HttpRequestTool {
             auth,
             content_type
         )
+    }
+
+    fn requires_runtime_approval(
+        risk: RiskLevel,
+        is_session_approved: bool,
+        is_trusted_session: bool,
+    ) -> bool {
+        risk != RiskLevel::Safe && !is_session_approved && !is_trusted_session
     }
 
     async fn is_session_approved(&self, session_id: &str, approval_key: &str) -> bool {
@@ -557,7 +565,7 @@ impl HttpRequestTool {
     }
 
     /// Apply auth to a request builder based on profile auth_type.
-    fn apply_auth(
+    pub(crate) fn apply_auth(
         builder: reqwest::RequestBuilder,
         profile: &HttpAuthProfile,
         method: &str,
@@ -921,6 +929,7 @@ impl Tool for HttpRequestTool {
         // Step 8: Classify risk and request approval
         let risk = Self::classify_risk(&method, profile.is_some());
         let session_id = args["_session_id"].as_str().unwrap_or("unknown");
+        let is_trusted_session = args["_trusted_session"].as_bool().unwrap_or(false);
         let approval_key = Self::approval_scope_key(
             &method,
             &parsed_url,
@@ -928,7 +937,11 @@ impl Tool for HttpRequestTool {
             content_type.as_deref(),
         );
 
-        if risk != RiskLevel::Safe && !self.is_session_approved(session_id, &approval_key).await {
+        if Self::requires_runtime_approval(
+            risk,
+            self.is_session_approved(session_id, &approval_key).await,
+            is_trusted_session,
+        ) {
             let mut desc = format!("{} {}", method, url);
             if let Some(name) = auth_profile_name {
                 desc.push_str(&format!(" [auth: {}]", name));
@@ -1352,6 +1365,39 @@ mod tests {
         assert!(HttpRequestTool::domain_matches(
             "twitter.com",
             "Twitter.COM"
+        ));
+    }
+
+    #[test]
+    fn test_trusted_session_skips_runtime_approval() {
+        assert!(!HttpRequestTool::requires_runtime_approval(
+            RiskLevel::High,
+            false,
+            true
+        ));
+        assert!(!HttpRequestTool::requires_runtime_approval(
+            RiskLevel::Critical,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_untrusted_write_request_still_requires_approval() {
+        assert!(HttpRequestTool::requires_runtime_approval(
+            RiskLevel::High,
+            false,
+            false
+        ));
+        assert!(!HttpRequestTool::requires_runtime_approval(
+            RiskLevel::Safe,
+            false,
+            false
+        ));
+        assert!(!HttpRequestTool::requires_runtime_approval(
+            RiskLevel::High,
+            true,
+            false
         ));
     }
 

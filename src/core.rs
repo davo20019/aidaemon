@@ -180,11 +180,14 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // 5. MCP registry (static from config + dynamic from DB)
     let mcp_registry = startup_mcp::setup_mcp_registry(&config, state.clone()).await?;
+    let http_profiles: crate::oauth::SharedHttpProfiles =
+        Arc::new(tokio::sync::RwLock::new(config.http_auth.clone()));
 
     // 6. Skills (filesystem as single source of truth)
     let skills_dir = startup_skills::register_skills_tools(
         &config,
         &config_path,
+        http_profiles.clone(),
         state.clone(),
         &mut tools,
         approval_tx.clone(),
@@ -197,6 +200,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     } = startup_tools::register_runtime_tools(
         &mut tools,
         &config,
+        &config_path,
+        http_profiles,
         state.clone(),
         mcp_registry.clone(),
         approval_tx.clone(),
@@ -1203,7 +1208,7 @@ fn build_base_system_prompt(config: &AppConfig, skill_names: &[String]) -> Strin
     };
 
     let manage_skills_table_row = if config.skills.enabled {
-        "\n| Add, list, remove, or browse skills | manage_skills | — |"
+        "\n| Add, update, or generate reusable skills/API guides | manage_skills | — |"
     } else {
         ""
     };
@@ -1223,17 +1228,17 @@ fn build_base_system_prompt(config: &AppConfig, skill_names: &[String]) -> Strin
     let manage_people_table_row =
         "\n| Track contacts, relationships, birthdays | manage_people | — |";
 
-    let http_request_table_row = if !config.http_auth.is_empty() || config.oauth.enabled {
-        "\n| Make authenticated API requests (Twitter, Stripe, etc.) | http_request | terminal (curl) |"
-    } else {
-        ""
-    };
+    let http_request_table_row =
+        "\n| Make authenticated API requests (Twitter, Stripe, etc.) | http_request | terminal (curl) |";
 
-    let manage_oauth_table_row = if config.oauth.enabled {
-        "\n| Connect external services via OAuth (Twitter, GitHub) | manage_oauth | — |"
-    } else {
-        ""
-    };
+    let manage_api_table_row =
+        "\n| Deterministically connect, learn, and verify an API end-to-end | manage_api | manual multi-tool orchestration |";
+
+    let manage_http_auth_table_row =
+        "\n| Create and verify generic API auth profiles | manage_http_auth | manual config edits + keychain commands |";
+
+    let manage_oauth_table_row =
+        "\n| Connect external services via OAuth (built-in or custom OAuth2) | manage_oauth | — |";
 
     let spawn_tool_doc = if config.subagents.enabled {
         format!(
@@ -1348,12 +1353,13 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
     };
 
     let manage_skills_tool_doc = if config.skills.enabled {
-        "\n- `manage_skills`: Add, list, remove, browse, install, update, or review skills. \
-        Actions: add (from URL), add_inline (from raw markdown), list (show all skills), \
+        "\n- `manage_skills`: Add, list, remove, browse, install, update, review, or generate skills from API docs/specs. \
+        Actions: add (from URL), add_inline (from raw markdown), learn_api (fetch an OpenAPI spec or docs page and turn it into a reusable API guide skill), list (show all skills), \
         remove (by name), remove_all (bulk remove by names, optional dry_run), browse (search skill registries), \
         install (from registry by name), update (refresh a skill from its source), \
         review (approve/dismiss auto-promoted skill drafts). \
-        Skills are reusable procedures that activate automatically when triggered by keywords."
+        Skills are reusable procedures that activate automatically when triggered by keywords. \
+        For newly connected APIs, prefer `learn_api` over hand-writing guide skills from scratch."
     } else {
         ""
     };
@@ -1374,137 +1380,128 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         ""
     };
 
-    let manage_oauth_tool_doc = if config.oauth.enabled {
-        "\n- `manage_oauth`: Connect external services (Twitter/X, GitHub, etc.) via OAuth. \
-        This is the easiest way to connect API accounts — the user clicks a link, authorizes in their browser, \
-        and you can start making API calls immediately. \
-        Actions: connect (start OAuth flow for a service), list (show connected services), \
-        remove (disconnect a service), set_credentials (store app client ID/secret), \
-        refresh (manually refresh an expired token), providers (show available services and credential status). \
-        \n  **IMPORTANT — Before connecting, credentials must be set up:** \
-        Each user creates their own app on the service's developer portal (e.g., developer.twitter.com, \
-        github.com/settings/developers) and provides their client ID and secret. Guide the user through this: \
-        \n  1. Tell them to create an app on the service's developer portal. \
-        \n  2. The OAuth callback URL they must register is: the daemon's callback URL \
-        (typically `http://localhost:<port>/oauth/callback` — shown in config). \
-        \n  3. Once they have the client ID and secret, tell them to store the credentials securely \
-        from their terminal using: `aidaemon keychain set oauth_<service>_client_id` and \
-        `aidaemon keychain set oauth_<service>_client_secret` (e.g., `aidaemon keychain set oauth_twitter_client_id`). \
-        NEVER ask the user to paste credentials in chat — they must use the CLI command. \
-        \n  4. Then use `manage_oauth` with action `connect` to start the OAuth flow — \
-        a URL will be sent for the user to click and authorize. \
+    let manage_api_tool_doc =
+        "\n- `manage_api`: Run a deterministic API onboarding flow when the user wants one end-to-end path. \
+        Action: onboard. \
+        It composes the existing API tools for you: manual auth (`manage_http_auth`) or browser OAuth (`manage_oauth`), \
+        API-guide generation (`manage_skills` with `learn_api` when skills are enabled), and a safe live probe (`http_request`). \
+        Prefer this when the user says things like \"connect this API and make sure it works\" or \"set up this service end-to-end.\" \
+        Provide `auth_mode`, the service name, and whichever docs/OpenAPI and verify URLs you know. \
+        For OAuth 2.0 APIs it can register the provider, connect it, learn the API docs/spec, and verify the connection in one deterministic tool flow. \
+        For API-key/bearer/header/basic/OAuth1a APIs it can create/update the manual auth profile, refresh runtime auth state, learn the docs/spec, and then verify with a safe probe. \
+        When the learned source is an OpenAPI spec, it can auto-derive a safe read-only probe from the spec. \
+        When the API is GraphQL and an endpoint is available, it can learn from GraphQL schema introspection and use that as the safe verification probe. \
+        NEVER ask the user to paste secrets into chat if you can instead tell them the exact secure CLI/keychain command to run.";
+
+    let manage_http_auth_tool_doc =
+        "\n- `manage_http_auth`: Create, inspect, verify, and remove manual HTTP auth profiles for any API \
+        that uses bearer tokens, custom header auth, basic auth, or OAuth 1.0a credentials. \
+        Actions: list, describe, upsert, remove, verify. \
+        Use this when the user wants to connect an API with an API key/token/username-password flow \
+        rather than a browser OAuth authorization flow. \
+        \n  Prefer this over hand-editing `[http_auth.<name>]` with `manage_config`. \
+        It writes the profile structure to config, tells the user the exact `aidaemon keychain set http_auth_<profile>_<field>` \
+        commands for missing secrets, binds any already-stored keychain/.env secrets it finds, and refreshes the live runtime auth profile. \
+        NEVER ask the user to paste secrets into chat. If secrets are missing, tell them the exact CLI commands to run. \
+        After the user stores or rotates credentials, use `verify` before the first live API call so the runtime auth profile is refreshed without a restart. \
+        If the user already knows the safe read-only endpoint to test, provide it to `verify` with a GET/HEAD URL on an allowed domain.";
+
+    let manage_oauth_tool_doc =
+        "\n- `manage_oauth`: Connect external services via OAuth. \
+        This covers both built-in providers (Twitter/X, GitHub, Google, etc.) and custom OAuth 2.0 providers \
+        that the user wants to add from scratch. \
+        Actions: providers (show built-in/custom providers and whether credentials are already stored), \
+        describe_provider (show setup details, callback URL, domains, scopes, and exact keychain commands), \
+        register_provider (add a custom OAuth 2.0 provider definition), \
+        connect (start the OAuth browser flow), list (show connected services), remove (disconnect a service), \
+        set_credentials (store app client ID/secret), refresh (manually refresh an expired token), \
+        remove_provider (delete a custom provider definition after it has been disconnected). \
+        \n  **When a user wants to connect a new OAuth API:** \
+        \n  1. Use `providers` first. If the service is not listed and it is a standard OAuth 2.0 API, use `register_provider`. \
+        \n  2. For `register_provider`, gather or confirm: auth type, token URL, allowed API domains, optional scopes, and an optional display name. For browser-based auth types, you also need authorize URL. \
+        \n  3. Tell the user to create their app in that service's developer portal and register the daemon callback URL shown by `describe_provider` \
+        (typically `http://localhost:<port>/oauth/callback`, unless the daemon is configured with a public callback URL). \
+        \n  4. Tell the user to store the client credentials securely from their terminal using \
+        `aidaemon keychain set oauth_<service>_client_id` and `aidaemon keychain set oauth_<service>_client_secret`. \
+        NEVER ask the user to paste credentials in chat. \
+        \n  5. Then use `connect` to send the authorization link. \
         \n  **After connecting, use `http_request` directly** — an auth profile is automatically created \
-        with the service name (e.g., auth_profile=\"twitter\"). Do NOT call `manage_oauth connect` again \
-        if the service is already connected. When the user asks to use an API, check `manage_oauth list` \
-        first to see if it's already connected, then use `http_request` with that profile name. \
-        \n  If an OAuth connection was removed or expired, do NOT assume the app credentials are gone. \
-        Use `manage_oauth providers` first to see whether client credentials are already stored. \
-        Only ask the user for client ID/secret if the provider actually reports that credentials are needed. \
-        Do NOT ask the user where their .env or keychain entries are located unless they explicitly asked for config help. \
-        \n  Use plain language with the user — say \"connect your Twitter account\" not \"configure OAuth credentials.\""
-    } else {
-        ""
-    };
+        with the service name (for example `auth_profile=\"twitter\"` or `auth_profile=\"linear\"`). \
+        Do NOT reconnect if the service is already connected; check `list` first. \
+        If a connection was removed or expired, do NOT assume the app credentials are gone. \
+        Use `providers` or `describe_provider` first to see whether credentials are already stored. \
+        Only ask the user for client ID/secret if the provider actually reports that credentials are missing. \
+        Do NOT ask the user where their `.env` or keychain entries are located unless they explicitly asked for config help. \
+        \n  Custom onboarding supports OAuth 2.0 PKCE, OAuth 2.0 authorization code, and OAuth 2.0 client credentials. \
+        If the API uses API keys, bearer tokens, custom headers, basic auth, or OAuth 1.0a tokens, use `manage_http_auth` instead. \
+        Use plain language with the user — say \"connect your account\" not \"configure OAuth credentials.\"";
 
-    let http_request_tool_doc = if !config.http_auth.is_empty() || config.oauth.enabled {
-        let profile_names: Vec<&str> = config.http_auth.keys().map(|s| s.as_str()).collect();
+    let profile_names: Vec<&str> = config.http_auth.keys().map(|s| s.as_str()).collect();
 
-        // Check which profiles have matching skills and which don't
-        let profiles_missing_skills: Vec<&str> = config
-            .http_auth
-            .keys()
-            .filter(|profile_name| {
-                !skill_names.iter().any(|sn| {
-                    let sn_lower = sn.to_lowercase();
-                    let pn_lower = profile_name.to_lowercase();
-                    sn_lower == pn_lower
-                        || sn_lower.contains(&pn_lower)
-                        || pn_lower.contains(&sn_lower)
-                })
+    let profiles_missing_skills: Vec<&str> = config
+        .http_auth
+        .keys()
+        .filter(|profile_name| {
+            !skill_names.iter().any(|sn| {
+                let sn_lower = sn.to_lowercase();
+                let pn_lower = profile_name.to_lowercase();
+                sn_lower == pn_lower || sn_lower.contains(&pn_lower) || pn_lower.contains(&sn_lower)
             })
-            .map(|s| s.as_str())
-            .collect();
+        })
+        .map(|s| s.as_str())
+        .collect();
 
-        let skill_warning = if profiles_missing_skills.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n  **ACTION REQUIRED — Missing API guides:** The following API connections are set up \
-                but don't have a \"skill\" yet: {}. \
-                \n  A skill is like a cheat sheet — it tells you which URLs to call, what parameters to send, \
-                and what responses to expect. Without one, you have the credentials but don't know the API's \
-                actual endpoints. You MUST create a skill before using these APIs. \
-                \n  **When the user asks about one of these APIs, follow this flow:** \
-                \n  1. Explain that you need to learn the API first by reading its documentation. Frame it as: \
-                \"Before I can use [API name] for you, I need to learn how it works. I can do this by reading \
-                the official documentation.\" \
-                \n  2. Ask: \"Do you have the API docs URL you'd like me to read? You can paste a link, \
-                or I can search for the official docs myself.\" \
-                \n  3. If the user pastes a URL, use `web_fetch` to read it directly. If not, use `web_search` \
-                to find the official API reference, then `web_fetch` to read it. If a single page is too large, \
-                fetch specific endpoint pages individually. \
-                \n  4. Generate a skill from the docs (key endpoints, parameters, examples) using `manage_skills` \
-                (action: add_inline). A skill is a reference guide you save so you remember the API details permanently. \
-                \n  5. Show the user a plain-language summary of what you can now do (e.g., \"I've learned the Twitter API! \
-                I can now post tweets, read your timeline, search, and manage likes for you.\") \
-                \n  6. Then proceed with the user's original request. \
-                \n  Keep explanations simple — the user may not be technical. Don't use jargon like \"skill\", \
-                \"endpoint\", or \"auth profile.\" Say things like \"I'll remember how this API works\" instead \
-                of \"I'll create a skill.\"",
-                profiles_missing_skills.join(", ")
-            )
-        };
-
-        format!(
-            "\n- `http_request`: Make authenticated HTTP requests to external APIs. \
-            Available auth profiles: {}. Each profile is bound to specific domains — credentials \
-            are only sent to allowed domains. HTTPS only. GET requests without auth may not need approval; \
-            write operations (POST/PUT/PATCH/DELETE) always require approval. \
-            Parameters: method, url, auth_profile (optional), headers, body, content_type, query_params, \
-            timeout_secs, follow_redirects, max_response_bytes. \
-            To add more API integrations, either use `manage_oauth` to connect via OAuth (easiest), \
-            or use `manage_config` to add an `[http_auth.<name>]` section manually \
-            with auth_type, allowed_domains, and credentials (use `aidaemon keychain set` for secrets).{}",
-            profile_names.join(", "),
-            skill_warning
-        )
+    let skill_warning = if profiles_missing_skills.is_empty() {
+        String::new()
     } else {
-        "\n- `http_request` (NOT YET CONFIGURED): You have a built-in `http_request` tool that can make \
-        authenticated HTTP requests to any external API (Twitter/X, Stripe, GitHub, etc.). It supports \
-        OAuth 2.0 PKCE, OAuth 1.0a, Bearer token, custom header, and Basic auth. \
-        \n  **When a user asks about connecting to an API, offer two paths:** \
-        \n  **Option A — OAuth (easiest, if `[oauth]` is enabled in config):** \
-        Tell the user to enable OAuth in config with `manage_config` (set `oauth.enabled = true`), \
-        then after restart (use the channel's restart command), use `manage_oauth` to connect services interactively. \
-        The user creates an app on the service's developer portal, provides their client ID and secret, \
-        and then clicks a link to authorize — no manual token management needed. \
-        \n  **Option B — Manual config (for API keys, tokens you already have):** \
-        Add an `[http_auth.<name>]` section to config using `manage_config`, \
-        then have the user store their credentials securely by running `aidaemon keychain set <key>` in their terminal. \
-        Example for Twitter:\n\
-        ```\n\
-        [http_auth.twitter]\n\
-        auth_type = \"oauth1a\"\n\
-        allowed_domains = [\"api.twitter.com\", \"api.x.com\"]\n\
-        api_key = \"keychain\"\n\
-        api_secret = \"keychain\"\n\
-        access_token = \"keychain\"\n\
-        access_token_secret = \"keychain\"\n\
-        ```\n\
-        Then: `aidaemon keychain set http_auth_twitter_api_key` (etc. for each field). After this, user runs the restart command. \
-        \n  **After connecting (either path) — Learn the API:** \
-        You need to learn how the API works by reading its documentation. \
-        Ask the user: \"Do you have the API docs URL? You can paste a link, or I can search \
-        for the official docs myself.\" If the user pastes a URL, use `web_fetch` directly. Otherwise, \
-        use `web_search` to find the official API reference, then `web_fetch` to read it. \
-        \n  **Then — Remember it permanently:** Generate a skill from the docs using `manage_skills` \
-        (action: add_inline) that captures the key endpoints, parameters, and example calls. Then show the \
-        user a plain-language summary of what you can now do (e.g., \"I've learned the Twitter API! I can now \
-        post tweets, read your timeline, and search tweets for you.\"). \
-        \n  Explain everything in plain language — the user may not be technical. Frame it as \"connecting \
-        your account\" and \"learning how it works\", not \"configuring OAuth\" or \"creating skills.\" \
-        Don't use jargon like \"endpoint\", \"auth profile\", or \"skill\" with the user.".to_string()
+        format!(
+            "\n  **ACTION REQUIRED — Missing API guides:** The following API connections are set up \
+            but don't have a \"skill\" yet: {}. \
+            \n  A skill is like a cheat sheet — it tells you which URLs to call, what parameters to send, \
+            and what responses to expect. Without one, you have the credentials but don't know the API's \
+            actual endpoints. You MUST create a skill before using these APIs. \
+            \n  **When the user asks about one of these APIs, follow this flow:** \
+            \n  1. Explain that you need to learn the API first by reading its documentation. Frame it as: \
+            \"Before I can use [API name] for you, I need to learn how it works. I can do this by reading \
+            the official documentation.\" \
+            \n  2. Ask: \"Do you have the API docs URL you'd like me to read? You can paste a link, \
+            or I can search for the official docs myself.\" \
+            \n  3. If the user wants a full connect + learn + verify flow, prefer `manage_api` so the steps stay deterministic. \
+            Otherwise, if the user pastes a URL, use `manage_skills` with action `learn_api` directly. If not, use `web_search` \
+            to find the official API reference or OpenAPI/Swagger URL first, then pass that URL to `manage_skills` \
+            with action `learn_api`. \
+            \n  4. Prefer OpenAPI/Swagger specs when available because they produce a more complete guide automatically. \
+            Use docs-page ingestion when that's all you have. The saved skill becomes your reusable API reference. \
+            \n  5. Show the user a plain-language summary of what you can now do (e.g., \"I've learned the Twitter API! \
+            I can now post tweets, read your timeline, search, and manage likes for you.\") \
+            \n  6. Then proceed with the user's original request. \
+            \n  Keep explanations simple — the user may not be technical. Don't use jargon like \"skill\", \
+            \"endpoint\", or \"auth profile.\" Say things like \"I'll remember how this API works\" instead \
+            of \"I'll create a skill.\"",
+            profiles_missing_skills.join(", ")
+        )
     };
+
+    let http_request_tool_doc = format!(
+        "\n- `http_request`: Make authenticated HTTP requests to external APIs. \
+        Available manual auth profiles: {}. OAuth-connected profiles also become available automatically after connection. \
+        Each profile is bound to specific domains — credentials are only sent to allowed domains. HTTPS only. \
+        GET requests without auth may not need approval; write operations (POST/PUT/PATCH/DELETE) always require approval. \
+        Parameters: method, url, auth_profile (optional), headers, body, content_type, query_params, \
+        timeout_secs, follow_redirects, max_response_bytes. \
+        If the user wants deterministic end-to-end onboarding, prefer `manage_api` before using this tool directly. \
+        To add more API integrations, use `manage_http_auth` for API keys/tokens/basic/header/OAuth1a setups, \
+        or use `manage_oauth` for browser-based OAuth where available. \
+        When you have credentials but still need to learn the API surface, use `manage_skills` with action `learn_api` \
+        on the official docs or OpenAPI/Swagger URL before improvising requests. \
+        Before using a newly added manual profile, run `manage_http_auth(action='verify', profile=...)` so the live runtime auth state is refreshed without a restart.{}",
+        if profile_names.is_empty() {
+            "(none yet)".to_string()
+        } else {
+            profile_names.join(", ")
+        },
+        skill_warning
+    );
 
     let manage_people_tool_doc =
         "\n- `manage_people`: Track the owner's contacts and social circle. \
@@ -1680,7 +1677,7 @@ information lookups should use memory first, then ask the user.
 | Diagnose why a task failed (root cause + evidence) | self_diagnose | terminal/sqlite log forensics |
 | Read or change aidaemon config | manage_config | terminal (editing config.toml) |
 | Switch primary or failover LLM providers with guided actions | manage_config (`switch_provider`, `list_failover_providers`, `add_failover_provider`, `remove_failover_provider`) | manual multi-key config edits |
-{send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_oauth_table_row}
+{send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_api_table_row}{manage_http_auth_table_row}{manage_oauth_table_row}
 
 ## Tools
 - `read_file`: Read file contents with line numbers. Supports line ranges for large files. Use instead of terminal cat/head/tail.
@@ -1731,12 +1728,13 @@ Make focused queries — one search is almost always enough. For factual lookups
 suffices — do NOT re-search with rephrased queries. Synthesize results promptly; \
 do not over-research.
 - `web_fetch`: Fetch a URL and extract its readable content. Strips ads/navigation. For login-required sites, use `browser` instead.
-{browser_tool_doc}{send_file_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}{manage_cli_agents_tool_doc}{health_probe_tool_doc}{manage_skills_tool_doc}{use_skill_tool_doc}{skill_resources_tool_doc}{manage_people_tool_doc}{http_request_tool_doc}{manage_oauth_tool_doc}{direct_mode_doc}
+{browser_tool_doc}{send_file_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}{manage_cli_agents_tool_doc}{health_probe_tool_doc}{manage_skills_tool_doc}{use_skill_tool_doc}{skill_resources_tool_doc}{manage_people_tool_doc}{http_request_tool_doc}{manage_api_tool_doc}{manage_http_auth_tool_doc}{manage_oauth_tool_doc}{direct_mode_doc}
 
 ## Built-in Channels
 Telegram, Discord, and Slack are built into your binary. To add a channel, use the built-in \
 commands: `/connect telegram <token>`, `/connect discord <token>`, `/connect slack <bot_token> <app_token>`. \
 To edit config: use `manage_config`. For provider switches, prefer `manage_config(action='switch_provider')`. \
+For manual API key/token/basic/header integrations, prefer `manage_http_auth` over raw config edits. \
 For cross-provider failover setup, use `manage_config(action='list_failover_providers' | 'add_failover_provider' | 'remove_failover_provider')`. \
 After changes: tell user to run `/restart` (`!restart` in Slack). \
 In Slack, use `!` prefix for commands (e.g., `!restart`, `!reload`) since `/` is reserved by Slack.

@@ -373,6 +373,139 @@ async fn test_goal_budget_auto_extends_and_persists() {
 /// Scheduled goals relax the auto-extension threshold so a productive scheduled
 /// run is less likely to be cut off mid-task, but the DB budget still must not
 /// be ratcheted upward.
+struct TrustProbeTool {
+    seen: Arc<tokio::sync::Mutex<Vec<bool>>>,
+}
+
+impl TrustProbeTool {
+    fn new(seen: Arc<tokio::sync::Mutex<Vec<bool>>>) -> Self {
+        Self { seen }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for TrustProbeTool {
+    fn name(&self) -> &str {
+        "trust_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Inspect whether the agent injected _trusted_session"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "trust_probe",
+            "description": "Inspect whether the agent injected _trusted_session",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: serde_json::Value = serde_json::from_str(arguments)?;
+        let trusted = args["_trusted_session"].as_bool().unwrap_or(false);
+        self.seen.lock().await.push(trusted);
+        Ok(if trusted { "trusted" } else { "untrusted" }.to_string())
+    }
+}
+
+#[tokio::test]
+async fn test_scheduled_goal_tool_calls_are_marked_trusted() {
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("trust_probe", "{}"),
+        MockProvider::text_response("done"),
+    ]);
+
+    let mut harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(TrustProbeTool::new(seen.clone())) as Arc<dyn crate::traits::Tool>],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut goal = Goal::new_continuous("Scheduled trust test", "scheduled_trust_session", None, None);
+    goal.status = "active".to_string();
+    harness.state.create_goal(&goal).await.unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = crate::traits::GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 * * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("hourly".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    harness.state.create_goal_schedule(&schedule).await.unwrap();
+    harness.agent.set_test_goal_id(Some(goal.id.clone()));
+
+    let response = harness
+        .agent
+        .handle_message(
+            "scheduled_trust_session",
+            "Run the scheduled goal",
+            None,
+            UserRole::Owner,
+            ChannelContext::internal(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "done");
+    assert_eq!(*seen.lock().await, vec![true]);
+}
+
+#[tokio::test]
+async fn test_non_scheduled_goal_tool_calls_remain_untrusted() {
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("trust_probe", "{}"),
+        MockProvider::text_response("done"),
+    ]);
+
+    let mut harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(TrustProbeTool::new(seen.clone())) as Arc<dyn crate::traits::Tool>],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut goal = Goal::new_finite("Plain goal", "plain_goal_session");
+    goal.status = "active".to_string();
+    harness.state.create_goal(&goal).await.unwrap();
+    harness.agent.set_test_goal_id(Some(goal.id.clone()));
+
+    let response = harness
+        .agent
+        .handle_message(
+            "plain_goal_session",
+            "Run the goal",
+            None,
+            UserRole::Owner,
+            ChannelContext::internal(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "done");
+    assert_eq!(*seen.lock().await, vec![false]);
+}
+
 #[tokio::test]
 async fn test_scheduled_goal_daily_budget_is_backstop_only_during_active_run() {
     let provider = MockProvider::with_responses(vec![

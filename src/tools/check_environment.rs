@@ -105,7 +105,7 @@ impl Tool for CheckEnvironmentTool {
 
         let mut output = String::new();
 
-        if let Some(runtime_context) = format_daemon_runtime_context(|key| std::env::var(key)) {
+        if let Some(runtime_context) = format_daemon_runtime_context(std::env::var) {
             output.push_str("## Daemon Runtime Context\n\n");
             output.push_str(&runtime_context);
             output.push('\n');
@@ -169,7 +169,7 @@ fn pad_right(s: &str, width: usize) -> String {
 
 fn format_daemon_runtime_context<F>(mut lookup: F) -> Option<String>
 where
-    F: FnMut(&str) -> Result<String, std::env::VarError>,
+    F: FnMut(&'static str) -> Result<String, std::env::VarError>,
 {
     let mut lines = Vec::new();
 

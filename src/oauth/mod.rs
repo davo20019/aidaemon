@@ -19,6 +19,8 @@ const FLOW_TIMEOUT_SECS: u64 = 600;
 #[derive(Debug, Clone, PartialEq)]
 pub enum OAuthType {
     OAuth2Pkce,
+    OAuth2AuthorizationCode,
+    OAuth2ClientCredentials,
     OAuth1a,
 }
 
@@ -91,12 +93,22 @@ impl OAuthGateway {
     /// Register a custom provider from config.
     pub async fn register_config_provider(&self, name: &str, config: &OAuthProviderConfig) {
         let auth_type = match config.auth_type.as_str() {
+            "oauth2_authorization_code" | "authorization_code" | "auth_code" => {
+                OAuthType::OAuth2AuthorizationCode
+            }
+            "oauth2_client_credentials" | "client_credentials" => {
+                OAuthType::OAuth2ClientCredentials
+            }
             "oauth1a" => OAuthType::OAuth1a,
             _ => OAuthType::OAuth2Pkce,
         };
         let provider = OAuthProvider {
             name: name.to_string(),
-            display_name: name.to_string(),
+            display_name: config
+                .display_name
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| name.to_string()),
             auth_type,
             authorize_url: config.authorize_url.clone(),
             token_url: config.token_url.clone(),
@@ -104,6 +116,12 @@ impl OAuthGateway {
             allowed_domains: config.allowed_domains.clone(),
         };
         self.register_provider(provider).await;
+    }
+
+    /// Remove a registered OAuth provider definition from the live gateway.
+    pub async fn unregister_provider(&self, name: &str) -> bool {
+        let mut providers = self.providers.write().await;
+        providers.remove(name).is_some()
     }
 
     /// List all registered providers.
@@ -121,7 +139,7 @@ impl OAuthGateway {
         providers.get(name).cloned()
     }
 
-    fn callback_url(&self) -> String {
+    pub fn callback_url(&self) -> String {
         Self::normalize_callback_url(&self.callback_base_url)
     }
 
@@ -179,7 +197,7 @@ impl OAuthGateway {
         Ok((client_id, client_secret))
     }
 
-    /// Start an OAuth 2.0 PKCE flow.
+    /// Start an interactive OAuth authorization flow.
     /// Returns the authorize URL and a receiver for the flow result.
     pub async fn start_oauth2_flow(
         &self,
@@ -191,9 +209,12 @@ impl OAuthGateway {
             .await
             .ok_or_else(|| anyhow::anyhow!("Unknown OAuth provider: {}", service))?;
 
-        if provider.auth_type != OAuthType::OAuth2Pkce {
+        if !matches!(
+            provider.auth_type,
+            OAuthType::OAuth2Pkce | OAuthType::OAuth2AuthorizationCode
+        ) {
             return Err(anyhow::anyhow!(
-                "Provider '{}' does not support OAuth 2.0 PKCE",
+                "Provider '{}' does not support interactive OAuth authorization flows",
                 service
             ));
         }
@@ -201,27 +222,36 @@ impl OAuthGateway {
         let (client_id, _) = Self::get_credentials(service)?;
 
         let state = Self::generate_state();
-        let code_verifier = Self::generate_code_verifier();
-        let code_challenge = Self::generate_code_challenge(&code_verifier);
+        let code_verifier = if provider.auth_type == OAuthType::OAuth2Pkce {
+            Some(Self::generate_code_verifier())
+        } else {
+            None
+        };
 
         let callback_url = self.callback_url();
         let scopes = provider.scopes.join(" ");
 
-        let authorize_url = format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        let mut authorize_url = format!(
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}",
             provider.authorize_url,
             urlencoded(&client_id),
             urlencoded(&callback_url),
             urlencoded(&scopes),
             urlencoded(&state),
-            urlencoded(&code_challenge),
         );
+        if let Some(ref verifier) = code_verifier {
+            let code_challenge = Self::generate_code_challenge(verifier);
+            authorize_url.push_str(&format!(
+                "&code_challenge={}&code_challenge_method=S256",
+                urlencoded(&code_challenge)
+            ));
+        }
 
         let (result_tx, result_rx) = oneshot::channel();
 
         let flow = PendingFlow {
             provider_name: service.to_string(),
-            code_verifier: Some(code_verifier),
+            code_verifier,
             session_id: session_id.to_string(),
             created_at: chrono::Utc::now(),
             result_tx,
@@ -233,6 +263,145 @@ impl OAuthGateway {
         }
 
         Ok((authorize_url, result_rx))
+    }
+
+    fn oauth_type_label(auth_type: &OAuthType) -> &'static str {
+        match auth_type {
+            OAuthType::OAuth2Pkce => "oauth2_pkce",
+            OAuthType::OAuth2AuthorizationCode => "oauth2_authorization_code",
+            OAuthType::OAuth2ClientCredentials => "oauth2_client_credentials",
+            OAuthType::OAuth1a => "oauth1a",
+        }
+    }
+
+    async fn store_connected_bearer_profile(
+        &self,
+        service: &str,
+        provider: &OAuthProvider,
+        access_token: &str,
+        refresh_token: Option<&str>,
+        expires_in: Option<u64>,
+    ) -> anyhow::Result<String> {
+        let at_key = format!("oauth_{}_access_token", service);
+        crate::config::store_in_keychain(&at_key, access_token)?;
+
+        if let Some(rt) = refresh_token {
+            let rt_key = format!("oauth_{}_refresh_token", service);
+            crate::config::store_in_keychain(&rt_key, rt)?;
+        }
+
+        let expires_at = expires_in
+            .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339());
+
+        let conn = crate::traits::OAuthConnection {
+            id: 0,
+            service: service.to_string(),
+            auth_type: Self::oauth_type_label(&provider.auth_type).to_string(),
+            username: None,
+            scopes: serde_json::to_string(&provider.scopes).unwrap_or_default(),
+            token_expires_at: expires_at,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.state_store.save_oauth_connection(&conn).await?;
+
+        let profile = HttpAuthProfile {
+            auth_type: HttpAuthType::Bearer,
+            allowed_domains: provider.allowed_domains.clone(),
+            api_key: None,
+            api_secret: None,
+            access_token: None,
+            access_token_secret: None,
+            user_id: None,
+            token: Some(access_token.to_string()),
+            header_name: None,
+            header_value: None,
+            username: None,
+            password: None,
+        };
+        {
+            let mut profiles = self.http_profiles.write().await;
+            profiles.insert(service.to_string(), profile);
+        }
+
+        Ok(format!(
+            "Connected to {}! Use `http_request` with auth_profile=\"{}\" to make API calls.",
+            provider.display_name, service
+        ))
+    }
+
+    async fn exchange_client_credentials_token(
+        &self,
+        service: &str,
+        provider: &OAuthProvider,
+    ) -> anyhow::Result<(String, Option<String>, Option<u64>)> {
+        let (client_id, client_secret) = Self::get_credentials(service)?;
+
+        let mut params = HashMap::new();
+        params.insert("grant_type", "client_credentials".to_string());
+        if !provider.scopes.is_empty() {
+            params.insert("scope", provider.scopes.join(" "));
+        }
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&provider.token_url)
+            .basic_auth(&client_id, Some(&client_secret))
+            .form(&params)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Client credentials token request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Client credentials token exchange failed (HTTP {}): {}",
+                status,
+                body
+            );
+        }
+
+        let token_data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse token response: {}", e))?;
+
+        let access_token = token_data["access_token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("No access_token in response"))?
+            .to_string();
+        let refresh_token = token_data["refresh_token"]
+            .as_str()
+            .map(ToString::to_string);
+        let expires_in = token_data["expires_in"].as_u64();
+        Ok((access_token, refresh_token, expires_in))
+    }
+
+    pub async fn connect_client_credentials(&self, service: &str) -> anyhow::Result<String> {
+        let provider = self
+            .get_provider(service)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Unknown OAuth provider: {}", service))?;
+
+        anyhow::ensure!(
+            provider.auth_type == OAuthType::OAuth2ClientCredentials,
+            "Provider '{}' is not configured for oauth2_client_credentials",
+            service
+        );
+
+        let (access_token, refresh_token, expires_in) = self
+            .exchange_client_credentials_token(service, &provider)
+            .await?;
+        self.store_connected_bearer_profile(
+            service,
+            &provider,
+            &access_token,
+            refresh_token.as_deref(),
+            expires_in,
+        )
+        .await
     }
 
     /// Handle an OAuth callback from the browser redirect.
@@ -313,57 +482,15 @@ impl OAuthGateway {
             .ok_or_else(|| anyhow::anyhow!("No access_token in response"))?;
         let refresh_token = token_data["refresh_token"].as_str();
         let expires_in = token_data["expires_in"].as_u64();
-
-        // Store tokens in keychain
-        let at_key = format!("oauth_{}_access_token", flow.provider_name);
-        crate::config::store_in_keychain(&at_key, access_token)?;
-
-        if let Some(rt) = refresh_token {
-            let rt_key = format!("oauth_{}_refresh_token", flow.provider_name);
-            crate::config::store_in_keychain(&rt_key, rt)?;
-        }
-
-        // Calculate token expiry
-        let expires_at = expires_in
-            .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339());
-
-        // Save connection metadata to SQLite
-        let conn = crate::traits::OAuthConnection {
-            id: 0,
-            service: flow.provider_name.clone(),
-            auth_type: "oauth2_pkce".to_string(),
-            username: None,
-            scopes: serde_json::to_string(&provider.scopes).unwrap_or_default(),
-            token_expires_at: expires_at.clone(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        };
-        self.state_store.save_oauth_connection(&conn).await?;
-
-        // Inject HttpAuthProfile into shared profiles map
-        let profile = HttpAuthProfile {
-            auth_type: HttpAuthType::Bearer,
-            allowed_domains: provider.allowed_domains.clone(),
-            api_key: None,
-            api_secret: None,
-            access_token: None,
-            access_token_secret: None,
-            user_id: None,
-            token: Some(access_token.to_string()),
-            header_name: None,
-            header_value: None,
-            username: None,
-            password: None,
-        };
-        {
-            let mut profiles = self.http_profiles.write().await;
-            profiles.insert(flow.provider_name.clone(), profile);
-        }
-
-        let message = format!(
-            "Connected to {}! Use `http_request` with auth_profile=\"{}\" to make API calls.",
-            provider.display_name, flow.provider_name
-        );
+        let message = self
+            .store_connected_bearer_profile(
+                &flow.provider_name,
+                &provider,
+                access_token,
+                refresh_token,
+                expires_in,
+            )
+            .await?;
         info!(
             service = %flow.provider_name,
             "OAuth connection established"
@@ -457,6 +584,22 @@ impl OAuthGateway {
             .get_provider(service)
             .await
             .ok_or_else(|| anyhow::anyhow!("Unknown OAuth provider: {}", service))?;
+
+        if provider.auth_type == OAuthType::OAuth2ClientCredentials {
+            let (access_token, refresh_token, expires_in) = self
+                .exchange_client_credentials_token(service, &provider)
+                .await?;
+            self.store_connected_bearer_profile(
+                service,
+                &provider,
+                &access_token,
+                refresh_token.as_deref(),
+                expires_in,
+            )
+            .await?;
+            info!(service = %service, "OAuth client-credentials token refreshed");
+            return Ok(format!("Token refreshed for {}", service));
+        }
 
         let rt_key = format!("oauth_{}_refresh_token", service);
         let refresh_token = crate::config::resolve_from_keychain(&rt_key)
@@ -564,6 +707,41 @@ fn urlencoded(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use axum::{extract::Form, routing::post, Json, Router};
+    use once_cell::sync::Lazy;
+    use tempfile::NamedTempFile;
+    use tokio::net::TcpListener;
+
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use crate::traits::StateStore;
+
+    static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
+
+    fn restore_env_var(name: &str, old_value: Option<String>) {
+        if let Some(value) = old_value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+
+    async fn test_gateway() -> anyhow::Result<OAuthGateway> {
+        let db_file = NamedTempFile::new()?;
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new()?);
+        let state = Arc::new(SqliteStateStore::new(&db_path, 32, None, embedding_service).await?);
+        let profiles: SharedHttpProfiles = Arc::new(RwLock::new(HashMap::new()));
+        Ok(OAuthGateway::new(
+            state as Arc<dyn StateStore>,
+            profiles,
+            "http://localhost:8080".to_string(),
+        ))
+    }
 
     #[test]
     fn test_pkce_code_verifier_length() {
@@ -623,5 +801,113 @@ mod tests {
             OAuthGateway::normalize_callback_url("http://localhost:8080/oauth/callback"),
             "http://localhost:8080/oauth/callback"
         );
+    }
+
+    #[tokio::test]
+    async fn authorization_code_flow_omits_pkce_challenge() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let gateway = test_gateway().await.unwrap();
+        gateway
+            .register_provider(OAuthProvider {
+                name: "linear".to_string(),
+                display_name: "Linear".to_string(),
+                auth_type: OAuthType::OAuth2AuthorizationCode,
+                authorize_url: "https://linear.app/oauth/authorize".to_string(),
+                token_url: "https://api.linear.app/oauth/token".to_string(),
+                scopes: vec!["read".to_string()],
+                allowed_domains: vec!["api.linear.app".to_string()],
+            })
+            .await;
+
+        let env_file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            env_file.path(),
+            "OAUTH_LINEAR_CLIENT_ID=abc\nOAUTH_LINEAR_CLIENT_SECRET=def\n",
+        )
+        .unwrap();
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var(
+            crate::RUNTIME_ENV_FILE_ENV_KEY,
+            env_file.path().to_string_lossy().to_string(),
+        );
+
+        let (authorize_url, _) = gateway.start_oauth2_flow("linear", "test").await.unwrap();
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
+
+        assert!(authorize_url.contains("response_type=code"));
+        assert!(!authorize_url.contains("code_challenge="));
+    }
+
+    #[tokio::test]
+    async fn client_credentials_flow_stores_connection_and_profile() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        async fn token_handler(
+            Form(form): Form<HashMap<String, String>>,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(
+                form.get("grant_type").map(String::as_str),
+                Some("client_credentials")
+            );
+            Json(serde_json::json!({
+                "access_token": "test-access",
+                "expires_in": 3600
+            }))
+        }
+
+        let app = Router::new().route("/oauth/token", post(token_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let gateway = test_gateway().await.unwrap();
+        gateway
+            .register_provider(OAuthProvider {
+                name: "service".to_string(),
+                display_name: "Service".to_string(),
+                auth_type: OAuthType::OAuth2ClientCredentials,
+                authorize_url: String::new(),
+                token_url: format!("http://{}/oauth/token", addr),
+                scopes: vec!["read".to_string()],
+                allowed_domains: vec!["api.example.com".to_string()],
+            })
+            .await;
+
+        let env_file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            env_file.path(),
+            "OAUTH_SERVICE_CLIENT_ID=abc\nOAUTH_SERVICE_CLIENT_SECRET=def\n",
+        )
+        .unwrap();
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var(
+            crate::RUNTIME_ENV_FILE_ENV_KEY,
+            env_file.path().to_string_lossy().to_string(),
+        );
+
+        let result = gateway.connect_client_credentials("service").await.unwrap();
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
+
+        assert!(result.contains("Connected to Service"));
+        let conn = gateway
+            .state_store
+            .get_oauth_connection("service")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(conn.auth_type, "oauth2_client_credentials");
+        let profiles = gateway.http_profiles.read().await;
+        let profile = profiles.get("service").unwrap();
+        assert_eq!(profile.token.as_deref(), Some("test-access"));
     }
 }

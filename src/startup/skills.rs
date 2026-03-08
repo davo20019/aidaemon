@@ -14,6 +14,7 @@ use crate::traits::Tool;
 pub async fn register_skills_tools(
     config: &AppConfig,
     config_path: &Path,
+    http_profiles: crate::oauth::SharedHttpProfiles,
     state: Arc<SqliteStateStore>,
     tools: &mut Vec<Arc<dyn Tool>>,
     approval_tx: mpsc::Sender<ApprovalRequest>,
@@ -105,6 +106,7 @@ pub async fn register_skills_tools(
     info!("skill_resources tool enabled");
 
     let manage_skills = ManageSkillsTool::new(dir.clone(), state, approval_tx)
+        .with_http_profiles(http_profiles)
         .with_registries(config.skills.registries.clone());
     tools.push(Arc::new(manage_skills));
     info!("manage_skills tool enabled");

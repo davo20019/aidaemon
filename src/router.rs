@@ -86,9 +86,11 @@ impl Router {
     }
 
     /// Profile mapping on top of default+fallback:
-    /// All profiles use the default model.  Cost savings for Cheap come from
+    /// All profiles use the default model. Cost savings for Cheap come from
     /// reduced tool_budget and context_budget, not from switching to a weaker
-    /// model.  Fallback models are reserved for error-recovery cascades only.
+    /// model. The open-source default policy auto-routing floors at Balanced;
+    /// Cheap remains available as an explicit lower-budget preset. Fallback
+    /// models are reserved for error-recovery cascades only.
     pub fn select_for_profile(&self, _profile: ModelProfile) -> &str {
         &self.models.default_model
     }

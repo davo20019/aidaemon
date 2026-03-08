@@ -29,6 +29,8 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub task_tokens_used: u64,
     pub user_text: &'a str,
     pub restrict_to_personal_memory_tools: bool,
+    pub active_untrusted_external_reference_skills: &'a [String],
+    pub restrict_untrusted_external_reference_tools: bool,
     pub is_reaffirmation_challenge_turn: bool,
     pub personal_memory_tool_call_cap: usize,
     pub base_tool_defs: &'a Vec<Value>,

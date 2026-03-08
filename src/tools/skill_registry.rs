@@ -64,18 +64,6 @@ pub fn search_registry<'a>(entries: &'a [RegistryEntry], query: &str) -> Vec<&'a
         .collect()
 }
 
-/// Fetch the skill markdown content from a registry entry's URL.
-pub async fn fetch_skill_content(client: &Client, entry: &RegistryEntry) -> anyhow::Result<String> {
-    validate_url_for_ssrf(&entry.url).map_err(|e| anyhow::anyhow!("Skill URL blocked: {}", e))?;
-
-    let response = client.get(&entry.url).send().await?;
-    if !response.status().is_success() {
-        anyhow::bail!("Failed to fetch skill content: HTTP {}", response.status());
-    }
-
-    response.text().await.map_err(Into::into)
-}
-
 /// Format registry entries for display to the user.
 pub fn format_registry_listing(entries: &[RegistryEntry]) -> String {
     if entries.is_empty() {
@@ -162,11 +150,6 @@ mod tests {
         assert!(output.contains("lint-code"));
         assert!(output.contains("v1.0.0"));
         assert!(output.contains("alice"));
-    }
-
-    #[test]
-    fn format_empty_listing() {
-        let output = format_registry_listing(&[]);
-        assert!(output.contains("No skills found"));
+        assert!(!output.contains("artifact:"));
     }
 }

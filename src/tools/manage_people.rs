@@ -66,50 +66,50 @@ impl Tool for ManagePeopleTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_people",
-            "description": "Manage the owner's contacts and social circle. Use 'enable'/'disable'/'status' to toggle People Intelligence at runtime. Other actions: add, list, view, brief, upcoming, reconnect, update, remove, add_fact, remove_fact, link, export, purge, audit, confirm",
+            "description": "Manage people, relationship notes, reminders, and linked facts.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["enable", "disable", "status", "add", "list", "view", "brief", "upcoming", "reconnect", "update", "remove", "add_fact", "remove_fact", "link", "export", "purge", "audit", "confirm"],
-                        "description": "Action to perform. 'enable'/'disable' toggle people tracking; 'status' shows current state."
+                        "description": "Action"
                     },
                     "name": {
                         "type": "string",
-                        "description": "Person's name (for add, view)"
+                        "description": "Person name"
                     },
                     "id": {
                         "type": "integer",
-                        "description": "Person's database ID (for update, remove)"
+                        "description": "Person id"
                     },
                     "relationship": {
                         "type": "string",
-                        "description": "Relationship type: spouse, family, friend, coworker, acquaintance, etc."
+                        "description": "Relationship type"
                     },
                     "notes": {
                         "type": "string",
-                        "description": "Free-form notes about the person"
+                        "description": "Free-form notes"
                     },
                     "communication_style": {
                         "type": "string",
-                        "description": "How to communicate with this person: casual, formal, warm, etc."
+                        "description": "Preferred communication style"
                     },
                     "language": {
                         "type": "string",
-                        "description": "Preferred language for interaction"
+                        "description": "Preferred language"
                     },
                     "person_name": {
                         "type": "string",
-                        "description": "Person's name (for add_fact, link, export, purge, audit)"
+                        "description": "Person name for fact/link actions"
                     },
                     "category": {
                         "type": "string",
-                        "description": "Fact category: birthday, preference, interest, work, family, important_date, personality, gift_idea"
+                        "description": "Fact category"
                     },
                     "key": {
                         "type": "string",
-                        "description": "Fact key (e.g., 'birthday', 'favorite_food')"
+                        "description": "Fact key"
                     },
                     "value": {
                         "type": "string",
@@ -117,23 +117,23 @@ impl Tool for ManagePeopleTool {
                     },
                     "platform_id": {
                         "type": "string",
-                        "description": "Platform-qualified ID (e.g., 'slack:U123', 'telegram:456')"
+                        "description": "Platform-qualified id"
                     },
                     "display_name": {
                         "type": "string",
-                        "description": "Display name for the platform identity"
+                        "description": "Platform display name"
                     },
                     "fact_id": {
                         "type": "integer",
-                        "description": "Fact ID (for remove_fact, confirm)"
+                        "description": "Fact id"
                     },
                     "within_days": {
                         "type": "integer",
-                        "description": "Window for upcoming dates (for upcoming, default 14)"
+                        "description": "Upcoming-date window"
                     },
                     "inactive_days": {
                         "type": "integer",
-                        "description": "Inactivity threshold in days (for reconnect, default 30)"
+                        "description": "Reconnect threshold"
                     }
                 },
                 "required": ["action"],

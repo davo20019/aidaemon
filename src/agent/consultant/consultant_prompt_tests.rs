@@ -117,6 +117,26 @@ fn test_user_text_references_filesystem_path_detects_common_paths_and_files() {
 }
 
 #[test]
+fn test_user_explicitly_requests_local_file_inspection_detects_explicit_requests() {
+    assert!(user_explicitly_requests_local_file_inspection(
+        "Inspect Cargo.toml and read src/main.rs"
+    ));
+    assert!(user_explicitly_requests_local_file_inspection(
+        "Search the repo for OAuth callback code"
+    ));
+}
+
+#[test]
+fn test_user_explicitly_requests_local_file_inspection_does_not_flag_api_only_turns() {
+    assert!(!user_explicitly_requests_local_file_inspection(
+        "Use the Twitter API to post a tweet"
+    ));
+    assert!(!user_explicitly_requests_local_file_inspection(
+        "Check the connected API status"
+    ));
+}
+
+#[test]
 fn test_infer_intent_gate_does_not_guess_clarification_from_text() {
     let gate = infer_intent_gate("update the site", "Could you clarify which site you mean?");
     assert_eq!(gate.needs_clarification, None);

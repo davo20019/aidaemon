@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.18] - 2026-03-07
+## [0.9.19] - 2026-03-08
 
 ### Added
 
@@ -15,13 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **External action timeout ack**: `finalize_external_action_timeout_ack()` in `llm_phase.rs` handles graceful completion when external actions (OAuth flows, HTTP requests) exceed the LLM call timeout.
 - **Daemon runtime context in `check_environment`**: Shows working dir, config path, env file path, and other daemon runtime info.
 - **OAuth callback URL normalization**: `normalize_callback_url()` accepts both base URLs and full callback URLs, preventing double `/oauth/callback` suffixes.
+- **Generic API auth onboarding**: New `manage_http_auth` tool creates, inspects, verifies, and removes manual HTTP auth profiles for bearer/header/basic/OAuth1a APIs, binds secrets from keychain or `.env`, and refreshes runtime auth state without a restart.
+- **Custom OAuth provider onboarding**: `manage_oauth` can now register, describe, and remove custom OAuth 2.0 PKCE, authorization-code, and client-credentials providers at runtime, making OAuth setup possible from a clean install without manual config edits.
+- **Automatic API guide generation**: `manage_skills` gains `learn_api`, which fetches an OpenAPI/Swagger URL or documentation page and turns it into a reusable API guide skill tied to the user's connected/authenticated API workflow.
+- **Deterministic API onboarding**: New `manage_api` tool orchestrates connect + learn + verify in one flow by composing `manage_oauth`, `manage_http_auth`, `manage_skills`, and `http_request`.
+- **Stronger API learning ingestion**: `manage_skills learn_api` now crawls multiple docs pages on the same host, discovers linked OpenAPI/Swagger specs from docs, bundles remote OpenAPI `$ref` documents, and captures GraphQL patterns from docs-only sources.
+- **Auto-derived verification probes**: `manage_api` can now derive a safe verification probe from learned OpenAPI specs, and can reuse GraphQL introspection as the probe for GraphQL APIs when no explicit `verify_url` was provided.
+- **GraphQL schema introspection learning**: `manage_skills learn_api` can now introspect GraphQL endpoints with the live auth profile instead of relying only on docs text heuristics.
 
 ### Changed
 
-- **`http_request` and `manage_oauth` added to `ESSENTIAL_TOOLS`**: Always available regardless of risk/policy filtering.
+- **`http_request`, `manage_http_auth`, and `manage_oauth` added to `ESSENTIAL_TOOLS`**: Always available regardless of risk/policy filtering.
+- **Connected API tool exposure expanded again**: Connected API turns now keep `manage_api` exposed alongside auth/request/learning tools so the agent can choose a deterministic end-to-end onboarding path.
 - **Connected API intent overrides intent gate**: `infer_intent_gate()` now forces `needs_tools=true` when connected API intent is detected, bypassing consultant text-only routing.
 - **Intent routing verb refinements**: Removed "open" from connected API write verbs (false positive on "open issues" meaning "not-closed"), removed "read" from read verbs (false positive on "read the docs").
 - **Runtime capability validation expanded**: Added "are you connected to" and "are you hooked up to" as direct phrase triggers.
+- **Generic API path always available**: `http_request` is now registered even before any profiles exist so the agent can onboard and use new APIs from a clean install.
+- **OAuth path always available**: `manage_oauth` is now registered even when OAuth was not pre-enabled in config, so users can add and connect built-in or custom OAuth providers from zero.
+- **Connected API tool exposure expanded**: Connected API turns now keep `manage_skills` exposed alongside auth/request tools so the agent can learn an API before using it.
 
 ### Fixed
 

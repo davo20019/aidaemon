@@ -354,6 +354,47 @@ impl crate::traits::Tool for ExternalActionTool {
     }
 }
 
+struct PreWrappedExternalActionTool;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for PreWrappedExternalActionTool {
+    fn name(&self) -> &str {
+        "prewrapped_external_action"
+    }
+
+    fn description(&self) -> &str {
+        "Writes to an external service and returns already-wrapped output."
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "prewrapped_external_action",
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        })
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok(crate::tools::sanitize::wrap_untrusted_output(
+            "prewrapped_external_action",
+            "Created remote record id=wrapped123",
+        ))
+    }
+}
+
 #[tokio::test]
 async fn test_successful_external_action_timeout_returns_deterministic_completion() {
     let responses = vec![
@@ -416,6 +457,60 @@ async fn test_successful_external_action_timeout_returns_deterministic_completio
         )),
         "expected ToolComplete status update for external_action, got: {:?}",
         updates
+    );
+}
+
+#[tokio::test]
+async fn test_prewrapped_external_action_timeout_keeps_latest_result() {
+    let responses = vec![
+        {
+            let mut resp = MockProvider::tool_call_response("prewrapped_external_action", "{}");
+            resp.content = Some("I'll handle that.".to_string());
+            resp
+        },
+        MockProvider::text_response("This reply should time out before it is used."),
+    ];
+
+    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_delayed_responses(
+            responses,
+            vec![std::time::Duration::ZERO, std::time::Duration::from_secs(2)],
+        ),
+        vec![Arc::new(PreWrappedExternalActionTool)],
+        Some(1),
+    )
+    .await
+    .unwrap();
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        harness.agent.handle_message(
+            "prewrapped_external_action_timeout",
+            "Create the remote record.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        ),
+    )
+    .await
+    .expect("request should not hang")
+    .unwrap();
+
+    assert!(
+        response.contains("The requested action completed successfully."),
+        "response should use deterministic completion ack: {}",
+        response
+    );
+    assert!(
+        response.contains("Created remote record id=wrapped123"),
+        "response should preserve the latest external action result: {}",
+        response
+    );
+    assert!(
+        !response.contains("UNTRUSTED EXTERNAL DATA"),
+        "response should not leak wrapper markers into the final reply: {}",
+        response
     );
 }
 
@@ -626,7 +721,6 @@ async fn test_duplicate_send_file_forces_text_closeout() {
         "Expected exactly one duplicate suppression message"
     );
 }
-
 
 /// Full-stack regression test: "What's the url of the site that you deployed?"
 ///

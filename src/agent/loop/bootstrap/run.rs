@@ -267,6 +267,17 @@ impl Agent {
             }
         }
         let requests_external_verification = user_requests_external_verification(user_text);
+        let skills_snapshot = self.skill_cache.get();
+        let active_untrusted_external_reference_skills =
+            matched_untrusted_external_reference_skill_names(
+                &skills_snapshot,
+                user_text,
+                user_role,
+                channel_ctx.visibility,
+            );
+        let restrict_untrusted_external_reference_tools =
+            !active_untrusted_external_reference_skills.is_empty()
+                && !user_explicitly_requests_local_file_inspection(user_text);
         // For personal-memory recall turns, keep tool search narrow unless the
         // user explicitly asks for broader verification.
         let restrict_to_personal_memory_tools =
@@ -304,6 +315,10 @@ impl Agent {
             if restrict_to_personal_memory_tools {
                 defs = filter_tool_defs_for_personal_memory(&defs);
                 caps.retain(|name, _| is_personal_memory_tool(name));
+            }
+            if restrict_untrusted_external_reference_tools {
+                defs = filter_tool_defs_for_untrusted_external_reference(&defs);
+                caps.retain(|name, _| !is_untrusted_external_reference_blocked_tool(name));
             }
 
             available_capabilities = caps;
@@ -364,6 +379,12 @@ impl Agent {
             tool_defs = filter_tool_defs_for_personal_memory(&tool_defs);
             base_tool_defs = filter_tool_defs_for_personal_memory(&base_tool_defs);
             available_capabilities.retain(|name, _| is_personal_memory_tool(name));
+        }
+        if restrict_untrusted_external_reference_tools {
+            tool_defs = filter_tool_defs_for_untrusted_external_reference(&tool_defs);
+            base_tool_defs = filter_tool_defs_for_untrusted_external_reference(&base_tool_defs);
+            available_capabilities
+                .retain(|name, _| !is_untrusted_external_reference_blocked_tool(name));
         }
 
         // Keep provider + router consistent for this task, even if runtime reloads.
@@ -549,6 +570,8 @@ impl Agent {
             is_reaffirmation_challenge_turn,
             requests_external_verification,
             restrict_to_personal_memory_tools,
+            active_untrusted_external_reference_skills,
+            restrict_untrusted_external_reference_tools,
             personal_memory_tool_call_cap,
             tools_allowed_for_user,
             available_capabilities,

@@ -125,6 +125,8 @@ impl Agent {
             is_reaffirmation_challenge_turn,
             requests_external_verification,
             restrict_to_personal_memory_tools,
+            active_untrusted_external_reference_skills,
+            restrict_untrusted_external_reference_tools,
             personal_memory_tool_call_cap,
             tools_allowed_for_user,
             mut available_capabilities,
@@ -788,6 +790,9 @@ impl Agent {
                     task_tokens_used,
                     user_text,
                     restrict_to_personal_memory_tools,
+                    active_untrusted_external_reference_skills:
+                        &active_untrusted_external_reference_skills,
+                    restrict_untrusted_external_reference_tools,
                     is_reaffirmation_challenge_turn,
                     personal_memory_tool_call_cap,
                     base_tool_defs: &base_tool_defs,

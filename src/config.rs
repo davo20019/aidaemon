@@ -1909,6 +1909,8 @@ fn default_retention_hours() -> u64 {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct OAuthConfig {
+    // Retained for backward-compatible config parsing; OAuth tooling is always available at runtime.
+    #[allow(dead_code)]
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -1919,6 +1921,8 @@ pub struct OAuthConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct OAuthProviderConfig {
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub auth_type: String,
     pub authorize_url: String,
     pub token_url: String,

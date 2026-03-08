@@ -31,7 +31,9 @@ fn is_tool_name_like(name: &str) -> bool {
             | "use_skill"
             | "skill_resources"
             | "manage_people"
+            | "manage_api"
             | "http_request"
+            | "manage_http_auth"
             | "manage_oauth"
             | "read_channel_history"
     ) || lower.starts_with("mcp__")

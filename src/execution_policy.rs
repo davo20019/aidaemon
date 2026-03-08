@@ -188,7 +188,9 @@ pub fn score_risk_from_capabilities(caps: &[ToolCapabilities]) -> f32 {
 pub fn profile_for_risk(risk_score: f32, uncertainty_score: f32) -> ModelProfile {
     let composite = clamp01((risk_score * 0.7) + (uncertainty_score * 0.3));
     if composite < 0.34 {
-        ModelProfile::Cheap
+        // Open-source default: floor automatic routing at Balanced for better
+        // reliability. Cheap remains available as an explicit lower-budget preset.
+        ModelProfile::Balanced
     } else if composite < 0.67 {
         ModelProfile::Balanced
     } else {
@@ -234,6 +236,13 @@ mod tests {
             prior_immediate_failure: false,
         });
         assert!((score - 0.60).abs() < 0.001);
+    }
+
+    #[test]
+    fn low_risk_auto_routing_floors_at_balanced() {
+        assert_eq!(profile_for_risk(0.05, 0.0), ModelProfile::Balanced);
+        assert_eq!(profile_for_risk(0.20, 0.10), ModelProfile::Balanced);
+        assert_eq!(profile_for_risk(0.95, 0.95), ModelProfile::Strong);
     }
 
     #[test]

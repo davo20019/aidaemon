@@ -154,9 +154,13 @@ impl Agent {
         match crate::agent::intent_routing::classify_connected_api_intent(user_message) {
             Some(crate::agent::intent_routing::ConnectedApiIntent::RuntimeCapabilityValidation)
             | Some(crate::agent::intent_routing::ConnectedApiIntent::ReadAction)
-            | Some(crate::agent::intent_routing::ConnectedApiIntent::WriteAction) => {
-                Some(&["manage_oauth", "http_request"])
-            }
+            | Some(crate::agent::intent_routing::ConnectedApiIntent::WriteAction) => Some(&[
+                "manage_api",
+                "manage_oauth",
+                "manage_http_auth",
+                "manage_skills",
+                "http_request",
+            ]),
             None => None,
         }
     }
@@ -232,7 +236,9 @@ impl Agent {
             "manage_people",
             "web_search",
             "web_fetch",
+            "manage_api",
             "http_request",
+            "manage_http_auth",
             "manage_oauth",
             "send_file",
         ];
@@ -469,7 +475,10 @@ mod tests {
         let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
         let base = vec![
             named_tool_def("search_files"),
+            named_tool_def("manage_api"),
             named_tool_def("http_request"),
+            named_tool_def("manage_http_auth"),
+            named_tool_def("manage_skills"),
             named_tool_def("manage_oauth"),
             named_tool_def("terminal"),
         ];
@@ -485,9 +494,12 @@ mod tests {
             .map(ToString::to_string)
             .collect();
 
+        assert!(names.contains(&"manage_api".to_string()));
         assert!(names.contains(&"http_request".to_string()));
+        assert!(names.contains(&"manage_http_auth".to_string()));
+        assert!(names.contains(&"manage_skills".to_string()));
         assert!(names.contains(&"manage_oauth".to_string()));
-        assert_eq!(names.first().map(String::as_str), Some("manage_oauth"));
+        assert_eq!(names.first().map(String::as_str), Some("manage_api"));
     }
 
     #[tokio::test]
@@ -499,7 +511,10 @@ mod tests {
         let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
         let base = vec![
             named_tool_def("search_files"),
+            named_tool_def("manage_api"),
             named_tool_def("http_request"),
+            named_tool_def("manage_http_auth"),
+            named_tool_def("manage_skills"),
             named_tool_def("manage_oauth"),
             named_tool_def("terminal"),
         ];
@@ -515,7 +530,10 @@ mod tests {
             .map(ToString::to_string)
             .collect();
 
+        assert!(names.contains(&"manage_api".to_string()));
         assert!(names.contains(&"http_request".to_string()));
+        assert!(names.contains(&"manage_http_auth".to_string()));
+        assert!(names.contains(&"manage_skills".to_string()));
         assert!(names.contains(&"manage_oauth".to_string()));
     }
 
@@ -528,7 +546,10 @@ mod tests {
         let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
         let base = vec![
             named_tool_def("search_files"),
+            named_tool_def("manage_api"),
             named_tool_def("http_request"),
+            named_tool_def("manage_http_auth"),
+            named_tool_def("manage_skills"),
             named_tool_def("manage_oauth"),
             named_tool_def("terminal"),
         ];
@@ -545,7 +566,10 @@ mod tests {
             .map(ToString::to_string)
             .collect();
 
+        assert!(names.contains(&"manage_api".to_string()));
         assert!(names.contains(&"http_request".to_string()));
+        assert!(names.contains(&"manage_http_auth".to_string()));
+        assert!(names.contains(&"manage_skills".to_string()));
         assert!(names.contains(&"manage_oauth".to_string()));
     }
 
@@ -558,7 +582,10 @@ mod tests {
         let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
         let base = vec![
             named_tool_def("search_files"),
+            named_tool_def("manage_api"),
             named_tool_def("http_request"),
+            named_tool_def("manage_http_auth"),
+            named_tool_def("manage_skills"),
             named_tool_def("manage_oauth"),
             named_tool_def("terminal"),
         ];
@@ -589,12 +616,24 @@ mod tests {
         let defs = vec![
             named_tool_def("search_files"),
             named_tool_def("read_file"),
+            named_tool_def("manage_api"),
             named_tool_def("http_request"),
+            named_tool_def("manage_http_auth"),
             named_tool_def("manage_oauth"),
         ];
         let capabilities: HashMap<String, ToolCapabilities> = HashMap::from([
             ("search_files".to_string(), ToolCapabilities::default()),
             ("read_file".to_string(), ToolCapabilities::default()),
+            (
+                "manage_api".to_string(),
+                ToolCapabilities {
+                    read_only: false,
+                    external_side_effect: true,
+                    needs_approval: true,
+                    idempotent: false,
+                    high_impact_write: true,
+                },
+            ),
             (
                 "http_request".to_string(),
                 ToolCapabilities {
@@ -603,6 +642,16 @@ mod tests {
                     needs_approval: true,
                     idempotent: false,
                     high_impact_write: false,
+                },
+            ),
+            (
+                "manage_http_auth".to_string(),
+                ToolCapabilities {
+                    read_only: false,
+                    external_side_effect: true,
+                    needs_approval: true,
+                    idempotent: false,
+                    high_impact_write: true,
                 },
             ),
             (
@@ -630,7 +679,9 @@ mod tests {
             .map(ToString::to_string)
             .collect();
 
+        assert!(names.contains(&"manage_api".to_string()));
         assert!(names.contains(&"http_request".to_string()));
+        assert!(names.contains(&"manage_http_auth".to_string()));
         assert!(names.contains(&"manage_oauth".to_string()));
     }
 }

@@ -226,6 +226,9 @@ health_port = 8080
 
 # [policy]
 # All policy features are enabled by default. Uncomment to override.
+# Policy profiles (`cheap`, `balanced`, `strong`) are execution presets, not separate model tiers.
+# They all use the configured default model; the differences are context/tool budgets, verification,
+# and approval behavior. The open-source default auto-routing floors at `balanced`.
 # policy_shadow_mode = true          # log policy shadow comparisons and rollout diagnostics
 # policy_enforce = true              # enforce policy context budget cap (vs model max only)
 # tool_filter_enforce = true         # risk-based tool filtering

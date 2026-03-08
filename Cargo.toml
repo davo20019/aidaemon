@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon"
-version = "0.9.18"
+version = "0.9.19"
 edition = "2021"
 description = "A personal AI agent that runs as a background daemon, accessible via Telegram, Slack, or Discord, with tool use, MCP integration, and persistent memory"
 license = "MIT"
@@ -20,6 +20,7 @@ reqwest = { version = "0.12", features = ["json", "blocking", "gzip", "deflate",
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 toml = "0.8"
 async-trait = "0.1"
 tracing = "0.1"

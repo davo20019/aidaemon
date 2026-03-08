@@ -68,7 +68,17 @@ impl Agent {
         let task_id = ctx.task_id;
         let channel_visibility = ctx.channel_visibility;
         let channel_id = ctx.channel_id;
-        let trusted = ctx.trusted;
+        let trusted = ctx.trusted
+            || if let Some(goal_id) = self.goal_id.as_deref() {
+                // Scheduled goal runs are user-confirmed automation, so treat
+                // their tool calls as trusted even when the execution context
+                // was recreated later by heartbeat/orphan dispatch.
+                goal_has_scheduled_provenance(&self.state, goal_id, task_id).await
+            } else if let Some(task_id) = task_id {
+                task_has_scheduled_provenance(&self.state, Some(task_id)).await
+            } else {
+                false
+            };
         let user_role = ctx.user_role;
 
         if user_role != UserRole::Owner {

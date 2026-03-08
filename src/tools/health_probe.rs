@@ -62,83 +62,82 @@ impl Tool for HealthProbeTool {
     fn schema(&self) -> Value {
         json!({
             "name": "health_probe",
-            "description": "Create, manage, and monitor health probes for HTTP endpoints, TCP ports, \
-                commands, and files. Probes run on a schedule and alert when services go down or degrade.",
+            "description": "Create and monitor scheduled health probes.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["create", "list", "delete", "pause", "resume", "run_now", "status"],
-                        "description": "The action to perform"
+                        "description": "Action"
                     },
                     "name": {
                         "type": "string",
-                        "description": "Human-readable name for the probe (required for create)"
+                        "description": "Probe name"
                     },
                     "type": {
                         "type": "string",
                         "enum": ["http", "port", "command", "file"],
-                        "description": "Type of probe: http (HTTP/HTTPS endpoint), port (TCP port), command (shell command), file (file existence/age)"
+                        "description": "Probe type"
                     },
                     "target": {
                         "type": "string",
-                        "description": "What to check. For http: URL, port: host:port, command: shell command, file: path"
+                        "description": "Target URL, host:port, command, or path"
                     },
                     "schedule": {
                         "type": "string",
-                        "description": "When to run. Natural: 'every 1m', 'every 5m', 'hourly'. Or 5-field cron"
+                        "description": "Natural schedule or 5-field cron"
                     },
                     "description": {
                         "type": "string",
-                        "description": "Optional description of what this probe monitors"
+                        "description": "Optional description"
                     },
                     "config": {
                         "type": "object",
-                        "description": "Probe-specific configuration",
+                        "description": "Probe config",
                         "properties": {
                             "timeout_secs": {
                                 "type": "integer",
-                                "description": "Timeout in seconds (default: 10)"
+                                "description": "Timeout"
                             },
                             "expected_status": {
                                 "type": "integer",
-                                "description": "For HTTP: expected status code (default: 200)"
+                                "description": "Expected HTTP status"
                             },
                             "expected_body": {
                                 "type": "string",
-                                "description": "For HTTP: expected substring in response body"
+                                "description": "Expected body substring"
                             },
                             "method": {
                                 "type": "string",
-                                "description": "For HTTP: request method (default: GET)"
+                                "description": "HTTP method"
                             },
                             "max_age_secs": {
                                 "type": "integer",
-                                "description": "For file: max age in seconds before unhealthy"
+                                "description": "Max file age"
                             },
                             "expected_exit_code": {
                                 "type": "integer",
-                                "description": "For command: expected exit code (default: 0)"
+                                "description": "Expected command exit code"
                             }
                         },
                         "additionalProperties": false
                     },
                     "consecutive_failures_alert": {
                         "type": "integer",
-                        "description": "Number of consecutive failures before alerting (default: 3)"
+                        "description": "Failures before alert"
                     },
                     "latency_threshold_ms": {
                         "type": "integer",
-                        "description": "Latency threshold in ms to trigger warnings"
+                        "description": "Latency warning threshold"
                     },
                     "id": {
                         "type": "string",
-                        "description": "Probe ID (required for delete, pause, resume, run_now, status)"
+                        "description": "Probe ID"
                     },
                     "hours": {
                         "type": "integer",
-                        "description": "For status action: hours of history to include (default: 24)"
+                        "description": "History window for status"
                     }
                 },
                 "required": ["action"],
