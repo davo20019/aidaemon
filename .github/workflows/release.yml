@@ -224,15 +224,8 @@ jobs:
           echo "Waiting for crates.io to report aidaemon ${EXPECTED_VERSION} (${PUBLISH_RESULT})."
 
           for ATTEMPT in $(seq 1 30); do
-            REPORTED_VERSION="$(python3 - <<'PY'
-            import json
-            import urllib.request
-
-            with urllib.request.urlopen("https://crates.io/api/v1/crates/aidaemon", timeout=20) as response:
-                payload = json.load(response)
-
-            print(payload["crate"]["max_version"])
-            PY
+            REPORTED_VERSION="$(
+              python3 -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("https://crates.io/api/v1/crates/aidaemon", timeout=20)); print(payload["crate"]["max_version"])'
             )"
 
             if [ "$REPORTED_VERSION" = "$EXPECTED_VERSION" ]; then
