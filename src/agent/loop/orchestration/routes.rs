@@ -1,11 +1,11 @@
-use super::types::ConsultantOrchestrationCtx;
-use crate::agent::consultant_direct_return::consultant_direct_return_ok;
-use crate::agent::consultant_fallthrough::consultant_fallthrough;
-use crate::agent::consultant_phase::ConsultantPhaseOutcome;
+use super::types::OrchestrationCtx;
+use crate::agent::direct_return::direct_return_ok;
+use crate::agent::fallthrough::fallthrough;
 use crate::agent::recall_guardrails::{
     filter_tool_defs_for_delegation, filter_tool_defs_for_personal_memory,
     is_delegation_blocked_tool, is_personal_memory_tool,
 };
+use crate::agent::response_phase::ResponsePhaseOutcome;
 use crate::agent::*;
 
 const MAX_SCHEDULE_SEGMENTS_PER_MESSAGE: usize = 10;
@@ -90,12 +90,12 @@ impl Agent {
         false
     }
 
-    async fn emit_consultant_direct_reply(
+    async fn emit_direct_reply(
         &self,
-        ctx: &ConsultantOrchestrationCtx<'_>,
+        ctx: &OrchestrationCtx<'_>,
         message: String,
         completion_note: &str,
-    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+    ) -> anyhow::Result<ResponsePhaseOutcome> {
         let assistant_msg = Message {
             id: Uuid::new_v4().to_string(),
             session_id: ctx.session_id.to_string(),
@@ -121,17 +121,17 @@ impl Agent {
             Some(completion_note.to_string()),
         )
         .await;
-        Ok(consultant_direct_return_ok(message))
+        Ok(direct_return_ok(message))
     }
 
     async fn confirm_scheduled_goal_activation(
         &self,
-        ctx: &mut ConsultantOrchestrationCtx<'_>,
+        ctx: &mut OrchestrationCtx<'_>,
         goal: &Goal,
         schedule: &crate::traits::GoalSchedule,
         tz_label: &str,
         completion_note: &str,
-    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+    ) -> anyhow::Result<ResponsePhaseOutcome> {
         let activation_msg = match self.state.activate_goal(&goal.id).await {
             Ok(true) => {
                 if let Some(ref registry) = self.goal_token_registry {
@@ -183,16 +183,16 @@ impl Agent {
             Some(completion_note.to_string()),
         )
         .await;
-        Ok(consultant_direct_return_ok(activation_msg))
+        Ok(direct_return_ok(activation_msg))
     }
 
     async fn confirm_scheduled_goal_activation_batch(
         &self,
-        ctx: &mut ConsultantOrchestrationCtx<'_>,
+        ctx: &mut OrchestrationCtx<'_>,
         goals_and_schedules: &[(Goal, crate::traits::GoalSchedule)],
         tz_label: &str,
         completion_note: &str,
-    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+    ) -> anyhow::Result<ResponsePhaseOutcome> {
         let mut activated = Vec::new();
         let mut activation_errors = Vec::new();
 
@@ -271,7 +271,7 @@ impl Agent {
             Some(completion_note.to_string()),
         )
         .await;
-        Ok(consultant_direct_return_ok(activation_msg))
+        Ok(direct_return_ok(activation_msg))
     }
 
     async fn cancel_scheduled_goals_before_confirmation(
@@ -299,7 +299,7 @@ impl Agent {
 
     async fn ensure_orchestrator_tools_loaded(
         &self,
-        ctx: &mut ConsultantOrchestrationCtx<'_>,
+        ctx: &mut OrchestrationCtx<'_>,
     ) -> anyhow::Result<()> {
         if !ctx.tool_defs.is_empty() || !ctx.tools_allowed_for_user {
             return Ok(());
@@ -329,8 +329,8 @@ impl Agent {
 
     pub(super) async fn maybe_handle_generic_cancel_request(
         &self,
-        ctx: &mut ConsultantOrchestrationCtx<'_>,
-    ) -> anyhow::Result<Option<ConsultantPhaseOutcome>> {
+        ctx: &mut OrchestrationCtx<'_>,
+    ) -> anyhow::Result<Option<ResponsePhaseOutcome>> {
         // Check for cancel/stop intent before routing
         let lower_trimmed = ctx.user_text.trim().to_lowercase();
         let explicit_cancel_command =
@@ -431,13 +431,13 @@ impl Agent {
         )
         .await;
 
-        Ok(Some(consultant_direct_return_ok(msg)))
+        Ok(Some(direct_return_ok(msg)))
     }
 
     async fn handle_scheduled_missing_timing_intent(
         &self,
-        ctx: &mut ConsultantOrchestrationCtx<'_>,
-    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+        ctx: &mut OrchestrationCtx<'_>,
+    ) -> anyhow::Result<ResponsePhaseOutcome> {
         // Fall through to the full agent loop instead of
         // giving up. The LLM with tools can ask for timing
         // or infer it from context.
@@ -446,23 +446,23 @@ impl Agent {
             "ScheduledMissingTiming — falling through to agent loop"
         );
         self.ensure_orchestrator_tools_loaded(ctx).await?;
-        Ok(consultant_fallthrough())
+        Ok(fallthrough())
     }
 
     async fn handle_scheduled_intent(
         &self,
-        ctx: &mut ConsultantOrchestrationCtx<'_>,
+        ctx: &mut OrchestrationCtx<'_>,
         mut schedule_raw: String,
         schedule_cron: Option<String>,
         is_one_shot: bool,
-    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+    ) -> anyhow::Result<ResponsePhaseOutcome> {
         if ctx.user_role != UserRole::Owner {
             // Non-owners cannot create scheduled goals — load tools and
             // fall through to agent loop so the request is handled directly.
             self.ensure_orchestrator_tools_loaded(ctx).await?;
             ctx.pending_system_messages
                 .push(SystemDirective::SchedulingOwnerOnly);
-            return Ok(consultant_fallthrough());
+            return Ok(fallthrough());
         }
 
         if is_internal_maintenance_intent(ctx.user_text) {
@@ -498,7 +498,7 @@ impl Agent {
                 Some(msg.chars().take(200).collect()),
             )
             .await;
-            return Ok(consultant_direct_return_ok(msg));
+            return Ok(direct_return_ok(msg));
         }
 
         let goal_user_text = ctx.turn_context.goal_user_text.clone();
@@ -511,11 +511,7 @@ impl Agent {
                 MAX_SCHEDULE_SEGMENTS_PER_MESSAGE
             );
             return self
-                .emit_consultant_direct_reply(
-                    ctx,
-                    msg,
-                    "Rejected oversized multi-schedule request.",
-                )
+                .emit_direct_reply(ctx, msg, "Rejected oversized multi-schedule request.")
                 .await;
         }
         if extracted_segments.len() > 1 {
@@ -541,7 +537,7 @@ impl Agent {
                             segment.schedule_raw
                         );
                         return self
-                            .emit_consultant_direct_reply(
+                            .emit_direct_reply(
                                 ctx,
                                 msg,
                                 "Rejected multi-schedule request with invalid segment.",
@@ -565,7 +561,7 @@ impl Agent {
                             segment.schedule_raw
                         );
                         return self
-                            .emit_consultant_direct_reply(
+                            .emit_direct_reply(
                                 ctx,
                                 msg,
                                 "Rejected multi-schedule request with invalid segment.",
@@ -763,7 +759,7 @@ impl Agent {
                             )
                         };
                         return self
-                            .emit_consultant_direct_reply(
+                            .emit_direct_reply(
                                 ctx,
                                 cancel_msg,
                                 "Scheduled goals cancelled via inline approval.",
@@ -801,7 +797,7 @@ impl Agent {
                 tz_label
             );
             return self
-                .emit_consultant_direct_reply(
+                .emit_direct_reply(
                     ctx,
                     confirmation,
                     "Scheduled goals awaiting text confirmation.",
@@ -859,7 +855,7 @@ impl Agent {
                     "Schedule parse failed — falling through to agent loop"
                 );
                 self.ensure_orchestrator_tools_loaded(ctx).await?;
-                return Ok(consultant_fallthrough());
+                return Ok(fallthrough());
             }
         };
 
@@ -925,7 +921,7 @@ impl Agent {
                             &existing.id[..8]
                         );
                         return self
-                            .emit_consultant_direct_reply(
+                            .emit_direct_reply(
                                 ctx,
                                 msg,
                                 "Duplicate scheduled goal detected in fast-path.",
@@ -1079,7 +1075,7 @@ impl Agent {
 
                     let cancel_msg = "OK, cancelled the scheduled goal.".to_string();
                     return self
-                        .emit_consultant_direct_reply(
+                        .emit_direct_reply(
                             ctx,
                             cancel_msg,
                             "Scheduled goal cancelled via inline approval.",
@@ -1101,7 +1097,7 @@ impl Agent {
             schedule_kind, schedule_desc, goal.description, tz_label
         );
 
-        self.emit_consultant_direct_reply(
+        self.emit_direct_reply(
             ctx,
             confirmation,
             "Scheduled goal awaiting text confirmation.",
@@ -1111,8 +1107,8 @@ impl Agent {
 
     async fn handle_knowledge_intent(
         &self,
-        ctx: &mut ConsultantOrchestrationCtx<'_>,
-    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+        ctx: &mut OrchestrationCtx<'_>,
+    ) -> anyhow::Result<ResponsePhaseOutcome> {
         self.ensure_orchestrator_tools_loaded(ctx).await?;
         ctx.pending_system_messages
             .push(SystemDirective::KnowledgeIntentDirectAnswer);
@@ -1120,13 +1116,13 @@ impl Agent {
             ctx.session_id,
             "Knowledge intent — classifier-only pass; continuing to execution loop"
         );
-        Ok(consultant_fallthrough())
+        Ok(fallthrough())
     }
 
     async fn handle_simple_intent(
         &self,
-        ctx: &mut ConsultantOrchestrationCtx<'_>,
-    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+        ctx: &mut OrchestrationCtx<'_>,
+    ) -> anyhow::Result<ResponsePhaseOutcome> {
         self.ensure_orchestrator_tools_loaded(ctx).await?;
         if !ctx.tool_defs.is_empty() {
             info!(
@@ -1142,13 +1138,13 @@ impl Agent {
 
         // Skip to next iteration where the full agent loop
         // runs with all tools and full context.
-        Ok(consultant_fallthrough())
+        Ok(fallthrough())
     }
 
     async fn handle_complex_intent(
         &self,
-        ctx: &mut ConsultantOrchestrationCtx<'_>,
-    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+        ctx: &mut OrchestrationCtx<'_>,
+    ) -> anyhow::Result<ResponsePhaseOutcome> {
         if ctx.user_role != UserRole::Owner {
             // Non-owners cannot create complex goals — load tools and
             // fall through to agent loop so the request is handled directly.
@@ -1174,7 +1170,7 @@ impl Agent {
             }
             ctx.pending_system_messages
                 .push(SystemDirective::GoalCreationOwnerOnly);
-            return Ok(consultant_fallthrough());
+            return Ok(fallthrough());
         }
 
         if is_internal_maintenance_intent(ctx.user_text) {
@@ -1210,7 +1206,7 @@ impl Agent {
                 Some(msg.chars().take(200).collect()),
             )
             .await;
-            return Ok(consultant_direct_return_ok(msg));
+            return Ok(direct_return_ok(msg));
         }
 
         // Create goal
@@ -1349,7 +1345,7 @@ impl Agent {
                         Some(response.chars().take(200).collect()),
                     )
                     .await;
-                    return Ok(consultant_direct_return_ok(response));
+                    return Ok(direct_return_ok(response));
                 }
                 Err(e) => {
                     let mut updated_goal = goal.clone();
@@ -1394,7 +1390,7 @@ impl Agent {
                         None,
                     )
                     .await;
-                    return Ok(consultant_direct_return_ok(err_reply));
+                    return Ok(direct_return_ok(err_reply));
                 }
             }
         }
@@ -1471,14 +1467,14 @@ impl Agent {
             Some("Goal created, working in background.".to_string()),
         )
         .await;
-        Ok(consultant_direct_return_ok(goal_response))
+        Ok(direct_return_ok(goal_response))
     }
 
-    pub(super) async fn route_consultant_complexity(
+    pub(super) async fn route_orchestration_complexity(
         &self,
-        ctx: &mut ConsultantOrchestrationCtx<'_>,
+        ctx: &mut OrchestrationCtx<'_>,
         complexity: IntentComplexity,
-    ) -> anyhow::Result<ConsultantPhaseOutcome> {
+    ) -> anyhow::Result<ResponsePhaseOutcome> {
         match complexity {
             IntentComplexity::ScheduledMissingTiming => {
                 self.handle_scheduled_missing_timing_intent(ctx).await

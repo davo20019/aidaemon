@@ -34,7 +34,6 @@ pub(in crate::agent) struct BootstrapData {
     pub llm_provider: Arc<dyn ModelProvider>,
     pub llm_router: Option<Router>,
     pub model: String,
-    pub consultant_pass_active: bool,
     pub route_failsafe_active: bool,
     pub system_prompt: String,
     pub pinned_memories: Vec<Message>,

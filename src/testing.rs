@@ -382,7 +382,7 @@ pub async fn setup_test_agent_with_extra_tools_and_llm_timeout(
     );
 
     // Set executor mode so integration tests exercise the execution loop directly,
-    // bypassing orchestrator routing (consultant pass, intent classification).
+    // bypassing orchestrator routing and first-pass intent classification.
     agent.set_test_executor_mode();
 
     // Channel (not wired to hub — tests call agent.handle_message directly)
@@ -398,14 +398,15 @@ pub async fn setup_test_agent_with_extra_tools_and_llm_timeout(
     })
 }
 
-/// Build a test agent with non-uniform model tiers (enables the smart router
-/// and consultant pass).
+/// Build a test agent with non-uniform model tiers (enables smart routing and
+/// first-pass orchestration).
 ///
 /// The `primary_model` name is used as the agent's default model and for the
 /// Primary router tier.  `smart_model` is used for the Smart tier (and Fast
 /// tier).  Because `MockProvider` ignores model names (pops from its response
-/// queue), the different names only affect routing logic and the consultant
-/// pass activation check (`first_turn_model != execution_model`).
+/// queue), the different names only affect routing logic and the
+/// first-pass orchestration activation check
+/// (`first_turn_model != execution_model`).
 #[allow(dead_code)]
 pub async fn setup_test_agent_with_models(
     provider: MockProvider,
@@ -477,7 +478,7 @@ pub async fn setup_test_agent_with_models(
         crate::config::PathAliasConfig::default(),
         None,
     );
-    // Note: keeps orchestrator mode (depth=0) — used by consultant pass tests
+    // Note: keeps orchestrator mode (depth=0) — used by orchestration tests
 
     let channel = Arc::new(TestChannel::new());
 
@@ -493,8 +494,8 @@ pub async fn setup_test_agent_with_models(
 
 /// Build a test agent in orchestrator mode with non-uniform model tiers.
 ///
-/// This enables the smart router + consultant pass so integration tests can
-/// exercise orchestration routing (intent gate + confirmation gate + full loop).
+/// This enables smart routing plus first-pass orchestration so integration
+/// tests can exercise orchestration routing and the full execution loop.
 #[allow(dead_code)]
 pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Result<TestHarness> {
     let db_file = tempfile::NamedTempFile::new()?;

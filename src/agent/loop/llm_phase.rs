@@ -14,7 +14,6 @@ pub(super) struct LlmPhaseCtx<'a> {
     pub session_id: &'a str,
     pub user_text: &'a str,
     pub iteration: usize,
-    pub consultant_pass_active: bool,
     pub force_text_response: bool,
     pub task_start: Instant,
     pub task_tokens_used: &'a mut u64,
@@ -106,7 +105,6 @@ impl Agent {
         let session_id = ctx.session_id;
         let user_text = ctx.user_text;
         let iteration = ctx.iteration;
-        let _consultant_pass_active = ctx.consultant_pass_active;
         let force_text_response = ctx.force_text_response;
         let task_start = ctx.task_start;
         let task_tokens_used = &mut *ctx.task_tokens_used;

@@ -752,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_body_consultant_style_none_with_empty_tools_is_safe() {
+    fn test_build_request_body_none_tool_choice_with_empty_tools_is_safe() {
         let p = provider();
         let messages = vec![json!({"role": "user", "content": "classify intent"})];
         let tools: Vec<Value> = vec![];

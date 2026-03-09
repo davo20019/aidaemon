@@ -43,7 +43,7 @@ async fn test_basic_message_response() {
 
 #[tokio::test]
 async fn test_empty_llm_response_retried_then_fallback() {
-    // With consultant pass disabled (default+fallback routing), the first empty
+    // With text-only pre-pass removed (default+fallback routing), the first empty
     // response IS the first iteration. Flow: empty -> retry with nudge -> empty -> fallback.
     // That's 2 LLM calls total.
     let provider = MockProvider::with_responses(vec![

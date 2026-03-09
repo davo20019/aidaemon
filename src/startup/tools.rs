@@ -475,6 +475,7 @@ pub async fn register_runtime_tools(
 
     let mut oauth_gateway: Option<crate::oauth::OAuthGateway> = None;
     let mut spawn_tool: Option<Arc<SpawnAgentTool>> = None;
+    let mut http_request_tool: Option<Arc<HttpRequestTool>> = None;
     let mut registered_runtime_tools: std::collections::HashSet<RuntimeToolId> =
         std::collections::HashSet::new();
 
@@ -511,6 +512,7 @@ pub async fn register_runtime_tools(
             mcp_registry.clone(),
             approval_tx.clone(),
             http_profiles.clone(),
+            &mut http_request_tool,
             &mut spawn_tool,
             &mut oauth_gateway,
         )
@@ -539,6 +541,7 @@ async fn register_runtime_tool_by_id(
     mcp_registry: McpRegistry,
     approval_tx: mpsc::Sender<ApprovalRequest>,
     http_profiles: crate::oauth::SharedHttpProfiles,
+    http_request_tool: &mut Option<Arc<HttpRequestTool>>,
     spawn_tool: &mut Option<Arc<SpawnAgentTool>>,
     oauth_gateway: &mut Option<crate::oauth::OAuthGateway>,
 ) -> anyhow::Result<()> {
@@ -564,7 +567,9 @@ async fn register_runtime_tool_by_id(
             }
         }
         RuntimeToolId::HttpRequest => {
-            tools.push(Arc::new(HttpRequestTool::new(http_profiles, approval_tx)));
+            let tool = Arc::new(HttpRequestTool::new(http_profiles, approval_tx));
+            tools.push(tool.clone());
+            *http_request_tool = Some(tool);
         }
         RuntimeToolId::ManageHttpAuth => {
             tools.push(Arc::new(ManageHttpAuthTool::new(
@@ -599,6 +604,10 @@ async fn register_runtime_tool_by_id(
 
             // Restore existing connections from DB + keychain.
             gateway.restore_connections().await;
+
+            if let Some(http_tool) = http_request_tool.as_ref() {
+                http_tool.set_oauth_gateway(gateway.clone()).await;
+            }
 
             tools.push(Arc::new(ManageOAuthTool::new(
                 gateway.clone(),

@@ -46,7 +46,7 @@ pub(super) fn user_text_looks_ambiguous(user_text: &str) -> bool {
     matches!(lower.as_str(), "it" | "this" | "that")
 }
 
-#[allow(dead_code)] // Kept for potential future consultant/fallback handling.
+#[allow(dead_code)] // Kept for potential future response/fallback handling.
 pub(super) fn first_question_line(text: &str) -> Option<String> {
     text.lines()
         .map(str::trim)
@@ -253,7 +253,8 @@ pub(super) fn is_trivial_message(lower: &str) -> bool {
 
 /// Returns true for short corrective follow-ups (not new requests), e.g.
 /// "you did send me the pdf". This is a deterministic guardrail when the
-/// consultant intent gate over-predicts `needs_tools=true`.
+/// first-pass intent gate over-predicts `needs_tools=true`.
+#[cfg(test)]
 pub(super) fn is_short_user_correction(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
     if lower.is_empty() || lower.contains('?') {

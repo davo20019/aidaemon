@@ -179,7 +179,7 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
     //    - connected API reads
     //    - connected API writes
     //
-    // These requests cannot be satisfied by text-only consultant output and
+    // These requests cannot be satisfied by a text-only first-pass response and
     // must run through the tool loop, regardless of model intent-gate output.
     if super::user_text_references_filesystem_path(user_text)
         || user_text_requires_local_tool_execution(user_text)
@@ -551,8 +551,8 @@ pub(super) fn classify_connected_api_intent(user_text: &str) -> Option<Connected
 /// Falls back to `Simple` when the field is absent or unrecognized.
 ///
 /// Guardrails override the LLM's "complex" classification for messages that
-/// are clearly simple — the consultant LLM over-classifies short commands,
-/// acknowledgments, and single-action requests as complex.
+/// are clearly simple — the first-pass classifier over-classifies short
+/// commands, acknowledgments, and single-action requests as complex.
 pub(super) fn classify_intent_complexity(
     user_text: &str,
     intent_gate: &IntentGateDecision,

@@ -22,7 +22,7 @@ pub use conversation::{
 };
 pub use dynamic::{
     CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
-    OAuthConnection, SkillDraft,
+    OAuthConnection, PendingOAuthFlow, SkillDraft,
 };
 pub use goals::{
     Goal, GoalSchedule, GoalTokenBudgetStatus, NotificationEntry, ScheduledRunState, Task,

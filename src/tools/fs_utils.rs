@@ -359,9 +359,20 @@ pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Opt
     None
 }
 
-pub fn resolve_contextual_project_nickname(
+fn explicit_project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for raw_root in alias_roots {
+        let Ok(root) = validate_path(raw_root) else {
+            continue;
+        };
+        push_unique_search_root(&mut roots, root);
+    }
+    roots
+}
+
+fn resolve_contextual_project_nickname_across_roots(
     raw_name: &str,
-    alias_roots: &[String],
+    roots: Vec<PathBuf>,
 ) -> Option<PathBuf> {
     let token = raw_name
         .trim_matches(|c: char| c.is_ascii_whitespace() || c == '`' || c == '\'' || c == '"')
@@ -383,7 +394,7 @@ pub fn resolve_contextual_project_nickname(
     let dotted = format!("{token}.");
     let dashed = format!("{token}-");
     let underscored = format!("{token}_");
-    for root in project_search_roots(alias_roots) {
+    for root in roots {
         for (name, path) in project_root_directory_entries(&root) {
             if name != token
                 && !name.starts_with(&dotted)
@@ -410,6 +421,24 @@ pub fn resolve_contextual_project_nickname(
     } else {
         None
     }
+}
+
+pub fn resolve_contextual_project_nickname(
+    raw_name: &str,
+    alias_roots: &[String],
+) -> Option<PathBuf> {
+    resolve_contextual_project_nickname_across_roots(raw_name, project_search_roots(alias_roots))
+}
+
+pub fn resolve_contextual_project_nickname_in_explicit_roots(
+    raw_name: &str,
+    alias_roots: &[String],
+) -> Option<PathBuf> {
+    let explicit_roots = explicit_project_search_roots(alias_roots);
+    if explicit_roots.is_empty() {
+        return resolve_contextual_project_nickname(raw_name, alias_roots);
+    }
+    resolve_contextual_project_nickname_across_roots(raw_name, explicit_roots)
 }
 
 pub fn resolve_project_scope_reference(raw: &str, alias_roots: &[String]) -> Option<PathBuf> {
@@ -808,6 +837,22 @@ mod tests {
 
         let resolved = resolve_named_project_root(
             "blog.aidaemon.ai",
+            &[alias_root.to_string_lossy().to_string()],
+        )
+        .expect("resolved");
+        assert_eq!(resolved, project);
+    }
+
+    #[test]
+    fn test_resolve_contextual_project_nickname_in_explicit_roots_prefers_alias_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias_root = dir.path().join("projects");
+        let project = alias_root.join("fairfax-va-site");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").unwrap();
+
+        let resolved = resolve_contextual_project_nickname_in_explicit_roots(
+            "fairfax",
             &[alias_root.to_string_lossy().to_string()],
         )
         .expect("resolved");

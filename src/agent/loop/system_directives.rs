@@ -52,6 +52,8 @@ pub(in crate::agent) enum SystemDirective {
     },
     DeferredToolCallRequired,
     DeferredProvideConcreteResults,
+    SuccessfulToolEvidenceMustBeUsed,
+    LiveWorkPivotRequired,
     RecoveryModeModelSwitch,
     NoEvidenceRespondKnownUnknown,
     CliAgentPresentResults,
@@ -187,6 +189,8 @@ impl SystemDirective {
             }
             Self::DeferredToolCallRequired => "[SYSTEM] HARD REQUIREMENT: your next reply MUST include at least one tool call. Do NOT return planning text like \"I'll do X\". Text-only replies are invalid for this request.".to_string(),
             Self::DeferredProvideConcreteResults => "[SYSTEM] You narrated future work instead of providing results. Execute any remaining required tools, or return concrete outcomes and blockers now.".to_string(),
+            Self::SuccessfulToolEvidenceMustBeUsed => "[SYSTEM] You already have successful live tool results in this turn. Do NOT claim you cannot browse, access current data, or only provide guidance. Use the actual tool results already in context and answer with concrete findings now.".to_string(),
+            Self::LiveWorkPivotRequired => "[SYSTEM] You summarized failed live attempts instead of completing the request. Do NOT stop with a \"What I tried\" / \"Current status\" summary while tools still remain. Change strategy now: if an API call returned HTTP 4xx or bad parameters, simplify the request, use `http_request` for APIs, keep `web_fetch` for readable pages only, or fall back to `web_search`/site search/browser and then answer with concrete findings.".to_string(),
             Self::RecoveryModeModelSwitch => "[SYSTEM] Recovery mode: a model switch was applied because prior replies kept promising actions without tool calls. Call the required tools now and return concrete results.".to_string(),
             Self::NoEvidenceRespondKnownUnknown => "[SYSTEM] You have searched across multiple tools and keep finding no evidence. Stop searching and respond with what is known/unknown.".to_string(),
             Self::CliAgentPresentResults => "[SYSTEM] The CLI agent completed successfully and returned substantive results. Present those results to the user directly now. Do NOT claim you cannot complete the request.".to_string(),
@@ -353,6 +357,13 @@ mod tests {
             SystemDirective::DuplicateSendFileAlreadySent.render(),
             "[SYSTEM] The requested file was already sent in this task. Stop calling send_file and reply with plain text only."
         );
+    }
+
+    #[test]
+    fn successful_tool_evidence_render_mentions_live_results() {
+        let rendered = SystemDirective::SuccessfulToolEvidenceMustBeUsed.render();
+        assert!(rendered.contains("successful live tool results"));
+        assert!(rendered.contains("answer with concrete findings now"));
     }
 
     #[test]

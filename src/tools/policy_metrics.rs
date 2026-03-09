@@ -20,13 +20,13 @@ impl Tool for PolicyMetricsTool {
     }
 
     fn description(&self) -> &str {
-        "Read runtime policy metrics (consultant routing outcomes, no-progress iterations, and failed-task token burn)"
+        "Read runtime policy metrics (response routing outcomes, no-progress iterations, and failed-task token burn)"
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "policy_metrics",
-            "description": "Read runtime policy/agent-loop metrics. Use this when the user asks about consultant usefulness, no-progress loops, policy routing behavior, or token cost of failed tasks.",
+            "description": "Read runtime policy/agent-loop metrics. Use this when the user asks about routing behavior, no-progress loops, or token cost of failed tasks.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -65,32 +65,32 @@ impl Tool for PolicyMetricsTool {
             .with_context(|| "policy_metrics arguments must be valid JSON")?;
         let metrics = crate::agent::policy_metrics_snapshot();
 
-        let consultant_total =
-            metrics.consultant_direct_return_total + metrics.consultant_fallthrough_total;
-        let consultant_direct_return_rate = if consultant_total > 0 {
-            metrics.consultant_direct_return_total as f64 / consultant_total as f64
+        let response_total =
+            metrics.response_direct_return_total + metrics.response_fallthrough_total;
+        let response_direct_return_rate = if response_total > 0 {
+            metrics.response_direct_return_total as f64 / response_total as f64
         } else {
             0.0
         };
-        let consultant_fallthrough_rate = if consultant_total > 0 {
-            metrics.consultant_fallthrough_total as f64 / consultant_total as f64
+        let response_fallthrough_rate = if response_total > 0 {
+            metrics.response_fallthrough_total as f64 / response_total as f64
         } else {
             0.0
         };
-        let route_reason_total = metrics.consultant_route_clarification_required_total
-            + metrics.consultant_route_tools_required_total
-            + metrics.consultant_route_short_correction_direct_reply_total
-            + metrics.consultant_route_acknowledgment_direct_reply_total
-            + metrics.consultant_route_default_continue_total;
+        let route_reason_total = metrics.orchestration_route_clarification_required_total
+            + metrics.orchestration_route_tools_required_total
+            + metrics.orchestration_route_short_correction_direct_reply_total
+            + metrics.orchestration_route_acknowledgment_direct_reply_total
+            + metrics.orchestration_route_default_continue_total;
         let route_reason_tools_required_rate = if route_reason_total > 0 {
-            metrics.consultant_route_tools_required_total as f64 / route_reason_total as f64
+            metrics.orchestration_route_tools_required_total as f64 / route_reason_total as f64
         } else {
             0.0
         };
         let route_reason_return_rate = if route_reason_total > 0 {
-            (metrics.consultant_route_clarification_required_total
-                + metrics.consultant_route_short_correction_direct_reply_total
-                + metrics.consultant_route_acknowledgment_direct_reply_total) as f64
+            (metrics.orchestration_route_clarification_required_total
+                + metrics.orchestration_route_short_correction_direct_reply_total
+                + metrics.orchestration_route_acknowledgment_direct_reply_total) as f64
                 / route_reason_total as f64
         } else {
             0.0
@@ -129,17 +129,17 @@ impl Tool for PolicyMetricsTool {
         {
             return Ok(format!(
                 "Policy metrics summary\n\
-                 - consultant_direct_return_total: {}\n\
-                 - consultant_fallthrough_total: {}\n\
-                 - consultant_direct_return_rate: {:.3}\n\
-                 - consultant_fallthrough_rate: {:.3}\n\
-                 - consultant_route_clarification_required_total: {}\n\
-                 - consultant_route_tools_required_total: {}\n\
-                 - consultant_route_short_correction_direct_reply_total: {}\n\
-                 - consultant_route_acknowledgment_direct_reply_total: {}\n\
-                 - consultant_route_default_continue_total: {}\n\
-                 - consultant_route_tools_required_rate: {:.3}\n\
-                 - consultant_route_return_rate: {:.3}\n\
+                 - response_direct_return_total: {}\n\
+                 - response_fallthrough_total: {}\n\
+                 - response_direct_return_rate: {:.3}\n\
+                 - response_fallthrough_rate: {:.3}\n\
+                 - orchestration_route_clarification_required_total: {}\n\
+                 - orchestration_route_tools_required_total: {}\n\
+                 - orchestration_route_short_correction_direct_reply_total: {}\n\
+                 - orchestration_route_acknowledgment_direct_reply_total: {}\n\
+                 - orchestration_route_default_continue_total: {}\n\
+                 - orchestration_route_tools_required_rate: {:.3}\n\
+                 - orchestration_route_return_rate: {:.3}\n\
                  - context_bleed_prevented_total: {}\n\
                  - context_mismatch_preflight_drop_total: {}\n\
                  - followup_mode_overrides_total: {}\n\
@@ -166,15 +166,15 @@ impl Tool for PolicyMetricsTool {
                  - deferred_no_tool_error_marker_total: {}\n\
                  - llm_payload_invalid_total: {}\n\
                  - llm_payload_invalid_breakdown_entries: {}",
-                metrics.consultant_direct_return_total,
-                metrics.consultant_fallthrough_total,
-                consultant_direct_return_rate,
-                consultant_fallthrough_rate,
-                metrics.consultant_route_clarification_required_total,
-                metrics.consultant_route_tools_required_total,
-                metrics.consultant_route_short_correction_direct_reply_total,
-                metrics.consultant_route_acknowledgment_direct_reply_total,
-                metrics.consultant_route_default_continue_total,
+                metrics.response_direct_return_total,
+                metrics.response_fallthrough_total,
+                response_direct_return_rate,
+                response_fallthrough_rate,
+                metrics.orchestration_route_clarification_required_total,
+                metrics.orchestration_route_tools_required_total,
+                metrics.orchestration_route_short_correction_direct_reply_total,
+                metrics.orchestration_route_acknowledgment_direct_reply_total,
+                metrics.orchestration_route_default_continue_total,
                 route_reason_tools_required_rate,
                 route_reason_return_rate,
                 metrics.context_bleed_prevented_total,
@@ -209,12 +209,12 @@ impl Tool for PolicyMetricsTool {
         let payload = json!({
             "metrics": metrics,
             "derived": {
-                "consultant_total": consultant_total,
-                "consultant_direct_return_rate": consultant_direct_return_rate,
-                "consultant_fallthrough_rate": consultant_fallthrough_rate,
-                "consultant_route_reason_total": route_reason_total,
-                "consultant_route_tools_required_rate": route_reason_tools_required_rate,
-                "consultant_route_return_rate": route_reason_return_rate,
+                "response_total": response_total,
+                "response_direct_return_rate": response_direct_return_rate,
+                "response_fallthrough_rate": response_fallthrough_rate,
+                "orchestration_route_reason_total": route_reason_total,
+                "orchestration_route_tools_required_rate": route_reason_tools_required_rate,
+                "orchestration_route_return_rate": route_reason_return_rate,
                 "route_drift_total": metrics.route_drift_alert_total,
                 "context_integrity_guard_events_total": metrics.context_bleed_prevented_total
                     + metrics.context_mismatch_preflight_drop_total
@@ -253,15 +253,15 @@ mod tests {
         assert!(parsed.get("derived").is_some());
         assert!(parsed
             .get("metrics")
-            .and_then(|m| m.get("consultant_direct_return_total"))
+            .and_then(|m| m.get("response_direct_return_total"))
             .is_some());
         assert!(parsed
             .get("metrics")
-            .and_then(|m| m.get("consultant_fallthrough_total"))
+            .and_then(|m| m.get("response_fallthrough_total"))
             .is_some());
         assert!(parsed
             .get("metrics")
-            .and_then(|m| m.get("consultant_route_tools_required_total"))
+            .and_then(|m| m.get("orchestration_route_tools_required_total"))
             .is_some());
         assert!(parsed
             .get("metrics")

@@ -10,11 +10,11 @@
 #[tokio::test]
 async fn test_task_boundary_injected_between_turns() {
     let provider = MockProvider::with_responses(vec![
-        // Turn 1: consultant pass → can answer now
+        // Turn 1: first routing call -> can answer now
         MockProvider::text_response(
             "[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false}",
         ),
-        // Turn 2: consultant pass → needs tools, then tool call, then answer
+        // Turn 2: first routing call -> needs tools, then tool call, then answer
         MockProvider::text_response(
             "[INTENT_GATE] {\"complexity\":\"simple\",\"can_answer_now\":false,\"needs_tools\":true}",
         ),
@@ -61,8 +61,23 @@ async fn test_task_boundary_injected_between_turns() {
         call_log.len()
     );
 
-    // Check all calls after Turn 1
-    let turn2_calls_ok = call_log.iter().skip(1).all(|call| {
+    let turn2_calls: Vec<_> = call_log
+        .iter()
+        .filter(|call| {
+            call.messages.iter().any(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && m.get("content")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|s| s.contains("Send me the resume in Spanish now."))
+            })
+        })
+        .collect();
+    assert!(
+        !turn2_calls.is_empty(),
+        "Expected at least one Turn 2 LLM call containing the current user request"
+    );
+
+    let turn2_calls_ok = turn2_calls.iter().all(|call| {
         let has_old_user = call.messages.iter().any(|m| {
             m.get("role").and_then(|r| r.as_str()) == Some("user")
                 && m.get("content")
@@ -88,7 +103,7 @@ async fn test_task_boundary_injected_between_turns() {
 
 #[tokio::test]
 async fn test_orchestrator_first_call_has_tools() {
-    // With default+fallback routing, the consultant text-only pre-pass is disabled.
+    // With default+fallback routing, the text-only pre-pass is disabled.
     // The first LLM call ALWAYS includes tools, even at depth=0 (orchestrator).
     // After the intent gate classifies the task, tools remain available for execution.
     let provider = MockProvider::with_responses(vec![
@@ -129,7 +144,7 @@ async fn test_orchestrator_first_call_has_tools() {
 async fn test_orchestrator_executes_tool_calls_in_first_iteration() {
     // With default+fallback routing, tools are always present. If the LLM
     // returns a tool call in iteration 1, it is executed (not dropped).
-    // Previously, the consultant pass had no tools and tool calls were
+    // Previously, the first routing pass had no tools and tool calls were
     // considered "hallucinated" and dropped. Now they are legitimate.
     use crate::traits::ToolCall;
 
@@ -354,17 +369,17 @@ async fn test_old_tool_intermediates_collapsed_in_follow_up() {
 /// messages (missing assistant in between) and bleeding context.
 #[tokio::test]
 async fn test_synthesized_done_persisted() {
-    // At depth=0 (orchestrator), iteration 1 is the consultant pass (no tools).
+    // At depth=0 (orchestrator), iteration 1 is the first routing call.
     // The mock tool_call_response triggers hallucinated-tool detection which
     // forces needs_tools=true → Simple intent → tools loaded → loop continues.
     let provider = MockProvider::with_responses(vec![
-        // Turn 1, iteration 1 (consultant pass): tool_call forces needs_tools=true
+        // Turn 1, iteration 1 (first routing call): tool_call forces needs_tools=true
         MockProvider::tool_call_response("system_info", "{}"),
         // Turn 1, iteration 2 (tools available): tool call is executed
         MockProvider::tool_call_response("system_info", "{}"),
         // Turn 1, iteration 3: empty response → "Done" synthesis at depth=0
         MockProvider::text_response(""),
-        // Turn 2, iteration 1 (consultant pass): classifier output
+        // Turn 2, iteration 1 (first routing call): classifier output
         MockProvider::text_response(
             "I can answer this from memory.\n[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false}",
         ),

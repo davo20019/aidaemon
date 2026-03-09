@@ -1,23 +1,22 @@
-use super::consultant_completion_phase::ConsultantCompletionCtx;
-use super::consultant_decision_phase::ConsultantDecisionCtx;
+use super::completion_phase::CompletionCtx;
 use super::*;
 use crate::execution_policy::PolicyBundle;
 use crate::traits::ProviderResponse;
 
-pub(super) enum ConsultantPhaseOutcome {
+pub(super) enum ResponsePhaseOutcome {
     ContinueLoop,
     Return(anyhow::Result<String>),
     ProceedToToolExecution,
 }
 
-pub(super) struct ConsultantPhaseCtx<'a> {
+#[allow(dead_code)]
+pub(super) struct ResponsePhaseCtx<'a> {
     pub resp: &'a mut ProviderResponse,
     pub emitter: &'a crate::events::EventEmitter,
     pub task_id: &'a str,
     pub session_id: &'a str,
     pub user_text: &'a str,
     pub iteration: usize,
-    pub consultant_pass_active: bool,
     pub task_start: Instant,
     pub task_tokens_used: u64,
     pub learning_ctx: &'a mut LearningContext,
@@ -57,48 +56,12 @@ pub(super) struct ConsultantPhaseCtx<'a> {
 }
 
 impl Agent {
-    pub(super) async fn run_consultant_phase(
+    pub(super) async fn run_response_phase(
         &self,
-        ctx: &mut ConsultantPhaseCtx<'_>,
-    ) -> anyhow::Result<ConsultantPhaseOutcome> {
-        let decision_outcome = self
-            .run_consultant_decision_phase(&mut ConsultantDecisionCtx {
-                resp: &mut *ctx.resp,
-                emitter: ctx.emitter,
-                task_id: ctx.task_id,
-                session_id: ctx.session_id,
-                user_text: ctx.user_text,
-                iteration: ctx.iteration,
-                consultant_pass_active: ctx.consultant_pass_active,
-                task_start: ctx.task_start,
-                task_tokens_used: ctx.task_tokens_used,
-                learning_ctx: &mut *ctx.learning_ctx,
-                pending_system_messages: &mut *ctx.pending_system_messages,
-                tool_defs: &mut *ctx.tool_defs,
-                base_tool_defs: &mut *ctx.base_tool_defs,
-                available_capabilities: &mut *ctx.available_capabilities,
-                policy_bundle: &mut *ctx.policy_bundle,
-                tools_allowed_for_user: ctx.tools_allowed_for_user,
-                restrict_to_personal_memory_tools: ctx.restrict_to_personal_memory_tools,
-                is_personal_memory_recall_turn: ctx.is_personal_memory_recall_turn,
-                is_reaffirmation_challenge_turn: ctx.is_reaffirmation_challenge_turn,
-                requests_external_verification: ctx.requests_external_verification,
-                llm_provider: ctx.llm_provider.clone(),
-                llm_router: ctx.llm_router.clone(),
-                model: &*ctx.model,
-                user_role: ctx.user_role,
-                channel_ctx: ctx.channel_ctx.clone(),
-                status_tx: ctx.status_tx.clone(),
-                turn_context: ctx.turn_context,
-                needs_tools_for_turn: &mut *ctx.needs_tools_for_turn,
-            })
-            .await?;
-        if let Some(outcome) = decision_outcome {
-            return Ok(outcome);
-        }
-
+        ctx: &mut ResponsePhaseCtx<'_>,
+    ) -> anyhow::Result<ResponsePhaseOutcome> {
         let completion_outcome = self
-            .run_consultant_completion_phase(&mut ConsultantCompletionCtx {
+            .run_completion_phase(&mut CompletionCtx {
                 resp: &mut *ctx.resp,
                 emitter: ctx.emitter,
                 task_id: ctx.task_id,
@@ -140,6 +103,6 @@ impl Agent {
             return Ok(outcome);
         }
 
-        Ok(ConsultantPhaseOutcome::ProceedToToolExecution)
+        Ok(ResponsePhaseOutcome::ProceedToToolExecution)
     }
 }

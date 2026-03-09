@@ -1,4 +1,5 @@
 use super::*;
+use crate::llm_markers::INTENT_GATE_MARKER;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -396,6 +397,96 @@ fn text_contains_any_phrase(text: &str, phrases: &[&str]) -> bool {
         .any(|phrase| contains_keyword_as_words(text, phrase))
 }
 
+fn text_has_explicit_project_scope_cues(lower_text: &str) -> bool {
+    text_contains_any_phrase(
+        lower_text,
+        &[
+            "project",
+            "repo",
+            "repository",
+            "workspace",
+            "directory",
+            "folder",
+            "codebase",
+            "code base",
+            "work in",
+            "inside",
+            "under",
+        ],
+    )
+}
+
+fn should_allow_verification_nickname_scope(text: &str, token: &str) -> bool {
+    if token.contains('.')
+        || token.contains('-')
+        || token.contains('_')
+        || token.chars().any(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+
+    let lower = text.trim().to_ascii_lowercase();
+    super::user_text_references_filesystem_path(text)
+        || text_has_explicit_project_scope_cues(&lower)
+}
+
+fn extract_verification_project_scopes(
+    text: &str,
+    scopes: &mut Vec<String>,
+    max_scopes: usize,
+    alias_roots: &[String],
+) {
+    for raw in text.split_whitespace() {
+        if scopes.len() >= max_scopes {
+            break;
+        }
+        let token = raw
+            .trim_matches(|c: char| {
+                c.is_ascii_whitespace()
+                    || matches!(
+                        c,
+                        '`' | '\''
+                            | '"'
+                            | ','
+                            | ';'
+                            | ':'
+                            | '.'
+                            | '!'
+                            | '?'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                    )
+            })
+            .trim();
+        if token.is_empty() || token.contains("://") {
+            continue;
+        }
+
+        let scope = if token_looks_like_filesystem_path(token) {
+            normalize_project_scope_path_with_aliases(token, alias_roots)
+        } else {
+            crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
+                .map(|path| path.to_string_lossy().to_string())
+                .or_else(|| {
+                    should_allow_verification_nickname_scope(text, token)
+                        .then(|| {
+                            crate::tools::fs_utils::resolve_contextual_project_nickname_in_explicit_roots(token, alias_roots)
+                        })
+                        .flatten()
+                        .map(|path| path.to_string_lossy().to_string())
+                })
+        };
+
+        if let Some(scope) = scope {
+            push_project_scope(scopes, scope, max_scopes);
+        }
+    }
+}
+
 fn extract_verification_targets(text: &str, alias_roots: &[String]) -> Vec<VerificationTarget> {
     let mut targets = Vec::new();
 
@@ -420,7 +511,7 @@ fn extract_verification_targets(text: &str, alias_roots: &[String]) -> Vec<Verif
     }
 
     let mut scopes = Vec::new();
-    extract_project_scopes_from_text(text, &mut scopes, 4, alias_roots);
+    extract_verification_project_scopes(text, &mut scopes, 4, alias_roots);
     for scope in scopes {
         if targets.iter().any(|existing| existing.value == scope) {
             continue;
@@ -2220,6 +2311,65 @@ mod tests {
             scopes.iter().any(|s| s.contains("tmp")),
             "Real path /tmp should be extracted, got: {:?}",
             scopes
+        );
+    }
+
+    #[test]
+    fn verification_targets_do_not_resolve_plain_word_nicknames_without_local_scope_cues() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects-root");
+        let project = alias_root.join("fairfax-va-site");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        let targets = extract_verification_targets(
+            "Find recruiting studies in Fairfax, Virginia and summarize them.",
+            &alias_roots,
+        );
+
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.kind != VerificationTargetKind::ProjectScope),
+            "plain-word nickname should not resolve without local scope cues: {:?}",
+            targets
+        );
+    }
+
+    #[test]
+    fn verification_targets_allow_plain_word_nicknames_with_explicit_project_scope_cues() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects-root");
+        let project = alias_root.join("fairfax-va-site");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        assert!(should_allow_verification_nickname_scope(
+            "Check the Fairfax project for broken links.",
+            "Fairfax"
+        ));
+        assert_eq!(
+            crate::tools::fs_utils::resolve_contextual_project_nickname_in_explicit_roots(
+                "Fairfax",
+                &alias_roots
+            ),
+            Some(project.clone())
+        );
+
+        let targets = extract_verification_targets(
+            "Check the Fairfax project for broken links.",
+            &alias_roots,
+        );
+
+        assert!(
+            targets.iter().any(|target| {
+                target.kind == VerificationTargetKind::ProjectScope
+                    && target.value == project.to_string_lossy()
+            }),
+            "explicit local scope cue should still allow nickname resolution: {:?}",
+            targets
         );
     }
 }

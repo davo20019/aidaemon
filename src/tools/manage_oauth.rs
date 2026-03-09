@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use crate::config::{AppConfig, OAuthProviderConfig};
 use crate::oauth::{OAuthGateway, OAuthType};
-use crate::traits::{StateStore, Tool, ToolCapabilities};
+use crate::traits::{StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCapabilities};
 use crate::types::{ApprovalResponse, StatusUpdate};
 
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
@@ -109,6 +109,24 @@ impl ManageOAuthTool {
             .map(|scope| scope.trim().to_string())
             .filter(|scope| !scope.is_empty())
             .collect()
+    }
+
+    fn pending_state_from_authorize_url(authorize_url: &str) -> Option<String> {
+        let parsed = reqwest::Url::parse(authorize_url).ok()?;
+        parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+    }
+
+    async fn send_connect_progress(status_tx: Option<&mpsc::Sender<StatusUpdate>>, chunk: String) {
+        if let Some(tx) = status_tx {
+            let _ = tx
+                .send(StatusUpdate::ToolProgress {
+                    name: "manage_oauth".to_string(),
+                    chunk,
+                })
+                .await;
+        }
     }
 
     fn validate_auth_type(raw: Option<&str>) -> anyhow::Result<String> {
@@ -457,27 +475,20 @@ impl ManageOAuthTool {
 
         let (authorize_url, result_rx) =
             self.gateway.start_oauth2_flow(service, session_id).await?;
+        let pending_state = Self::pending_state_from_authorize_url(&authorize_url);
         let callback_warning = Self::callback_access_warning(&self.gateway.callback_url());
         let reconnect_note = has_existing_connection
             .then(|| Self::reconnect_preserves_existing_connection_note(service));
 
-        if let Some(ref tx) = status_tx {
-            let mut parts = Vec::new();
-            if let Some(note) = &reconnect_note {
-                parts.push(note.clone());
-            }
-            if let Some(warning) = &callback_warning {
-                parts.push(format!("Note: {}", warning));
-            }
-            parts.push(format!("Click this link to authorize:\n{}", authorize_url));
-            let msg = parts.join("\n\n");
-            let _ = tx
-                .send(StatusUpdate::ToolProgress {
-                    name: "manage_oauth".to_string(),
-                    chunk: msg,
-                })
-                .await;
+        let mut authorize_parts = Vec::new();
+        if let Some(note) = &reconnect_note {
+            authorize_parts.push(note.clone());
         }
+        if let Some(warning) = &callback_warning {
+            authorize_parts.push(format!("Note: {}", warning));
+        }
+        authorize_parts.push(format!("Click this link to authorize:\n{}", authorize_url));
+        Self::send_connect_progress(status_tx.as_ref(), authorize_parts.join("\n\n")).await;
 
         let compose_result = |body: String| {
             let mut parts = Vec::new();
@@ -492,12 +503,51 @@ impl ManageOAuthTool {
         };
 
         match tokio::time::timeout(OAuthGateway::flow_timeout(), result_rx).await {
-            Ok(Ok(result)) => Ok(compose_result(result.message)),
-            Ok(Err(_)) => Ok(compose_result("OAuth flow was cancelled.".to_string())),
+            Ok(Ok(result)) => {
+                Self::send_connect_progress(
+                    status_tx.as_ref(),
+                    format!(
+                        "Browser authorization completed. Returning to chat.\n{}",
+                        result.message
+                    ),
+                )
+                .await;
+                Ok(compose_result(result.message))
+            }
+            Ok(Err(_)) => {
+                Self::send_connect_progress(
+                    status_tx.as_ref(),
+                    "OAuth browser authorization was cancelled.".to_string(),
+                )
+                .await;
+                Ok(compose_result("OAuth flow was cancelled.".to_string()))
+            }
             Err(_) => {
                 warn!(service = %service, "OAuth flow timed out");
+                if let Some(state) = pending_state.as_deref() {
+                    if let Err(err) = self
+                        .gateway
+                        .expire_pending_flow(
+                            state,
+                            Some(OAuthGateway::expired_flow_message().to_string()),
+                        )
+                        .await
+                    {
+                        warn!(
+                            service = %service,
+                            state = %state,
+                            error = %err,
+                            "Failed to expire timed out OAuth flow"
+                        );
+                    }
+                }
+                Self::send_connect_progress(
+                    status_tx.as_ref(),
+                    OAuthGateway::expired_flow_message().to_string(),
+                )
+                .await;
                 Ok(compose_result(
-                    "OAuth flow timed out (10 minutes). Please try again.".to_string(),
+                    OAuthGateway::expired_flow_message().to_string(),
                 ))
             }
         }
@@ -981,16 +1031,39 @@ impl Tool for ManageOAuthTool {
             )),
         }
     }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let args: ManageOAuthArgs = serde_json::from_str(arguments)?;
+        let output = self.call_with_status(arguments, status_tx).await?;
+        let mut outcome = ToolCallOutcome::from_output(output.clone());
+        if args.action == "connect" {
+            outcome.metadata = ToolCallMetadata {
+                direct_response: Some(output),
+                ..ToolCallMetadata::default()
+            };
+        }
+        Ok(outcome)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use axum::{extract::Form, routing::post, Json, Router};
     use once_cell::sync::Lazy;
     use tempfile::NamedTempFile;
+    use tokio::net::TcpListener;
 
     use crate::memory::embeddings::EmbeddingService;
-    use crate::oauth::SharedHttpProfiles;
+    use crate::oauth::{OAuthProvider, SharedHttpProfiles};
     use crate::state::SqliteStateStore;
 
     static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
@@ -1208,6 +1281,122 @@ allowed_domains = ["api.linear.app"]
 
         assert!(result.contains("callback_url: http://localhost:8080/oauth/callback"));
         assert!(result.contains("same machine running aidaemon"));
+    }
+
+    #[tokio::test]
+    async fn connect_reports_browser_completion_via_status_updates() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        async fn token_handler(
+            Form(form): Form<HashMap<String, String>>,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(
+                form.get("grant_type").map(String::as_str),
+                Some("authorization_code")
+            );
+            Json(serde_json::json!({
+                "access_token": "connected-token",
+                "refresh_token": "refresh-token",
+                "expires_in": 3600
+            }))
+        }
+
+        let app = Router::new().route("/oauth/token", post(token_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let config_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        let (tool, gateway) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        gateway
+            .register_provider(OAuthProvider {
+                name: "linear".to_string(),
+                display_name: "Linear".to_string(),
+                auth_type: OAuthType::OAuth2AuthorizationCode,
+                authorize_url: "https://linear.app/oauth/authorize".to_string(),
+                token_url: format!("http://{addr}/oauth/token"),
+                scopes: vec!["read".to_string()],
+                allowed_domains: vec!["api.linear.app".to_string()],
+            })
+            .await;
+
+        let env_file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            env_file.path(),
+            "OAUTH_LINEAR_CLIENT_ID=abc\nOAUTH_LINEAR_CLIENT_SECRET=def\n",
+        )
+        .unwrap();
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var(
+            crate::RUNTIME_ENV_FILE_ENV_KEY,
+            env_file.path().to_string_lossy().to_string(),
+        );
+
+        let (status_tx, mut status_rx) = mpsc::channel::<StatusUpdate>(8);
+        let tool = Arc::new(tool);
+        let tool_task = {
+            let tool = tool.clone();
+            tokio::spawn(async move {
+                tool.call_with_status_outcome(
+                    r#"{"action":"connect","service":"linear","_session_id":"telegram:123"}"#,
+                    Some(status_tx),
+                )
+                .await
+            })
+        };
+
+        let first_update = tokio::time::timeout(Duration::from_secs(2), status_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let authorize_chunk = match first_update {
+            StatusUpdate::ToolProgress { chunk, .. } => chunk,
+            other => panic!("unexpected first status update: {other:?}"),
+        };
+        assert!(authorize_chunk.contains("Click this link to authorize:"));
+        let authorize_url = authorize_chunk
+            .lines()
+            .find(|line| line.starts_with("https://"))
+            .unwrap()
+            .trim();
+        let state = reqwest::Url::parse(authorize_url)
+            .unwrap()
+            .query_pairs()
+            .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+            .unwrap();
+
+        let callback_result = gateway
+            .handle_callback(&state, Some("auth-code"), None)
+            .await
+            .unwrap();
+        assert!(callback_result.contains("Connected to Linear"));
+
+        let second_update = tokio::time::timeout(Duration::from_secs(2), status_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let completion_chunk = match second_update {
+            StatusUpdate::ToolProgress { chunk, .. } => chunk,
+            other => panic!("unexpected completion status update: {other:?}"),
+        };
+        assert!(completion_chunk.contains("Browser authorization completed"));
+        assert!(completion_chunk.contains("Connected to Linear"));
+
+        let tool_outcome = tool_task.await.unwrap().unwrap();
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
+
+        assert!(tool_outcome.output.contains("Connected to Linear"));
+        assert_eq!(
+            tool_outcome.metadata.direct_response,
+            Some(tool_outcome.output)
+        );
     }
 
     #[tokio::test]

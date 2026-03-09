@@ -1,7 +1,8 @@
-use super::consultant_phase::ConsultantPhaseOutcome;
 use super::recall_guardrails::filter_tool_defs_for_personal_memory;
+use super::response_phase::ResponsePhaseOutcome;
 use super::*;
 use crate::execution_policy::PolicyBundle;
+use crate::llm_markers::INTENT_GATE_MARKER;
 use crate::traits::ProviderResponse;
 
 fn build_tool_output_completion_reply(tool_output: &str) -> Option<String> {
@@ -50,12 +51,25 @@ fn looks_like_directory_listing(lower: &str) -> bool {
 }
 
 fn build_activity_summary_reply(tool_calls: &[&str]) -> String {
-    let mut summary = String::from("I completed the following actions:\n");
-    for (i, call) in tool_calls.iter().enumerate() {
-        summary.push_str(&format!("{}. {}\n", i + 1, call));
+    let calls: Vec<String> = tool_calls.iter().map(|call| (*call).to_string()).collect();
+    let summary = post_task::categorize_tool_calls(&calls);
+    if !summary.trim().is_empty() {
+        return summary.trim().to_string();
     }
-    summary.push_str("\nLet me know if you need anything else.");
-    summary
+
+    let external_only = tool_calls
+        .iter()
+        .any(|call| call.starts_with("http_request(") || call.starts_with("web_fetch("));
+    if external_only {
+        "I checked the requested external sources, but I still need a final confirmation before I can claim success."
+            .to_string()
+    } else {
+        format!(
+            "I completed {} action{}.",
+            tool_calls.len(),
+            if tool_calls.len() == 1 { "" } else { "s" }
+        )
+    }
 }
 
 fn build_verification_pending_reply(
@@ -124,7 +138,7 @@ fn completion_verification_still_required(
         && has_concrete_verification_reason
 }
 
-pub(super) struct ConsultantCompletionCtx<'a> {
+pub(super) struct CompletionCtx<'a> {
     pub resp: &'a mut ProviderResponse,
     pub emitter: &'a crate::events::EventEmitter,
     pub task_id: &'a str,
@@ -163,10 +177,10 @@ pub(super) struct ConsultantCompletionCtx<'a> {
 }
 
 impl Agent {
-    pub(super) async fn run_consultant_completion_phase(
+    pub(super) async fn run_completion_phase(
         &self,
-        ctx: &mut ConsultantCompletionCtx<'_>,
-    ) -> anyhow::Result<Option<ConsultantPhaseOutcome>> {
+        ctx: &mut CompletionCtx<'_>,
+    ) -> anyhow::Result<Option<ResponsePhaseOutcome>> {
         let resp = &mut *ctx.resp;
         let emitter = ctx.emitter;
         let task_id = ctx.task_id;
@@ -380,7 +394,7 @@ impl Agent {
                             "Blocked no-tool completion because current turn requires tools"
                         );
                         commit_state!();
-                        return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
+                        return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                     }
                 }
             }
@@ -444,8 +458,57 @@ impl Agent {
                     }
 
                     commit_state!();
-                    return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
+                    return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                 }
+            }
+
+            let has_tool_attempts = !learning_ctx.tool_calls.is_empty();
+            let false_capability_denial =
+                looks_like_false_capability_denial_after_tool_success(&reply);
+
+            if false_capability_denial {
+                if !force_text_response && !tool_defs.is_empty() && stall_count == 0 {
+                    stall_count = stall_count.saturating_add(1);
+                    consecutive_clean_iterations = 0;
+                    pending_system_messages.push(SystemDirective::SuccessfulToolEvidenceMustBeUsed);
+                    warn!(
+                        session_id,
+                        iteration,
+                        reply_preview = %reply.chars().take(180).collect::<String>(),
+                        "Rejected completion that denied live capabilities after successful tool use"
+                    );
+                    commit_state!();
+                    return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+                }
+
+                let mut recovered = false;
+                if let Some((tool_name, tool_output)) =
+                    self.latest_non_system_tool_result(session_id, 2500).await
+                {
+                    if tool_name == "send_file" {
+                        reply = Self::send_file_completion_reply().to_string();
+                        recovered = true;
+                    } else if let Some(tool_reply) =
+                        build_tool_output_completion_reply(&tool_output)
+                    {
+                        reply = tool_reply;
+                        recovered = true;
+                    }
+                }
+                if !recovered && !learning_ctx.tool_calls.is_empty() {
+                    let actions: Vec<&str> = learning_ctx
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.as_str())
+                        .collect();
+                    reply = build_activity_summary_reply(&actions);
+                }
+                info!(
+                    session_id,
+                    iteration,
+                    recovered,
+                    "Recovered false capability-denial completion after successful tools"
+                );
             }
 
             let low_signal_completion = is_low_signal_task_lead_reply(&reply);
@@ -604,7 +667,7 @@ impl Agent {
                         );
 
                         commit_state!();
-                        return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
+                        return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                     }
 
                     let response_note = if empty_response_retry_pending {
@@ -656,12 +719,12 @@ impl Agent {
                     .await;
 
                     commit_state!();
-                    return Ok(Some(ConsultantPhaseOutcome::Return(Ok(fallback))));
+                    return Ok(Some(ResponsePhaseOutcome::Return(Ok(fallback))));
                 }
                 // First iteration or sub-agent — stay silent
                 info!(session_id, iteration, "Agent completed with empty response");
                 commit_state!();
-                return Ok(Some(ConsultantPhaseOutcome::Return(Ok(String::new()))));
+                return Ok(Some(ResponsePhaseOutcome::Return(Ok(String::new()))));
             }
 
             if require_file_recheck_before_answer {
@@ -688,7 +751,7 @@ impl Agent {
                         "Blocking completion until required file re-check is performed"
                     );
                     commit_state!();
-                    return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
+                    return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                 }
             }
 
@@ -718,7 +781,7 @@ impl Agent {
                         "Blocking completion until request outcome verification is performed"
                     );
                     commit_state!();
-                    return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
+                    return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                 }
             }
 
@@ -745,17 +808,17 @@ impl Agent {
             };
             let reply_is_substantive =
                 !has_structural_markers && is_substantive_text_response(&reply, 200);
-            if self.depth == 0
-                && !used_identity_prefill
-                && looks_like_deferred_action_response(&reply)
-                && !reply_is_substantive
+            let incomplete_live_work_summary = looks_like_incomplete_live_work_summary(&reply);
+            if !used_identity_prefill
+                && (looks_like_deferred_action_response(&reply) || incomplete_live_work_summary)
+                && (!reply_is_substantive || incomplete_live_work_summary)
             {
                 // Post-tool-success: if we've already caught one deferral after tools
                 // succeeded, accept this reply instead of stalling further.
                 // Exception: when force_text is active (tools stripped), a deferred
                 // reply like "Let me examine..." is useless — the model can't act.
                 // Replace it with an activity summary of what was actually done.
-                if total_successful_tool_calls > 0 && stall_count >= 1 {
+                if has_tool_attempts && stall_count >= 1 {
                     if force_text_response && !learning_ctx.tool_calls.is_empty() {
                         let actions: Vec<&str> =
                             learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
@@ -785,7 +848,7 @@ impl Agent {
                     );
                     reply = "I wasn't able to complete that request because no execution tools are available in this context. Please try again in a context with tool access."
                     .to_string();
-                } else if total_successful_tool_calls == 0
+                } else if !has_tool_attempts
                     && deferred_no_tool_streak >= DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
                     && is_substantive_text_response(&reply, 50)
                 {
@@ -806,7 +869,7 @@ impl Agent {
                     // Pre-execution deferrals ("I'll do X") should not consume the
                     // main stall budget. Reserve stall_count for post-tool loops so
                     // we don't fail as "stuck" before any tool ever executes.
-                    if total_successful_tool_calls == 0 {
+                    if !has_tool_attempts {
                         deferred_no_tool_streak = deferred_no_tool_streak.saturating_add(1);
                         POLICY_METRICS
                             .deferred_no_tool_deferral_detected_total
@@ -822,11 +885,14 @@ impl Agent {
                         stall_count,
                         deferred_no_tool_streak,
                         total_successful_tool_calls,
+                        has_tool_attempts,
                         "Deferred-action reply without concrete results; continuing loop"
                     );
 
-                    let deferred_nudge = if total_successful_tool_calls == 0 {
+                    let deferred_nudge = if !has_tool_attempts {
                         SystemDirective::DeferredToolCallRequired
+                    } else if incomplete_live_work_summary {
+                        SystemDirective::LiveWorkPivotRequired
                     } else {
                         SystemDirective::DeferredProvideConcreteResults
                     };
@@ -835,7 +901,7 @@ impl Agent {
 
                     // Fallback expansion: widen tool set once after exactly two
                     // no-progress iterations, even in no-tool-call paths.
-                    let fallback_trigger = if total_successful_tool_calls == 0 {
+                    let fallback_trigger = if !has_tool_attempts {
                         deferred_no_tool_streak == 2
                     } else {
                         stall_count == 2
@@ -870,7 +936,7 @@ impl Agent {
                         }
                     }
 
-                    if total_successful_tool_calls == 0
+                    if !has_tool_attempts
                         && deferred_no_tool_streak >= DEFERRED_NO_TOOL_SWITCH_THRESHOLD
                         && deferred_no_tool_model_switches < MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES
                     {
@@ -896,7 +962,7 @@ impl Agent {
                         }
                     }
 
-                    if total_successful_tool_calls == 0
+                    if !has_tool_attempts
                         && deferred_no_tool_streak >= MAX_STALL_ITERATIONS
                         && !learning_ctx
                             .errors
@@ -918,7 +984,7 @@ impl Agent {
                     }
 
                     commit_state!();
-                    return Ok(Some(ConsultantPhaseOutcome::ContinueLoop));
+                    return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                 }
             }
 
@@ -997,7 +1063,8 @@ impl Agent {
                 }
             }
 
-            // Sanitize output for public channels
+            // Sanitize user-facing output before any channel-specific redaction.
+            let reply = crate::tools::sanitize::sanitize_user_facing_reply(&reply);
             let reply = match channel_ctx.visibility {
                 ChannelVisibility::Public | ChannelVisibility::PublicExternal => {
                     let (sanitized, had_redactions) =
@@ -1036,7 +1103,7 @@ impl Agent {
                 "Agent completed naturally"
             );
             commit_state!();
-            return Ok(Some(ConsultantPhaseOutcome::Return(Ok(reply))));
+            return Ok(Some(ResponsePhaseOutcome::Return(Ok(reply))));
         }
 
         commit_state!();
@@ -1094,10 +1161,10 @@ mod tests {
     fn activity_summary_lists_tool_calls() {
         let calls = vec!["terminal(mkdir -p /tmp/foo)", "write_file(/tmp/foo/bar.py)"];
         let reply = build_activity_summary_reply(&calls);
-        assert!(reply.contains("terminal(mkdir"));
-        assert!(reply.contains("write_file("));
-        assert!(reply.contains("1."));
-        assert!(reply.contains("2."));
+        assert!(reply.contains("Commands run:"));
+        assert!(reply.contains("Files written:"));
+        assert!(!reply.contains("terminal("));
+        assert!(!reply.contains("write_file("));
     }
 
     #[test]
@@ -1130,7 +1197,8 @@ mod tests {
         let reply = build_verification_pending_reply(&turn_context, &learning_ctx);
         assert!(reply.contains("haven't verified"));
         assert!(reply.contains("https://blog.aidaemon.ai"));
-        assert!(reply.contains("terminal(vite build)"));
+        assert!(reply.contains("Commands run:"));
+        assert!(!reply.contains("terminal(vite build)"));
     }
 
     #[test]

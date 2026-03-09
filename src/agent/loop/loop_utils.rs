@@ -30,7 +30,7 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 }
 
 static HTTP_STATUS_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?i)\bhttp/\d(?:\.\d+)?\s+([1-5][0-9]{2})\b|\bstatus\s+code\s+([1-5][0-9]{2})\b|\bstatus\s*[:=]\s*([1-5][0-9]{2})\b|"(?:status|status_code|statusCode|http_status|httpStatus)"\s*:\s*"?([1-5][0-9]{2})"?|\battempt\s+\d+\s*[:=-]\s*([1-5][0-9]{2})\b|\b(?:http\s*)?code\s*[:=]\s*([1-5][0-9]{2})\b"#)
+    Regex::new(r#"(?i)\bhttp/\d(?:\.\d+)?\s+([1-5][0-9]{2})\b|\bhttp\s+([1-5][0-9]{2})\b|\bstatus\s+code\s+([1-5][0-9]{2})\b|\bstatus\s*[:=]\s*([1-5][0-9]{2})\b|"(?:status|status_code|statusCode|http_status|httpStatus)"\s*:\s*"?([1-5][0-9]{2})"?|\battempt\s+\d+\s*[:=-]\s*([1-5][0-9]{2})\b|\b(?:http\s*)?code\s*[:=]\s*([1-5][0-9]{2})\b"#)
         .expect("http status regex must compile")
 });
 
@@ -349,6 +349,23 @@ fn is_data_content_tool(tool_name: &str) -> bool {
     )
 }
 
+fn manage_memories_list_output_is_report(result_text: &str, tool_arguments: Option<&str>) -> bool {
+    let action = tool_arguments
+        .and_then(|args| serde_json::from_str::<Value>(args).ok())
+        .and_then(|args| {
+            args.get("action")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    if action.as_deref() != Some("list") {
+        return false;
+    }
+
+    let cleaned = strip_appended_diagnostics(result_text);
+    let trimmed = cleaned.trim_start();
+    trimmed.starts_with("**Stored Memories**") || trimmed == "No memories stored."
+}
+
 pub(super) fn classify_tool_result_failure(
     tool_name: &str,
     result_text: &str,
@@ -436,6 +453,12 @@ pub(super) fn classify_tool_result_failure_with_args(
     result_text: &str,
     tool_arguments: Option<&str>,
 ) -> Option<ToolFailureClass> {
+    if tool_name == "manage_memories"
+        && manage_memories_list_output_is_report(result_text, tool_arguments)
+    {
+        return None;
+    }
+
     let classified = classify_tool_result_failure(tool_name, result_text);
     if classified.is_some() {
         return classified;
@@ -738,7 +761,7 @@ mod tool_error_detection_tests {
     fn policy_metrics_output_not_classified_as_error() {
         // policy_metrics returns JSON with field names like "tokens_failed_tasks_total"
         // and "llm_payload_invalid_total" — these should NOT be classified as errors.
-        let result = r#"{"metrics":{"tokens_failed_tasks_total":0,"llm_payload_invalid_total":0,"no_progress_iterations_total":0},"derived":{"consultant_total":5}}"#;
+        let result = r#"{"metrics":{"tokens_failed_tasks_total":0,"llm_payload_invalid_total":0,"no_progress_iterations_total":0},"derived":{"response_total":5}}"#;
         let classified = classify_tool_result_failure("policy_metrics", result);
         assert_eq!(
             classified, None,
@@ -750,6 +773,12 @@ mod tool_error_detection_tests {
     fn detects_http_status_failures() {
         let semantic = classify_tool_result_failure("http_request", "Status: 404 Not Found");
         assert_eq!(semantic, Some(ToolFailureClass::Semantic));
+
+        let semantic_plain = classify_tool_result_failure(
+            "web_fetch",
+            "Error fetching https://example.com: HTTP 400 Bad Request",
+        );
+        assert_eq!(semantic_plain, Some(ToolFailureClass::Semantic));
 
         let transient =
             classify_tool_result_failure("http_request", "HTTP/1.1 503 Service Unavailable");
@@ -789,6 +818,15 @@ mod tool_error_detection_tests {
         let classified =
             classify_tool_result_failure_with_args("terminal", "(no output)", Some(args));
         assert_eq!(classified, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn manage_memories_list_output_is_not_classified_as_error() {
+        let args = r#"{"action":"list"}"#;
+        let result = "**Stored Memories** (showing 2 of 2 facts)\n\n- **api_auth_resolution**: Uses manage_oauth to resolve HTTP 401 Unauthorized errors";
+        let classified =
+            classify_tool_result_failure_with_args("manage_memories", result, Some(args));
+        assert_eq!(classified, None);
     }
 
     #[test]

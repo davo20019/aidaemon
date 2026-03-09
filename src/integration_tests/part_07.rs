@@ -2,8 +2,8 @@
 
 #[tokio::test]
 async fn test_orchestration_uniform_models_no_routing() {
-    // With uniform models (no router), consultant pass doesn't activate,
-    // so orchestration routing doesn't happen — simple messages get direct responses.
+    // With uniform models (no router), first-pass orchestration does not
+    // activate, so simple messages get direct responses.
     let provider = MockProvider::new(); // Returns "Mock response"
     let harness = setup_test_agent(provider).await.unwrap();
 
@@ -22,17 +22,17 @@ async fn test_orchestration_uniform_models_no_routing() {
 
     assert_eq!(response, "Mock response");
 
-    // No goals — uniform models bypass consultant pass / routing
+    // No goals — uniform models bypass orchestration routing
     let goals = harness.state.get_active_goals().await.unwrap();
     assert!(goals.is_empty(), "No goals with uniform models");
 }
 
 #[tokio::test]
 async fn test_orchestration_simple_falls_through_to_full_loop() {
-    // Orchestration enabled, non-uniform models → consultant pass activates → routing
-    // Consultant says "needs tools" (not can_answer_now), simple task → full agent loop
+    // Orchestration enabled, non-uniform models -> first routing pass activates.
+    // Routing says "needs tools" (not can_answer_now), simple task -> full agent loop
     let provider = MockProvider::with_responses(vec![
-        // 1st call: consultant pass — analysis that triggers needs_tools
+        // 1st call: first routing pass -> analysis that triggers needs_tools
         MockProvider::text_response(
             "I'll help you check the system info.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
         ),
@@ -69,7 +69,7 @@ async fn test_orchestration_complex_creates_goal() {
     // Deterministic pre-routing classifies the request as complex based on
     // keyword heuristics (action markers + compound keywords), creates a goal,
     // and spawns a task lead synchronously (no self_ref in tests).
-    // No consultant LLM call — routing is purely deterministic.
+    // No orchestration LLM call — routing is purely deterministic.
     let provider = MockProvider::with_responses(vec![
         // Task lead's LLM call — deterministic routing creates the goal
         // without an LLM call, then the task lead runs the agent loop.
@@ -153,9 +153,9 @@ async fn test_orchestration_complex_internal_maintenance_does_not_create_goal() 
 #[tokio::test]
 async fn test_orchestration_simple_stall_detection_in_full_loop() {
     // Simple tasks now go through full agent loop which has its own stall detection.
-    // After the consultant pass, repeated identical tool calls should be detected.
+    // After the first routing pass, repeated identical tool calls should be detected.
     let provider = MockProvider::with_responses(vec![
-        // 1st call: consultant pass
+        // 1st call: first routing pass
         MockProvider::text_response(
             "I'll run a command for you.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
         ),
@@ -197,7 +197,7 @@ async fn test_orchestration_simple_uses_full_loop_with_all_tools() {
     // Simple tasks now use the full agent loop with all tools available.
     // Verify the agent can complete a simple task through the full loop.
     let provider = MockProvider::with_responses(vec![
-        // 1st call: consultant pass
+        // 1st call: first routing pass
         MockProvider::text_response(
             "I'll help with that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
         ),
@@ -294,7 +294,7 @@ async fn test_personal_recall_challenge_scopes_tools_and_reaffirms() {
 
 #[tokio::test]
 async fn test_personal_recall_challenge_inherits_previous_turn_context() {
-    // With deterministic routing (no consultant LLM pass), each turn makes a
+    // With deterministic routing (no orchestration LLM pass), each turn makes a
     // single LLM call through the normal agent loop. The deterministic routing
     // classifies both messages as Simple (no action markers, no schedule) and
     // falls through to the execution loop.
@@ -341,7 +341,7 @@ async fn test_personal_recall_challenge_inherits_previous_turn_context() {
         "Expected no-information reaffirmation or tools-unavailable message, got: {}",
         second
     );
-    // No consultant pass: 1 LLM call per turn x 2 turns = 2
+    // No text-only pre-pass: 1 LLM call per turn x 2 turns = 2
     assert!(
         harness.provider.call_count().await <= 3,
         "Follow-up challenge should stay bounded and not spiral"

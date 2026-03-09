@@ -60,6 +60,68 @@ async fn test_tool_result_compressed() {
     assert!(compressed.contains("5000"));
 }
 
+/// If a live tool succeeds but the model still falls back to "I can't do a
+/// live search", the completion phase should reject that reply and force one
+/// more synthesis pass using the actual tool result.
+#[tokio::test]
+async fn test_retries_when_reply_denies_live_access_after_successful_tool_use() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"method":"GET","url":"https://clinicaltrials.gov/api/v2/studies"}"#,
+        ),
+        MockProvider::text_response(
+            "I can guide you on how to find skin cancer clinical trials, but I cannot perform a live search of current databases.",
+        ),
+        MockProvider::text_response(
+            "I checked the live ClinicalTrials.gov results. The first matching study in Fairfax, Virginia is Example Skin Trial.",
+        ),
+    ]);
+
+    let http_tool: Arc<dyn crate::traits::Tool> = Arc::new(MockTool::new(
+        "http_request",
+        "Make HTTP requests",
+        "HTTP 200 OK\ncontent-type: application/json\n\n{\"studies\":[{\"briefTitle\":\"Example Skin Trial\",\"city\":\"Fairfax\",\"state\":\"Virginia\"}]}",
+    ));
+    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![http_tool],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "http_retry_session",
+            "Search for clinical trials for skin cancer near Fairfax Virginia for a man.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("Example Skin Trial"),
+        "final response was: {}",
+        response
+    );
+    assert!(
+        !response
+            .to_ascii_lowercase()
+            .contains("cannot perform a live search"),
+        "Final response should use live results instead of capability denial: {}",
+        response
+    );
+    assert!(
+        harness.provider.call_count().await >= 3,
+        "Expected at least one retry after the bad fallback reply"
+    );
+}
+
 /// Verify conversation summary CRUD operations work correctly.
 #[tokio::test]
 async fn test_summary_crud() {

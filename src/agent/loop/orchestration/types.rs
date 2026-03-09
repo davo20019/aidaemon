@@ -1,7 +1,7 @@
 use crate::agent::*;
 use crate::execution_policy::PolicyBundle;
 
-pub(in crate::agent) struct ConsultantOrchestrationCtx<'a> {
+pub(in crate::agent) struct OrchestrationCtx<'a> {
     pub emitter: &'a crate::events::EventEmitter,
     pub task_id: &'a str,
     pub session_id: &'a str,

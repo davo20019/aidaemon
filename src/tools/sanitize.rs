@@ -458,6 +458,10 @@ static TOOL_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(&format!(
             r"(?i)(?:use|using|call|calling|invoke|invoking|run|running|via)\s+(?:the\s+)?(?:{names})(?:\s+tool)?"
         )).unwrap(),
+        // Raw call-form leaks: "http_request(GET https://...)" / "web_fetch(https://...)"
+        Regex::new(&format!(
+            r"(?:{names})\([^()\n]{{0,240}}\)"
+        )).unwrap(),
     ]
 });
 
@@ -736,6 +740,17 @@ mod tests {
             !result.contains("spawn_agent"),
             "spawn_agent leaked: {result}"
         );
+    }
+
+    #[test]
+    fn test_strip_raw_tool_call_form() {
+        let input = "I tried http_request(GET https://clinicaltrials.gov/api/query) and web_fetch(https://clinicaltrials.gov/search) before stopping.";
+        let result = strip_tool_name_references(input);
+        assert!(
+            !result.contains("http_request"),
+            "http_request leaked: {result}"
+        );
+        assert!(!result.contains("web_fetch"), "web_fetch leaked: {result}");
     }
 
     #[test]

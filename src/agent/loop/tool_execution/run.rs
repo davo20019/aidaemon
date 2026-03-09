@@ -1256,6 +1256,62 @@ impl Agent {
             )
             .await?;
 
+            let direct_response = if !is_error
+                && self.depth == 0
+                && resp.tool_calls.len() == 1
+                && !background_detached
+            {
+                result_metadata.direct_response.clone()
+            } else {
+                None
+            };
+            if let Some(reply) = direct_response {
+                let assistant_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "assistant".to_string(),
+                    content: Some(reply.clone()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.5,
+                    ..Message::runtime_defaults()
+                };
+                self.append_assistant_message_with_event(
+                    emitter,
+                    &assistant_msg,
+                    "system",
+                    None,
+                    None,
+                )
+                .await?;
+                self.emit_task_end(
+                    emitter,
+                    task_id,
+                    TaskStatus::Completed,
+                    task_start,
+                    iteration,
+                    learning_ctx.tool_calls.len(),
+                    None,
+                    Some(reply.chars().take(200).collect()),
+                )
+                .await;
+
+                learning_ctx.completed_naturally = true;
+                let learning_ctx_for_task = learning_ctx.clone();
+                let state = self.state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await
+                    {
+                        warn!("Learning failed: {}", e);
+                    }
+                });
+
+                commit_state!();
+                return Ok(ToolExecutionOutcome::Return(Ok(reply)));
+            }
+
             // Emit Error event if tool failed
             if is_error {
                 let _ = emitter

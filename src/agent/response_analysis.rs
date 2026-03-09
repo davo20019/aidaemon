@@ -1,5 +1,6 @@
-use super::{CONSULTANT_TEXT_ONLY_MARKER, INTENT_GATE_MARKER};
+use crate::llm_markers::INTENT_GATE_MARKER;
 
+#[cfg(test)]
 fn is_pseudo_tool_line(line: &str) -> bool {
     let lower = line.trim().to_ascii_lowercase();
     lower.starts_with("[tool_use:")
@@ -8,6 +9,7 @@ fn is_pseudo_tool_line(line: &str) -> bool {
         || lower.starts_with("[functioncall:")
 }
 
+#[cfg(test)]
 fn is_tool_name_like(name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -40,6 +42,7 @@ fn is_tool_name_like(name: &str) -> bool {
         || lower.contains("__")
 }
 
+#[cfg(test)]
 fn parse_name_field(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let (key, value) = trimmed.split_once(':')?;
@@ -194,8 +197,9 @@ pub(super) fn is_substantive_text_response(text: &str, min_len: usize) -> bool {
     substantive_len >= min_len
 }
 
-/// Remove leaked consultant control markers and pseudo tool-call text.
-pub(super) fn sanitize_consultant_analysis(analysis: &str) -> String {
+/// Remove leaked text-only control markers and pseudo tool-call text.
+#[cfg(test)]
+pub(super) fn sanitize_response_analysis(analysis: &str) -> String {
     let lines: Vec<&str> = analysis.lines().collect();
     let has_pseudo_tool_block = lines.iter().any(|line| is_pseudo_tool_line(line));
 
@@ -241,7 +245,7 @@ pub(super) fn sanitize_consultant_analysis(analysis: &str) -> String {
             continue;
         }
 
-        let replaced = line.replace(CONSULTANT_TEXT_ONLY_MARKER, "");
+        let replaced = line.replace(crate::llm_markers::TEXT_ONLY_RESPONSE_MARKER, "");
         let trimmed_replaced = replaced.trim();
         let lower_replaced = trimmed_replaced.to_ascii_lowercase();
 
@@ -255,7 +259,7 @@ pub(super) fn sanitize_consultant_analysis(analysis: &str) -> String {
             continue;
         }
 
-        // Some models echo the consultant control instructions verbatim.
+        // Some models echo the text-only control instructions verbatim.
         // Strip the control header and nearby instruction lines so they don't
         // pollute the injected warm-start context for iteration 2.
         if lower_replaced.starts_with("[important:")

@@ -24,7 +24,6 @@ use crate::events::{
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
 use crate::goal_tokens::{GoalRunBudgetStatus, GoalTokenRegistry};
-use crate::llm_markers::{CONSULTANT_TEXT_ONLY_MARKER, INTENT_GATE_MARKER};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
 use crate::providers::{ProviderError, ProviderErrorKind};
@@ -76,20 +75,20 @@ const PROGRESS_SUMMARY_INTERVAL: Duration = Duration::from_secs(300); // 5 minut
 /// scheduled goal" meta-queries to avoid accidental schedule creation.
 const ENABLE_SCHEDULE_HEURISTICS: bool = true;
 
+#[cfg(test)]
 #[path = "intent/intent_gate.rs"]
 mod intent_gate;
+#[cfg(test)]
 use intent_gate::extract_intent_gate;
 #[cfg(test)]
 use intent_gate::parse_intent_gate_json;
-#[path = "consultant/consultant_analysis.rs"]
-mod consultant_analysis;
-#[path = "consultant/consultant_pass.rs"]
-mod consultant_pass;
+#[path = "response_analysis.rs"]
+mod response_analysis;
 #[cfg(test)]
-use consultant_analysis::has_action_promise;
-use consultant_analysis::{
-    is_substantive_text_response, looks_like_deferred_action_response, sanitize_consultant_analysis,
-};
+use response_analysis::has_action_promise;
+#[cfg(test)]
+use response_analysis::sanitize_response_analysis;
+use response_analysis::{is_substantive_text_response, looks_like_deferred_action_response};
 #[path = "intent/intent_routing.rs"]
 mod intent_routing;
 use intent_routing::{
@@ -100,9 +99,11 @@ use intent_routing::{
 use intent_routing::{detect_schedule_heuristic, looks_like_recurring_intent_without_timing};
 #[path = "policy/policy_signals.rs"]
 mod policy_signals;
+#[cfg(test)]
+use policy_signals::is_short_user_correction;
 use policy_signals::{
     build_policy_bundle, default_clarifying_question, detect_explicit_outcome_signal,
-    is_short_user_correction, tool_is_side_effecting,
+    tool_is_side_effecting,
 };
 #[path = "loop/loop_utils.rs"]
 mod loop_utils;
@@ -124,24 +125,20 @@ mod tool_loop_state;
 
 #[path = "loop/bootstrap_phase.rs"]
 mod bootstrap_phase;
-#[path = "loop/consultant_completion_phase.rs"]
-mod consultant_completion_phase;
-#[path = "loop/consultant_decision_phase.rs"]
-mod consultant_decision_phase;
-#[path = "loop/consultant_direct_return.rs"]
-mod consultant_direct_return;
-#[path = "loop/consultant_fallthrough.rs"]
-mod consultant_fallthrough;
-#[path = "loop/consultant_intent_gate_phase.rs"]
-mod consultant_intent_gate_phase;
-#[path = "loop/consultant_orchestration_phase.rs"]
-mod consultant_orchestration_phase;
-#[path = "loop/consultant_phase.rs"]
-mod consultant_phase;
+#[path = "loop/completion_phase.rs"]
+mod completion_phase;
+#[path = "loop/direct_return.rs"]
+mod direct_return;
+#[path = "loop/fallthrough.rs"]
+mod fallthrough;
 #[path = "runtime/graceful.rs"]
 mod graceful;
 #[path = "runtime/history.rs"]
 mod history;
+#[path = "loop/orchestration_phase.rs"]
+mod orchestration_phase;
+#[path = "loop/response_phase.rs"]
+mod response_phase;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
@@ -181,8 +178,6 @@ mod tool_prelude_phase;
 mod tool_result_notices;
 
 pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
-#[cfg(test)]
-use system_prompt::{build_consultant_system_prompt, ConsultantPromptStyle};
 use system_prompt::{build_tool_loop_system_prompt, format_goal_context, ToolLoopPromptStyle};
 pub(in crate::agent) use tool_result_notices::ToolResultNotice;
 
@@ -199,13 +194,13 @@ struct PolicyRuntimeMetrics {
     context_refresh_total: AtomicU64,
     escalation_total: AtomicU64,
     fallback_expansion_total: AtomicU64,
-    consultant_direct_return_total: AtomicU64,
-    consultant_fallthrough_total: AtomicU64,
-    consultant_route_clarification_required_total: AtomicU64,
-    consultant_route_tools_required_total: AtomicU64,
-    consultant_route_short_correction_direct_reply_total: AtomicU64,
-    consultant_route_acknowledgment_direct_reply_total: AtomicU64,
-    consultant_route_default_continue_total: AtomicU64,
+    response_direct_return_total: AtomicU64,
+    response_fallthrough_total: AtomicU64,
+    orchestration_route_clarification_required_total: AtomicU64,
+    orchestration_route_tools_required_total: AtomicU64,
+    orchestration_route_short_correction_direct_reply_total: AtomicU64,
+    orchestration_route_acknowledgment_direct_reply_total: AtomicU64,
+    orchestration_route_default_continue_total: AtomicU64,
     context_bleed_prevented_total: AtomicU64,
     context_mismatch_preflight_drop_total: AtomicU64,
     followup_mode_overrides_total: AtomicU64,
@@ -240,13 +235,13 @@ impl PolicyRuntimeMetrics {
             context_refresh_total: AtomicU64::new(0),
             escalation_total: AtomicU64::new(0),
             fallback_expansion_total: AtomicU64::new(0),
-            consultant_direct_return_total: AtomicU64::new(0),
-            consultant_fallthrough_total: AtomicU64::new(0),
-            consultant_route_clarification_required_total: AtomicU64::new(0),
-            consultant_route_tools_required_total: AtomicU64::new(0),
-            consultant_route_short_correction_direct_reply_total: AtomicU64::new(0),
-            consultant_route_acknowledgment_direct_reply_total: AtomicU64::new(0),
-            consultant_route_default_continue_total: AtomicU64::new(0),
+            response_direct_return_total: AtomicU64::new(0),
+            response_fallthrough_total: AtomicU64::new(0),
+            orchestration_route_clarification_required_total: AtomicU64::new(0),
+            orchestration_route_tools_required_total: AtomicU64::new(0),
+            orchestration_route_short_correction_direct_reply_total: AtomicU64::new(0),
+            orchestration_route_acknowledgment_direct_reply_total: AtomicU64::new(0),
+            orchestration_route_default_continue_total: AtomicU64::new(0),
             context_bleed_prevented_total: AtomicU64::new(0),
             context_mismatch_preflight_drop_total: AtomicU64::new(0),
             followup_mode_overrides_total: AtomicU64::new(0),
@@ -350,6 +345,7 @@ fn llm_payload_invalid_breakdown_snapshot() -> Vec<LlmPayloadInvalidMetric> {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct RouteDriftSample {
     reason: RouteDriftReason,
     action: RouteDriftAction,
@@ -357,6 +353,7 @@ struct RouteDriftSample {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum RouteDriftReason {
     ClarificationRequired,
     ToolsRequired,
@@ -366,6 +363,7 @@ enum RouteDriftReason {
     Unknown,
 }
 
+#[allow(dead_code)]
 impl RouteDriftReason {
     fn from_str(reason: &str) -> Self {
         match reason {
@@ -380,12 +378,14 @@ impl RouteDriftReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum RouteDriftAction {
     Return,
     Continue,
     Unknown,
 }
 
+#[allow(dead_code)]
 impl RouteDriftAction {
     fn from_str(action: &str) -> Self {
         match action {
@@ -397,6 +397,7 @@ impl RouteDriftAction {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 struct RouteDriftSessionState {
     samples: VecDeque<RouteDriftSample>,
     last_seen_epoch_secs: u64,
@@ -406,27 +407,36 @@ struct RouteDriftSessionState {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 struct RouteDriftMonitor {
     sessions: HashMap<String, RouteDriftSessionState>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(in crate::agent) struct RouteDriftSignal {
     pub summary: String,
     pub failsafe_activated: bool,
 }
 
+#[allow(dead_code)]
 const ROUTE_DRIFT_WINDOW_SIZE: usize = 24;
+#[allow(dead_code)]
 const ROUTE_DRIFT_MIN_WINDOW: usize = 12;
+#[allow(dead_code)]
 const ROUTE_DRIFT_ALERT_COOLDOWN_SECS: u64 = 300;
+#[allow(dead_code)]
 const ROUTE_DRIFT_FAILSAFE_DURATION_SECS: u64 = 900;
+#[allow(dead_code)]
 const ROUTE_DRIFT_FAILSAFE_STREAK: u32 = 2;
 const ROUTE_DRIFT_MAX_TRACKED_SESSIONS: usize = 256;
 const ROUTE_DRIFT_STALE_SESSION_SECS: u64 = 7200;
 
+#[allow(dead_code)]
 static ROUTE_DRIFT_MONITOR: Lazy<std::sync::Mutex<RouteDriftMonitor>> =
     Lazy::new(|| std::sync::Mutex::new(RouteDriftMonitor::default()));
 
+#[allow(dead_code)]
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -434,6 +444,7 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 fn prune_route_drift_sessions(monitor: &mut RouteDriftMonitor, now: u64) {
     monitor.sessions.retain(|_, state| {
         now.saturating_sub(state.last_seen_epoch_secs) <= ROUTE_DRIFT_STALE_SESSION_SECS
@@ -459,6 +470,7 @@ fn prune_route_drift_sessions(monitor: &mut RouteDriftMonitor, now: u64) {
     }
 }
 
+#[allow(dead_code)]
 pub(in crate::agent) fn observe_route_reason_for_drift(
     session_id: &str,
     route_reason: &str,
@@ -628,26 +640,26 @@ pub fn policy_metrics_snapshot() -> PolicyMetricsData {
         fallback_expansion_total: POLICY_METRICS
             .fallback_expansion_total
             .load(Ordering::Relaxed),
-        consultant_direct_return_total: POLICY_METRICS
-            .consultant_direct_return_total
+        response_direct_return_total: POLICY_METRICS
+            .response_direct_return_total
             .load(Ordering::Relaxed),
-        consultant_fallthrough_total: POLICY_METRICS
-            .consultant_fallthrough_total
+        response_fallthrough_total: POLICY_METRICS
+            .response_fallthrough_total
             .load(Ordering::Relaxed),
-        consultant_route_clarification_required_total: POLICY_METRICS
-            .consultant_route_clarification_required_total
+        orchestration_route_clarification_required_total: POLICY_METRICS
+            .orchestration_route_clarification_required_total
             .load(Ordering::Relaxed),
-        consultant_route_tools_required_total: POLICY_METRICS
-            .consultant_route_tools_required_total
+        orchestration_route_tools_required_total: POLICY_METRICS
+            .orchestration_route_tools_required_total
             .load(Ordering::Relaxed),
-        consultant_route_short_correction_direct_reply_total: POLICY_METRICS
-            .consultant_route_short_correction_direct_reply_total
+        orchestration_route_short_correction_direct_reply_total: POLICY_METRICS
+            .orchestration_route_short_correction_direct_reply_total
             .load(Ordering::Relaxed),
-        consultant_route_acknowledgment_direct_reply_total: POLICY_METRICS
-            .consultant_route_acknowledgment_direct_reply_total
+        orchestration_route_acknowledgment_direct_reply_total: POLICY_METRICS
+            .orchestration_route_acknowledgment_direct_reply_total
             .load(Ordering::Relaxed),
-        consultant_route_default_continue_total: POLICY_METRICS
-            .consultant_route_default_continue_total
+        orchestration_route_default_continue_total: POLICY_METRICS
+            .orchestration_route_default_continue_total
             .load(Ordering::Relaxed),
         context_bleed_prevented_total: POLICY_METRICS
             .context_bleed_prevented_total
@@ -1034,6 +1046,7 @@ fn summarize_tool_args(name: &str, arguments: &str) -> String {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct IntentGateDecision {
     can_answer_now: Option<bool>,
     needs_tools: Option<bool>,
@@ -1367,6 +1380,7 @@ fn filter_tool_defs_for_untrusted_external_reference(defs: &[Value]) -> Vec<Valu
         .collect()
 }
 
+#[allow(dead_code)]
 fn merge_intent_gate_decision(
     model_decision: Option<IntentGateDecision>,
     inferred: IntentGateDecision,
@@ -1791,6 +1805,77 @@ fn is_low_signal_task_lead_reply(text: &str) -> bool {
     false
 }
 
+fn looks_like_incomplete_live_work_summary(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    let has_attempt_structure = lower.contains("what i tried:")
+        || lower.contains("current status:")
+        || (contains_keyword_as_words(&lower, "i attempted to")
+            && contains_keyword_as_words(&lower, "current status"));
+
+    let has_blocked_outcome = contains_keyword_as_words(&lower, "no results retrieved yet")
+        || contains_keyword_as_words(&lower, "no results found yet")
+        || contains_keyword_as_words(&lower, "could not retrieve results")
+        || contains_keyword_as_words(&lower, "encountered api errors")
+        || contains_keyword_as_words(&lower, "bad request")
+        || contains_keyword_as_words(&lower, "request is malformed")
+        || contains_keyword_as_words(&lower, "request was malformed")
+        || contains_keyword_as_words(&lower, "api is rejecting");
+
+    has_attempt_structure && has_blocked_outcome
+}
+
+fn looks_like_false_capability_denial_after_tool_success(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    const DIRECT_DENIALS: &[&str] = &[
+        "can't browse",
+        "cannot browse",
+        "can't access",
+        "cannot access",
+        "don't have access",
+        "do not have access",
+        "can't perform a live search",
+        "cannot perform a live search",
+        "unable to perform a live search",
+        "can't search the web",
+        "cannot search the web",
+        "don't have real time access",
+        "do not have real time access",
+        "don't have real-time access",
+        "do not have real-time access",
+        "can't access real time information",
+        "cannot access real time information",
+        "can't access real-time information",
+        "cannot access real-time information",
+        "from my training data",
+        "based on my training data",
+        "from training data",
+        "based on training data",
+    ];
+
+    if DIRECT_DENIALS.iter().any(|phrase| lower.contains(phrase)) {
+        return true;
+    }
+
+    let guide_only = lower.contains("i can guide you on how to find")
+        || lower.contains("i can guide you on how to")
+        || lower.contains("here's how to find");
+    let live_data_context = lower.contains("live search")
+        || lower.contains("current databases")
+        || lower.contains("current database")
+        || lower.contains("real time information")
+        || lower.contains("real-time information");
+
+    guide_only && live_data_context
+}
+
 pub(crate) fn goal_completion_response_indicates_incomplete_work(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1799,6 +1884,7 @@ pub(crate) fn goal_completion_response_indicates_incomplete_work(text: &str) -> 
 
     goal_completion_summary_indicates_not_finished(trimmed)
         || is_low_signal_task_lead_reply(trimmed)
+        || looks_like_incomplete_live_work_summary(trimmed)
         || (looks_like_deferred_action_response(trimmed)
             && !is_substantive_text_response(trimmed, 200))
 }

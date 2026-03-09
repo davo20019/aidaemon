@@ -13,6 +13,16 @@ pub struct OAuthConnection {
     pub updated_at: String,
 }
 
+/// A pending interactive OAuth flow awaiting browser callback completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingOAuthFlow {
+    pub state: String,
+    pub service: String,
+    pub code_verifier: Option<String>,
+    pub session_id: String,
+    pub created_at: String,
+}
+
 /// A dynamically added skill (stored in database).
 /// Deprecated: kept for migration compatibility. Use filesystem skills instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]

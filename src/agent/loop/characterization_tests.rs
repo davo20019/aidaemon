@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[tokio::test]
-async fn consultant_metrics_capture_direct_return_and_fallthrough_paths() {
+async fn response_metrics_capture_direct_return_and_fallthrough_paths() {
     let before = policy_metrics_snapshot();
 
     // Direct-return case (deterministic schedule routing before first LLM call).
@@ -69,23 +69,23 @@ async fn consultant_metrics_capture_direct_return_and_fallthrough_paths() {
 
     let after = policy_metrics_snapshot();
     let direct_delta = after
-        .consultant_direct_return_total
-        .saturating_sub(before.consultant_direct_return_total);
+        .response_direct_return_total
+        .saturating_sub(before.response_direct_return_total);
     let fallthrough_delta = after
-        .consultant_fallthrough_total
-        .saturating_sub(before.consultant_fallthrough_total);
+        .response_fallthrough_total
+        .saturating_sub(before.response_fallthrough_total);
 
     assert!(
         direct_delta >= 1,
-        "expected consultant_direct_return_total to increase by at least 1; before={} after={}",
-        before.consultant_direct_return_total,
-        after.consultant_direct_return_total
+        "expected response_direct_return_total to increase by at least 1; before={} after={}",
+        before.response_direct_return_total,
+        after.response_direct_return_total
     );
     assert!(
         fallthrough_delta >= 1,
-        "expected consultant_fallthrough_total to increase by at least 1; before={} after={}",
-        before.consultant_fallthrough_total,
-        after.consultant_fallthrough_total
+        "expected response_fallthrough_total to increase by at least 1; before={} after={}",
+        before.response_fallthrough_total,
+        after.response_fallthrough_total
     );
 }
 
@@ -470,7 +470,7 @@ async fn mixed_project_inspect_path_and_paths_preserves_primary_path_for_follow_
 }
 
 #[tokio::test]
-async fn replay_trace_yes_do_it_with_sanitized_consultant_analysis_falls_through_to_tools() {
+async fn replay_trace_yes_do_it_with_sanitized_response_analysis_falls_through_to_tools() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "arguments:\nname: terminal\ncommand: ls\n\
@@ -501,7 +501,7 @@ async fn replay_trace_yes_do_it_with_sanitized_consultant_analysis_falls_through
     assert_eq!(reply, "Applied the requested changes.");
     assert!(
         harness.provider.call_count().await >= 3,
-        "expected consultant + tool-call + final response path"
+        "expected initial routing call + tool-call + final response path"
     );
 }
 
@@ -551,7 +551,7 @@ async fn replay_trace_deferred_planning_text_does_not_stall_before_first_tool_ca
         !call_log
             .iter()
             .any(|entry| matches!(entry.options.response_mode, ResponseMode::JsonSchema { .. })),
-        "text-only consultant schema pass should be disabled"
+        "text-only schema pass should be disabled"
     );
 
     let required_tool_choice_seen = call_log
@@ -653,6 +653,6 @@ async fn provider_option_rejection_falls_back_to_default_chat() {
         call_log
             .iter()
             .all(|entry| entry.options == ChatOptions::default()),
-        "expected default chat options when consultant text-pass is disabled"
+        "expected default chat options when the text-only pass is disabled"
     );
 }

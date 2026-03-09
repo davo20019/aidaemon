@@ -5,4 +5,4 @@ mod run;
 mod tests;
 mod types;
 
-pub(in crate::agent) use types::ConsultantOrchestrationCtx;
+pub(in crate::agent) use types::OrchestrationCtx;

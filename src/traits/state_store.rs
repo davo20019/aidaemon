@@ -599,6 +599,11 @@ pub trait OAuthStore: Send + Sync {
         Ok(0)
     }
 
+    /// Save or replace a pending interactive OAuth flow.
+    async fn save_pending_oauth_flow(&self, _flow: &super::PendingOAuthFlow) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Get an OAuth connection by service name.
     async fn get_oauth_connection(
         &self,
@@ -612,8 +617,26 @@ pub trait OAuthStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Get a pending OAuth flow by state parameter.
+    async fn get_pending_oauth_flow(
+        &self,
+        _state: &str,
+    ) -> anyhow::Result<Option<super::PendingOAuthFlow>> {
+        Ok(None)
+    }
+
+    /// List all pending OAuth flows.
+    async fn list_pending_oauth_flows(&self) -> anyhow::Result<Vec<super::PendingOAuthFlow>> {
+        Ok(vec![])
+    }
+
     /// Delete an OAuth connection by service name.
     async fn delete_oauth_connection(&self, _service: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Delete a pending OAuth flow by state parameter.
+    async fn delete_pending_oauth_flow(&self, _state: &str) -> anyhow::Result<()> {
         Ok(())
     }
 

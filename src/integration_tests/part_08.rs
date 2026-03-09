@@ -6,7 +6,8 @@
 async fn test_orchestration_task_lead_flag_off_uses_agent_loop() {
     // Deterministic pre-routing classifies the request as complex based on action
     // markers (analyze, compare, identify, find, summarize) + compound keywords.
-    // No consultant LLM call. Goal created, task lead spawned synchronously.
+    // No first-pass orchestration LLM call. Goal created, task lead spawned
+    // synchronously.
     let provider = MockProvider::with_responses(vec![
         // Task lead's LLM call (deterministic routing creates goal without LLM call)
         MockProvider::text_response("I'll start building the website."),
@@ -45,7 +46,7 @@ async fn test_orchestration_task_lead_spawns_for_complex() {
     // Deterministic pre-routing classifies the request as complex, creates a goal,
     // and spawns a task lead synchronously (no self_ref in tests).
     let provider = MockProvider::with_responses(vec![
-        // Task lead's LLM call (no consultant pass — deterministic routing)
+        // Task lead's LLM call (no first-pass prelude — deterministic routing)
         MockProvider::text_response("I've planned and completed all the tasks for your website."),
     ]);
     let harness = setup_test_agent_orchestrator_task_leads(provider)

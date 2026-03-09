@@ -3,10 +3,10 @@
 // ---------------------------------------------------------------------------
 
 /// With non-uniform models, iteration 1 runs with tools available (no separate
-/// consultant text-only pass). The INTENT_GATE in the response is still parsed
+/// text-only pre-pass). The INTENT_GATE in the response is still parsed
 /// and the execution loop produces the user-visible answer.
 #[tokio::test]
-async fn test_consultant_pass_classifies_then_executor_answers_questions() {
+async fn test_initial_routing_call_classifies_then_executor_answers_questions() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "I can answer this from memory.\n[INTENT_GATE]\n\
@@ -58,7 +58,7 @@ async fn test_consultant_pass_classifies_then_executor_answers_questions() {
     // With default+fallback routing, all LLM calls include tools
     assert!(
         !calls[0].tools.is_empty(),
-        "First call should have tools (no separate tool-free consultant pass)"
+        "First call should have tools (no separate tool-free text-only pre-pass)"
     );
 }
 
@@ -104,10 +104,11 @@ async fn test_critical_owner_name_query_is_deterministic() {
 
 #[tokio::test]
 async fn test_personal_recall_turn_routes_at_least_primary_model() {
-    // With deterministic routing (no consultant LLM pass), the execution loop
+    // With deterministic routing (no first-pass orchestration LLM call), the
+    // execution loop
     // handles the request directly with a single LLM call.
     let provider = MockProvider::with_responses(vec![
-        // Execution loop — direct answer (no consultant pass response needed)
+        // Execution loop — direct answer (no text-only pre-pass response needed)
         MockProvider::text_response("I don't have pet information saved."),
     ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
@@ -141,7 +142,7 @@ async fn test_personal_recall_turn_routes_at_least_primary_model() {
 }
 
 #[tokio::test]
-async fn test_consultant_empty_answerable_turn_falls_through_to_tool_path() {
+async fn test_empty_answerable_routing_output_falls_through_to_tool_path() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
@@ -171,7 +172,7 @@ async fn test_consultant_empty_answerable_turn_falls_through_to_tool_path() {
     assert!(calls.len() >= 2);
     assert!(
         !calls[1].tools.is_empty(),
-        "Empty answerable consultant output should trigger tool-enabled retry path"
+        "Empty answerable routing output should trigger tool-enabled retry path"
     );
 }
 
@@ -235,7 +236,7 @@ async fn test_identity_tool_result_survives_context_collapse() {
 /// For action requests (non-questions), the first LLM call has tools available
 /// and the execution model handles tool use.
 #[tokio::test]
-async fn test_consultant_pass_continues_for_actions() {
+async fn test_initial_routing_call_continues_for_actions() {
     // Three responses:
     //   1. First call (with tools) → text analysis of the action
     //   2. Agent loop → tool call (system_info)
@@ -276,7 +277,7 @@ async fn test_consultant_pass_continues_for_actions() {
     // With default+fallback routing, all LLM calls include tools
     assert!(
         !calls[0].tools.is_empty(),
-        "First call should have tools (no separate tool-free consultant pass)"
+        "First call should have tools (no separate tool-free text-only pre-pass)"
     );
 }
 
@@ -321,7 +322,7 @@ async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
     assert_eq!(harness.provider.call_count().await, 4);
 
     let calls = harness.provider.call_log.lock().await;
-    // All calls now have tools available (no separate tool-free consultant pass)
+    // All calls now have tools available (no separate tool-free text-only pre-pass)
     assert!(
         !calls[0].tools.is_empty(),
         "First call should have tools available"
@@ -375,7 +376,7 @@ async fn test_deferred_action_after_tool_progress_does_not_complete_task() {
     assert_eq!(harness.provider.call_count().await, 4);
 
     let calls = harness.provider.call_log.lock().await;
-    // All calls now have tools available (no separate tool-free consultant pass)
+    // All calls now have tools available (no separate tool-free text-only pre-pass)
     assert!(
         !calls[0].tools.is_empty(),
         "First call should have tools available"
@@ -386,16 +387,16 @@ async fn test_deferred_action_after_tool_progress_does_not_complete_task() {
     );
 }
 
-/// With uniform models (all "mock-model"), no consultant pass — tools should
+/// With uniform models (all "mock-model"), no text-only pre-pass — tools should
 /// be available from the very first LLM call.
 #[tokio::test]
-async fn test_no_consultant_pass_with_uniform_models() {
+async fn test_uniform_models_have_tools_on_first_call() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Here is your info."),
     ]);
 
-    // Uniform models → router disabled → no consultant pass
+    // Uniform models -> router disabled -> no text-only pre-pass
     let harness = setup_test_agent(provider).await.unwrap();
 
     let response = harness
@@ -414,22 +415,22 @@ async fn test_no_consultant_pass_with_uniform_models() {
     assert_eq!(response, "Here is your info.");
     assert_eq!(harness.provider.call_count().await, 2);
 
-    // First call should have tools (no consultant pass)
+    // First call should have tools (no text-only pre-pass)
     let calls = harness.provider.call_log.lock().await;
     assert!(
         !calls[0].tools.is_empty(),
-        "Without consultant pass, first call should have tools"
+        "Without text-only pre-pass, first call should have tools"
     );
 }
 
-/// Consultant pass with an empty response on iteration 1 should NOT
+/// An empty first-pass response on iteration 1 should NOT
 /// intercept — it falls through to the normal empty-response handling.
 #[tokio::test]
-async fn test_consultant_pass_empty_response_not_intercepted() {
-    // Consultant returns empty text → should not be intercepted
+async fn test_empty_first_pass_response_not_intercepted() {
+    // First-pass response is empty -> should not be intercepted
     // Then execution model responds normally
     let provider = MockProvider::with_responses(vec![
-        // Empty content response (consultant returns nothing)
+        // Empty content response from the first routing call
         ProviderResponse {
             content: Some(String::new()),
             tool_calls: vec![],
@@ -461,7 +462,7 @@ async fn test_consultant_pass_empty_response_not_intercepted() {
         .await
         .unwrap();
 
-    // The empty consultant response should NOT be intercepted (the !reply.is_empty()
+    // The empty first-pass response should NOT be intercepted (the !reply.is_empty()
     // check lets it fall through to normal empty-response handling).
     // The exact behavior depends on depth/iteration, but it should not panic.
 }
@@ -634,7 +635,7 @@ async fn test_empty_execution_response_retry_recovers_with_text() {
     assert!(!response.contains("I wasn't able to process that request."));
 }
 
-/// When the consultant pass model returns BOTH text AND tool calls on
+/// When the first routing call returns BOTH text AND tool calls on
 /// iteration 1, the tool calls should be DROPPED and only the text
 /// analysis should be kept.  This handles Gemini models that hallucinate
 /// function calls from system prompt tool descriptions.
@@ -642,14 +643,14 @@ async fn test_empty_execution_response_retry_recovers_with_text() {
 /// (the LLM signaled it needs tools by attempting to call them), so the question
 /// falls through to the tool loop — not returned directly.
 #[tokio::test]
-async fn test_consultant_pass_drops_hallucinated_tool_calls() {
+async fn test_initial_routing_call_drops_hallucinated_tool_calls() {
     use crate::traits::ToolCall;
 
-    // Consultant returns confident text + hallucinated tool call (iteration 1)
+    // First routing call returns confident text + hallucinated tool call (iteration 1)
     // → hallucinated tool calls force needs_tools=true → falls through to execution loop.
     // Execution loop returns the final text response.
     let provider = MockProvider::with_responses(vec![
-        // Iteration 1: consultant returns confident text AND a hallucinated tool call
+        // Iteration 1: first routing call returns confident text AND a hallucinated tool call
         ProviderResponse {
             content: Some(
                 "Your website is deployed at your-site.workers.dev on Cloudflare Workers."
@@ -700,16 +701,16 @@ async fn test_consultant_pass_drops_hallucinated_tool_calls() {
         "Your website is deployed at your-site.workers.dev on Cloudflare Workers."
     );
 
-    // At least 1 LLM call (consultant) + execution loop calls
+    // At least 1 initial routing call + execution loop calls
     let call_count = harness.provider.call_count().await;
     assert!(
         call_count >= 3,
-        "Expected at least 3 LLM calls — consultant + tool call + final response (got {})",
+        "Expected at least 3 LLM calls — initial routing call + tool call + final response (got {})",
         call_count
     );
 }
 
-/// Regression: if consultant analysis sanitizes to empty but intent gate says
+/// Regression: if first-pass analysis sanitizes to empty but intent gate says
 /// acknowledgment + needs_tools=true (e.g. "Yes, do it."), we must NOT return
 /// an empty direct reply. The turn should fall through to execution.
 #[tokio::test]
@@ -749,11 +750,11 @@ async fn test_acknowledgment_with_needs_tools_and_empty_analysis_falls_through()
     assert_eq!(
         harness.provider.call_count().await,
         3,
-        "Expected consultant pass + tool call + execution pass"
+        "Expected initial routing call + tool call + execution pass"
     );
 }
 
-/// With default+fallback routing (consultant pass disabled), an LLM response
+/// With default+fallback routing (text-only pre-pass disabled), an LLM response
 /// containing only INTENT_GATE metadata is treated as deferred action text
 /// (structural marker detected) and the agent loops to get a real response.
 #[tokio::test]
@@ -783,13 +784,13 @@ async fn test_acknowledgment_with_empty_analysis_returns_default_reply() {
         .await
         .unwrap();
 
-    // With consultant pass disabled, the INTENT_GATE-only response is treated
+    // With text-only pre-pass disabled, the INTENT_GATE-only response is treated
     // as deferred action text, so the agent loops and gets the second response.
     assert_eq!(response, "Got it, understood.");
     assert_eq!(harness.provider.call_count().await, 2);
 }
 
-/// With default+fallback routing (consultant pass disabled), an LLM response
+/// With default+fallback routing (text-only pre-pass disabled), an LLM response
 /// containing only INTENT_GATE metadata is treated as deferred action text
 /// and the agent loops to get a real response for corrections too.
 #[tokio::test]
@@ -819,13 +820,13 @@ async fn test_short_correction_with_empty_analysis_returns_default_reply() {
         .await
         .unwrap();
 
-    // With consultant pass disabled, the INTENT_GATE-only response triggers
+    // With text-only pre-pass disabled, the INTENT_GATE-only response triggers
     // deferred action detection, so the agent loops and returns the second response.
     assert_eq!(response, "You're right, my apologies for the confusion.");
     assert_eq!(harness.provider.call_count().await, 2);
 }
 
-/// With default+fallback routing (consultant pass disabled), intent_gate
+/// With default+fallback routing (text-only pre-pass disabled), intent_gate
 /// decision points are not emitted for direct replies. The LLM response
 /// with INTENT_GATE metadata is treated as deferred action text and the
 /// agent loops to produce a real response.
@@ -855,15 +856,16 @@ async fn test_intent_gate_decision_metadata_includes_route_reason_for_direct_rep
         )
         .await
         .unwrap();
-    // With consultant pass disabled, INTENT_GATE-only responses trigger
+    // With text-only pre-pass disabled, INTENT_GATE-only responses trigger
     // deferred action detection; the agent loops and returns the second response.
     assert_eq!(response, "Got it, understood.");
     assert_eq!(harness.provider.call_count().await, 2);
 
-    // Intent gate decision points are no longer emitted when consultant pass is disabled.
+    // Intent gate decision points are no longer emitted when the text-only
+    // pre-pass is disabled.
     // Verify that intent_gate contract enforcement decision points may still be emitted
     // (from the completion phase), but the specific route_reason metadata from the
-    // consultant decision phase is not present.
+    // removed decision phase is not present.
     let event_rows: Vec<String> = sqlx::query_scalar(
         "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point' ORDER BY id DESC",
     )
@@ -884,15 +886,15 @@ async fn test_intent_gate_decision_metadata_includes_route_reason_for_direct_rep
                     == Some("acknowledgment_direct_reply")
         });
 
-    // With consultant pass disabled, no acknowledgment_direct_reply decision points
+    // With text-only pre-pass disabled, no acknowledgment_direct_reply decision points
     assert!(
         intent_gate_direct_reply.is_none(),
-        "With consultant pass disabled, acknowledgment_direct_reply intent_gate decisions should not be emitted"
+        "With text-only pre-pass disabled, acknowledgment_direct_reply intent_gate decisions should not be emitted"
     );
 }
 
-/// With default+fallback routing (consultant pass disabled), intent_gate
-/// decision points from the consultant decision phase are not emitted.
+/// With default+fallback routing (text-only pre-pass disabled), intent_gate
+/// decision points from the removed decision phase are not emitted.
 /// The LLM response with INTENT_GATE metadata is treated as deferred action
 /// text, and the agent continues looping with tools available.
 #[tokio::test]
@@ -933,8 +935,8 @@ async fn test_intent_gate_decision_metadata_includes_route_reason_for_continue()
     .await
     .unwrap();
 
-    // With consultant pass disabled, the specific tools_required route_reason
-    // from the consultant decision phase is not emitted.
+    // With text-only pre-pass disabled, the specific tools_required route_reason
+    // from the removed decision phase is not emitted.
     let intent_gate_tools_required = event_rows
         .iter()
         .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
@@ -949,6 +951,6 @@ async fn test_intent_gate_decision_metadata_includes_route_reason_for_continue()
 
     assert!(
         intent_gate_tools_required.is_none(),
-        "With consultant pass disabled, tools_required intent_gate decisions from consultant decision phase should not be emitted"
+        "With text-only pre-pass disabled, tools_required intent_gate decisions from the removed decision phase should not be emitted"
     );
 }

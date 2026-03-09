@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
-use crate::llm_markers::CONSULTANT_TEXT_ONLY_MARKER;
+use crate::llm_markers::TEXT_ONLY_RESPONSE_MARKER;
 use crate::providers::ProviderError;
 use crate::traits::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
@@ -375,8 +375,8 @@ impl GoogleGenAiProvider {
         }
     }
 
-    /// Detect whether the system instruction explicitly requests text-only consultant mode.
-    fn is_consultant_text_only_mode(system_instruction: &Option<Value>) -> bool {
+    /// Detect whether the system instruction explicitly requests text-only mode.
+    fn is_text_only_response_mode(system_instruction: &Option<Value>) -> bool {
         system_instruction
             .as_ref()
             .and_then(|sys| sys.get("parts"))
@@ -385,7 +385,7 @@ impl GoogleGenAiProvider {
                 parts.iter().any(|part| {
                     part.get("text")
                         .and_then(|t| t.as_str())
-                        .is_some_and(|text| text.contains(CONSULTANT_TEXT_ONLY_MARKER))
+                        .is_some_and(|text| text.contains(TEXT_ONLY_RESPONSE_MARKER))
                 })
             })
     }
@@ -397,13 +397,13 @@ impl GoogleGenAiProvider {
         tools: &[Value],
         options: &ChatOptions,
     ) -> (Value, bool, bool, bool) {
-        let consultant_text_only_mode = Self::is_consultant_text_only_mode(&system_instruction);
+        let text_only_response_mode = Self::is_text_only_response_mode(&system_instruction);
         let has_function_tools = !tools.is_empty();
         let include_grounding = matches!(options.tool_choice, ToolChoiceMode::Auto)
             && !has_function_tools
-            && !consultant_text_only_mode;
+            && !text_only_response_mode;
         let disable_function_calling = !has_function_tools
-            || consultant_text_only_mode
+            || text_only_response_mode
             || matches!(options.tool_choice, ToolChoiceMode::None);
         let gemini_tools = self.convert_tools(tools, include_grounding);
 
@@ -455,7 +455,7 @@ impl GoogleGenAiProvider {
 
         (
             body,
-            consultant_text_only_mode,
+            text_only_response_mode,
             include_grounding,
             disable_function_calling,
         )
@@ -673,7 +673,7 @@ impl ModelProvider for GoogleGenAiProvider {
         let (system_instruction, contents) = self.convert_messages(messages);
         let original_contents = contents.clone();
         let has_function_tools = !tools.is_empty();
-        let (body, consultant_text_only_mode, include_grounding, disable_function_calling) =
+        let (body, text_only_response_mode, include_grounding, disable_function_calling) =
             self.build_request_body(system_instruction, contents, tools, options);
 
         // Use header-based authentication instead of URL query parameter
@@ -683,7 +683,7 @@ impl ModelProvider for GoogleGenAiProvider {
         info!(
             model,
             url_prefix = %self.base_url,
-            consultant_text_only_mode,
+            text_only_response_mode,
             has_function_tools,
             include_grounding,
             disable_function_calling,
@@ -1053,31 +1053,31 @@ mod tests {
     }
 
     #[test]
-    fn test_detects_consultant_text_only_marker() {
+    fn test_detects_text_only_response_marker() {
         let sys = Some(json!({
             "parts": [
                 { "text": "prefix" },
-                { "text": "[CONSULTANT_TEXT_ONLY_MODE]\ntext only" }
+                { "text": "[TEXT_ONLY_RESPONSE_MODE]\ntext only" }
             ]
         }));
-        assert!(GoogleGenAiProvider::is_consultant_text_only_mode(&sys));
+        assert!(GoogleGenAiProvider::is_text_only_response_mode(&sys));
     }
 
     #[test]
-    fn test_request_body_consultant_mode_disables_grounding_and_function_calls() {
+    fn test_request_body_text_only_mode_disables_grounding_and_function_calls() {
         let p = provider();
         let system_instruction = Some(json!({
-            "parts": [{ "text": "[CONSULTANT_TEXT_ONLY_MODE]\ntext only" }]
+            "parts": [{ "text": "[TEXT_ONLY_RESPONSE_MODE]\ntext only" }]
         }));
         let contents = vec![json!({
             "role": "user",
             "parts": [{ "text": "what is rust?" }]
         })];
 
-        let (body, consultant_mode, include_grounding, disable_fn_calling) =
+        let (body, text_only_mode, include_grounding, disable_fn_calling) =
             p.build_request_body(system_instruction, contents, &[], &ChatOptions::default());
 
-        assert!(consultant_mode);
+        assert!(text_only_mode);
         assert!(!include_grounding);
         assert!(disable_fn_calling);
         assert!(body.get("tools").is_none());
@@ -1098,10 +1098,10 @@ mod tests {
             "parts": [{ "text": "latest news" }]
         })];
 
-        let (body, consultant_mode, include_grounding, disable_fn_calling) =
+        let (body, text_only_mode, include_grounding, disable_fn_calling) =
             p.build_request_body(system_instruction, contents, &[], &ChatOptions::default());
 
-        assert!(!consultant_mode);
+        assert!(!text_only_mode);
         assert!(include_grounding);
         assert!(disable_fn_calling);
         assert_eq!(
@@ -1111,7 +1111,7 @@ mod tests {
         let tools = body["tools"].as_array().expect("tools should be present");
         assert!(
             tools.iter().any(|t| t.get("google_search").is_some()),
-            "expected google_search grounding when not in consultant mode"
+            "expected google_search grounding when not in text-only mode"
         );
     }
 
@@ -1137,10 +1137,10 @@ mod tests {
             tool_choice: ToolChoiceMode::Required,
         };
 
-        let (body, consultant_mode, include_grounding, disable_fn_calling) =
+        let (body, text_only_mode, include_grounding, disable_fn_calling) =
             p.build_request_body(system_instruction, contents, &tools, &options);
 
-        assert!(!consultant_mode);
+        assert!(!text_only_mode);
         assert!(!include_grounding);
         assert!(!disable_fn_calling);
         assert_eq!(

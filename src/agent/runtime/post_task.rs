@@ -229,6 +229,7 @@ fn user_friendly_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
         "terminal" => "command execution",
         "web_search" | "web_fetch" => "web access",
+        "http_request" => "API access",
         "cli_agent" => "external agent",
         "edit_file" | "write_file" | "read_file" => "file operations",
         "browser" => "browser interaction",
@@ -665,6 +666,7 @@ pub(in crate::agent) fn categorize_tool_calls(tool_calls: &[String]) -> String {
     let mut commands_run: Vec<&str> = Vec::new();
     let mut files_sent: Vec<&str> = Vec::new();
     let mut searches: Vec<&str> = Vec::new();
+    let mut external_reads: Vec<&str> = Vec::new();
     let mut other: Vec<&str> = Vec::new();
 
     for entry in tool_calls {
@@ -683,6 +685,7 @@ pub(in crate::agent) fn categorize_tool_calls(tool_calls: &[String]) -> String {
             "terminal" | "run_command" => commands_run.push(args),
             "send_file" | "send_media" => files_sent.push(args),
             "web_search" | "search_files" => searches.push(args),
+            "web_fetch" | "http_request" => external_reads.push(args),
             "project_inspect" => files_read.push(args),
             _ => {
                 if !args.is_empty() {
@@ -713,6 +716,10 @@ pub(in crate::agent) fn categorize_tool_calls(tool_calls: &[String]) -> String {
     if !searches.is_empty() {
         let items: Vec<&str> = searches.iter().copied().take(5).collect();
         sections.push(format!("Searches: {}", items.join(", ")));
+    }
+    if !external_reads.is_empty() {
+        let items: Vec<&str> = external_reads.iter().copied().take(8).collect();
+        sections.push(format!("External sources checked: {}", items.join(", ")));
     }
 
     if sections.is_empty() {
@@ -1056,6 +1063,18 @@ mod tests {
         assert!(summary.contains("- web access"));
         let web_access_mentions = summary.matches("web access").count();
         assert_eq!(web_access_mentions, 1, "web access should be deduplicated");
+    }
+
+    #[test]
+    fn test_tool_failure_summary_labels_http_request_as_api_access() {
+        let mut tool_failure_count = HashMap::new();
+        tool_failure_count.insert(
+            "http_request".to_string(),
+            semantic_failure_limit("http_request"),
+        );
+        let summary = format_tool_failure_summary(&tool_failure_count);
+        assert!(summary.contains("- API access"));
+        assert!(!summary.contains("other capability"));
     }
 
     #[test]

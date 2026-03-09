@@ -1,8 +1,8 @@
 use super::bootstrap_phase::{BootstrapCtx, BootstrapData, BootstrapOutcome};
-use super::consultant_orchestration_phase::ConsultantOrchestrationCtx;
-use super::consultant_phase::{ConsultantPhaseCtx, ConsultantPhaseOutcome};
 use super::llm_phase::{LlmPhaseCtx, LlmPhaseOutcome};
 use super::message_build_phase::{MessageBuildCtx, MessageBuildData};
+use super::orchestration_phase::OrchestrationCtx;
+use super::response_phase::{ResponsePhaseCtx, ResponsePhaseOutcome};
 use super::stopping_phase::{StoppingPhaseCtx, StoppingPhaseOutcome};
 use super::tool_execution_phase::{ToolExecutionCtx, ToolExecutionOutcome};
 use super::tool_prelude_phase::{ToolPreludeCtx, ToolPreludeOutcome};
@@ -136,7 +136,6 @@ impl Agent {
             llm_provider,
             llm_router,
             mut model,
-            mut consultant_pass_active,
             route_failsafe_active,
             system_prompt,
             pinned_memories,
@@ -217,7 +216,6 @@ impl Agent {
         const SCHEDULED_HARD_TOKEN_CAP: i64 = 20_000_000;
         let mut pending_system_messages: Vec<SystemDirective> = Vec::new();
         if route_failsafe_active {
-            consultant_pass_active = false;
             pending_system_messages.push(SystemDirective::RouteFailsafeActive);
         }
         // Track recent tool names for alternating pattern detection (A-B-A-B cycles)
@@ -260,8 +258,8 @@ impl Agent {
         let mut dirs_with_search_no_matches: HashSet<String> = HashSet::new();
         // When true, the assistant must run at least one file re-check before finalizing text.
         let mut require_file_recheck_before_answer = false;
-        // Route fail-safe bypasses consultant pass; seed tools-required state so
-        // text-only completions cannot bypass execution in this mode.
+        // Route fail-safe bypasses normal first-pass routing; seed tools-required
+        // state so text-only completions cannot bypass execution in this mode.
         let mut needs_tools_for_turn = route_failsafe_active;
 
         // Determine iteration limit behavior
@@ -608,7 +606,7 @@ impl Agent {
             {
                 let intent_gate = infer_deterministic_orchestration_intent(user_text);
                 if let Some(outcome) = self
-                    .run_consultant_orchestration_phase(&mut ConsultantOrchestrationCtx {
+                    .run_orchestration_phase(&mut OrchestrationCtx {
                         emitter: &emitter,
                         task_id: &task_id,
                         session_id,
@@ -635,9 +633,9 @@ impl Agent {
                     .await?
                 {
                     match outcome {
-                        ConsultantPhaseOutcome::ContinueLoop => continue,
-                        ConsultantPhaseOutcome::Return(result) => return result,
-                        ConsultantPhaseOutcome::ProceedToToolExecution => {}
+                        ResponsePhaseOutcome::ContinueLoop => continue,
+                        ResponsePhaseOutcome::Return(result) => return result,
+                        ResponsePhaseOutcome::ProceedToToolExecution => {}
                     }
                 }
             }
@@ -649,7 +647,6 @@ impl Agent {
                     user_text,
                     model: &model,
                     system_prompt: &system_prompt,
-                    consultant_pass_active,
                     pinned_memories: &pinned_memories,
                     tool_defs: &tool_defs,
                     policy_bundle: &policy_bundle,
@@ -669,7 +666,6 @@ impl Agent {
                     session_id,
                     user_text,
                     iteration,
-                    consultant_pass_active,
                     force_text_response,
                     task_start,
                     task_tokens_used: &mut task_tokens_used,
@@ -706,15 +702,14 @@ impl Agent {
                 LlmPhaseOutcome::Proceed(resp) => resp,
             };
 
-            let consultant_outcome = self
-                .run_consultant_phase(&mut ConsultantPhaseCtx {
+            let response_outcome = self
+                .run_response_phase(&mut ResponsePhaseCtx {
                     resp: &mut resp,
                     emitter: &emitter,
                     task_id: &task_id,
                     session_id,
                     user_text,
                     iteration,
-                    consultant_pass_active,
                     task_start,
                     task_tokens_used,
                     learning_ctx: &mut learning_ctx,
@@ -753,10 +748,10 @@ impl Agent {
                     force_text_response,
                 })
                 .await?;
-            match consultant_outcome {
-                ConsultantPhaseOutcome::ContinueLoop => continue,
-                ConsultantPhaseOutcome::Return(result) => return result,
-                ConsultantPhaseOutcome::ProceedToToolExecution => {}
+            match response_outcome {
+                ResponsePhaseOutcome::ContinueLoop => continue,
+                ResponsePhaseOutcome::Return(result) => return result,
+                ResponsePhaseOutcome::ProceedToToolExecution => {}
             }
             // === EXECUTE TOOL CALLS ===
             let tool_prelude_outcome = self

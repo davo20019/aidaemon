@@ -12,8 +12,8 @@ mod goal_delivery_tests;
 #[path = "runtime/goal_failure_tests.rs"]
 mod goal_failure_tests;
 
-#[path = "consultant/consultant_prompt_tests.rs"]
-mod consultant_prompt_tests;
+#[path = "response_analysis_tests.rs"]
+mod response_analysis_tests;
 
 #[path = "intent/intent_tests.rs"]
 mod intent_tests;

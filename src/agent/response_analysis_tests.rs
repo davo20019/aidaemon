@@ -12,17 +12,6 @@ fn test_strip_markdown_section_removes_target_heading() {
 }
 
 #[test]
-fn test_build_consultant_system_prompt_adds_marker_and_strips_tools() {
-    let prompt = "## Identity\nA\n## Tool Selection Guide\nB\n## Tools\nC\n## Behavior\nD";
-    let consultant = build_consultant_system_prompt(prompt, ConsultantPromptStyle::Full);
-    assert!(consultant.contains(CONSULTANT_TEXT_ONLY_MARKER));
-    assert!(consultant.contains("## Identity"));
-    assert!(consultant.contains("## Behavior"));
-    assert!(!consultant.contains("## Tool Selection Guide"));
-    assert!(!consultant.contains("## Tools"));
-}
-
-#[test]
 fn test_build_tool_loop_system_prompt_strips_heavy_sections() {
     let prompt = "## Identity\nA\n## Tool Selection Guide\nB\n## Tools\nC\n## Behavior\nD";
 
@@ -150,39 +139,39 @@ fn test_infer_intent_gate_does_not_infer_schedule_from_user_text() {
 }
 
 #[test]
-fn test_sanitize_consultant_analysis_strips_marker_and_pseudo_tool_block() {
+fn test_sanitize_response_analysis_strips_marker_and_pseudo_tool_block() {
     let input = "I recall it was deployed to Cloudflare Workers.\n\n\
-                 [CONSULTANT_TEXT_ONLY_MODE]\n\
+                 [TEXT_ONLY_RESPONSE_MODE]\n\
                  [tool_use: terminal]\n\
                  cmd: find $HOME -name wrangler.toml\n\
                  args: {\"x\":1}";
-    let out = sanitize_consultant_analysis(input);
+    let out = sanitize_response_analysis(input);
     assert!(out.contains("I recall it was deployed to Cloudflare Workers."));
-    assert!(!out.contains("CONSULTANT_TEXT_ONLY_MODE"));
+    assert!(!out.contains("TEXT_ONLY_RESPONSE_MODE"));
     assert!(!out.contains("[tool_use:"));
     assert!(!out.contains("cmd:"));
     assert!(!out.contains("args:"));
 }
 
 #[test]
-fn test_sanitize_consultant_analysis_keeps_normal_cmd_text_without_tool_block() {
+fn test_sanitize_response_analysis_keeps_normal_cmd_text_without_tool_block() {
     let input = "Run this command manually:\ncmd: wrangler whoami";
-    let out = sanitize_consultant_analysis(input);
+    let out = sanitize_response_analysis(input);
     assert!(out.contains("cmd: wrangler whoami"));
 }
 
 #[test]
-fn test_sanitize_consultant_analysis_strips_arguments_name_terminal_block() {
+fn test_sanitize_response_analysis_strips_arguments_name_terminal_block() {
     let input = "I'll check config.\n\narguments:\nname: terminal";
-    let out = sanitize_consultant_analysis(input);
+    let out = sanitize_response_analysis(input);
     assert_eq!(out, "I'll check config.");
 }
 
 #[test]
-fn test_sanitize_consultant_analysis_strips_echoed_important_instruction() {
+fn test_sanitize_response_analysis_strips_echoed_important_instruction() {
     let input = "I don't have the exact URL yet.\n\n\
         [IMPORTANT: You are being consulted for your knowledge and reasoning. Respond with TEXT ONLY. Do NOT call any functions or tools. Do NOT output functionCall or tool_use blocks. Answer the user's question directly from your knowledge and the context provided.]";
-    let out = sanitize_consultant_analysis(input);
+    let out = sanitize_response_analysis(input);
     assert_eq!(out, "I don't have the exact URL yet.");
 }
 
@@ -327,10 +316,10 @@ fn test_parse_wait_task_seconds_ignores_non_wait_tasks() {
 }
 
 #[test]
-fn test_sanitize_consultant_analysis_strips_consultation_heading() {
+fn test_sanitize_response_analysis_strips_consultation_heading() {
     let input =
         "I don't have the URL yet.\n\n[Consultation]\nTo find it I'd inspect wrangler.toml.";
-    let out = sanitize_consultant_analysis(input);
+    let out = sanitize_response_analysis(input);
     assert!(!out.contains("[Consultation]"));
 }
 

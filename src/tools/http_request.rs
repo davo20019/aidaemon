@@ -39,6 +39,7 @@ pub struct HttpRequestTool {
     profiles: Arc<RwLock<HashMap<String, HttpAuthProfile>>>,
     approval_tx: mpsc::Sender<ApprovalRequest>,
     session_approvals: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    oauth_gateway: Arc<RwLock<Option<crate::oauth::OAuthGateway>>>,
 }
 
 impl HttpRequestTool {
@@ -50,7 +51,18 @@ impl HttpRequestTool {
             profiles,
             approval_tx,
             session_approvals: Arc::new(RwLock::new(HashMap::new())),
+            oauth_gateway: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub fn with_oauth_gateway(mut self, gateway: crate::oauth::OAuthGateway) -> Self {
+        self.oauth_gateway = Arc::new(RwLock::new(Some(gateway)));
+        self
+    }
+
+    pub async fn set_oauth_gateway(&self, gateway: crate::oauth::OAuthGateway) {
+        let mut guard = self.oauth_gateway.write().await;
+        *guard = Some(gateway);
     }
 
     /// Check if a request domain is allowed by the profile's allowed_domains.
@@ -389,6 +401,103 @@ impl HttpRequestTool {
         }
     }
 
+    fn content_type_is_json(content_type: &str) -> bool {
+        let normalized = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim()
+            .to_ascii_lowercase();
+        normalized == "application/json"
+            || normalized.ends_with("+json")
+            || normalized == "text/json"
+    }
+
+    fn summarize_json_value(value: &Value) -> Option<String> {
+        match value {
+            Value::Object(map) => {
+                let mut lines = Vec::new();
+                let mut top_keys: Vec<&str> = map.keys().map(|key| key.as_str()).collect();
+                top_keys.sort_unstable();
+                if !top_keys.is_empty() {
+                    let key_list = top_keys
+                        .iter()
+                        .take(10)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let suffix = if top_keys.len() > 10 { ", ..." } else { "" };
+                    lines.push(format!("Top-level keys: {}{}", key_list, suffix));
+                }
+
+                let mut array_keys: Vec<&str> = map
+                    .iter()
+                    .filter_map(|(key, value)| value.as_array().map(|_| key.as_str()))
+                    .collect();
+                array_keys.sort_unstable();
+                for key in array_keys.into_iter().take(3) {
+                    if let Some(items) = map.get(key).and_then(|value| value.as_array()) {
+                        lines.push(format!("{}: array({} item(s))", key, items.len()));
+                        if let Some(first_obj) = items.first().and_then(|value| value.as_object()) {
+                            let mut item_keys: Vec<&str> =
+                                first_obj.keys().map(|item_key| item_key.as_str()).collect();
+                            item_keys.sort_unstable();
+                            if !item_keys.is_empty() {
+                                let sample_keys = item_keys
+                                    .iter()
+                                    .take(8)
+                                    .copied()
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let suffix = if item_keys.len() > 8 { ", ..." } else { "" };
+                                lines.push(format!("{}[0] keys: {}{}", key, sample_keys, suffix));
+                            }
+                        }
+                    }
+                }
+
+                if lines.is_empty() {
+                    None
+                } else {
+                    Some(lines.join("\n"))
+                }
+            }
+            Value::Array(items) => {
+                Some(format!("Top-level JSON array with {} item(s)", items.len()))
+            }
+            _ => None,
+        }
+    }
+
+    fn format_json_response_body(
+        text: &str,
+        content_type: &str,
+        max_response_bytes: u64,
+        truncated: bool,
+    ) -> Option<String> {
+        let trimmed = text.trim_start();
+        if !(Self::content_type_is_json(content_type)
+            || trimmed.starts_with('{')
+            || trimmed.starts_with('['))
+        {
+            return None;
+        }
+
+        let value = serde_json::from_str::<Value>(text).ok()?;
+        let pretty = serde_json::to_string_pretty(&value).ok()?;
+        let body = if let Some(summary) = Self::summarize_json_value(&value) {
+            format!("JSON summary:\n{}\n\n{}", summary, pretty)
+        } else {
+            pretty
+        };
+
+        if truncated {
+            Some(Self::append_truncation_notice(&body, max_response_bytes))
+        } else {
+            Some(body)
+        }
+    }
+
     fn format_response_body(
         bytes: &[u8],
         content_type: &str,
@@ -411,6 +520,14 @@ impl HttpRequestTool {
 
         match String::from_utf8(bytes.to_vec()) {
             Ok(text) => {
+                if let Some(json_text) = Self::format_json_response_body(
+                    &text,
+                    content_type,
+                    max_response_bytes,
+                    truncated,
+                ) {
+                    return json_text;
+                }
                 if truncated {
                     Self::append_truncation_notice(&text, max_response_bytes)
                 } else {
@@ -437,6 +554,45 @@ impl HttpRequestTool {
                 }
             }
         }
+    }
+
+    fn build_oauth_retry_note(
+        profile_name: &str,
+        refresh_message: &str,
+        retry_status: reqwest::StatusCode,
+    ) -> String {
+        if retry_status == reqwest::StatusCode::UNAUTHORIZED {
+            format!(
+                "aidaemon refreshed OAuth profile '{}' and retried the request once, but the remote API still returned HTTP 401 Unauthorized. {}",
+                profile_name, refresh_message
+            )
+        } else {
+            format!(
+                "aidaemon refreshed OAuth profile '{}' and retried the request once. {}",
+                profile_name, refresh_message
+            )
+        }
+    }
+
+    fn oauth_diagnostic_line(
+        status_code: u16,
+        auth_profile_name: Option<&str>,
+        oauth_retry_note: Option<&str>,
+    ) -> Option<String> {
+        if let Some(note) = oauth_retry_note {
+            return Some(format!("OAuth diagnostic: {}", note));
+        }
+
+        if status_code == 401 {
+            if let Some(profile_name) = auth_profile_name {
+                return Some(format!(
+                    "OAuth diagnostic: HTTP 401 Unauthorized while using auth_profile='{}'. This response alone does not prove the token is expired. It may also indicate revoked credentials, missing scopes, or app permission mismatch.",
+                    profile_name
+                ));
+            }
+        }
+
+        None
     }
 
     /// Build an OAuth 1.0a Authorization header value (RFC 5849).
@@ -687,6 +843,168 @@ impl HttpRequestTool {
             }
         }
     }
+
+    async fn try_refresh_oauth_profile(
+        &self,
+        profile_name: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let gateway = self.oauth_gateway.read().await.clone();
+        let Some(gateway) = gateway else {
+            return Ok(None);
+        };
+        if gateway.get_provider(profile_name).await.is_none() {
+            return Ok(None);
+        }
+        let result = gateway.refresh_token(profile_name).await?;
+        Ok(Some(result))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_request(
+        &self,
+        client: &reqwest::Client,
+        method: &str,
+        url: &str,
+        parsed_url: &reqwest::Url,
+        body: Option<&str>,
+        content_type: Option<&str>,
+        custom_headers: Option<&serde_json::Map<String, Value>>,
+        profile: Option<&HttpAuthProfile>,
+        profiles_snapshot: &HashMap<String, HttpAuthProfile>,
+        follow_redirects: bool,
+    ) -> anyhow::Result<(reqwest::Response, usize)> {
+        let mut current_url = url.to_string();
+        let mut current_method = method.to_string();
+        let original_url = parsed_url.clone();
+        let mut redirect_count = 0;
+        let mut resend_body = false;
+
+        let response = loop {
+            let mut builder = match current_method.as_str() {
+                "GET" => client.get(&current_url),
+                "POST" => client.post(&current_url),
+                "PUT" => client.put(&current_url),
+                "PATCH" => client.patch(&current_url),
+                "DELETE" => client.delete(&current_url),
+                _ => return Err(anyhow::anyhow!("Unsupported method: {}", current_method)),
+            };
+
+            if let Some(ct) = content_type {
+                builder = builder.header("Content-Type", ct);
+            }
+            if let Some(payload) = body {
+                if redirect_count == 0 || resend_body {
+                    builder = builder.body(payload.to_string());
+                }
+            }
+
+            if let Some(headers) = custom_headers {
+                for (k, v) in headers {
+                    if let Some(val) = v.as_str() {
+                        builder = builder.header(k.as_str(), val);
+                    }
+                }
+            }
+
+            let current_parsed = reqwest::Url::parse(&current_url).unwrap_or(parsed_url.clone());
+            let same_origin = Self::same_origin(&original_url, &current_parsed);
+
+            if let Some(profile) = profile {
+                if same_origin {
+                    builder = Self::apply_auth(
+                        builder,
+                        profile,
+                        &current_method,
+                        &current_url,
+                        if redirect_count == 0 || resend_body {
+                            body
+                        } else {
+                            None
+                        },
+                        content_type,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "{}",
+                            Self::strip_credentials_from_error_with(
+                                profiles_snapshot,
+                                &e.to_string()
+                            )
+                        )
+                    })?;
+                } else {
+                    warn!(
+                        "Auth stripped on cross-origin redirect: {} -> {}",
+                        original_url, current_parsed
+                    );
+                }
+            }
+
+            let resp = builder.send().await.map_err(|e| {
+                anyhow::anyhow!(
+                    "{}",
+                    Self::strip_credentials_from_error_with(profiles_snapshot, &e.to_string())
+                )
+            })?;
+
+            if follow_redirects && resp.status().is_redirection() {
+                redirect_count += 1;
+                if redirect_count > MAX_REDIRECTS {
+                    return Err(anyhow::anyhow!(
+                        "Request stopped: exceeded maximum {} redirects",
+                        MAX_REDIRECTS
+                    ));
+                }
+
+                if let Some(location) = resp.headers().get("location") {
+                    let location_str = location.to_str().unwrap_or("");
+                    let next_url = if location_str.starts_with("http") {
+                        location_str.to_string()
+                    } else {
+                        let base = reqwest::Url::parse(&current_url).unwrap_or(parsed_url.clone());
+                        base.join(location_str)
+                            .map(|u| u.to_string())
+                            .unwrap_or(location_str.to_string())
+                    };
+
+                    if let Err(reason) = validate_url_for_ssrf(&next_url) {
+                        return Err(anyhow::anyhow!(
+                            "Redirect blocked (hop {}): {}",
+                            redirect_count,
+                            reason
+                        ));
+                    }
+
+                    if let Ok(next_parsed) = reqwest::Url::parse(&next_url) {
+                        if next_parsed.scheme() != "https" {
+                            return Err(anyhow::anyhow!(
+                                "Redirect blocked: redirected to non-HTTPS URL"
+                            ));
+                        }
+                    }
+
+                    current_url = next_url;
+                    let (next_method, next_resend_body) = Self::redirect_behavior(
+                        &current_method,
+                        resp.status().as_u16(),
+                        body.is_some(),
+                    );
+                    current_method = next_method;
+                    resend_body = next_resend_body;
+                    continue;
+                }
+
+                return Err(anyhow::anyhow!(
+                    "Redirect response (HTTP {}) missing Location header",
+                    resp.status()
+                ));
+            }
+
+            break resp;
+        };
+
+        Ok((response, redirect_count))
+    }
 }
 
 /// Simple percent-decoding for form-encoded body params.
@@ -872,13 +1190,13 @@ impl Tool for HttpRequestTool {
         }
 
         // Step 5: Resolve auth profile and check domain
-        let profiles_guard = self.profiles.read().await;
+        let profiles_snapshot = self.profiles.read().await.clone();
         let profile = if let Some(name) = auth_profile_name {
-            let p = profiles_guard
+            let p = profiles_snapshot
                 .get(name)
+                .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Unknown auth profile: '{}'", name))?;
 
-            // Verify request domain is in allowed_domains
             let request_host = parsed_url.host_str().unwrap_or("");
             let domain_ok = p
                 .allowed_domains
@@ -967,146 +1285,96 @@ impl Tool for HttpRequestTool {
             }
         }
 
-        // Step 9: Execute request with manual redirect loop
+        // Step 9: Execute request, optionally refreshing OAuth-backed bearer auth once on 401.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
+        if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
+            return Ok(format!("Unsupported method: {}", method));
+        }
 
-        let mut current_url = url.clone();
-        let mut current_method = method.clone();
-        let original_url = parsed_url.clone();
-        let mut redirect_count = 0;
-        let mut resend_body = false;
+        let (mut response, mut redirect_count) = self
+            .execute_request(
+                &client,
+                &method,
+                &url,
+                &parsed_url,
+                body,
+                content_type.as_deref(),
+                custom_headers,
+                profile.as_ref(),
+                &profiles_snapshot,
+                follow_redirects,
+            )
+            .await?;
 
-        let mut response = loop {
-            let mut builder = match current_method.as_str() {
-                "GET" => client.get(&current_url),
-                "POST" => client.post(&current_url),
-                "PUT" => client.put(&current_url),
-                "PATCH" => client.patch(&current_url),
-                "DELETE" => client.delete(&current_url),
-                _ => return Ok(format!("Unsupported method: {}", current_method)),
-            };
-
-            // Set content-type and body
-            if let Some(ref ct) = content_type {
-                builder = builder.header("Content-Type", ct.as_str());
-            }
-            if let Some(b) = body {
-                if redirect_count == 0 || resend_body {
-                    builder = builder.body(b.to_string());
-                }
-            }
-
-            // Add custom headers
-            if let Some(headers) = custom_headers {
-                for (k, v) in headers {
-                    if let Some(val) = v.as_str() {
-                        builder = builder.header(k.as_str(), val);
-                    }
-                }
-            }
-
-            // Apply auth (only if same origin)
-            let current_parsed = reqwest::Url::parse(&current_url).unwrap_or(parsed_url.clone());
-            let same_origin = Self::same_origin(&original_url, &current_parsed);
-
-            if let Some(p) = profile {
-                if same_origin {
-                    builder = Self::apply_auth(
-                        builder,
-                        p,
-                        &current_method,
-                        &current_url,
-                        if redirect_count == 0 || resend_body {
-                            body
-                        } else {
-                            None
-                        },
-                        content_type.as_deref(),
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "{}",
-                            Self::strip_credentials_from_error_with(
-                                &profiles_guard,
-                                &e.to_string()
-                            )
-                        )
-                    })?;
-                } else {
-                    warn!(
-                        "Auth stripped on cross-origin redirect: {} -> {}",
-                        original_url, current_parsed
-                    );
-                }
-            }
-
-            let resp = builder.send().await.map_err(|e| {
-                anyhow::anyhow!(
-                    "{}",
-                    Self::strip_credentials_from_error_with(&profiles_guard, &e.to_string())
-                )
-            })?;
-
-            // Handle redirects manually
-            if follow_redirects && resp.status().is_redirection() {
-                redirect_count += 1;
-                if redirect_count > MAX_REDIRECTS {
-                    return Ok(format!(
-                        "Request stopped: exceeded maximum {} redirects",
-                        MAX_REDIRECTS
-                    ));
-                }
-
-                if let Some(location) = resp.headers().get("location") {
-                    let location_str = location.to_str().unwrap_or("");
-                    let next_url = if location_str.starts_with("http") {
-                        location_str.to_string()
-                    } else {
-                        // Relative redirect
-                        let base = reqwest::Url::parse(&current_url).unwrap_or(parsed_url.clone());
-                        base.join(location_str)
-                            .map(|u| u.to_string())
-                            .unwrap_or(location_str.to_string())
-                    };
-
-                    // SSRF check on each redirect hop
-                    if let Err(reason) = validate_url_for_ssrf(&next_url) {
-                        return Ok(format!(
-                            "Redirect blocked (hop {}): {}",
-                            redirect_count, reason
-                        ));
-                    }
-
-                    // HTTPS enforcement on redirects
-                    if let Ok(next_parsed) = reqwest::Url::parse(&next_url) {
-                        if next_parsed.scheme() != "https" {
-                            return Ok("Redirect blocked: redirected to non-HTTPS URL".to_string());
+        let mut oauth_retry_note: Option<String> = None;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(profile_name) = auth_profile_name {
+                let is_bearer_profile = profile.as_ref().is_some_and(|resolved| {
+                    matches!(resolved.auth_type, crate::config::HttpAuthType::Bearer)
+                });
+                if is_bearer_profile {
+                    match self.try_refresh_oauth_profile(profile_name).await {
+                        Ok(Some(refresh_message)) => {
+                            let refreshed_profiles = self.profiles.read().await.clone();
+                            let refreshed_profile = refreshed_profiles.get(profile_name).cloned();
+                            if let Some(refreshed_profile_value) = refreshed_profile {
+                                let (retry_response, retry_redirects) = self
+                                    .execute_request(
+                                        &client,
+                                        &method,
+                                        &url,
+                                        &parsed_url,
+                                        body,
+                                        content_type.as_deref(),
+                                        custom_headers,
+                                        Some(&refreshed_profile_value),
+                                        &refreshed_profiles,
+                                        follow_redirects,
+                                    )
+                                    .await?;
+                                let retry_status = retry_response.status();
+                                response = retry_response;
+                                redirect_count = retry_redirects;
+                                oauth_retry_note = Some(Self::build_oauth_retry_note(
+                                    profile_name,
+                                    &refresh_message,
+                                    retry_status,
+                                ));
+                            } else {
+                                oauth_retry_note = Some(format!(
+                                    "aidaemon refreshed OAuth provider state for '{}' but could not rebuild the HTTP auth profile, so it did not retry the request. {}",
+                                    profile_name, refresh_message
+                                ));
+                            }
+                        }
+                        Ok(None) => {
+                            oauth_retry_note = Some(format!(
+                                "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. \
+aidaemon did not attempt an OAuth refresh because this profile is not managed by the OAuth gateway.",
+                                profile_name
+                            ));
+                        }
+                        Err(err) => {
+                            oauth_retry_note = Some(format!(
+                                "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. \
+aidaemon attempted an OAuth refresh once, but it failed: {}",
+                                profile_name, err
+                            ));
                         }
                     }
-
-                    current_url = next_url;
-                    let (next_method, next_resend_body) = Self::redirect_behavior(
-                        &current_method,
-                        resp.status().as_u16(),
-                        body.is_some(),
-                    );
-                    current_method = next_method;
-                    resend_body = next_resend_body;
-                    continue;
                 } else {
-                    return Ok(format!(
-                        "Redirect response (HTTP {}) missing Location header",
-                        resp.status()
+                    oauth_retry_note = Some(format!(
+                        "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. \
+aidaemon did not attempt an OAuth refresh because this profile is not bearer-token OAuth-managed.",
+                        profile_name
                     ));
                 }
             }
-
-            break resp;
-        };
+        }
 
         // Step 9: Format response
         let status = response.status();
@@ -1124,10 +1392,11 @@ impl Tool for HttpRequestTool {
         let mut collected_body = Vec::new();
         let mut observed_bytes = 0u64;
         let mut truncated = false;
+        let response_profiles = self.profiles.read().await.clone();
         while let Some(chunk) = response.chunk().await.map_err(|e| {
             anyhow::anyhow!(
                 "{}",
-                Self::strip_credentials_from_error_with(&profiles_guard, &e.to_string())
+                Self::strip_credentials_from_error_with(&response_profiles, &e.to_string())
             )
         })? {
             truncated = Self::append_chunk_with_limit(
@@ -1179,6 +1448,14 @@ impl Tool for HttpRequestTool {
         if status_code >= 400 {
             result.push_str("\n--- API ERROR ---\n");
             result.push_str(&format!("Status: {}\n", status_code));
+            if let Some(diagnostic_line) = Self::oauth_diagnostic_line(
+                status_code,
+                auth_profile_name,
+                oauth_retry_note.as_deref(),
+            ) {
+                result.push_str(&diagnostic_line);
+                result.push('\n');
+            }
 
             // Try to parse common API error formats (JSON with detail/message/error fields)
             if let Ok(error_json) = serde_json::from_str::<Value>(&body_str) {
@@ -1514,6 +1791,56 @@ mod tests {
         let formatted = HttpRequestTool::format_response_body(b"\x89PNG", "image/png", 10, 4, true);
         assert!(formatted.contains("Binary response truncated"));
         assert!(formatted.contains("image/png"));
+    }
+
+    #[test]
+    fn test_format_response_body_pretty_prints_json_with_summary() {
+        let raw = br#"{"studies":[{"protocolSection":{"identificationModule":{"briefTitle":"Skin Trial"}}}],"nextPageToken":"abc"}"#;
+        let formatted = HttpRequestTool::format_response_body(
+            raw,
+            "application/json",
+            raw.len() as u64,
+            4096,
+            false,
+        );
+        assert!(formatted.contains("JSON summary:"));
+        assert!(formatted.contains("studies: array(1 item(s))"));
+        assert!(formatted.contains("\"briefTitle\": \"Skin Trial\""));
+        assert!(formatted.contains('\n'));
+    }
+
+    #[test]
+    fn test_build_oauth_retry_note_mentions_persistent_401() {
+        let note = HttpRequestTool::build_oauth_retry_note(
+            "twitter",
+            "Token refreshed for twitter",
+            reqwest::StatusCode::UNAUTHORIZED,
+        );
+        assert!(note.contains("still returned HTTP 401 Unauthorized"));
+        assert!(note.contains("Token refreshed for twitter"));
+    }
+
+    #[test]
+    fn test_oauth_diagnostic_line_avoids_expiry_guessing() {
+        let diagnostic =
+            HttpRequestTool::oauth_diagnostic_line(401, Some("twitter"), None).unwrap();
+        assert!(diagnostic.contains("does not prove the token is expired"));
+        assert!(diagnostic.contains("missing scopes"));
+        assert!(diagnostic.contains("app permission mismatch"));
+    }
+
+    #[test]
+    fn test_oauth_diagnostic_line_prefers_concrete_retry_note() {
+        let diagnostic = HttpRequestTool::oauth_diagnostic_line(
+            401,
+            Some("twitter"),
+            Some("retried the request once"),
+        )
+        .unwrap();
+        assert_eq!(
+            diagnostic,
+            "OAuth diagnostic: retried the request once".to_string()
+        );
     }
 
     #[test]

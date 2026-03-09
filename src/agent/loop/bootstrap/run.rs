@@ -396,9 +396,9 @@ impl Agent {
         let llm_router = llm_runtime_snapshot.router();
 
         // Model selection: route to the appropriate model.
-        // Consultant text-only pre-pass is disabled; iteration 1 runs deterministic
-        // control-plane routing before entering the normal tool-enabled loop.
-        let (selected_model, mut consultant_pass_active) = {
+        // Iteration 1 runs deterministic orchestration routing before entering
+        // the normal tool-enabled loop.
+        let selected_model = {
             let is_override = match tokio::time::timeout(
                 Duration::from_secs(2),
                 self.model_override.read(),
@@ -437,7 +437,7 @@ impl Agent {
                         policy_profile = ?policy_bundle.policy.model_profile,
                         "Selected model for task"
                     );
-                    (routed_model, false)
+                    routed_model
                 } else {
                     // No router: for top-level auto mode, pick the model from the same
                     // runtime snapshot as provider/router to avoid transient reload races.
@@ -457,7 +457,7 @@ impl Agent {
                             }
                         }
                     };
-                    (m, false)
+                    m
                 }
             } else {
                 // Model override keeps normal loop behavior.
@@ -472,15 +472,14 @@ impl Agent {
                         llm_runtime_snapshot.primary_model()
                     }
                 };
-                (m, false)
+                m
             }
         };
         let mut model = selected_model.clone();
         let route_failsafe_active = route_failsafe_active_for_session(session_id);
         if route_failsafe_active {
-            // Fail-safe mode: bypass consultant direct-return routing and force
-            // strong profile/model selection for this turn.
-            consultant_pass_active = false;
+            // Fail-safe mode: bypass deterministic direct-return routing and
+            // force strong profile/model selection for this turn.
             if !matches!(policy_bundle.policy.model_profile, ModelProfile::Strong) {
                 policy_bundle.policy = ExecutionPolicy::for_profile(ModelProfile::Strong);
                 policy_bundle
@@ -581,7 +580,6 @@ impl Agent {
             llm_provider,
             llm_router,
             model,
-            consultant_pass_active,
             route_failsafe_active,
             system_prompt,
             pinned_memories,

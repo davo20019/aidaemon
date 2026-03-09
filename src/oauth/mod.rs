@@ -14,6 +14,10 @@ use crate::traits::StateStore;
 
 /// Timeout for OAuth flow completion (10 minutes).
 const FLOW_TIMEOUT_SECS: u64 = 600;
+const RECENT_FLOW_RESULT_TTL_SECS: i64 = 900;
+const FLOW_EXPIRED_MESSAGE: &str = "OAuth flow expired (10 minutes). Please try again.";
+const INVALID_OR_USED_FLOW_MESSAGE: &str =
+    "OAuth flow expired or was already used. Please start a new connection attempt.";
 
 /// OAuth type enum.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +60,19 @@ struct PendingFlow {
     result_tx: oneshot::Sender<OAuthFlowResult>,
 }
 
+struct RecentFlowResult {
+    message: String,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+struct ResolvedPendingFlow {
+    state: String,
+    provider_name: String,
+    code_verifier: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    result_tx: Option<oneshot::Sender<OAuthFlowResult>>,
+}
+
 /// Shared HTTP auth profiles map type.
 pub type SharedHttpProfiles = Arc<RwLock<HashMap<String, HttpAuthProfile>>>;
 
@@ -64,6 +81,7 @@ pub type SharedHttpProfiles = Arc<RwLock<HashMap<String, HttpAuthProfile>>>;
 pub struct OAuthGateway {
     providers: Arc<RwLock<HashMap<String, OAuthProvider>>>,
     pending_flows: Arc<RwLock<HashMap<String, PendingFlow>>>,
+    recent_flow_results: Arc<RwLock<HashMap<String, RecentFlowResult>>>,
     state_store: Arc<dyn StateStore>,
     http_profiles: SharedHttpProfiles,
     callback_base_url: String,
@@ -78,6 +96,7 @@ impl OAuthGateway {
         Self {
             providers: Arc::new(RwLock::new(HashMap::new())),
             pending_flows: Arc::new(RwLock::new(HashMap::new())),
+            recent_flow_results: Arc::new(RwLock::new(HashMap::new())),
             state_store,
             http_profiles,
             callback_base_url,
@@ -171,6 +190,120 @@ impl OAuthGateway {
         uuid::Uuid::new_v4().to_string()
     }
 
+    pub fn expired_flow_message() -> &'static str {
+        FLOW_EXPIRED_MESSAGE
+    }
+
+    fn parse_pending_flow_created_at(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|parsed| parsed.with_timezone(&chrono::Utc))
+    }
+
+    fn flow_cutoff() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::seconds(FLOW_TIMEOUT_SECS as i64)
+    }
+
+    fn flow_is_expired(created_at: chrono::DateTime<chrono::Utc>) -> bool {
+        created_at < Self::flow_cutoff()
+    }
+
+    async fn remember_recent_flow_result(&self, state: &str, message: String) {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(RECENT_FLOW_RESULT_TTL_SECS);
+        let mut recent = self.recent_flow_results.write().await;
+        recent.retain(|_, result| result.recorded_at >= cutoff);
+        recent.insert(
+            state.to_string(),
+            RecentFlowResult {
+                message,
+                recorded_at: chrono::Utc::now(),
+            },
+        );
+    }
+
+    async fn recent_flow_result(&self, state: &str) -> Option<String> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(RECENT_FLOW_RESULT_TTL_SECS);
+        let mut recent = self.recent_flow_results.write().await;
+        recent.retain(|_, result| result.recorded_at >= cutoff);
+        recent.get(state).map(|result| result.message.clone())
+    }
+
+    async fn finalize_flow_result(&self, flow: ResolvedPendingFlow, message: String) -> String {
+        self.remember_recent_flow_result(&flow.state, message.clone())
+            .await;
+        if let Some(result_tx) = flow.result_tx {
+            let _ = result_tx.send(OAuthFlowResult {
+                service: flow.provider_name,
+                username: None,
+                message: message.clone(),
+            });
+        }
+        message
+    }
+
+    async fn resolve_pending_flow(
+        &self,
+        state: &str,
+    ) -> anyhow::Result<Option<ResolvedPendingFlow>> {
+        if let Some(stored) = self.state_store.get_pending_oauth_flow(state).await? {
+            self.state_store.delete_pending_oauth_flow(state).await?;
+            let result_tx = {
+                let mut flows = self.pending_flows.write().await;
+                flows.remove(state).map(|flow| flow.result_tx)
+            };
+            let created_at = match Self::parse_pending_flow_created_at(&stored.created_at) {
+                Some(created_at) => created_at,
+                None => {
+                    warn!(
+                        state = %state,
+                        stored_created_at = %stored.created_at,
+                        "Pending OAuth flow has an invalid timestamp; treating it as expired"
+                    );
+                    chrono::Utc::now() - chrono::Duration::seconds((FLOW_TIMEOUT_SECS as i64) + 1)
+                }
+            };
+            return Ok(Some(ResolvedPendingFlow {
+                state: stored.state,
+                provider_name: stored.service,
+                code_verifier: stored.code_verifier,
+                created_at,
+                result_tx,
+            }));
+        }
+
+        let flow = {
+            let mut flows = self.pending_flows.write().await;
+            flows.remove(state)
+        };
+        Ok(flow.map(|flow| ResolvedPendingFlow {
+            state: state.to_string(),
+            provider_name: flow.provider_name,
+            code_verifier: flow.code_verifier,
+            created_at: flow.created_at,
+            result_tx: Some(flow.result_tx),
+        }))
+    }
+
+    pub async fn expire_pending_flow(
+        &self,
+        state: &str,
+        message: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let Some(flow) = self.resolve_pending_flow(state).await? else {
+            return Ok(false);
+        };
+        let service = flow.provider_name.clone();
+        let message = message.unwrap_or_else(|| Self::expired_flow_message().to_string());
+        let final_message = self.finalize_flow_result(flow, message).await;
+        info!(
+            service = %service,
+            state = %state,
+            message = %final_message,
+            "Expired pending OAuth flow"
+        );
+        Ok(true)
+    }
+
     /// Check if client credentials exist in keychain for a service.
     pub fn has_credentials(service: &str) -> bool {
         let client_id_key = format!("oauth_{}_client_id", service);
@@ -248,18 +381,30 @@ impl OAuthGateway {
         }
 
         let (result_tx, result_rx) = oneshot::channel();
+        let created_at = chrono::Utc::now();
 
         let flow = PendingFlow {
             provider_name: service.to_string(),
             code_verifier,
             session_id: session_id.to_string(),
-            created_at: chrono::Utc::now(),
+            created_at,
             result_tx,
         };
 
+        let pending_flow = crate::traits::PendingOAuthFlow {
+            state: state.clone(),
+            service: service.to_string(),
+            code_verifier: flow.code_verifier.clone(),
+            session_id: session_id.to_string(),
+            created_at: created_at.to_rfc3339(),
+        };
+        self.state_store
+            .save_pending_oauth_flow(&pending_flow)
+            .await?;
+
         {
             let mut flows = self.pending_flows.write().await;
-            flows.insert(state, flow);
+            flows.insert(state.clone(), flow);
         }
 
         Ok((authorize_url, result_rx))
@@ -411,120 +556,157 @@ impl OAuthGateway {
         code: Option<&str>,
         error: Option<&str>,
     ) -> anyhow::Result<String> {
-        // Extract the pending flow
-        let flow = {
-            let mut flows = self.pending_flows.write().await;
-            flows
-                .remove(state)
-                .ok_or_else(|| anyhow::anyhow!("Unknown or expired OAuth state parameter"))?
+        let Some(flow) = self.resolve_pending_flow(state).await? else {
+            if let Some(message) = self.recent_flow_result(state).await {
+                return Ok(message);
+            }
+            return Ok(INVALID_OR_USED_FLOW_MESSAGE.to_string());
         };
+
+        if Self::flow_is_expired(flow.created_at) {
+            return Ok(self
+                .finalize_flow_result(flow, Self::expired_flow_message().to_string())
+                .await);
+        }
 
         // Check for error from provider
         if let Some(err) = error {
             let msg = format!("OAuth authorization denied: {}", err);
-            let _ = flow.result_tx.send(OAuthFlowResult {
-                service: flow.provider_name.clone(),
-                username: None,
-                message: msg.clone(),
-            });
-            return Ok(msg);
+            return Ok(self.finalize_flow_result(flow, msg).await);
         }
 
-        let code = code.ok_or_else(|| anyhow::anyhow!("No authorization code in callback"))?;
+        let service = flow.provider_name.clone();
+        let message = match async {
+            let code = code.ok_or_else(|| anyhow::anyhow!("No authorization code in callback"))?;
 
-        let provider = self
-            .get_provider(&flow.provider_name)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", flow.provider_name))?;
+            let provider = self
+                .get_provider(&flow.provider_name)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", flow.provider_name))?;
 
-        // Exchange code for tokens
-        let (client_id, client_secret) = Self::get_credentials(&flow.provider_name)?;
-        let callback_url = self.callback_url();
+            let (client_id, client_secret) = Self::get_credentials(&flow.provider_name)?;
+            let callback_url = self.callback_url();
 
-        let mut params = HashMap::new();
-        params.insert("grant_type", "authorization_code".to_string());
-        params.insert("code", code.to_string());
-        params.insert("redirect_uri", callback_url);
+            let mut params = HashMap::new();
+            params.insert("grant_type", "authorization_code".to_string());
+            params.insert("code", code.to_string());
+            params.insert("redirect_uri", callback_url);
 
-        if let Some(ref verifier) = flow.code_verifier {
-            params.insert("code_verifier", verifier.clone());
-        }
+            if let Some(ref verifier) = flow.code_verifier {
+                params.insert("code_verifier", verifier.clone());
+            }
 
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(&provider.token_url)
-            .basic_auth(&client_id, Some(&client_secret))
-            .form(&params)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Token exchange request failed: {}", e))?;
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(&provider.token_url)
+                .basic_auth(&client_id, Some(&client_secret))
+                .form(&params)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Token exchange request failed: {}", e))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let msg = format!("Token exchange failed (HTTP {}): {}", status, body);
-            let _ = flow.result_tx.send(OAuthFlowResult {
-                service: flow.provider_name.clone(),
-                username: None,
-                message: msg.clone(),
-            });
-            return Ok(msg);
-        }
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Token exchange failed (HTTP {}): {}", status, body);
+            }
 
-        let token_data: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse token response: {}", e))?;
+            let token_data: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to parse token response: {}", e))?;
 
-        let access_token = token_data["access_token"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("No access_token in response"))?;
-        let refresh_token = token_data["refresh_token"].as_str();
-        let expires_in = token_data["expires_in"].as_u64();
-        let message = self
-            .store_connected_bearer_profile(
+            let access_token = token_data["access_token"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("No access_token in response"))?;
+            let refresh_token = token_data["refresh_token"].as_str();
+            let expires_in = token_data["expires_in"].as_u64();
+
+            self.store_connected_bearer_profile(
                 &flow.provider_name,
                 &provider,
                 access_token,
                 refresh_token,
                 expires_in,
             )
-            .await?;
-        info!(
-            service = %flow.provider_name,
-            "OAuth connection established"
-        );
+            .await
+        }
+        .await
+        {
+            Ok(message) => {
+                info!(service = %service, "OAuth connection established");
+                message
+            }
+            Err(err) => {
+                warn!(
+                    service = %service,
+                    state = %state,
+                    error = %err,
+                    "OAuth callback failed"
+                );
+                err.to_string()
+            }
+        };
 
-        let _ = flow.result_tx.send(OAuthFlowResult {
-            service: flow.provider_name.clone(),
-            username: None,
-            message: message.clone(),
-        });
-
-        Ok(message)
+        Ok(self.finalize_flow_result(flow, message).await)
     }
 
     /// Remove expired pending flows (older than 10 minutes).
     pub async fn cleanup_expired_flows(&self) {
-        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(FLOW_TIMEOUT_SECS as i64);
-        let mut flows = self.pending_flows.write().await;
-        let expired: Vec<String> = flows
-            .iter()
-            .filter(|(_, f)| f.created_at < cutoff)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in &expired {
-            if let Some(flow) = flows.remove(key) {
-                let _ = flow.result_tx.send(OAuthFlowResult {
-                    service: flow.provider_name,
-                    username: None,
-                    message: "OAuth flow expired (timeout)".to_string(),
-                });
+        let cutoff = Self::flow_cutoff();
+        let mut expired_states = Vec::new();
+        match self.state_store.list_pending_oauth_flows().await {
+            Ok(flows) => {
+                for flow in flows {
+                    let created_at = Self::parse_pending_flow_created_at(&flow.created_at)
+                        .unwrap_or_else(|| {
+                            warn!(
+                                state = %flow.state,
+                                stored_created_at = %flow.created_at,
+                                "Pending OAuth flow has an invalid timestamp; expiring it"
+                            );
+                            chrono::Utc::now()
+                                - chrono::Duration::seconds((FLOW_TIMEOUT_SECS as i64) + 1)
+                        });
+                    if created_at < cutoff {
+                        expired_states.push(flow.state);
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "Failed to enumerate pending OAuth flows for cleanup");
             }
         }
-        if !expired.is_empty() {
-            info!(count = expired.len(), "Cleaned up expired OAuth flows");
+
+        let in_memory_expired: Vec<String> = {
+            let flows = self.pending_flows.read().await;
+            flows
+                .iter()
+                .filter(|(_, flow)| flow.created_at < cutoff)
+                .map(|(state, _)| state.clone())
+                .collect()
+        };
+        for state in in_memory_expired {
+            if !expired_states.contains(&state) {
+                expired_states.push(state);
+            }
+        }
+
+        for state in &expired_states {
+            if let Err(err) = self
+                .expire_pending_flow(state, Some(Self::expired_flow_message().to_string()))
+                .await
+            {
+                warn!(state = %state, error = %err, "Failed to expire pending OAuth flow");
+            }
+        }
+
+        if !expired_states.is_empty() {
+            info!(
+                count = expired_states.len(),
+                "Cleaned up expired OAuth flows"
+            );
         }
     }
 
@@ -652,8 +834,29 @@ impl OAuthGateway {
         // Update in-memory profile
         {
             let mut profiles = self.http_profiles.write().await;
-            if let Some(profile) = profiles.get_mut(service) {
-                profile.token = Some(new_access_token.to_string());
+            let had_profile = profiles.contains_key(service);
+            profiles.insert(
+                service.to_string(),
+                HttpAuthProfile {
+                    auth_type: HttpAuthType::Bearer,
+                    allowed_domains: provider.allowed_domains.clone(),
+                    api_key: None,
+                    api_secret: None,
+                    access_token: None,
+                    access_token_secret: None,
+                    user_id: None,
+                    token: Some(new_access_token.to_string()),
+                    header_name: None,
+                    header_value: None,
+                    username: None,
+                    password: None,
+                },
+            );
+            if !had_profile {
+                info!(
+                    service = %service,
+                    "Rebuilt missing OAuth auth profile during token refresh"
+                );
             }
         }
 
@@ -728,6 +931,14 @@ mod tests {
         } else {
             std::env::remove_var(name);
         }
+    }
+
+    fn state_from_authorize_url(authorize_url: &str) -> String {
+        reqwest::Url::parse(authorize_url)
+            .unwrap()
+            .query_pairs()
+            .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+            .unwrap()
     }
 
     async fn test_gateway() -> anyhow::Result<OAuthGateway> {
@@ -909,5 +1120,254 @@ mod tests {
         let profiles = gateway.http_profiles.read().await;
         let profile = profiles.get("service").unwrap();
         assert_eq!(profile.token.as_deref(), Some("test-access"));
+    }
+
+    #[tokio::test]
+    async fn callback_survives_restart_using_persisted_pending_flow() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        async fn token_handler(
+            Form(form): Form<HashMap<String, String>>,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(
+                form.get("grant_type").map(String::as_str),
+                Some("authorization_code")
+            );
+            assert_eq!(form.get("code").map(String::as_str), Some("auth-code"));
+            assert!(form.get("code_verifier").is_some());
+            Json(serde_json::json!({
+                "access_token": "restart-safe-token",
+                "refresh_token": "refresh-123",
+                "expires_in": 3600
+            }))
+        }
+
+        let app = Router::new().route("/oauth/token", post(token_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let gateway = test_gateway().await.unwrap();
+        gateway
+            .register_provider(OAuthProvider {
+                name: "linear".to_string(),
+                display_name: "Linear".to_string(),
+                auth_type: OAuthType::OAuth2Pkce,
+                authorize_url: "https://linear.app/oauth/authorize".to_string(),
+                token_url: format!("http://{addr}/oauth/token"),
+                scopes: vec!["read".to_string()],
+                allowed_domains: vec!["api.linear.app".to_string()],
+            })
+            .await;
+
+        let env_file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            env_file.path(),
+            "OAUTH_LINEAR_CLIENT_ID=abc\nOAUTH_LINEAR_CLIENT_SECRET=def\n",
+        )
+        .unwrap();
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var(
+            crate::RUNTIME_ENV_FILE_ENV_KEY,
+            env_file.path().to_string_lossy().to_string(),
+        );
+
+        let (authorize_url, _result_rx) =
+            gateway.start_oauth2_flow("linear", "test").await.unwrap();
+        let state = state_from_authorize_url(&authorize_url);
+        {
+            let mut flows = gateway.pending_flows.write().await;
+            flows.clear();
+        }
+
+        let result = gateway
+            .handle_callback(&state, Some("auth-code"), None)
+            .await
+            .unwrap();
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
+
+        assert!(result.contains("Connected to Linear"));
+        assert!(gateway
+            .state_store
+            .get_pending_oauth_flow(&state)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(gateway
+            .state_store
+            .get_oauth_connection("linear")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn callback_refresh_reuses_recent_result_message() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let gateway = test_gateway().await.unwrap();
+        gateway
+            .register_provider(OAuthProvider {
+                name: "linear".to_string(),
+                display_name: "Linear".to_string(),
+                auth_type: OAuthType::OAuth2AuthorizationCode,
+                authorize_url: "https://linear.app/oauth/authorize".to_string(),
+                token_url: "https://api.linear.app/oauth/token".to_string(),
+                scopes: vec!["read".to_string()],
+                allowed_domains: vec!["api.linear.app".to_string()],
+            })
+            .await;
+
+        let env_file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            env_file.path(),
+            "OAUTH_LINEAR_CLIENT_ID=abc\nOAUTH_LINEAR_CLIENT_SECRET=def\n",
+        )
+        .unwrap();
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var(
+            crate::RUNTIME_ENV_FILE_ENV_KEY,
+            env_file.path().to_string_lossy().to_string(),
+        );
+
+        let (authorize_url, _result_rx) =
+            gateway.start_oauth2_flow("linear", "test").await.unwrap();
+        let state = state_from_authorize_url(&authorize_url);
+        let first = gateway
+            .handle_callback(&state, None, Some("access_denied"))
+            .await
+            .unwrap();
+        let second = gateway.handle_callback(&state, None, None).await.unwrap();
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
+
+        assert_eq!(first, "OAuth authorization denied: access_denied");
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expires_persisted_flows_and_keeps_callback_message() {
+        let gateway = test_gateway().await.unwrap();
+        gateway
+            .state_store
+            .save_pending_oauth_flow(&crate::traits::PendingOAuthFlow {
+                state: "expired-state".to_string(),
+                service: "linear".to_string(),
+                code_verifier: Some("verifier".to_string()),
+                session_id: "session-1".to_string(),
+                created_at: (chrono::Utc::now()
+                    - chrono::Duration::seconds((FLOW_TIMEOUT_SECS as i64) + 30))
+                .to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        gateway.cleanup_expired_flows().await;
+
+        assert!(gateway
+            .state_store
+            .get_pending_oauth_flow("expired-state")
+            .await
+            .unwrap()
+            .is_none());
+        let message = gateway
+            .handle_callback("expired-state", Some("unused"), None)
+            .await
+            .unwrap();
+        assert_eq!(message, OAuthGateway::expired_flow_message());
+    }
+
+    #[tokio::test]
+    async fn refresh_token_rebuilds_missing_http_profile() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        async fn token_handler(
+            Form(form): Form<HashMap<String, String>>,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(
+                form.get("grant_type").map(String::as_str),
+                Some("refresh_token")
+            );
+            assert_eq!(
+                form.get("refresh_token").map(String::as_str),
+                Some("refresh-123")
+            );
+            Json(serde_json::json!({
+                "access_token": "refreshed-access",
+                "expires_in": 3600
+            }))
+        }
+
+        let app = Router::new().route("/oauth/token", post(token_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let gateway = test_gateway().await.unwrap();
+        gateway
+            .register_provider(OAuthProvider {
+                name: "twitter".to_string(),
+                display_name: "Twitter/X".to_string(),
+                auth_type: OAuthType::OAuth2Pkce,
+                authorize_url: "https://twitter.com/i/oauth2/authorize".to_string(),
+                token_url: format!("http://{addr}/oauth/token"),
+                scopes: vec!["tweet.read".to_string()],
+                allowed_domains: vec!["api.twitter.com".to_string(), "api.x.com".to_string()],
+            })
+            .await;
+
+        let env_file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            env_file.path(),
+            "OAUTH_TWITTER_CLIENT_ID=abc\nOAUTH_TWITTER_CLIENT_SECRET=def\nOAUTH_TWITTER_REFRESH_TOKEN=refresh-123\n",
+        )
+        .unwrap();
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var(
+            crate::RUNTIME_ENV_FILE_ENV_KEY,
+            env_file.path().to_string_lossy().to_string(),
+        );
+
+        gateway
+            .state_store
+            .save_oauth_connection(&crate::traits::OAuthConnection {
+                id: 0,
+                service: "twitter".to_string(),
+                auth_type: "oauth2_pkce".to_string(),
+                username: None,
+                scopes: r#"["tweet.read"]"#.to_string(),
+                token_expires_at: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        let result = gateway.refresh_token("twitter").await.unwrap();
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
+
+        assert_eq!(result, "Token refreshed for twitter");
+        let profiles = gateway.http_profiles.read().await;
+        let profile = profiles.get("twitter").expect("twitter profile rebuilt");
+        assert_eq!(profile.token.as_deref(), Some("refreshed-access"));
+        assert!(profile
+            .allowed_domains
+            .iter()
+            .any(|domain| domain == "api.x.com"));
     }
 }

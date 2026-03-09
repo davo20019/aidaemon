@@ -199,6 +199,10 @@ pub struct ToolCallMetadata {
     /// Transport/runtime failure outside normal tool semantics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_error: Option<String>,
+    /// Optional final user-facing reply. When set, the root agent may close the
+    /// turn directly from the tool result instead of running another LLM pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direct_response: Option<String>,
     /// Completion semantics for this specific tool call.
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,

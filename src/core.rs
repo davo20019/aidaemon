@@ -1732,7 +1732,9 @@ Make focused queries — one search is almost always enough. For factual lookups
 (weather, time, scores, prices, exchange rates, simple questions), a single search \
 suffices — do NOT re-search with rephrased queries. Synthesize results promptly; \
 do not over-research.
-- `web_fetch`: Fetch a URL and extract its readable content. Strips ads/navigation. For login-required sites, use `browser` instead.
+- `web_fetch`: Fetch a readable web page and extract its content. Strips ads/navigation. \
+Do NOT use it for REST/JSON API endpoints or machine-readable responses; use `http_request` for APIs instead. \
+For login-required sites, use `browser` instead.
 {browser_tool_doc}{send_file_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}{manage_cli_agents_tool_doc}{health_probe_tool_doc}{manage_skills_tool_doc}{use_skill_tool_doc}{skill_resources_tool_doc}{manage_people_tool_doc}{http_request_tool_doc}{manage_api_tool_doc}{manage_http_auth_tool_doc}{manage_oauth_tool_doc}{direct_mode_doc}
 
 ## Built-in Channels

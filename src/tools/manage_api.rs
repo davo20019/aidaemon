@@ -93,13 +93,14 @@ impl ManageApiTool {
                 state_store.clone(),
             ),
             manage_oauth: ManageOAuthTool::new(
-                oauth_gateway,
+                oauth_gateway.clone(),
                 state_store,
                 config_path,
                 approval_tx.clone(),
             ),
             manage_skills,
-            http_request: HttpRequestTool::new(profiles, approval_tx),
+            http_request: HttpRequestTool::new(profiles, approval_tx)
+                .with_oauth_gateway(oauth_gateway),
             search_backend,
         }
     }

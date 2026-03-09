@@ -66,6 +66,25 @@ fn goal_completion_response_detects_deferred_action_reply() {
 }
 
 #[test]
+fn incomplete_live_work_summary_detects_attempt_only_reply() {
+    let reply = "I've attempted to search the live API, but encountered API errors.\n\nWhat I tried:\n- Multiple attempts with different geographic parameters\n\nCurrent status:\nNo results retrieved yet. The API is rejecting the parameters I attempted.";
+    assert!(looks_like_incomplete_live_work_summary(reply));
+    assert!(goal_completion_response_indicates_incomplete_work(reply));
+}
+
+#[test]
+fn incomplete_live_work_summary_allows_concrete_results() {
+    let reply = "I queried ClinicalTrials.gov and found an actively recruiting skin cancer study in Fairfax, Virginia.";
+    assert!(!looks_like_incomplete_live_work_summary(reply));
+}
+
+#[test]
+fn false_capability_denial_detects_live_search_fallback_text() {
+    let reply = "I can guide you on how to find skin cancer clinical trials, but I cannot perform a live search of current databases.";
+    assert!(looks_like_false_capability_denial_after_tool_success(reply));
+}
+
+#[test]
 fn goal_completion_response_allows_concrete_finished_reply() {
     let reply = "I audited the disk usage and found 1.2G in /Users/me/projects/aidaemon/target.";
     assert!(!goal_completion_response_indicates_incomplete_work(reply));

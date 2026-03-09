@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.21] - 2026-03-09
+
+### Added
+
+- **Durable pending OAuth flows**: Pending browser auth flows are now persisted in SQLite, and recent callback outcomes are cached so reconnects/timeouts survive restarts and duplicate callbacks return a useful result.
+- **Direct tool replies for interactive auth**: Tools can now attach a user-facing `direct_response`, allowing `manage_oauth connect` to finish the turn directly after browser completion instead of forcing another LLM pass.
+- **Legacy message migration**: Startup now migrates the legacy `messages` table into canonical `events`, removes the old table, and clears obsolete projection settings.
+- **JSON response summaries in `http_request`**: JSON API responses now include a compact key/array summary before the pretty-printed body.
+
+### Changed
+
+- **Agent loop terminology and structure**: Consultant-specific routing modules were consolidated into `orchestration`, `response`, `completion`, `direct_return`, and `fallthrough` phases, with policy metrics and dashboard fields renamed to match the new model.
+- **OAuth/API request plumbing**: `http_request` now shares the OAuth gateway, can refresh OAuth profiles and retry once, and keeps auth scoped to same-origin redirects.
+- **Verification scope extraction**: Plain-word project nicknames are only resolved as verification scopes when the user text includes explicit local/project cues, reducing accidental project-scope inference.
+- **Live-work recovery guidance**: New response-analysis heuristics and system directives detect incomplete "What I tried" summaries and false "can't browse/search" denials after successful tool results, forcing the loop to use the evidence it already gathered.
+
+### Fixed
+
+- **OAuth timeout cleanup**: Timed-out browser auth attempts now expire their pending `state` records instead of leaving stale flows behind.
+- **Final-answer regressions after successful tools**: The loop now carries successful live tool evidence forward instead of allowing misleading capability denials or pseudo tool-call text to leak into the answer.
+- **Policy metrics naming drift**: Dashboard API responses and `policy_metrics` output now line up with the renamed response/orchestration counters.
+
 ## [0.9.20] - 2026-03-08
 
 ### Added

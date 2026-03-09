@@ -9,7 +9,6 @@ pub(super) struct MessageBuildCtx<'a> {
     pub user_text: &'a str,
     pub model: &'a str,
     pub system_prompt: &'a str,
-    pub consultant_pass_active: bool,
     pub pinned_memories: &'a [Message],
     pub tool_defs: &'a [Value],
     pub policy_bundle: &'a PolicyBundle,
@@ -105,7 +104,6 @@ impl Agent {
         let user_text = ctx.user_text;
         let model = ctx.model;
         let system_prompt = ctx.system_prompt;
-        let _consultant_pass_active = ctx.consultant_pass_active;
         let pinned_memories = ctx.pinned_memories;
         let tool_defs = ctx.tool_defs;
         let policy_bundle = ctx.policy_bundle;
@@ -578,7 +576,7 @@ impl Agent {
         // The DB write (append_user_message_with_event) may not yet be visible
         // to load_recent_history due to a race condition, especially on
         // iteration 1. It can also be missing on iteration 2 after a
-        // consultant-pass `continue` (no messages are stored between iterations,
+        // early-iteration `continue` (no messages are stored between iterations,
         // so the race condition persists). Check all messages on every iteration
         // to be safe — the content match prevents duplicates.
         {
@@ -1002,7 +1000,6 @@ mod tests {
             user_text: "Why?",
             model: "mock-model",
             system_prompt: "You are a helpful test assistant.",
-            consultant_pass_active: false,
             pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,

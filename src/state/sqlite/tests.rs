@@ -2032,6 +2032,39 @@ async fn test_oauth_connection_not_found() {
     assert!(result.is_none());
 }
 
+#[tokio::test]
+async fn test_pending_oauth_flow_crud() {
+    let (store, _tmp) = setup_test_store().await;
+
+    let flow = crate::traits::PendingOAuthFlow {
+        state: "state-123".to_string(),
+        service: "twitter".to_string(),
+        code_verifier: Some("verifier-abc".to_string()),
+        session_id: "sess-1".to_string(),
+        created_at: "2026-03-08T23:00:00Z".to_string(),
+    };
+
+    store.save_pending_oauth_flow(&flow).await.unwrap();
+
+    let fetched = store
+        .get_pending_oauth_flow("state-123")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.service, "twitter");
+    assert_eq!(fetched.code_verifier.as_deref(), Some("verifier-abc"));
+
+    let all = store.list_pending_oauth_flows().await.unwrap();
+    assert_eq!(all.len(), 1);
+
+    store.delete_pending_oauth_flow("state-123").await.unwrap();
+    assert!(store
+        .get_pending_oauth_flow("state-123")
+        .await
+        .unwrap()
+        .is_none());
+}
+
 // -----------------------------------------------------------------------
 // Dynamic CLI Agent CRUD tests
 // -----------------------------------------------------------------------

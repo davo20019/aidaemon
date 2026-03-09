@@ -247,13 +247,13 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL and extract its readable content"
+        "Fetch a readable web page and extract its content; not for REST/JSON API endpoints"
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "web_fetch",
-            "description": "Fetch a URL and extract its readable content. Strips ads/navigation. For login-required sites, use browser instead.",
+            "description": "Fetch a readable web page and extract its content. Strips ads/navigation. Do NOT use for REST/JSON API endpoints or machine-readable responses; use http_request for APIs. For login-required sites, use browser instead.",
             "parameters": {
                 "type": "object",
                 "properties": {

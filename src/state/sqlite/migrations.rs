@@ -662,6 +662,24 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS pending_oauth_flows (
+            state TEXT PRIMARY KEY,
+            service TEXT NOT NULL,
+            code_verifier TEXT,
+            session_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_pending_oauth_flows_created_at \
+         ON pending_oauth_flows(created_at)",
+    )
+    .execute(pool)
+    .await?;
+
     // --- Settings table (generic key-value runtime toggles) ---
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS settings (

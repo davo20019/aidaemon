@@ -1,6 +1,6 @@
 use super::memory_scope::{is_low_signal_goal_text, scope_goal_memory_to_project_hints};
-use super::types::ConsultantOrchestrationCtx;
-use crate::agent::consultant_phase::ConsultantPhaseOutcome;
+use super::types::OrchestrationCtx;
+use crate::agent::response_phase::ResponsePhaseOutcome;
 use crate::agent::*;
 
 impl Agent {
@@ -78,17 +78,17 @@ impl Agent {
         Some(serde_json::to_string(&ctx).unwrap_or_default())
     }
 
-    pub(in crate::agent) async fn run_consultant_orchestration_phase(
+    pub(in crate::agent) async fn run_orchestration_phase(
         &self,
-        ctx: &mut ConsultantOrchestrationCtx<'_>,
-    ) -> anyhow::Result<Option<ConsultantPhaseOutcome>> {
+        ctx: &mut OrchestrationCtx<'_>,
+    ) -> anyhow::Result<Option<ResponsePhaseOutcome>> {
         if let Some(outcome) = self.maybe_handle_generic_cancel_request(ctx).await? {
             return Ok(Some(outcome));
         }
 
         // Orchestration routing (always-on).
         let (complexity, _) = classify_intent_complexity(ctx.user_text, ctx.intent_gate);
-        let outcome = self.route_consultant_complexity(ctx, complexity).await?;
+        let outcome = self.route_orchestration_complexity(ctx, complexity).await?;
         Ok(Some(outcome))
     }
 }

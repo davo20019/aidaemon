@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 
-use super::{IntentGateDecision, INTENT_GATE_MARKER};
+use super::IntentGateDecision;
+use crate::llm_markers::INTENT_GATE_MARKER;
 
 pub(super) fn parse_intent_gate_json(text: &str) -> Option<IntentGateDecision> {
     let value: Value = serde_json::from_str(text).ok()?;
