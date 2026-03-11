@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a self-diagnosis system that detects repeated tool failures, runs a fast-model reflection LLM call to analyze root causes against loaded skills, injects corrective guidance, and stores learnings persistently for future tasks.
+**Goal:** Add a self-diagnosis system that detects repeated tool failures, runs a reflection LLM call to analyze root causes against the task's active skills, injects corrective guidance, and stores verified learnings persistently for future tasks.
 
-**Architecture:** A new `reflection.rs` module in `src/agent/loop/tool_execution/` handles the reflection LLM call. It's triggered from `run.rs` after `apply_result_learning()` detects a 2nd same-signature failure. The diagnosis is injected as a `SystemDirective::ReflectionDiagnosis` and learnings are stored immediately via `state.insert_error_solution()`.
+**Architecture:** A new `reflection.rs` module in `src/agent/loop/tool_execution/` handles the reflection LLM call. It's triggered from `run.rs` after `apply_result_learning()` detects a 2nd same-signature failure. The diagnosis is injected as a `SystemDirective::ReflectionDiagnosis`. Learnings are stored as unverified (`success_count=0`) via `state.insert_error_solution()` and only promoted to verified when the agent actually recovers in the same task.
 
 **Tech Stack:** Rust, tokio async, serde_json, existing ModelProvider/StateStore traits
 
@@ -120,6 +120,7 @@ Create `src/agent/loop/tool_execution/reflection.rs` with types, parsing logic, 
 
 ```rust
 use crate::agent::*;
+use crate::tools::sanitize::redact_secrets;
 use crate::traits::{ErrorSolution, ModelProvider, ProviderResponse};
 use std::sync::Arc;
 use tracing::warn;
@@ -149,35 +150,43 @@ pub(super) struct ErrorSolutionDraft {
     pub solution_steps: Vec<String>,
 }
 
-const MAX_ERROR_HISTORY_PER_TOOL: usize = 5;
+const MAX_ERROR_HISTORY_PER_KEY: usize = 5;
 const ARGS_SUMMARY_MAX_CHARS: usize = 500;
 const ERROR_TEXT_MAX_CHARS: usize = 1000;
 const SKILL_EXCERPT_MAX_CHARS: usize = 2000;
+const USER_TASK_MAX_CHARS: usize = 1000;
 const REFLECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Record an error entry for a tool. Keeps at most MAX_ERROR_HISTORY_PER_TOOL entries.
+/// Record an error entry keyed by (tool_name, signature).
+/// Keeps at most MAX_ERROR_HISTORY_PER_KEY entries per key.
 pub(super) fn record_tool_error(
-    tool_error_history: &mut HashMap<String, Vec<ToolErrorEntry>>,
+    tool_error_history: &mut HashMap<(String, String), Vec<ToolErrorEntry>>,
     tool_name: &str,
+    signature: &str,
     iteration: usize,
     arguments: &str,
     error_text: &str,
 ) {
-    let entries = tool_error_history
-        .entry(tool_name.to_string())
-        .or_default();
-    if entries.len() >= MAX_ERROR_HISTORY_PER_TOOL {
+    let key = (tool_name.to_string(), signature.to_string());
+    let entries = tool_error_history.entry(key).or_default();
+    if entries.len() >= MAX_ERROR_HISTORY_PER_KEY {
         entries.remove(0);
     }
+    // Redact secrets before storing — tool arguments may contain auth tokens,
+    // connection strings, or other sensitive data that would leak into the
+    // reflection LLM prompt.
+    let redacted_args = redact_secrets(arguments);
+    let redacted_error = redact_secrets(error_text);
     entries.push(ToolErrorEntry {
         iteration,
-        arguments_summary: arguments.chars().take(ARGS_SUMMARY_MAX_CHARS).collect(),
-        error_text: error_text.chars().take(ERROR_TEXT_MAX_CHARS).collect(),
+        arguments_summary: redacted_args.chars().take(ARGS_SUMMARY_MAX_CHARS).collect(),
+        error_text: redacted_error.chars().take(ERROR_TEXT_MAX_CHARS).collect(),
     });
 }
 
-/// Find a relevant skill by matching the tool arguments URL domain against skill source_urls,
-/// or by matching skill triggers against the tool name.
+/// Find a relevant skill from the task's already-active skills by matching the tool arguments
+/// URL domain against skill source_urls, or by matching skill triggers against the tool name.
+/// Only searches skills that were confirmed during bootstrap — NOT all enabled skills.
 pub(super) fn find_relevant_skill_excerpt(
     skills: &[crate::skills::Skill],
     tool_name: &str,
@@ -233,13 +242,14 @@ fn build_reflection_prompt(
     user_task: &str,
     skill_excerpt: Option<&str>,
 ) -> String {
+    let task_truncated: String = user_task.chars().take(USER_TASK_MAX_CHARS).collect();
     let mut prompt = format!(
         "You are a failure analysis system. An AI agent is stuck repeating the same error.\n\n\
          TASK: {}\n\
          FAILING TOOL: {}\n\
          ERROR PATTERN: {}\n\n\
          ERROR HISTORY (most recent first):\n",
-        user_task, tool_name, failure_signature
+        task_truncated, tool_name, failure_signature
     );
 
     for entry in error_history.iter().rev() {
@@ -312,6 +322,8 @@ fn parse_reflection_response(
 impl Agent {
     /// Trigger a reflection LLM call if the 2nd same-signature failure just occurred.
     /// Returns `Some(diagnosis)` if reflection ran successfully, `None` otherwise.
+    /// Trigger a reflection LLM call if the 2nd same-signature failure just occurred.
+    /// `active_skills` is scoped to the task's already-confirmed skills (NOT all enabled skills).
     pub(super) async fn maybe_trigger_reflection(
         &self,
         tool_name: &str,
@@ -319,6 +331,7 @@ impl Agent {
         semantic_failure_count: usize,
         error_history: &[ToolErrorEntry],
         user_task: &str,
+        active_skills: &[crate::skills::Skill],
         reflection_completed: &mut HashSet<(String, String)>,
     ) -> Option<ReflectionDiagnosis> {
         // Only trigger on exactly the 2nd same-signature failure
@@ -332,21 +345,18 @@ impl Agent {
         }
         reflection_completed.insert(key);
 
-        // Find relevant skill excerpt
-        let skills_snapshot = self.skill_cache.get();
+        // Find relevant skill excerpt from active skills only
         let last_args = error_history
             .last()
             .map(|e| e.arguments_summary.as_str())
             .unwrap_or("");
         let skill_excerpt =
-            find_relevant_skill_excerpt(&skills_snapshot, tool_name, last_args);
+            find_relevant_skill_excerpt(active_skills, tool_name, last_args);
 
-        // Get fast model
+        // Use the primary model (router maps all tiers to default;
+        // fallbacks are reserved for error-recovery cascades only)
         let runtime_snapshot = self.llm_runtime.snapshot();
-        let model = runtime_snapshot
-            .router()
-            .and_then(|r| r.first_fallback().map(str::to_string))
-            .unwrap_or_else(|| runtime_snapshot.model().to_string());
+        let model = runtime_snapshot.primary_model();
         let provider = runtime_snapshot.provider();
 
         // Build reflection prompt
@@ -398,13 +408,17 @@ impl Agent {
     }
 }
 
-/// Store a reflection learning as an ErrorSolution immediately.
+/// Store a reflection learning as an UNVERIFIED ErrorSolution (success_count=0).
+/// Returns the solution ID so the caller can verify it on recovery.
+/// The existing retrieval filter (success_count > failure_count) naturally gates
+/// unverified learnings from future tasks until the agent actually recovers.
 pub(super) async fn store_reflection_learning(
     state: &Arc<dyn crate::traits::StateStore>,
     draft: ErrorSolutionDraft,
-) {
+) -> Option<i64> {
+    let now = chrono::Utc::now();
     let solution = ErrorSolution {
-        id: 0,
+        id: 0,  // Set by database
         error_pattern: draft.error_pattern,
         domain: draft.domain,
         solution_summary: draft.solution_summary,
@@ -413,15 +427,21 @@ pub(super) async fn store_reflection_learning(
         } else {
             Some(draft.solution_steps)
         },
-        success_count: 0,
+        success_count: 0,  // UNVERIFIED — promoted on recovery
         failure_count: 0,
+        last_used_at: None,  // Never used yet
+        created_at: now,
     };
-    if let Err(e) = state.insert_error_solution(&solution).await {
-        warn!(
-            error_pattern = %solution.error_pattern,
-            error = %e,
-            "Failed to store reflection learning"
-        );
+    match state.insert_error_solution(&solution).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!(
+                error_pattern = %solution.error_pattern,
+                error = %e,
+                "Failed to store reflection learning"
+            );
+            None
+        }
     }
 }
 
@@ -431,25 +451,38 @@ mod tests {
 
     #[test]
     fn test_record_tool_error_caps_at_max() {
-        let mut history: HashMap<String, Vec<ToolErrorEntry>> = HashMap::new();
+        let mut history: HashMap<(String, String), Vec<ToolErrorEntry>> = HashMap::new();
         for i in 0..10 {
-            record_tool_error(&mut history, "http_request", i, "args", "error");
+            record_tool_error(&mut history, "http_request", "http 404", i, "args", "error");
         }
+        let key = ("http_request".to_string(), "http 404".to_string());
         assert_eq!(
-            history.get("http_request").unwrap().len(),
-            MAX_ERROR_HISTORY_PER_TOOL
+            history.get(&key).unwrap().len(),
+            MAX_ERROR_HISTORY_PER_KEY
         );
         // Oldest entries should have been evicted
-        assert_eq!(history.get("http_request").unwrap()[0].iteration, 5);
+        assert_eq!(history.get(&key).unwrap()[0].iteration, 5);
+    }
+
+    #[test]
+    fn test_record_tool_error_separates_by_signature() {
+        let mut history: HashMap<(String, String), Vec<ToolErrorEntry>> = HashMap::new();
+        record_tool_error(&mut history, "http_request", "http 404", 1, "args1", "not found");
+        record_tool_error(&mut history, "http_request", "http 500", 2, "args2", "server error");
+        let key_404 = ("http_request".to_string(), "http 404".to_string());
+        let key_500 = ("http_request".to_string(), "http 500".to_string());
+        assert_eq!(history.get(&key_404).unwrap().len(), 1);
+        assert_eq!(history.get(&key_500).unwrap().len(), 1);
     }
 
     #[test]
     fn test_record_tool_error_truncates_long_text() {
-        let mut history: HashMap<String, Vec<ToolErrorEntry>> = HashMap::new();
+        let mut history: HashMap<(String, String), Vec<ToolErrorEntry>> = HashMap::new();
         let long_args = "x".repeat(1000);
         let long_error = "e".repeat(2000);
-        record_tool_error(&mut history, "test_tool", 1, &long_args, &long_error);
-        let entry = &history.get("test_tool").unwrap()[0];
+        record_tool_error(&mut history, "test_tool", "sig", 1, &long_args, &long_error);
+        let key = ("test_tool".to_string(), "sig".to_string());
+        let entry = &history.get(&key).unwrap()[0];
         assert_eq!(entry.arguments_summary.len(), ARGS_SUMMARY_MAX_CHARS);
         assert_eq!(entry.error_text.len(), ERROR_TEXT_MAX_CHARS);
     }
@@ -666,8 +699,11 @@ git commit -m "feat: add reflection module with diagnosis types, parsing, and sk
 In `src/agent/loop/tool_execution/types.rs`, add after line 87 (`pub tool_result_cache: ...`), before the closing `}`:
 
 ```rust
-    pub tool_error_history: &'a mut HashMap<String, Vec<super::reflection::ToolErrorEntry>>,
+    pub tool_error_history: &'a mut HashMap<(String, String), Vec<super::reflection::ToolErrorEntry>>,
     pub reflection_completed: &'a mut HashSet<(String, String)>,
+    /// Names of skills that were activated for this task during bootstrap.
+    /// Used by reflection to scope skill cross-referencing to already-active skills only.
+    pub active_skill_names: &'a [String],
 ```
 
 - [ ] **Step 2: Add fields to ResultLearningState**
@@ -675,7 +711,7 @@ In `src/agent/loop/tool_execution/types.rs`, add after line 87 (`pub tool_result
 In `src/agent/loop/tool_execution/result_learning.rs`, add after `pub dirs_with_search_no_matches` (line 58), before the closing `}`:
 
 ```rust
-    pub tool_error_history: &'a mut HashMap<String, Vec<super::reflection::ToolErrorEntry>>,
+    pub tool_error_history: &'a mut HashMap<(String, String), Vec<super::reflection::ToolErrorEntry>>,
     pub reflection_completed: &'a mut HashSet<(String, String)>,
 ```
 
@@ -684,7 +720,7 @@ In `src/agent/loop/tool_execution/result_learning.rs`, add after `pub dirs_with_
 In `src/agent/loop/main_loop.rs`, add after `let mut tool_cooldown_until_iteration` (around line 224):
 
 ```rust
-        let mut tool_error_history: HashMap<String, Vec<super::tool_execution::reflection::ToolErrorEntry>> = HashMap::new();
+        let mut tool_error_history: HashMap<(String, String), Vec<super::tool_execution::reflection::ToolErrorEntry>> = HashMap::new();
         let mut reflection_completed: HashSet<(String, String)> = HashSet::new();
 ```
 
@@ -732,15 +768,19 @@ git commit -m "feat: thread tool_error_history and reflection_completed through 
 In `result_learning.rs`, inside `apply_result_learning()`, right after the `record_semantic_failure_signature` call (line ~266-271), add:
 
 ```rust
-                // Accumulate error entry for reflection
+                // Accumulate error entry for reflection, keyed by (tool, signature)
+                let failure_sig = super::result_learning::derive_failure_signature(&base_error);
                 super::reflection::record_tool_error(
                     state.tool_error_history,
                     &tc.name,
+                    &failure_sig,
                     env.iteration,
                     &tc.arguments,
                     &base_error,
                 );
 ```
+
+Note: `derive_failure_signature` is already called internally by `record_semantic_failure_signature`. To avoid duplicating the call, either extract the signature from the existing code path (make `record_semantic_failure_signature` return it) or call `derive_failure_signature` again (it's a pure function, negligible cost). The simpler approach is to call it again.
 
 This goes right after `let semantic_count = record_semantic_failure_signature(...)` and before the `if semantic_count == 1 && looks_like_missing_goal_id_error(...)` block.
 
@@ -779,11 +819,22 @@ In `run.rs`, after the `apply_result_learning` call block (after line ~1509, aft
                 // Find if any signature just hit count == 2
                 for ((_, sig), count) in &tool_sigs {
                     if **count == 2 {
+                        // Error history is keyed by (tool, signature) — only same-signature errors
+                        let history_key = (tc.name.clone(), sig.clone());
                         let error_history = learning_state
                             .tool_error_history
-                            .get(&tc.name)
+                            .get(&history_key)
                             .cloned()
                             .unwrap_or_default();
+
+                        // Get active skills for scoped cross-referencing
+                        let skills_snapshot = self.skill_cache.get();
+                        let active_skills: Vec<_> = skills_snapshot
+                            .iter()
+                            .filter(|s| ctx.active_skill_names.contains(&s.name))
+                            .cloned()
+                            .collect();
+
                         if let Some(diagnosis) = self
                             .maybe_trigger_reflection(
                                 &tc.name,
@@ -791,6 +842,7 @@ In `run.rs`, after the `apply_result_learning` call block (after line ~1509, aft
                                 2,
                                 &error_history,
                                 ctx.user_text,
+                                &active_skills,
                                 learning_state.reflection_completed,
                             )
                             .await
@@ -807,11 +859,22 @@ In `run.rs`, after the `apply_result_learning` call block (after line ~1509, aft
                                     recommended_action: diagnosis.recommended_action,
                                 },
                             );
+                            // Store as UNVERIFIED (success_count=0).
+                            // Track the solution ID so we can verify it on recovery.
                             if let Some(draft) = diagnosis.learning {
-                                super::reflection::store_reflection_learning(
-                                    &self.state, draft,
-                                )
-                                .await;
+                                if let Some(solution_id) =
+                                    super::reflection::store_reflection_learning(
+                                        &self.state, draft,
+                                    )
+                                    .await
+                                {
+                                    // Add to pending_error_solution_ids for verification
+                                    // on same-tool recovery (existing mechanism in
+                                    // result_learning.rs)
+                                    learning_state
+                                        .pending_error_solution_ids
+                                        .push(solution_id);
+                                }
                             }
                         }
                         break; // Only one reflection per iteration

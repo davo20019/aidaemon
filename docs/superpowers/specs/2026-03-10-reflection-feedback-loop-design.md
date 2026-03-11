@@ -10,7 +10,7 @@ When the agent encounters repeated tool failures (wrong API URL, incorrect param
 
 ## Solution
 
-A general-purpose reflection system inspired by the Reflexion framework. On the 2nd repeated failure with the same error signature, a fast-model LLM call analyzes the failure, cross-references loaded skill guides, and produces a diagnosis that gets injected as a high-priority system directive before the next main-model call. Learnings are stored immediately in the existing `error_solutions` table for retrieval in future tasks.
+A general-purpose reflection system inspired by the Reflexion framework. On the 2nd repeated failure with the same error signature, an LLM call analyzes the failure, cross-references the task's already-active skills, and produces a diagnosis that gets injected as a high-priority system directive before the next main-model call. Learnings are stored as *unverified* in the existing `error_solutions` table and only promoted to verified (retrievable by future tasks) when the agent actually recovers in the same task.
 
 ## Architecture: Approach B — Dedicated Reflection Module
 
@@ -33,19 +33,19 @@ Why 2nd failure: 1st is normal exploration, 3rd+ is near the block limit. 2nd is
 New field on `ResultLearningState`:
 
 ```rust
-pub tool_error_history: &'a mut HashMap<String, Vec<ToolErrorEntry>>,
+pub tool_error_history: &'a mut HashMap<(String, String), Vec<ToolErrorEntry>>,  // keyed by (tool_name, signature)
 pub reflection_completed: &'a mut HashSet<(String, String)>,
 ```
 
 ```rust
 pub(super) struct ToolErrorEntry {
     pub iteration: usize,
-    pub arguments_summary: String,  // truncated to 500 chars
-    pub error_text: String,         // truncated to 1000 chars
+    pub arguments_summary: String,  // truncated to 500 chars, secrets redacted
+    pub error_text: String,         // truncated to 1000 chars, secrets redacted
 }
 ```
 
-Each semantic failure appends to `tool_error_history` (capped at 5 entries per tool). When the 2nd same-signature failure occurs and `reflection_completed` doesn't contain the pair, reflection triggers.
+Each semantic failure appends to `tool_error_history` keyed by `(tool_name, signature)` (capped at 5 entries per key). This ensures only same-signature errors are fed into the reflection prompt — tools like `http_request` with varied failure modes won't mix unrelated errors. **Arguments and error text are redacted via `redact_secrets()` before storage** to prevent auth tokens, connection strings, or secret-bearing data from leaking into the reflection LLM prompt. When the 2nd same-signature failure occurs and `reflection_completed` doesn't contain the pair, reflection triggers.
 
 ### Reflection Context & Output
 
@@ -103,15 +103,17 @@ LEARNING: <one sentence that would prevent this mistake in future tasks, or NONE
 
 ### Skill Cross-Referencing
 
-Before the reflection LLM call, `skill_cache.get()` is checked for any skill whose:
-- `source_url` domain matches the failing URL domain (extracted from tool arguments)
-- OR whose triggers match the tool name or error keywords
+Reflection is scoped to **already-active skills** — the skills that were matched and confirmed during the task's bootstrap phase (the same set injected into the system prompt). This is safer and more relevant than scanning all enabled skills via `skill_cache.get()`.
 
-If a matching skill is found, its `body` is included (truncated to 2000 chars) in the reflection prompt so the fast model can spot discrepancies between what the skill says and what the agent did.
+The active skill names are threaded into the reflection context. For each active skill, we check:
+- `source_url` domain matches the failing URL domain (extracted from tool arguments)
+- OR triggers match the tool name or error keywords
+
+If a matching skill is found, its `body` is included (truncated to 2000 chars) in the reflection prompt so the model can spot discrepancies between what the skill says and what the agent did. The same sanitization/trust handling used for system prompt injection applies here.
 
 ### Model Selection
 
-`router.first_fallback()` if available, otherwise `router.default_model()`. The reflection call is ~200 input + ~50 output tokens — negligible cost. 10-second timeout; on failure/timeout, skip gracefully.
+Uses `router.default_model()` directly. The current router maps all tiers to the default model and reserves fallbacks for error-recovery cascades only — there is no separate "fast model" routing. The reflection call is ~200 input + ~50 output tokens — negligible cost. 10-second timeout; on failure/timeout, skip gracefully.
 
 ### Diagnosis Injection
 
@@ -135,14 +137,18 @@ Do NOT repeat the same failing approach. If you cannot fix the issue, report the
 
 Pushed to `pending_system_messages` immediately after reflection completes, injected before the very next main-model LLM call.
 
-### Immediate Persistent Learning
+### Verified Persistent Learning
 
-When `ReflectionDiagnosis.learning` is `Some(draft)`, stored immediately via `state.insert_error_solution()`. Deduplication: if an error solution with the same `error_pattern` already exists, update rather than duplicate.
+When `ReflectionDiagnosis.learning` is `Some(draft)`, stored immediately via `state.insert_error_solution()` with `success_count=0, failure_count=0` (unverified). The existing retrieval filter (`success_count > failure_count`) naturally gates unverified learnings from future tasks.
 
-Future task retrieval flow:
+**Verification flow:** If the agent recovers in the same task (the same tool succeeds after the reflection), `success_count` is incremented to 1, making the learning retrievable by future tasks. This prevents speculative reflections from becoming authoritative guidance.
+
+**Deduplication:** Uses the existing `insert_error_solution()` path which upserts on `(error_pattern, domain, solution_summary)`. Multiple solutions for the same pattern are intentionally preserved — the existing schema allows alternative fixes.
+
+Future task retrieval flow (only for verified learnings):
 1. 1st failure with similar pattern
 2. `apply_result_learning()` queries `get_relevant_error_solutions()` (existing code, runs on 1st failure)
-3. Finds stored learning, appends coaching notice to tool result
+3. Finds verified learning (`success_count > failure_count`), appends coaching notice to tool result
 4. Agent self-corrects without needing reflection
 
 ### Force-Text Promise Prevention
@@ -194,13 +200,13 @@ Unit tests with `MockProvider`:
 
 | File | Change |
 |------|--------|
-| `src/agent/loop/tool_execution/reflection.rs` | **NEW** — ReflectionCtx, ReflectionDiagnosis, maybe_trigger_reflection(), response parsing, skill matching |
-| `src/agent/loop/tool_execution/result_learning.rs` | Add ToolErrorEntry, tool_error_history accumulation on semantic failures |
-| `src/agent/loop/tool_execution/run.rs` | Call maybe_trigger_reflection() after apply_result_learning() |
-| `src/agent/loop/tool_execution/mod.rs` | Declare reflection module |
-| `src/agent/loop/system_directives.rs` | Add ReflectionDiagnosis variant + render |
-| `src/agent/loop/stopping_phase.rs` | Append promise prevention to ForceTextToolLimitReached render |
-| `src/agent/loop/main_loop.rs` | Initialize tool_error_history and reflection_completed in loop state |
+| `src/agent/loop/tool_execution/reflection.rs` | **NEW** — ReflectionDiagnosis, maybe_trigger_reflection(), response parsing, skill matching (scoped to active skills) |
+| `src/agent/loop/tool_execution/result_learning.rs` | Add ToolErrorEntry, tool_error_history accumulation on semantic failures, verification on recovery |
+| `src/agent/loop/tool_execution/run.rs` | Call maybe_trigger_reflection() after apply_result_learning(), track pending reflection solution IDs for verification |
+| `src/agent/loop/tool_execution/phase_impl.rs` | Declare `mod reflection;` |
+| `src/agent/loop/tool_execution/types.rs` | Add tool_error_history and reflection_completed to ToolExecutionCtx |
+| `src/agent/loop/system_directives.rs` | Add ReflectionDiagnosis variant + render, append promise prevention to ForceTextToolLimitReached |
+| `src/agent/loop/main_loop.rs` | Initialize tool_error_history and reflection_completed, thread active_skill_names into ToolExecutionCtx |
 
 ## End-to-End Example
 
@@ -212,13 +218,18 @@ Iteration 1: http_request("api.clinicaltrials.gov/...") → 404
 
 Iteration 2: http_request("api.clinicaltrials.gov/...") → 404 (same signature)
   → 2nd semantic failure, TRIGGERS REFLECTION
-  → fast-model sees error history + skill excerpt (says "use clinicaltrials.gov/api/v2")
+  → LLM sees error history + active skill excerpt (says "use clinicaltrials.gov/api/v2")
   → returns: ROOT_CAUSE: "Wrong hostname — skill says use clinicaltrials.gov/api/v2"
   → injects SystemDirective::ReflectionDiagnosis
-  → stores ErrorSolution: pattern="http 404.*clinicaltrials"
+  → stores ErrorSolution with success_count=0 (UNVERIFIED)
 
-Iteration 3: LLM sees [SYSTEM] SELF-DIAGNOSIS → correct URL → success
+Iteration 3: LLM sees [SYSTEM] SELF-DIAGNOSIS → uses correct URL → SUCCESS
+  → recovery detected: same tool succeeded after reflection
+  → ErrorSolution.success_count bumped to 1 (now VERIFIED)
 
 Future task (weeks later):
-  → 1st failure → error_solutions match → coaching notice → self-corrects immediately
+  → 1st failure with similar pattern
+  → error_solutions match (success_count=1 > failure_count=0)
+  → coaching notice from verified learning
+  → self-corrects without needing reflection
 ```
