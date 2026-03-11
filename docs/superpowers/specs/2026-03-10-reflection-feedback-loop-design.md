@@ -107,7 +107,8 @@ Reflection is scoped to **already-active skills** — the skills that were match
 
 The active skill names are extracted from `build_system_prompt_for_message()` (which already computes the confirmed skill set), stored in `BootstrapData`, and threaded through `ToolExecutionCtx` into the reflection context. For each active skill, we check:
 - `source_url` domain matches the failing URL domain (extracted from tool arguments)
-- OR triggers match using **word-boundary matching** via `contains_keyword_as_words()` (repo convention — no substring `.contains()`)
+- OR triggers match the **tool arguments** using **word-boundary matching** via `contains_keyword_as_words()` (repo convention — no substring `.contains()`)
+- OR triggers match the **tool name** using the same word-boundary matching (catches skills that trigger on the tool itself, e.g., a skill with trigger `"http_request"` matches when `http_request` is the failing tool)
 
 If a matching skill is found, its `body` is included (truncated to 2000 chars, **secrets redacted** via `redact_secrets()`) in the reflection prompt so the model can spot discrepancies between what the skill says and what the agent did.
 
@@ -141,7 +142,7 @@ Pushed to `pending_system_messages` immediately after reflection completes, inje
 
 When `ReflectionDiagnosis.learning` is `Some(draft)`, stored immediately via `state.insert_error_solution()` with `success_count=0, failure_count=0` (unverified). The existing retrieval filter (`success_count > failure_count`) naturally gates unverified learnings from future tasks.
 
-**Verification flow:** Reflection solution IDs are tracked in a tool-scoped `pending_reflection_solutions: HashMap<String, Vec<i64>>` (keyed by tool name). Only when the **same tool** succeeds after the reflection is `success_count` incremented to 1, making the learning retrievable by future tasks. This is separate from the existing `pending_error_solution_ids` mechanism (which is tool-agnostic and handles diagnostic-hint verification). Using a tool-scoped map prevents unrelated tool successes from promoting speculative learnings.
+**Verification flow:** Reflection solution IDs are tracked in `pending_reflection_solutions: HashMap<(String, String), Vec<i64>>` (keyed by `(tool_name, signature)`). Only when the **same tool** succeeds after the reflection is `success_count` incremented to 1, making the learning retrievable by future tasks. This is separate from the existing `pending_error_solution_ids` mechanism (which is tool-agnostic and handles diagnostic-hint verification). Using a `(tool, signature)`-scoped map prevents unrelated tool successes from promoting speculative learnings.
 
 **Deduplication:** Uses the existing `insert_error_solution()` path which upserts on `(error_pattern, domain, solution_summary)`. Multiple solutions for the same pattern are intentionally preserved — the existing schema allows alternative fixes.
 

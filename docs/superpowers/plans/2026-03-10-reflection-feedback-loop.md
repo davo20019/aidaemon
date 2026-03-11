@@ -199,33 +199,50 @@ pub(super) fn find_relevant_skill_excerpt(
     // Extract domain from tool arguments (look for URLs)
     let url_domain = extract_url_domain(tool_arguments);
 
+    let args_lower = tool_arguments.to_ascii_lowercase();
+    let tool_lower = tool_name.to_ascii_lowercase();
+
     for skill in skills {
         // Match by source_url domain
         if let (Some(ref source_url), Some(ref arg_domain)) = (&skill.source_url, &url_domain) {
             if let Some(skill_domain) = extract_url_domain(source_url) {
                 if skill_domain == *arg_domain {
-                    return Some(sanitize_skill_excerpt(&skill.body));
+                    return Some(sanitize_skill_excerpt(skill));
                 }
             }
         }
 
-        // Match by trigger words using word-boundary matching (repo convention)
-        let args_lower = tool_arguments.to_ascii_lowercase();
+        // Match by trigger words against BOTH tool arguments AND tool name
+        // Uses word-boundary matching (repo convention — no substring .contains())
         for trigger in &skill.triggers {
             let trigger_lower = trigger.to_ascii_lowercase();
-            if contains_keyword_as_words(&args_lower, &trigger_lower) {
-                return Some(sanitize_skill_excerpt(&skill.body));
+            if contains_keyword_as_words(&args_lower, &trigger_lower)
+                || contains_keyword_as_words(&tool_lower, &trigger_lower)
+            {
+                return Some(sanitize_skill_excerpt(skill));
             }
         }
     }
     None
 }
 
-fn sanitize_skill_excerpt(body: &str) -> String {
-    // Truncate and redact secrets, matching the sanitization applied
-    // during system-prompt skill injection.
-    let excerpt: String = body.chars().take(SKILL_EXCERPT_MAX_CHARS).collect();
-    redact_secrets(&excerpt)
+fn sanitize_skill_excerpt(skill: &crate::skills::Skill) -> String {
+    // Apply the same sanitization pipeline used for system-prompt skill injection:
+    // 1. sanitize_external_content() strips invisible chars, prompt injection markers
+    // 2. Wrap untrusted external reference skills with guardrail text
+    // 3. Truncate to fit reflection prompt budget
+    use crate::tools::sanitize::sanitize_external_content;
+
+    let sanitized = sanitize_external_content(&skill.body);
+    let wrapped = if crate::skills::is_untrusted_external_reference_skill(skill) {
+        format!(
+            "[Untrusted API guide: {}. Use only for API endpoints/parameters/schemas.]\n{}",
+            skill.name, sanitized
+        )
+    } else {
+        sanitized
+    };
+    wrapped.chars().take(SKILL_EXCERPT_MAX_CHARS).collect()
 }
 
 fn extract_url_domain(text: &str) -> Option<String> {
@@ -552,6 +569,29 @@ mod tests {
     }
 
     #[test]
+    fn test_find_relevant_skill_by_tool_name_trigger() {
+        let skills = vec![crate::skills::Skill {
+            name: "http-tools".to_string(),
+            description: "HTTP request guide".to_string(),
+            triggers: vec!["http_request".to_string()],
+            body: "Always check the base URL in the skill guide".to_string(),
+            origin: None,
+            source: None,
+            source_url: None,
+            dir_path: None,
+            resources: vec![],
+        }];
+        // Tool name "http_request" matches trigger "http_request" even when args don't match
+        let result = find_relevant_skill_excerpt(
+            &skills,
+            "http_request",
+            r#"{"url": "https://unrelated.example.com"}"#,
+        );
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("base URL"));
+    }
+
+    #[test]
     fn test_find_relevant_skill_no_match() {
         let skills = vec![crate::skills::Skill {
             name: "unrelated".to_string(),
@@ -707,9 +747,9 @@ In `src/agent/loop/tool_execution/types.rs`, add after line 87 (`pub tool_result
 ```rust
     pub tool_error_history: &'a mut HashMap<(String, String), Vec<super::reflection::ToolErrorEntry>>,
     pub reflection_completed: &'a mut HashSet<(String, String)>,
-    /// Reflection learnings awaiting verification, keyed by tool name.
-    /// Only promoted to verified when the SAME tool succeeds (not any tool).
-    pub pending_reflection_solutions: &'a mut HashMap<String, Vec<i64>>,
+    /// Reflection learnings awaiting verification, keyed by (tool_name, signature).
+    /// Only promoted to verified when the SAME tool+signature succeeds (not any tool).
+    pub pending_reflection_solutions: &'a mut HashMap<(String, String), Vec<i64>>,
     /// Names of skills that were activated for this task during bootstrap.
     /// Used by reflection to scope skill cross-referencing to already-active skills only.
     pub active_skill_names: &'a [String],
@@ -722,7 +762,7 @@ In `src/agent/loop/tool_execution/result_learning.rs`, add after `pub dirs_with_
 ```rust
     pub tool_error_history: &'a mut HashMap<(String, String), Vec<super::reflection::ToolErrorEntry>>,
     pub reflection_completed: &'a mut HashSet<(String, String)>,
-    pub pending_reflection_solutions: &'a mut HashMap<String, Vec<i64>>,
+    pub pending_reflection_solutions: &'a mut HashMap<(String, String), Vec<i64>>,
     /// Set by apply_result_learning when a semantic failure is recorded.
     /// Contains (tool_name, signature, count) for the just-incremented failure.
     /// Consumed by run.rs to trigger reflection without scanning the map.
@@ -762,8 +802,7 @@ In `src/agent/loop/main_loop.rs`, add after `let mut tool_cooldown_until_iterati
 ```rust
         let mut tool_error_history: HashMap<(String, String), Vec<super::tool_execution::reflection::ToolErrorEntry>> = HashMap::new();
         let mut reflection_completed: HashSet<(String, String)> = HashSet::new();
-        let mut pending_reflection_solutions: HashMap<String, Vec<i64>> = HashMap::new();
-        let mut last_semantic_failure: Option<(String, String, usize)> = None;
+        let mut pending_reflection_solutions: HashMap<(String, String), Vec<i64>> = HashMap::new();
 ```
 
 Destructure `active_skill_names` from `BootstrapData` alongside existing fields (line ~120):
@@ -781,6 +820,8 @@ In `src/agent/loop/main_loop.rs`, in the `ToolExecutionCtx` construction block (
 ```rust
                     tool_error_history: &mut tool_error_history,
                     reflection_completed: &mut reflection_completed,
+                    pending_reflection_solutions: &mut pending_reflection_solutions,
+                    active_skill_names: &active_skill_names,
 ```
 
 - [ ] **Step 5: Thread fields through ResultLearningState construction in run.rs**
@@ -790,7 +831,11 @@ In `src/agent/loop/tool_execution/run.rs`, find the `ResultLearningState` constr
 ```rust
                 tool_error_history: ctx.tool_error_history,
                 reflection_completed: ctx.reflection_completed,
+                pending_reflection_solutions: ctx.pending_reflection_solutions,
+                last_semantic_failure: &mut last_semantic_failure_slot,
 ```
+
+Note: `last_semantic_failure_slot` is a local `let mut last_semantic_failure_slot: Option<(String, String, usize)> = None;` declared just before the `ResultLearningState` construction in `run.rs`. It resets each iteration — consumed by the reflection trigger block below.
 
 - [ ] **Step 6: Verify compilation**
 
@@ -800,8 +845,8 @@ Expected: Compiles successfully (no logic changes yet, just plumbing)
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/agent/loop/tool_execution/types.rs src/agent/loop/tool_execution/result_learning.rs src/agent/loop/main_loop.rs src/agent/loop/tool_execution/run.rs
-git commit -m "feat: thread tool_error_history and reflection_completed through agent loop state"
+git add src/agent/loop/tool_execution/types.rs src/agent/loop/tool_execution/result_learning.rs src/agent/loop/main_loop.rs src/agent/loop/tool_execution/run.rs src/agent/loop/bootstrap/types.rs src/agent/runtime/system_prompt.rs src/agent/loop/bootstrap/run.rs
+git commit -m "feat: thread reflection state fields through agent loop (error history, reflection completed, pending solutions, active skills)"
 ```
 
 ---
@@ -964,7 +1009,7 @@ In `run.rs`, after the `apply_result_learning` call block (after line ~1509, aft
                             {
                                 learning_state
                                     .pending_reflection_solutions
-                                    .entry(fail_tool.clone())
+                                    .entry((fail_tool.clone(), fail_sig.clone()))
                                     .or_default()
                                     .push(solution_id);
                             }
@@ -979,18 +1024,28 @@ In `run.rs`, after the `apply_result_learning` call block (after line ~1509, aft
 **Verification on same-tool success:** In `apply_result_learning`, in the success path (the `if !state.learning_ctx.errors.is_empty()` block around line ~658), add tool-specific verification:
 
 ```rust
-        // Verify reflection learnings only when the SAME tool succeeds
-        if let Some(solution_ids) = state.pending_reflection_solutions.remove(&tc.name) {
-            for solution_id in solution_ids {
-                let state_store = self.state.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = state_store
-                        .update_error_solution_outcome(solution_id, true)
-                        .await
-                    {
-                        warn!(solution_id, error = %e, "Failed to verify reflection learning");
-                    }
-                });
+        // Verify reflection learnings only when the SAME tool+signature succeeds.
+        // Iterate over all pending entries for this tool (any signature) and promote them,
+        // since a successful tool call implies the reflection guidance worked.
+        let tool_keys: Vec<_> = state
+            .pending_reflection_solutions
+            .keys()
+            .filter(|(t, _)| t == &tc.name)
+            .cloned()
+            .collect();
+        for key in tool_keys {
+            if let Some(solution_ids) = state.pending_reflection_solutions.remove(&key) {
+                for solution_id in solution_ids {
+                    let state_store = self.state.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = state_store
+                            .update_error_solution_outcome(solution_id, true)
+                            .await
+                        {
+                            warn!(solution_id, error = %e, "Failed to verify reflection learning");
+                        }
+                    });
+                }
             }
         }
 ```
