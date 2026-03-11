@@ -887,6 +887,58 @@ fn record_semantic_failure_signature(
 
 Update all call sites to destructure the tuple (there's only one call site in `apply_result_learning`).
 
+- [ ] **Step 1b: Update existing unit tests for the new return type**
+
+The existing tests in `result_learning.rs` (`test_repeated_signature_persists_without_reset` at line ~783, `test_signature_counter_only_rises_on_repeated_same_error` at line ~806) assert `usize` return values. Update them to destructure the `(usize, String)` tuple:
+
+```rust
+    #[test]
+    fn test_repeated_signature_persists_without_reset() {
+        let mut counts = HashMap::new();
+        let mut signatures = HashMap::new();
+        let (first, _sig1) = record_semantic_failure_signature(
+            &mut counts, &mut signatures, "read_file",
+            "Error: missing required field `path`",
+        );
+        let (second, sig2) = record_semantic_failure_signature(
+            &mut counts, &mut signatures, "read_file",
+            "Error: missing required field `path`",
+        );
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(counts.get("read_file").copied(), Some(2));
+        // Verify the signature is returned correctly
+        assert!(!sig2.is_empty());
+    }
+
+    #[test]
+    fn test_signature_counter_only_rises_on_repeated_same_error() {
+        let mut counts = HashMap::new();
+        let mut signatures = HashMap::new();
+
+        let (first, sig_a) = record_semantic_failure_signature(
+            &mut counts, &mut signatures, "read_file",
+            "Error: missing required field `path`",
+        );
+        let (second_unique, sig_b) = record_semantic_failure_signature(
+            &mut counts, &mut signatures, "read_file",
+            "Error: permission denied",
+        );
+        let (third_repeat, sig_c) = record_semantic_failure_signature(
+            &mut counts, &mut signatures, "read_file",
+            "Error: missing required field `path`",
+        );
+
+        assert_eq!(first, 1);
+        assert_eq!(second_unique, 1);
+        assert_eq!(third_repeat, 2);
+        // Different error texts produce different signatures
+        assert_ne!(sig_a, sig_b);
+        // Same error text produces the same signature
+        assert_eq!(sig_a, sig_c);
+    }
+```
+
 - [ ] **Step 2: Add error recording and surface the signature**
 
 In `apply_result_learning()`, update the semantic failure block:
@@ -1024,16 +1076,27 @@ In `run.rs`, after the `apply_result_learning` call block (after line ~1509, aft
 **Verification on same-tool success:** In `apply_result_learning`, in the success path (the `if !state.learning_ctx.errors.is_empty()` block around line ~658), add tool-specific verification:
 
 ```rust
-        // Verify reflection learnings only when the SAME tool+signature succeeds.
-        // Iterate over all pending entries for this tool (any signature) and promote them,
-        // since a successful tool call implies the reflection guidance worked.
-        let tool_keys: Vec<_> = state
-            .pending_reflection_solutions
+        // Verify reflection learnings: only promote the EXACT (tool, signature) that
+        // was reflected on, not all pending entries for this tool. This prevents a
+        // successful http_request to one endpoint from incorrectly verifying a
+        // reflection learning about a completely different failure signature.
+        //
+        // Find the most recent failure signature for this tool from tool_error_history.
+        // That's the signature we just recovered from.
+        let recovered_signature: Option<String> = state
+            .tool_error_history
             .keys()
             .filter(|(t, _)| t == &tc.name)
-            .cloned()
-            .collect();
-        for key in tool_keys {
+            .max_by_key(|key| {
+                state.tool_error_history.get(key)
+                    .and_then(|entries| entries.last())
+                    .map(|e| e.iteration)
+                    .unwrap_or(0)
+            })
+            .map(|(_, sig)| sig.clone());
+
+        if let Some(sig) = recovered_signature {
+            let key = (tc.name.clone(), sig);
             if let Some(solution_ids) = state.pending_reflection_solutions.remove(&key) {
                 for solution_id in solution_ids {
                     let state_store = self.state.clone();
@@ -1050,7 +1113,7 @@ In `run.rs`, after the `apply_result_learning` call block (after line ~1509, aft
         }
 ```
 
-This is separate from the existing `pending_error_solution_ids` mechanism (which is tool-agnostic and handles diagnostic-hint verification). Reflection solutions use their own tool-scoped map.
+This is separate from the existing `pending_error_solution_ids` mechanism (which is tool-agnostic and handles diagnostic-hint verification). Reflection solutions use their own `(tool, signature)`-keyed map, and verification only promotes the exact signature whose most recent failure entry has the highest iteration number — i.e., the failure we most recently recovered from.
 
 - [ ] **Step 2: Verify compilation**
 
