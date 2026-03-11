@@ -16,14 +16,16 @@
 
 | File | Role |
 |------|------|
-| `src/agent/loop/tool_execution/reflection.rs` | **NEW** — Core reflection module: `ReflectionCtx`, `ReflectionDiagnosis`, `ToolErrorEntry`, `maybe_trigger_reflection()`, response parsing, skill matching |
+| `src/agent/loop/tool_execution/reflection.rs` | **NEW** — Core reflection module: `ReflectionDiagnosis`, `ToolErrorEntry`, `maybe_trigger_reflection()`, response parsing, skill matching (word-boundary + sanitized), verification tracking |
 | `src/agent/loop/tool_execution/phase_impl.rs` | Add `mod reflection;` declaration |
-| `src/agent/loop/tool_execution/types.rs` | Add `tool_error_history` and `reflection_completed` fields to `ToolExecutionCtx` |
-| `src/agent/loop/tool_execution/result_learning.rs` | Add `tool_error_history` and `reflection_completed` fields to `ResultLearningState`, accumulate error entries on semantic failures |
-| `src/agent/loop/tool_execution/run.rs` | Call `maybe_trigger_reflection()` after `apply_result_learning()` at line ~1509 |
-| `src/agent/loop/main_loop.rs` | Initialize `tool_error_history` and `reflection_completed` in loop state (~line 221), thread them through `ToolExecutionCtx` (~line 896) |
-| `src/agent/loop/system_directives.rs` | Add `ReflectionDiagnosis` variant + render + test |
-| `src/agent/loop/stopping_phase.rs` | Append promise-prevention text to `ForceTextToolLimitReached` render (~line 274) |
+| `src/agent/loop/tool_execution/types.rs` | Add `tool_error_history`, `reflection_completed`, `active_skill_names`, `pending_reflection_solutions` fields to `ToolExecutionCtx` |
+| `src/agent/loop/tool_execution/result_learning.rs` | Add fields to `ResultLearningState`, accumulate error entries, **return just-incremented signature from semantic failure path**, verify reflection solutions on same-tool success |
+| `src/agent/loop/tool_execution/run.rs` | Call `maybe_trigger_reflection()` using the signature returned by `apply_result_learning()` |
+| `src/agent/loop/main_loop.rs` | Initialize new loop state fields (~line 221), thread through `ToolExecutionCtx` (~line 896) |
+| `src/agent/loop/bootstrap/types.rs` | Add `active_skill_names: Vec<String>` to `BootstrapData` |
+| `src/agent/runtime/system_prompt.rs` | Return active skill names alongside system prompt string |
+| `src/agent/loop/bootstrap/run.rs` | Capture active skill names from system prompt build, store in `BootstrapData` |
+| `src/agent/loop/system_directives.rs` | Add `ReflectionDiagnosis` variant + render + test, add promise prevention to `ForceTextToolLimitReached` |
 
 ---
 
@@ -187,6 +189,8 @@ pub(super) fn record_tool_error(
 /// Find a relevant skill from the task's already-active skills by matching the tool arguments
 /// URL domain against skill source_urls, or by matching skill triggers against the tool name.
 /// Only searches skills that were confirmed during bootstrap — NOT all enabled skills.
+/// Uses word-boundary matching (contains_keyword_as_words) per repo convention.
+/// Sanitizes the skill body before returning to prevent raw untrusted content injection.
 pub(super) fn find_relevant_skill_excerpt(
     skills: &[crate::skills::Skill],
     tool_name: &str,
@@ -200,26 +204,28 @@ pub(super) fn find_relevant_skill_excerpt(
         if let (Some(ref source_url), Some(ref arg_domain)) = (&skill.source_url, &url_domain) {
             if let Some(skill_domain) = extract_url_domain(source_url) {
                 if skill_domain == *arg_domain {
-                    let excerpt: String =
-                        skill.body.chars().take(SKILL_EXCERPT_MAX_CHARS).collect();
-                    return Some(excerpt);
+                    return Some(sanitize_skill_excerpt(&skill.body));
                 }
             }
         }
 
-        // Match by trigger words against tool name or error context
+        // Match by trigger words using word-boundary matching (repo convention)
+        let args_lower = tool_arguments.to_ascii_lowercase();
         for trigger in &skill.triggers {
             let trigger_lower = trigger.to_ascii_lowercase();
-            let tool_lower = tool_name.to_ascii_lowercase();
-            let args_lower = tool_arguments.to_ascii_lowercase();
-            if tool_lower.contains(&trigger_lower) || args_lower.contains(&trigger_lower) {
-                let excerpt: String =
-                    skill.body.chars().take(SKILL_EXCERPT_MAX_CHARS).collect();
-                return Some(excerpt);
+            if contains_keyword_as_words(&args_lower, &trigger_lower) {
+                return Some(sanitize_skill_excerpt(&skill.body));
             }
         }
     }
     None
+}
+
+fn sanitize_skill_excerpt(body: &str) -> String {
+    // Truncate and redact secrets, matching the sanitization applied
+    // during system-prompt skill injection.
+    let excerpt: String = body.chars().take(SKILL_EXCERPT_MAX_CHARS).collect();
+    redact_secrets(&excerpt)
 }
 
 fn extract_url_domain(text: &str) -> Option<String> {
@@ -701,6 +707,9 @@ In `src/agent/loop/tool_execution/types.rs`, add after line 87 (`pub tool_result
 ```rust
     pub tool_error_history: &'a mut HashMap<(String, String), Vec<super::reflection::ToolErrorEntry>>,
     pub reflection_completed: &'a mut HashSet<(String, String)>,
+    /// Reflection learnings awaiting verification, keyed by tool name.
+    /// Only promoted to verified when the SAME tool succeeds (not any tool).
+    pub pending_reflection_solutions: &'a mut HashMap<String, Vec<i64>>,
     /// Names of skills that were activated for this task during bootstrap.
     /// Used by reflection to scope skill cross-referencing to already-active skills only.
     pub active_skill_names: &'a [String],
@@ -713,15 +722,54 @@ In `src/agent/loop/tool_execution/result_learning.rs`, add after `pub dirs_with_
 ```rust
     pub tool_error_history: &'a mut HashMap<(String, String), Vec<super::reflection::ToolErrorEntry>>,
     pub reflection_completed: &'a mut HashSet<(String, String)>,
+    pub pending_reflection_solutions: &'a mut HashMap<String, Vec<i64>>,
+    /// Set by apply_result_learning when a semantic failure is recorded.
+    /// Contains (tool_name, signature, count) for the just-incremented failure.
+    /// Consumed by run.rs to trigger reflection without scanning the map.
+    pub last_semantic_failure: &'a mut Option<(String, String, usize)>,
 ```
 
-- [ ] **Step 3: Initialize state in main_loop.rs**
+- [ ] **Step 3: Add active_skill_names to BootstrapData**
+
+In `src/agent/loop/bootstrap/types.rs`, add after `pub session_summary` (line 40):
+
+```rust
+    pub active_skill_names: Vec<String>,
+```
+
+In `src/agent/runtime/system_prompt.rs`, modify `build_system_prompt_for_message()` to return `(String, Vec<String>)` — the system prompt string and the final active skill names. Extract the `final_skill_names` that are already computed at line ~233:
+
+```rust
+    // After the LLM confirmation block, at the end:
+    let final_skill_names: Vec<String> = active_skills.iter().map(|s| s.name.clone()).collect();
+    Ok((system_prompt_string, final_skill_names))
+```
+
+Update the call site in `src/agent/loop/bootstrap/run.rs` (line ~518) to capture both:
+
+```rust
+        let (system_prompt, active_skill_names) = self
+            .build_system_prompt_for_message(...)
+            .await?;
+```
+
+And pass `active_skill_names` into `BootstrapData`.
+
+- [ ] **Step 4: Initialize state in main_loop.rs**
 
 In `src/agent/loop/main_loop.rs`, add after `let mut tool_cooldown_until_iteration` (around line 224):
 
 ```rust
         let mut tool_error_history: HashMap<(String, String), Vec<super::tool_execution::reflection::ToolErrorEntry>> = HashMap::new();
         let mut reflection_completed: HashSet<(String, String)> = HashSet::new();
+        let mut pending_reflection_solutions: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut last_semantic_failure: Option<(String, String, usize)> = None;
+```
+
+Destructure `active_skill_names` from `BootstrapData` alongside existing fields (line ~120):
+
+```rust
+            active_skill_names,
 ```
 
 Note: `reflection` module types need to be pub(super) accessible. If the import path doesn't resolve, the module re-export in `phase_impl.rs` may need a `pub(in crate::agent)` on the module declaration, or use a `use` re-export.
@@ -758,29 +806,78 @@ git commit -m "feat: thread tool_error_history and reflection_completed through 
 
 ---
 
-### Task 4: Accumulate error entries on semantic failures
+### Task 4: Accumulate error entries and surface the just-incremented signature
 
 **Files:**
-- Modify: `src/agent/loop/tool_execution/result_learning.rs:266-271` (after `record_semantic_failure_signature`)
+- Modify: `src/agent/loop/tool_execution/result_learning.rs:160-189` (record_semantic_failure_signature)
+- Modify: `src/agent/loop/tool_execution/result_learning.rs:266-271` (after record_semantic_failure_signature call)
+- Modify: `src/agent/loop/tool_execution/result_learning.rs:193-202` (apply_result_learning return type)
 
-- [ ] **Step 1: Add error recording call**
+- [ ] **Step 1: Make record_semantic_failure_signature return the signature string**
 
-In `result_learning.rs`, inside `apply_result_learning()`, right after the `record_semantic_failure_signature` call (line ~266-271), add:
+Change `record_semantic_failure_signature` (line ~170) to return `(usize, String)` instead of just `usize`:
 
 ```rust
+fn record_semantic_failure_signature(
+    tool_failure_count: &mut HashMap<String, usize>,
+    tool_failure_signatures: &mut HashMap<(String, String), usize>,
+    tool_name: &str,
+    error_text: &str,
+) -> (usize, String) {  // returns (count, signature)
+    let signature = derive_failure_signature(error_text);
+    let count = tool_failure_signatures
+        .entry((tool_name.to_string(), signature.clone()))
+        .or_insert(0);
+    *count += 1;
+    let repeated_count = *count;
+    let per_tool = tool_failure_count
+        .entry(tool_name.to_string())
+        .or_insert(repeated_count);
+    if repeated_count > *per_tool {
+        *per_tool = repeated_count;
+    }
+    (repeated_count, signature)
+}
+```
+
+Update all call sites to destructure the tuple (there's only one call site in `apply_result_learning`).
+
+- [ ] **Step 2: Add error recording and surface the signature**
+
+In `apply_result_learning()`, update the semantic failure block:
+
+```rust
+                let (semantic_count, failure_signature) = record_semantic_failure_signature(
+                    state.tool_failure_count,
+                    state.tool_failure_signatures,
+                    &tc.name,
+                    &base_error,
+                );
+
                 // Accumulate error entry for reflection, keyed by (tool, signature)
-                let failure_sig = super::result_learning::derive_failure_signature(&base_error);
                 super::reflection::record_tool_error(
                     state.tool_error_history,
                     &tc.name,
-                    &failure_sig,
+                    &failure_signature,
                     env.iteration,
                     &tc.arguments,
                     &base_error,
                 );
 ```
 
-Note: `derive_failure_signature` is already called internally by `record_semantic_failure_signature`. To avoid duplicating the call, either extract the signature from the existing code path (make `record_semantic_failure_signature` return it) or call `derive_failure_signature` again (it's a pure function, negligible cost). The simpler approach is to call it again.
+- [ ] **Step 3: Add a `last_semantic_failure` output field**
+
+Add a new field to `ResultLearningState` (or add a return value from `apply_result_learning`) to surface the just-incremented `(tool_name, signature, count)` triple. The simplest approach is a new field:
+
+```rust
+    pub last_semantic_failure: &'a mut Option<(String, String, usize)>,  // (tool, sig, count)
+```
+
+Set it inside `apply_result_learning` after `record_semantic_failure_signature`:
+
+```rust
+                *state.last_semantic_failure = Some((tc.name.clone(), failure_signature.clone(), semantic_count));
+```
 
 This goes right after `let semantic_count = record_semantic_failure_signature(...)` and before the `if semantic_count == 1 && looks_like_missing_goal_id_error(...)` block.
 
@@ -808,80 +905,97 @@ git commit -m "feat: accumulate tool error entries on semantic failures for refl
 In `run.rs`, after the `apply_result_learning` call block (after line ~1509, after the `commit_state!(); return Ok(outcome);` block), add before the `if !is_error {` line:
 
 ```rust
-            // Trigger reflection on 2nd same-signature failure
-            if is_error {
-                // Get the current failure signature count for this tool
-                let tool_sigs: Vec<_> = learning_state
-                    .tool_failure_signatures
-                    .iter()
-                    .filter(|((name, _), _)| name == &tc.name)
-                    .collect();
-                // Find if any signature just hit count == 2
-                for ((_, sig), count) in &tool_sigs {
-                    if **count == 2 {
-                        // Error history is keyed by (tool, signature) — only same-signature errors
-                        let history_key = (tc.name.clone(), sig.clone());
-                        let error_history = learning_state
-                            .tool_error_history
-                            .get(&history_key)
-                            .cloned()
-                            .unwrap_or_default();
+            // Trigger reflection using the exact signature that just incremented
+            // (avoids non-deterministic map scanning and wrong-signature diagnosis)
+            if let Some((ref fail_tool, ref fail_sig, fail_count)) =
+                *learning_state.last_semantic_failure
+            {
+                if fail_count == 2 {
+                    // Error history is keyed by (tool, signature) — only same-signature errors
+                    let history_key = (fail_tool.clone(), fail_sig.clone());
+                    let error_history = learning_state
+                        .tool_error_history
+                        .get(&history_key)
+                        .cloned()
+                        .unwrap_or_default();
 
-                        // Get active skills for scoped cross-referencing
-                        let skills_snapshot = self.skill_cache.get();
-                        let active_skills: Vec<_> = skills_snapshot
-                            .iter()
-                            .filter(|s| ctx.active_skill_names.contains(&s.name))
-                            .cloned()
-                            .collect();
+                    // Get active skills for scoped cross-referencing
+                    let skills_snapshot = self.skill_cache.get();
+                    let active_skills: Vec<_> = skills_snapshot
+                        .iter()
+                        .filter(|s| ctx.active_skill_names.contains(&s.name))
+                        .cloned()
+                        .collect();
 
-                        if let Some(diagnosis) = self
-                            .maybe_trigger_reflection(
-                                &tc.name,
-                                sig,
-                                2,
-                                &error_history,
-                                ctx.user_text,
-                                &active_skills,
-                                learning_state.reflection_completed,
-                            )
-                            .await
-                        {
-                            info!(
-                                tool = %tc.name,
-                                root_cause = %diagnosis.root_cause,
-                                "Reflection diagnosis produced"
-                            );
-                            learning_state.pending_system_messages.push(
-                                SystemDirective::ReflectionDiagnosis {
-                                    tool_name: tc.name.clone(),
-                                    root_cause: diagnosis.root_cause,
-                                    recommended_action: diagnosis.recommended_action,
-                                },
-                            );
-                            // Store as UNVERIFIED (success_count=0).
-                            // Track the solution ID so we can verify it on recovery.
-                            if let Some(draft) = diagnosis.learning {
-                                if let Some(solution_id) =
-                                    super::reflection::store_reflection_learning(
-                                        &self.state, draft,
-                                    )
-                                    .await
-                                {
-                                    // Add to pending_error_solution_ids for verification
-                                    // on same-tool recovery (existing mechanism in
-                                    // result_learning.rs)
-                                    learning_state
-                                        .pending_error_solution_ids
-                                        .push(solution_id);
-                                }
+                    if let Some(diagnosis) = self
+                        .maybe_trigger_reflection(
+                            fail_tool,
+                            fail_sig,
+                            2,
+                            &error_history,
+                            ctx.user_text,
+                            &active_skills,
+                            learning_state.reflection_completed,
+                        )
+                        .await
+                    {
+                        info!(
+                            tool = %fail_tool,
+                            root_cause = %diagnosis.root_cause,
+                            "Reflection diagnosis produced"
+                        );
+                        learning_state.pending_system_messages.push(
+                            SystemDirective::ReflectionDiagnosis {
+                                tool_name: fail_tool.clone(),
+                                root_cause: diagnosis.root_cause,
+                                recommended_action: diagnosis.recommended_action,
+                            },
+                        );
+                        // Store as UNVERIFIED (success_count=0).
+                        // Track in tool-scoped pending_reflection_solutions so
+                        // verification only fires when THIS tool succeeds,
+                        // not any unrelated tool.
+                        if let Some(draft) = diagnosis.learning {
+                            if let Some(solution_id) =
+                                super::reflection::store_reflection_learning(
+                                    &self.state, draft,
+                                )
+                                .await
+                            {
+                                learning_state
+                                    .pending_reflection_solutions
+                                    .entry(fail_tool.clone())
+                                    .or_default()
+                                    .push(solution_id);
                             }
                         }
-                        break; // Only one reflection per iteration
                     }
                 }
+                // Clear after processing
+                *learning_state.last_semantic_failure = None;
             }
 ```
+
+**Verification on same-tool success:** In `apply_result_learning`, in the success path (the `if !state.learning_ctx.errors.is_empty()` block around line ~658), add tool-specific verification:
+
+```rust
+        // Verify reflection learnings only when the SAME tool succeeds
+        if let Some(solution_ids) = state.pending_reflection_solutions.remove(&tc.name) {
+            for solution_id in solution_ids {
+                let state_store = self.state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = state_store
+                        .update_error_solution_outcome(solution_id, true)
+                        .await
+                    {
+                        warn!(solution_id, error = %e, "Failed to verify reflection learning");
+                    }
+                });
+            }
+        }
+```
+
+This is separate from the existing `pending_error_solution_ids` mechanism (which is tool-agnostic and handles diagnostic-hint verification). Reflection solutions use their own tool-scoped map.
 
 - [ ] **Step 2: Verify compilation**
 
@@ -962,10 +1076,9 @@ Add to `reflection.rs` `#[cfg(test)]` module:
     async fn test_maybe_trigger_reflection_fires_on_second_failure() {
         use crate::testing::{setup_test_agent, MockProvider};
 
-        // Script the mock: first call is the main loop (won't be used),
-        // second call is the reflection response
+        // Script the mock with the reflection response
         let provider = MockProvider::with_responses(vec![
-            crate::testing::text_response(
+            MockProvider::text_response(
                 "ROOT_CAUSE: Wrong API endpoint used\n\
                  RECOMMENDED_ACTION: Use the correct base URL from the skill guide\n\
                  LEARNING: Always check the skill guide for the correct base URL before making API calls",
@@ -986,6 +1099,7 @@ Add to `reflection.rs` `#[cfg(test)]` module:
                 error_text: "HTTP 404 Not Found".to_string(),
             },
         ];
+        let active_skills: Vec<crate::skills::Skill> = vec![];
 
         // Should trigger on count == 2
         let result = harness
@@ -996,6 +1110,7 @@ Add to `reflection.rs` `#[cfg(test)]` module:
                 2,
                 &error_history,
                 "Find clinical trials near me",
+                &active_skills,
                 &mut reflection_completed,
             )
             .await;
@@ -1015,6 +1130,7 @@ Add to `reflection.rs` `#[cfg(test)]` module:
                 2,
                 &error_history,
                 "Find clinical trials near me",
+                &active_skills,
                 &mut reflection_completed,
             )
             .await;
@@ -1031,6 +1147,7 @@ Add to `reflection.rs` `#[cfg(test)]` module:
         let provider = MockProvider::new();
         let harness = setup_test_agent(provider).await;
         let mut reflection_completed: HashSet<(String, String)> = HashSet::new();
+        let active_skills: Vec<crate::skills::Skill> = vec![];
 
         let result = harness
             .agent
@@ -1040,6 +1157,7 @@ Add to `reflection.rs` `#[cfg(test)]` module:
                 1, // count == 1, should not trigger
                 &[],
                 "test task",
+                &active_skills,
                 &mut reflection_completed,
             )
             .await;
@@ -1054,6 +1172,7 @@ Add to `reflection.rs` `#[cfg(test)]` module:
         let provider = MockProvider::new();
         let harness = setup_test_agent(provider).await;
         let mut reflection_completed: HashSet<(String, String)> = HashSet::new();
+        let active_skills: Vec<crate::skills::Skill> = vec![];
 
         let result = harness
             .agent
@@ -1063,6 +1182,7 @@ Add to `reflection.rs` `#[cfg(test)]` module:
                 3, // count == 3, should not trigger
                 &[],
                 "test task",
+                &active_skills,
                 &mut reflection_completed,
             )
             .await;

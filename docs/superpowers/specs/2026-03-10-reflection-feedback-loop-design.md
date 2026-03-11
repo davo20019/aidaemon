@@ -105,11 +105,11 @@ LEARNING: <one sentence that would prevent this mistake in future tasks, or NONE
 
 Reflection is scoped to **already-active skills** — the skills that were matched and confirmed during the task's bootstrap phase (the same set injected into the system prompt). This is safer and more relevant than scanning all enabled skills via `skill_cache.get()`.
 
-The active skill names are threaded into the reflection context. For each active skill, we check:
+The active skill names are extracted from `build_system_prompt_for_message()` (which already computes the confirmed skill set), stored in `BootstrapData`, and threaded through `ToolExecutionCtx` into the reflection context. For each active skill, we check:
 - `source_url` domain matches the failing URL domain (extracted from tool arguments)
-- OR triggers match the tool name or error keywords
+- OR triggers match using **word-boundary matching** via `contains_keyword_as_words()` (repo convention — no substring `.contains()`)
 
-If a matching skill is found, its `body` is included (truncated to 2000 chars) in the reflection prompt so the model can spot discrepancies between what the skill says and what the agent did. The same sanitization/trust handling used for system prompt injection applies here.
+If a matching skill is found, its `body` is included (truncated to 2000 chars, **secrets redacted** via `redact_secrets()`) in the reflection prompt so the model can spot discrepancies between what the skill says and what the agent did.
 
 ### Model Selection
 
@@ -141,7 +141,7 @@ Pushed to `pending_system_messages` immediately after reflection completes, inje
 
 When `ReflectionDiagnosis.learning` is `Some(draft)`, stored immediately via `state.insert_error_solution()` with `success_count=0, failure_count=0` (unverified). The existing retrieval filter (`success_count > failure_count`) naturally gates unverified learnings from future tasks.
 
-**Verification flow:** If the agent recovers in the same task (the same tool succeeds after the reflection), `success_count` is incremented to 1, making the learning retrievable by future tasks. This prevents speculative reflections from becoming authoritative guidance.
+**Verification flow:** Reflection solution IDs are tracked in a tool-scoped `pending_reflection_solutions: HashMap<String, Vec<i64>>` (keyed by tool name). Only when the **same tool** succeeds after the reflection is `success_count` incremented to 1, making the learning retrievable by future tasks. This is separate from the existing `pending_error_solution_ids` mechanism (which is tool-agnostic and handles diagnostic-hint verification). Using a tool-scoped map prevents unrelated tool successes from promoting speculative learnings.
 
 **Deduplication:** Uses the existing `insert_error_solution()` path which upserts on `(error_pattern, domain, solution_summary)`. Multiple solutions for the same pattern are intentionally preserved — the existing schema allows alternative fixes.
 
@@ -200,13 +200,16 @@ Unit tests with `MockProvider`:
 
 | File | Change |
 |------|--------|
-| `src/agent/loop/tool_execution/reflection.rs` | **NEW** — ReflectionDiagnosis, maybe_trigger_reflection(), response parsing, skill matching (scoped to active skills) |
-| `src/agent/loop/tool_execution/result_learning.rs` | Add ToolErrorEntry, tool_error_history accumulation on semantic failures, verification on recovery |
-| `src/agent/loop/tool_execution/run.rs` | Call maybe_trigger_reflection() after apply_result_learning(), track pending reflection solution IDs for verification |
+| `src/agent/loop/tool_execution/reflection.rs` | **NEW** — ReflectionDiagnosis, maybe_trigger_reflection(), response parsing, skill matching (word-boundary, sanitized, scoped to active skills) |
+| `src/agent/loop/tool_execution/result_learning.rs` | Add ToolErrorEntry, tool_error_history accumulation, return just-incremented signature, tool-scoped reflection verification on recovery |
+| `src/agent/loop/tool_execution/run.rs` | Call maybe_trigger_reflection() using signature from apply_result_learning(), track in pending_reflection_solutions |
 | `src/agent/loop/tool_execution/phase_impl.rs` | Declare `mod reflection;` |
-| `src/agent/loop/tool_execution/types.rs` | Add tool_error_history and reflection_completed to ToolExecutionCtx |
+| `src/agent/loop/tool_execution/types.rs` | Add tool_error_history, reflection_completed, pending_reflection_solutions, active_skill_names to ToolExecutionCtx |
 | `src/agent/loop/system_directives.rs` | Add ReflectionDiagnosis variant + render, append promise prevention to ForceTextToolLimitReached |
-| `src/agent/loop/main_loop.rs` | Initialize tool_error_history and reflection_completed, thread active_skill_names into ToolExecutionCtx |
+| `src/agent/loop/bootstrap/types.rs` | Add active_skill_names to BootstrapData |
+| `src/agent/runtime/system_prompt.rs` | Return active skill names alongside system prompt string |
+| `src/agent/loop/bootstrap/run.rs` | Capture active skill names, store in BootstrapData |
+| `src/agent/loop/main_loop.rs` | Initialize all new loop state fields, destructure active_skill_names from bootstrap |
 
 ## End-to-End Example
 
