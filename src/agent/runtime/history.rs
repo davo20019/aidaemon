@@ -201,7 +201,9 @@ fn assistant_message_looks_like_clarifying_question(message: &str) -> bool {
         "how",
         "do you want",
         "would you like",
+        "want me to",
         "should i",
+        "shall i",
         "can you clarify",
         "any specific",
         "do you prefer",
@@ -2238,6 +2240,15 @@ mod tests {
         let followup = "Yes, do it.";
         let prev = "Should I proceed with this change?";
         assert!(looks_like_followup_reply(followup, Some(prev)));
+    }
+
+    #[test]
+    fn followup_accepts_answer_to_want_me_to_clarification() {
+        let current = "Post it.";
+        let prev = "Please answer directly: Want me to tweak this or post it?";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::ClarificationAnswer);
+        assert!(reasons.contains(&TurnContextReason::ClarificationAnswer));
     }
 
     #[test]

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.23] - 2026-03-12
+
+### Added
+
+- **Non-resolving confirmation shortcut**: Bare "yes"/"ok"/"go ahead" replies to assistant questions that require a specific answer (which/what/or-choices) now get a direct follow-up requesting the actual choice instead of entering the full agent loop.
+- **Progress-based budget extension**: Each successful tool execution extends the budget (LLM calls, tool calls, steps, wall-clock time), so productive multi-step runs are never artificially stopped by the initial budget ceiling.
+- **Successful tool calls count as concrete work**: The stopping phase now considers any successfully completed tool call as concrete execution, preventing premature abandon when tools execute but their effects don't classify as observation/mutation (common for MCP tools).
+
+### Changed
+
+- **Pre-execution planning no longer charges budget**: Planning and critique passes are system-initiated quality checks — they no longer count against the agent's LLM call and validation round budget.
+- **Budget tier limits raised**: None tier LLM calls 8→14, validation rounds 1→3; Small tier steps 12→16, LLM calls 10→14, tool calls 10→14, validation rounds 2→3.
+- **Clarification question detection expanded**: "want me to" and "shall i" now recognized as clarification patterns for followup classification.
+
+### Fixed
+
+- **Productive runs stopped by tight budget**: Runs with successful tool calls were budget-exhausted even though every call succeeded. Progress-based extension ensures productive work continues.
+
 ## [0.9.22] - 2026-03-11
 
 ### Added

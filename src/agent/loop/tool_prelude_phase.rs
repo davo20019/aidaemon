@@ -757,7 +757,10 @@ impl Agent {
                     .unwrap_or_default();
                 let expected_target = extract_target_preview(&first_risky_tool_call.arguments);
 
-                execution_state.record_llm_call();
+                // Pre-execution planning is a system-initiated quality check,
+                // not an agent action. Do not charge it against the execution
+                // budget — the agent should not be penalised for the system's
+                // own safety overhead.
                 match self
                     .request_pre_execution_plan(
                         llm_provider,
@@ -816,8 +819,9 @@ impl Agent {
                                 capabilities,
                                 execution_state,
                             ) {
-                                execution_state.record_llm_call();
-                                execution_state.record_validation_round();
+                                // Same principle: critique is system-initiated
+                                // quality gating, not agent work. Do not charge
+                                // it against the execution budget.
                                 match self
                                     .request_pre_execution_critique(
                                         ctx.llm_provider.clone(),

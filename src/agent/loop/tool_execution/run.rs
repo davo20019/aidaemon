@@ -1559,6 +1559,10 @@ impl Agent {
             }
 
             if !is_error {
+                // Each successful tool execution extends the budget so
+                // productive multi-step runs are never artificially stopped.
+                execution_state.extend_budget_on_progress();
+
                 send_status(
                     &status_tx,
                     StatusUpdate::ToolComplete {

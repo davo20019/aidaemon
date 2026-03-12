@@ -340,6 +340,42 @@ impl Agent {
         Ok(None)
     }
 
+    pub(super) async fn maybe_handle_non_resolving_confirmation_shortcut(
+        &self,
+        session_id: &str,
+        user_text: &str,
+        task_id: &str,
+        emitter: &crate::events::EventEmitter,
+    ) -> anyhow::Result<Option<String>> {
+        if self.depth != 0 || !is_bare_confirmation(user_text) {
+            return Ok(None);
+        }
+
+        let history = self
+            .state
+            .get_history(session_id, 12)
+            .await
+            .unwrap_or_default();
+        let prev_assistant = history
+            .iter()
+            .rev()
+            .find(|msg| msg.role == "assistant")
+            .and_then(|msg| msg.content.as_deref());
+        let Some(prev_assistant) = prev_assistant else {
+            return Ok(None);
+        };
+
+        if !assistant_question_requires_specific_answer(prev_assistant) {
+            return Ok(None);
+        }
+
+        let reply = build_specific_answer_request(prev_assistant);
+        let reply = self
+            .emit_bootstrap_direct_reply(emitter, task_id, session_id, Instant::now(), &reply)
+            .await?;
+        Ok(Some(reply))
+    }
+
     pub(super) async fn maybe_handle_trivial_ack_shortcut(
         &self,
         session_id: &str,
@@ -538,9 +574,86 @@ fn looks_like_mid_task_pivot(user_text: &str) -> bool {
     has_pivot_cue && lower.split_whitespace().count() >= 5
 }
 
+fn is_bare_confirmation(user_text: &str) -> bool {
+    let normalized = user_text
+        .trim()
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "yes"
+            | "yes please"
+            | "yep"
+            | "yep please"
+            | "yeah"
+            | "yeah please"
+            | "sure"
+            | "sure please"
+            | "ok"
+            | "okay"
+            | "go ahead"
+            | "please do"
+            | "do it"
+            | "sounds good"
+            | "confirm"
+            | "confirmed"
+            | "proceed"
+    )
+}
+
+fn extract_last_question_line(message: &str) -> Option<&str> {
+    message
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && line.contains('?'))
+}
+
+fn question_requires_specific_answer(question: &str) -> bool {
+    let lower = question.trim().to_ascii_lowercase();
+    if !lower.contains('?') {
+        return false;
+    }
+
+    if lower.contains(" or ") {
+        return true;
+    }
+
+    lower.starts_with("how ")
+        || contains_keyword_as_words(&lower, "which")
+        || contains_keyword_as_words(&lower, "what")
+        || contains_keyword_as_words(&lower, "where")
+        || contains_keyword_as_words(&lower, "when")
+        || contains_keyword_as_words(&lower, "who")
+        || lower.contains("any specific")
+        || lower.contains("can you clarify")
+        || lower.contains("could you clarify")
+}
+
+fn assistant_question_requires_specific_answer(message: &str) -> bool {
+    extract_last_question_line(message).is_some_and(question_requires_specific_answer)
+}
+
+fn build_specific_answer_request(prev_assistant: &str) -> String {
+    if let Some(question) = extract_last_question_line(prev_assistant) {
+        let question = question.trim();
+        if question.chars().count() <= 160 {
+            return format!(
+                "I still need the specific answer to my last question before I can continue. Please answer directly: {}",
+                question
+            );
+        }
+    }
+
+    "I still need the specific option or missing detail from my last question before I can continue. Please answer with the exact choice or value you want, not just a confirmation.".to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::looks_like_mid_task_pivot;
+    use super::{
+        assistant_question_requires_specific_answer, build_specific_answer_request,
+        is_bare_confirmation, looks_like_mid_task_pivot,
+    };
 
     #[test]
     fn test_looks_like_mid_task_pivot_detects_explicit_pivot() {
@@ -565,5 +678,33 @@ mod tests {
             "Actually create a static page instead."
         ));
         assert!(!looks_like_mid_task_pivot("Never mind."));
+    }
+
+    #[test]
+    fn test_bare_confirmation_detects_short_affirmations() {
+        assert!(is_bare_confirmation("Yes"));
+        assert!(is_bare_confirmation("go ahead"));
+        assert!(!is_bare_confirmation("yes, post it"));
+    }
+
+    #[test]
+    fn test_specific_answer_required_for_branching_question() {
+        assert!(assistant_question_requires_specific_answer(
+            "Want me to tweak this or post it?"
+        ));
+        assert!(assistant_question_requires_specific_answer(
+            "What time should I schedule it?"
+        ));
+        assert!(!assistant_question_requires_specific_answer(
+            "Should I post it now?"
+        ));
+    }
+
+    #[test]
+    fn test_specific_answer_request_reuses_last_question_line() {
+        let reply = build_specific_answer_request(
+            "Persistent context. Not just chat.\n\nWant me to tweak this or post it?",
+        );
+        assert!(reply.contains("Please answer directly: Want me to tweak this or post it?"));
     }
 }

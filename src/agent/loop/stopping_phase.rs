@@ -80,20 +80,28 @@ fn has_any_concrete_execution(
     turn_context: &TurnContext,
     completion_progress: &CompletionProgress,
     recoverable_tool_snapshot_present: bool,
+    total_successful_tool_calls: usize,
 ) -> bool {
     has_task_relevant_progress(turn_context, completion_progress)
         || recoverable_tool_snapshot_present
+        // Any successfully completed tool call counts as concrete work,
+        // even if its semantics did not classify as observation/mutation
+        // (common for MCP tools with Unknown/Administrative effects).
+        // This prevents the harsh "abandon" path when tools DID execute.
+        || total_successful_tool_calls > 0
 }
 
 fn only_final_response_remains(
     turn_context: &TurnContext,
     completion_progress: &CompletionProgress,
     recoverable_tool_snapshot_present: bool,
+    total_successful_tool_calls: usize,
 ) -> bool {
     has_any_concrete_execution(
         turn_context,
         completion_progress,
         recoverable_tool_snapshot_present,
+        total_successful_tool_calls,
     ) && !completion_progress.verification_pending
 }
 
@@ -279,11 +287,13 @@ impl Agent {
                 turn_context,
                 completion_progress,
                 recoverable_tool_snapshot_present,
+                total_successful_tool_calls,
             );
             let final_response_only = only_final_response_remains(
                 turn_context,
                 completion_progress,
                 recoverable_tool_snapshot_present,
+                total_successful_tool_calls,
             );
             let can_shift_to_final_response_closeout =
                 final_response_only && !execution_state.final_response_closeout_active;
@@ -1894,12 +1904,35 @@ mod tests {
         assert!(has_any_concrete_execution(
             &turn_context,
             &completion_progress,
-            true
+            true,
+            0,
         ));
         assert!(only_final_response_remains(
             &turn_context,
             &completion_progress,
-            true
+            true,
+            0,
+        ));
+    }
+
+    #[test]
+    fn successful_tool_calls_count_as_concrete_work() {
+        let turn_context = TurnContext::default();
+        let completion_progress = CompletionProgress::default();
+
+        // No snapshot, no progress, but successful tool calls → concrete work
+        assert!(has_any_concrete_execution(
+            &turn_context,
+            &completion_progress,
+            false,
+            1,
+        ));
+        // Zero successful tool calls and no other progress → not concrete
+        assert!(!has_any_concrete_execution(
+            &turn_context,
+            &completion_progress,
+            false,
+            0,
         ));
     }
 
@@ -1920,12 +1953,14 @@ mod tests {
         assert!(has_any_concrete_execution(
             &turn_context,
             &completion_progress,
-            true
+            true,
+            0,
         ));
         assert!(!only_final_response_remains(
             &turn_context,
             &completion_progress,
-            true
+            true,
+            0,
         ));
     }
 }

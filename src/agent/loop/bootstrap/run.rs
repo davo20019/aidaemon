@@ -124,6 +124,15 @@ impl Agent {
         }
 
         if let Some(reply) = self
+            .maybe_handle_non_resolving_confirmation_shortcut(
+                session_id, user_text, &task_id, &emitter,
+            )
+            .await?
+        {
+            return Ok(BootstrapOutcome::Return(Ok(reply)));
+        }
+
+        if let Some(reply) = self
             .maybe_handle_trivial_ack_shortcut(session_id, user_text, &task_id, &emitter)
             .await?
         {

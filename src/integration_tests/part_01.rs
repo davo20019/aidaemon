@@ -1212,7 +1212,11 @@ async fn test_execution_budget_starts_after_tool_handoff_response() {
 }
 
 #[tokio::test]
-async fn test_observational_progress_shifts_to_final_response_closeout_after_budget_exhaustion() {
+async fn test_observational_progress_extends_budget_so_productive_runs_complete() {
+    // Regression: previously, a tight budget (max_llm_calls=2) would exhaust
+    // after two tool-calling iterations, even though both calls succeeded.
+    // With progress-based budget extension, each successful tool call extends
+    // the budget, so productive runs are never artificially stopped.
     let provider = MockProvider::with_responses(vec![
         ProviderResponse {
             content: None,
@@ -1252,9 +1256,9 @@ async fn test_observational_progress_shifts_to_final_response_closeout_after_bud
     ]);
 
     let mut harness = setup_test_agent(provider).await.unwrap();
-    // Override execution budget so it exhausts after 2 LLM calls (one per
-    // tool-call iteration). The default Extended tier has limits too high to
-    // trigger budget exhaustion within this short test.
+    // Start with a tight budget. Both tool calls succeed, so the
+    // progress-based extension keeps the budget above the usage counter and
+    // the agent completes normally — no budget blocker.
     harness
         .agent
         .set_test_execution_budget_override(Some(crate::agent::ExecutionBudget {
@@ -1285,13 +1289,11 @@ async fn test_observational_progress_shifts_to_final_response_closeout_after_bud
 
     let call_log = harness.provider.call_log.lock().await.clone();
     assert_eq!(call_log.len(), 3);
+    // Budget was NOT exhausted because successful tool calls extended it,
+    // so the final call proceeds normally without being forced into closeout.
     assert!(
-        call_log[2].tools.is_empty(),
-        "final closeout after observational progress should disable tools instead of surfacing a budget blocker"
-    );
-    assert_eq!(
-        call_log[2].options.tool_choice,
-        crate::traits::ToolChoiceMode::None
+        !response.contains("blocked"),
+        "productive runs should never be stopped by the budget"
     );
 }
 

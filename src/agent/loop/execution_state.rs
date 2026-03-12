@@ -226,6 +226,44 @@ impl ExecutionState {
         self.last_outcome = Some(outcome);
     }
 
+    /// Extend the budget when a tool call completes successfully.
+    ///
+    /// This implements the principle "only limit when wasting tokens, not when
+    /// making progress."  Each successful tool execution earns additional
+    /// capacity so productive multi-step runs are never artificially stopped by
+    /// the initial budget ceiling.  Stall detection, repetition guards, and
+    /// wall-clock limits remain the primary defences against genuine waste.
+    pub fn extend_budget_on_progress(&mut self) {
+        if !self.budget_envelope_active {
+            return;
+        }
+        const PROGRESS_EXTENSION: usize = 6;
+        /// Wall-clock extension per successful tool call (30 seconds).
+        /// Slow external APIs, large builds, or chained terminal commands
+        /// can legitimately consume significant wall time while making
+        /// real progress.
+        const WALL_CLOCK_EXTENSION_MS: u64 = 30_000;
+        if self.budget.max_llm_calls > 0 {
+            self.budget.max_llm_calls =
+                self.budget.max_llm_calls.saturating_add(PROGRESS_EXTENSION);
+        }
+        if self.budget.max_tool_calls > 0 {
+            self.budget.max_tool_calls = self
+                .budget
+                .max_tool_calls
+                .saturating_add(PROGRESS_EXTENSION);
+        }
+        if self.budget.max_steps > 0 {
+            self.budget.max_steps = self.budget.max_steps.saturating_add(PROGRESS_EXTENSION);
+        }
+        if self.budget.max_wall_clock_ms > 0 {
+            self.budget.max_wall_clock_ms = self
+                .budget
+                .max_wall_clock_ms
+                .saturating_add(WALL_CLOCK_EXTENSION_MS);
+        }
+    }
+
     pub fn exhausted_limit(
         &self,
         task_tokens_used: u64,
@@ -276,17 +314,17 @@ pub fn default_execution_budget(tier: BudgetTier) -> ExecutionBudget {
         BudgetTier::None => ExecutionBudget {
             max_steps: 24,
             max_tokens: 0,
-            max_llm_calls: 8,
+            max_llm_calls: 14,
             max_tool_calls: 24,
-            max_validation_rounds: 1,
+            max_validation_rounds: 3,
             max_wall_clock_ms: 180_000,
         },
         BudgetTier::Small => ExecutionBudget {
-            max_steps: 12,
+            max_steps: 16,
             max_tokens: 0,
-            max_llm_calls: 10,
-            max_tool_calls: 10,
-            max_validation_rounds: 2,
+            max_llm_calls: 14,
+            max_tool_calls: 14,
+            max_validation_rounds: 3,
             max_wall_clock_ms: 180_000,
         },
         BudgetTier::Standard => ExecutionBudget {
@@ -636,7 +674,7 @@ mod tests {
         );
         assert_eq!(tier, BudgetTier::Small);
         assert_eq!(route_kind, "scoped_modification");
-        assert_eq!(budget.max_validation_rounds, 2);
+        assert_eq!(budget.max_validation_rounds, 3);
     }
 
     #[test]
@@ -902,5 +940,68 @@ mod tests {
         assert_eq!(tier, BudgetTier::Standard);
         assert_eq!(route_kind, "contextual_followup");
         assert!(budget.max_validation_rounds >= 3);
+    }
+
+    #[test]
+    fn extend_budget_on_progress_increases_limits() {
+        let mut state = ExecutionState::new(
+            BudgetTier::None,
+            default_execution_budget(BudgetTier::None),
+            ExecutionPersistence::Ephemeral,
+        );
+        let original_llm = state.budget.max_llm_calls;
+        let original_tools = state.budget.max_tool_calls;
+        let original_steps = state.budget.max_steps;
+        let original_wall = state.budget.max_wall_clock_ms;
+
+        // No extension when budget envelope is inactive
+        state.extend_budget_on_progress();
+        assert_eq!(state.budget.max_llm_calls, original_llm);
+        assert_eq!(state.budget.max_wall_clock_ms, original_wall);
+
+        // Extension kicks in once the envelope is active
+        state.activate_budget_envelope(0, Duration::from_millis(0));
+        state.extend_budget_on_progress();
+        assert!(state.budget.max_llm_calls > original_llm);
+        assert!(state.budget.max_tool_calls > original_tools);
+        assert!(state.budget.max_steps > original_steps);
+        assert!(state.budget.max_wall_clock_ms > original_wall);
+
+        // Cumulative extensions keep growing
+        let after_first = state.budget.max_llm_calls;
+        let after_first_wall = state.budget.max_wall_clock_ms;
+        state.extend_budget_on_progress();
+        assert!(state.budget.max_llm_calls > after_first);
+        assert!(state.budget.max_wall_clock_ms > after_first_wall);
+    }
+
+    #[test]
+    fn productive_run_never_exhausts_budget() {
+        let mut state = ExecutionState::new(
+            BudgetTier::None,
+            default_execution_budget(BudgetTier::None),
+            ExecutionPersistence::Ephemeral,
+        );
+        state.activate_budget_envelope(0, Duration::from_millis(0));
+
+        // Simulate 30 productive iterations: each records an LLM call + tool
+        // call but also extends via progress.  Use realistic elapsed time
+        // (~10s per iteration → 300s total) to verify wall-clock extension
+        // keeps pace with real-world execution.
+        for _ in 0..30 {
+            state.record_llm_call();
+            state.record_tool_call();
+            state.extend_budget_on_progress();
+        }
+
+        // 30 iterations × ~10s each = 300s of wall time.  The base budget
+        // for None tier is 180s, but 30 progress extensions add 30 × 30s =
+        // 900s, giving a total wall-clock budget of 1080s — well above 300s.
+        let realistic_elapsed = Duration::from_secs(300);
+        assert_eq!(
+            state.exhausted_limit(0, realistic_elapsed),
+            None,
+            "Productive run should never exhaust budget, even with realistic wall-clock time"
+        );
     }
 }
