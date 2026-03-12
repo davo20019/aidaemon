@@ -317,6 +317,9 @@ async fn test_reflection_full_flow_verifies_learning_on_immediate_recovery() {
         "post-reflection model call should receive the injected self-diagnosis directive"
     );
 
+    // Verification runs via tokio::spawn — yield to let the spawned task complete.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT solution_summary, success_count FROM error_solutions WHERE solution_summary = ?",
     )
