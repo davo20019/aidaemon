@@ -882,7 +882,8 @@ fn infer_completion_signals(
         &[
             "change", "update", "edit", "write", "create", "delete", "remove", "deploy", "build",
             "connect", "set up", "setup", "install", "restart", "reload", "enable", "disable",
-            "remember", "store", "save", "note",
+            "remember", "store", "save", "note", "pull", "push", "run", "execute", "fetch",
+            "merge", "start", "stop", "compile", "download", "clone", "migrate",
         ],
     );
     let visible_state_problem = text_contains_any_phrase(

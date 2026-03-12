@@ -571,7 +571,13 @@ impl Agent {
                 .iter()
                 .filter(|tc| tool_call_is_side_effecting(self, tc, available_capabilities))
                 .all(|tc| crate::agent::recall_guardrails::is_personal_memory_tool(&tc.name));
-            if !all_side_effecting_are_memory && turn_prefers_plain_text_completion(turn_context) {
+            // Sub-sessions (spawned TaskLead/Executor) exist to execute actions —
+            // never redirect them to plain-text mode.
+            let is_sub_session = session_id.starts_with("sub-");
+            if !is_sub_session
+                && !all_side_effecting_are_memory
+                && turn_prefers_plain_text_completion(turn_context)
+            {
                 validation_state.note_replan();
                 learning_ctx.record_replay_note(
                     ReplayNoteCategory::RetryReason,
