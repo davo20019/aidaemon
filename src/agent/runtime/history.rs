@@ -2720,22 +2720,17 @@ mod tests {
     #[test]
     fn project_scope_extraction_resolves_projects_folder_alias_to_configured_root() {
         let history = vec![];
-        let mut project_name = format!("alias-test-{}", uuid::Uuid::new_v4().simple());
-        let cwd = std::env::current_dir().expect("cwd");
-        let mut cwd_candidate = cwd.join("projects").join(&project_name);
-        if cwd_candidate.exists() {
-            project_name = format!("alias-test-{}", uuid::Uuid::new_v4().simple());
-            cwd_candidate = cwd.join("projects").join(&project_name);
-        }
-        assert!(
-            !cwd_candidate.exists(),
-            "cwd candidate unexpectedly exists: {}",
-            cwd_candidate.display()
-        );
-        let current = format!("Initialize a Vite app at projects/{}", project_name);
+        let project_name = format!("alias-test-{}", uuid::Uuid::new_v4().simple());
+        // Use an absolute path so the test doesn't depend on cwd containing a
+        // "projects" directory (which exists locally but not on CI runners).
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
         std::fs::create_dir_all(&alias_root).expect("create alias root");
+        let project_path = alias_root.join(&project_name);
+        let current = format!(
+            "Initialize a Vite app at {}",
+            project_path.to_string_lossy()
+        );
         let alias_roots = vec![alias_root.to_string_lossy().to_string()];
         let scopes =
             extract_project_scopes_from_history(&history, &current, 4, false, &alias_roots);
