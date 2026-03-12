@@ -26,11 +26,21 @@ impl Agent {
         child_depth: usize,
         wrap_input: bool,
     ) -> TaskLeadSpec {
-        let mut tools: Vec<Arc<dyn Tool>> = full_tools
-            .iter()
-            .filter(|t| matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal))
-            .cloned()
-            .collect();
+        // Scheduled goals are pre-authorized by the user, so the TaskLead needs
+        // full tool access (including Action tools like terminal, write_file, etc.)
+        // to complete work autonomously without human intervention.
+        let is_scheduled = goal_has_scheduled_provenance(&self.state, goal_id, None).await;
+
+        let mut tools: Vec<Arc<dyn Tool>> = if is_scheduled {
+            // Scheduled goals: include Action tools so TaskLead can execute directly
+            full_tools.to_vec()
+        } else {
+            full_tools
+                .iter()
+                .filter(|t| matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal))
+                .cloned()
+                .collect()
+        };
 
         let has_cli_agent = if let Some(cli_tool) = full_tools
             .iter()
@@ -64,6 +74,7 @@ impl Agent {
             child_depth,
             self.max_depth,
             has_cli_agent,
+            is_scheduled,
         );
 
         let input_text = if wrap_input {
@@ -530,7 +541,15 @@ impl Agent {
                         .filter(|t| matches!(t.tool_role(), ToolRole::Action | ToolRole::Universal))
                         .cloned()
                         .collect();
-                    if has_cli_agent {
+                    // Scheduled goals keep full tool access (terminal, browser, etc.)
+                    // since they run unattended and need reliability over delegation elegance.
+                    let is_scheduled_goal = if let Some(gid) = goal_id {
+                        goal_has_scheduled_provenance(&self.state, gid, task_id).await
+                    } else {
+                        false
+                    };
+                    let effective_delegation_mode = has_cli_agent && !is_scheduled_goal;
+                    if effective_delegation_mode {
                         // Delegation mode: avoid competing execution surfaces when
                         // cli_agent is available for the same task.
                         tools.retain(|t| !recall_guardrails::is_delegation_blocked_tool(t.name()));
@@ -547,7 +566,7 @@ impl Agent {
                         mission,
                         child_depth,
                         self.max_depth,
-                        has_cli_agent,
+                        effective_delegation_mode,
                         task_id,
                         inherited_project_scope,
                     );
@@ -972,12 +991,21 @@ impl Agent {
         depth: usize,
         max_depth: usize,
         has_cli_agent: bool,
+        is_scheduled: bool,
     ) -> String {
+        let execution_mode = if is_scheduled {
+            "You have full tool access including `terminal`. For simple steps (single shell commands, \
+             file writes), execute them directly. For complex multi-step work, you may still delegate \
+             to executors via the workflow below."
+        } else {
+            "Your job is to plan and delegate work. You MUST NOT execute tasks yourself."
+        };
+
         let mut prompt = format!(
             "You are a Task Lead managing goal: {goal_id}\n\
              Goal: {goal_description}\n\n\
              You are a sub-agent (depth {depth}/{max_depth}).\n\
-             Your job is to plan and delegate work. You MUST NOT execute tasks yourself.\n\n\
+             {execution_mode}\n\n\
              ## Workflow\n\
              1. Analyze the goal and break it into concrete tasks using manage_goal_tasks(create_task)\n\
                 - Start with 2-5 tasks for the NEXT PHASE (not the entire project)\n\
@@ -1211,7 +1239,8 @@ mod tests {
 
     #[test]
     fn task_lead_prompt_requires_concrete_final_results() {
-        let prompt = Agent::build_task_lead_prompt("goal_1", "audit disk usage", None, 1, 3, false);
+        let prompt =
+            Agent::build_task_lead_prompt("goal_1", "audit disk usage", None, 1, 3, false, false);
         assert!(prompt.contains("final reply MUST include concrete executor results"));
         assert!(prompt.contains("not just \"goal completed\""));
     }
@@ -1246,12 +1275,41 @@ mod tests {
 
     #[test]
     fn task_lead_prompt_mentions_cli_agent_when_available() {
-        let prompt = Agent::build_task_lead_prompt("goal_2", "build release", None, 1, 3, true);
+        let prompt =
+            Agent::build_task_lead_prompt("goal_2", "build release", None, 1, 3, true, false);
         assert!(prompt.contains("## CLI Agent Delegation"));
         assert!(prompt.contains("Treat `cli_agent` as a delegation surface"));
         assert!(prompt.contains("claim the task and use `spawn_agent`"));
         assert!(prompt.contains("action=\"run\""));
         assert!(prompt.contains("working_dir"));
         assert!(prompt.contains("do NOT have `terminal`, `browser`, or `run_command`"));
+    }
+
+    #[test]
+    fn scheduled_task_lead_prompt_allows_direct_execution() {
+        let prompt =
+            Agent::build_task_lead_prompt("goal_3", "deploy blog", None, 1, 3, false, true);
+        assert!(
+            prompt.contains("full tool access including `terminal`"),
+            "Scheduled task lead should mention terminal access"
+        );
+        assert!(
+            !prompt.contains("MUST NOT execute tasks yourself"),
+            "Scheduled task lead should NOT prohibit direct execution"
+        );
+    }
+
+    #[test]
+    fn non_scheduled_task_lead_prompt_prohibits_direct_execution() {
+        let prompt =
+            Agent::build_task_lead_prompt("goal_4", "deploy blog", None, 1, 3, false, false);
+        assert!(
+            prompt.contains("MUST NOT execute tasks yourself"),
+            "Non-scheduled task lead should prohibit direct execution"
+        );
+        assert!(
+            !prompt.contains("full tool access including `terminal`"),
+            "Non-scheduled task lead should NOT mention terminal access"
+        );
     }
 }

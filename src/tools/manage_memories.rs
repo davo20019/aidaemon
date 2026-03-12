@@ -248,7 +248,7 @@ impl Tool for ManageMemoriesTool {
     }
 
     fn description(&self) -> &str {
-        "List/search/forget memories, and list/add/cancel/pause/resume/retry/diagnose scheduled goals (accepts full or unique prefix goal_id; includes bulk retry for failed schedules)"
+        "List/search/forget memories, and list/add/cancel/pause/resume/retry/trigger/diagnose scheduled goals (accepts full or unique prefix goal_id; includes bulk retry for failed schedules and trigger_now for immediate execution)"
     }
 
     fn schema(&self) -> Value {
@@ -260,7 +260,7 @@ impl Tool for ManageMemoriesTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "forget", "set_privacy", "search", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled"],
+                        "enum": ["list", "forget", "set_privacy", "search", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled", "trigger_now"],
                         "description": "Action"
                     },
                     "limit": {
@@ -1677,7 +1677,64 @@ impl Tool for ManageMemoriesTool {
 
                 Ok(out)
             }
-            other => Ok(format!("Unknown action: '{}'. Use list, forget, set_privacy, search, create_personal_goal, list_goals, complete_goal, abandon_goal, create_scheduled_goal, list_scheduled, list_scheduled_matching, add_schedule, cancel_scheduled, pause_scheduled, resume_scheduled, retry_scheduled, retry_failed_scheduled, cancel_scheduled_matching, retry_scheduled_matching, or diagnose_scheduled.", other)),
+            "trigger_now" => {
+                let goal_id = args
+                    .goal_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for trigger_now action"))?;
+                let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
+                    Ok(id) => id,
+                    Err(e) => return Ok(e.to_string()),
+                };
+                let Some(goal) = self.state.get_goal(&resolved_goal_id).await? else {
+                    return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
+                };
+                if goal.status != "active" {
+                    return Ok(format!(
+                        "Goal must be active to trigger (current status: {}). Use retry_scheduled for failed goals.",
+                        goal.status
+                    ));
+                }
+                let schedules = self.state.get_schedules_for_goal(&resolved_goal_id).await?;
+                if schedules.is_empty() {
+                    return Ok("Goal has no schedules — trigger_now is only for scheduled goals.".to_string());
+                }
+                // Check for existing pending/running tasks to avoid duplicates
+                let tasks = self.state.get_tasks_for_goal(&resolved_goal_id).await?;
+                let has_open = tasks.iter().any(|t| matches!(t.status.as_str(), "pending" | "claimed" | "running"));
+                if has_open {
+                    return Ok("Goal already has open tasks (pending/claimed/running). Wait for them to finish or cancel them first.".to_string());
+                }
+                // Create a new pending task — the heartbeat will dispatch it to a TaskLead
+                let now = chrono::Utc::now().to_rfc3339();
+                let task = crate::traits::Task {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    goal_id: resolved_goal_id.clone(),
+                    description: goal.description.clone(),
+                    status: "pending".to_string(),
+                    priority: "high".to_string(),
+                    task_order: 0,
+                    parallel_group: None,
+                    depends_on: None,
+                    agent_id: None,
+                    context: None,
+                    result: None,
+                    error: None,
+                    blocker: None,
+                    idempotent: true,
+                    retry_count: 0,
+                    max_retries: 3,
+                    created_at: now.clone(),
+                    started_at: None,
+                    completed_at: None,
+                };
+                self.state.create_task(&task).await?;
+                Ok(format!(
+                    "Triggered scheduled goal {} now. Created pending task {} — the heartbeat will dispatch it shortly.",
+                    resolved_goal_id, task.id
+                ))
+            }
+            other => Ok(format!("Unknown action: '{}'. Use list, forget, set_privacy, search, create_personal_goal, list_goals, complete_goal, abandon_goal, create_scheduled_goal, list_scheduled, list_scheduled_matching, add_schedule, cancel_scheduled, pause_scheduled, resume_scheduled, retry_scheduled, retry_failed_scheduled, cancel_scheduled_matching, retry_scheduled_matching, diagnose_scheduled, or trigger_now.", other)),
         }
     }
 

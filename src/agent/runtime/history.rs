@@ -2001,8 +2001,17 @@ impl Agent {
         );
         let allow_multi_project_scope =
             looks_like_multi_project_request(&current.to_ascii_lowercase());
+        // Prefer scopes extracted from the *current* user message over
+        // history scopes.  `choose_primary_project_scope` picks the first
+        // scope that is a real project root on disk – when a user asks to
+        // CREATE a new project (path doesn't exist yet) while the history
+        // contains an existing project, the history scope would win.
+        // By trying current-turn scopes first we guarantee the user's
+        // explicit path takes priority even if the directory hasn't been
+        // created yet.
         let primary_project_scope = resolve_primary_project_scope(
-            choose_primary_project_scope(&project_scopes),
+            choose_primary_project_scope(&current_project_scopes)
+                .or_else(|| choose_primary_project_scope(&project_scopes)),
             self.inherited_project_scope.as_deref(),
             allow_multi_project_scope,
             allow_scope_carryover,
@@ -2459,6 +2468,45 @@ mod tests {
             blog.to_string_lossy().to_string(),
         ]);
         assert_eq!(chosen, Some(blog.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn current_turn_scope_beats_history_scope_even_when_not_yet_on_disk() {
+        // Reproduces the bug where a user asks to CREATE a new project
+        // (~/projects/ai-news-hub) but the scope lock latches onto an
+        // existing project from conversation history (modern-plants-site)
+        // because choose_primary_project_scope prefers real project roots.
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects");
+        let existing = alias_root.join("modern-plants-site");
+        let new_project = alias_root.join("ai-news-hub");
+        std::fs::create_dir_all(&existing).expect("create existing");
+        std::fs::write(existing.join("package.json"), "{}").expect("package.json");
+        // new_project intentionally NOT created — the user is asking to create it
+
+        let current_turn_scopes = vec![new_project.to_string_lossy().to_string()];
+        let combined_scopes = vec![
+            new_project.to_string_lossy().to_string(),
+            existing.to_string_lossy().to_string(),
+        ];
+
+        // Old behaviour: choose_primary_project_scope on the combined list
+        // would pick the existing project because it's a real root.
+        let old_pick = choose_primary_project_scope(&combined_scopes);
+        assert_eq!(
+            old_pick,
+            Some(existing.to_string_lossy().to_string()),
+            "sanity: combined list still prefers existing project root"
+        );
+
+        // Fixed behaviour: try current-turn scopes first, fall back to combined.
+        let fixed_pick = choose_primary_project_scope(&current_turn_scopes)
+            .or_else(|| choose_primary_project_scope(&combined_scopes));
+        assert_eq!(
+            fixed_pick,
+            Some(new_project.to_string_lossy().to_string()),
+            "current-turn scope should win even if the dir doesn't exist yet"
+        );
     }
 
     #[test]
