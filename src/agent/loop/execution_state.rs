@@ -243,6 +243,14 @@ impl ExecutionState {
         /// can legitimately consume significant wall time while making
         /// real progress.
         const WALL_CLOCK_EXTENSION_MS: u64 = 30_000;
+        /// Validation round extension per successful tool call.
+        /// Complex multi-step tasks legitimately trigger multiple
+        /// completion-verification cycles while still making real
+        /// progress (reading files, running builds, deploying).
+        /// Without extending this limit, productive runs are stopped
+        /// by the validation cap even though every other budget
+        /// dimension has headroom.
+        const VALIDATION_EXTENSION: usize = 1;
         if self.budget.max_llm_calls > 0 {
             self.budget.max_llm_calls =
                 self.budget.max_llm_calls.saturating_add(PROGRESS_EXTENSION);
@@ -261,6 +269,12 @@ impl ExecutionState {
                 .budget
                 .max_wall_clock_ms
                 .saturating_add(WALL_CLOCK_EXTENSION_MS);
+        }
+        if self.budget.max_validation_rounds > 0 {
+            self.budget.max_validation_rounds = self
+                .budget
+                .max_validation_rounds
+                .saturating_add(VALIDATION_EXTENSION);
         }
     }
 
@@ -953,11 +967,13 @@ mod tests {
         let original_tools = state.budget.max_tool_calls;
         let original_steps = state.budget.max_steps;
         let original_wall = state.budget.max_wall_clock_ms;
+        let original_validation = state.budget.max_validation_rounds;
 
         // No extension when budget envelope is inactive
         state.extend_budget_on_progress();
         assert_eq!(state.budget.max_llm_calls, original_llm);
         assert_eq!(state.budget.max_wall_clock_ms, original_wall);
+        assert_eq!(state.budget.max_validation_rounds, original_validation);
 
         // Extension kicks in once the envelope is active
         state.activate_budget_envelope(0, Duration::from_millis(0));
@@ -966,13 +982,16 @@ mod tests {
         assert!(state.budget.max_tool_calls > original_tools);
         assert!(state.budget.max_steps > original_steps);
         assert!(state.budget.max_wall_clock_ms > original_wall);
+        assert!(state.budget.max_validation_rounds > original_validation);
 
         // Cumulative extensions keep growing
         let after_first = state.budget.max_llm_calls;
         let after_first_wall = state.budget.max_wall_clock_ms;
+        let after_first_validation = state.budget.max_validation_rounds;
         state.extend_budget_on_progress();
         assert!(state.budget.max_llm_calls > after_first);
         assert!(state.budget.max_wall_clock_ms > after_first_wall);
+        assert!(state.budget.max_validation_rounds > after_first_validation);
     }
 
     #[test]
@@ -985,18 +1004,25 @@ mod tests {
         state.activate_budget_envelope(0, Duration::from_millis(0));
 
         // Simulate 30 productive iterations: each records an LLM call + tool
-        // call but also extends via progress.  Use realistic elapsed time
-        // (~10s per iteration → 300s total) to verify wall-clock extension
-        // keeps pace with real-world execution.
-        for _ in 0..30 {
+        // call + occasional validation round, but also extends via progress.
+        // Use realistic elapsed time (~10s per iteration → 300s total) to
+        // verify wall-clock extension keeps pace with real-world execution.
+        for i in 0..30 {
             state.record_llm_call();
             state.record_tool_call();
+            // Simulate a validation round every ~10 tool calls (realistic
+            // for complex multi-step tasks).
+            if i % 10 == 9 {
+                state.record_validation_round();
+            }
             state.extend_budget_on_progress();
         }
 
         // 30 iterations × ~10s each = 300s of wall time.  The base budget
         // for None tier is 180s, but 30 progress extensions add 30 × 30s =
         // 900s, giving a total wall-clock budget of 1080s — well above 300s.
+        // Validation rounds: base 3, used 3, but 30 extensions of +1 each
+        // give 33 total — well above the 3 used.
         let realistic_elapsed = Duration::from_secs(300);
         assert_eq!(
             state.exhausted_limit(0, realistic_elapsed),
