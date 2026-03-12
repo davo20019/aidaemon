@@ -175,6 +175,341 @@ async fn test_multi_turn_with_tool_use() {
     );
 }
 
+struct ReflectionProbeTool;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for ReflectionProbeTool {
+    fn name(&self) -> &str {
+        "http_request"
+    }
+
+    fn description(&self) -> &str {
+        "Synthetic http_request tool for reflection feedback loop tests"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "http_request",
+            "description": "Synthetic http_request tool for reflection feedback loop tests",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": { "type": "string" },
+                    "url": { "type": "string" },
+                    "method": { "type": "string" }
+                },
+                "required": ["mode"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let mode = serde_json::from_str::<serde_json::Value>(arguments)?
+            .get("mode")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        match mode.as_str() {
+            "alpha" => Err(anyhow::anyhow!("wrong base url alpha")),
+            "beta" => Err(anyhow::anyhow!("wrong auth beta")),
+            "ok" => Ok("probe ok".to_string()),
+            other => Err(anyhow::anyhow!("unexpected mode {}", other)),
+        }
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+}
+
+fn reflection_diagnosis_response(
+    root_cause: &str,
+    action: &str,
+    learning: &str,
+) -> ProviderResponse {
+    MockProvider::text_response(&format!(
+        "ROOT_CAUSE: {root_cause}\nRECOMMENDED_ACTION: {action}\nLEARNING: {learning}"
+    ))
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_reflection_full_flow_verifies_learning_on_immediate_recovery() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"alpha","method":"GET","url":"https://api.example.com/alpha?attempt=1"}"#,
+        ),
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"alpha","method":"HEAD","url":"https://api.example.com/alpha?attempt=2"}"#,
+        ),
+        reflection_diagnosis_response(
+            "The tool keeps using the wrong base URL.",
+            "Switch the probe to the corrected endpoint.",
+            "Always switch the probe off the broken alpha URL before retrying.",
+        ),
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"ok","method":"GET","url":"https://api.example.com/fixed"}"#,
+        ),
+        MockProvider::text_response("Recovered after reflection."),
+    ]);
+
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(ReflectionProbeTool)],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "reflection_verify_success",
+            "run the reflection probe",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Recovered after reflection.");
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(
+        call_log.len(),
+        5,
+        "expected tool/tool/reflection/tool/final flow"
+    );
+    assert!(
+        call_log[2].tools.is_empty(),
+        "reflection call must be text-only with no tools exposed"
+    );
+    assert!(
+        call_log[2].messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("ERROR HISTORY"))
+        }),
+        "reflection call should include the failure analysis prompt"
+    );
+    assert!(
+        call_log[3].messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("SELF-DIAGNOSIS")
+                        && content.contains("wrong base URL")
+                        && content.contains("Switch the probe")
+                })
+        }),
+        "post-reflection model call should receive the injected self-diagnosis directive"
+    );
+
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT solution_summary, success_count FROM error_solutions WHERE solution_summary = ?",
+    )
+    .bind("Always switch the probe off the broken alpha URL before retrying.")
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "expected one stored reflection learning");
+    assert_eq!(
+        rows[0].1, 1,
+        "immediate recovery should verify the reflection learning"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_reflection_full_flow_does_not_verify_stale_signature_after_drift() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"alpha","method":"GET","url":"https://api.example.com/alpha?attempt=1"}"#,
+        ),
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"alpha","method":"HEAD","url":"https://api.example.com/alpha?attempt=2"}"#,
+        ),
+        reflection_diagnosis_response(
+            "The tool keeps using the wrong base URL.",
+            "Fix the alpha endpoint before retrying.",
+            "Always correct the alpha endpoint before retrying the probe.",
+        ),
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"beta","method":"GET","url":"https://api.example.com/beta?attempt=1"}"#,
+        ),
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"beta","method":"HEAD","url":"https://api.example.com/beta?attempt=2"}"#,
+        ),
+        reflection_diagnosis_response(
+            "The tool is now failing auth.",
+            "Refresh the beta auth settings before retrying.",
+            "Always refresh beta auth settings before retrying the probe.",
+        ),
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"alpha","method":"POST","url":"https://api.example.com/alpha?attempt=3"}"#,
+        ),
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"ok","method":"GET","url":"https://api.example.com/fixed"}"#,
+        ),
+        MockProvider::text_response("Finished without verifying a stale reflection."),
+    ]);
+
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(ReflectionProbeTool)],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "reflection_verify_drift",
+            "run the reflection probe through a few retries",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Finished without verifying a stale reflection.");
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(
+        call_log.len(),
+        9,
+        "expected two reflection calls in the real loop"
+    );
+    assert!(
+        call_log[2].tools.is_empty() && call_log[5].tools.is_empty(),
+        "both reflection calls must be text-only"
+    );
+
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT solution_summary, success_count FROM error_solutions WHERE solution_summary IN (?, ?) ORDER BY solution_summary",
+    )
+    .bind("Always correct the alpha endpoint before retrying the probe.")
+    .bind("Always refresh beta auth settings before retrying the probe.")
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected both reflection learnings to be stored"
+    );
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "Always correct the alpha endpoint before retrying the probe.".to_string(),
+                0,
+            ),
+            (
+                "Always refresh beta auth settings before retrying the probe.".to_string(),
+                0,
+            ),
+        ],
+        "a later success after signature drift must not verify either earlier reflection"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_reflection_full_flow_does_not_verify_after_skipping_recovery_turn() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"alpha","method":"GET","url":"https://api.example.com/alpha?attempt=1"}"#,
+        ),
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"alpha","method":"HEAD","url":"https://api.example.com/alpha?attempt=2"}"#,
+        ),
+        reflection_diagnosis_response(
+            "The tool keeps using the wrong base URL.",
+            "Fix the alpha endpoint before retrying.",
+            "Always correct the alpha endpoint before retrying the probe.",
+        ),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response(
+            "http_request",
+            r#"{"mode":"ok","method":"GET","url":"https://api.example.com/fixed"}"#,
+        ),
+        MockProvider::text_response("Finished after a later unrelated probe success."),
+    ]);
+
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(ReflectionProbeTool)],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "reflection_verify_skip_turn",
+            "run the reflection probe and gather other context first",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Finished after a later unrelated probe success.");
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(
+        call_log.len(),
+        6,
+        "expected tool/tool/reflection/other-tool/tool/final flow"
+    );
+    assert!(
+        call_log[2].tools.is_empty(),
+        "reflection call must be text-only with no tools exposed"
+    );
+
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT solution_summary, success_count FROM error_solutions WHERE solution_summary = ?",
+    )
+    .bind("Always correct the alpha endpoint before retrying the probe.")
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 1, "expected one stored reflection learning");
+    assert_eq!(
+        rows[0].1, 0,
+        "skipping the designated recovery turn must leave the reflection learning unverified"
+    );
+}
+
 /// Scenario: Guest on Telegram asks for help — no tools are available.
 /// Verifies guest still gets a conversational response.
 #[tokio::test]
@@ -295,6 +630,909 @@ async fn test_multi_step_tool_execution() {
     assert_eq!(response, "Done! I checked your system and saved the info.");
     // Should be 4 LLM calls: intent-gated + system_info + remember_fact + final
     assert_eq!(harness.provider.call_count().await, 4);
+}
+
+#[tokio::test]
+async fn test_risky_tool_calls_trigger_structured_pre_execution_plan() {
+    let provider = MockProvider::with_responses(vec![
+        {
+            let mut resp = MockProvider::tool_call_response(
+                "remember_fact",
+                r#"{"category":"preference","key":"favorite_editor","value":"helix"}"#,
+            );
+            resp.content =
+                Some("I'll store that preference and confirm it back to you.".to_string());
+            resp
+        },
+        MockProvider::text_response(
+            r#"{"goal":"Store the user's editor preference","success_criteria":["The preference is stored in long-term memory","The final reply confirms what was stored"],"first_action":{"tool":"remember_fact","target":"","description":"Store the favorite editor preference in long-term memory"},"requires_verification":true,"risky_actions":["This mutates long-term memory state"],"version":1}"#,
+        ),
+        MockProvider::text_response("I'll remember that your favorite editor is helix."),
+    ]);
+
+    let harness = setup_test_agent_root(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "plan_gate_success",
+            "remember that my favorite editor is helix",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(
+        response,
+        "I'll remember that your favorite editor is helix."
+    );
+
+    assert_eq!(
+        call_log.len(),
+        3,
+        "expected tool call + planning gate + final"
+    );
+    assert!(
+        matches!(
+            call_log[1].options.response_mode,
+            crate::traits::ResponseMode::JsonSchema { .. }
+        ),
+        "second LLM call should be the schema-constrained pre-execution planning gate"
+    );
+    assert!(
+        call_log[1].tools.is_empty(),
+        "planning gate should run without tool definitions"
+    );
+    let has_tool_result = call_log[2]
+        .messages
+        .iter()
+        .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"));
+    assert!(
+        has_tool_result,
+        "final LLM call should receive the remember_fact tool result"
+    );
+
+    let event_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point' ORDER BY id DESC",
+    )
+    .bind("plan_gate_success")
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+
+    let accepted_gate = event_rows
+        .iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+        .find(|data| {
+            data.get("decision_type").and_then(|v| v.as_str()) == Some("execution_planning_gate")
+                && data
+                    .get("metadata")
+                    .and_then(|m| m.get("gate_result"))
+                    .and_then(|v| v.as_str())
+                    == Some("accepted")
+        })
+        .expect("expected accepted execution_planning_gate decision point");
+    assert_eq!(
+        accepted_gate["metadata"]["tool"].as_str(),
+        Some("remember_fact")
+    );
+}
+
+#[tokio::test]
+async fn test_pre_execution_plan_gate_gracefully_falls_back_when_provider_rejects_structured_call()
+{
+    let provider = MockProvider::with_responses(vec![
+        {
+            let mut resp = MockProvider::tool_call_response(
+                "remember_fact",
+                r#"{"category":"preference","key":"favorite_shell","value":"zsh"}"#,
+            );
+            resp.content = Some("I'll save that shell preference for later.".to_string());
+            resp
+        },
+        MockProvider::text_response("I'll remember that your preferred shell is zsh."),
+    ])
+    .rejecting_non_default_options();
+
+    let harness = setup_test_agent_root(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "plan_gate_unavailable",
+            "remember that my preferred shell is zsh",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "I'll remember that your preferred shell is zsh.");
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(
+        call_log.len(),
+        3,
+        "expected tool call + failed planning gate + final"
+    );
+    assert!(
+        matches!(
+            call_log[1].options.response_mode,
+            crate::traits::ResponseMode::JsonSchema { .. }
+        ),
+        "second LLM call should still attempt the structured planning gate"
+    );
+
+    let event_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point' ORDER BY id DESC",
+    )
+    .bind("plan_gate_unavailable")
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+
+    let unavailable_gate = event_rows
+        .iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+        .find(|data| {
+            data.get("decision_type").and_then(|v| v.as_str()) == Some("execution_planning_gate")
+                && data
+                    .get("metadata")
+                    .and_then(|m| m.get("gate_result"))
+                    .and_then(|v| v.as_str())
+                    == Some("unavailable")
+        })
+        .expect("expected unavailable execution_planning_gate decision point");
+    assert_eq!(
+        unavailable_gate["metadata"]["tool"].as_str(),
+        Some("remember_fact")
+    );
+}
+
+#[tokio::test]
+async fn test_high_risk_critique_pass_replans_before_external_execution() {
+    let provider = MockProvider::with_responses(vec![
+        {
+            let mut resp = MockProvider::tool_call_response("external_action", "{}");
+            resp.content = Some(
+                "I'm going to write to the external system immediately and then summarize the result."
+                    .to_string(),
+            );
+            resp
+        },
+        MockProvider::text_response(
+            r#"{"goal":"Write to the external system","success_criteria":["The write completes successfully","The final reply confirms the result"],"first_action":{"tool":"external_action","target":"","description":"Write to the external system immediately"},"requires_verification":true,"risky_actions":["This performs an external state-changing action"],"version":1}"#,
+        ),
+        MockProvider::text_response(
+            r#"{"verdict":"replan","issues":["Missing evidence: the plan jumps straight to an external write without first inspecting the current target state."],"summary":"The plan should inspect the target state before performing the external write."}"#,
+        ),
+        MockProvider::text_response(
+            "I need to inspect the target state before I perform the external write.",
+        ),
+    ]);
+
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(ExternalActionTool)],
+        None,
+    )
+    .await
+    .unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "critique_replan_external",
+            "write the new record to the external system",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !response.is_empty(),
+        "expected the loop to return a non-empty retry response after critique rejection"
+    );
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(
+        call_log.len(),
+        4,
+        "expected tool call + plan + critique + retry"
+    );
+    assert!(
+        matches!(
+            call_log[2].options.response_mode,
+            crate::traits::ResponseMode::JsonSchema { .. }
+        ),
+        "third LLM call should be the schema-constrained critique pass"
+    );
+
+    let event_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point' ORDER BY id DESC",
+    )
+    .bind("critique_replan_external")
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+
+    let rejected_critique = event_rows
+        .iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+        .find(|data| {
+            data.get("decision_type").and_then(|v| v.as_str()) == Some("execution_critique_pass")
+                && data
+                    .get("metadata")
+                    .and_then(|m| m.get("critique_result"))
+                    .and_then(|v| v.as_str())
+                    == Some("rejected")
+        })
+        .expect("expected rejected execution_critique_pass decision point");
+    assert_eq!(
+        rejected_critique["metadata"]["tool"].as_str(),
+        Some("external_action")
+    );
+
+    let tool_call_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE session_id = ? AND event_type = 'tool_call'",
+    )
+    .bind("critique_replan_external")
+    .fetch_one(&harness.state.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        tool_call_count, 0,
+        "critique rejection should block external execution before any tool call event is emitted"
+    );
+}
+
+#[tokio::test]
+async fn test_execution_state_snapshots_and_idempotency_key_are_emitted_for_mutations() {
+    let provider = MockProvider::with_responses(vec![
+        {
+            let mut resp = MockProvider::tool_call_response(
+                "remember_fact",
+                r#"{"category":"preference","key":"favorite_terminal","value":"ghostty"}"#,
+            );
+            resp.content =
+                Some("I'll store that terminal preference and confirm it back to you.".to_string());
+            resp
+        },
+        MockProvider::text_response(
+            r#"{"goal":"Store the user's terminal preference","success_criteria":["The preference is stored in long-term memory","The final reply confirms what was stored"],"first_action":{"tool":"remember_fact","target":"","description":"Store the favorite terminal preference in long-term memory"},"requires_verification":true,"risky_actions":["This mutates long-term memory state"]}"#,
+        ),
+        MockProvider::text_response("I'll remember that your favorite terminal is ghostty."),
+    ]);
+
+    let harness = setup_test_agent_root(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "execution_state_remember",
+            "remember that my favorite terminal is ghostty",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        "I'll remember that your favorite terminal is ghostty."
+    );
+
+    let decision_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point' ORDER BY id DESC",
+    )
+    .bind("execution_state_remember")
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+
+    let has_budget_selection = decision_rows
+        .iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+        .any(|data| {
+            data.get("decision_type").and_then(|v| v.as_str()) == Some("execution_budget_selection")
+                && data
+                    .get("metadata")
+                    .and_then(|m| m.get("route_kind"))
+                    .and_then(|v| v.as_str())
+                    .is_some()
+        });
+    assert!(
+        has_budget_selection,
+        "expected execution budget selection event"
+    );
+
+    let has_step_completed_snapshot = decision_rows
+        .iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+        .any(|data| {
+            data.get("decision_type").and_then(|v| v.as_str()) == Some("execution_state_snapshot")
+                && data
+                    .get("metadata")
+                    .and_then(|m| m.get("condition"))
+                    .and_then(|v| v.as_str())
+                    == Some("step_completed")
+        });
+    assert!(
+        has_step_completed_snapshot,
+        "expected step_completed execution state snapshot"
+    );
+
+    let tool_call_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT data FROM events WHERE session_id = ? AND event_type = 'tool_call' ORDER BY id DESC",
+    )
+    .bind("execution_state_remember")
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+    let tool_call = tool_call_rows
+        .iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+        .find(|data| data.get("name").and_then(|v| v.as_str()) == Some("remember_fact"))
+        .expect("expected remember_fact tool call event");
+
+    let idempotency_key = tool_call
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .expect("expected idempotency key on mutating tool call");
+    assert!(
+        idempotency_key.starts_with("exec:"),
+        "expected execution-scoped idempotency key, got {idempotency_key}"
+    );
+}
+
+#[tokio::test]
+async fn test_evidence_gate_blocks_edit_until_file_is_read_then_plans_first_mutation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let file_path = temp_dir.path().join("notes.txt");
+    std::fs::write(&file_path, "hello world\n").unwrap();
+    let file_path = file_path.to_string_lossy().to_string();
+
+    let provider = MockProvider::with_responses(vec![
+        {
+            let mut resp = MockProvider::tool_call_response(
+                "edit_file",
+                &json!({
+                    "path": file_path.clone(),
+                    "old_text": "hello world",
+                    "new_text": "hello evidence gate",
+                })
+                .to_string(),
+            );
+            resp.content = Some("I'll update the file now.".to_string());
+            resp
+        },
+        {
+            let mut resp = MockProvider::tool_call_response(
+                "read_file",
+                &json!({ "path": file_path.clone() }).to_string(),
+            );
+            resp.content = Some("I need to inspect the file before editing it.".to_string());
+            resp
+        },
+        {
+            let mut resp = MockProvider::tool_call_response(
+                "edit_file",
+                &json!({
+                    "path": file_path.clone(),
+                    "old_text": "hello world",
+                    "new_text": "hello evidence gate",
+                })
+                .to_string(),
+            );
+            resp.content = Some("I have read the file and will now update it.".to_string());
+            resp
+        },
+        MockProvider::text_response(
+            &json!({
+                "goal": "Update the target file contents",
+                "success_criteria": [
+                    "The target file contains the new replacement text",
+                    "The final reply confirms the edit"
+                ],
+                "first_action": {
+                    "tool": "edit_file",
+                    "target": file_path.clone(),
+                    "description": "Replace the old text in the file after inspecting it"
+                },
+                "requires_verification": true,
+                "risky_actions": ["This mutates a local file"]
+            })
+            .to_string(),
+        ),
+        MockProvider::text_response("Updated notes.txt successfully."),
+    ]);
+
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(ReadFileTool), Arc::new(EditFileTool)],
+        None,
+    )
+    .await
+    .unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "evidence_gate_edit",
+            "update the note file",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Updated notes.txt successfully.");
+    assert_eq!(
+        std::fs::read_to_string(&file_path).unwrap(),
+        "hello evidence gate\n"
+    );
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(
+        call_log.len(),
+        5,
+        "expected edit block + read + edit + planning gate + final"
+    );
+    assert!(
+        matches!(
+            call_log[3].options.response_mode,
+            crate::traits::ResponseMode::JsonSchema { .. }
+        ),
+        "planning gate should still run after read-only evidence is gathered"
+    );
+
+    let event_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT data FROM events WHERE session_id = ? AND event_type = 'decision_point' ORDER BY id DESC",
+    )
+    .bind("evidence_gate_edit")
+    .fetch_all(&harness.state.pool())
+    .await
+    .unwrap();
+
+    let evidence_gate = event_rows
+        .iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+        .find(|data| {
+            data.get("decision_type").and_then(|v| v.as_str()) == Some("evidence_gate")
+                && data
+                    .get("metadata")
+                    .and_then(|m| m.get("tool"))
+                    .and_then(|v| v.as_str())
+                    == Some("edit_file")
+        })
+        .expect("expected edit_file evidence_gate decision point");
+    assert_eq!(
+        evidence_gate["metadata"]["required_evidence_kind"].as_str(),
+        Some("FileRead")
+    );
+}
+
+#[tokio::test]
+async fn test_plain_text_retry_does_not_trip_execution_budget_before_tool_mode() {
+    let provider = MockProvider::with_responses(vec![
+        ProviderResponse {
+            content: None,
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 12_000,
+                output_tokens: 6_000,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: Some("truncated".to_string()),
+        },
+        MockProvider::text_response(
+            "Here is a tweet: Building a lot lately. What should I share next?",
+        ),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "plain_text_retry_budget",
+            "can you post a tweet about your new stuff, thoughts, updates or anything about yourself? make it engaging so people want to comment on it",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        "Here is a tweet: Building a lot lately. What should I share next?"
+    );
+    assert_eq!(
+        harness.provider.call_count().await,
+        2,
+        "plain-text retries should be allowed to recover without tripping execution budget"
+    );
+}
+
+#[tokio::test]
+async fn test_execution_budget_starts_after_tool_handoff_response() {
+    let provider = MockProvider::with_responses(vec![
+        ProviderResponse {
+            content: None,
+            tool_calls: vec![crate::traits::ToolCall {
+                id: "call_budget_baseline".to_string(),
+                name: "system_info".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 30_000,
+                output_tokens: 15_000,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        MockProvider::text_response("I checked the system info successfully."),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "execution_budget_baseline",
+            "check the system info on this machine",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "I checked the system info successfully.");
+    assert_eq!(
+        harness.provider.call_count().await,
+        2,
+        "the pre-tool planning/tool-selection call should not consume the execution token envelope"
+    );
+}
+
+#[tokio::test]
+async fn test_observational_progress_shifts_to_final_response_closeout_after_budget_exhaustion() {
+    let provider = MockProvider::with_responses(vec![
+        ProviderResponse {
+            content: None,
+            tool_calls: vec![crate::traits::ToolCall {
+                id: "call_system_info_initial".to_string(),
+                name: "system_info".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 200,
+                output_tokens: 100,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        ProviderResponse {
+            content: None,
+            tool_calls: vec![crate::traits::ToolCall {
+                id: "call_system_info_repeat".to_string(),
+                name: "system_info".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 48_000,
+                output_tokens: 24_000,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: Some("oversized_observational_retry".to_string()),
+        },
+        MockProvider::text_response(
+            "Here is the current system summary: macOS on arm64 with the expected hardware profile.",
+        ),
+    ]);
+
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    // Override execution budget so it exhausts after 2 LLM calls (one per
+    // tool-call iteration). The default Extended tier has limits too high to
+    // trigger budget exhaustion within this short test.
+    harness
+        .agent
+        .set_test_execution_budget_override(Some(crate::agent::ExecutionBudget {
+            max_steps: 100,
+            max_tokens: 0,
+            max_llm_calls: 2,
+            max_tool_calls: 100,
+            max_validation_rounds: 100,
+            max_wall_clock_ms: 600_000,
+        }));
+    let response = harness
+        .agent
+        .handle_message(
+            "observation_budget_closeout",
+            "check the current system info and summarize it for me",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        "Here is the current system summary: macOS on arm64 with the expected hardware profile."
+    );
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(call_log.len(), 3);
+    assert!(
+        call_log[2].tools.is_empty(),
+        "final closeout after observational progress should disable tools instead of surfacing a budget blocker"
+    );
+    assert_eq!(
+        call_log[2].options.tool_choice,
+        crate::traits::ToolChoiceMode::None
+    );
+}
+
+#[tokio::test]
+async fn test_deferred_text_only_turn_switches_to_plain_text_recovery_mode() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("I'll draft something engaging for you."),
+        MockProvider::text_response(
+            "Building a lot lately. What's something you're curious about behind the scenes?",
+        ),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "text_only_draft_recovery",
+            "write a tweet about what you've been building lately and make it engaging",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        "Building a lot lately. What's something you're curious about behind the scenes?"
+    );
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(
+        call_log.len(),
+        2,
+        "expected one direct-answer recovery retry"
+    );
+    assert!(
+        !call_log[0].tools.is_empty(),
+        "initial drafting turn should still expose tools before recovery decides they are unnecessary"
+    );
+    assert!(
+        call_log[1].tools.is_empty(),
+        "plain-text recovery retry should strip tools to break the deferred-action loop"
+    );
+    assert_eq!(
+        call_log[1].options.tool_choice,
+        crate::traits::ToolChoiceMode::None
+    );
+}
+
+#[tokio::test]
+async fn test_route_failsafe_does_not_turn_plain_text_draft_into_tool_required_loop() {
+    let session_id = "route_failsafe_plain_text_draft";
+    crate::agent::set_route_failsafe_for_session_for_test(session_id, true);
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("Let me draft a strong tweet for you."),
+        MockProvider::text_response(
+            "Been heads-down building. What should I share a behind-the-scenes update about next?",
+        ),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            session_id,
+            "can you post a tweet about your new stuff and make it engaging",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    crate::agent::set_route_failsafe_for_session_for_test(session_id, false);
+
+    assert_eq!(
+        response,
+        "Been heads-down building. What should I share a behind-the-scenes update about next?"
+    );
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(call_log.len(), 2);
+    // "post a tweet ... make it engaging" is now classified as DraftThenDeliver
+    // (expects_mutation=true), so the second call keeps tools available for
+    // the mutation path rather than stripping them.
+    assert!(
+        !call_log[1].tools.is_empty(),
+        "DraftThenDeliver mutation turn should keep tools on retry"
+    );
+}
+
+#[tokio::test]
+async fn test_text_only_turn_recovers_when_model_drifts_to_side_effecting_tool() {
+    let temp_path = std::env::temp_dir().join(format!(
+        "aidaemon-text-only-drift-{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    let _ = std::fs::remove_file(&temp_path);
+    let provider = MockProvider::with_responses(vec![
+        ProviderResponse {
+            content: Some("I'll handle that for you now.".to_string()),
+            tool_calls: vec![crate::traits::ToolCall {
+                id: "text_only_side_effecting_drift".to_string(),
+                name: "terminal".to_string(),
+                arguments: json!({"command": format!("touch {}", temp_path.display())})
+                    .to_string(),
+                extra_content: None,
+            }],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 12,
+                output_tokens: 8,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        MockProvider::text_response(
+            "Been heads-down building lately. What should I share a behind-the-scenes update about next?",
+        ),
+    ]);
+
+    let harness = setup_full_stack_test_agent(provider).await.unwrap();
+    // Use a conversational question that doesn't trigger expects_mutation
+    // or requires_observation, so the text-only prelude fires.
+    let response = harness
+        .agent
+        .handle_message(
+            "text_only_side_effecting_drift",
+            "what is the meaning of life",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        "Been heads-down building lately. What should I share a behind-the-scenes update about next?"
+    );
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(call_log.len(), 2);
+    assert!(
+        call_log[1].tools.is_empty(),
+        "text-only recovery should disable tools after side-effecting drift"
+    );
+    assert_eq!(
+        call_log[1].options.tool_choice,
+        crate::traits::ToolChoiceMode::None
+    );
+    assert!(
+        !temp_path.exists(),
+        "side-effecting terminal drift should be blocked before execution"
+    );
+}
+
+#[tokio::test]
+async fn test_account_scoped_social_post_request_stays_in_execution_lane() {
+    let temp_path = std::env::temp_dir().join(format!(
+        "aidaemon-live-delivery-{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    let _ = std::fs::remove_file(&temp_path);
+    let provider = MockProvider::with_responses(vec![
+        crate::traits::ProviderResponse {
+            content: Some("I'll post that now.".to_string()),
+            tool_calls: vec![crate::traits::ToolCall {
+                id: "account_scoped_social_post".to_string(),
+                name: "terminal".to_string(),
+                arguments: serde_json::json!({
+                    "command": format!("touch {}", temp_path.display())
+                })
+                .to_string(),
+                extra_content: None,
+            }],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 12,
+                output_tokens: 8,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        MockProvider::text_response("Posted."),
+    ]);
+
+    let harness = setup_full_stack_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "account_scoped_social_post",
+            "Can you post a tweet on your account?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Posted.");
+    assert!(
+        temp_path.exists(),
+        "account-scoped live-delivery phrasing should remain tool-enabled"
+    );
+}
+
+#[tokio::test]
+async fn test_explicit_tool_turn_still_forces_required_tool_choice_after_no_tool_deferral() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("I'll check the system info now."),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("I checked the system info for you."),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "tool_required_deferral_recovery",
+            "check the system info on this machine",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "I checked the system info for you.");
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(call_log.len(), 3);
+    assert_eq!(
+        call_log[1].options.tool_choice,
+        crate::traits::ToolChoiceMode::Required,
+        "genuinely tool-required turns should still escalate to required tool choice on retry"
+    );
 }
 
 /// Stall detection: agent keeps calling an unknown tool which errors each
@@ -934,4 +2172,3 @@ async fn test_memory_system_prompt_enrichment() {
         turn1_msgs
     );
 }
-

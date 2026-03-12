@@ -84,6 +84,87 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
         )
         .await
         .unwrap();
+    emitter
+        .emit(
+            EventType::DecisionPoint,
+            DecisionPointData {
+                decision_type: DecisionType::ExecutionStateSnapshot,
+                task_id: orphan_task_id.to_string(),
+                iteration: 2,
+                severity: crate::events::DiagnosticSeverity::Info,
+                code: Some("step_completed".to_string()),
+                metadata: json!({
+                    "condition": "step_completed",
+                    "execution_state": {
+                        "execution_id": "exec-orphan-1",
+                        "current_step": {
+                            "step_id": "step-2-call_pending",
+                            "description": "Run `system_info` against /tmp/demo",
+                            "plan_version": 1,
+                            "primary_tool": "system_info",
+                            "expected_effect": "observation",
+                            "target_scope": {
+                                "allowed_targets": [{"kind":"path","value":"/tmp/demo"}],
+                                "hard_fail_outside_scope": false
+                            },
+                            "expected_targets": [{"kind":"path","value":"/tmp/demo"}],
+                            "retry_policy": {
+                                "max_attempts": 1,
+                                "allow_tool_invocation_retry": false
+                            },
+                            "approval_requirement": "not_needed",
+                            "idempotency_key": null
+                        },
+                        "attempt_count": 1,
+                        "last_tool_name": "system_info",
+                        "last_outcome": "progress",
+                        "background_handoff_active": false,
+                        "persisted_at": null,
+                        "budget_tier": "small",
+                        "budget": {
+                            "max_steps": 4,
+                            "max_tokens": 12000,
+                            "max_llm_calls": 8,
+                            "max_tool_calls": 5,
+                            "max_validation_rounds": 2,
+                            "max_wall_clock_ms": 180000
+                        },
+                        "persistence": "durable",
+                        "llm_calls_used": 1,
+                        "tool_calls_used": 1,
+                        "validation_rounds_used": 0,
+                        "steps_used": 1
+                    }
+                }),
+                summary: "Captured execution state snapshot".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let checkpoint = harness
+        .agent
+        .build_resume_checkpoint(session_id)
+        .await
+        .unwrap()
+        .expect("expected resume checkpoint");
+    let execution_snapshot = checkpoint
+        .execution_snapshot
+        .as_ref()
+        .expect("expected execution snapshot on resume checkpoint");
+    assert_eq!(execution_snapshot.execution_id, "exec-orphan-1");
+    assert_eq!(
+        execution_snapshot.current_step_id.as_deref(),
+        Some("step-2-call_pending")
+    );
+    assert_eq!(
+        execution_snapshot.current_tool.as_deref(),
+        Some("system_info")
+    );
+    assert_eq!(
+        execution_snapshot.current_target.as_deref(),
+        Some("/tmp/demo")
+    );
 
     let reply = harness
         .agent

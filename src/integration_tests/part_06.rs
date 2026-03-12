@@ -143,12 +143,14 @@ async fn test_personal_recall_turn_routes_at_least_primary_model() {
 
 #[tokio::test]
 async fn test_empty_answerable_routing_output_falls_through_to_tool_path() {
+    // With deterministic orchestration (no first-pass LLM call), an empty/low-signal
+    // first response should cause the agent to retry and eventually use tools.
     let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            "[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
-        ),
-        // Empty analysis forces needs_tools=true, so executor must use tool calls
+        // 1) First LLM call produces an empty response
+        MockProvider::text_response(""),
+        // 2) Retry: the agent uses tools
         MockProvider::tool_call_response("system_info", "{}"),
+        // 3) Final answer
         MockProvider::text_response("Recovered after memory/tool retry."),
     ]);
 
@@ -172,7 +174,7 @@ async fn test_empty_answerable_routing_output_falls_through_to_tool_path() {
     assert!(calls.len() >= 2);
     assert!(
         !calls[1].tools.is_empty(),
-        "Empty answerable routing output should trigger tool-enabled retry path"
+        "Empty first response should trigger tool-enabled retry path"
     );
 }
 

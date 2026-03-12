@@ -65,6 +65,9 @@ pub struct UserMessageData {
     /// Structured annotations attached to the rendered content.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub annotations: Vec<MessageAnnotation>,
+    /// Role of the speaker when the message was received.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_role: Option<String>,
 }
 
 /// Data for AssistantResponse event
@@ -309,6 +312,13 @@ pub enum DecisionType {
     SkillMatch,
     MemoryRetrieval,
     IntentGate,
+    ExecutionPlanningGate,
+    ExecutionCritiquePass,
+    ExecutionBudgetSelection,
+    ExecutionStateSnapshot,
+    EvidenceGate,
+    ExecutionFailureClassification,
+    PostExecutionValidation,
     RepetitiveCallDetection,
     ConsecutiveSameToolDetection,
     AlternatingPatternDetection,
@@ -325,6 +335,13 @@ impl DecisionType {
             DecisionType::SkillMatch => "skill_match",
             DecisionType::MemoryRetrieval => "memory_retrieval",
             DecisionType::IntentGate => "intent_gate",
+            DecisionType::ExecutionPlanningGate => "execution_planning_gate",
+            DecisionType::ExecutionCritiquePass => "execution_critique_pass",
+            DecisionType::ExecutionBudgetSelection => "execution_budget_selection",
+            DecisionType::ExecutionStateSnapshot => "execution_state_snapshot",
+            DecisionType::EvidenceGate => "evidence_gate",
+            DecisionType::ExecutionFailureClassification => "execution_failure_classification",
+            DecisionType::PostExecutionValidation => "post_execution_validation",
             DecisionType::RepetitiveCallDetection => "repetitive_call_detection",
             DecisionType::ConsecutiveSameToolDetection => "consecutive_same_tool_detection",
             DecisionType::AlternatingPatternDetection => "alternating_pattern_detection",

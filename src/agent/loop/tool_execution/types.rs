@@ -29,6 +29,7 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub task_tokens_used: u64,
     pub user_text: &'a str,
     pub restrict_to_personal_memory_tools: bool,
+    pub active_skill_names: &'a [String],
     pub active_untrusted_external_reference_skills: &'a [String],
     pub restrict_untrusted_external_reference_tools: bool,
     pub is_reaffirmation_challenge_turn: bool,
@@ -53,6 +54,11 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub no_evidence_tools_seen: &'a mut HashSet<String>,
     pub evidence_gain_count: &'a mut usize,
     pub pending_error_solution_ids: &'a mut Vec<i64>,
+    pub tool_error_history:
+        &'a mut HashMap<(String, String), Vec<super::reflection::ToolErrorEntry>>,
+    pub reflection_completed: &'a mut HashSet<(String, String)>,
+    pub pending_reflection_recoveries:
+        &'a mut HashMap<String, super::reflection::PendingReflectionRecovery>,
     pub tool_failure_patterns: &'a mut HashMap<(String, String), usize>,
     pub last_tool_failure: &'a mut Option<(String, String)>,
     pub in_session_learned: &'a mut HashSet<(String, String)>,
@@ -65,6 +71,7 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub recent_tool_names: &'a mut VecDeque<String>,
     pub successful_send_file_keys: &'a mut HashSet<String>,
     pub cli_agent_boundary_injected: &'a mut bool,
+    pub evidence_state: &'a mut EvidenceState,
     pub pending_background_ack: &'a mut Option<String>,
     pub pending_external_action_ack: &'a mut Option<String>,
     pub stall_count: &'a mut usize,
@@ -78,6 +85,8 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub completion_progress: &'a mut CompletionProgress,
     pub turn_context: &'a TurnContext,
     pub resolved_goal_id: Option<&'a str>,
+    pub execution_state: &'a mut ExecutionState,
+    pub validation_state: &'a mut ValidationState,
     /// Cache of last successful tool results keyed by call hash.
     /// Used to replay read_file/search_files content when the repetitive
     /// redirect fires, so the model retains data lost to context truncation.

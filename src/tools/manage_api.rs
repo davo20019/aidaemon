@@ -756,7 +756,7 @@ impl Tool for ManageApiTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_api",
-            "description": "Deterministic API onboarding: connect auth, learn docs/specs into a skill, and verify with a safe probe.",
+            "description": "Connect auth, learn API docs/specs, and verify with a safe probe.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -772,7 +772,7 @@ impl Tool for ManageApiTool {
                     "auth_mode": {
                         "type": "string",
                         "enum": ["existing", "oauth2_pkce", "oauth2_authorization_code", "oauth2_client_credentials", "bearer", "header", "basic", "oauth1a"],
-                        "description": "existing, OAuth, or manual auth"
+                        "description": "Auth mode"
                     },
                     "allowed_domains": {
                         "type": "array",
@@ -780,75 +780,62 @@ impl Tool for ManageApiTool {
                         "description": "Allowed API domains"
                     },
                     "header_name": {
-                        "type": "string",
-                        "description": "Header name for header auth"
+                        "type": "string"
                     },
                     "username": {
-                        "type": "string",
-                        "description": "Username for basic auth"
+                        "type": "string"
                     },
                     "user_id": {
-                        "type": "string",
-                        "description": "Optional OAuth1a user/account id"
+                        "type": "string"
                     },
                     "display_name": {
-                        "type": "string",
-                        "description": "Optional provider label"
+                        "type": "string"
                     },
                     "authorize_url": {
-                        "type": "string",
-                        "description": "OAuth authorize URL"
+                        "type": "string"
                     },
                     "token_url": {
-                        "type": "string",
-                        "description": "OAuth token URL"
+                        "type": "string"
                     },
                     "scopes": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Optional OAuth scopes"
+                        "items": { "type": "string" }
                     },
                     "client_id": {
-                        "type": "string",
-                        "description": "Optional OAuth client_id"
+                        "type": "string"
                     },
                     "client_secret": {
-                        "type": "string",
-                        "description": "Optional OAuth client_secret"
+                        "type": "string"
                     },
                     "connect": {
                         "type": "boolean",
-                        "description": "Connect now; default true"
+                        "description": "Connect now"
                     },
                     "docs_url": {
-                        "type": "string",
-                        "description": "HTTPS docs URL or API URL"
+                        "type": "string"
                     },
                     "openapi_url": {
-                        "type": "string",
-                        "description": "HTTPS OpenAPI or Swagger URL"
+                        "type": "string"
                     },
                     "learn_url": {
-                        "type": "string",
-                        "description": "HTTPS docs, spec, or base URL"
+                        "type": "string"
                     },
                     "learn_kind": {
                         "type": "string",
                         "enum": ["auto", "openapi", "docs"],
-                        "description": "Learning mode"
+                        "description": "Learn mode"
                     },
                     "verify_url": {
-                        "type": "string",
-                        "description": "Optional safe probe URL"
+                        "type": "string"
                     },
                     "verify_method": {
                         "type": "string",
                         "enum": ["GET", "HEAD"],
-                        "description": "Probe method"
+                        "description": "Probe verb"
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Probe timeout"
+                        "description": "Timeout"
                     }
                 },
                 "required": ["action", "service"],

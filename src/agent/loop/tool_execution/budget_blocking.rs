@@ -116,11 +116,11 @@ impl Agent {
                 }
                 .render(),
             )
-        } else if tc.name == "web_search" && prior_calls >= 3 {
+        } else if tc.name == "web_search" && prior_calls >= 5 {
             Some(ToolResultNotice::WebSearchBudgetBlocked { prior_calls }.render())
-        } else if (tc.name == "web_search" || tc.name == "web_fetch") && combined_web_calls >= 6 {
+        } else if (tc.name == "web_search" || tc.name == "web_fetch") && combined_web_calls >= 10 {
             Some(ToolResultNotice::CombinedWebBudgetBlocked { combined_web_calls }.render())
-        } else if tc.name == "web_fetch" && prior_calls >= 4 {
+        } else if tc.name == "web_fetch" && prior_calls >= 6 {
             Some(ToolResultNotice::WebFetchBudgetBlocked { prior_calls }.render())
         } else if tc.name == "spawn_agent" && prior_calls >= 15 {
             // spawn_agent gets a higher cap than generic tools since task leads

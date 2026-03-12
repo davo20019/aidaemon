@@ -171,7 +171,7 @@ impl Agent {
         tools_count: usize,
         resume_checkpoint: Option<&ResumeCheckpoint>,
         owner_dm_fact_cache: Option<&[crate::traits::Fact]>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, Vec<String>)> {
         // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
         let skills_snapshot = self.skill_cache.get();
         let skill_matches = skills::match_skills(
@@ -793,7 +793,8 @@ impl Agent {
              1. **Never claim actions were performed unless confirmed by a tool result.** \
              If you did not execute a tool and receive a success result, do NOT tell the user you performed an action. \
              Do not fabricate completed actions, settings changes, or operations that never happened. \
-             Only report actions that you actually executed and whose results you can see.\n\
+             Only report actions that you actually executed and whose results you can see. \
+             When describing any tool-derived result or error, only cite filenames, paths, status codes, error messages, field names, parameter names, IDs, test names, values, counts, or other specifics that actually appear in the tool output; if a detail is missing or ambiguous, say that plainly instead of inferring it.\n\
              2. **Cross-reference memory before answering fact questions.** \
              When the user asks about stored preferences, personal details, or previously saved information \
              (favorite color, name, location, etc.), retrieve the actual stored value using your memory/fact tools \
@@ -851,6 +852,11 @@ impl Agent {
             system_prompt
         );
 
+        let active_skill_names: Vec<String> = active_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect();
+
         if self.record_decision_points {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             system_prompt.hash(&mut hasher);
@@ -883,7 +889,7 @@ impl Agent {
             "Memory context loaded"
         );
 
-        Ok(system_prompt)
+        Ok((system_prompt, active_skill_names))
     }
 }
 

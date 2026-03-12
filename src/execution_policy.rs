@@ -134,6 +134,11 @@ impl PolicyBundle {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UncertaintySignals {
     pub missing_required_slot: bool,
+    pub missing_target_project: bool,
+    pub missing_target_file: bool,
+    pub missing_target_environment: bool,
+    pub missing_expected_output: bool,
+    pub missing_rollback_path: bool,
     pub conflicting_constraints: bool,
     pub ambiguous_wording: bool,
     pub prior_immediate_failure: bool,
@@ -143,6 +148,21 @@ pub fn score_uncertainty(signals: UncertaintySignals) -> f32 {
     let mut score = 0.0f32;
     if signals.missing_required_slot {
         score += 0.35;
+    }
+    if signals.missing_target_project {
+        score += 0.12;
+    }
+    if signals.missing_target_file {
+        score += 0.10;
+    }
+    if signals.missing_target_environment {
+        score += 0.12;
+    }
+    if signals.missing_expected_output {
+        score += 0.10;
+    }
+    if signals.missing_rollback_path {
+        score += 0.08;
     }
     if signals.conflicting_constraints {
         score += 0.25;
@@ -231,11 +251,32 @@ mod tests {
     fn uncertainty_weights() {
         let score = score_uncertainty(UncertaintySignals {
             missing_required_slot: true,
+            missing_target_project: false,
+            missing_target_file: false,
+            missing_target_environment: false,
+            missing_expected_output: false,
+            missing_rollback_path: false,
             conflicting_constraints: true,
             ambiguous_wording: false,
             prior_immediate_failure: false,
         });
         assert!((score - 0.60).abs() < 0.001);
+    }
+
+    #[test]
+    fn slot_gaps_raise_uncertainty_for_risky_work() {
+        let score = score_uncertainty(UncertaintySignals {
+            missing_required_slot: false,
+            missing_target_project: true,
+            missing_target_file: false,
+            missing_target_environment: true,
+            missing_expected_output: true,
+            missing_rollback_path: true,
+            conflicting_constraints: false,
+            ambiguous_wording: false,
+            prior_immediate_failure: false,
+        });
+        assert!(score > 0.35, "expected slot gaps to increase uncertainty");
     }
 
     #[test]

@@ -53,12 +53,6 @@ pub(super) struct ScheduledRunBudgetControlCtx<'a> {
     pub goal_id: &'a str,
     pub status: &'a crate::goal_tokens::GoalRunBudgetStatus,
     pub user_role: UserRole,
-    pub learning_ctx: &'a LearningContext,
-    pub evidence_gain_count: usize,
-    pub stall_count: usize,
-    pub consecutive_same_tool_count: usize,
-    pub consecutive_same_tool_unique_args: usize,
-    pub total_successful_tool_calls: usize,
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
     pub max_budget_extensions: usize,
     pub hard_token_cap: i64,
@@ -73,6 +67,94 @@ pub(super) enum ScheduledRunBudgetControlOutcome {
 }
 
 impl Agent {
+    pub(super) fn has_meaningful_budget_progress(
+        evidence_gain_count: usize,
+        total_successful_tool_calls: usize,
+    ) -> bool {
+        // A single evidence gain is enough to show the run produced something
+        // concrete; otherwise require at least a few successful tool calls so
+        // we do not auto-extend pure narration or shallow retries.
+        evidence_gain_count > 0 || total_successful_tool_calls >= 3
+    }
+
+    pub(super) fn scheduled_run_health_snapshot(
+        learning_ctx: &LearningContext,
+        evidence_gain_count: usize,
+        stall_count: usize,
+        consecutive_same_tool_count: usize,
+        consecutive_same_tool_unique_args: usize,
+        total_successful_tool_calls: usize,
+    ) -> crate::traits::ScheduledRunHealth {
+        crate::traits::ScheduledRunHealth {
+            evidence_gain_count,
+            total_successful_tool_calls,
+            stall_count,
+            consecutive_same_tool_count,
+            consecutive_same_tool_unique_args,
+            unrecovered_error_count: learning_ctx
+                .errors
+                .iter()
+                .filter(|(_, recovered)| !recovered)
+                .count(),
+        }
+    }
+
+    pub(super) fn scheduled_run_metrics_are_clearly_unproductive(
+        health: &crate::traits::ScheduledRunHealth,
+    ) -> bool {
+        if health.stall_count > 1 {
+            return true;
+        }
+
+        let diverse_limit = MAX_CONSECUTIVE_SAME_TOOL + 4;
+        if health.consecutive_same_tool_count >= diverse_limit {
+            return true;
+        }
+        if health.consecutive_same_tool_count >= MAX_CONSECUTIVE_SAME_TOOL {
+            let is_diverse =
+                health.consecutive_same_tool_unique_args * 2 > health.consecutive_same_tool_count;
+            if !is_diverse {
+                return true;
+            }
+        }
+
+        if health.total_successful_tool_calls == 0 {
+            return health.unrecovered_error_count > 0 && health.evidence_gain_count == 0;
+        }
+
+        health.unrecovered_error_count >= health.total_successful_tool_calls
+    }
+
+    pub(super) fn scheduled_run_auto_extension_candidate(
+        status: &crate::goal_tokens::GoalRunBudgetStatus,
+        max_budget_extensions: usize,
+        hard_token_cap: i64,
+    ) -> Option<i64> {
+        let old_budget = status.effective_budget_per_check;
+        let new_budget = old_budget
+            .saturating_mul(2)
+            .max(status.tokens_used.saturating_add(old_budget / 2))
+            .min(hard_token_cap);
+
+        let has_meaningful_progress = Self::has_meaningful_budget_progress(
+            status.health.evidence_gain_count,
+            status.health.total_successful_tool_calls,
+        );
+        let clearly_unproductive =
+            Self::scheduled_run_metrics_are_clearly_unproductive(&status.health);
+
+        if status.budget_extensions_count < max_budget_extensions
+            && old_budget < hard_token_cap
+            && new_budget > status.tokens_used
+            && has_meaningful_progress
+            && !clearly_unproductive
+        {
+            Some(new_budget)
+        } else {
+            None
+        }
+    }
+
     pub(super) async fn run_task_end_tool_hooks(&self, task_id: &str, session_id: &str) {
         for tool in &self.tools {
             if let Err(e) = tool.on_task_end(task_id, session_id).await {
@@ -90,8 +172,12 @@ impl Agent {
     /// Ask the owner to approve a one-time budget extension for the current run.
     ///
     /// Returns true only when the owner explicitly approves.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn request_budget_continue_approval(
         &self,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        iteration: usize,
         session_id: &str,
         user_role: UserRole,
         scope_label: &str,
@@ -124,14 +210,43 @@ impl Agent {
             return false;
         };
 
-        let approval_desc = format!(
-            "Extend {} token budget from {} to {} and continue?",
-            scope_label, current_budget, proposed_budget
+        let approval_request = build_needs_approval_request(
+            format!(
+                "extend the {} token budget from {} to {} and continue execution",
+                scope_label, current_budget, proposed_budget
+            ),
+            Some(format!("{} token budget", scope_label)),
+            format!(
+                "Current usage is {} tokens, which exhausted the {} budget.",
+                used_tokens, scope_label
+            ),
+            "Explicit owner approval is required before spending more tokens on this run.",
+            format!(
+                "If approved, I will continue the current work inside the extended {} budget.",
+                scope_label
+            ),
+            None,
         );
-        let warnings = vec![
-            format!("Current usage: {} tokens.", used_tokens),
-            "This may increase spend for this run.".to_string(),
-        ];
+        let (approval_desc, warnings) = approval_request.to_inline_approval_prompt();
+        self.emit_decision_point(
+            emitter,
+            task_id,
+            iteration,
+            DecisionType::BudgetAutoExtension,
+            format!(
+                "Requested owner approval for {} budget extension",
+                scope_label
+            ),
+            json!({
+                "condition": "budget_extension_manual_request",
+                "scope_label": scope_label,
+                "approval_state": ApprovalState::Requested,
+                "used_tokens": used_tokens,
+                "current_budget": current_budget,
+                "proposed_budget": proposed_budget,
+            }),
+        )
+        .await;
 
         match hub_arc
             .request_inline_approval(
@@ -146,8 +261,43 @@ impl Agent {
             Ok(ApprovalResponse::AllowOnce)
             | Ok(ApprovalResponse::AllowSession)
             | Ok(ApprovalResponse::AllowAlways) => true,
-            Ok(ApprovalResponse::Deny) => false,
+            Ok(ApprovalResponse::Deny) => {
+                self.emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::BudgetAutoExtension,
+                    format!("Owner denied {} budget extension", scope_label),
+                    json!({
+                        "condition": "budget_extension_manual_denied",
+                        "scope_label": scope_label,
+                        "approval_state": ApprovalState::Denied,
+                        "used_tokens": used_tokens,
+                        "current_budget": current_budget,
+                        "proposed_budget": proposed_budget,
+                    }),
+                )
+                .await;
+                false
+            }
             Err(e) => {
+                self.emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::BudgetAutoExtension,
+                    format!("Approval unavailable for {} budget extension", scope_label),
+                    json!({
+                        "condition": "budget_extension_manual_unavailable",
+                        "scope_label": scope_label,
+                        "approval_state": ApprovalState::Denied,
+                        "used_tokens": used_tokens,
+                        "current_budget": current_budget,
+                        "proposed_budget": proposed_budget,
+                        "error": e.to_string(),
+                    }),
+                )
+                .await;
                 warn!(
                     session_id,
                     scope = scope_label,
@@ -186,17 +336,21 @@ impl Agent {
             .min(ctx.hard_token_cap);
 
         let productive = if ctx.is_scheduled_goal {
-            (ctx.total_successful_tool_calls >= 1 || ctx.evidence_gain_count >= 1)
-                && ctx.stall_count == 0
+            Self::has_meaningful_budget_progress(
+                ctx.evidence_gain_count,
+                ctx.total_successful_tool_calls,
+            ) && ctx.stall_count == 0
         } else {
-            ctx.evidence_gain_count >= 2
-                && post_task::is_productive(
-                    ctx.learning_ctx,
-                    ctx.stall_count,
-                    ctx.consecutive_same_tool_count,
-                    ctx.consecutive_same_tool_unique_args,
-                    ctx.total_successful_tool_calls,
-                )
+            Self::has_meaningful_budget_progress(
+                ctx.evidence_gain_count,
+                ctx.total_successful_tool_calls,
+            ) && post_task::is_productive(
+                ctx.learning_ctx,
+                ctx.stall_count,
+                ctx.consecutive_same_tool_count,
+                ctx.consecutive_same_tool_unique_args,
+                ctx.total_successful_tool_calls,
+            )
         };
 
         let (auto_condition, manual_condition, source_label) = match ctx.source {
@@ -271,6 +425,9 @@ impl Agent {
         let approved_extension =
             if old_gbudget < ctx.hard_token_cap && new_gbudget > ctx.status.tokens_used_today {
                 self.request_budget_continue_approval(
+                    ctx.emitter,
+                    ctx.task_id,
+                    ctx.iteration,
                     ctx.session_id,
                     ctx.user_role,
                     "goal daily",
@@ -304,6 +461,7 @@ impl Agent {
                 json!({
                     "condition": manual_condition,
                     "goal_id": ctx.goal_id,
+                    "approval_state": ApprovalState::Granted,
                     "old_budget": old_gbudget,
                     "new_budget": new_gbudget,
                     "tokens_used_today": ctx.status.tokens_used_today,
@@ -319,42 +477,6 @@ impl Agent {
         }
     }
 
-    fn scheduled_run_is_clearly_unproductive(
-        learning_ctx: &LearningContext,
-        stall_count: usize,
-        consecutive_same_tool_count: usize,
-        consecutive_same_tool_unique_args: usize,
-        total_successful_tool_calls: usize,
-        evidence_gain_count: usize,
-    ) -> bool {
-        if stall_count > 1 {
-            return true;
-        }
-
-        let diverse_limit = MAX_CONSECUTIVE_SAME_TOOL + 4;
-        if consecutive_same_tool_count >= diverse_limit {
-            return true;
-        }
-        if consecutive_same_tool_count >= MAX_CONSECUTIVE_SAME_TOOL {
-            let is_diverse = consecutive_same_tool_unique_args * 2 > consecutive_same_tool_count;
-            if !is_diverse {
-                return true;
-            }
-        }
-
-        let unrecovered = learning_ctx
-            .errors
-            .iter()
-            .filter(|(_, recovered)| !recovered)
-            .count();
-
-        if total_successful_tool_calls == 0 {
-            return unrecovered > 0 && evidence_gain_count == 0;
-        }
-
-        unrecovered >= total_successful_tool_calls
-    }
-
     pub(super) async fn enforce_scheduled_run_budget_control(
         &self,
         ctx: &mut ScheduledRunBudgetControlCtx<'_>,
@@ -365,25 +487,15 @@ impl Agent {
         }
 
         let old_budget = budget_per_check;
-        let new_budget = old_budget
+        let proposed_budget = old_budget
             .saturating_mul(2)
             .max(ctx.status.tokens_used.saturating_add(old_budget / 2))
             .min(ctx.hard_token_cap);
-
-        let clearly_unproductive = Self::scheduled_run_is_clearly_unproductive(
-            ctx.learning_ctx,
-            ctx.stall_count,
-            ctx.consecutive_same_tool_count,
-            ctx.consecutive_same_tool_unique_args,
-            ctx.total_successful_tool_calls,
-            ctx.evidence_gain_count,
-        );
-
-        if ctx.status.budget_extensions_count < ctx.max_budget_extensions
-            && old_budget < ctx.hard_token_cap
-            && new_budget > ctx.status.tokens_used
-            && !clearly_unproductive
-        {
+        if let Some(new_budget) = Self::scheduled_run_auto_extension_candidate(
+            ctx.status,
+            ctx.max_budget_extensions,
+            ctx.hard_token_cap,
+        ) {
             if let Some(registry) = &self.goal_token_registry {
                 let updated = registry
                     .auto_extend_run_budget(ctx.goal_id, new_budget)
@@ -434,14 +546,17 @@ impl Agent {
         }
 
         let approved_extension =
-            if old_budget < ctx.hard_token_cap && new_budget > ctx.status.tokens_used {
+            if old_budget < ctx.hard_token_cap && proposed_budget > ctx.status.tokens_used {
                 self.request_budget_continue_approval(
+                    ctx.emitter,
+                    ctx.task_id,
+                    ctx.iteration,
                     ctx.session_id,
                     ctx.user_role,
                     "scheduled run",
                     ctx.status.tokens_used,
                     old_budget,
-                    new_budget,
+                    proposed_budget,
                 )
                 .await
             } else {
@@ -450,7 +565,7 @@ impl Agent {
 
         if approved_extension {
             if let Some(registry) = &self.goal_token_registry {
-                if let Some(status) = registry.set_run_budget(ctx.goal_id, new_budget).await {
+                if let Some(status) = registry.set_run_budget(ctx.goal_id, proposed_budget).await {
                     persist_scheduled_run_state(&self.state, ctx.goal_id, None, &status).await;
                 }
             }
@@ -463,8 +578,9 @@ impl Agent {
                 json!({
                     "condition": "scheduled_run_budget_extension_manual",
                     "goal_id": ctx.goal_id,
+                    "approval_state": ApprovalState::Granted,
                     "old_budget": old_budget,
-                    "new_budget": new_budget,
+                    "new_budget": proposed_budget,
                     "tokens_used": ctx.status.tokens_used,
                 }),
             )
@@ -922,5 +1038,80 @@ impl Agent {
                 },
             )
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meaningful_budget_progress_accepts_evidence_gain() {
+        assert!(Agent::has_meaningful_budget_progress(1, 0));
+    }
+
+    #[test]
+    fn meaningful_budget_progress_accepts_three_successful_calls() {
+        assert!(Agent::has_meaningful_budget_progress(0, 3));
+    }
+
+    #[test]
+    fn meaningful_budget_progress_rejects_shallow_runs_without_evidence() {
+        assert!(!Agent::has_meaningful_budget_progress(0, 2));
+    }
+
+    #[test]
+    fn scheduled_run_metrics_detect_unproductive_snapshot() {
+        assert!(Agent::scheduled_run_metrics_are_clearly_unproductive(
+            &crate::traits::ScheduledRunHealth {
+                evidence_gain_count: 0,
+                total_successful_tool_calls: 0,
+                stall_count: 0,
+                consecutive_same_tool_count: 0,
+                consecutive_same_tool_unique_args: 0,
+                unrecovered_error_count: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn scheduled_run_auto_extension_candidate_requires_health() {
+        assert_eq!(
+            Agent::scheduled_run_auto_extension_candidate(
+                &crate::goal_tokens::GoalRunBudgetStatus {
+                    effective_budget_per_check: 100,
+                    tokens_used: 100,
+                    budget_extensions_count: 0,
+                    health: crate::traits::ScheduledRunHealth::default(),
+                },
+                12,
+                1_000,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn scheduled_run_auto_extension_candidate_accepts_productive_snapshot() {
+        assert_eq!(
+            Agent::scheduled_run_auto_extension_candidate(
+                &crate::goal_tokens::GoalRunBudgetStatus {
+                    effective_budget_per_check: 100,
+                    tokens_used: 100,
+                    budget_extensions_count: 0,
+                    health: crate::traits::ScheduledRunHealth {
+                        evidence_gain_count: 1,
+                        total_successful_tool_calls: 3,
+                        stall_count: 0,
+                        consecutive_same_tool_count: 1,
+                        consecutive_same_tool_unique_args: 1,
+                        unrecovered_error_count: 0,
+                    },
+                },
+                12,
+                1_000,
+            ),
+            Some(200)
+        );
     }
 }

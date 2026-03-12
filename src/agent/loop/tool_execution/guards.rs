@@ -65,8 +65,34 @@ impl Agent {
                 }),
             )
             .await;
-            let is_read_only = matches!(tc.name.as_str(), "read_file" | "search_files");
-            let redirect_msg = if is_read_only {
+            let is_read_only = is_cached_read_only_reacquisition(&tc.name, &tc.arguments);
+            let is_api_tool = matches!(tc.name.as_str(), "http_request" | "web_fetch");
+            let redirect_msg = if is_read_only && is_api_tool {
+                // For API tools, provide context-aware guidance about the
+                // previous result so the LLM can report errors accurately
+                // instead of saying "requests are being blocked."
+                let previous_hint = tool_result_cache
+                    .get(&call_hash)
+                    .map(|cached| {
+                        // Extract just the status line (e.g., "HTTP 404 Not Found")
+                        cached
+                            .lines()
+                            .find(|l| l.contains("HTTP ") || l.contains("Error"))
+                            .unwrap_or("(result in conversation history)")
+                            .chars()
+                            .take(200)
+                            .collect::<String>()
+                    })
+                    .unwrap_or_else(|| {
+                        "(check your conversation history for the previous result)".to_string()
+                    });
+                ToolResultNotice::RepeatedApiCallBlocked {
+                    tool_name: tc.name.clone(),
+                    repetitive_count,
+                    previous_result_hint: previous_hint,
+                }
+                .render()
+            } else if is_read_only {
                 // For read-only tools, replay cached content so the model can
                 // act on it despite context truncation dropping earlier results.
                 if let Some(cached) = tool_result_cache.get(&call_hash) {
@@ -425,9 +451,38 @@ fn is_background_status_poll(tool_name: &str, arguments: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_cached_read_only_reacquisition(tool_name: &str, arguments: &str) -> bool {
+    if matches!(tool_name, "read_file" | "search_files" | "web_fetch") {
+        return true;
+    }
+
+    if tool_name != "http_request" {
+        return false;
+    }
+
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("method")
+                .and_then(|method| method.as_str())
+                .map(|method| {
+                    let normalized = method.trim().to_ascii_uppercase();
+                    normalized == "GET" || normalized == "HEAD"
+                })
+        })
+        .unwrap_or(false)
+}
+
 fn repetitive_redirect_threshold_for_call(tool_name: &str, arguments: &str) -> usize {
     if is_background_status_poll(tool_name, arguments) {
         // Background status checks can consume budget quickly with little progress.
+        2
+    } else if is_cached_read_only_reacquisition(tool_name, arguments)
+        && matches!(tool_name, "http_request" | "web_fetch")
+    {
+        // Large read-only payloads are expensive to reacquire. Redirect the
+        // second identical GET/fetch and replay the cached result instead.
         2
     } else if matches!(tool_name, "read_file" | "search_files") {
         // Read-only tools need a higher threshold because context truncation
@@ -442,7 +497,10 @@ fn repetitive_redirect_threshold_for_call(tool_name: &str, arguments: &str) -> u
 
 #[cfg(test)]
 mod tests {
-    use super::{is_background_status_poll, repetitive_redirect_threshold_for_call};
+    use super::{
+        is_background_status_poll, is_cached_read_only_reacquisition,
+        repetitive_redirect_threshold_for_call,
+    };
     use crate::agent::REPETITIVE_REDIRECT_THRESHOLD;
 
     #[test]
@@ -483,6 +541,40 @@ mod tests {
         assert_eq!(
             repetitive_redirect_threshold_for_call("write_file", r#"{"path":"/tmp/foo.py"}"#),
             REPETITIVE_REDIRECT_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn repeated_http_gets_redirect_earlier() {
+        assert!(is_cached_read_only_reacquisition(
+            "http_request",
+            r#"{"method":"GET","url":"https://clinicaltrials.gov/api/v2/studies"}"#
+        ));
+        assert_eq!(
+            repetitive_redirect_threshold_for_call(
+                "http_request",
+                r#"{"method":"GET","url":"https://clinicaltrials.gov/api/v2/studies"}"#
+            ),
+            2
+        );
+        assert_eq!(
+            repetitive_redirect_threshold_for_call(
+                "http_request",
+                r#"{"method":"POST","url":"https://example.com/api"}"#
+            ),
+            REPETITIVE_REDIRECT_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn web_fetch_is_treated_as_cached_read_only_reacquisition() {
+        assert!(is_cached_read_only_reacquisition(
+            "web_fetch",
+            r#"{"url":"https://example.com"}"#
+        ));
+        assert_eq!(
+            repetitive_redirect_threshold_for_call("web_fetch", r#"{"url":"https://example.com"}"#),
+            2
         );
     }
 

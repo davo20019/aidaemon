@@ -44,6 +44,15 @@ pub(in crate::agent) enum ToolResultNotice {
     EditFileReplaceAllRecovery {
         path: String,
     },
+    ToolContractFailureRetry {
+        tool_name: String,
+    },
+    EnvironmentFailureGuidance {
+        tool_name: String,
+    },
+    LogicFailureReplan {
+        tool_name: String,
+    },
     ErrorCoaching {
         key_line: String,
     },
@@ -59,6 +68,11 @@ pub(in crate::agent) enum ToolResultNotice {
     RepeatedReadBlocked {
         tool_name: String,
         repetitive_count: usize,
+    },
+    RepeatedApiCallBlocked {
+        tool_name: String,
+        repetitive_count: usize,
+        previous_result_hint: String,
     },
     RepeatedTerminalBlockedAfterEdits {
         repetitive_count: usize,
@@ -221,6 +235,23 @@ If the user asked for a full rewrite, use write_file for full content replacemen
 or expanding old_text with nearby unique context from read_file(path=\"{}\").",
                 path
             ),
+            Self::ToolContractFailureRetry { tool_name } => format!(
+                "[SYSTEM] `{}` failed because the tool call contract was wrong. \
+Fix the arguments or required fields and retry once with corrected parameters. \
+Do NOT change target scope until the call shape is valid.",
+                tool_name
+            ),
+            Self::EnvironmentFailureGuidance { tool_name } => format!(
+                "[SYSTEM] `{}` failed because the environment or target state is missing or unavailable. \
+Gather the missing evidence, inspect the target, or ask for the missing permission/configuration. \
+Do NOT blindly retry the same call.",
+                tool_name
+            ),
+            Self::LogicFailureReplan { tool_name } => format!(
+                "[SYSTEM] `{}` failed because the approach or target appears wrong. \
+Do NOT repeat the same call. Change approach, reduce scope, or tell the user what remains blocked.",
+                tool_name
+            ),
             Self::ErrorCoaching { key_line } => format!(
                 "[SYSTEM] IMPORTANT — The error says: \"{}\"\n\
          Do NOT repeat the same command. Analyze what this error means and use a DIFFERENT approach.\n\
@@ -265,6 +296,22 @@ or expanding old_text with nearby unique context from read_file(path=\"{}\").",
                          Use `write_file` to apply your fixes based on what you already know.\n\n\
                          You MUST use `write_file` now — do not try to read the file again.",
                 tool_name, repetitive_count
+            ),
+            Self::RepeatedApiCallBlocked {
+                tool_name,
+                repetitive_count,
+                previous_result_hint,
+            } => format!(
+                "[SYSTEM] BLOCKED: You already called `{}` with these exact same arguments {} times. \
+                         Retrying with identical arguments will NOT produce a different result.\n\n\
+                         Previous result: {}\n\n\
+                         You MUST either:\n\
+                         - Try DIFFERENT parameters (different URL, query params, or method)\n\
+                         - Tell the user what happened honestly (e.g., \"the API returned 404 — \
+                         this resource may not exist\")\n\
+                         - Use an alternative approach (e.g., `web_fetch` to access the web page directly)\n\n\
+                         Do NOT say your requests are \"being blocked\" — be specific about the actual error.",
+                tool_name, repetitive_count, previous_result_hint
             ),
             Self::RepeatedTerminalBlockedAfterEdits { repetitive_count } => format!(
                 "[SYSTEM] BLOCKED: You already ran this exact terminal command {} times. \

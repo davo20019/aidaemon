@@ -1030,16 +1030,18 @@ impl crate::traits::GoalStore for SqliteStateStore {
     }
 
     async fn upsert_scheduled_run_state(&self, state: &ScheduledRunState) -> anyhow::Result<()> {
+        let health_json = serde_json::to_string(&state.health)?;
         sqlx::query(
             "INSERT INTO scheduled_run_state (
                 goal_id, root_task_id, effective_budget_per_check, tokens_used,
-                budget_extensions_count, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                budget_extensions_count, health_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(goal_id) DO UPDATE SET
                 root_task_id = excluded.root_task_id,
                 effective_budget_per_check = excluded.effective_budget_per_check,
                 tokens_used = excluded.tokens_used,
                 budget_extensions_count = excluded.budget_extensions_count,
+                health_json = excluded.health_json,
                 updated_at = excluded.updated_at",
         )
         .bind(&state.goal_id)
@@ -1047,6 +1049,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
         .bind(state.effective_budget_per_check)
         .bind(state.tokens_used)
         .bind(state.budget_extensions_count as i64)
+        .bind(health_json)
         .bind(&state.created_at)
         .bind(&state.updated_at)
         .execute(&self.pool)
@@ -1060,7 +1063,7 @@ impl crate::traits::GoalStore for SqliteStateStore {
     ) -> anyhow::Result<Option<ScheduledRunState>> {
         let row = sqlx::query(
             "SELECT goal_id, root_task_id, effective_budget_per_check, tokens_used,
-                    budget_extensions_count, created_at, updated_at
+                    budget_extensions_count, health_json, created_at, updated_at
              FROM scheduled_run_state
              WHERE goal_id = ?",
         )
@@ -1074,6 +1077,11 @@ impl crate::traits::GoalStore for SqliteStateStore {
             effective_budget_per_check: r.get("effective_budget_per_check"),
             tokens_used: r.get("tokens_used"),
             budget_extensions_count: r.get::<i64, _>("budget_extensions_count") as usize,
+            health: r
+                .try_get::<String, _>("health_json")
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default(),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
         }))

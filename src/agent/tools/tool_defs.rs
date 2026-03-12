@@ -154,7 +154,44 @@ impl Agent {
             .and_then(|n| n.as_str())
     }
 
+    fn request_requires_connected_api_setup_tools(user_message: &str) -> bool {
+        crate::agent::intent_routing::user_text_requests_auth_or_integration_management(
+            user_message,
+        ) || crate::agent::intent_routing::classify_connected_api_intent(user_message).is_some()
+    }
+
+    pub(super) fn restrict_connected_api_setup_tools_for_request(
+        &self,
+        user_message: &str,
+        defs: &[Value],
+    ) -> Vec<Value> {
+        if Self::request_requires_connected_api_setup_tools(user_message) {
+            return defs.to_vec();
+        }
+
+        defs.iter()
+            .filter(|def| {
+                !matches!(
+                    Self::tool_name_from_definition(def),
+                    Some("manage_api" | "manage_http_auth" | "manage_oauth")
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
     fn connected_api_tools_to_pin(user_message: &str) -> Option<&'static [&'static str]> {
+        if crate::agent::intent_routing::user_text_requests_auth_or_integration_management(
+            user_message,
+        ) {
+            return Some(&[
+                "manage_api",
+                "manage_oauth",
+                "manage_http_auth",
+                "http_request",
+            ]);
+        }
+
         match crate::agent::intent_routing::classify_connected_api_intent(user_message) {
             Some(crate::agent::intent_routing::ConnectedApiIntent::RuntimeCapabilityValidation)
             | Some(crate::agent::intent_routing::ConnectedApiIntent::ReadAction)
@@ -162,7 +199,6 @@ impl Agent {
                 "manage_api",
                 "manage_oauth",
                 "manage_http_auth",
-                "manage_skills",
                 "http_request",
             ]),
             None => None,
@@ -240,10 +276,7 @@ impl Agent {
             "manage_people",
             "web_search",
             "web_fetch",
-            "manage_api",
             "http_request",
-            "manage_http_auth",
-            "manage_oauth",
             "send_file",
         ];
         let role_required_tools: &[&str] = match self.role() {
@@ -349,8 +382,10 @@ impl Agent {
         }
 
         let base_defs = defs.clone();
+        defs = self.restrict_connected_api_setup_tools_for_request(user_message, &defs);
         if enforce_filter {
             defs = self.filter_tool_definitions_for_policy(&defs, &caps, policy, risk_score, false);
+            defs = self.restrict_connected_api_setup_tools_for_request(user_message, &defs);
             defs = self.ensure_connected_api_tools_exposed(user_message, &defs, &base_defs);
         }
 
@@ -504,7 +539,6 @@ mod tests {
         assert!(names.contains(&"manage_api".to_string()));
         assert!(names.contains(&"http_request".to_string()));
         assert!(names.contains(&"manage_http_auth".to_string()));
-        assert!(names.contains(&"manage_skills".to_string()));
         assert!(names.contains(&"manage_oauth".to_string()));
         assert_eq!(names.first().map(String::as_str), Some("manage_api"));
     }
@@ -540,7 +574,6 @@ mod tests {
         assert!(names.contains(&"manage_api".to_string()));
         assert!(names.contains(&"http_request".to_string()));
         assert!(names.contains(&"manage_http_auth".to_string()));
-        assert!(names.contains(&"manage_skills".to_string()));
         assert!(names.contains(&"manage_oauth".to_string()));
     }
 
@@ -576,7 +609,6 @@ mod tests {
         assert!(names.contains(&"manage_api".to_string()));
         assert!(names.contains(&"http_request".to_string()));
         assert!(names.contains(&"manage_http_auth".to_string()));
-        assert!(names.contains(&"manage_skills".to_string()));
         assert!(names.contains(&"manage_oauth".to_string()));
     }
 
@@ -615,7 +647,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_filter_keeps_connected_api_tools_exposed() {
+    async fn auth_management_queries_pin_connected_api_tools() {
+        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
+            .await
+            .unwrap();
+
+        let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
+        let base = vec![
+            named_tool_def("search_files"),
+            named_tool_def("manage_api"),
+            named_tool_def("http_request"),
+            named_tool_def("manage_http_auth"),
+            named_tool_def("manage_oauth"),
+            named_tool_def("terminal"),
+        ];
+
+        let exposed = harness.agent.ensure_connected_api_tools_exposed(
+            "Reconnect my GitHub OAuth integration.",
+            &filtered,
+            &base,
+        );
+        let names: Vec<String> = exposed
+            .iter()
+            .filter_map(Agent::tool_name_from_definition)
+            .map(ToString::to_string)
+            .collect();
+
+        assert!(names.contains(&"manage_api".to_string()));
+        assert!(names.contains(&"http_request".to_string()));
+        assert!(names.contains(&"manage_http_auth".to_string()));
+        assert!(names.contains(&"manage_oauth".to_string()));
+    }
+
+    #[tokio::test]
+    async fn drafting_queries_strip_connected_api_setup_tools() {
         let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
             .await
             .unwrap();
@@ -680,16 +745,28 @@ mod tests {
             0.2,
             false,
         );
+        let filtered = harness
+            .agent
+            .restrict_connected_api_setup_tools_for_request(
+                "Can you post a tweet about your new stuff and make it engaging?",
+                &filtered,
+            );
         let names: Vec<String> = filtered
             .iter()
             .filter_map(Agent::tool_name_from_definition)
             .map(ToString::to_string)
             .collect();
 
+        // "post a tweet ... make it engaging" now classifies as WriteAction
+        // (DraftThenDeliver), so restrict_connected_api_setup_tools_for_request
+        // keeps all defs. However, the upstream policy filter (Cheap, risk=0.2)
+        // already removed manage_oauth via the low-risk truncation. The
+        // restrict step can only preserve what survived the policy filter.
         assert!(names.contains(&"manage_api".to_string()));
         assert!(names.contains(&"http_request".to_string()));
         assert!(names.contains(&"manage_http_auth".to_string()));
-        assert!(names.contains(&"manage_oauth".to_string()));
+        // manage_oauth was removed by Cheap low-risk policy truncation
+        assert!(!names.contains(&"manage_oauth".to_string()));
     }
 
     #[tokio::test]

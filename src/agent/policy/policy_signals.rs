@@ -77,6 +77,133 @@ fn contains_any_as_words(haystack: &str, needles: &[&str]) -> bool {
         .any(|needle| contains_keyword_as_words(haystack, needle))
 }
 
+fn looks_like_scoped_target(lower: &str) -> bool {
+    lower.contains('/')
+        || lower.contains('\\')
+        || contains_any(
+            lower,
+            &[
+                ".rs", ".md", ".toml", ".json", ".yaml", ".yml", ".js", ".ts", ".tsx", ".py", ".go",
+            ],
+        )
+        || contains_any_as_words(
+            lower,
+            &[
+                "repo",
+                "repository",
+                "project",
+                "directory",
+                "folder",
+                "file",
+                "path",
+                "url",
+                "endpoint",
+            ],
+        )
+}
+
+fn looks_like_mutation_request(lower: &str) -> bool {
+    contains_any_as_words(
+        lower,
+        &[
+            "write", "edit", "change", "modify", "create", "delete", "remove", "fix", "deploy",
+            "install", "run", "execute", "commit", "schedule", "restart", "send", "update",
+            "refactor",
+        ],
+    )
+}
+
+fn looks_like_deployment_or_external_write(lower: &str) -> bool {
+    contains_any_as_words(
+        lower,
+        &[
+            "deploy",
+            "publish",
+            "release",
+            "restart",
+            "production",
+            "staging",
+            "send",
+            "post",
+            "put",
+            "patch",
+            "delete",
+            "webhook",
+        ],
+    )
+}
+
+fn looks_like_scheduled_action(lower: &str) -> bool {
+    contains_any_as_words(
+        lower,
+        &[
+            "schedule",
+            "scheduled",
+            "cron",
+            "every day",
+            "every week",
+            "every month",
+            "tomorrow",
+            "next week",
+            "daily",
+            "weekly",
+            "monthly",
+        ],
+    )
+}
+
+fn has_explicit_environment_target(lower: &str) -> bool {
+    contains_any_as_words(
+        lower,
+        &[
+            "production",
+            "prod",
+            "staging",
+            "stage",
+            "development",
+            "dev",
+            "local",
+            "localhost",
+            "test environment",
+            "preview",
+        ],
+    ) || lower.contains("http://")
+        || lower.contains("https://")
+}
+
+fn has_expected_output_hint(lower: &str) -> bool {
+    contains_any_as_words(
+        lower,
+        &[
+            "so that",
+            "confirm",
+            "verify",
+            "check that",
+            "expect",
+            "result should",
+            "success means",
+            "health",
+            "status",
+            "output",
+            "response",
+        ],
+    )
+}
+
+fn has_rollback_hint(lower: &str) -> bool {
+    contains_any_as_words(
+        lower,
+        &[
+            "rollback",
+            "roll back",
+            "revert",
+            "undo",
+            "fallback",
+            "backup",
+        ],
+    )
+}
+
 fn estimate_risk_from_text(user_text: &str) -> f32 {
     let lower = user_text.to_ascii_lowercase();
     let mut score = 0.18f32;
@@ -129,8 +256,29 @@ fn estimate_risk_from_text(user_text: &str) -> f32 {
 
 fn infer_uncertainty_signals(user_text: &str, prior_immediate_failure: bool) -> UncertaintySignals {
     let lower = user_text.trim().to_ascii_lowercase();
+    let mutation_request = looks_like_mutation_request(&lower);
+    let deployment_or_external_write = looks_like_deployment_or_external_write(&lower);
+    let scheduled_action = looks_like_scheduled_action(&lower);
     let missing_required_slot = user_text_looks_ambiguous(user_text)
         || matches!(lower.as_str(), "do it" | "handle it" | "fix it" | "run it");
+
+    let missing_target_project =
+        (mutation_request || deployment_or_external_write || scheduled_action)
+            && !looks_like_scoped_target(&lower);
+    let missing_target_file = contains_any_as_words(
+        &lower,
+        &["edit", "write", "change", "modify", "refactor", "rename"],
+    ) && !contains_any_as_words(&lower, &["file", "path"])
+        && !contains_any(&lower, &[".rs", ".md", ".toml", ".json", ".yaml", ".yml"]);
+    let missing_target_environment = (deployment_or_external_write
+        || contains_any_as_words(&lower, &["restart", "send"]))
+        && !has_explicit_environment_target(&lower);
+    let missing_expected_output = (mutation_request
+        || contains_any_as_words(&lower, &["check", "verify", "confirm"]))
+        && !has_expected_output_hint(&lower);
+    let missing_rollback_path = (deployment_or_external_write
+        || contains_any_as_words(&lower, &["overwrite", "delete", "drop", "truncate"]))
+        && !has_rollback_hint(&lower);
 
     let conflicting_constraints = (lower.contains("quick") && lower.contains("detailed"))
         || (lower.contains("short") && lower.contains("comprehensive"))
@@ -153,6 +301,11 @@ fn infer_uncertainty_signals(user_text: &str, prior_immediate_failure: bool) -> 
 
     UncertaintySignals {
         missing_required_slot,
+        missing_target_project,
+        missing_target_file,
+        missing_target_environment,
+        missing_expected_output,
+        missing_rollback_path,
         conflicting_constraints,
         ambiguous_wording,
         prior_immediate_failure,

@@ -5,7 +5,7 @@ use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
 use crate::memory::scoring::calculate_episode_importance;
 use crate::traits::{BehaviorPattern, Message, Person, StateStore, UserProfile};
-use crate::types::{ChannelVisibility, FactPrivacy};
+use crate::types::{ChannelVisibility, FactPrivacy, UserRole};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
@@ -249,6 +249,111 @@ impl MemoryManager {
         Some(ChannelVisibility::from_str_lossy(vis))
     }
 
+    fn parse_event_user_role(data: &serde_json::Value) -> Option<UserRole> {
+        match data.get("user_role").and_then(|v| v.as_str()) {
+            Some("owner") => Some(UserRole::Owner),
+            Some("guest") => Some(UserRole::Guest),
+            Some("public") => Some(UserRole::Public),
+            _ => None,
+        }
+    }
+
+    async fn fact_consolidation_batch_is_owner_only(
+        &self,
+        session_id: &str,
+        cutoff: &str,
+        after_event_id: i64,
+    ) -> anyhow::Result<bool> {
+        let rows = sqlx::query(
+            r#"
+            SELECT data
+            FROM events
+            WHERE session_id = ?
+              AND event_type = 'user_message'
+              AND id > ?
+              AND created_at < ?
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(session_id)
+        .bind(after_event_id)
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut saw_owner_message = false;
+        for row in rows {
+            let data_raw: String = row.get("data");
+            let data: serde_json::Value = match serde_json::from_str(&data_raw) {
+                Ok(val) => val,
+                Err(_) => return Ok(false),
+            };
+
+            match Self::parse_event_user_role(&data) {
+                Some(role) if role.can_persist_owner_memory() => {
+                    saw_owner_message = true;
+                }
+                _ => return Ok(false),
+            }
+        }
+
+        Ok(saw_owner_message)
+    }
+
+    async fn session_since_last_episode_is_owner_only(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        let last_episode_end: Option<String> =
+            sqlx::query_scalar("SELECT MAX(end_time) FROM episodes WHERE session_id = ?")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+
+        let rows = if let Some(ref since) = last_episode_end {
+            sqlx::query(
+                "SELECT data FROM events
+                 WHERE session_id = ?
+                   AND event_type = 'user_message'
+                   AND created_at > ?
+                 ORDER BY created_at ASC",
+            )
+            .bind(session_id)
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT data FROM events
+                 WHERE session_id = ?
+                   AND event_type = 'user_message'
+                 ORDER BY created_at ASC",
+            )
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        let mut saw_owner_message = false;
+        for row in rows {
+            let data_raw: String = row.get("data");
+            let data: serde_json::Value = match serde_json::from_str(&data_raw) {
+                Ok(val) => val,
+                Err(_) => return Ok(false),
+            };
+
+            match Self::parse_event_user_role(&data) {
+                Some(role) if role.can_persist_owner_memory() => {
+                    saw_owner_message = true;
+                }
+                _ => return Ok(false),
+            }
+        }
+
+        Ok(saw_owner_message)
+    }
+
     fn fact_consolidation_cursor_key(session_id: &str) -> String {
         format!("memory_fact_consolidation_cursor:{}", session_id)
     }
@@ -375,6 +480,33 @@ impl MemoryManager {
 
         for session_id in candidate_sessions {
             let cursor = self.get_fact_consolidation_cursor(&session_id).await;
+            if !self
+                .fact_consolidation_batch_is_owner_only(&session_id, &cutoff, cursor)
+                .await?
+            {
+                let max_seen: Option<i64> = sqlx::query_scalar(
+                    r#"
+                    SELECT MAX(id)
+                    FROM events
+                    WHERE session_id = ?
+                      AND event_type IN ('user_message', 'assistant_response', 'tool_result')
+                      AND id > ?
+                      AND created_at < ?
+                    "#,
+                )
+                .bind(&session_id)
+                .bind(cursor)
+                .bind(&cutoff)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+                if let Some(max_seen) = max_seen {
+                    let _ = self
+                        .set_fact_consolidation_cursor(&session_id, max_seen)
+                        .await;
+                }
+                continue;
+            }
             let events = self
                 .fetch_fact_consolidation_messages(&session_id, &cutoff, cursor, 300)
                 .await?;
@@ -443,6 +575,7 @@ impl MemoryManager {
             - relationship: Communication patterns with the AI\n\
             - behavior: Observed tool-usage patterns and recurring workflows\n\
             - people: Information about OTHER individuals mentioned or participating in conversation\n\n\
+            ONLY learn from owner-authenticated user messages. NEVER extract or store facts from guest/public speakers, and NEVER treat another person's self-description as owner data.\n\n\
             For \"behavior\", look for:\n\
             - Which tools the user prefers for specific tasks\n\
             - Recurring workflows or action sequences\n\
@@ -1598,6 +1731,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         );
 
         for session_id in idle_sessions {
+            if !self
+                .session_since_last_episode_is_owner_only(&session_id)
+                .await?
+            {
+                continue;
+            }
             // Fetch messages since the latest episode (or all if none)
             let messages = self
                 .fetch_session_messages_since_last_episode(&session_id, 100)
@@ -1640,6 +1779,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         .await?;
 
         for session_id in session_ids {
+            if !self
+                .session_since_last_episode_is_owner_only(&session_id)
+                .await?
+            {
+                continue;
+            }
             let messages = self
                 .fetch_session_messages_since_last_episode(&session_id, 100)
                 .await?;
@@ -1746,6 +1891,9 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         let one_day_ago = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
 
         let recent_messages = self.fetch_messages_since(&one_day_ago, 500).await?;
+        let owner_user_messages = self
+            .fetch_owner_user_messages_since(&one_day_ago, 500)
+            .await?;
 
         if recent_messages.is_empty() {
             return Ok(());
@@ -1758,8 +1906,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         }
 
         // Update communication style profile
-        let _profile = self.analyze_communication_style(&recent_messages).await?;
-        info!("Updated user communication profile");
+        if !owner_user_messages.is_empty() {
+            let _profile = self
+                .analyze_communication_style(&owner_user_messages)
+                .await?;
+            info!("Updated user communication profile");
+        }
 
         Ok(())
     }
@@ -1848,6 +2000,59 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                 Ok(v) => v,
                 Err(_) => continue,
             };
+
+            if let Some(turn) = crate::events::turn_from_event(
+                event_id,
+                &session_id,
+                &event_type,
+                &data,
+                created_at,
+            ) {
+                let mut msg = turn.clone().into_message();
+                msg.importance = crate::memory::scoring::score_turn(&turn);
+                messages.push(msg);
+            }
+        }
+
+        Ok(messages)
+    }
+
+    async fn fetch_owner_user_messages_since(
+        &self,
+        since: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
+        let rows = sqlx::query(
+            "SELECT id, session_id, event_type, data, created_at
+             FROM events
+             WHERE created_at >= ?
+               AND event_type = 'user_message'
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(since)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_id: i64 = row.get("id");
+            let session_id: String = row.get("session_id");
+            let event_type: String = row.get("event_type");
+            let created_str: String = row.get("created_at");
+            let created_at = DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let data_raw: String = row.get("data");
+            let data: serde_json::Value = match serde_json::from_str(&data_raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if !Self::parse_event_user_role(&data).is_some_and(UserRole::can_persist_owner_memory) {
+                continue;
+            }
 
             if let Some(turn) = crate::events::turn_from_event(
                 event_id,
@@ -1970,6 +2175,7 @@ mod tests {
             "content": "hello world",
             "message_id": msg_id,
             "has_attachments": false,
+            "user_role": "owner",
             "channel_visibility": "public_external",
             "channel_id": "twitter:ext_999",
             "platform": "twitter",
@@ -2019,6 +2225,206 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cnt, 0);
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_skips_non_owner_sessions() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let store = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                consolidated_at TEXT,
+                task_id TEXT,
+                tool_name TEXT
+            )
+            "#,
+        )
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        let session_id = "slack:D_non_owner";
+        let user_data = serde_json::json!({
+            "content": "My name is Aracely",
+            "message_id": "msg-1",
+            "has_attachments": false,
+            "user_role": "public",
+            "channel_visibility": "private",
+            "channel_id": "slack:D_non_owner",
+            "platform": "slack",
+        });
+        let assistant_data = serde_json::json!({
+            "message_id": "msg-2",
+            "content": "Nice to meet you."
+        });
+
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind("user_message")
+        .bind(user_data.to_string())
+        .bind((Utc::now() - chrono::Duration::hours(2)).to_rfc3339())
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind("assistant_response")
+        .bind(assistant_data.to_string())
+        .bind((Utc::now() - chrono::Duration::hours(2) + chrono::Duration::seconds(5)).to_rfc3339())
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        let provider = Arc::new(MockProvider::new());
+        let llm_runtime = SharedLlmRuntime::new(
+            provider.clone(),
+            None,
+            ProviderKind::OpenaiCompatible,
+            "mock".to_string(),
+        );
+        let mgr = MemoryManager::new(
+            store.pool(),
+            embedding_service,
+            llm_runtime,
+            Duration::from_secs(60),
+            None,
+        )
+        .with_state(store.clone());
+
+        mgr.consolidate_memories().await.unwrap();
+
+        assert_eq!(provider.call_count().await, 0);
+
+        let cursor = store
+            .get_setting(&format!("memory_fact_consolidation_cursor:{}", session_id))
+            .await
+            .unwrap();
+        assert!(cursor.is_some());
+
+        let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM facts")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+        assert_eq!(cnt, 0);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_owner_user_messages_since_filters_non_owner_messages() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let store = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                consolidated_at TEXT,
+                task_id TEXT,
+                tool_name TEXT
+            )
+            "#,
+        )
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        let owner_data = serde_json::json!({
+            "content": "Please keep responses short.",
+            "message_id": "owner-msg",
+            "has_attachments": false,
+            "user_role": "owner"
+        });
+        let public_data = serde_json::json!({
+            "content": "I like pirate responses.",
+            "message_id": "public-msg",
+            "has_attachments": false,
+            "user_role": "public"
+        });
+
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind("owner-session")
+        .bind("user_message")
+        .bind(owner_data.to_string())
+        .bind((Utc::now() - chrono::Duration::minutes(10)).to_rfc3339())
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind("public-session")
+        .bind("user_message")
+        .bind(public_data.to_string())
+        .bind((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339())
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+        let provider = Arc::new(MockProvider::new());
+        let llm_runtime = SharedLlmRuntime::new(
+            provider,
+            None,
+            ProviderKind::OpenaiCompatible,
+            "mock".to_string(),
+        );
+        let mgr = MemoryManager::new(
+            store.pool(),
+            embedding_service,
+            llm_runtime,
+            Duration::from_secs(60),
+            None,
+        )
+        .with_state(store);
+
+        let since = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let messages = mgr
+            .fetch_owner_user_messages_since(&since, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].content.as_deref(),
+            Some("Please keep responses short.")
+        );
     }
 
     #[tokio::test]

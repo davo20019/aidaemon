@@ -52,7 +52,9 @@ pub(super) struct ResponsePhaseCtx<'a> {
     pub completion_progress: &'a mut CompletionProgress,
     pub turn_context: &'a TurnContext,
     pub needs_tools_for_turn: &'a mut bool,
-    pub force_text_response: bool,
+    pub force_text_response: &'a mut bool,
+    pub execution_state: &'a mut ExecutionState,
+    pub validation_state: &'a mut ValidationState,
 }
 
 impl Agent {
@@ -80,6 +82,7 @@ impl Agent {
                 llm_router: ctx.llm_router.clone(),
                 model: &mut *ctx.model,
                 channel_ctx: ctx.channel_ctx.clone(),
+                user_role: ctx.user_role,
                 total_successful_tool_calls: ctx.total_successful_tool_calls,
                 stall_count: &mut *ctx.stall_count,
                 consecutive_clean_iterations: &mut *ctx.consecutive_clean_iterations,
@@ -96,7 +99,9 @@ impl Agent {
                 completion_progress: &mut *ctx.completion_progress,
                 turn_context: ctx.turn_context,
                 needs_tools_for_turn: *ctx.needs_tools_for_turn,
-                force_text_response: ctx.force_text_response,
+                force_text_response: &mut *ctx.force_text_response,
+                execution_state: &mut *ctx.execution_state,
+                validation_state: &mut *ctx.validation_state,
             })
             .await?;
         if let Some(outcome) = completion_outcome {

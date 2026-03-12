@@ -4,13 +4,14 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
+use crate::agent::Agent;
 use crate::config::QueuePolicyConfig;
 use crate::queue_policy::{should_shed_due_to_overload, SessionFairnessBudget};
 use crate::queue_telemetry::{QueuePressure, QueueTelemetry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::traits::Channel;
-use crate::types::{ApprovalKind, ApprovalResponse, MediaMessage};
+use crate::types::{ApprovalKind, ApprovalResponse, MediaKind, MediaMessage};
 
 /// Shared map of session_id → channel name.
 /// Written by channels when they receive incoming messages,
@@ -29,6 +30,7 @@ pub struct ChannelHub {
     session_map: SessionMap,
     queue_telemetry: Option<Arc<QueueTelemetry>>,
     queue_policy: Option<QueuePolicyConfig>,
+    delivery_note_agent: Option<Arc<Agent>>,
     /// Best-effort duplicate suppression for rapid-fire identical messages.
     /// Keyed by session_id.
     last_sent_text: RwLock<HashMap<String, (String, tokio::time::Instant)>>,
@@ -41,6 +43,7 @@ impl ChannelHub {
             session_map,
             queue_telemetry: None,
             queue_policy: None,
+            delivery_note_agent: None,
             last_sent_text: RwLock::new(HashMap::new()),
         }
     }
@@ -53,6 +56,38 @@ impl ChannelHub {
     pub fn with_queue_policy(mut self, queue_policy: QueuePolicyConfig) -> Self {
         self.queue_policy = Some(queue_policy);
         self
+    }
+
+    pub fn with_delivery_note_agent(mut self, agent: Arc<Agent>) -> Self {
+        self.delivery_note_agent = Some(agent);
+        self
+    }
+
+    async fn record_media_delivery_note(&self, media: &MediaMessage) {
+        let Some(agent) = self.delivery_note_agent.as_ref() else {
+            return;
+        };
+        let MediaKind::Document {
+            file_path,
+            filename,
+        } = &media.kind
+        else {
+            return;
+        };
+        let summary = format!(
+            "Delivery note: I sent the attachment {} in chat. Local copy: {}",
+            filename, file_path
+        );
+        if let Err(err) = agent
+            .record_auxiliary_assistant_note(&media.session_id, &summary)
+            .await
+        {
+            warn!(
+                session_id = %media.session_id,
+                error = %err,
+                "Failed to persist outbound media delivery summary"
+            );
+        }
     }
 
     /// Register a new channel dynamically.
@@ -391,6 +426,8 @@ impl ChannelHub {
                     if let Err(e) = channel.send_media(&msg.session_id, &msg).await {
                         had_error = true;
                         warn!("Failed to send media via {}: {}", channel.name(), e);
+                    } else {
+                        self.record_media_delivery_note(&msg).await;
                     }
                 } else {
                     // Channel doesn't support media — send caption as text
@@ -461,7 +498,9 @@ impl ChannelHub {
     pub async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
         if let Some(channel) = self.channel_for_session(session_id).await {
             if channel.capabilities().media {
-                channel.send_media(session_id, media).await
+                channel.send_media(session_id, media).await?;
+                self.record_media_delivery_note(media).await;
+                Ok(())
             } else {
                 channel
                     .send_text(session_id, &format!("[File] {}", media.caption))

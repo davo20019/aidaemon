@@ -295,7 +295,34 @@ pub struct TestHarness {
 ///
 /// Each call creates an isolated database, so tests can run in parallel.
 pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarness> {
-    setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![], None).await
+    setup_test_agent_internal(provider, vec![], None, true, true).await
+}
+
+/// Build a root-mode test agent without forcing executor-mode loop behavior.
+#[allow(dead_code)]
+pub async fn setup_test_agent_root(provider: MockProvider) -> anyhow::Result<TestHarness> {
+    setup_test_agent_internal(provider, vec![], None, false, true).await
+}
+
+/// Build a root-mode test agent with extra tools and an optional per-LLM timeout.
+#[allow(dead_code)]
+pub async fn setup_test_agent_root_with_extra_tools_and_llm_timeout(
+    provider: MockProvider,
+    extra_tools: Vec<Arc<dyn Tool>>,
+    llm_call_timeout_secs: Option<u64>,
+) -> anyhow::Result<TestHarness> {
+    setup_test_agent_internal(provider, extra_tools, llm_call_timeout_secs, false, true).await
+}
+
+/// Build a root-mode test agent with an exact toolset, without the default
+/// SystemInfo/RememberFact tools. Useful for focused policy and tool-surface tests.
+#[allow(dead_code)]
+pub async fn setup_test_agent_root_with_only_tools_and_llm_timeout(
+    provider: MockProvider,
+    tools: Vec<Arc<dyn Tool>>,
+    llm_call_timeout_secs: Option<u64>,
+) -> anyhow::Result<TestHarness> {
+    setup_test_agent_internal(provider, tools, llm_call_timeout_secs, false, false).await
 }
 
 /// Build a test agent with extra tools and an optional per-LLM-call timeout.
@@ -303,6 +330,16 @@ pub async fn setup_test_agent_with_extra_tools_and_llm_timeout(
     provider: MockProvider,
     extra_tools: Vec<Arc<dyn Tool>>,
     llm_call_timeout_secs: Option<u64>,
+) -> anyhow::Result<TestHarness> {
+    setup_test_agent_internal(provider, extra_tools, llm_call_timeout_secs, true, true).await
+}
+
+async fn setup_test_agent_internal(
+    provider: MockProvider,
+    extra_tools: Vec<Arc<dyn Tool>>,
+    llm_call_timeout_secs: Option<u64>,
+    use_test_executor_mode: bool,
+    include_default_tools: bool,
 ) -> anyhow::Result<TestHarness> {
     // Temp file for SQLite (pool needs a real file, not :memory:)
     let db_file = tempfile::NamedTempFile::new()?;
@@ -324,12 +361,16 @@ pub async fn setup_test_agent_with_extra_tools_and_llm_timeout(
     let provider = Arc::new(provider);
 
     // Tools — SystemInfoTool + RememberFactTool (no side effects, no approval)
-    let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SystemInfoTool),
-        Arc::new(RememberFactTool::new(
-            state.clone() as Arc<dyn crate::traits::StateStore>
-        )),
-    ];
+    let mut tools: Vec<Arc<dyn Tool>> = if include_default_tools {
+        vec![
+            Arc::new(SystemInfoTool),
+            Arc::new(RememberFactTool::new(
+                state.clone() as Arc<dyn crate::traits::StateStore>
+            )),
+        ]
+    } else {
+        Vec::new()
+    };
     tools.extend(extra_tools);
 
     // Models config (all tiers point to "mock-model")
@@ -381,9 +422,11 @@ pub async fn setup_test_agent_with_extra_tools_and_llm_timeout(
         None,
     );
 
-    // Set executor mode so integration tests exercise the execution loop directly,
-    // bypassing orchestrator routing and first-pass intent classification.
-    agent.set_test_executor_mode();
+    if use_test_executor_mode {
+        // Set executor mode so integration tests exercise the execution loop directly,
+        // bypassing orchestrator routing and first-pass intent classification.
+        agent.set_test_executor_mode();
+    }
 
     // Channel (not wired to hub — tests call agent.handle_message directly)
     let channel = Arc::new(TestChannel::new());

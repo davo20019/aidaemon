@@ -238,10 +238,8 @@ async fn collect_status_updates(
 }
 
 /// Task token budget auto-extends when the agent is making productive progress.
-/// is_productive requires 8+ successful tool calls. We alternate between
-/// system_info and remember_fact to avoid the repeated-call blocking guard
-/// (which blocks non-exempt tools after 8 calls) while accumulating enough
-/// successful calls to pass the is_productive threshold.
+/// This long-run case still verifies the extension path with many successful
+/// calls and mixed tools.
 #[tokio::test]
 async fn test_task_budget_auto_extends_on_progress() {
     let provider = MockProvider::with_responses(vec![
@@ -323,6 +321,69 @@ async fn test_task_budget_auto_extends_on_progress() {
     }
 }
 
+/// Short productive runs should also auto-extend once they have concrete
+/// multi-step progress, instead of requiring a long tool streak.
+#[tokio::test]
+async fn test_task_budget_auto_extends_on_short_productive_run() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", r#"{"verbose": true}"#),
+        MockProvider::tool_call_response("system_info", r#"{"check": "os"}"#),
+        MockProvider::text_response("Short task completed."),
+    ]);
+
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    harness.agent.set_test_executor_mode();
+    // 4 LLM calls × 15 tokens = 60; the fourth response should hit the budget
+    // after three successful tool calls and trigger an auto-extension.
+    harness.agent.set_test_task_token_budget(Some(60));
+
+    let response = harness
+        .agent
+        .handle_message(
+            "short_budget_test",
+            "Run a short multi-step check",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Short task completed.");
+}
+
+#[tokio::test]
+async fn test_global_daily_budget_auto_extends_on_short_productive_run() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("system_info", r#"{"verbose": true}"#),
+        MockProvider::tool_call_response("system_info", r#"{"check": "os"}"#),
+        MockProvider::tool_call_response("system_info", r#"{"check": "mem"}"#),
+        MockProvider::text_response("Daily budget task completed."),
+    ]);
+
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    harness.agent.set_test_executor_mode();
+    harness.agent.set_test_daily_token_budget(Some(60));
+
+    let response = harness
+        .agent
+        .handle_message(
+            "daily_budget_test",
+            "Run a short multi-step check against the daily budget",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Daily budget task completed.");
+}
+
 /// Task token budget stops execution when progress is not productive (stalling).
 /// Script: same tool with same args → stall detection → is_productive=false → stops.
 #[tokio::test]
@@ -373,9 +434,8 @@ async fn test_task_budget_stops_when_not_productive() {
     );
 }
 
-/// Non-scheduled goals keep the stricter productivity threshold for automatic
-/// goal-budget extension. Low-call runs should still stop at the budget, and
-/// the DB budget must not be ratcheted upward.
+/// Non-scheduled goals should auto-extend when the run has already made
+/// concrete progress, without persisting the temporary extension to SQLite.
 #[tokio::test]
 async fn test_goal_budget_auto_extends_and_persists() {
     let provider = MockProvider::with_responses(vec![
@@ -384,7 +444,6 @@ async fn test_goal_budget_auto_extends_and_persists() {
         MockProvider::tool_call_response("system_info", r#"{"verbose": true}"#),
         MockProvider::tool_call_response("system_info", r#"{"check": "os"}"#),
         MockProvider::tool_call_response("system_info", r#"{"check": "mem"}"#),
-        // Call 5: won't be reached — budget stops execution with only 3 successful calls
         MockProvider::text_response("Goal task completed."),
     ]);
 
@@ -415,14 +474,9 @@ async fn test_goal_budget_auto_extends_and_persists() {
         .await
         .unwrap();
 
-    // With only 3 successful tool calls, is_productive returns false → budget stops execution
-    assert!(
-        response.contains("daily processing budget"),
-        "Expected budget-exceeded message, got: {}",
-        response
-    );
+    assert_eq!(response, "Goal task completed.");
 
-    // Verify the budget was NOT persisted/inflated in the database
+    // Verify the DB budget was NOT persisted/inflated; runtime extensions are in-memory only.
     let updated_goal = harness.state.get_goal(&goal.id).await.unwrap().unwrap();
     assert_eq!(
         updated_goal.budget_daily.unwrap(),
@@ -890,9 +944,44 @@ async fn test_scheduled_goal_run_budget_stops_unproductive_run() {
 #[tokio::test]
 async fn test_scheduled_goal_run_budget_resets_between_runs() {
     let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("no_such_tool", "{}"),
-        MockProvider::text_response("Should not reach the first run."),
-        MockProvider::text_response("Second scheduled run completed."),
+        crate::traits::ProviderResponse {
+            content: None,
+            tool_calls: vec![crate::traits::ToolCall {
+                id: format!("call_{}", uuid::Uuid::new_v4()),
+                name: "no_such_tool".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        crate::traits::ProviderResponse {
+            content: Some("Should not reach the first run.".to_string()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
+        crate::traits::ProviderResponse {
+            content: Some("Second scheduled run completed.".to_string()),
+            tool_calls: vec![],
+            usage: Some(crate::traits::TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                model: "mock".to_string(),
+            }),
+            thinking: None,
+            response_note: None,
+        },
     ]);
 
     let mut harness = setup_test_agent(provider).await.unwrap();
@@ -1094,6 +1183,14 @@ async fn test_scheduled_goal_restores_run_state_after_restart_like_resume() {
             effective_budget_per_check: 20,
             tokens_used: 15,
             budget_extensions_count: 0,
+            health: crate::traits::ScheduledRunHealth {
+                evidence_gain_count: 0,
+                total_successful_tool_calls: 0,
+                stall_count: 0,
+                consecutive_same_tool_count: 0,
+                consecutive_same_tool_unique_args: 0,
+                unrecovered_error_count: 1,
+            },
             created_at: now.clone(),
             updated_at: now,
         })

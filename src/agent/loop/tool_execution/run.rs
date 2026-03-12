@@ -2,12 +2,13 @@ use super::budget_blocking::{DuplicateSendFileNoopCtx, ToolBlockKind, ToolBudget
 use super::execution_io::ToolExecutionIoCtx;
 use super::guards::LoopPatternGuardOutcome;
 use super::project_dir::{
-    extract_project_dir_hint_with_aliases, extract_project_dirs_from_tool_args,
-    is_file_recheck_tool, is_recognized_project_root, maybe_inject_project_dir_into_tool_args,
-    project_dir_from_tool_args, scope_allows_project_dir, tool_call_includes_project_path,
+    extract_project_dir_hint_with_aliases, is_file_recheck_tool, is_recognized_project_root,
+    maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args, scope_allows_project_dir,
+    tool_call_includes_project_path,
 };
 use super::result_learning::{ResultLearningEnv, ResultLearningState};
 use super::types::{ToolExecutionCtx, ToolExecutionOutcome};
+use crate::agent::execution_state::{extract_target_hints_from_arguments, StepExecutionPlan};
 use crate::agent::recall_guardrails::is_personal_memory_tool;
 use crate::agent::*;
 use crate::traits::{ToolCallSemantics, ToolTargetHint, ToolTargetHintKind};
@@ -88,12 +89,52 @@ If they asked about scheduled-goal runs, first get IDs with \
     }
 }
 
+fn manage_memories_missing_goal_id_violation(
+    raw_arguments: &str,
+) -> Option<DeterministicToolContractViolation> {
+    const ACTIONS_REQUIRING_GOAL_ID: &[&str] = &[
+        "add_schedule",
+        "cancel_scheduled",
+        "pause_scheduled",
+        "resume_scheduled",
+        "retry_scheduled",
+        "diagnose_scheduled",
+    ];
+
+    let parsed = serde_json::from_str::<Value>(raw_arguments).ok()?;
+    let map = parsed.as_object()?;
+    let action = map.get("action").and_then(|v| v.as_str())?;
+    if !ACTIONS_REQUIRING_GOAL_ID.contains(&action) {
+        return None;
+    }
+
+    let has_goal_id = map
+        .get("goal_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| !v.trim().is_empty());
+    if has_goal_id {
+        return None;
+    }
+
+    Some(DeterministicToolContractViolation {
+        reason: format!(
+            "action `{}` requires `goal_id` for `manage_memories`",
+            action
+        ),
+        coaching: "If the user asked about scheduled goals, first get IDs with \
+`manage_memories(action='list_scheduled')`, then retry the intended \
+`manage_memories` action with a concrete `goal_id`."
+            .to_string(),
+    })
+}
+
 fn deterministic_tool_contract_violation(
     tool_name: &str,
     raw_arguments: &str,
 ) -> Option<DeterministicToolContractViolation> {
     match tool_name {
         "scheduled_goal_runs" => scheduled_goal_runs_missing_goal_id_violation(raw_arguments),
+        "manage_memories" => manage_memories_missing_goal_id_violation(raw_arguments),
         _ => None,
     }
 }
@@ -126,55 +167,93 @@ Use API/auth tools directly, or ask explicitly for local file or repository insp
     )
 }
 
-fn project_scope_violation_for_tool_call(
+fn allow_scaffold_parent_dir_for_target(
+    tool_name: &str,
+    allowed_target: &ToolTargetHint,
+    candidate_target: &ToolTargetHint,
+) -> bool {
+    if tool_name != "run_command" {
+        return false;
+    }
+    let Some(scope_path) = crate::tools::fs_utils::validate_path(&allowed_target.value).ok() else {
+        return false;
+    };
+    if scope_path.is_dir() {
+        return false;
+    }
+    let Some(candidate_path) = crate::tools::fs_utils::validate_path(&candidate_target.value).ok()
+    else {
+        return false;
+    };
+    scope_path
+        .parent()
+        .is_some_and(|parent| parent.is_dir() && candidate_path == parent)
+}
+
+fn target_hint_allowed_for_step(
+    tool_name: &str,
+    allowed_target: &ToolTargetHint,
+    candidate_target: &ToolTargetHint,
+) -> bool {
+    match (&allowed_target.kind, &candidate_target.kind) {
+        (ToolTargetHintKind::Url, ToolTargetHintKind::Url) => allowed_target
+            .value
+            .eq_ignore_ascii_case(&candidate_target.value),
+        (
+            ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope,
+            ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope,
+        ) => {
+            allowed_target.value == candidate_target.value
+                || scope_allows_project_dir(&allowed_target.value, &candidate_target.value)
+                || allow_scaffold_parent_dir_for_target(tool_name, allowed_target, candidate_target)
+                || is_recognized_project_root(&candidate_target.value)
+        }
+        _ => false,
+    }
+}
+
+fn target_scope_violation_for_tool_call(
     tool_name: &str,
     effective_arguments: &str,
-    allowed_scope: Option<&str>,
-    allow_multi_project_scope: bool,
+    step_plan: &StepExecutionPlan,
 ) -> Option<String> {
-    if allow_multi_project_scope {
+    if !step_plan.target_scope.hard_fail_outside_scope
+        || step_plan.target_scope.allowed_targets.is_empty()
+    {
         return None;
     }
 
-    let allowed_scope = allowed_scope?;
-    let candidate_dirs = extract_project_dirs_from_tool_args(tool_name, effective_arguments);
-    if candidate_dirs.is_empty() {
+    let candidate_targets = extract_target_hints_from_arguments(effective_arguments);
+    if candidate_targets.is_empty() {
         return None;
     }
 
-    let allow_scaffold_parent_dir = |candidate: &str| -> bool {
-        if tool_name != "run_command" {
-            return false;
-        }
-        let Some(scope_path) = crate::tools::fs_utils::validate_path(allowed_scope).ok() else {
-            return false;
-        };
-        if scope_path.is_dir() {
-            return false;
-        }
-        let Some(candidate_path) = crate::tools::fs_utils::validate_path(candidate).ok() else {
-            return false;
-        };
-        scope_path
-            .parent()
-            .is_some_and(|parent| parent.is_dir() && candidate_path == parent)
-    };
-
-    let violations: Vec<String> = candidate_dirs
+    let violations: Vec<String> = candidate_targets
         .iter()
-        .filter(|dir| {
-            !scope_allows_project_dir(allowed_scope, dir)
-                && !allow_scaffold_parent_dir(dir)
-                && !is_recognized_project_root(dir)
+        .filter(|candidate_target| {
+            !step_plan
+                .target_scope
+                .allowed_targets
+                .iter()
+                .any(|allowed_target| {
+                    target_hint_allowed_for_step(tool_name, allowed_target, candidate_target)
+                })
         })
-        .cloned()
+        .map(|target| target.value.clone())
         .collect();
     if violations.is_empty() {
         None
     } else {
+        let allowed_targets = step_plan
+            .target_scope
+            .allowed_targets
+            .iter()
+            .map(|target| target.value.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         Some(format!(
-            "project scope lock violation (allowed scope `{}`, requested path(s): {})",
-            allowed_scope,
+            "target scope lock violation (allowed target(s): {}, requested target(s): {})",
+            allowed_targets,
             violations.join(", ")
         ))
     }
@@ -451,6 +530,7 @@ impl Agent {
         let task_tokens_used = ctx.task_tokens_used;
         let _user_text = ctx.user_text;
         let restrict_to_personal_memory_tools = ctx.restrict_to_personal_memory_tools;
+        let active_skill_names = ctx.active_skill_names;
         let active_untrusted_external_reference_skills =
             ctx.active_untrusted_external_reference_skills;
         let restrict_untrusted_external_reference_tools =
@@ -466,6 +546,8 @@ impl Agent {
         let heartbeat = ctx.heartbeat;
         let turn_context = ctx.turn_context;
         let resolved_goal_id = ctx.resolved_goal_id;
+        let evidence_state = &mut *ctx.evidence_state;
+        let validation_state = &mut *ctx.validation_state;
 
         let mut tool_defs = std::mem::take(ctx.tool_defs);
         let mut total_tool_calls_attempted = *ctx.total_tool_calls_attempted;
@@ -480,6 +562,9 @@ impl Agent {
         let mut no_evidence_tools_seen = std::mem::take(ctx.no_evidence_tools_seen);
         let mut evidence_gain_count = *ctx.evidence_gain_count;
         let mut pending_error_solution_ids = std::mem::take(ctx.pending_error_solution_ids);
+        let mut tool_error_history = std::mem::take(ctx.tool_error_history);
+        let mut reflection_completed = std::mem::take(ctx.reflection_completed);
+        let mut pending_reflection_recoveries = std::mem::take(ctx.pending_reflection_recoveries);
         let mut tool_failure_patterns = std::mem::take(ctx.tool_failure_patterns);
         let mut last_tool_failure = std::mem::take(ctx.last_tool_failure);
         let mut in_session_learned = std::mem::take(ctx.in_session_learned);
@@ -506,6 +591,7 @@ impl Agent {
         let mut require_file_recheck_before_answer = *ctx.require_file_recheck_before_answer;
         let mut completion_progress = ctx.completion_progress.clone();
         let mut tool_result_cache = std::mem::take(ctx.tool_result_cache);
+        let execution_state = &mut *ctx.execution_state;
 
         macro_rules! commit_state {
             () => {
@@ -522,6 +608,9 @@ impl Agent {
                 *ctx.no_evidence_tools_seen = no_evidence_tools_seen;
                 *ctx.evidence_gain_count = evidence_gain_count;
                 *ctx.pending_error_solution_ids = pending_error_solution_ids;
+                *ctx.tool_error_history = tool_error_history;
+                *ctx.reflection_completed = reflection_completed;
+                *ctx.pending_reflection_recoveries = pending_reflection_recoveries;
                 *ctx.tool_failure_patterns = tool_failure_patterns;
                 *ctx.last_tool_failure = last_tool_failure;
                 *ctx.in_session_learned = in_session_learned;
@@ -564,7 +653,34 @@ impl Agent {
             total_successful_tool_calls,
             "Tool execution phase starting"
         );
+        super::result_learning::expire_stale_pending_reflection_recoveries(
+            &mut pending_reflection_recoveries,
+            iteration,
+        );
         for tc in &resp.tool_calls {
+            if let Some(limit) =
+                execution_state.exhausted_limit(task_tokens_used, task_start.elapsed())
+            {
+                force_text_response = true;
+                self.emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::ExecutionStateSnapshot,
+                    format!(
+                        "Stopped additional tool execution because {} is exhausted",
+                        limit.as_str()
+                    ),
+                    json!({
+                        "condition": "execution_budget_exhausted_mid_iteration",
+                        "budget_limit": limit,
+                        "execution_state": execution_state.clone(),
+                        "next_tool_blocked": tc.name,
+                    }),
+                )
+                .await;
+                break;
+            }
             let policy_tool_budget = policy_bundle.policy.tool_budget;
             if self.policy_config.policy_enforce
                 && is_hard_policy_tool_budget_reached(
@@ -799,17 +915,62 @@ impl Agent {
 
             let internal_scope_violation =
                 raw_internal_scope_violation(&tc.arguments, session_id, resolved_goal_id);
-            let allowed_project_scope = turn_context
-                .primary_project_scope
-                .as_deref()
-                .or(known_project_dir.as_deref());
-            let project_scope_violation = project_scope_violation_for_tool_call(
+            let allowed_project_scope = (!turn_context.allow_multi_project_scope)
+                .then_some(
+                    turn_context
+                        .primary_project_scope
+                        .as_deref()
+                        .or(known_project_dir.as_deref()),
+                )
+                .flatten();
+            let call_semantics = self
+                .tools
+                .iter()
+                .find(|tool| tool.name() == tc.name && tool.is_available())
+                .map(|tool| tool.call_semantics(&effective_arguments))
+                .unwrap_or_default();
+            let tool_caps = available_capabilities
+                .get(&tc.name)
+                .copied()
+                .unwrap_or_default();
+            let step_plan = compile_step_execution_plan(
+                &execution_state.execution_id,
+                execution_state.current_plan_version.unwrap_or(1),
+                iteration,
+                &tc.id,
                 &tc.name,
                 &effective_arguments,
+                &call_semantics,
+                tool_caps,
                 allowed_project_scope,
-                turn_context.allow_multi_project_scope,
             );
-            if let Some(scope_reason) = internal_scope_violation.or(project_scope_violation) {
+            execution_state.begin_step(step_plan.clone());
+            if matches!(
+                step_plan.approval_requirement,
+                ApprovalRequirement::Required { .. }
+            ) || call_semantics.mutates_state()
+                || tool_caps.external_side_effect
+            {
+                execution_state.promote_persistence(ExecutionPersistence::Durable);
+            }
+            execution_state.mark_persisted_now();
+            self.emit_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                DecisionType::ExecutionStateSnapshot,
+                format!("Compiled execution step for {}", tc.name),
+                json!({
+                    "condition": "step_compiled",
+                    "execution_id": execution_state.execution_id,
+                    "current_step": step_plan,
+                    "execution_state": execution_state.clone(),
+                }),
+            )
+            .await;
+            let step_scope_violation =
+                target_scope_violation_for_tool_call(&tc.name, &effective_arguments, &step_plan);
+            if let Some(scope_reason) = internal_scope_violation.or(step_scope_violation) {
                 POLICY_METRICS
                     .cross_scope_blocked_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -840,10 +1001,48 @@ impl Agent {
                     Some(task_id),
                 )
                 .await?;
+                validation_state.record_failure(ValidationFailure::ScopeViolation);
+                validation_state.note_replan();
+                learning_ctx.record_replay_note(
+                    ReplayNoteCategory::ValidationFailure,
+                    "target_scope_violation",
+                    format!(
+                        "Blocked {} because the requested target fell outside the compiled step scope.",
+                        tc.name
+                    ),
+                    true,
+                );
+                learning_ctx.record_replay_note(
+                    ReplayNoteCategory::RetryReason,
+                    "replan_required",
+                    format!(
+                        "Replanned because {} attempted to act outside the allowed target scope.",
+                        tc.name
+                    ),
+                    true,
+                );
                 pending_system_messages.push(SystemDirective::ScopeLockBlocked {
                     tool_name: tc.name.clone(),
                     reason: scope_reason,
                 });
+                self.emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::ExecutionFailureClassification,
+                    format!("Classified scope violation for {}", tc.name),
+                    json!({
+                        "condition": "target_scope_violation",
+                        "tool": tc.name,
+                        "execution_failure_kind": ExecutionFailureKind::LogicFailure,
+                        "failure_class": "semantic",
+                        "key_error_line": "scope violation",
+                        "loop_repetition_reason": validation_state.loop_repetition_reason,
+                    }),
+                )
+                .await;
+                execution_state.complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
+                execution_state.mark_persisted_now();
                 iteration_had_tool_failures = true;
                 continue;
             }
@@ -883,6 +1082,42 @@ impl Agent {
                     reason: contract_violation.reason.to_string(),
                     coaching: contract_violation.coaching.to_string(),
                 });
+                learning_ctx.record_replay_note(
+                    ReplayNoteCategory::ValidationFailure,
+                    "tool_contract_violation",
+                    format!(
+                        "Blocked {} because its arguments violated a deterministic contract: {}.",
+                        tc.name, contract_violation.reason
+                    ),
+                    true,
+                );
+                learning_ctx.record_replay_note(
+                    ReplayNoteCategory::RetryReason,
+                    "retry_step",
+                    format!(
+                        "Retried locally after deterministic contract failure on {}.",
+                        tc.name
+                    ),
+                    true,
+                );
+                self.emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::ExecutionFailureClassification,
+                    format!("Classified deterministic contract failure for {}", tc.name),
+                    json!({
+                        "condition": "tool_contract_violation",
+                        "tool": tc.name,
+                        "execution_failure_kind": ExecutionFailureKind::ToolContractFailure,
+                        "failure_class": "semantic",
+                        "key_error_line": contract_violation.reason,
+                        "loop_repetition_reason": "retry_step",
+                    }),
+                )
+                .await;
+                execution_state.complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
+                execution_state.mark_persisted_now();
                 iteration_had_tool_failures = true;
                 continue;
             }
@@ -982,6 +1217,10 @@ impl Agent {
                     tc,
                     &ToolExecutionIoCtx {
                         effective_arguments: &effective_arguments,
+                        idempotency_key: execution_state
+                            .current_step
+                            .as_ref()
+                            .and_then(|step| step.idempotency_key.as_deref()),
                         injected_project_dir: injected_project_dir.as_deref(),
                         project_scope: allowed_project_scope,
                         session_id,
@@ -995,6 +1234,8 @@ impl Agent {
                     },
                 )
                 .await;
+            execution_state.record_tool_call();
+            execution_state.mark_persisted_now();
             let mut result_text = io.result_text;
             let mut tool_duration_ms = io.tool_duration_ms;
             let mut result_metadata = io.result_metadata;
@@ -1122,16 +1363,102 @@ impl Agent {
                 Some(&effective_arguments),
                 Some(&result_metadata),
             );
+            let execution_failure_kind = classify_execution_failure_kind(
+                &tc.name,
+                &result_text,
+                Some(&effective_arguments),
+                Some(&result_metadata),
+                false,
+            );
             let is_error = failure_class.is_some();
+            execution_state.complete_current_step(classify_step_execution_outcome(
+                is_error,
+                background_detached,
+            ));
+            execution_state.mark_persisted_now();
+            match execution_failure_kind {
+                Some(ExecutionFailureKind::ToolContractFailure)
+                | Some(ExecutionFailureKind::ToolInvocationFailure) => {
+                    validation_state.note_retry(LoopRepetitionReason::RetryStep);
+                    learning_ctx.record_replay_note(
+                        ReplayNoteCategory::RetryReason,
+                        "retry_step",
+                        format!(
+                            "Retried {} locally after {:?}.",
+                            tc.name, execution_failure_kind
+                        ),
+                        true,
+                    );
+                }
+                Some(ExecutionFailureKind::EnvironmentFailure)
+                | Some(ExecutionFailureKind::LogicFailure) => {
+                    validation_state.note_replan();
+                    learning_ctx.record_replay_note(
+                        ReplayNoteCategory::RetryReason,
+                        "replan_required",
+                        format!(
+                            "Replanned after {:?} on {}.",
+                            execution_failure_kind, tc.name
+                        ),
+                        true,
+                    );
+                }
+                None => {
+                    validation_state.clear_loop_repetition_reason();
+                }
+            }
+            self.emit_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                DecisionType::ExecutionStateSnapshot,
+                format!("Recorded step outcome for {}", tc.name),
+                json!({
+                    "condition": "step_completed",
+                    "tool": tc.name,
+                    "outcome": execution_state.last_outcome,
+                    "execution_state": execution_state.clone(),
+                    "background_detached": background_detached,
+                    "is_error": is_error,
+                }),
+            )
+            .await;
             info!(
                 session_id,
                 iteration,
                 tool = %tc.name,
                 is_error,
+                execution_failure_kind = ?execution_failure_kind,
                 result_len = result_text.len(),
                 result_preview = &result_text.chars().take(80).collect::<String>() as &str,
                 "Tool execution completed"
             );
+            if let Some(execution_failure_kind) = execution_failure_kind {
+                self.emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::ExecutionFailureClassification,
+                    format!("Classified execution failure for {}", tc.name),
+                    json!({
+                        "condition": match execution_failure_kind {
+                            ExecutionFailureKind::ToolContractFailure => "tool_contract_failure",
+                            ExecutionFailureKind::ToolInvocationFailure => "tool_invocation_failure",
+                            ExecutionFailureKind::EnvironmentFailure => "environment_failure",
+                            ExecutionFailureKind::LogicFailure => "logic_failure",
+                        },
+                        "tool": tc.name,
+                        "execution_failure_kind": execution_failure_kind,
+                        "failure_class": failure_class.map(|class| match class {
+                            ToolFailureClass::Semantic => "semantic",
+                            ToolFailureClass::Transient => "transient",
+                        }),
+                        "key_error_line": extract_key_error_line(&result_text),
+                        "loop_repetition_reason": validation_state.loop_repetition_reason,
+                    }),
+                )
+                .await;
+            }
 
             let learning_env = ResultLearningEnv {
                 attempted_required_file_recheck,
@@ -1143,6 +1470,7 @@ impl Agent {
                 emitter,
                 task_start,
                 iteration,
+                tool_arguments: &effective_arguments,
                 tool_summary: &tool_summary,
             };
             let mut learning_state = ResultLearningState {
@@ -1157,6 +1485,8 @@ impl Agent {
                 tool_transient_failure_count: &mut tool_transient_failure_count,
                 tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
                 pending_error_solution_ids: &mut pending_error_solution_ids,
+                tool_error_history: &mut tool_error_history,
+                pending_reflection_recoveries: &mut pending_reflection_recoveries,
                 tool_failure_patterns: &mut tool_failure_patterns,
                 last_tool_failure: &mut last_tool_failure,
                 in_session_learned: &mut in_session_learned,
@@ -1176,19 +1506,56 @@ impl Agent {
                     &mut dirs_with_project_inspect_file_evidence,
                 dirs_with_search_no_matches: &mut dirs_with_search_no_matches,
             };
-            if let Some(outcome) = self
+            let learning_outcome = self
                 .apply_result_learning(
                     tc,
                     &mut result_text,
                     is_error,
                     failure_class,
+                    execution_failure_kind,
                     &learning_env,
                     &mut learning_state,
                 )
-                .await?
-            {
+                .await?;
+            if let Some(outcome) = learning_outcome.control_flow {
                 commit_state!();
                 return Ok(outcome);
+            }
+            if let Some(failure) = learning_outcome.semantic_failure.as_ref() {
+                if let Some(diagnosis) = self
+                    .maybe_trigger_reflection(
+                        &tc.name,
+                        &effective_arguments,
+                        failure,
+                        _user_text,
+                        active_skill_names,
+                        &tool_error_history,
+                        &mut reflection_completed,
+                        session_id,
+                    )
+                    .await
+                {
+                    let failure_key = (tc.name.clone(), failure.signature.clone());
+                    pending_system_messages.push(SystemDirective::ReflectionDiagnosis {
+                        tool_name: tc.name.clone(),
+                        root_cause: diagnosis.root_cause.clone(),
+                        recommended_action: diagnosis.recommended_action.clone(),
+                    });
+                    if let Some(draft) = diagnosis.learning {
+                        if let Some(solution_id) =
+                            super::reflection::store_reflection_learning(&self.state, draft).await
+                        {
+                            pending_reflection_recoveries.insert(
+                                tc.name.clone(),
+                                super::reflection::PendingReflectionRecovery {
+                                    signature: failure_key.1,
+                                    solution_ids: vec![solution_id],
+                                    verify_on_iteration: iteration.saturating_add(1),
+                                },
+                            );
+                        }
+                    }
+                }
             }
 
             if !is_error {
@@ -1204,6 +1571,24 @@ impl Agent {
                     .copied()
                     .unwrap_or_default();
                 let semantics = &result_metadata.semantics;
+                let evidence_count_before = evidence_state.records.len();
+                record_successful_tool_evidence(
+                    evidence_state,
+                    &tc.name,
+                    &effective_arguments,
+                    semantics,
+                );
+                let action_target = step_plan
+                    .expected_targets
+                    .first()
+                    .or_else(|| step_plan.target_scope.allowed_targets.first())
+                    .map(|target| target.value.clone());
+                validation_state.record_action(
+                    Some(&tc.name),
+                    action_target,
+                    evidence_state.records.len() > evidence_count_before,
+                );
+                validation_state.clear_loop_repetition_reason();
                 if semantics.mutates_state() {
                     completion_progress.mark_mutation(&turn_context.completion_contract);
                 }
@@ -1233,6 +1618,12 @@ impl Agent {
                 }
             } else {
                 pending_external_action_ack = None;
+                if matches!(
+                    execution_state.last_outcome,
+                    Some(StepExecutionOutcome::NonrecoverableFailure)
+                ) {
+                    validation_state.record_failure(ValidationFailure::NonrecoverableFailure);
+                }
             }
 
             let tool_msg = Message {
@@ -1401,6 +1792,8 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::execution_state::RetryPolicy;
+    use crate::traits::ToolCallEffect;
 
     #[test]
     fn internal_scope_violation_detects_session_mismatch() {
@@ -1434,6 +1827,23 @@ mod tests {
     fn deterministic_tool_contract_violation_allows_scheduled_goal_runs_with_goal_id() {
         let args = r#"{"action":"run_history","goal_id":"goal-123"}"#;
         let violation = deterministic_tool_contract_violation("scheduled_goal_runs", args);
+        assert!(violation.is_none());
+    }
+
+    #[test]
+    fn deterministic_tool_contract_violation_blocks_manage_memories_without_goal_id() {
+        let args = r#"{"action":"diagnose_scheduled"}"#;
+        let violation = deterministic_tool_contract_violation("manage_memories", args);
+        assert!(violation.is_some());
+        let violation = violation.expect("violation expected");
+        assert!(violation.reason.contains("requires `goal_id`"));
+        assert!(violation.coaching.contains("list_scheduled"));
+    }
+
+    #[test]
+    fn deterministic_tool_contract_violation_allows_manage_memories_with_goal_id() {
+        let args = r#"{"action":"diagnose_scheduled","goal_id":"goal-123"}"#;
+        let violation = deterministic_tool_contract_violation("manage_memories", args);
         assert!(violation.is_none());
     }
 
@@ -1507,26 +1917,60 @@ mod tests {
     }
 
     #[test]
-    fn project_scope_violation_flags_out_of_scope_path() {
-        let args = r#"{"path":"/tmp/project-b/src"}"#;
-        let violation = project_scope_violation_for_tool_call(
-            "search_files",
-            args,
-            Some("/tmp/project-a"),
-            false,
-        );
+    fn target_scope_violation_flags_out_of_scope_mutation_path() {
+        let step_plan = StepExecutionPlan {
+            step_id: "step-1".to_string(),
+            description: "Edit a scoped file".to_string(),
+            plan_version: 1,
+            primary_tool: Some("edit_file".to_string()),
+            expected_effect: ToolCallEffect::Mutation,
+            target_scope: TargetScope {
+                allowed_targets: vec![ToolTargetHint::new(
+                    ToolTargetHintKind::ProjectScope,
+                    "/tmp/project-a",
+                )
+                .expect("scope target")],
+                hard_fail_outside_scope: true,
+            },
+            expected_targets: Vec::new(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                allow_tool_invocation_retry: false,
+            },
+            approval_requirement: ApprovalRequirement::NotNeeded,
+            idempotency_key: None,
+        };
+        let args = r#"{"path":"/tmp/project-b/src/main.rs"}"#;
+        let violation = target_scope_violation_for_tool_call("edit_file", args, &step_plan);
         assert!(violation.is_some());
     }
 
     #[test]
-    fn project_scope_violation_allows_multi_project_requests() {
+    fn target_scope_violation_skips_non_hard_fail_observation_steps() {
+        let step_plan = StepExecutionPlan {
+            step_id: "step-1".to_string(),
+            description: "Inspect a path".to_string(),
+            plan_version: 1,
+            primary_tool: Some("search_files".to_string()),
+            expected_effect: ToolCallEffect::Observation,
+            target_scope: TargetScope {
+                allowed_targets: vec![ToolTargetHint::new(
+                    ToolTargetHintKind::ProjectScope,
+                    "/tmp/project-a",
+                )
+                .expect("scope target")],
+                hard_fail_outside_scope: false,
+            },
+            expected_targets: Vec::new(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                allow_tool_invocation_retry: true,
+            },
+            approval_requirement: ApprovalRequirement::NotNeeded,
+            idempotency_key: None,
+        };
         let args = r#"{"path":"/tmp/project-b/src"}"#;
-        let violation = project_scope_violation_for_tool_call(
-            "search_files",
-            args,
-            Some("/tmp/project-a"),
-            true,
-        );
+        let violation = target_scope_violation_for_tool_call("search_files", args, &step_plan);
         assert!(violation.is_none());
     }
 
@@ -1566,21 +2010,38 @@ mod tests {
     }
 
     #[test]
-    fn project_scope_violation_allows_run_command_parent_dir_for_new_project_scaffolding() {
+    fn target_scope_violation_allows_run_command_parent_dir_for_new_project_scaffolding() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = tmp.path().join("projects");
         std::fs::create_dir_all(&parent).expect("create parent");
         let target = parent.join("new-site");
+        let step_plan = StepExecutionPlan {
+            step_id: "step-1".to_string(),
+            description: "Scaffold a project".to_string(),
+            plan_version: 1,
+            primary_tool: Some("run_command".to_string()),
+            expected_effect: ToolCallEffect::Mutation,
+            target_scope: TargetScope {
+                allowed_targets: vec![ToolTargetHint::new(
+                    ToolTargetHintKind::ProjectScope,
+                    target.to_string_lossy().to_string(),
+                )
+                .expect("scope target")],
+                hard_fail_outside_scope: true,
+            },
+            expected_targets: Vec::new(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                allow_tool_invocation_retry: false,
+            },
+            approval_requirement: ApprovalRequirement::NotNeeded,
+            idempotency_key: None,
+        };
         let args = format!(
             r#"{{"command":"pwd","working_dir":"{}"}}"#,
             parent.to_string_lossy()
         );
-        let violation = project_scope_violation_for_tool_call(
-            "run_command",
-            &args,
-            Some(target.to_string_lossy().as_ref()),
-            false,
-        );
+        let violation = target_scope_violation_for_tool_call("run_command", &args, &step_plan);
         assert!(violation.is_none());
     }
 

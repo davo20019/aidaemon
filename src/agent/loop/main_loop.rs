@@ -4,7 +4,9 @@ use super::message_build_phase::{MessageBuildCtx, MessageBuildData};
 use super::orchestration_phase::OrchestrationCtx;
 use super::response_phase::{ResponsePhaseCtx, ResponsePhaseOutcome};
 use super::stopping_phase::{StoppingPhaseCtx, StoppingPhaseOutcome};
-use super::tool_execution_phase::{ToolExecutionCtx, ToolExecutionOutcome};
+use super::tool_execution_phase::{
+    PendingReflectionRecovery, ToolErrorEntry, ToolExecutionCtx, ToolExecutionOutcome,
+};
 use super::tool_prelude_phase::{ToolPreludeCtx, ToolPreludeOutcome};
 use super::*;
 
@@ -125,6 +127,7 @@ impl Agent {
             is_reaffirmation_challenge_turn,
             requests_external_verification,
             restrict_to_personal_memory_tools,
+            active_skill_names,
             active_untrusted_external_reference_skills,
             restrict_untrusted_external_reference_tools,
             personal_memory_tool_call_cap,
@@ -160,6 +163,51 @@ impl Agent {
             .map(|reason| reason.as_code())
             .collect();
         let mut completion_progress = CompletionProgress::new(&turn_context.completion_contract);
+        let (execution_budget_tier, execution_budget_route, execution_budget) =
+            select_initial_execution_budget(user_text, &turn_context, self.depth, self.role);
+        #[cfg(test)]
+        let execution_budget = self
+            .execution_budget_override
+            .clone()
+            .unwrap_or(execution_budget);
+        let mut execution_state = ExecutionState::new(
+            execution_budget_tier,
+            execution_budget.clone(),
+            if self.depth > 0 || self.task_id.is_some() {
+                ExecutionPersistence::Durable
+            } else {
+                ExecutionPersistence::Ephemeral
+            },
+        );
+        execution_state.mark_persisted_now();
+        self.emit_decision_point(
+            &emitter,
+            &task_id,
+            0,
+            DecisionType::ExecutionBudgetSelection,
+            "Selected initial execution budget tier".to_string(),
+            json!({
+                "condition": "initial_execution_budget_selected",
+                "budget_tier": execution_budget_tier,
+                "route_kind": execution_budget_route,
+                "budget": execution_budget,
+                "persistence": execution_state.persistence,
+                "execution_id": execution_state.execution_id,
+            }),
+        )
+        .await;
+        self.emit_decision_point(
+            &emitter,
+            &task_id,
+            0,
+            DecisionType::ExecutionStateSnapshot,
+            "Initialized execution state snapshot".to_string(),
+            json!({
+                "condition": "execution_state_initialized",
+                "execution_state": execution_state.clone(),
+            }),
+        )
+        .await;
         info!(
             session_id,
             followup_mode,
@@ -187,8 +235,14 @@ impl Agent {
         let mut no_evidence_result_streak: usize = 0;
         let mut no_evidence_tools_seen: HashSet<String> = HashSet::new();
         let mut evidence_gain_count: usize = 0;
+        let mut evidence_state = EvidenceState::default();
+        let mut validation_state = ValidationState::default();
         // Track which error solutions were injected so we can credit them on recovery.
         let mut pending_error_solution_ids: Vec<i64> = Vec::new();
+        let mut tool_error_history: HashMap<(String, String), Vec<ToolErrorEntry>> = HashMap::new();
+        let mut reflection_completed: HashSet<(String, String)> = HashSet::new();
+        let mut pending_reflection_recoveries: HashMap<String, PendingReflectionRecovery> =
+            HashMap::new();
         // In-session error learning: track repeated failures by (tool, normalized error pattern).
         let mut tool_failure_patterns: HashMap<(String, String), usize> = HashMap::new();
         let mut last_tool_failure: Option<(String, String)> = None;
@@ -217,6 +271,16 @@ impl Agent {
         let mut pending_system_messages: Vec<SystemDirective> = Vec::new();
         if route_failsafe_active {
             pending_system_messages.push(SystemDirective::RouteFailsafeActive);
+        }
+        let has_recent_tool_context = turn_context
+            .recent_messages
+            .iter()
+            .any(|row| row.get("role").and_then(|v| v.as_str()) == Some("tool"));
+        if looks_like_evidence_grounding_challenge(user_text)
+            && (turn_context.followup_mode != Some(FollowupMode::NewTask)
+                || has_recent_tool_context)
+        {
+            pending_system_messages.push(SystemDirective::EvidenceGroundingRequired);
         }
         // Track recent tool names for alternating pattern detection (A-B-A-B cycles)
         let mut recent_tool_names: VecDeque<String> = VecDeque::new();
@@ -258,9 +322,13 @@ impl Agent {
         let mut dirs_with_search_no_matches: HashSet<String> = HashSet::new();
         // When true, the assistant must run at least one file re-check before finalizing text.
         let mut require_file_recheck_before_answer = false;
-        // Route fail-safe bypasses normal first-pass routing; seed tools-required
-        // state so text-only completions cannot bypass execution in this mode.
-        let mut needs_tools_for_turn = route_failsafe_active;
+        // Deterministic tool-required state is driven by the request itself, not
+        // by route-drift fail-safe mode. Fail-safe can force a stronger model and
+        // stricter routing posture without turning plain-text tasks into
+        // pseudo-execution tasks.
+        let mut needs_tools_for_turn = infer_intent_gate(user_text, "")
+            .needs_tools
+            .unwrap_or(false);
 
         // Determine iteration limit behavior
         let (mut hard_cap, mut soft_threshold, mut soft_warn_at) = match &self.iteration_config {
@@ -351,6 +419,7 @@ impl Agent {
                                         state.effective_budget_per_check,
                                         state.tokens_used,
                                         state.budget_extensions_count,
+                                        state.health.clone(),
                                     )
                                     .await
                             } else {
@@ -389,6 +458,7 @@ impl Agent {
                                     state.effective_budget_per_check,
                                     state.tokens_used,
                                     state.budget_extensions_count,
+                                    state.health.clone(),
                                 )
                                 .await;
                         } else {
@@ -589,6 +659,11 @@ impl Agent {
                     consecutive_clean_iterations: &mut consecutive_clean_iterations,
                     max_budget_extensions,
                     hard_token_cap,
+                    execution_state: &mut execution_state,
+                    force_text_response: &mut force_text_response,
+                    completion_progress: &mut completion_progress,
+                    turn_context: &turn_context,
+                    validation_state: &mut validation_state,
                 })
                 .await?;
             match stopping_outcome {
@@ -645,6 +720,7 @@ impl Agent {
                     session_id,
                     iteration,
                     user_text,
+                    completed_tool_calls: &learning_ctx.tool_calls,
                     model: &model,
                     system_prompt: &system_prompt,
                     pinned_memories: &pinned_memories,
@@ -658,7 +734,7 @@ impl Agent {
                 })
                 .await?;
 
-            let mut resp = match self
+            let llm_outcome = self
                 .run_llm_phase(&mut LlmPhaseCtx {
                     messages: &mut messages,
                     emitter: &emitter,
@@ -692,13 +768,24 @@ impl Agent {
                     empty_response_retry_note: &mut empty_response_retry_note,
                     identity_prefill_text: &mut identity_prefill_text,
                     deferred_no_tool_streak,
+                    tools_required_for_turn: needs_tools_for_turn,
                     max_budget_extensions,
                     hard_token_cap,
                 })
-                .await?
-            {
-                LlmPhaseOutcome::ContinueLoop => continue,
-                LlmPhaseOutcome::Return(result) => return result,
+                .await?;
+            let mut resp = match llm_outcome {
+                LlmPhaseOutcome::ContinueLoop => {
+                    if execution_state.execution_budget_applies() {
+                        execution_state.record_llm_call();
+                    }
+                    continue;
+                }
+                LlmPhaseOutcome::Return(result) => {
+                    if execution_state.execution_budget_applies() {
+                        execution_state.record_llm_call();
+                    }
+                    return result;
+                }
                 LlmPhaseOutcome::Proceed(resp) => resp,
             };
 
@@ -745,28 +832,55 @@ impl Agent {
                     completion_progress: &mut completion_progress,
                     turn_context: &turn_context,
                     needs_tools_for_turn: &mut needs_tools_for_turn,
-                    force_text_response,
+                    force_text_response: &mut force_text_response,
+                    execution_state: &mut execution_state,
+                    validation_state: &mut validation_state,
                 })
                 .await?;
             match response_outcome {
-                ResponsePhaseOutcome::ContinueLoop => continue,
-                ResponsePhaseOutcome::Return(result) => return result,
-                ResponsePhaseOutcome::ProceedToToolExecution => {}
+                ResponsePhaseOutcome::ContinueLoop => {
+                    if execution_state.execution_budget_applies() {
+                        execution_state.record_llm_call();
+                    }
+                    continue;
+                }
+                ResponsePhaseOutcome::Return(result) => {
+                    if execution_state.execution_budget_applies() {
+                        execution_state.record_llm_call();
+                    }
+                    return result;
+                }
+                ResponsePhaseOutcome::ProceedToToolExecution => {
+                    if !resp.tool_calls.is_empty() && !execution_state.execution_budget_applies() {
+                        execution_state
+                            .activate_budget_envelope(task_tokens_used, task_start.elapsed());
+                    }
+                    if !resp.tool_calls.is_empty() || execution_state.execution_budget_applies() {
+                        execution_state.record_llm_call();
+                    }
+                }
             }
             // === EXECUTE TOOL CALLS ===
             let tool_prelude_outcome = self
-                .run_tool_prelude_phase(&ToolPreludeCtx {
+                .run_tool_prelude_phase(&mut ToolPreludeCtx {
                     resp: &resp,
                     emitter: &emitter,
                     task_id: &task_id,
                     session_id,
                     model: &model,
+                    llm_provider: llm_provider.clone(),
                     iteration,
                     task_start,
-                    learning_ctx: &learning_ctx,
+                    learning_ctx: &mut learning_ctx,
+                    evidence_state: &evidence_state,
                     user_text,
                     policy_bundle: &policy_bundle,
                     available_capabilities: &available_capabilities,
+                    execution_state: &mut execution_state,
+                    validation_state: &mut validation_state,
+                    pending_system_messages: &mut pending_system_messages,
+                    force_text_response: &mut force_text_response,
+                    turn_context: &turn_context,
                 })
                 .await?;
             match tool_prelude_outcome {
@@ -787,6 +901,7 @@ impl Agent {
                     task_tokens_used,
                     user_text,
                     restrict_to_personal_memory_tools,
+                    active_skill_names: &active_skill_names,
                     active_untrusted_external_reference_skills:
                         &active_untrusted_external_reference_skills,
                     restrict_untrusted_external_reference_tools,
@@ -812,6 +927,9 @@ impl Agent {
                     no_evidence_tools_seen: &mut no_evidence_tools_seen,
                     evidence_gain_count: &mut evidence_gain_count,
                     pending_error_solution_ids: &mut pending_error_solution_ids,
+                    tool_error_history: &mut tool_error_history,
+                    reflection_completed: &mut reflection_completed,
+                    pending_reflection_recoveries: &mut pending_reflection_recoveries,
                     tool_failure_patterns: &mut tool_failure_patterns,
                     last_tool_failure: &mut last_tool_failure,
                     in_session_learned: &mut in_session_learned,
@@ -824,6 +942,7 @@ impl Agent {
                     recent_tool_names: &mut recent_tool_names,
                     successful_send_file_keys: &mut successful_send_file_keys,
                     cli_agent_boundary_injected: &mut cli_agent_boundary_injected,
+                    evidence_state: &mut evidence_state,
                     pending_background_ack: &mut pending_background_ack,
                     pending_external_action_ack: &mut pending_external_action_ack,
                     stall_count: &mut stall_count,
@@ -839,6 +958,8 @@ impl Agent {
                     turn_context: &turn_context,
                     resolved_goal_id: resolved_goal_id.as_deref(),
                     tool_result_cache: &mut tool_result_cache,
+                    execution_state: &mut execution_state,
+                    validation_state: &mut validation_state,
                 })
                 .await?;
             match tool_execution_outcome {

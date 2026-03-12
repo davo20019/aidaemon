@@ -12,6 +12,7 @@ pub(super) struct ToolExecutionIoResult {
 
 pub(super) struct ToolExecutionIoCtx<'a> {
     pub effective_arguments: &'a str,
+    pub idempotency_key: Option<&'a str>,
     pub injected_project_dir: Option<&'a str>,
     pub project_scope: Option<&'a str>,
     pub session_id: &'a str,
@@ -50,7 +51,9 @@ impl Agent {
                     Some(ctx.task_id.to_string()),
                 )
                 .with_policy_metadata(
-                    Some(format!("{}:{}:{}", ctx.task_id, tc.name, tc.id)),
+                    ctx.idempotency_key
+                        .map(str::to_string)
+                        .or_else(|| Some(format!("{}:{}:{}", ctx.task_id, tc.name, tc.id))),
                     Some(ctx.policy_bundle.policy.policy_rev),
                     Some(ctx.policy_bundle.risk_score),
                 ),

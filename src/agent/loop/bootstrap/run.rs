@@ -84,7 +84,7 @@ impl Agent {
         let mut user_msg = user_msg;
         user_msg.importance = score;
 
-        self.append_user_message_with_event(&emitter, &user_msg, &channel_ctx, false)
+        self.append_user_message_with_event(&emitter, &user_msg, user_role, &channel_ctx, false)
             .await?;
 
         if let Some(reply) = self
@@ -219,6 +219,7 @@ impl Agent {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            replay_notes: Vec::new(),
         };
         if let Some((label, is_positive)) = detect_explicit_outcome_signal(user_text) {
             if is_positive {
@@ -348,6 +349,8 @@ impl Agent {
                 policy_bundle.risk_score,
                 false,
             );
+            let shadow_filtered =
+                self.restrict_connected_api_setup_tools_for_request(user_text, &shadow_filtered);
             let shadow_filtered =
                 self.ensure_connected_api_tools_exposed(user_text, &shadow_filtered, &tool_defs);
             POLICY_METRICS
@@ -499,6 +502,8 @@ impl Agent {
                     false,
                 );
                 tool_defs =
+                    self.restrict_connected_api_setup_tools_for_request(user_text, &tool_defs);
+                tool_defs =
                     self.ensure_connected_api_tools_exposed(user_text, &tool_defs, &base_tool_defs);
             }
             warn!(
@@ -510,7 +515,7 @@ impl Agent {
         }
 
         // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
-        let system_prompt = self
+        let (system_prompt, active_skill_names) = self
             .build_system_prompt_for_message(
                 &emitter,
                 &task_id,
@@ -569,6 +574,7 @@ impl Agent {
             is_reaffirmation_challenge_turn,
             requests_external_verification,
             restrict_to_personal_memory_tools,
+            active_skill_names,
             active_untrusted_external_reference_skills,
             restrict_untrusted_external_reference_tools,
             personal_memory_tool_call_cap,

@@ -1268,6 +1268,108 @@ fn build_failure_pattern_observation(
                 confidence: with_confidence(if semantic_failures > 0 { 0.74 } else { 0.68 }),
             })
         }
+        "missing_pre_execution_evidence" => {
+            let tool = metadata
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_tool");
+            let evidence_kind = metadata
+                .get("required_evidence_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("direct evidence");
+            let target = metadata
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("current target");
+            Some(FailurePatternObservation {
+                trigger_context: format!("{}:{}:{}", code, tool, evidence_kind),
+                action: "gather_direct_evidence_before_mutation".to_string(),
+                description: format!(
+                    "Before using {}, gather {} for {} instead of mutating from memory or inference alone.{}",
+                    tool, evidence_kind, target, recovery_suffix
+                ),
+                confidence: with_confidence(0.82),
+            })
+        }
+        "plan_rejected" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "replan_first_risky_step_before_execution".to_string(),
+            description: format!(
+                "When the structured first-step plan is rejected, revise the target or first action before executing again.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.74),
+        }),
+        "critique_rejected" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "address_critique_before_retry".to_string(),
+            description: format!(
+                "If the critique pass rejects the first risky action, fix the missing evidence or target assumptions before retrying.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.76),
+        }),
+        "target_scope_violation" => {
+            let tool = metadata
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_tool");
+            Some(FailurePatternObservation {
+                trigger_context: format!("{}:{}", code, tool),
+                action: "confirm_target_scope_before_mutation".to_string(),
+                description: format!(
+                    "If {} attempts to act outside the compiled target scope, stop and confirm the correct repo/file target before retrying.{}",
+                    tool, recovery_suffix
+                ),
+                confidence: with_confidence(0.86),
+            })
+        }
+        "tool_contract_violation" => {
+            let tool = metadata
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_tool");
+            Some(FailurePatternObservation {
+                trigger_context: format!("{}:{}", code, tool),
+                action: "fix_tool_arguments_before_retry".to_string(),
+                description: format!(
+                    "Deterministic argument-contract failures on {} should be corrected locally before retrying the step.{}",
+                    tool, recovery_suffix
+                ),
+                confidence: with_confidence(0.72),
+            })
+        }
+        "contradictory_file_evidence" => Some(FailurePatternObservation {
+            trigger_context: code.to_string(),
+            action: "recheck_conflicting_state_before_completion".to_string(),
+            description: format!(
+                "When file evidence contradicts itself, re-read the target before claiming completion instead of trusting stale state.{}",
+                recovery_suffix
+            ),
+            confidence: with_confidence(0.80),
+        }),
+        "verification_pending" | "verification_unavailable_in_phase" => {
+            Some(FailurePatternObservation {
+                trigger_context: code.to_string(),
+                action: "run_verification_before_claiming_success".to_string(),
+                description: format!(
+                    "Do not claim success while verification is pending; either run the check or surface a precise partial result.{}",
+                    recovery_suffix
+                ),
+                confidence: with_confidence(0.82),
+            })
+        }
+        "validation_budget_exhausted" | "execution_budget_exhausted" => {
+            Some(FailurePatternObservation {
+                trigger_context: code.to_string(),
+                action: "reduce_scope_when_budget_exhausts".to_string(),
+                description: format!(
+                    "When execution or validation budget is exhausted, reduce scope or checkpoint progress instead of pushing through unverified completion.{}",
+                    recovery_suffix
+                ),
+                confidence: with_confidence(0.70),
+            })
+        }
         "pre_tool_deferral_stall" => Some(FailurePatternObservation {
             trigger_context: code.to_string(),
             action: "ask_clarifying_question_or_take_next_tool_step".to_string(),
@@ -1535,5 +1637,88 @@ mod tests {
             pattern.description
         );
         assert!(pattern.confidence >= 0.8);
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_records_evidence_gate_failure_patterns() {
+        let (state, event_store, consolidator, _db_file) = setup_consolidator_test().await;
+
+        let task_id = "task-evidence-pattern";
+        let mut task_start = Event::new(
+            "session-evidence-pattern",
+            EventType::TaskStart,
+            json!({
+                "task_id": task_id,
+                "description": "edit src/main.rs"
+            }),
+        );
+        task_start.created_at = Utc::now();
+        event_store
+            .append(task_start)
+            .await
+            .expect("append task start");
+
+        let mut decision = Event::new(
+            "session-evidence-pattern",
+            EventType::DecisionPoint,
+            serde_json::to_value(DecisionPointData {
+                decision_type: crate::events::DecisionType::EvidenceGate,
+                task_id: task_id.to_string(),
+                iteration: 1,
+                severity: DiagnosticSeverity::Warning,
+                code: Some("missing_pre_execution_evidence".to_string()),
+                metadata: json!({
+                    "condition": "missing_pre_execution_evidence",
+                    "tool": "edit_file",
+                    "required_evidence_kind": "file_read",
+                    "target": "src/main.rs"
+                }),
+                summary: "Blocked edit_file until required evidence is gathered".to_string(),
+            })
+            .expect("serialize decision"),
+        );
+        decision.created_at = Utc::now();
+        event_store.append(decision).await.expect("append decision");
+
+        let mut task_end = Event::new(
+            "session-evidence-pattern",
+            EventType::TaskEnd,
+            serde_json::to_value(TaskEndData {
+                task_id: task_id.to_string(),
+                status: TaskStatus::Failed,
+                duration_secs: 2,
+                iterations: 1,
+                tool_calls_count: 0,
+                error: Some("missing evidence".to_string()),
+                summary: None,
+            })
+            .expect("serialize task end"),
+        );
+        task_end.created_at = Utc::now();
+        event_store.append(task_end).await.expect("append task end");
+
+        let result = consolidator
+            .consolidate_session("session-evidence-pattern")
+            .await
+            .expect("consolidate session");
+        assert_eq!(result.behavior_patterns_recorded, 1);
+
+        let patterns = state
+            .get_behavior_patterns(0.0)
+            .await
+            .expect("get behavior patterns");
+        let pattern = patterns
+            .iter()
+            .find(|pattern| {
+                pattern.trigger_context.as_deref()
+                    == Some("missing_pre_execution_evidence:edit_file:file_read")
+            })
+            .expect("evidence gate failure pattern");
+        assert_eq!(pattern.pattern_type, "failure");
+        assert_eq!(
+            pattern.action.as_deref(),
+            Some("gather_direct_evidence_before_mutation")
+        );
+        assert!(pattern.description.contains("gather file_read"));
     }
 }

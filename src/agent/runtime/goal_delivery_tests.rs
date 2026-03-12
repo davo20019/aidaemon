@@ -85,6 +85,36 @@ fn false_capability_denial_detects_live_search_fallback_text() {
 }
 
 #[test]
+fn evidence_grounding_challenge_detects_made_up_question() {
+    let reply = "Since the returned errors, does it mean you made them up?";
+    assert!(looks_like_evidence_grounding_challenge(reply));
+}
+
+#[test]
+fn evidence_grounding_challenge_detects_exact_output_request() {
+    let reply = "Show me the exact output from the tool.";
+    assert!(looks_like_evidence_grounding_challenge(reply));
+}
+
+#[test]
+fn evidence_grounding_challenge_detects_test_failure_verification() {
+    let reply = "Did that test actually fail?";
+    assert!(looks_like_evidence_grounding_challenge(reply));
+}
+
+#[test]
+fn evidence_grounding_challenge_detects_blocker_followup() {
+    let reply = "Disabled? Why?";
+    assert!(looks_like_evidence_grounding_challenge(reply));
+}
+
+#[test]
+fn evidence_grounding_challenge_ignores_generic_followup() {
+    let reply = "What does it mean?";
+    assert!(!looks_like_evidence_grounding_challenge(reply));
+}
+
+#[test]
 fn goal_completion_response_allows_concrete_finished_reply() {
     let reply = "I audited the disk usage and found 1.2G in /Users/me/projects/aidaemon/target.";
     assert!(!goal_completion_response_indicates_incomplete_work(reply));

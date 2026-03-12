@@ -95,7 +95,12 @@ impl Skill {
                     "name" => name = Some(value.to_string()),
                     "description" => description = Some(value.to_string()),
                     "triggers" => {
-                        triggers = value
+                        let normalized_value = value.trim();
+                        let normalized_value = normalized_value
+                            .strip_prefix('[')
+                            .and_then(|trimmed| trimmed.strip_suffix(']'))
+                            .unwrap_or(normalized_value);
+                        triggers = normalized_value
                             .split(',')
                             .map(|s| s.trim().to_lowercase())
                             .filter(|s| !s.is_empty())
@@ -1653,6 +1658,20 @@ mod tests {
         let content = "---\nname: parser-test\ndescription: body rules\ntriggers: parse\n---\nLine one\n---\nLine two";
         let skill = Skill::parse(content).unwrap();
         assert_eq!(skill.body, "Line one\n---\nLine two");
+    }
+
+    #[test]
+    fn parse_frontmatter_accepts_bracketed_trigger_lists() {
+        let content = "---\nname: parser-test\ndescription: bracketed triggers\ntriggers: [tweet, post to twitter, reply to tweet]\n---\nBody content.";
+        let skill = Skill::parse(content).unwrap();
+        assert_eq!(
+            skill.triggers,
+            vec![
+                "tweet".to_string(),
+                "post to twitter".to_string(),
+                "reply to tweet".to_string()
+            ]
+        );
     }
 
     // --- to_markdown roundtrip tests ---

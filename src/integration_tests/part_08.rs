@@ -168,11 +168,13 @@ async fn test_orchestration_task_lead_claims_before_dispatch() {
 
     // User text triggers complex classification: analyze, compare, identify, find,
     // report = 5 action markers + "and"/"then" compound keywords.
+    // Includes "build" and "deploy" so the completion contract has expects_mutation=true,
+    // which prevents the text-only prelude from blocking side-effecting tool calls.
     let response = harness
         .agent
         .handle_message(
             "test_session",
-            "Analyze the quantum computing landscape, compare visualization frameworks, identify performance bottlenecks, find optimal algorithms, and report on production deployment strategies with monitoring and documentation",
+            "Analyze the quantum computing landscape, compare visualization frameworks, identify performance bottlenecks, find optimal algorithms, build a prototype, and deploy production monitoring with documentation",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),

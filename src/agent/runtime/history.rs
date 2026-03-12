@@ -25,6 +25,7 @@ pub(super) enum TurnContextReason {
     DefaultNewTask,
     ExplicitFollowup,
     ClarificationAnswer,
+    ContextDependentQuestion,
     FollowupOverrideStandalone,
     FollowupOverrideMismatchPreflight,
     CarryoverSanitized,
@@ -36,6 +37,7 @@ impl TurnContextReason {
             TurnContextReason::DefaultNewTask => "default_new_task",
             TurnContextReason::ExplicitFollowup => "explicit_followup",
             TurnContextReason::ClarificationAnswer => "clarification_answer",
+            TurnContextReason::ContextDependentQuestion => "context_dependent_question",
             TurnContextReason::FollowupOverrideStandalone => "followup_override_standalone",
             TurnContextReason::FollowupOverrideMismatchPreflight => {
                 "followup_override_mismatch_preflight"
@@ -50,6 +52,7 @@ pub(super) enum CompletionTaskKind {
     #[default]
     Conversational,
     Answer,
+    Compose,
     Check,
     Find,
     Change,
@@ -79,6 +82,7 @@ pub(super) struct CompletionContract {
     pub requires_observation: bool,
     pub requires_reverification_after_mutation: bool,
     pub explicit_verification_requested: bool,
+    pub connected_content_mode: super::intent_routing::ConnectedContentMode,
     pub verification_targets: Vec<VerificationTarget>,
 }
 
@@ -230,6 +234,116 @@ fn looks_like_style_followup(lower_text: &str) -> bool {
     style_markers.iter().any(|m| lower_text.contains(m))
 }
 
+fn looks_like_context_dependent_followup_question(lower_text: &str) -> bool {
+    if !looks_like_question_request(lower_text) || lower_text.chars().count() > 160 {
+        return false;
+    }
+
+    let status_followup_prefixes = [
+        "did you ",
+        "were you able",
+        "have you ",
+        "what did you find",
+        "which one",
+        "which ones",
+        "what happened",
+        "how many",
+        "why did",
+        "why was",
+        "why were",
+    ];
+    let shared_context_markers = [
+        "those",
+        "these",
+        "them",
+        "earlier",
+        "before",
+        "previous",
+        "last",
+        "again",
+        "already",
+        "the api",
+        "the result",
+        "the results",
+        "the output",
+        "the response",
+        "our chat",
+        "the convo",
+        "the conversation",
+        "you just",
+        "you sent",
+        "you found",
+        "you pulled",
+    ];
+    if status_followup_prefixes
+        .iter()
+        .any(|prefix| lower_text.starts_with(prefix))
+    {
+        return text_contains_any_phrase(lower_text, &shared_context_markers);
+    }
+
+    let explanation_followup_prefixes = [
+        "what does",
+        "what do",
+        "can you explain",
+        "could you explain",
+        "can you clarify",
+        "could you clarify",
+        "can you help me understand",
+        "could you help me understand",
+    ];
+    if !explanation_followup_prefixes
+        .iter()
+        .any(|prefix| lower_text.starts_with(prefix))
+    {
+        return false;
+    }
+
+    let deictic_markers = ["it", "that", "this", "these", "those", "them"];
+    let explanation_cues = [
+        "mean",
+        "means",
+        "explain",
+        "clarify",
+        "understand",
+        "interpret",
+    ];
+
+    text_contains_any_phrase(lower_text, &explanation_cues)
+        && (text_contains_any_phrase(lower_text, &deictic_markers)
+            || text_contains_any_phrase(lower_text, &shared_context_markers))
+}
+
+fn looks_like_artifact_inspection_request(lower_text: &str) -> bool {
+    let mentions_artifact = text_contains_any_phrase(
+        lower_text,
+        &[
+            "doc",
+            "document",
+            "file",
+            "attachment",
+            "attached",
+            "screenshot",
+            "image",
+            "photo",
+            "picture",
+            "pdf",
+            "note",
+        ],
+    );
+    if !mentions_artifact {
+        return false;
+    }
+
+    text_contains_any_phrase(
+        lower_text,
+        &[
+            "check", "read", "review", "inspect", "look at", "open", "analyze", "analyse", "fix",
+            "issue", "problem", "error",
+        ],
+    )
+}
+
 fn looks_like_standalone_goal_request(lower_text: &str) -> bool {
     let word_count = lower_text.split_whitespace().count();
     if word_count < 8 {
@@ -275,6 +389,124 @@ fn looks_like_standalone_goal_request(lower_text: &str) -> bool {
 
     (asks_for_uninterrupted_execution && has_action_verb)
         || (word_count >= 14 && has_action_verb && has_scope_detail)
+}
+
+fn payload_has_self_contained_detail(text: &str) -> bool {
+    let meaningful_tokens = text
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\'' && c != '-')
+                .to_ascii_lowercase()
+        })
+        .filter(|token| !token.is_empty())
+        .filter(|token| {
+            !matches!(
+                token.as_str(),
+                "a" | "an"
+                    | "the"
+                    | "to"
+                    | "for"
+                    | "at"
+                    | "on"
+                    | "in"
+                    | "of"
+                    | "my"
+                    | "your"
+                    | "our"
+                    | "me"
+                    | "you"
+                    | "it"
+                    | "this"
+                    | "that"
+                    | "these"
+                    | "those"
+                    | "them"
+                    | "task"
+                    | "goal"
+                    | "job"
+                    | "schedule"
+                    | "scheduled"
+                    | "daily"
+                    | "every"
+                    | "day"
+                    | "weekdays"
+                    | "weekends"
+                    | "recurring"
+                    | "reminder"
+                    | "remind"
+                    | "set"
+                    | "setup"
+                    | "up"
+                    | "create"
+                    | "build"
+                    | "write"
+                    | "edit"
+                    | "update"
+                    | "delete"
+                    | "remove"
+                    | "deploy"
+                    | "publish"
+                    | "post"
+                    | "send"
+                    | "email"
+                    | "message"
+                    | "upload"
+                    | "install"
+                    | "connect"
+                    | "enable"
+                    | "disable"
+                    | "restart"
+                    | "reload"
+                    | "commit"
+                    | "push"
+                    | "can"
+                    | "could"
+                    | "would"
+                    | "please"
+            )
+        })
+        .count();
+
+    meaningful_tokens >= 3
+}
+
+fn looks_like_self_contained_mutation_request(current: &str, lower_text: &str) -> bool {
+    let trimmed = current.trim();
+    if trimmed.is_empty() || trimmed.split_whitespace().count() < 6 {
+        return false;
+    }
+
+    if let Some((schedule_raw, _)) = crate::cron_utils::extract_schedule_from_text(trimmed) {
+        let cleaned = crate::cron_utils::clean_task_description(trimmed, &schedule_raw);
+        return payload_has_self_contained_detail(&cleaned);
+    }
+
+    let has_mutation_cue = [
+        "set up", "setup", "create", "build", "write", "edit", "update", "delete", "remove",
+        "deploy", "publish", "post", "send", "email", "message", "upload", "install", "connect",
+        "enable", "disable", "restart", "reload", "commit", "push",
+    ]
+    .iter()
+    .any(|phrase| contains_keyword_as_words(lower_text, phrase));
+    if !has_mutation_cue {
+        return false;
+    }
+
+    let has_structured_target = looks_like_short_command_request(trimmed)
+        || HTTP_URL_RE.is_match(trimmed)
+        || super::user_text_references_filesystem_path(trimmed)
+        || super::text_has_explicit_project_scope_cues(lower_text)
+        || lower_text.contains(".json")
+        || lower_text.contains(".toml")
+        || lower_text.contains(".yaml")
+        || lower_text.contains(".yml")
+        || lower_text.contains(".md")
+        || lower_text.contains(".ts")
+        || lower_text.contains(".js")
+        || lower_text.contains(".rs");
+
+    has_structured_target && payload_has_self_contained_detail(trimmed)
 }
 
 fn looks_like_short_command_request(current: &str) -> bool {
@@ -382,6 +614,31 @@ fn looks_like_short_command_request(current: &str) -> bool {
     !deictic_only
 }
 
+fn looks_like_scope_carryover_ack(current: &str) -> bool {
+    let trimmed = current.trim();
+    if trimmed.is_empty() || trimmed.ends_with('?') || trimmed.chars().count() > 80 {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    [
+        "yes",
+        "go ahead",
+        "do it",
+        "continue",
+        "keep going",
+        "proceed",
+        "sounds good",
+        "ok",
+        "okay",
+        "sure",
+        "same repo",
+        "same project",
+    ]
+    .iter()
+    .any(|phrase| contains_keyword_as_words(&lower, phrase))
+}
+
 fn looks_like_multi_project_request(lower_text: &str) -> bool {
     contains_keyword_as_words(lower_text, "all my projects")
         || contains_keyword_as_words(lower_text, "across all projects")
@@ -397,37 +654,8 @@ fn text_contains_any_phrase(text: &str, phrases: &[&str]) -> bool {
         .any(|phrase| contains_keyword_as_words(text, phrase))
 }
 
-fn text_has_explicit_project_scope_cues(lower_text: &str) -> bool {
-    text_contains_any_phrase(
-        lower_text,
-        &[
-            "project",
-            "repo",
-            "repository",
-            "workspace",
-            "directory",
-            "folder",
-            "codebase",
-            "code base",
-            "work in",
-            "inside",
-            "under",
-        ],
-    )
-}
-
 fn should_allow_verification_nickname_scope(text: &str, token: &str) -> bool {
-    if token.contains('.')
-        || token.contains('-')
-        || token.contains('_')
-        || token.chars().any(|c| c.is_ascii_digit())
-    {
-        return true;
-    }
-
-    let lower = text.trim().to_ascii_lowercase();
-    super::user_text_references_filesystem_path(text)
-        || text_has_explicit_project_scope_cues(&lower)
+    super::should_allow_contextual_project_nickname_scope(text, token)
 }
 
 fn extract_verification_project_scopes(
@@ -469,16 +697,15 @@ fn extract_verification_project_scopes(
         let scope = if token_looks_like_filesystem_path(token) {
             normalize_project_scope_path_with_aliases(token, alias_roots)
         } else {
-            crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
-                .map(|path| path.to_string_lossy().to_string())
-                .or_else(|| {
-                    should_allow_verification_nickname_scope(text, token)
-                        .then(|| {
+            should_allow_verification_nickname_scope(text, token)
+                .then(|| {
+                    crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
+                        .or_else(|| {
                             crate::tools::fs_utils::resolve_contextual_project_nickname_in_explicit_roots(token, alias_roots)
                         })
-                        .flatten()
-                        .map(|path| path.to_string_lossy().to_string())
                 })
+                .flatten()
+                .map(|path| path.to_string_lossy().to_string())
         };
 
         if let Some(scope) = scope {
@@ -600,8 +827,17 @@ fn infer_completion_signals(
     let is_question = looks_like_question_request(lower_text);
     let asks_schedule = text_contains_any_phrase(
         lower_text,
-        &["remind me", "schedule", "set a reminder", "add reminder"],
-    );
+        &[
+            "remind me",
+            "schedule",
+            "set a reminder",
+            "add reminder",
+            "scheduled task",
+            "scheduled goal",
+            "recurring task",
+            "recurring goal",
+        ],
+    ) || crate::cron_utils::extract_schedule_from_text(lower_text).is_some();
     let asks_monitor =
         text_contains_any_phrase(lower_text, &["monitor", "watch", "keep an eye on"]);
     let asks_check = text_contains_any_phrase(
@@ -644,6 +880,7 @@ fn infer_completion_signals(
         &[
             "change", "update", "edit", "write", "create", "delete", "remove", "deploy", "build",
             "connect", "set up", "setup", "install", "restart", "reload", "enable", "disable",
+            "remember", "store", "save", "note",
         ],
     );
     let visible_state_problem = text_contains_any_phrase(
@@ -791,16 +1028,29 @@ fn infer_completion_contract(text: &str, alias_roots: &[String]) -> CompletionCo
 
     let verification_targets = extract_verification_targets(text, alias_roots);
     let signals = infer_completion_signals(&lower, &verification_targets);
-    let task_kind = infer_completion_task_kind(&signals);
+    let connected_content_mode = super::intent_routing::classify_connected_content_mode(text);
+    let mut task_kind = infer_completion_task_kind(&signals);
+    if matches!(
+        connected_content_mode,
+        super::intent_routing::ConnectedContentMode::DraftOnly
+    ) {
+        task_kind = CompletionTaskKind::Compose;
+    }
 
-    let expects_mutation = matches!(
-        task_kind,
-        CompletionTaskKind::Change
-            | CompletionTaskKind::Deliver
-            | CompletionTaskKind::Schedule
-            | CompletionTaskKind::Monitor
-            | CompletionTaskKind::Diagnose
-    );
+    let expects_mutation = if connected_content_mode.expects_live_delivery() {
+        true
+    } else if connected_content_mode.is_authoring_only() {
+        false
+    } else {
+        matches!(
+            task_kind,
+            CompletionTaskKind::Change
+                | CompletionTaskKind::Deliver
+                | CompletionTaskKind::Schedule
+                | CompletionTaskKind::Monitor
+                | CompletionTaskKind::Diagnose
+        )
+    };
     let requires_observation = signals.explicit_verification_requested
         || signals.observable_target_request
         || signals.visible_state_problem
@@ -823,6 +1073,7 @@ fn infer_completion_contract(text: &str, alias_roots: &[String]) -> CompletionCo
         requires_observation,
         requires_reverification_after_mutation,
         explicit_verification_requested: signals.explicit_verification_requested,
+        connected_content_mode,
         verification_targets,
     }
 }
@@ -866,6 +1117,11 @@ fn classify_followup_mode(
         reasons.push(TurnContextReason::DefaultNewTask);
         return (FollowupMode::NewTask, reasons);
     }
+    if looks_like_self_contained_mutation_request(trimmed, &lower) {
+        reasons.push(TurnContextReason::FollowupOverrideStandalone);
+        reasons.push(TurnContextReason::DefaultNewTask);
+        return (FollowupMode::NewTask, reasons);
+    }
     if looks_like_short_command_request(trimmed) {
         reasons.push(TurnContextReason::FollowupOverrideStandalone);
         reasons.push(TurnContextReason::DefaultNewTask);
@@ -892,10 +1148,16 @@ fn classify_followup_mode(
         return (FollowupMode::Followup, reasons);
     }
 
+    if prev_assistant.is_some() && looks_like_context_dependent_followup_question(&lower) {
+        reasons.push(TurnContextReason::ContextDependentQuestion);
+        return (FollowupMode::Followup, reasons);
+    }
+
     if prev_assistant.is_some_and(|prev| {
         assistant_message_looks_like_clarifying_question(prev)
             && !trimmed.trim_end().ends_with('?')
             && !looks_like_explicit_task_switch(&lower)
+            && !looks_like_artifact_inspection_request(&lower)
     }) {
         reasons.push(TurnContextReason::ClarificationAnswer);
         return (FollowupMode::ClarificationAnswer, reasons);
@@ -951,35 +1213,146 @@ fn trim_assistant_context_content(content: &str) -> String {
     }
 }
 
-fn extract_recent_parent_messages(history: &[Message], max_messages: usize) -> Vec<Value> {
-    let mut rows: Vec<Value> = history
-        .iter()
-        .filter_map(|msg| {
-            if msg.role != "user" && msg.role != "assistant" {
-                return None;
-            }
-            let raw = msg.content.as_deref()?.trim();
-            if raw.is_empty() {
-                return None;
-            }
-            let content = if msg.role == "assistant" {
-                trim_assistant_context_content(raw)
-            } else {
-                raw.to_string()
-            };
-            if content.trim().is_empty() {
-                return None;
-            }
-            Some(json!({
-                "role": msg.role,
-                "content": truncate_for_resume(content.trim(), 500),
-            }))
-        })
-        .collect();
-    if rows.len() > max_messages {
-        rows = rows.split_off(rows.len() - max_messages);
+fn is_low_signal_http_metadata_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    lower.starts_with("content-type:")
+        || lower.starts_with("content-length:")
+        || lower.starts_with("cache-control:")
+        || lower.starts_with("date:")
+        || lower.starts_with("etag:")
+        || lower.starts_with("expires:")
+        || lower.starts_with("last-modified:")
+        || lower.starts_with("location:")
+        || lower.starts_with("server:")
+        || lower.starts_with("strict-transport-security:")
+        || lower.starts_with("vary:")
+        || lower.starts_with("via:")
+        || lower.starts_with("x-")
+}
+
+fn is_low_info_recent_tool_context(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "write_file"
+            | "edit_file"
+            | "manage_memories"
+            | "manage_people"
+            | "remember_fact"
+            | "check_environment"
+    )
+}
+
+fn is_low_signal_tool_context_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    lower.is_empty()
+        || is_low_signal_http_metadata_line(line)
+        || lower == "[truncated]"
+        || lower.starts_with("exit code:")
+        || lower.starts_with("[mode:")
+}
+
+fn summarize_http_request_context(primary: &str) -> Option<String> {
+    let mut lines = primary
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = lines.next()?;
+    if !first.to_ascii_lowercase().starts_with("http ") {
+        return Some(first.to_string());
     }
-    rows
+
+    let detail = lines.find(|line| !is_low_signal_http_metadata_line(line));
+    match detail {
+        Some(detail) if !detail.eq_ignore_ascii_case(first) => Some(format!("{first} | {detail}")),
+        _ => Some(first.to_string()),
+    }
+}
+
+fn summarize_generic_tool_context(primary: &str) -> Option<String> {
+    let mut lines = primary
+        .lines()
+        .map(str::trim)
+        .filter(|line| !is_low_signal_tool_context_line(line));
+    let first = lines.next()?;
+    let second = lines.next();
+    match second {
+        Some(second) if !second.eq_ignore_ascii_case(first) => Some(format!("{first} | {second}")),
+        _ => Some(first.to_string()),
+    }
+}
+
+fn summarize_recent_tool_context(msg: &Message) -> Option<String> {
+    let tool_name = msg.tool_name.as_deref()?;
+    if is_low_info_recent_tool_context(tool_name) {
+        return None;
+    }
+
+    let primary = msg.primary_content()?;
+    let summary = match tool_name {
+        "http_request" => summarize_http_request_context(&primary)?,
+        _ => summarize_generic_tool_context(&primary)?,
+    };
+    Some(format!(
+        "{}: {}",
+        tool_name,
+        truncate_for_resume(&summary, 240)
+    ))
+}
+
+fn extract_recent_parent_messages(history: &[Message], max_messages: usize) -> Vec<Value> {
+    let mut rows_rev: Vec<Value> = Vec::new();
+    let mut recent_tool_rows = 0usize;
+
+    for msg in history.iter().rev() {
+        let row = match msg.role.as_str() {
+            "user" => {
+                let Some(raw) = msg.content.as_deref().map(str::trim) else {
+                    continue;
+                };
+                if raw.is_empty() {
+                    continue;
+                }
+                Some(json!({
+                    "role": msg.role,
+                    "content": truncate_for_resume(raw, 500),
+                }))
+            }
+            "assistant" => {
+                let Some(raw) = msg.content.as_deref().map(str::trim) else {
+                    continue;
+                };
+                if raw.is_empty() {
+                    continue;
+                }
+                let content = trim_assistant_context_content(raw);
+                if content.trim().is_empty() {
+                    continue;
+                }
+                Some(json!({
+                    "role": msg.role,
+                    "content": truncate_for_resume(content.trim(), 500),
+                }))
+            }
+            "tool" if recent_tool_rows < 2 => summarize_recent_tool_context(msg).map(|content| {
+                recent_tool_rows += 1;
+                json!({
+                    "role": "tool",
+                    "content": content,
+                })
+            }),
+            _ => None,
+        };
+
+        if let Some(row) = row {
+            rows_rev.push(row);
+            if rows_rev.len() >= max_messages {
+                break;
+            }
+        }
+    }
+
+    rows_rev.reverse();
+    rows_rev
 }
 
 fn is_generic_non_project_token(token: &str) -> bool {
@@ -1022,6 +1395,11 @@ fn is_likely_filename(token: &str) -> bool {
     let Some((name, ext)) = token.rsplit_once('.') else {
         return false;
     };
+    // If the name portion itself contains dots (e.g. "blog.aidaemon" in "blog.aidaemon.ai"),
+    // this looks like a domain name or multi-label hostname, not a plain filename.
+    if name.contains('.') {
+        return false;
+    }
     !name.is_empty()
         && !ext.is_empty()
         && ext.len() <= 8
@@ -1054,6 +1432,52 @@ fn token_looks_like_filesystem_path(token: &str) -> bool {
         || token.contains('/')
         || token.contains('\\')
         || looks_windows_abs
+}
+
+fn token_looks_like_project_scope_path(token: &str, alias_roots: &[String]) -> bool {
+    if !token_looks_like_filesystem_path(token) {
+        return false;
+    }
+
+    // History often contains natural-language slash phrases ("reload/restart")
+    // and markdown emphasis artifacts ("path**"). Those should not become the
+    // sticky project scope for later turns.
+    if token.contains('*') || token.contains('?') {
+        return false;
+    }
+
+    let bytes = token.as_bytes();
+    let looks_windows_abs = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    if token.starts_with('/')
+        || token.starts_with("~/")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || looks_windows_abs
+    {
+        return true;
+    }
+
+    let Some(first_segment) = token
+        .split(['/', '\\'])
+        .find(|segment| !segment.trim().is_empty())
+    else {
+        return false;
+    };
+
+    let cwd_has_segment = std::env::current_dir()
+        .ok()
+        .is_some_and(|cwd| cwd.join(first_segment).exists());
+    if cwd_has_segment {
+        return true;
+    }
+
+    alias_roots
+        .iter()
+        .filter_map(|root| crate::tools::fs_utils::validate_path(root).ok())
+        .any(|root| root.join(first_segment).exists())
 }
 
 fn is_common_path_segment(token: &str) -> bool {
@@ -1293,13 +1717,17 @@ fn extract_project_scopes_from_text(
         if token.is_empty() || token.contains("://") {
             continue;
         }
-        let scope = if token_looks_like_filesystem_path(token) {
+        let scope = if token_looks_like_project_scope_path(token, alias_roots) {
             normalize_project_scope_path_with_aliases(token, alias_roots)
         } else {
-            crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
-                .or_else(|| {
-                    crate::tools::fs_utils::resolve_contextual_project_nickname(token, alias_roots)
+            super::should_allow_contextual_project_nickname_scope(text, token)
+                .then(|| {
+                    crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
+                        .or_else(|| {
+                            crate::tools::fs_utils::resolve_contextual_project_nickname_in_explicit_roots(token, alias_roots)
+                        })
                 })
+                .flatten()
                 .map(|path| path.to_string_lossy().to_string())
         };
         if let Some(scope) = scope {
@@ -1326,18 +1754,79 @@ fn choose_primary_project_scope(scopes: &[String]) -> Option<String> {
         .or_else(|| scopes.first().cloned())
 }
 
+fn turn_allows_inherited_project_scope(
+    current_user_text: &str,
+    current_user_scopes: &[String],
+) -> bool {
+    if !current_user_scopes.is_empty() {
+        return true;
+    }
+
+    if super::user_explicitly_requests_local_file_inspection(current_user_text) {
+        return true;
+    }
+
+    let lower = current_user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    if super::text_has_explicit_project_scope_cues(&lower)
+        || looks_like_short_command_request(current_user_text)
+    {
+        return true;
+    }
+
+    [
+        "cargo",
+        "npm",
+        "pnpm",
+        "yarn",
+        "pytest",
+        "wrangler",
+        "docker",
+        "kubectl",
+        "build",
+        "compile",
+        "deploy",
+        "lint",
+        "format",
+        "fmt",
+        "commit",
+        "branch",
+        "diff",
+        "logs",
+        "log",
+        "migration",
+        "migrations",
+        "schema",
+        "daemon",
+    ]
+    .iter()
+    .any(|kw| contains_keyword_as_words(&lower, kw))
+}
+
 fn resolve_primary_project_scope(
     extracted_primary_scope: Option<String>,
     inherited_project_scope: Option<&str>,
     allow_multi_project_scope: bool,
+    allow_inherited_scope: bool,
 ) -> Option<String> {
-    if allow_multi_project_scope {
-        return extracted_primary_scope.or_else(|| inherited_project_scope.map(ToOwned::to_owned));
+    if extracted_primary_scope.is_some() {
+        return extracted_primary_scope;
     }
 
-    inherited_project_scope
-        .map(ToOwned::to_owned)
-        .or(extracted_primary_scope)
+    if allow_multi_project_scope {
+        return allow_inherited_scope
+            .then(|| inherited_project_scope.map(ToOwned::to_owned))
+            .flatten();
+    }
+
+    if allow_inherited_scope {
+        inherited_project_scope.map(ToOwned::to_owned)
+    } else {
+        None
+    }
 }
 
 fn extract_project_scopes_from_history(
@@ -1358,21 +1847,46 @@ fn extract_project_scopes_from_history(
         if scopes.len() >= max_scopes {
             break;
         }
+        if msg.role != "user" {
+            continue;
+        }
         let Some(content) = msg.content.as_deref() else {
             continue;
         };
-        match msg.role.as_str() {
-            "user" | "assistant" | "tool" => {
-                extract_project_scopes_from_text(content, &mut scopes, max_scopes, alias_roots);
-            }
-            _ => {}
-        }
+        extract_project_scopes_from_text(content, &mut scopes, max_scopes, alias_roots);
     }
 
     scopes
 }
 
 impl Agent {
+    pub(crate) async fn record_auxiliary_assistant_note(
+        &self,
+        session_id: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+
+        let emitter = crate::events::EventEmitter::new(self.event_store.clone(), session_id);
+        let msg = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: "assistant".to_string(),
+            content: Some(trimmed.to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.2,
+            ..Message::runtime_defaults()
+        };
+        self.append_assistant_message_with_event(&emitter, &msg, "system", None, None)
+            .await
+    }
+
     pub(super) async fn build_turn_context_from_recent_history(
         &self,
         session_id: &str,
@@ -1452,11 +1966,35 @@ impl Agent {
             GOAL_CONTEXT_MAX_PROJECT_HINTS,
             include_history_context,
         );
+        let mut current_project_scopes = Vec::new();
+        extract_project_scopes_from_text(
+            current,
+            &mut current_project_scopes,
+            GOAL_CONTEXT_MAX_PROJECT_SCOPES,
+            &self.path_aliases.projects,
+        );
+        let allow_scope_carryover = if looks_like_scope_carryover_ack(current) {
+            let mut prior_user_scopes = Vec::new();
+            if let Some(prev_user_text) = prev_user.as_deref() {
+                extract_project_scopes_from_text(
+                    prev_user_text,
+                    &mut prior_user_scopes,
+                    GOAL_CONTEXT_MAX_PROJECT_SCOPES,
+                    &self.path_aliases.projects,
+                );
+            }
+            !prior_user_scopes.is_empty()
+                || prev_user.as_deref().is_some_and(|prev_user_text| {
+                    turn_allows_inherited_project_scope(prev_user_text, &prior_user_scopes)
+                })
+        } else {
+            turn_allows_inherited_project_scope(current, &current_project_scopes)
+        };
         let project_scopes = extract_project_scopes_from_history(
             &history,
             current,
             GOAL_CONTEXT_MAX_PROJECT_SCOPES,
-            include_history_context,
+            include_history_context && allow_scope_carryover,
             &self.path_aliases.projects,
         );
         let allow_multi_project_scope =
@@ -1465,6 +2003,7 @@ impl Agent {
             choose_primary_project_scope(&project_scopes),
             self.inherited_project_scope.as_deref(),
             allow_multi_project_scope,
+            allow_scope_carryover,
         );
         let completion_contract =
             infer_completion_contract(&goal_user_text, &self.path_aliases.projects);
@@ -1492,6 +2031,7 @@ impl Agent {
         &self,
         emitter: &crate::events::EventEmitter,
         msg: &Message,
+        user_role: crate::types::UserRole,
         channel_ctx: &ChannelContext,
         has_attachments: bool,
     ) -> anyhow::Result<()> {
@@ -1509,6 +2049,7 @@ impl Agent {
                     "channel_id": channel_ctx.channel_id.clone(),
                     "platform": channel_ctx.platform.clone(),
                     "sender_id": channel_ctx.sender_id.clone(),
+                    "user_role": user_role.to_string(),
                 }),
             )
             .await?;
@@ -1700,6 +2241,51 @@ mod tests {
     }
 
     #[test]
+    fn followup_accepts_context_dependent_status_question() {
+        let followup = "Did you find those 10 in the API?";
+        let prev = "I fetched the search results and sent the JSON export.";
+        let (mode, reasons) = classify_followup_mode(followup, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+
+    #[test]
+    fn followup_accepts_context_dependent_explanation_question() {
+        let followup = "What does it mean?";
+        let prev = "I found several matching studies and sent the JSON export.";
+        let (mode, reasons) = classify_followup_mode(followup, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+
+    #[test]
+    fn generic_explanation_question_without_context_markers_stays_new_task() {
+        let current = "Can you explain Rust ownership?";
+        let prev = "I fetched the search results and sent the JSON export.";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+
+    #[test]
+    fn generic_short_question_without_context_markers_stays_new_task() {
+        let current = "What is the weather in Paris?";
+        let prev = "I fetched the search results and sent the JSON export.";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+
+    #[test]
+    fn artifact_request_does_not_inherit_previous_topic_as_clarification_answer() {
+        let current = "Check the doc and fix the issue.";
+        let prev = "Would you like me to get more detailed information for any specific trial(s)?";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+
+    #[test]
     fn project_hint_extraction_finds_project_name() {
         let history = vec![
             msg(
@@ -1828,7 +2414,7 @@ mod tests {
     }
 
     #[test]
-    fn project_scope_extraction_resolves_contextual_nickname_from_history() {
+    fn project_scope_extraction_resolves_contextual_nickname_from_prior_user_request() {
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
         let nickname = format!("scope-nick-{}", uuid::Uuid::new_v4().simple());
@@ -1839,19 +2425,11 @@ mod tests {
         let alias_roots = vec![alias_root.to_string_lossy().to_string()];
 
         let history = vec![msg(
-            "assistant",
-            &format!(
-                "To publish from the {} directory, build and deploy there.",
-                nickname
-            ),
+            "user",
+            &format!("Please deploy the {} project when you can.", nickname),
         )];
-        let scopes = extract_project_scopes_from_history(
-            &history,
-            "Run build, and deploy it",
-            4,
-            true,
-            &alias_roots,
-        );
+        let scopes =
+            extract_project_scopes_from_history(&history, "Yes, do it.", 4, true, &alias_roots);
         assert_eq!(scopes, vec![project.to_string_lossy().to_string()]);
     }
 
@@ -1873,16 +2451,17 @@ mod tests {
     }
 
     #[test]
-    fn inherited_project_scope_wins_when_multi_project_is_not_allowed() {
+    fn explicit_scope_wins_over_inherited_scope_when_present() {
         let extracted = Some("/Users/davidloor/projects/terminal.aidaemon.ai".to_string());
         let resolved = resolve_primary_project_scope(
             extracted,
             Some("/Users/davidloor/Library/Logs/aidaemon"),
             false,
+            true,
         );
         assert_eq!(
             resolved,
-            Some("/Users/davidloor/Library/Logs/aidaemon".to_string())
+            Some("/Users/davidloor/projects/terminal.aidaemon.ai".to_string())
         );
     }
 
@@ -1893,8 +2472,55 @@ mod tests {
             extracted.clone(),
             Some("/Users/davidloor/Library/Logs/aidaemon"),
             true,
+            true,
         );
         assert_eq!(resolved, extracted);
+    }
+
+    #[test]
+    fn inherited_project_scope_is_ignored_when_turn_is_not_local_project_work() {
+        let resolved = resolve_primary_project_scope(
+            None,
+            Some("/Users/davidloor/projects/fairfax-va-site"),
+            false,
+            false,
+        );
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn inherited_project_scope_allowed_for_workspace_command_turns() {
+        assert!(turn_allows_inherited_project_scope("run cargo test", &[]));
+        assert!(looks_like_scope_carryover_ack("Yes, do it."));
+    }
+
+    #[test]
+    fn inherited_project_scope_blocked_for_external_followup_without_local_cues() {
+        assert!(!turn_allows_inherited_project_scope(
+            "Give me more details of the ones offered by next oncology.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn project_scope_extraction_ignores_assistant_paths_for_non_local_followup() {
+        let history = vec![msg(
+            "assistant",
+            "I am currently locked to /Users/davidloor/projects/fairfax-va-site.",
+        )];
+
+        let scopes = extract_project_scopes_from_history(
+            &history,
+            "Give me all the info about the top 2.",
+            4,
+            true,
+            &[],
+        );
+        assert!(
+            scopes.is_empty(),
+            "non-local followup should not inherit assistant path scope: {:?}",
+            scopes
+        );
     }
 
     #[test]
@@ -1949,12 +2575,15 @@ mod tests {
 
     #[test]
     fn reading_target_requires_observation_without_change() {
+        // "post" triggers connected content mode DraftThenDeliver (as both
+        // a content delivery resource and a delivery verb), which forces
+        // expects_mutation=true even though task_kind remains Answer.
         let contract = infer_completion_contract(
             "Read https://blog.aidaemon.ai and summarize the latest post.",
             &[],
         );
         assert_eq!(contract.task_kind, CompletionTaskKind::Answer);
-        assert!(!contract.expects_mutation);
+        assert!(contract.expects_mutation);
         assert!(contract.requires_observation);
         assert!(!contract.requires_reverification_after_mutation);
     }
@@ -1978,6 +2607,24 @@ mod tests {
         assert!(contract.expects_mutation);
         assert!(!contract.requires_observation);
         assert!(!contract.requires_reverification_after_mutation);
+    }
+
+    #[test]
+    fn detailed_schedule_request_breaks_followup_carryover() {
+        let current = "Can you set up a daily scheduled task at 6:00 am to publish the blog with honest reflections about recent errors and fixes.";
+        let (mode, reasons) =
+            classify_followup_mode(current, Some("Would you like me to schedule that?"));
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::FollowupOverrideStandalone));
+    }
+
+    #[test]
+    fn deictic_schedule_followup_stays_contextual() {
+        let current = "Schedule it for every day at 6am.";
+        let (mode, reasons) =
+            classify_followup_mode(current, Some("Would you like me to schedule that?"));
+        assert_ne!(mode, FollowupMode::NewTask);
+        assert!(!reasons.contains(&TurnContextReason::FollowupOverrideStandalone));
     }
 
     #[test]
@@ -2008,11 +2655,38 @@ mod tests {
     }
 
     #[test]
+    fn connected_content_draft_only_request_uses_compose_contract() {
+        let contract = infer_completion_contract("Help me write a tweet about our launch.", &[]);
+        assert_eq!(contract.task_kind, CompletionTaskKind::Compose);
+        assert!(!contract.expects_mutation);
+        assert_eq!(
+            contract.connected_content_mode,
+            super::super::intent_routing::ConnectedContentMode::DraftOnly
+        );
+    }
+
+    #[test]
+    fn connected_content_draft_then_deliver_request_keeps_delivery_contract() {
+        let contract = infer_completion_contract(
+            "Can you post a tweet about your new stuff and make it engaging so people want to comment?",
+            &[],
+        );
+        assert_eq!(contract.task_kind, CompletionTaskKind::Deliver);
+        assert!(contract.expects_mutation);
+        assert_eq!(
+            contract.connected_content_mode,
+            super::super::intent_routing::ConnectedContentMode::DraftThenDeliver
+        );
+    }
+
+    #[test]
     fn generic_find_request_does_not_force_verification_without_target() {
+        // "note" triggers asks_change which takes priority over asks_find,
+        // so this is classified as Change with expects_mutation=true.
         let contract =
             infer_completion_contract("Find the most relevant note from last week.", &[]);
-        assert_eq!(contract.task_kind, CompletionTaskKind::Find);
-        assert!(!contract.expects_mutation);
+        assert_eq!(contract.task_kind, CompletionTaskKind::Change);
+        assert!(contract.expects_mutation);
         assert!(!contract.requires_observation);
     }
 
@@ -2127,6 +2801,116 @@ mod tests {
     }
 
     #[test]
+    fn project_scope_extraction_rejects_named_project_roots_without_local_cues() {
+        let history = vec![];
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects-root");
+        let project = alias_root.join("blog.aidaemon.ai");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"blog\"\n").expect("wrangler");
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        let scopes = extract_project_scopes_from_history(
+            &history,
+            "Tell me about blog.aidaemon.ai and its latest posts.",
+            4,
+            false,
+            &alias_roots,
+        );
+        assert!(
+            scopes.is_empty(),
+            "descriptive external request should not infer project scope: {:?}",
+            scopes
+        );
+    }
+
+    #[test]
+    fn project_scope_extraction_rejects_plain_word_nickname_without_local_scope_cues() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects-root");
+        let project = alias_root.join("fairfax-va-site");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        let scopes = extract_project_scopes_from_history(
+            &[],
+            "Find recruiting studies in Fairfax, Virginia and summarize them.",
+            4,
+            false,
+            &alias_roots,
+        );
+
+        assert!(
+            scopes.is_empty(),
+            "plain language should not infer a project scope: {:?}",
+            scopes
+        );
+    }
+
+    #[test]
+    fn project_scope_extraction_allows_plain_word_nickname_with_explicit_project_scope_cues() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let alias_root = root.path().join("projects-root");
+        let project = alias_root.join("fairfax-va-site");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+        let alias_roots = vec![alias_root.to_string_lossy().to_string()];
+
+        let scopes = extract_project_scopes_from_history(
+            &[],
+            "Check the Fairfax project for broken links.",
+            4,
+            false,
+            &alias_roots,
+        );
+
+        assert_eq!(scopes, vec![project.to_string_lossy().to_string()]);
+    }
+
+    #[test]
+    fn project_scope_extraction_rejects_natural_language_slash_phrases() {
+        let scopes = extract_project_scopes_from_history(
+            &[],
+            "The old workflow used to commit, deploy, and reload/restart the daemon.",
+            4,
+            false,
+            &[],
+        );
+
+        assert!(
+            scopes.is_empty(),
+            "natural-language slash phrase should not infer a project scope: {:?}",
+            scopes
+        );
+    }
+
+    #[test]
+    fn project_scope_extraction_rejects_globbed_absolute_paths() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let project = root.path().join("demo-project");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("cargo");
+        let text = format!(
+            "Previous failure mentioned {}",
+            project.join("reload/restart**").display()
+        );
+
+        let mut scopes = Vec::new();
+        extract_project_scopes_from_text(&text, &mut scopes, 4, &[]);
+
+        assert!(
+            scopes.is_empty(),
+            "globbed absolute path should not infer a project scope: {:?}",
+            scopes
+        );
+    }
+
+    #[test]
     fn named_project_scope_divergence_breaks_followup_carryover() {
         let root = tempfile::tempdir().expect("tempdir");
         let alias_root = root.path().join("projects-root");
@@ -2162,6 +2946,157 @@ mod tests {
             .unwrap_or_default();
         assert!(!assistant_content.contains("[INTENT_GATE]"));
         assert_eq!(assistant_content, "Sure, I can help.");
+    }
+
+    #[test]
+    fn recent_parent_messages_include_recent_api_and_file_tool_summaries() {
+        let history = vec![
+            msg("user", "Look up those studies."),
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: "test-session".to_string(),
+                role: "tool".to_string(),
+                content: Some(crate::tools::sanitize::wrap_untrusted_output(
+                    "http_request",
+                    "HTTP 200 OK\ncontent-type: application/json\n\n{\"studies\":[]}",
+                )),
+                tool_call_id: Some("call-http".to_string()),
+                tool_name: Some("http_request".to_string()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.5,
+                ..Message::runtime_defaults()
+            },
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: "test-session".to_string(),
+                role: "tool".to_string(),
+                content: Some("File sent: studies.json (127 KB)".to_string()),
+                tool_call_id: Some("call-file".to_string()),
+                tool_name: Some("send_file".to_string()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.5,
+                ..Message::runtime_defaults()
+            },
+            msg("assistant", "I fetched the results and sent the file."),
+        ];
+
+        let messages = extract_recent_parent_messages(&history, 6);
+        assert!(messages.iter().any(|row| {
+            row.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && row
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|content| content.contains("http_request: HTTP 200 OK"))
+        }));
+        assert!(messages.iter().any(|row| {
+            row.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && row
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|content| content.contains("send_file: File sent: studies.json"))
+        }));
+    }
+
+    #[test]
+    fn recent_parent_messages_preserve_http_error_detail_beyond_headers() {
+        let history = vec![
+            msg("user", "Check that trial ID."),
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: "test-session".to_string(),
+                role: "tool".to_string(),
+                content: Some(crate::tools::sanitize::wrap_untrusted_output(
+                    "http_request",
+                    "HTTP 404 Not Found\ncontent-type: application/json\n\nNot Found: NCT05178195",
+                )),
+                tool_call_id: Some("call-http".to_string()),
+                tool_name: Some("http_request".to_string()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.5,
+                ..Message::runtime_defaults()
+            },
+            msg(
+                "assistant",
+                "The API could not find that study, but I should confirm the exact error.",
+            ),
+        ];
+
+        let messages = extract_recent_parent_messages(&history, 6);
+        assert!(messages.iter().any(|row| {
+            row.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && row
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|content| {
+                        content
+                            .contains("http_request: HTTP 404 Not Found | Not Found: NCT05178195")
+                    })
+        }));
+    }
+
+    #[test]
+    fn recent_parent_messages_include_web_fetch_error_summaries() {
+        let history = vec![
+            msg("user", "Check that page."),
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: "test-session".to_string(),
+                role: "tool".to_string(),
+                content: Some(crate::tools::sanitize::wrap_untrusted_output(
+                    "web_fetch",
+                    "Error fetching https://example.com/missing: HTTP 404 Not Found",
+                )),
+                tool_call_id: Some("call-web-fetch".to_string()),
+                tool_name: Some("web_fetch".to_string()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.5,
+                ..Message::runtime_defaults()
+            },
+            msg("assistant", "That page fetch failed."),
+        ];
+
+        let messages = extract_recent_parent_messages(&history, 6);
+        assert!(messages.iter().any(|row| {
+            row.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && row.get("content").and_then(|v| v.as_str()).is_some_and(|content| {
+                    content.contains("web_fetch: Error fetching https://example.com/missing: HTTP 404 Not Found")
+                    })
+        }));
+    }
+
+    #[test]
+    fn recent_parent_messages_include_generic_terminal_evidence_summary() {
+        let history = vec![
+            msg("user", "Run the tests."),
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: "test-session".to_string(),
+                role: "tool".to_string(),
+                content: Some("pytest\nAssertionError: expected 1 but got 2".to_string()),
+                tool_call_id: Some("call-terminal".to_string()),
+                tool_name: Some("terminal".to_string()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.5,
+                ..Message::runtime_defaults()
+            },
+            msg("assistant", "The tests failed."),
+        ];
+
+        let messages = extract_recent_parent_messages(&history, 6);
+        assert!(messages.iter().any(|row| {
+            row.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && row
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|content| {
+                        content.contains("terminal: pytest | AssertionError: expected 1 but got 2")
+                    })
+        }));
     }
 
     #[tokio::test]
@@ -2202,6 +3137,96 @@ mod tests {
             "new tasks should not inherit prior project hints: {:?}",
             turn_context.project_hints
         );
+    }
+
+    #[tokio::test]
+    async fn build_turn_context_does_not_reuse_old_local_scope_for_external_followup() {
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .state
+            .append_message(&msg(
+                "user",
+                "Please work in /Users/davidloor/projects/fairfax-va-site and inspect the logs.",
+            ))
+            .await
+            .expect("append old local user");
+        harness
+            .state
+            .append_message(&msg(
+                "assistant",
+                "I am currently locked to /Users/davidloor/projects/fairfax-va-site.",
+            ))
+            .await
+            .expect("append old local assistant");
+        harness
+            .state
+            .append_message(&msg(
+                "user",
+                "Find melanoma clinical trials recruiting near Fairfax, Virginia.",
+            ))
+            .await
+            .expect("append external user");
+        harness
+            .state
+            .append_message(&msg(
+                "assistant",
+                "I found 10 recruiting trials near Fairfax, VA with male participants.",
+            ))
+            .await
+            .expect("append external assistant");
+
+        let turn_context = harness
+            .agent
+            .build_turn_context_from_recent_history(
+                "test-session",
+                "Give me all the info about the top 2.",
+            )
+            .await;
+
+        assert_eq!(turn_context.primary_project_scope, None);
+    }
+
+    #[tokio::test]
+    async fn build_turn_context_keeps_detailed_schedule_request_separate_from_previous_task() {
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .state
+            .append_message(&msg(
+                "user",
+                "Can you post your daily blog post on your blog?",
+            ))
+            .await
+            .expect("append prior user");
+        harness
+            .state
+            .append_message(&msg("assistant", "Would you like me to schedule that too?"))
+            .await
+            .expect("append prior assistant");
+
+        let current = "Can you set up a daily scheduled task at 6:00 am to publish the blog with honest reflections about recent errors and fixes.";
+        let turn_context = harness
+            .agent
+            .build_turn_context_from_recent_history("test-session", current)
+            .await;
+
+        assert_eq!(turn_context.followup_mode, Some(FollowupMode::NewTask));
+        assert_eq!(turn_context.goal_user_text, current);
+        assert!(turn_context.recent_messages.is_empty());
+        assert_eq!(
+            turn_context.completion_contract.task_kind,
+            CompletionTaskKind::Schedule
+        );
+        assert!(!turn_context.completion_contract.requires_observation);
     }
 
     proptest! {

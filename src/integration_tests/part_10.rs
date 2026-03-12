@@ -99,6 +99,129 @@ async fn test_task_boundary_injected_between_turns() {
     );
 }
 
+/// Regression: artifact-inspection requests with uploaded-file context should not
+/// carry over the immediately prior topical conversation. The uploaded artifact
+/// is the anchor, not the previous assistant question.
+#[tokio::test]
+async fn test_uploaded_artifact_request_drops_previous_topic_context() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            "Would you like me to get more detailed information for any specific trial(s)?",
+        ),
+        MockProvider::text_response("I reviewed the uploaded document and identified the issue."),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "artifact_bleed_test",
+            "These are the NCT trial numbers: NCT06737964 and NCT06737965.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let artifact_request = "[File received: 68235.png (413 KB, image/png)\nSaved to: /Users/davidloor/projects/aidaemon/.aidaemon/files/inbox/694c3943_68235.png]\nCheck the doc and fix the issue.";
+    let _ = harness
+        .agent
+        .handle_message(
+            "artifact_bleed_test",
+            artifact_request,
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    let turn2_call = call_log.last().expect("turn 2 call");
+
+    assert!(
+        turn2_call.messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("[File received: 68235.png"))
+        }),
+        "Turn 2 should include the uploaded-file context"
+    );
+
+    assert!(
+        !turn2_call.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("NCT06737964") || s.contains("specific trial"))
+        }),
+        "Uploaded artifact request should not include the previous trial topic in Turn 2 context: {:?}",
+        turn2_call.messages
+    );
+}
+
+/// Regression: after tool progress exists in the current task, a generic idle
+/// prompt must not be accepted as the final answer. The next LLM call should
+/// also carry an execution checkpoint for continuity.
+#[tokio::test]
+async fn test_idle_reengagement_reply_after_tool_progress_is_recovered() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("I'm here. What would you like me to help you with?"),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "idle_reengagement_recovery",
+            "Check the system details and tell me what machine this is.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !response.contains("What would you like me to help you with"),
+        "generic idle re-engagement reply should not be returned after tool progress: {}",
+        response
+    );
+    assert!(
+        response.contains("latest tool output") || response.contains("Date:"),
+        "final reply should recover from concrete tool evidence: {}",
+        response
+    );
+
+    let call_log = harness.provider.call_log.lock().await;
+    assert!(
+        call_log.len() >= 2,
+        "expected at least two LLM calls, got {}",
+        call_log.len()
+    );
+    let second_call_has_checkpoint = call_log[1].messages.iter().any(|message| {
+        message.get("role").and_then(|r| r.as_str()) == Some("system")
+            && message
+                .get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|content| {
+                    content.contains("EXECUTION CHECKPOINT")
+                        && content.contains("Check the system details")
+                })
+    });
+    assert!(
+        second_call_has_checkpoint,
+        "second LLM call should include the execution checkpoint"
+    );
+}
+
 // ==================== Orchestrator Tool Presence Regression Tests ====================
 
 #[tokio::test]

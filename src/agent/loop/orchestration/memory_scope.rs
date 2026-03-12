@@ -1,3 +1,4 @@
+use crate::agent::contains_keyword_as_words;
 use crate::traits::{Fact, Procedure};
 
 fn normalize_for_project_match(input: &str) -> String {
@@ -22,12 +23,8 @@ fn text_matches_project_hint(text: &str, hint: &str) -> bool {
         return false;
     }
 
-    let lower_text = text.to_ascii_lowercase();
-    if lower_text.contains(&hint.to_ascii_lowercase()) {
-        return true;
-    }
     let normalized_text = normalize_for_project_match(text);
-    normalized_text.contains(&normalized_hint)
+    contains_keyword_as_words(&normalized_text, &normalized_hint)
 }
 
 fn fact_matches_project_hints(fact: &Fact, project_hints: &[String]) -> bool {

@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use tracing::warn;
@@ -17,11 +18,23 @@ pub(super) enum ToolFailureClass {
     Transient,
 }
 
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ExecutionFailureKind {
+    ToolContractFailure,
+    ToolInvocationFailure,
+    EnvironmentFailure,
+    LogicFailure,
+}
+
 pub(super) fn semantic_failure_limit(tool_name: &str) -> usize {
-    if tool_name == "cli_agent" {
-        2
-    } else {
-        3
+    match tool_name {
+        "cli_agent" => 2,
+        // API calls often need multiple attempts to discover correct parameter
+        // formats, especially for unfamiliar APIs. Give more room to iterate.
+        "http_request" => 5,
+        _ => 3,
     }
 }
 
@@ -68,6 +81,16 @@ fn classify_text_error(lower: &str) -> ToolFailureClass {
     if contains_any(
         lower,
         &[
+            "temporarily unavailable in this session",
+            "unavailable in this session",
+        ],
+    ) {
+        return ToolFailureClass::Semantic;
+    }
+
+    if contains_any(
+        lower,
+        &[
             "rate limit",
             "too many requests",
             "timed out",
@@ -93,6 +116,88 @@ fn classify_text_error(lower: &str) -> ToolFailureClass {
         return ToolFailureClass::Transient;
     }
     ToolFailureClass::Semantic
+}
+
+fn looks_like_tool_contract_error(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "missing required parameter",
+            "missing required field",
+            "invalid arguments",
+            "invalid argument",
+            "invalid json",
+            "invalid request format",
+            "failed to parse",
+            "parse error",
+            "expected object",
+            "schema mismatch",
+            "unexpected field",
+            "unknown action",
+            "requires `goal_id`",
+            "requires 'goal_id'",
+            "\"goal_id\" is required",
+            "tool-only parameters were embedded in the url",
+        ],
+    )
+}
+
+fn looks_like_environment_error(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "file not found",
+            "no such file",
+            "no such directory",
+            "does not exist",
+            "path is a directory",
+            "not a git repository",
+            "permission denied",
+            "operation not permitted",
+            "access denied",
+            "unauthorized",
+            "forbidden",
+            "missing auth",
+            "missing api key",
+            "credentials",
+            "command not found",
+            "service not running",
+            "not configured",
+        ],
+    )
+}
+
+fn metadata_indicates_tool_invocation_failure(metadata: &crate::traits::ToolCallMetadata) -> bool {
+    if metadata.timed_out {
+        return true;
+    }
+    metadata
+        .transport_error
+        .as_ref()
+        .is_some_and(|transport_err| {
+            let lower_err = transport_err.to_ascii_lowercase();
+            contains_any(
+                &lower_err,
+                &[
+                    "timed out",
+                    "timeout",
+                    "connection refused",
+                    "connection reset",
+                    "broken pipe",
+                    "network",
+                    "rate limit",
+                    "429",
+                    "503",
+                    "502",
+                    "504",
+                    "econnrefused",
+                    "econnreset",
+                    "etimedout",
+                    "ehostunreach",
+                    "dns",
+                ],
+            )
+        })
 }
 
 fn is_file_lookup_tool(tool_name: &str) -> bool {
@@ -150,6 +255,8 @@ fn looks_like_error_signal(lower: &str) -> bool {
             "connection aborted",
             "connection failed",
             "connection timed out",
+            "temporarily unavailable in this session",
+            "unavailable in this session",
         ],
     )
 }
@@ -349,6 +456,13 @@ fn is_data_content_tool(tool_name: &str) -> bool {
     )
 }
 
+/// Tools that return external data which may contain error-like keywords in
+/// successful responses. Skips generic error detection but still checks HTTP
+/// status codes (which indicate actual request failures).
+fn is_external_data_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "web_fetch" | "http_request")
+}
+
 fn manage_memories_list_output_is_report(result_text: &str, tool_arguments: Option<&str>) -> bool {
     let action = tool_arguments
         .and_then(|args| serde_json::from_str::<Value>(args).ok())
@@ -405,6 +519,13 @@ pub(super) fn classify_tool_result_failure(
         if let Some(kind) = classify_http_status(status) {
             return Some(kind);
         }
+    }
+
+    // External data tools (http_request, web_fetch) return content that
+    // routinely contains error-like keywords from remote sites. Only HTTP
+    // status failures (checked above) indicate real tool failures.
+    if is_external_data_tool(tool_name) {
+        return None;
     }
 
     if cleaned.starts_with('{') || cleaned.starts_with('[') {
@@ -531,6 +652,36 @@ pub(super) fn classify_tool_result_failure_with_context(
         }
     }
     classify_tool_result_failure_with_args(tool_name, result_text, tool_arguments)
+}
+
+pub(super) fn classify_execution_failure_kind(
+    tool_name: &str,
+    result_text: &str,
+    tool_arguments: Option<&str>,
+    metadata: Option<&crate::traits::ToolCallMetadata>,
+    had_deterministic_contract_violation: bool,
+) -> Option<ExecutionFailureKind> {
+    if had_deterministic_contract_violation {
+        return Some(ExecutionFailureKind::ToolContractFailure);
+    }
+
+    let lower = strip_appended_diagnostics(result_text).to_ascii_lowercase();
+    if looks_like_tool_contract_error(&lower) {
+        return Some(ExecutionFailureKind::ToolContractFailure);
+    }
+    if looks_like_environment_error(&lower) {
+        return Some(ExecutionFailureKind::EnvironmentFailure);
+    }
+    if metadata.is_some_and(metadata_indicates_tool_invocation_failure) {
+        return Some(ExecutionFailureKind::ToolInvocationFailure);
+    }
+
+    classify_tool_result_failure_with_context(tool_name, result_text, tool_arguments, metadata).map(
+        |failure_class| match failure_class {
+            ToolFailureClass::Transient => ExecutionFailureKind::ToolInvocationFailure,
+            ToolFailureClass::Semantic => ExecutionFailureKind::LogicFailure,
+        },
+    )
 }
 
 /// Extract the most informative error line from a tool error result.
@@ -731,8 +882,9 @@ mod task_boundary_hint_tests {
 #[cfg(test)]
 mod tool_error_detection_tests {
     use super::{
-        classify_tool_result_failure, classify_tool_result_failure_with_args,
-        classify_tool_result_failure_with_context, ToolFailureClass,
+        classify_execution_failure_kind, classify_tool_result_failure,
+        classify_tool_result_failure_with_args, classify_tool_result_failure_with_context,
+        ExecutionFailureKind, ToolFailureClass,
     };
 
     #[test]
@@ -792,6 +944,17 @@ mod tool_error_detection_tests {
 
         let semantic_attempt = classify_tool_result_failure("terminal", "Attempt 1: 404");
         assert_eq!(semantic_attempt, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn treats_session_scoped_unavailability_as_semantic_error() {
+        let result = "Filesystem MCP server is temporarily unavailable in this session.";
+        let classified = classify_tool_result_failure("manage_skills", result);
+        assert_eq!(classified, Some(ToolFailureClass::Semantic));
+
+        let failure_kind =
+            classify_execution_failure_kind("manage_skills", result, None, None, false);
+        assert_eq!(failure_kind, Some(ExecutionFailureKind::LogicFailure));
     }
 
     #[test]
@@ -980,6 +1143,65 @@ mod tool_error_detection_tests {
         );
         // Falls through to text classification → Transient (file lookup miss)
         assert_eq!(classified, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn execution_failure_kind_detects_tool_contract_errors() {
+        let classified = classify_execution_failure_kind(
+            "manage_memories",
+            r#"{"error":"invalid arguments: missing required field"}"#,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(classified, Some(ExecutionFailureKind::ToolContractFailure));
+    }
+
+    #[test]
+    fn execution_failure_kind_detects_environment_errors() {
+        let classified = classify_execution_failure_kind(
+            "read_file",
+            "Error: File not found: /tmp/missing.txt",
+            None,
+            None,
+            false,
+        );
+        assert_eq!(classified, Some(ExecutionFailureKind::EnvironmentFailure));
+    }
+
+    #[test]
+    fn execution_failure_kind_detects_transport_failures() {
+        let metadata = crate::traits::ToolCallMetadata {
+            transport_error: Some("connection refused".to_string()),
+            ..Default::default()
+        };
+        let classified = classify_execution_failure_kind(
+            "web_fetch",
+            "Error: connection refused",
+            None,
+            Some(&metadata),
+            false,
+        );
+        assert_eq!(
+            classified,
+            Some(ExecutionFailureKind::ToolInvocationFailure)
+        );
+    }
+
+    #[test]
+    fn execution_failure_kind_detects_logic_failures() {
+        let metadata = crate::traits::ToolCallMetadata {
+            exit_code: Some(2),
+            ..Default::default()
+        };
+        let classified = classify_execution_failure_kind(
+            "terminal",
+            "tests failed",
+            None,
+            Some(&metadata),
+            false,
+        );
+        assert_eq!(classified, Some(ExecutionFailureKind::LogicFailure));
     }
 }
 

@@ -194,7 +194,7 @@ impl Tool for ManageGoalTasksTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_goal_tasks",
-            "description": "Manage tasks within your assigned goal. Use create_task to break work into steps, claim_task before spawning an executor, list_tasks to check progress, update_task to record results.",
+            "description": "Manage tasks inside the current goal.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -205,11 +205,11 @@ impl Tool for ManageGoalTasksTool {
                     },
                     "task_id": {
                         "type": "string",
-                        "description": "Task ID (for update_task, claim_task, retry_task)"
+                        "description": "Task ID"
                     },
                     "description": {
                         "type": "string",
-                        "description": "Task description (for create_task)"
+                        "description": "Task description"
                     },
                     "priority": {
                         "type": "string",
@@ -218,20 +218,20 @@ impl Tool for ManageGoalTasksTool {
                     },
                     "task_order": {
                         "type": "integer",
-                        "description": "Execution order within the goal"
+                        "description": "Execution order"
                     },
                     "parallel_group": {
                         "type": "string",
-                        "description": "Group name for tasks that can run concurrently"
+                        "description": "Parallel group"
                     },
                     "depends_on": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Task IDs this task depends on"
+                        "description": "Dependencies"
                     },
                     "idempotent": {
                         "type": "boolean",
-                        "description": "Whether this task is safe to retry"
+                        "description": "Safe to retry"
                     },
                     "status": {
                         "type": "string",
@@ -240,19 +240,19 @@ impl Tool for ManageGoalTasksTool {
                     },
                     "result": {
                         "type": "string",
-                        "description": "Result text (for update_task with completed status)"
+                        "description": "Result text"
                     },
                     "error": {
                         "type": "string",
-                        "description": "Error message (for update_task with failed status)"
+                        "description": "Error text"
                     },
                     "summary": {
                         "type": "string",
-                        "description": "Summary (for complete_goal/fail_goal)"
+                        "description": "Goal summary"
                     },
                     "agent_id": {
                         "type": "string",
-                        "description": "Agent identifier (for claim_task)"
+                        "description": "Agent ID"
                     }
                 },
                 "required": ["action"],

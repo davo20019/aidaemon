@@ -96,6 +96,265 @@ impl Agent {
         self.cancel_token.as_ref().map(|t| t.child_token())
     }
 
+    fn collect_executor_expected_targets(
+        mission: &str,
+        task_description: &str,
+        project_scope: Option<&str>,
+    ) -> Vec<crate::traits::ToolTargetHint> {
+        let mut targets = Vec::new();
+
+        if let Some(scope) = project_scope {
+            if let Some(target) = crate::traits::ToolTargetHint::new(
+                crate::traits::ToolTargetHintKind::ProjectScope,
+                scope,
+            ) {
+                targets.push(target);
+            }
+        }
+
+        let mut add_dir = |dir: String| {
+            if let Some(target) =
+                crate::traits::ToolTargetHint::new(crate::traits::ToolTargetHintKind::Path, dir)
+            {
+                if !targets.iter().any(|existing| existing == &target) {
+                    targets.push(target);
+                }
+            }
+        };
+
+        for dir in Self::extract_directory_paths(mission) {
+            add_dir(dir);
+        }
+        for dir in Self::extract_directory_paths(task_description) {
+            add_dir(dir);
+        }
+
+        targets
+    }
+
+    fn build_executor_handoff(
+        task_id: &str,
+        mission: &str,
+        task_description: &str,
+        tools: &[Arc<dyn Tool>],
+        project_scope: Option<&str>,
+    ) -> ExecutorHandoff {
+        let expected_targets =
+            Self::collect_executor_expected_targets(mission, task_description, project_scope);
+        let allowed_targets = if let Some(scope) = project_scope {
+            crate::traits::ToolTargetHint::new(
+                crate::traits::ToolTargetHintKind::ProjectScope,
+                scope,
+            )
+            .into_iter()
+            .collect()
+        } else {
+            expected_targets.clone()
+        };
+
+        ExecutorHandoff {
+            task_id: task_id.to_string(),
+            mission: mission.to_string(),
+            task_description: task_description.to_string(),
+            target_scope: crate::agent::execution_state::TargetScope {
+                allowed_targets,
+                hard_fail_outside_scope: project_scope.is_some(),
+            },
+            expected_targets,
+            allowed_tools: Some(
+                tools
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
+
+    async fn prepare_executor_task_handoff(
+        &self,
+        task_id: &str,
+        handoff: &ExecutorHandoff,
+        child_session: &str,
+    ) {
+        if let Ok(Some(mut task)) = self.state.get_task(task_id).await {
+            task.status = "running".to_string();
+            if task.started_at.is_none() {
+                task.started_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            if let Ok(context) = persist_executor_handoff_context(task.context.as_deref(), handoff)
+            {
+                task.context = Some(context);
+            }
+            let _ = self.state.update_task(&task).await;
+        }
+
+        let activity = crate::traits::TaskActivity {
+            id: 0,
+            task_id: task_id.to_string(),
+            activity_type: "executor_handoff".to_string(),
+            tool_name: Some("spawn_agent".to_string()),
+            tool_args: serde_json::to_string(handoff).ok(),
+            result: None,
+            success: Some(true),
+            tokens_used: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let _ = self.state.log_task_activity(&activity).await;
+
+        if self.record_decision_points {
+            let emitter = crate::events::EventEmitter::new(
+                self.event_store.clone(),
+                child_session.to_string(),
+            );
+            let _ = emitter
+                .emit(
+                    EventType::DecisionPoint,
+                    DecisionPointData {
+                        decision_type: DecisionType::ExecutionPlanningGate,
+                        task_id: task_id.to_string(),
+                        iteration: 0,
+                        severity: crate::events::DiagnosticSeverity::Info,
+                        code: Some("executor_handoff".to_string()),
+                        metadata: json!({
+                            "condition": "executor_handoff",
+                            "executor_handoff": handoff,
+                        }),
+                        summary: "Persisted executor handoff contract before delegated execution."
+                            .to_string(),
+                    },
+                )
+                .await;
+        }
+    }
+
+    async fn finalize_executor_task_outcome(
+        &self,
+        task_id: &str,
+        response: Option<&str>,
+        error: Option<&str>,
+        child_session: &str,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let latest_task = self.state.get_task(task_id).await.ok().flatten();
+        let structured =
+            derive_executor_step_result(task_id, latest_task.as_ref(), response, error);
+        let task_lead_summary = structured.render_task_lead_summary();
+
+        if let Some(mut task) = latest_task {
+            if let Ok(context) =
+                persist_executor_result_context(task.context.as_deref(), &structured)
+            {
+                task.context = Some(context);
+            }
+
+            match error {
+                Some(error) => {
+                    task.status = "failed".to_string();
+                    task.error = Some(error.to_string());
+                    task.completed_at = Some(now.clone());
+                    if task
+                        .result
+                        .as_deref()
+                        .is_none_or(|result| result.trim().is_empty())
+                    {
+                        task.result = Some(structured.summary.clone());
+                    }
+                }
+                None => {
+                    match structured.task_outcome {
+                        TaskValidationOutcome::TaskDone
+                        | TaskValidationOutcome::ContinueWithNextStep => {
+                            if task
+                                .result
+                                .as_deref()
+                                .is_none_or(|result| result.trim().is_empty())
+                            {
+                                if let Some(response) = response {
+                                    if !response.trim().is_empty() {
+                                        task.result = Some(response.to_string());
+                                    } else {
+                                        task.result = Some(structured.summary.clone());
+                                    }
+                                } else {
+                                    task.result = Some(structured.summary.clone());
+                                }
+                            }
+                            task.status = "completed".to_string();
+                            task.blocker = None;
+                            task.error = None;
+                        }
+                        _ => {
+                            task.result = Some(task_lead_summary.clone());
+                            task.status = "blocked".to_string();
+                            task.blocker = structured
+                                .blocker
+                                .clone()
+                                .or_else(|| structured.exact_need.clone())
+                                .or_else(|| Some(structured.summary.clone()));
+                        }
+                    }
+                    task.completed_at = Some(now.clone());
+                }
+            }
+
+            let _ = self.state.update_task(&task).await;
+        }
+
+        let activity = crate::traits::TaskActivity {
+            id: 0,
+            task_id: task_id.to_string(),
+            activity_type: "step_validation".to_string(),
+            tool_name: None,
+            tool_args: None,
+            result: serde_json::to_string(&structured).ok(),
+            success: Some(error.is_none()),
+            tokens_used: None,
+            created_at: now.clone(),
+        };
+        let _ = self.state.log_task_activity(&activity).await;
+
+        if self.record_decision_points {
+            let emitter = crate::events::EventEmitter::new(
+                self.event_store.clone(),
+                child_session.to_string(),
+            );
+            let _ = emitter
+                .emit(
+                    EventType::DecisionPoint,
+                    DecisionPointData {
+                        decision_type: DecisionType::PostExecutionValidation,
+                        task_id: task_id.to_string(),
+                        iteration: 0,
+                        severity: if error.is_some() {
+                            crate::events::DiagnosticSeverity::Error
+                        } else if matches!(structured.task_outcome, TaskValidationOutcome::TaskDone)
+                        {
+                            crate::events::DiagnosticSeverity::Info
+                        } else {
+                            crate::events::DiagnosticSeverity::Warning
+                        },
+                        code: Some("executor_task_validation".to_string()),
+                        metadata: json!({
+                            "condition": "executor_task_validation",
+                            "step_validation_outcome": structured.step_outcome,
+                            "task_validation_outcome": structured.task_outcome,
+                            "executor_result": structured,
+                        }),
+                        summary: "Recorded delegated executor step/task validation outcome."
+                            .to_string(),
+                    },
+                )
+                .await;
+        }
+    }
+
+    pub(crate) async fn mark_executor_task_timeout(&self, task_id: &str, timeout_secs: u64) {
+        let session_id = format!("executor-timeout-{task_id}");
+        let error = format!("Executor timed out after {timeout_secs} seconds");
+        self.finalize_executor_task_outcome(task_id, None, Some(&error), &session_id)
+            .await;
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn create_child_agent(
         &self,
@@ -289,6 +548,8 @@ impl Agent {
                         child_depth,
                         self.max_depth,
                         has_cli_agent,
+                        task_id,
+                        inherited_project_scope,
                     );
                     // Executors never get SpawnAgentTool
                     return self
@@ -436,6 +697,19 @@ impl Agent {
         let start = std::time::Instant::now();
         // Save task_id for post-completion knowledge extraction (Phase 4)
         let saved_task_id = task_id.clone();
+        if role == AgentRole::Executor {
+            if let Some(task_id) = saved_task_id.as_deref() {
+                let handoff = Self::build_executor_handoff(
+                    task_id,
+                    mission,
+                    task,
+                    tools,
+                    inherited_project_scope,
+                );
+                self.prepare_executor_task_handoff(task_id, &handoff, &child_session)
+                    .await;
+            }
+        }
         let cancel_token =
             cancel_token_override.or_else(|| self.cancel_token.as_ref().map(|t| t.child_token()));
         let child = self
@@ -463,6 +737,19 @@ impl Agent {
                 None,
             )
             .await;
+
+        if role == AgentRole::Executor {
+            if let Some(task_id) = saved_task_id.as_deref() {
+                let error_text = result.as_ref().err().map(|error| error.to_string());
+                self.finalize_executor_task_outcome(
+                    task_id,
+                    result.as_ref().ok().map(String::as_str),
+                    error_text.as_deref(),
+                    &child_session,
+                )
+                .await;
+            }
+        }
 
         let duration = start.elapsed();
 
@@ -713,7 +1000,8 @@ impl Agent {
              - Spawn executors one at a time (sequential execution)\n\
              - Each executor gets a single, focused task\n\
              - Always check list_tasks before spawning the next executor\n\
-             - If an executor reports a blocker, resolve it or adjust the plan\n\
+             - If an executor reports a blocker, inspect the recorded task status/result and resolve it or adjust the plan\n\
+             - Executors persist a structured handoff/result contract onto the claimed task record; do not treat vague prose alone as proof of completion\n\
              - When finishing the goal, your final reply MUST include concrete executor results (outputs, paths, data), not just \"goal completed\""
         );
 
@@ -729,12 +1017,13 @@ impl Agent {
             prompt.push_str(
                 "\n\n## CLI Agent Delegation\n\
                  You have direct access to `cli_agent` (a specialized coding/research agent running on this machine).\n\
-                 Prefer `cli_agent` for execution-heavy tasks (coding, analysis, file work, command workflows).\n\
-                 Use `spawn_agent` only when work specifically needs aidaemon-only tools like memory/people/MCP.\n\
+                 Treat `cli_agent` as a delegation surface, not as a reason to skip task structure.\n\
+                 If the work should stay tied to a claimed task with executor results or blocker handling, claim the task and use `spawn_agent`.\n\
+                 Prefer direct `cli_agent` calls for focused execution-heavy work when you do not need aidaemon-only tools in the child.\n\
                  When calling `cli_agent`, use `action=\"run\"` and include a non-empty `prompt` describing the work.\n\
                  Pass `working_dir` whenever the task targets a specific repo or directory.\n\
                  Example: `cli_agent(action=\"run\", prompt=\"Inspect the latest service logs, patch the root cause, run cargo fmt, and run the narrowest relevant tests\", working_dir=\"/absolute/project/path\")`.\n\
-                 Note: Executor sub-agents have `terminal`, `read_file`, `write_file`, `edit_file`, and `search_files` available alongside `cli_agent`.",
+                 Note: Executors spawned via `spawn_agent` still have direct file tools (`read_file`, `write_file`, `edit_file`, `search_files`), but when `cli_agent` is available they do NOT have `terminal`, `browser`, or `run_command`.",
             );
         }
 
@@ -785,6 +1074,8 @@ impl Agent {
         depth: usize,
         max_depth: usize,
         has_cli_agent: bool,
+        task_id: Option<&str>,
+        project_scope: Option<&str>,
     ) -> String {
         // Extract directory paths from both parent mission and task description
         let mut all_dirs = Self::extract_directory_paths(parent_mission);
@@ -818,6 +1109,18 @@ impl Agent {
             );
         }
 
+        if let Some(task_id) = task_id {
+            let handoff = Self::build_executor_handoff(
+                task_id,
+                parent_mission,
+                task_description,
+                &[],
+                project_scope,
+            );
+            prompt.push_str(&handoff.render_prompt_section());
+            prompt.push_str("\n\n");
+        }
+
         prompt.push_str(&format!(
             "## Original User Request\n\
              {parent_mission}\n\n\
@@ -830,22 +1133,25 @@ impl Agent {
              - There is no human in this loop — you are an autonomous executor.\n\
              - For modifying code: use `edit_file` (preferred) or `write_file`. NEVER use `python3 -c` to rewrite files — it is blocked.\n\
              - For reading code: use `read_file` with ABSOLUTE paths. For searching: use `search_files` with ABSOLUTE directory path.\n\
-             - For running tests or commands: use `terminal` with simple, single-line commands.\n\
-             - Avoid multi-line terminal commands. If you need to do file edits, use `edit_file` tool.\n\
-             - If terminal is unavoidable, scope commands to explicit directories and avoid scanning `target`, `node_modules`, and `.git` trees.\n\
+             - For running commands, use the execution surface actually available in your tool set.\n\
+             - If `terminal` is available, keep commands simple and single-line.\n\
+             - If `terminal` is available, scope commands to explicit directories and avoid scanning `target`, `node_modules`, and `.git` trees.\n\
              - If you encounter ambiguity or a blocker you cannot resolve, use report_blocker immediately.\n\
+             - When using report_blocker, include outcome, reason, partial_work when applicable, exact_need, next_step, and target.\n\
              - Return the FULL content you produced — not a meta-description of what you did.\n\
              - NEVER return just \"I researched X\" or \"Generated a report about Y\". Return the actual content.\n\
              - Include specific outputs (file paths, data retrieved, commands run).\n\
              - If you create or write a file, include its FULL ABSOLUTE PATH in your result text.\n\
+             - Do NOT claim the overall goal is complete. You may only finish this single task.\n\
              - Do NOT spawn sub-agents."
         ));
 
         if has_cli_agent {
             prompt.push_str(
-                "\n- `cli_agent` is available for multi-step coding, research, and file work.\n\
-                 If you use it, always provide `action=\"run\"`, a concrete `prompt`, and `working_dir` when you know the repo path.\n\
-                 For simple operations (single commands, file reads), prefer `terminal` directly.",
+                "\n- Delegation mode is active: `terminal`, `browser`, and `run_command` are not available here.\n\
+                 Use direct file tools (`read_file`, `edit_file`, `write_file`, `search_files`) for narrow file work.\n\
+                 Use `cli_agent` for shell/test flows or multi-step coding and research work.\n\
+                 When you use `cli_agent`, always provide `action=\"run\"`, a concrete `prompt`, and `working_dir` when you know the repo path.",
             );
         }
 
@@ -859,7 +1165,8 @@ mod tests {
 
     #[test]
     fn executor_prompt_includes_search_files_preference() {
-        let prompt = Agent::build_executor_prompt("find async fns", "user request", 2, 4, false);
+        let prompt =
+            Agent::build_executor_prompt("find async fns", "user request", 2, 4, false, None, None);
         assert!(prompt.contains("search_files"));
         assert!(prompt.contains("edit_file"));
         assert!(prompt.contains("avoid scanning `target`, `node_modules`, and `.git`"));
@@ -873,6 +1180,8 @@ mod tests {
             2,
             4,
             false,
+            None,
+            Some("/tmp/debugme3"),
         );
         assert!(
             prompt.contains("WORKING DIRECTORY"),
@@ -909,19 +1218,40 @@ mod tests {
 
     #[test]
     fn executor_prompt_mentions_cli_delegate_mode_when_cli_present() {
-        let prompt = Agent::build_executor_prompt("refactor auth", "user request", 2, 4, true);
-        assert!(prompt.contains("`cli_agent` is available"));
-        assert!(prompt.contains("prefer `terminal` directly"));
+        let prompt =
+            Agent::build_executor_prompt("refactor auth", "user request", 2, 4, true, None, None);
+        assert!(prompt.contains("Delegation mode is active"));
+        assert!(prompt.contains("`terminal`, `browser`, and `run_command` are not available"));
+        assert!(!prompt.contains("prefer `terminal` directly"));
         assert!(prompt.contains("action=\"run\""));
         assert!(prompt.contains("working_dir"));
+    }
+
+    #[test]
+    fn executor_prompt_includes_task_contract_when_task_id_present() {
+        let prompt = Agent::build_executor_prompt(
+            "patch /tmp/demo/src/main.rs",
+            "fix the scoped regression in /tmp/demo",
+            2,
+            4,
+            false,
+            Some("task-123"),
+            Some("/tmp/demo"),
+        );
+        assert!(prompt.contains("## Task Contract"));
+        assert!(prompt.contains("task_id: task-123"));
+        assert!(prompt.contains("allowed targets (hard boundary): /tmp/demo"));
+        assert!(prompt.contains("report_blocker"));
     }
 
     #[test]
     fn task_lead_prompt_mentions_cli_agent_when_available() {
         let prompt = Agent::build_task_lead_prompt("goal_2", "build release", None, 1, 3, true);
         assert!(prompt.contains("## CLI Agent Delegation"));
-        assert!(prompt.contains("Prefer `cli_agent`"));
+        assert!(prompt.contains("Treat `cli_agent` as a delegation surface"));
+        assert!(prompt.contains("claim the task and use `spawn_agent`"));
         assert!(prompt.contains("action=\"run\""));
         assert!(prompt.contains("working_dir"));
+        assert!(prompt.contains("do NOT have `terminal`, `browser`, or `run_command`"));
     }
 }

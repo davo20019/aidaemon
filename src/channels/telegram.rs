@@ -2017,6 +2017,8 @@ impl TelegramChannel {
 
     /// Auto-send file attachments referenced as absolute paths in a reply.
     async fn send_referenced_files_from_reply(
+        agent: &Agent,
+        session_id: &str,
         bot: &Bot,
         chat_id: ChatId,
         reply: &str,
@@ -2044,6 +2046,7 @@ impl TelegramChannel {
         let mut seen = HashSet::new();
         let mut sent = 0usize;
         let mut skipped = 0usize;
+        let mut delivered_files: Vec<(String, String)> = Vec::new();
 
         for path in candidate_paths {
             if sent >= MAX_FILES_PER_REPLY {
@@ -2075,6 +2078,7 @@ impl TelegramChannel {
             {
                 Ok(_) => {
                     sent += 1;
+                    delivered_files.push((file_name, path));
                 }
                 Err(e) => {
                     warn!(file = %path, error = %e, "Failed to send referenced file");
@@ -2085,6 +2089,19 @@ impl TelegramChannel {
                         )
                         .await;
                 }
+            }
+        }
+
+        if let Some(summary) = format_attachment_delivery_summary(&delivered_files) {
+            if let Err(err) = agent
+                .record_auxiliary_assistant_note(session_id, &summary)
+                .await
+            {
+                warn!(
+                    session_id,
+                    error = %err,
+                    "Failed to persist Telegram attachment delivery summary"
+                );
             }
         }
 
@@ -4879,6 +4896,8 @@ impl TelegramChannel {
                                 warn!("Failed to send Telegram message: {}", e);
                             }
                             TelegramChannel::send_referenced_files_from_reply(
+                                agent.as_ref(),
+                                &session_id,
                                 &bot,
                                 chat_id,
                                 &reply,
@@ -5590,6 +5609,31 @@ fn extract_candidate_file_paths(text: &str) -> Vec<String> {
     out
 }
 
+fn format_attachment_delivery_summary(delivered_files: &[(String, String)]) -> Option<String> {
+    if delivered_files.is_empty() {
+        return None;
+    }
+
+    if delivered_files.len() == 1 {
+        let (filename, path) = &delivered_files[0];
+        return Some(format!(
+            "Delivery note: I sent the attachment {} in chat. Local copy: {}",
+            filename, path
+        ));
+    }
+
+    let files = delivered_files
+        .iter()
+        .map(|(filename, path)| format!("{} ({})", filename, path))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "Delivery note: I sent {} attachments in chat. Local copies: {}",
+        delivered_files.len(),
+        files
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5644,6 +5688,29 @@ mod tests {
     fn split_for_expandable_blockquote_handles_empty_text() {
         let chunks = split_for_expandable_blockquote("", 10);
         assert_eq!(chunks, vec![String::new()]);
+    }
+
+    #[test]
+    fn attachment_delivery_summary_includes_single_file_path() {
+        let summary = format_attachment_delivery_summary(&[(
+            "studies.json".to_string(),
+            "/tmp/studies.json".to_string(),
+        )])
+        .expect("summary");
+        assert!(summary.contains("studies.json"));
+        assert!(summary.contains("/tmp/studies.json"));
+    }
+
+    #[test]
+    fn attachment_delivery_summary_handles_multiple_files() {
+        let summary = format_attachment_delivery_summary(&[
+            ("a.json".to_string(), "/tmp/a.json".to_string()),
+            ("b.json".to_string(), "/tmp/b.json".to_string()),
+        ])
+        .expect("summary");
+        assert!(summary.contains("2 attachments"));
+        assert!(summary.contains("a.json"));
+        assert!(summary.contains("b.json"));
     }
 
     // --- check_auth ---

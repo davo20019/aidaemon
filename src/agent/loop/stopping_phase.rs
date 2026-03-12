@@ -55,6 +55,46 @@ pub(super) struct StoppingPhaseCtx<'a> {
     pub consecutive_clean_iterations: &'a mut usize,
     pub max_budget_extensions: usize,
     pub hard_token_cap: i64,
+    pub execution_state: &'a mut ExecutionState,
+    pub force_text_response: &'a mut bool,
+    pub completion_progress: &'a mut CompletionProgress,
+    pub turn_context: &'a TurnContext,
+    pub validation_state: &'a mut ValidationState,
+}
+
+fn turn_contract_is_text_only(turn_context: &TurnContext) -> bool {
+    !turn_context.completion_contract.expects_mutation
+        && !turn_context.completion_contract.requires_observation
+}
+
+fn has_task_relevant_progress(
+    turn_context: &TurnContext,
+    completion_progress: &CompletionProgress,
+) -> bool {
+    (turn_context.completion_contract.expects_mutation && completion_progress.mutation_count > 0)
+        || completion_progress.observation_count > 0
+        || completion_progress.verification_count > 0
+}
+
+fn has_any_concrete_execution(
+    turn_context: &TurnContext,
+    completion_progress: &CompletionProgress,
+    recoverable_tool_snapshot_present: bool,
+) -> bool {
+    has_task_relevant_progress(turn_context, completion_progress)
+        || recoverable_tool_snapshot_present
+}
+
+fn only_final_response_remains(
+    turn_context: &TurnContext,
+    completion_progress: &CompletionProgress,
+    recoverable_tool_snapshot_present: bool,
+) -> bool {
+    has_any_concrete_execution(
+        turn_context,
+        completion_progress,
+        recoverable_tool_snapshot_present,
+    ) && !completion_progress.verification_pending
 }
 
 impl Agent {
@@ -195,6 +235,11 @@ impl Agent {
         let mut consecutive_clean_iterations = *ctx.consecutive_clean_iterations;
         let max_budget_extensions = ctx.max_budget_extensions;
         let hard_token_cap = ctx.hard_token_cap;
+        let execution_state = &mut *ctx.execution_state;
+        let mut force_text_response = *ctx.force_text_response;
+        let completion_progress = &mut *ctx.completion_progress;
+        let turn_context = ctx.turn_context;
+        let mut validation_state = ctx.validation_state.clone();
 
         macro_rules! commit_state {
             () => {
@@ -211,7 +256,241 @@ impl Agent {
                 *ctx.policy_bundle = policy_bundle.clone();
                 *ctx.last_escalation_iteration = last_escalation_iteration;
                 *ctx.consecutive_clean_iterations = consecutive_clean_iterations;
+                *ctx.force_text_response = force_text_response;
+                *ctx.validation_state = validation_state.clone();
             };
+        }
+
+        if let Some(limit) = execution_state.exhausted_limit(task_tokens_used, task_start.elapsed())
+        {
+            let text_only_turn = turn_contract_is_text_only(turn_context);
+            let recoverable_tool_snapshot_present = if total_successful_tool_calls > 0
+                && !has_task_relevant_progress(turn_context, completion_progress)
+            {
+                self.latest_non_system_tool_result(session_id, 1200)
+                    .await
+                    .is_some()
+            } else {
+                false
+            };
+            let made_progress = has_task_relevant_progress(turn_context, completion_progress)
+                || recoverable_tool_snapshot_present;
+            let has_executed_concrete_work = has_any_concrete_execution(
+                turn_context,
+                completion_progress,
+                recoverable_tool_snapshot_present,
+            );
+            let final_response_only = only_final_response_remains(
+                turn_context,
+                completion_progress,
+                recoverable_tool_snapshot_present,
+            );
+            let can_shift_to_final_response_closeout =
+                final_response_only && !execution_state.final_response_closeout_active;
+
+            if can_shift_to_final_response_closeout {
+                validation_state.record_failure(ValidationFailure::BudgetExhausted);
+                force_text_response = true;
+                pending_system_messages.push(SystemDirective::DeferredProvideConcreteResults);
+                execution_state.suspend_budget_for_final_response();
+                self.emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::ExecutionStateSnapshot,
+                    "Suspending execution budget after concrete progress so the agent can finish the final answer"
+                        .to_string(),
+                    json!({
+                        "condition": "execution_budget_shifted_to_final_response_closeout",
+                        "budget_limit": limit,
+                        "execution_state": execution_state.clone(),
+                        "validation_state": validation_state.clone(),
+                        "observational_progress": completion_progress.observation_count,
+                        "mutation_progress": completion_progress.mutation_count,
+                        "verification_progress": completion_progress.verification_count,
+                        "recoverable_tool_snapshot_present": recoverable_tool_snapshot_present,
+                    }),
+                )
+                .await;
+                commit_state!();
+                return Ok(StoppingPhaseOutcome::Proceed);
+            }
+
+            let closeout_grace_available = !validation_state
+                .failed_checks
+                .contains(&ValidationFailure::BudgetExhausted)
+                && made_progress
+                && matches!(
+                    execution_state.last_outcome,
+                    Some(StepExecutionOutcome::Progress | StepExecutionOutcome::BackgroundDetached)
+                );
+            if closeout_grace_available {
+                validation_state.record_failure(ValidationFailure::BudgetExhausted);
+                force_text_response = true;
+                pending_system_messages.push(SystemDirective::DeferredProvideConcreteResults);
+                self.emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::ExecutionStateSnapshot,
+                    "Allowing one force-text closeout after execution budget exhaustion"
+                        .to_string(),
+                    json!({
+                        "condition": "execution_budget_exhausted_closeout_grace",
+                        "budget_limit": limit,
+                        "execution_state": execution_state.clone(),
+                        "validation_state": validation_state.clone(),
+                    }),
+                )
+                .await;
+                commit_state!();
+                return Ok(StoppingPhaseOutcome::Proceed);
+            }
+
+            let plain_text_recovery_available = text_only_turn
+                && !force_text_response
+                && !validation_state
+                    .failed_checks
+                    .contains(&ValidationFailure::BudgetExhausted);
+            if plain_text_recovery_available {
+                validation_state.record_failure(ValidationFailure::BudgetExhausted);
+                force_text_response = true;
+                pending_system_messages.push(SystemDirective::ToolModeDisabledPlainText);
+                self.emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::ExecutionStateSnapshot,
+                    "Allowing one plain-text recovery after execution budget exhaustion"
+                        .to_string(),
+                    json!({
+                        "condition": "execution_budget_exhausted_plain_text_recovery",
+                        "budget_limit": limit,
+                        "execution_state": execution_state.clone(),
+                        "validation_state": validation_state.clone(),
+                    }),
+                )
+                .await;
+                commit_state!();
+                return Ok(StoppingPhaseOutcome::Proceed);
+            }
+
+            validation_state.record_failure(ValidationFailure::BudgetExhausted);
+            let request = if made_progress {
+                build_reduce_scope_request(
+                    turn_context,
+                    learning_ctx,
+                    format!(
+                        "I hit the current execution budget limit ({}) before I could safely continue.",
+                        limit.as_str()
+                    ),
+                    "Confirm the reduced scope or next concrete target I should spend the remaining effort on.",
+                    "I will continue only on that narrowed scope and then report what changed.",
+                )
+            } else if matches!(
+                execution_state.last_outcome,
+                Some(StepExecutionOutcome::NonrecoverableFailure)
+            ) {
+                validation_state.record_failure(ValidationFailure::NonrecoverableFailure);
+                build_abandon_request(
+                    turn_context,
+                    learning_ctx,
+                    format!(
+                        "The current execution path failed nonrecoverably before making progress, and I also hit the {} limit.",
+                        limit.as_str()
+                    ),
+                    "A different plan, target, or operator intervention before I attempt this again.",
+                    "I will abandon this path and wait for a revised instruction instead of retrying the same broken approach.",
+                )
+            } else if !has_executed_concrete_work {
+                build_abandon_request(
+                    turn_context,
+                    learning_ctx,
+                    format!(
+                        "I hit the current execution budget limit ({}) while planning or retrying, before any concrete tool or verification step could complete.",
+                        limit.as_str()
+                    ),
+                    "A narrower target, a revised approach, or explicit permission to spend more execution budget on a new attempt.",
+                    "I will stop this execution path here instead of pretending partial work exists when no concrete step completed.",
+                )
+            } else {
+                build_partial_done_blocked_request(
+                    turn_context,
+                    learning_ctx,
+                    format!(
+                        "I hit the current execution budget limit ({}) before I could safely continue.",
+                        limit.as_str()
+                    ),
+                    "A narrower scope or explicit approval to continue beyond the current execution envelope.",
+                    "I will either continue with the reduced scope or spend the additional budget on the next concrete step.",
+                )
+            };
+            learning_ctx.record_replay_note(
+                ReplayNoteCategory::ValidationFailure,
+                "execution_budget_exhausted",
+                format!(
+                    "Stopped because execution budget limit {} was exhausted before the task could finish safely.",
+                    limit.as_str()
+                ),
+                true,
+            );
+            let retry_code = match request.outcome {
+                ValidationOutcome::ReduceScope => "reduce_scope",
+                ValidationOutcome::Abandon => "abandon",
+                _ => "execution_budget_blocked",
+            };
+            learning_ctx.record_replay_note(
+                ReplayNoteCategory::RetryReason,
+                retry_code,
+                format!(
+                    "Budget exhaustion forced {:?} instead of continuing the same execution path.",
+                    request.outcome
+                ),
+                true,
+            );
+            self.emit_warning_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                DecisionType::ExecutionStateSnapshot,
+                "Stopping because execution budget is exhausted".to_string(),
+                json!({
+                    "condition": "execution_budget_exhausted",
+                    "budget_limit": limit,
+                    "execution_state": execution_state.clone(),
+                    "validation_state": validation_state.clone(),
+                    "request": request.clone(),
+                }),
+            )
+            .await;
+            let reply = request.render_user_message();
+            let assistant_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "assistant".to_string(),
+                content: Some(reply.clone()),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.5,
+                ..Message::runtime_defaults()
+            };
+            self.append_assistant_message_with_event(emitter, &assistant_msg, &model, None, None)
+                .await?;
+            self.emit_task_end(
+                emitter,
+                task_id,
+                TaskStatus::Completed,
+                task_start,
+                iteration,
+                learning_ctx.tool_calls.len(),
+                None,
+                Some(reply.chars().take(200).collect()),
+            )
+            .await;
+            commit_state!();
+            return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
         }
 
         if self.depth == 0 {
@@ -461,18 +740,21 @@ impl Agent {
                     .saturating_mul(2)
                     .max(task_tokens_used.saturating_add(budget / 2))
                     .min(cap_u64);
+                let productive = Self::has_meaningful_budget_progress(
+                    evidence_gain_count,
+                    total_successful_tool_calls,
+                ) && post_task::is_productive(
+                    learning_ctx,
+                    stall_count,
+                    consecutive_same_tool.1,
+                    consecutive_same_tool_arg_hashes.len(),
+                    total_successful_tool_calls,
+                );
                 if budget_extensions_count < max_budget_extensions
                     && budget < cap_u64
                     && new_budget_u64 > task_tokens_used
                     && user_role == UserRole::Owner
-                    && evidence_gain_count >= 2
-                    && post_task::is_productive(
-                        learning_ctx,
-                        stall_count,
-                        consecutive_same_tool.1,
-                        consecutive_same_tool_arg_hashes.len(),
-                        total_successful_tool_calls,
-                    )
+                    && productive
                 {
                     let old_budget_i64 = budget as i64;
                     let new_budget_i64 = new_budget_u64 as i64;
@@ -525,6 +807,9 @@ impl Agent {
                     && new_budget_u64 > task_tokens_used
                     && self
                         .request_budget_continue_approval(
+                            emitter,
+                            task_id,
+                            iteration,
                             session_id,
                             user_role,
                             "task",
@@ -548,6 +833,7 @@ impl Agent {
                         "Extended task token budget via owner approval".to_string(),
                         json!({
                             "condition": "task_token_budget_extension_manual",
+                            "approval_state": ApprovalState::Granted,
                             "old_budget": budget,
                             "new_budget": new_budget_u64,
                             "task_tokens_used": task_tokens_used,
@@ -626,10 +912,24 @@ impl Agent {
         if let Some(ref goal_id) = resolved_goal_id {
             if is_scheduled_goal {
                 if let Some(run_budget_status) = if let Some(registry) = &self.goal_token_registry {
-                    registry.get_run_budget(goal_id).await
+                    registry
+                        .update_run_health(
+                            goal_id,
+                            Self::scheduled_run_health_snapshot(
+                                learning_ctx,
+                                evidence_gain_count,
+                                stall_count,
+                                consecutive_same_tool.1,
+                                consecutive_same_tool_arg_hashes.len(),
+                                total_successful_tool_calls,
+                            ),
+                        )
+                        .await
                 } else {
                     None
                 } {
+                    persist_scheduled_run_state(&self.state, goal_id, None, &run_budget_status)
+                        .await;
                     let mut run_budget_ctx = graceful::ScheduledRunBudgetControlCtx {
                         emitter,
                         task_id,
@@ -638,12 +938,6 @@ impl Agent {
                         goal_id,
                         status: &run_budget_status,
                         user_role,
-                        learning_ctx,
-                        evidence_gain_count,
-                        stall_count,
-                        consecutive_same_tool_count: consecutive_same_tool.1,
-                        consecutive_same_tool_unique_args: consecutive_same_tool_arg_hashes.len(),
-                        total_successful_tool_calls,
                         status_tx,
                         max_budget_extensions,
                         hard_token_cap,
@@ -862,10 +1156,68 @@ impl Agent {
                         .saturating_mul(2)
                         .max(total.saturating_add(daily_budget / 2))
                         .min(cap_u64);
+                    let productive = Self::has_meaningful_budget_progress(
+                        evidence_gain_count,
+                        total_successful_tool_calls,
+                    ) && post_task::is_productive(
+                        learning_ctx,
+                        stall_count,
+                        consecutive_same_tool.1,
+                        consecutive_same_tool_arg_hashes.len(),
+                        total_successful_tool_calls,
+                    );
+                    if budget_extensions_count < max_budget_extensions
+                        && daily_budget < cap_u64
+                        && new_daily_budget > total
+                        && user_role == UserRole::Owner
+                        && productive
+                    {
+                        budget_extensions_count += 1;
+                        effective_daily_budget = Some(new_daily_budget);
+                        pending_system_messages.push(
+                            SystemDirective::GlobalDailyBudgetAutoExtended {
+                                old_budget: daily_budget as i64,
+                                new_budget: new_daily_budget as i64,
+                                extension: budget_extensions_count,
+                                max_extensions: max_budget_extensions,
+                            },
+                        );
+                        send_status(
+                            status_tx,
+                            StatusUpdate::BudgetExtended {
+                                old_budget: daily_budget as i64,
+                                new_budget: new_daily_budget as i64,
+                                extension: budget_extensions_count,
+                                max_extensions: max_budget_extensions,
+                            },
+                        );
+                        self.emit_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::BudgetAutoExtension,
+                            "Auto-extended global daily token budget on productive progress"
+                                .to_string(),
+                            json!({
+                                "condition":"daily_token_budget_extension",
+                                "old_budget": daily_budget,
+                                "new_budget": new_daily_budget,
+                                "extension": budget_extensions_count,
+                                "max_extensions": max_budget_extensions,
+                                "total_today": total
+                            }),
+                        )
+                        .await;
+                        commit_state!();
+                        return Ok(StoppingPhaseOutcome::ContinueLoop);
+                    }
                     if daily_budget < cap_u64
                         && new_daily_budget > total
                         && self
                             .request_budget_continue_approval(
+                                emitter,
+                                task_id,
+                                iteration,
                                 session_id,
                                 user_role,
                                 "global daily",
@@ -890,6 +1242,7 @@ impl Agent {
                             "Extended global daily token budget via owner approval".to_string(),
                             json!({
                                 "condition":"daily_token_budget_extension_manual",
+                                "approval_state": ApprovalState::Granted,
                                 "old_budget": daily_budget,
                                 "new_budget": new_daily_budget,
                                 "total_today": total
@@ -1526,5 +1879,53 @@ impl Agent {
 
         commit_state!();
         Ok(StoppingPhaseOutcome::Proceed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recoverable_tool_snapshot_counts_as_concrete_progress() {
+        let turn_context = TurnContext::default();
+        let completion_progress = CompletionProgress::default();
+
+        assert!(has_any_concrete_execution(
+            &turn_context,
+            &completion_progress,
+            true
+        ));
+        assert!(only_final_response_remains(
+            &turn_context,
+            &completion_progress,
+            true
+        ));
+    }
+
+    #[test]
+    fn verification_pending_prevents_final_response_closeout_even_with_snapshot() {
+        let turn_context = TurnContext {
+            completion_contract: CompletionContract {
+                requires_observation: true,
+                ..CompletionContract::default()
+            },
+            ..TurnContext::default()
+        };
+        let completion_progress = CompletionProgress {
+            verification_pending: true,
+            ..CompletionProgress::default()
+        };
+
+        assert!(has_any_concrete_execution(
+            &turn_context,
+            &completion_progress,
+            true
+        ));
+        assert!(!only_final_response_remains(
+            &turn_context,
+            &completion_progress,
+            true
+        ));
     }
 }

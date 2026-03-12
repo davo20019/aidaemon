@@ -66,6 +66,41 @@ fn scope_goal_memory_returns_empty_when_project_hints_do_not_match() {
 }
 
 #[test]
+fn scope_goal_memory_avoids_substring_bleed_for_short_hints() {
+    let facts = vec![fact("project", "fairfax-va-site-framework", "React")];
+    let procs = vec![procedure("fairfax deploy", "deploy fairfax-va-site")];
+
+    let (scoped_facts, scoped_procs) =
+        scope_goal_memory_to_project_hints(facts, procs, &["fair".to_string()]);
+
+    assert!(
+        scoped_facts.is_empty(),
+        "substring-only hint should not match project facts: {:?}",
+        scoped_facts
+    );
+    assert!(
+        scoped_procs.is_empty(),
+        "substring-only hint should not match project procedures: {:?}",
+        scoped_procs
+    );
+}
+
+#[test]
+fn scope_goal_memory_matches_normalized_multi_word_project_hints() {
+    let facts = vec![fact("project", "blog.aidaemon.ai-framework", "Astro")];
+    let procs = vec![procedure(
+        "blog deploy",
+        "deploy blog.aidaemon.ai to cloudflare",
+    )];
+
+    let (scoped_facts, scoped_procs) =
+        scope_goal_memory_to_project_hints(facts, procs, &["blog.aidaemon.ai".to_string()]);
+
+    assert_eq!(scoped_facts.len(), 1);
+    assert_eq!(scoped_procs.len(), 1);
+}
+
+#[test]
 fn low_signal_goal_text_detects_vague_prompt() {
     assert!(is_low_signal_goal_text(
         "You are a senior designer and frontend developer. Do what you consider the best."

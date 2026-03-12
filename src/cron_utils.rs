@@ -54,6 +54,21 @@ static RE_SCHEDULE_DAILY_AT: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .expect("daily-at schedule regex")
 });
+static RE_SCHEDULE_DAILY_FLEX_AT: LazyLock<Regex> = LazyLock::new(|| {
+    let filler =
+        r"(?:scheduled?|schedule|task|tasks|goal|goals|job|jobs|run|runs|reminder|reminders)";
+    let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
+    let time_list = format!(
+        r"(?P<times>{time}(?:\s*(?:,|\band\b|&)\s*{time})*)",
+        time = time
+    );
+    Regex::new(&format!(
+        r"(?i)\b(?:daily|every\s+day|everyday|each\s+day)(?:\s+{filler}){{1,4}}\s+at\s+{time_list}",
+        filler = filler,
+        time_list = time_list
+    ))
+    .expect("daily-flex-at schedule regex")
+});
 static RE_SCHEDULE_WEEKDAYS_AT: LazyLock<Regex> = LazyLock::new(|| {
     let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
     let time_list = format!(
@@ -66,6 +81,21 @@ static RE_SCHEDULE_WEEKDAYS_AT: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .expect("weekdays-at schedule regex")
 });
+static RE_SCHEDULE_WEEKDAYS_FLEX_AT: LazyLock<Regex> = LazyLock::new(|| {
+    let filler =
+        r"(?:scheduled?|schedule|task|tasks|goal|goals|job|jobs|run|runs|reminder|reminders)";
+    let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
+    let time_list = format!(
+        r"(?P<times>{time}(?:\s*(?:,|\band\b|&)\s*{time})*)",
+        time = time
+    );
+    Regex::new(&format!(
+        r"(?i)\b(?:weekdays?|every\s+weekdays?|every\s+weekday|each\s+weekday)(?:\s+{filler}){{1,4}}\s+at\s+{time_list}",
+        filler = filler,
+        time_list = time_list
+    ))
+    .expect("weekdays-flex-at schedule regex")
+});
 static RE_SCHEDULE_WEEKENDS_AT: LazyLock<Regex> = LazyLock::new(|| {
     let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
     let time_list = format!(
@@ -77,6 +107,21 @@ static RE_SCHEDULE_WEEKENDS_AT: LazyLock<Regex> = LazyLock::new(|| {
         time_list
     ))
     .expect("weekends-at schedule regex")
+});
+static RE_SCHEDULE_WEEKENDS_FLEX_AT: LazyLock<Regex> = LazyLock::new(|| {
+    let filler =
+        r"(?:scheduled?|schedule|task|tasks|goal|goals|job|jobs|run|runs|reminder|reminders)";
+    let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
+    let time_list = format!(
+        r"(?P<times>{time}(?:\s*(?:,|\band\b|&)\s*{time})*)",
+        time = time
+    );
+    Regex::new(&format!(
+        r"(?i)\b(?:weekends?|every\s+weekends?|every\s+weekend|each\s+weekend)(?:\s+{filler}){{1,4}}\s+at\s+{time_list}",
+        filler = filler,
+        time_list = time_list
+    ))
+    .expect("weekends-flex-at schedule regex")
 });
 static RE_SCHEDULE_SPECIFIC_DAYS_AT: LazyLock<Regex> = LazyLock::new(|| {
     let day =
@@ -99,7 +144,7 @@ static RE_PREFIX_NOISE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static RE_FILLER_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)^\s*(?:please\s+)?(?:remind me to|schedule(?:\s+a)?\s+task\s+to|schedule\s+to|set up(?:\s+a)?\s+task\s+to|set up\s+to|i need you to|can you(?:\s+please)?\s+)\s*",
+        r"(?i)^\s*(?:please\s+)?(?:remind me to|schedule(?:\s+a)?\s+task\s+to|schedule(?:\s+a)?\s+to|set up(?:\s+a)?\s+task\s+to|set up(?:\s+a)?\s+to|i need you to|can you(?:\s+please)?\s+)\s*",
     )
     .expect("filler-prefix regex")
 });
@@ -265,6 +310,16 @@ fn extract_schedule_match(text: &str) -> Option<ScheduleMatch> {
             end: extend_match_past_trailing_timezone(text, m.end()),
         });
     }
+    if let Some(caps) = RE_SCHEDULE_DAILY_FLEX_AT.captures(text) {
+        let m = caps.get(0)?;
+        let times = caps.name("times")?.as_str().trim();
+        return Some(ScheduleMatch {
+            schedule_raw: format!("every day at {}", times),
+            is_one_shot: false,
+            start: m.start(),
+            end: extend_match_past_trailing_timezone(text, m.end()),
+        });
+    }
 
     if let Some(caps) = RE_SCHEDULE_WEEKDAYS_AT.captures(text) {
         let m = caps.get(0)?;
@@ -276,8 +331,28 @@ fn extract_schedule_match(text: &str) -> Option<ScheduleMatch> {
             end: extend_match_past_trailing_timezone(text, m.end()),
         });
     }
+    if let Some(caps) = RE_SCHEDULE_WEEKDAYS_FLEX_AT.captures(text) {
+        let m = caps.get(0)?;
+        let times = caps.name("times")?.as_str().trim();
+        return Some(ScheduleMatch {
+            schedule_raw: format!("weekdays at {}", times),
+            is_one_shot: false,
+            start: m.start(),
+            end: extend_match_past_trailing_timezone(text, m.end()),
+        });
+    }
 
     if let Some(caps) = RE_SCHEDULE_WEEKENDS_AT.captures(text) {
+        let m = caps.get(0)?;
+        let times = caps.name("times")?.as_str().trim();
+        return Some(ScheduleMatch {
+            schedule_raw: format!("weekends at {}", times),
+            is_one_shot: false,
+            start: m.start(),
+            end: extend_match_past_trailing_timezone(text, m.end()),
+        });
+    }
+    if let Some(caps) = RE_SCHEDULE_WEEKENDS_FLEX_AT.captures(text) {
         let m = caps.get(0)?;
         let times = caps.name("times")?.as_str().trim();
         return Some(ScheduleMatch {
@@ -1306,6 +1381,27 @@ mod tests {
         let cleaned =
             clean_task_description("every day at 3pm UTC run backup job", "every day at 3pm");
         assert_eq!(cleaned, "Run backup job");
+    }
+
+    #[test]
+    fn test_extract_schedule_from_text_detects_daily_scheduled_task_phrase() {
+        let detected = extract_schedule_from_text(
+            "Can you set up a daily scheduled task at 6:00 am EST to publish the blog?",
+        );
+        assert_eq!(detected, Some(("every day at 6:00 am".to_string(), false)));
+    }
+
+    #[test]
+    fn test_extract_schedule_segments_strips_flexible_scheduled_task_phrase() {
+        let segments = extract_schedule_segments(
+            "Set up a daily scheduled task at 6:00 am to publish the blog with honest reflections.",
+        );
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].schedule_raw, "every day at 6:00 am");
+        assert_eq!(
+            segments[0].description,
+            "Publish the blog with honest reflections"
+        );
     }
 
     #[test]

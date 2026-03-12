@@ -18,11 +18,18 @@ use super::{
     command_risk::{PermissionMode, RiskLevel},
     daemon_guard::detect_daemonization_primitives,
 };
+use crate::agent::{
+    derive_executor_step_result, persist_executor_handoff_context, persist_executor_result_context,
+    ExecutorHandoff, TargetScope, TaskValidationOutcome,
+};
 use crate::channels::ChannelHub;
 use crate::config::CliAgentsConfig;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::tools::terminal::ApprovalRequest;
-use crate::traits::{DynamicCliAgent, ModelProvider, StateStore, Tool, ToolCapabilities};
+use crate::traits::{
+    DynamicCliAgent, ModelProvider, StateStore, Tool, ToolCapabilities, ToolTargetHint,
+    ToolTargetHintKind,
+};
 use crate::types::ApprovalResponse;
 use crate::types::StatusUpdate;
 use crate::utils::{truncate_str, truncate_with_note};
@@ -167,6 +174,8 @@ struct RunningCliAgent {
     child_id: u32,
     /// Session ID for filtering cancel_all by session
     session_id: String,
+    /// Delegated task ID when this cli_agent run is acting as an executor.
+    delegated_task_id: Option<String>,
     /// Working directory for git diff capture
     working_dir: Option<String>,
 }
@@ -316,6 +325,62 @@ async fn command_exists(command: &str) -> bool {
 }
 
 impl CliAgentTool {
+    async fn persist_delegated_cli_result_with_state(
+        state: Arc<dyn StateStore>,
+        delegated_task_id: &str,
+        response: Option<&str>,
+        error: Option<&str>,
+    ) {
+        let latest_task = state.get_task(delegated_task_id).await.ok().flatten();
+        let structured =
+            derive_executor_step_result(delegated_task_id, latest_task.as_ref(), response, error);
+        let task_lead_summary = structured.render_task_lead_summary();
+
+        if let Ok(Some(mut task)) = state.get_task(delegated_task_id).await {
+            if let Ok(context) =
+                persist_executor_result_context(task.context.as_deref(), &structured)
+            {
+                task.context = Some(context);
+            }
+
+            match error {
+                Some(error) => {
+                    task.status = "failed".to_string();
+                    task.error = Some(error.to_string());
+                    task.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                }
+                None => {
+                    if matches!(structured.task_outcome, TaskValidationOutcome::TaskDone) {
+                        if task
+                            .result
+                            .as_deref()
+                            .is_none_or(|result| result.trim().is_empty())
+                        {
+                            if let Some(response) = response {
+                                task.result = Some(response.to_string());
+                            } else {
+                                task.result = Some(structured.summary.clone());
+                            }
+                        }
+                        task.status = "completed".to_string();
+                        task.blocker = None;
+                    } else {
+                        task.result = Some(task_lead_summary.clone());
+                        task.status = "blocked".to_string();
+                        task.blocker = structured
+                            .blocker
+                            .clone()
+                            .or_else(|| structured.exact_need.clone())
+                            .or_else(|| Some(structured.summary.clone()));
+                    }
+                    task.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                }
+            }
+
+            let _ = state.update_task(&task).await;
+        }
+    }
+
     fn prune_completed_map(completed: &mut HashMap<String, CompletedCliAgent>) {
         const COMPLETED_TTL: Duration = Duration::from_secs(10 * 60);
         const COMPLETED_CAP: usize = 128;
@@ -1227,6 +1292,7 @@ impl CliAgentTool {
         working_dir: Option<&str>,
         session_id: &str,
         goal_id: Option<&str>,
+        delegated_task_id: Option<&str>,
         system_instruction: Option<&str>,
         async_mode: bool,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
@@ -1296,11 +1362,21 @@ impl CliAgentTool {
                     let _ = self.state.update_dynamic_cli_agent(&agent).await;
                 }
             }
-            return Ok(format!(
+            let message = format!(
                 "CLI agent '{}' command not found. It may have been uninstalled. \
                  Use manage_cli_agents to remove it.",
                 tool_name
-            ));
+            );
+            if let Some(task_id) = delegated_task_id {
+                Self::persist_delegated_cli_result_with_state(
+                    self.state.clone(),
+                    task_id,
+                    None,
+                    Some(&message),
+                )
+                .await;
+            }
+            return Ok(message);
         }
 
         let canonical_working_dir = working_dir.map(Self::normalize_working_dir);
@@ -1317,7 +1393,7 @@ impl CliAgentTool {
             if let Some(claim) = claims.get(dir) {
                 let sim = prompt_similarity(&dedup_prompt, &claim.dedup_prompt);
                 if sim > 0.5 {
-                    return Ok(format!(
+                    let message = format!(
                         "BLOCKED: A very similar task is already running in {} \
                          (task_id={}, agent={}, similarity={:.0}%). \
                          You MUST wait for it to finish or cancel it.",
@@ -1325,15 +1401,35 @@ impl CliAgentTool {
                         claim.task_id,
                         claim.tool_name,
                         sim * 100.0
-                    ));
+                    );
+                    if let Some(task_id) = delegated_task_id {
+                        Self::persist_delegated_cli_result_with_state(
+                            self.state.clone(),
+                            task_id,
+                            Some(&message),
+                            None,
+                        )
+                        .await;
+                    }
+                    return Ok(message);
                 }
-                return Ok(format!(
+                let message = format!(
                     "BLOCKED: Another CLI agent is already working in {} \
                      (task_id={}, agent={}, prompt=\"{}\"). \
                      You MUST wait for it to finish or cancel it before dispatching \
                      another task to the same directory.",
                     dir, claim.task_id, claim.tool_name, claim.prompt_summary
-                ));
+                );
+                if let Some(task_id) = delegated_task_id {
+                    Self::persist_delegated_cli_result_with_state(
+                        self.state.clone(),
+                        task_id,
+                        Some(&message),
+                        None,
+                    )
+                    .await;
+                }
+                return Ok(message);
             }
 
             claims.insert(
@@ -1366,12 +1462,32 @@ impl CliAgentTool {
                 if let Some(ref dir) = canonical_working_dir {
                     self.release_working_dir_claim(dir, &task_id).await;
                 }
-                return Ok(format!(
+                let message = format!(
                     "Maximum {} CLI agents already running. Use action='list' to see running tasks, or action='cancel' to stop one.",
                     self.max_concurrent
-                ));
+                );
+                if let Some(task_id) = delegated_task_id {
+                    Self::persist_delegated_cli_result_with_state(
+                        self.state.clone(),
+                        task_id,
+                        None,
+                        Some(&message),
+                    )
+                    .await;
+                }
+                return Ok(message);
             }
         };
+
+        if let Some(task_id) = delegated_task_id {
+            self.persist_delegated_cli_handoff(
+                task_id,
+                tool_name,
+                &final_prompt,
+                canonical_working_dir.as_deref(),
+            )
+            .await;
+        }
 
         info!(
             tool = tool_name,
@@ -1396,6 +1512,7 @@ impl CliAgentTool {
             .unwrap_or(0);
 
         let state_for_completion = self.state.clone();
+        let delegated_task_id_owned = delegated_task_id.map(|task_id| task_id.to_string());
 
         // Build command
         let mut cmd = tokio::process::Command::new(&command);
@@ -1450,6 +1567,15 @@ impl CliAgentTool {
                         .log_cli_agent_complete(invocation_id, None, &summary, false, duration)
                         .await;
                 }
+                if let Some(ref delegated_task_id) = delegated_task_id_owned {
+                    Self::persist_delegated_cli_result_with_state(
+                        state_for_completion.clone(),
+                        delegated_task_id,
+                        None,
+                        Some(&format!("Failed to spawn CLI agent '{}': {}", tool_name, e)),
+                    )
+                    .await;
+                }
                 return Err(e.into());
             }
         };
@@ -1457,14 +1583,44 @@ impl CliAgentTool {
 
         // stdin is null (prompt passed via args), so just drop any handle
         drop(child.stdin.take());
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                if let Some(ref dir) = canonical_working_dir {
+                    self.release_working_dir_claim(dir, &task_id).await;
+                }
+                let error = "Failed to capture stdout".to_string();
+                if let Some(ref delegated_task_id) = delegated_task_id_owned {
+                    Self::persist_delegated_cli_result_with_state(
+                        self.state.clone(),
+                        delegated_task_id,
+                        None,
+                        Some(&error),
+                    )
+                    .await;
+                }
+                return Err(anyhow::anyhow!(error));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                if let Some(ref dir) = canonical_working_dir {
+                    self.release_working_dir_claim(dir, &task_id).await;
+                }
+                let error = "Failed to capture stderr".to_string();
+                if let Some(ref delegated_task_id) = delegated_task_id_owned {
+                    Self::persist_delegated_cli_result_with_state(
+                        self.state.clone(),
+                        delegated_task_id,
+                        None,
+                        Some(&error),
+                    )
+                    .await;
+                }
+                return Err(anyhow::anyhow!(error));
+            }
+        };
 
         // Two buffers: stdout_buf for JSON extraction, display_buf for user display
         let stdout_buf = Arc::new(Mutex::new(String::new()));
@@ -1496,6 +1652,7 @@ impl CliAgentTool {
         let notify_working_dir = canonical_working_dir.clone();
         let hub_for_completion = self.get_hub();
         let task_id_for_notify = task_id.clone();
+        let delegated_task_id_for_completion = delegated_task_id_owned.clone();
         let should_notify_for_task = Arc::clone(&should_notify);
         let slot_permit_for_task = slot_permit;
         tokio::spawn(async move {
@@ -1733,26 +1890,32 @@ impl CliAgentTool {
             // Persist completion even if the caller timed out and moved the task to background.
             if invocation_id != 0 {
                 let duration = invocation_started_at.elapsed().as_secs_f64();
-                let (success, output_summary) = if loop_detected {
-                    (false, "Killed - infinite loop detected".to_string())
-                } else {
-                    // Prefer stdout for success summaries; fall back to display output for failures.
-                    let stdout_text = stdout_buf_writer.lock().await.clone();
-                    let display_text = display_buf_writer.lock().await.clone();
-
-                    if exit_code == Some(0) {
-                        let result_text =
-                            extract_meaningful_output(&stdout_text, max_output_for_log);
-                        let summary: String = result_text.chars().take(200).collect();
-                        (true, summary)
+                let (success, output_summary, structured_response, structured_error) =
+                    if loop_detected {
+                        (
+                            false,
+                            "Killed - infinite loop detected".to_string(),
+                            None,
+                            Some("Killed - infinite loop detected".to_string()),
+                        )
                     } else {
-                        let auth_msg =
-                            CliAgentTool::detect_auth_error(&display_text, &tool_name_owned);
-                        let summary_src = auth_msg.unwrap_or(display_text);
-                        let summary: String = summary_src.chars().take(200).collect();
-                        (false, summary)
-                    }
-                };
+                        // Prefer stdout for success summaries; fall back to display output for failures.
+                        let stdout_text = stdout_buf_writer.lock().await.clone();
+                        let display_text = display_buf_writer.lock().await.clone();
+
+                        if exit_code == Some(0) {
+                            let result_text =
+                                extract_meaningful_output(&stdout_text, max_output_for_log);
+                            let summary: String = result_text.chars().take(200).collect();
+                            (true, summary, Some(result_text), None)
+                        } else {
+                            let auth_msg =
+                                CliAgentTool::detect_auth_error(&display_text, &tool_name_owned);
+                            let summary_src = auth_msg.unwrap_or(display_text);
+                            let summary: String = summary_src.chars().take(200).collect();
+                            (false, summary, None, Some(summary_src))
+                        }
+                    };
 
                 let _ = state_for_completion
                     .log_cli_agent_complete(
@@ -1763,6 +1926,16 @@ impl CliAgentTool {
                         duration,
                     )
                     .await;
+
+                if let Some(ref delegated_task_id) = delegated_task_id_for_completion {
+                    CliAgentTool::persist_delegated_cli_result_with_state(
+                        state_for_completion.clone(),
+                        delegated_task_id,
+                        structured_response.as_deref(),
+                        structured_error.as_deref(),
+                    )
+                    .await;
+                }
 
                 // Send proactive notification when the caller won't necessarily be waiting
                 // for completion (async_mode or sync->timeout moved to background).
@@ -1840,6 +2013,7 @@ impl CliAgentTool {
                 stdout_buf,
                 child_id: pid,
                 session_id: session_id.to_string(),
+                delegated_task_id: delegated_task_id_owned.clone(),
                 working_dir: working_dir_owned,
             };
             self.running.lock().await.insert(task_id.clone(), agent);
@@ -1962,6 +2136,11 @@ impl CliAgentTool {
                          - Revert partial changes with `git checkout .` if needed",
                     );
 
+                    if let Some(task_id) = delegated_task_id {
+                        self.persist_delegated_cli_result(task_id, None, Some(&error_msg))
+                            .await;
+                    }
+
                     return Ok(error_msg);
                 }
 
@@ -1970,6 +2149,10 @@ impl CliAgentTool {
                 if let Some(diff) = diff_section {
                     final_result.push_str(&diff);
                 }
+                if let Some(task_id) = delegated_task_id {
+                    self.persist_delegated_cli_result(task_id, Some(final_result.as_str()), None)
+                        .await;
+                }
                 Ok(final_result)
             }
             Ok(Err(_)) => {
@@ -1977,10 +2160,13 @@ impl CliAgentTool {
                     self.release_working_dir_claim(dir, &task_id).await;
                 }
                 // Channel closed unexpectedly
-                Ok(format!(
-                    "ERROR: CLI agent '{}' task failed unexpectedly",
-                    tool_name
-                ))
+                let error_msg =
+                    format!("ERROR: CLI agent '{}' task failed unexpectedly", tool_name);
+                if let Some(task_id) = delegated_task_id {
+                    self.persist_delegated_cli_result(task_id, None, Some(&error_msg))
+                        .await;
+                }
+                Ok(error_msg)
             }
             Err(_) => {
                 // Timeout - move to background
@@ -2003,6 +2189,7 @@ impl CliAgentTool {
                     stdout_buf,
                     child_id: pid,
                     session_id: session_id.to_string(),
+                    delegated_task_id: delegated_task_id_owned.clone(),
                     working_dir: working_dir_owned,
                 };
                 self.running.lock().await.insert(task_id.clone(), agent);
@@ -2015,6 +2202,57 @@ impl CliAgentTool {
                 ))
             }
         }
+    }
+
+    async fn persist_delegated_cli_handoff(
+        &self,
+        delegated_task_id: &str,
+        tool_name: &str,
+        prompt: &str,
+        working_dir: Option<&str>,
+    ) {
+        let expected_targets = working_dir
+            .and_then(|dir| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, dir))
+            .into_iter()
+            .collect::<Vec<_>>();
+        let handoff = ExecutorHandoff {
+            task_id: delegated_task_id.to_string(),
+            mission: format!("cli_agent:{tool_name}"),
+            task_description: prompt.to_string(),
+            target_scope: TargetScope {
+                allowed_targets: expected_targets.clone(),
+                hard_fail_outside_scope: working_dir.is_some(),
+            },
+            expected_targets,
+            allowed_tools: Some(vec![format!("cli_agent:{tool_name}")]),
+        };
+
+        if let Ok(Some(mut task)) = self.state.get_task(delegated_task_id).await {
+            task.status = "running".to_string();
+            if task.started_at.is_none() {
+                task.started_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            if let Ok(context) = persist_executor_handoff_context(task.context.as_deref(), &handoff)
+            {
+                task.context = Some(context);
+            }
+            let _ = self.state.update_task(&task).await;
+        }
+    }
+
+    async fn persist_delegated_cli_result(
+        &self,
+        delegated_task_id: &str,
+        response: Option<&str>,
+        error: Option<&str>,
+    ) {
+        Self::persist_delegated_cli_result_with_state(
+            self.state.clone(),
+            delegated_task_id,
+            response,
+            error,
+        )
+        .await;
     }
 
     /// Check on a background CLI agent task.
@@ -2075,6 +2313,16 @@ impl CliAgentTool {
         // Try to kill the process
         kill_process(agent.child_id).await;
 
+        if let Some(ref delegated_task_id) = agent.delegated_task_id {
+            Self::persist_delegated_cli_result_with_state(
+                self.state.clone(),
+                delegated_task_id,
+                None,
+                Some("Executor CLI run was cancelled before completion."),
+            )
+            .await;
+        }
+
         Ok(format!(
             "Cancelled CLI agent '{}' (was running for {}s).\n\nOutput before cancellation:\n{}",
             agent.tool_name,
@@ -2114,6 +2362,15 @@ impl CliAgentTool {
                 self.release_working_dir_claim(dir, &task_id).await;
             }
             kill_process(agent.child_id).await;
+            if let Some(ref delegated_task_id) = agent.delegated_task_id {
+                Self::persist_delegated_cli_result_with_state(
+                    self.state.clone(),
+                    delegated_task_id,
+                    None,
+                    Some("Executor CLI run was cancelled before completion."),
+                )
+                .await;
+            }
             cancelled.push(format!("{} ({})", agent.tool_name, task_id));
         }
 
@@ -2602,8 +2859,8 @@ impl Tool for CliAgentTool {
         json!({
             "name": "cli_agent",
             "description": format!(
-                "Delegate substantial coding work to an installed CLI agent. Available agents: {}. \
-                 Use manage_memories for scheduling, not this tool. Long tasks can run in background and be checked or cancelled.",
+                "Delegate coding work to an installed CLI agent. Available agents: {}. \
+                 Use manage_memories for scheduling. Long runs can be checked or cancelled.",
                 tools_help
             ),
             "parameters": {
@@ -2617,27 +2874,27 @@ impl Tool for CliAgentTool {
                     "tool": {
                         "type": "string",
                         "enum": names_vec,
-                        "description": "CLI agent name; optional for run"
+                        "description": "Agent name"
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "Task for the CLI agent"
+                        "description": "Task prompt"
                     },
                     "working_dir": {
                         "type": "string",
-                        "description": "Absolute working directory; strongly recommended for conflict detection"
+                        "description": "Absolute working directory"
                     },
                     "task_id": {
                         "type": "string",
-                        "description": "Task ID for check/cancel"
+                        "description": "Task ID"
                     },
                     "system_instruction": {
                         "type": "string",
-                        "description": "Optional specialist instruction"
+                        "description": "Optional system instruction"
                     },
                     "async_mode": {
                         "type": "boolean",
-                        "description": "Start in background immediately"
+                        "description": "Run in background"
                     }
                 },
                 "required": ["action"],
@@ -2811,6 +3068,7 @@ impl Tool for CliAgentTool {
                     args.working_dir.as_deref(),
                     &session_id,
                     args._goal_id.as_deref(),
+                    args._task_id.as_deref(),
                     args.system_instruction.as_deref(),
                     async_mode,
                     status_tx,
@@ -3587,6 +3845,25 @@ mod tests {
             "Expected synthesized task from task context, got: {}",
             result
         );
+
+        let updated_task = tool.state.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(updated_task.status, "completed");
+        let context: serde_json::Value =
+            serde_json::from_str(updated_task.context.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            context["executor_result"]["task_outcome"].as_str(),
+            Some("task_done")
+        );
+        let stored_scope = context["executor_handoff"]["target_scope"]["allowed_targets"][0]
+            ["value"]
+            .as_str()
+            .unwrap();
+        assert!(
+            stored_scope.ends_with(tmp_dir.path().to_string_lossy().as_ref()),
+            "expected stored scope '{}' to end with '{}'",
+            stored_scope,
+            tmp_dir.path().to_string_lossy()
+        );
     }
 
     #[tokio::test]
@@ -4141,6 +4418,74 @@ mod tests {
         assert!(
             invocations[0].duration_secs.unwrap_or(0.0) > 0.0,
             "Expected a positive duration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_background_delegated_run_persists_structured_task_result() {
+        let (tool, _db) = setup_bash_tool().await;
+        {
+            let mut tools = tool.tools.write().unwrap();
+            tools.get_mut("bash-agent").unwrap().timeout = Duration::from_millis(50);
+        }
+
+        let goal = Goal::new_finite("Patch the current repo safely", "sess-bg");
+        tool.state.create_goal(&goal).await.unwrap();
+
+        let task = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Run a delegated CLI task in the background".to_string(),
+            status: "claimed".to_string(),
+            priority: "high".to_string(),
+            task_order: 1,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: Some("task-lead".to_string()),
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        tool.state.create_task(&task).await.unwrap();
+
+        let resp = tool
+            .call(&format!(
+                r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 0.2; echo delegated-background-ok","_session_id":"sess-bg","_goal_id":"{}","_task_id":"{}"}}"#,
+                goal.id, task.id
+            ))
+            .await
+            .unwrap();
+        assert!(
+            resp.contains("Moved to background") || resp.contains("still running"),
+            "expected timeout/background handoff, got: {}",
+            resp
+        );
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let updated_task = tool.state.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(updated_task.status, "completed");
+        let context: serde_json::Value =
+            serde_json::from_str(updated_task.context.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            context["executor_result"]["task_outcome"].as_str(),
+            Some("task_done")
+        );
+        assert!(
+            updated_task
+                .result
+                .as_deref()
+                .unwrap_or("")
+                .contains("delegated-background-ok"),
+            "expected delegated background result to be persisted, got: {:?}",
+            updated_task.result
         );
     }
 

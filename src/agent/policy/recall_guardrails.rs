@@ -395,6 +395,9 @@ pub(super) fn looks_like_personal_memory_recall_question(user_text: &str) -> boo
         || (contains_keyword_as_words(&lower, "do i have") && mentions_personal_entities)
         || (contains_keyword_as_words(&lower, "what about") && mentions_personal_entities)
         || (contains_keyword_as_words(&lower, "do i") && mentions_personal_entities)
+        || (contains_keyword_as_words(&lower, "i have")
+            && mentions_personal_entities
+            && user_is_reaffirmation_challenge(user_text))
 }
 
 pub(super) fn user_is_reaffirmation_challenge(user_text: &str) -> bool {

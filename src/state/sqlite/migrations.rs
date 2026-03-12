@@ -1464,12 +1464,19 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             effective_budget_per_check INTEGER NOT NULL,
             tokens_used INTEGER NOT NULL DEFAULT 0,
             budget_extensions_count INTEGER NOT NULL DEFAULT 0,
+            health_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )",
     )
     .execute(pool)
     .await?;
+
+    let _ = sqlx::query(
+        "ALTER TABLE scheduled_run_state ADD COLUMN health_json TEXT NOT NULL DEFAULT '{}'",
+    )
+    .execute(pool)
+    .await;
 
     // Columns on goals added via ALTER for older migrated databases.
     let _ =

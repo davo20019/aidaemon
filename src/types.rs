@@ -178,6 +178,13 @@ impl std::fmt::Display for UserRole {
     }
 }
 
+impl UserRole {
+    /// Only explicit owner traffic is allowed to update durable owner memory.
+    pub fn can_persist_owner_memory(self) -> bool {
+        matches!(self, Self::Owner)
+    }
+}
+
 /// Distinguishes different kinds of approval requests so channels can render
 /// appropriate buttons (e.g., Allow Once / Deny for commands vs Confirm / Cancel
 /// for scheduled-goal confirmations).

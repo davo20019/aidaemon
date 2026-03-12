@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.22] - 2026-03-11
+
+### Added
+
+- **Reflection feedback loop**: New `reflection.rs` module watches for repeated tool errors with the same semantic signature, invokes the LLM as a diagnostician to analyze root cause and suggest a fix, persists the learning as an `ErrorSolution`, and verifies on the next successful call that the solution was actually applied.
+- **Evidence state tracking**: New `EvidenceState` records concrete observations (file reads, command output, API responses, verification results) per turn, supports pre-execution evidence gates blocking premature writes, and provides contradiction detection.
+- **Execution state machine**: New `ExecutionState` / `StepExecutionPlan` / `StepExecutionOutcome` hierarchy that selects a budget tier at turn start, tracks plan version, idempotency keys, and background-handoff flags, and can suspend its own budget for a force-text closeout.
+- **Validation state**: New `ValidationState` records matched success criteria, failed checks (`BudgetExhausted`, `ScopeViolation`, `PlanRejected`, etc.), and exposes helpers for building structured `ExecutorStepResult` / `PartialResult` / blocker payloads.
+- **Pre-execution planning and critique gate**: LLM-driven planning pass before the first tool call generates a `PlanState` (goal, first action, success criteria), a critique pass checks it, and both are logged as decision events.
+- **Execution replay notes and diagnose surfacing**: `LearningContext` accumulates `ReplayNote` entries during a turn; `DiagnoseTool` builds an `ExecutionReplaySummary` from decision-point events.
+- **Execution checkpoint in context window**: When history is trimmed, an `[SYSTEM] EXECUTION CHECKPOINT` message is injected summarising the active request, completed work, and latest evidence.
+- **Scheduled run health tracking**: `ScheduledRunHealth` struct (evidence gains, tool-call count, stall/error counts) persisted in `scheduled_run_state` and used for budget auto-extension decisions.
+- **New system directives**: `GlobalDailyBudgetAutoExtended`, `EvidenceGroundingRequired`, `StructuredToolResultSynthesis`, `ReflectionDiagnosis`.
+- **Execution failure taxonomy**: Errors classified as `ToolContractFailure`, `ToolInvocationFailure`, `EnvironmentFailure`, or `LogicFailure` for targeted recovery coaching.
+- **Executor handoff for CLI agents**: CLI agent invocations acting as task executors now persist `ExecutorHandoff` context and write structured `ExecutorStepResult` back to the task.
+- **Resume checkpoint reconstructs execution snapshot**: `build_resume_checkpoint()` reads `ExecutionStateSnapshot` decision events to reconstruct last known execution state.
+- **`report_blocker` structured outcome fields**: Accepts `outcome`, `exact_need`, `next_step`, `target`, `consequence_if_not_provided`, and `artifacts` for machine-readable blocker records.
+- **Outbound media delivery notes**: After delivering attachments, the hub records an assistant note so the agent context reflects what was sent.
+- **Owner-only fact consolidation guard**: Consolidation checks event-level `user_role` before running fact extraction; non-owner traffic excluded from owner memory.
+- **Auth/integration management intent bypass**: Requests involving OAuth/token setup always force the tool loop.
+- **Extended intent gate complexity enum**: Six granular complexity values for finer intent classification.
+
+### Changed
+
+- **Stopping phase integrates execution and validation state**: Consults `ExecutionState`, `ValidationState`, and `CompletionProgress` when budget limits are hit to decide between force-text closeout, one-time grace, or hard stop.
+- **Scheduled run auto-extension uses health metrics**: Requires meaningful budget progress and blocks extension for clearly unproductive runs (stalls, non-diverse repetition, errors outpacing successes).
+- **Repetitive call guard context-aware for API tools**: Redirect message for repeated identical `http_request` calls now includes the previous result hint instead of a generic "blocked" message.
+- **Result learning returns semantic failure info**: `apply_result_learning` returns `ResultLearningOutcome` with `semantic_failure` and receives `ExecutionFailureKind` for targeted coaching notices.
+- **Web tool budget caps raised**: `web_search` per-tool cap from 3→5, combined web cap 6→10, `web_fetch` cap 4→6.
+- **Read-saturation thresholds raised**: Nudge threshold 2→4, escalation 4→7, reducing false-positive saturation nudges.
+- **Scope violation check refactored to `TargetScope`**: Uses structured `StepExecutionPlan.target_scope` with typed `ToolTargetHint` matching.
+- **Completion phase smarter about tool output synthesis**: Compacts HTTP/JSON outputs and filters low-signal headers before presenting structured excerpts.
+- **Force-text closeout prohibits future-tense promises**: `SummarizeAndComplete` directive forces concrete results and blockers instead of "let me try…" phrasing.
+- **Connected-API scope matching expanded**: Matches possessive phrases for all pronouns, adds content-delivery detection helpers.
+- **Policy complexity signals expanded**: New helpers for scoped targets, mutation requests, and deployment/external writes.
+
+### Fixed
+
+- **Repeated API call guard falsely claimed requests were "blocked"**: Now includes the actual previous result hint in its coaching message.
+- **`manage_memories` schedule actions called without `goal_id`**: Added contract-violation check returning immediate guidance instead of silent failures.
+- **Session memory contaminated by non-owner traffic**: Consolidation loop checks `user_role` before fact extraction.
+- **Scheduled run budget extended despite unproductive runs**: Auto-extension blocked when health metrics indicate a stuck run.
+- **Force-text closeout still promised future work**: Directive now explicitly forbids future-tense phrases.
+- **CLI agent delegation lost task context on failure**: Executors now persist handoff context and structured step results.
+- **Execution state not recoverable after crash/restart**: Resume checkpoint reconstructs last execution state from decision events.
+
 ## [0.9.21] - 2026-03-09
 
 ### Added

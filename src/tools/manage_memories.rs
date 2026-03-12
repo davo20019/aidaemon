@@ -254,7 +254,7 @@ impl Tool for ManageMemoriesTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_memories",
-            "description": "Manage memories, goals, and scheduled goals.",
+            "description": "Manage memories and goals.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -265,7 +265,7 @@ impl Tool for ManageMemoriesTool {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Optional max items"
+                        "description": "Max items"
                     },
                     "category": {
                         "type": "string",
@@ -282,7 +282,7 @@ impl Tool for ManageMemoriesTool {
                     },
                     "query": {
                         "type": "string",
-                        "description": "Search term or scheduled-goal matcher"
+                        "description": "Search term"
                     },
                     "goal": {
                         "type": "string",
@@ -295,29 +295,29 @@ impl Tool for ManageMemoriesTool {
                     },
                     "goal_id": {
                         "type": "string",
-                        "description": "Goal ID; cancel_scheduled also accepts all/*"
+                        "description": "Goal ID"
                     },
                     "schedule_id": {
                         "type": "string",
-                        "description": "Schedule ID for schedule-specific actions"
+                        "description": "Schedule ID"
                     },
                     "schedule": {
                         "type": "string",
-                        "description": "Natural-language schedule or 5-field cron"
+                        "description": "Schedule"
                     },
                     "schedules": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional list of schedules"
+                        "description": "Schedules"
                     },
                     "fire_policy": {
                         "type": "string",
                         "enum": ["coalesce", "always_fire"],
-                        "description": "Schedule fire policy"
+                        "description": "Fire policy"
                     },
                     "is_one_shot": {
                         "type": "boolean",
-                        "description": "Delete after first fire"
+                        "description": "Delete after first run"
                     },
                     "is_paused": {
                         "type": "boolean",

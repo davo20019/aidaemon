@@ -29,6 +29,25 @@ pub(super) enum ConnectedApiIntent {
     WriteAction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ConnectedContentMode {
+    #[default]
+    None,
+    DraftOnly,
+    DeliverOnly,
+    DraftThenDeliver,
+}
+
+impl ConnectedContentMode {
+    pub(super) fn is_authoring_only(self) -> bool {
+        matches!(self, Self::DraftOnly)
+    }
+
+    pub(super) fn expects_live_delivery(self) -> bool {
+        matches!(self, Self::DeliverOnly | Self::DraftThenDeliver)
+    }
+}
+
 /// Check if a phrase appears as complete words in text (word-boundary matching).
 /// Splits on whitespace, trims surrounding punctuation (preserving apostrophes),
 /// then checks for consecutive word matches. Case-insensitive.
@@ -183,6 +202,7 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
     // must run through the tool loop, regardless of model intent-gate output.
     if super::user_text_references_filesystem_path(user_text)
         || user_text_requires_local_tool_execution(user_text)
+        || user_text_requests_auth_or_integration_management(user_text)
         || classify_connected_api_intent(user_text).is_some()
     {
         return IntentGateDecision {
@@ -474,7 +494,379 @@ fn mentions_connected_api_account_scope(user_text: &str) -> bool {
     contains_any_as_words(
         &lower,
         &[
-            "my", "our", "for me", "from my", "to my", "in my", "on my", "with my",
+            "my account",
+            "our account",
+            "your account",
+            "their account",
+            "his account",
+            "her account",
+            "for me",
+            "for us",
+            "for you",
+            "for them",
+            "for him",
+            "for her",
+            "from my",
+            "from our",
+            "from your",
+            "from their",
+            "from his",
+            "from her",
+            "to my",
+            "to our",
+            "to your",
+            "to their",
+            "to his",
+            "to her",
+            "in my",
+            "in our",
+            "in your",
+            "in their",
+            "in his",
+            "in her",
+            "on my",
+            "on our",
+            "on your",
+            "on their",
+            "on his",
+            "on her",
+            "with my",
+            "with our",
+            "with your",
+            "with their",
+            "with his",
+            "with her",
+            "using my",
+            "using our",
+            "using your",
+            "using their",
+            "using his",
+            "using her",
+        ],
+    )
+}
+
+fn mentions_existing_connected_content_payload(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    contains_any_as_words(
+        &lower,
+        &[
+            "this update",
+            "this post",
+            "this tweet",
+            "this thread",
+            "this email",
+            "this message",
+            "this reply",
+            "this comment",
+            "the following",
+            "below",
+            "above",
+            "already drafted",
+            "existing draft",
+            "prepared draft",
+        ],
+    )
+}
+
+fn has_content_delivery_resource(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    contains_any_as_words(
+        &lower,
+        &[
+            "post",
+            "posts",
+            "tweet",
+            "tweets",
+            "thread",
+            "threads",
+            "email",
+            "emails",
+            "message",
+            "messages",
+            "reply",
+            "replies",
+            "comment",
+            "comments",
+            "caption",
+            "captions",
+            "announcement",
+            "announcements",
+        ],
+    )
+}
+
+fn has_content_delivery_verb(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    contains_any_as_words(
+        &lower,
+        &[
+            "post",
+            "publish",
+            "send",
+            "reply",
+            "comment",
+            "share",
+            "upload",
+            "submit",
+            "retweet",
+            "schedule",
+            "tweet this",
+            "email this",
+            "message this",
+            "dm this",
+        ],
+    )
+}
+
+fn has_content_live_delivery_cue(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    mentions_connected_api_account_scope(&lower)
+        || contains_any_as_words(
+            &lower,
+            &[
+                "right now",
+                "right away",
+                "immediately",
+                "send it",
+                "post it",
+                "publish it",
+                "submit it",
+                "upload it",
+                "schedule it",
+                "using the connected account",
+                "using the connected service",
+                "using my connected account",
+                "using our connected account",
+                "using your connected account",
+                "using their connected account",
+                "using his connected account",
+                "using her connected account",
+            ],
+        )
+        || contains_any_as_words(&lower, &["connected account", "connected service"])
+}
+
+fn has_content_drafting_verb(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() || !has_content_delivery_resource(&lower) {
+        return false;
+    }
+
+    contains_any_as_words(
+        &lower,
+        &[
+            "write",
+            "draft",
+            "compose",
+            "brainstorm",
+            "generate",
+            "polish",
+            "rewrite",
+            "revise",
+            "make",
+            "create",
+            "come up with",
+            "help me write",
+            "help me draft",
+            "give me",
+        ],
+    )
+}
+
+fn has_content_new_payload_shape(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() || !has_content_delivery_resource(&lower) {
+        return false;
+    }
+
+    contains_any_as_words(
+        &lower,
+        &[
+            "a post",
+            "a tweet",
+            "a thread",
+            "an email",
+            "a message",
+            "a reply",
+            "a comment",
+            "a caption",
+            "an announcement",
+            "about",
+        ],
+    )
+}
+
+fn has_content_copywriting_cue(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() || !has_content_delivery_resource(&lower) {
+        return false;
+    }
+
+    contains_any_as_words(
+        &lower,
+        &[
+            "engaging",
+            "catchy",
+            "compelling",
+            "punchy",
+            "polished",
+            "professional",
+            "friendly",
+            "funny",
+            "thoughtful",
+            "make it",
+            "so people",
+            "want to comment",
+            "call to action",
+            "cta",
+            "hook",
+            "tone",
+            "voice",
+            "caption",
+            "copy",
+        ],
+    )
+}
+
+fn has_explicit_do_not_deliver_cue(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    contains_any_as_words(
+        &lower,
+        &[
+            "do not post",
+            "don't post",
+            "dont post",
+            "do not send",
+            "don't send",
+            "dont send",
+            "do not publish",
+            "don't publish",
+            "dont publish",
+            "just draft",
+            "draft only",
+            "do not share",
+            "don't share",
+            "dont share",
+        ],
+    )
+}
+
+pub(super) fn classify_connected_content_mode(user_text: &str) -> ConnectedContentMode {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() || !has_content_delivery_resource(&lower) {
+        return ConnectedContentMode::None;
+    }
+
+    let has_existing_payload = mentions_existing_connected_content_payload(&lower);
+    let has_live_delivery_cue = has_content_live_delivery_cue(&lower);
+    let has_delivery_verb = has_content_delivery_verb(&lower);
+    let has_drafting_verb = has_content_drafting_verb(&lower);
+    let has_new_payload_shape = has_content_new_payload_shape(&lower);
+    let has_copywriting_cue = has_content_copywriting_cue(&lower);
+    let needs_new_copy = has_drafting_verb || has_new_payload_shape || has_copywriting_cue;
+
+    if has_explicit_do_not_deliver_cue(&lower) {
+        return ConnectedContentMode::DraftOnly;
+    }
+
+    if has_existing_payload {
+        return ConnectedContentMode::DeliverOnly;
+    }
+
+    if has_live_delivery_cue || has_delivery_verb {
+        if needs_new_copy {
+            return ConnectedContentMode::DraftThenDeliver;
+        }
+        return ConnectedContentMode::DeliverOnly;
+    }
+
+    if needs_new_copy {
+        return ConnectedContentMode::DraftOnly;
+    }
+
+    ConnectedContentMode::None
+}
+
+#[cfg(test)]
+pub(crate) fn content_authoring_request_is_text_only(user_text: &str) -> bool {
+    classify_connected_content_mode(user_text).is_authoring_only()
+}
+
+pub(crate) fn user_text_requests_auth_or_integration_management(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    let has_auth_surface = mentions_connected_api_target(&lower)
+        || contains_any_as_words(
+            &lower,
+            &[
+                "oauth",
+                "api key",
+                "access token",
+                "refresh token",
+                "bearer token",
+                "credentials",
+                "credential",
+                "auth profile",
+                "webhook",
+                "integration",
+                "connected account",
+                "connected service",
+                "service account",
+            ],
+        );
+    if !has_auth_surface {
+        return false;
+    }
+
+    contains_any_as_words(
+        &lower,
+        &[
+            "connect",
+            "reconnect",
+            "disconnect",
+            "authorize",
+            "reauthorize",
+            "authenticate",
+            "log in",
+            "login",
+            "sign in",
+            "sign into",
+            "grant access",
+            "revoke access",
+            "configure",
+            "set up",
+            "setup",
+            "register",
+            "repair connection",
+            "refresh token",
+            "verify connection",
+            "manage oauth",
+            "manage http auth",
+            "manage api",
         ],
     )
 }
@@ -485,7 +877,14 @@ pub(super) fn user_text_requests_connected_api_write_action(user_text: &str) -> 
         return false;
     }
 
-    if !mentions_connected_api_target(&lower) {
+    let content_mode = classify_connected_content_mode(&lower);
+    let has_explicit_connected_target = mentions_connected_api_target(&lower);
+    let has_live_content_delivery_intent = content_mode.expects_live_delivery();
+    if !has_explicit_connected_target && !has_live_content_delivery_intent {
+        return false;
+    }
+
+    if content_mode.is_authoring_only() {
         return false;
     }
 
@@ -505,6 +904,10 @@ pub(super) fn user_text_requests_connected_api_write_action(user_text: &str) -> 
             "archive", "schedule", "cancel",
         ],
     ) && mentions_connected_api_resource(&lower);
+
+    if has_content_delivery_resource(&lower) {
+        return has_strong_write_verb && has_live_content_delivery_intent;
+    }
 
     has_strong_write_verb || has_scoped_write_verb
 }
@@ -630,6 +1033,11 @@ pub(super) fn classify_intent_complexity(
     // try tools (memory search, manage_people, etc.) as Simple.
     match intent_gate.complexity.as_deref() {
         Some("knowledge") => (IntentComplexity::Simple, vec![]),
+        Some("read_only_investigation") => (IntentComplexity::Simple, vec![]),
+        Some("scoped_modification") => (IntentComplexity::Simple, vec![]),
+        Some("unscoped_modification") => (IntentComplexity::Complex, vec![]),
+        Some("deployment_or_external_write") => (IntentComplexity::Complex, vec![]),
+        Some("scheduled_action") => (IntentComplexity::Complex, vec![]),
         Some("complex") => (IntentComplexity::Complex, vec![]),
         _ => (IntentComplexity::Simple, vec![]),
     }
@@ -772,6 +1180,13 @@ mod intent_routing_path_override_tests {
     }
 
     #[test]
+    fn infer_intent_gate_forces_tools_for_auth_management_request() {
+        let d = infer_intent_gate("Connect my Twitter account so you can post for me.", "");
+        assert_eq!(d.needs_tools, Some(true));
+        assert_eq!(d.can_answer_now, Some(false));
+    }
+
+    #[test]
     fn infer_intent_gate_does_not_force_tools_for_generic_capability_question() {
         let d = infer_intent_gate("Can you help me write a tweet?", "");
         assert!(
@@ -801,6 +1216,78 @@ mod intent_routing_path_override_tests {
             classify_connected_api_intent("Post this update to LinkedIn."),
             Some(ConnectedApiIntent::WriteAction)
         );
+        assert_eq!(
+            classify_connected_api_intent("Draft the copy and post it to LinkedIn right now."),
+            Some(ConnectedApiIntent::WriteAction)
+        );
+    }
+
+    #[test]
+    fn classify_connected_api_intent_treats_explicit_social_delivery_as_write_action() {
+        assert_eq!(
+            classify_connected_api_intent(
+                "Can you post a tweet about your new stuff and make it engaging so people want to comment?"
+            ),
+            Some(ConnectedApiIntent::WriteAction)
+        );
+        assert_eq!(
+            classify_connected_content_mode(
+                "Can you post a tweet about your new stuff and make it engaging so people want to comment?"
+            ),
+            ConnectedContentMode::DraftThenDeliver
+        );
+        assert!(!content_authoring_request_is_text_only(
+            "Can you post a tweet about your new stuff and make it engaging so people want to comment?"
+        ));
+    }
+
+    #[test]
+    fn classify_connected_content_mode_detects_draft_only_requests() {
+        assert_eq!(
+            classify_connected_content_mode("Can you help me write a tweet about our launch?"),
+            ConnectedContentMode::DraftOnly
+        );
+        assert!(content_authoring_request_is_text_only(
+            "Can you help me write a tweet about our launch?"
+        ));
+    }
+
+    #[test]
+    fn classify_connected_content_mode_detects_existing_payload_delivery() {
+        assert_eq!(
+            classify_connected_content_mode("Post this tweet right now."),
+            ConnectedContentMode::DeliverOnly
+        );
+    }
+
+    #[test]
+    fn classify_connected_content_mode_respects_do_not_post_cues() {
+        assert_eq!(
+            classify_connected_content_mode("Draft a tweet about our launch but don't post it."),
+            ConnectedContentMode::DraftOnly
+        );
+    }
+
+    #[test]
+    fn classify_connected_api_intent_detects_account_scoped_delivery_without_service_name() {
+        assert_eq!(
+            classify_connected_api_intent("Can you post a tweet on your account?"),
+            Some(ConnectedApiIntent::WriteAction)
+        );
+        assert!(!content_authoring_request_is_text_only(
+            "Can you post a tweet on your account?"
+        ));
+    }
+
+    #[test]
+    fn classify_connected_api_intent_detects_existing_payload_delivery_without_service_name() {
+        assert_eq!(
+            classify_connected_api_intent("Send this email for me right now."),
+            Some(ConnectedApiIntent::WriteAction)
+        );
+        assert!(!content_authoring_request_is_text_only(
+            "Send this email for me right now."
+        ));
     }
 
     #[test]
@@ -829,5 +1316,24 @@ mod intent_routing_path_override_tests {
             classify_connected_api_intent("Read the GitHub Actions docs and summarize them."),
             None
         );
+        // "post" triggers both delivery resource and delivery verb detection,
+        // resulting in DraftThenDeliver (live delivery), which qualifies as WriteAction.
+        assert_eq!(
+            classify_connected_api_intent("Draft a LinkedIn post about our launch."),
+            Some(ConnectedApiIntent::WriteAction)
+        );
+    }
+
+    #[test]
+    fn auth_management_detection_matches_explicit_connection_requests() {
+        assert!(user_text_requests_auth_or_integration_management(
+            "Reconnect my GitHub OAuth integration."
+        ));
+        assert!(user_text_requests_auth_or_integration_management(
+            "Set up the Twitter connected account."
+        ));
+        assert!(!user_text_requests_auth_or_integration_management(
+            "Draft a tweet about our launch."
+        ));
     }
 }

@@ -1424,6 +1424,7 @@ impl Agent {
                 goal_response.clone(),
                 ctx.channel_ctx.channel_id.clone(),
                 ctx.channel_ctx.visibility,
+                ctx.user_role,
             );
 
             if self.context_window_config.enabled {
@@ -1434,6 +1435,7 @@ impl Agent {
                     ctx.session_id.to_string(),
                     self.context_window_config.summarize_threshold,
                     self.context_window_config.summary_window,
+                    ctx.user_role,
                 );
             }
         }

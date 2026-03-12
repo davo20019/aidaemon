@@ -58,10 +58,14 @@ pub(crate) fn extract_project_dir_hint_with_aliases(
         let normalized = if looks_path {
             normalize_project_dir(token)
         } else {
-            crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
-                .or_else(|| {
-                    crate::tools::fs_utils::resolve_contextual_project_nickname(token, alias_roots)
+            crate::agent::should_allow_contextual_project_nickname_scope(text, token)
+                .then(|| {
+                    crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
+                        .or_else(|| {
+                            crate::tools::fs_utils::resolve_contextual_project_nickname_in_explicit_roots(token, alias_roots)
+                        })
                 })
+                .flatten()
                 .map(|path| path.to_string_lossy().to_string())
         };
         let Some(normalized) = normalized else {
@@ -418,6 +422,63 @@ mod tests {
             &[alias_root.to_string_lossy().to_string()],
         )
         .expect("project hint");
+        assert_eq!(hint, project.to_string_lossy());
+    }
+
+    #[test]
+    fn does_not_extract_plain_word_nickname_without_local_scope_cues() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alias_root = dir.path().join("projects");
+        let project = alias_root.join("fairfax-va-site");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+
+        let hint = extract_project_dir_hint_with_aliases(
+            "Find recruiting studies in Fairfax, Virginia and summarize them.",
+            &[alias_root.to_string_lossy().to_string()],
+        );
+
+        assert!(
+            hint.is_none(),
+            "plain language should not infer a project hint: {:?}",
+            hint
+        );
+    }
+
+    #[test]
+    fn does_not_extract_dotted_nickname_without_local_scope_cues() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alias_root = dir.path().join("projects");
+        let project = alias_root.join("blog.aidaemon.ai");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"blog\"\n").expect("wrangler");
+
+        let hint = extract_project_dir_hint_with_aliases(
+            "Tell me about blog.aidaemon.ai and its latest posts.",
+            &[alias_root.to_string_lossy().to_string()],
+        );
+
+        assert!(
+            hint.is_none(),
+            "descriptive external request should not infer a project hint: {:?}",
+            hint
+        );
+    }
+
+    #[test]
+    fn extracts_plain_word_nickname_with_explicit_project_scope_cues() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alias_root = dir.path().join("projects");
+        let project = alias_root.join("fairfax-va-site");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"fairfax\"\n").expect("wrangler");
+
+        let hint = extract_project_dir_hint_with_aliases(
+            "Check the Fairfax project for broken links.",
+            &[alias_root.to_string_lossy().to_string()],
+        )
+        .expect("project hint");
+
         assert_eq!(hint, project.to_string_lossy());
     }
 

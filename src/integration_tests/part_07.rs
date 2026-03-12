@@ -284,8 +284,12 @@ async fn test_personal_recall_challenge_scopes_tools_and_reaffirms() {
                 c.contains("Personal-memory recall")
                     || c.contains("not a real tool")
                     || c.contains("Unknown tool")
+                    || c.contains("should be answered directly in plain text")
             })
         });
+    // The browser tool call may be blocked by the personal-recall scope
+    // guard OR by the text-only prelude check (for non-mutation turns).
+    // Either path prevents execution.
     assert!(
         scoped_block,
         "Expected out-of-scope browser tool call to be blocked for personal recall turn"

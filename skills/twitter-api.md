@@ -1,9 +1,41 @@
 ---
 name: twitter-api
 description: X/Twitter API knowledge, error diagnosis, and tier limitations
-triggers: tweet, twitter, x.com, reply, comment, post, retweet, like, follow, mention, hashtag, timeline
+triggers: twitter api, x api, twitter oauth, twitter auth, twitter developer, twitter error, x error, tweet api, tweet visibility, twitter timeline, post to twitter, post to x, twitter post, tweet this, reply to tweet, quote tweet
 ---
 When working with the X (Twitter) API, use this knowledge to diagnose errors and avoid loops.
+
+### Common Actions
+
+Use the `http_request` tool with `auth_profile="twitter"`.
+
+Create a post:
+```json
+POST https://api.x.com/2/tweets
+{
+  "text": "your message"
+}
+```
+
+Reply to a post:
+```json
+POST https://api.x.com/2/tweets
+{
+  "text": "your reply text",
+  "reply": {
+    "in_reply_to_tweet_id": "TWEET_ID_HERE"
+  }
+}
+```
+
+Quote a post:
+```json
+POST https://api.x.com/2/tweets
+{
+  "text": "your comment",
+  "quote_tweet_id": "TWEET_ID_HERE"
+}
+```
 
 ### API Tier Limitations (IMPORTANT)
 
@@ -35,19 +67,7 @@ When working with the X (Twitter) API, use this knowledge to diagnose errors and
 | "Forbidden" (generic) | App permissions set to "Read" only | Change to "Read and Write" in X Developer Portal, then start a fresh OAuth connect flow |
 | 403 after changing permissions | Old OAuth token has stale scopes | Run `manage_oauth` connect for twitter again. Do not remove the existing connection first |
 
-### Replying to a Tweet
-
-To reply, include the `reply` field:
-```json
-POST https://api.twitter.com/2/tweets
-{
-  "text": "your reply text",
-  "reply": {
-    "in_reply_to_tweet_id": "TWEET_ID_HERE"
-  }
-}
-```
-**IMPORTANT**: This only works if the API can "see" the target tweet. On Free tier, you can only reply to your own tweets.
+**IMPORTANT**: Replying only works if the API can "see" the target tweet. On Free tier, you can only reply to your own tweets.
 
 ### Error Handling Rules
 

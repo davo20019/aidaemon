@@ -49,8 +49,8 @@ impl Agent {
         // Tier 2 (7+ reads): Hard escalation — strip read tools from tool_defs
         //   so the model literally cannot call read_file.
         // Restore: when consecutive_reads drops below threshold, restore read tools.
-        const READ_SATURATION_THRESHOLD: usize = 2;
-        const READ_SATURATION_ESCALATION: usize = 4;
+        const READ_SATURATION_THRESHOLD: usize = 4;
+        const READ_SATURATION_ESCALATION: usize = 7;
         let read_only_tools = [
             "read_file",
             "search_files",
@@ -335,6 +335,10 @@ impl Agent {
                 policy_bundle.risk_score,
                 true,
             );
+            widened =
+                self.restrict_connected_api_setup_tools_for_request(inputs.user_text, &widened);
+            widened =
+                self.ensure_connected_api_tools_exposed(inputs.user_text, &widened, base_tool_defs);
             widened.truncate(20);
             let widened = if restrict_to_personal_memory_tools {
                 filter_tool_defs_for_personal_memory(&widened)

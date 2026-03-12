@@ -25,8 +25,8 @@ pub use dynamic::{
     OAuthConnection, PendingOAuthFlow, SkillDraft,
 };
 pub use goals::{
-    Goal, GoalSchedule, GoalTokenBudgetStatus, NotificationEntry, ScheduledRunState, Task,
-    TaskActivity,
+    Goal, GoalSchedule, GoalTokenBudgetStatus, NotificationEntry, ScheduledRunHealth,
+    ScheduledRunState, Task, TaskActivity,
 };
 pub use memory::{
     BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Procedure, UserProfile,

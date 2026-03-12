@@ -127,6 +127,10 @@ impl SessionContext {
         }
 
         let mut lines = vec!["## Current Session Activity".to_string()];
+        let active_task_is_uploaded_artifact = self
+            .current_task
+            .as_ref()
+            .is_some_and(|task| task.description.contains("[File received:"));
 
         // Current task
         if let Some(task) = &self.current_task {
@@ -140,24 +144,26 @@ impl SessionContext {
         }
 
         // Last completed task
-        if let Some(task) = &self.last_completed_task {
-            let status_str = match task.status {
-                TaskStatus::Completed => "completed",
-                TaskStatus::Cancelled => "CANCELLED",
-                TaskStatus::Failed => "FAILED",
-            };
-            let error_suffix = task
-                .error
-                .as_ref()
-                .map(|e| format!(" - Error: {}", truncate_str(e, 50)))
-                .unwrap_or_default();
-            lines.push(format!(
-                "- **Last task:** \"{}\" - {} ({}s){}",
-                truncate_str(&task.description, 50),
-                status_str,
-                task.duration_secs,
-                error_suffix
-            ));
+        if !active_task_is_uploaded_artifact {
+            if let Some(task) = &self.last_completed_task {
+                let status_str = match task.status {
+                    TaskStatus::Completed => "completed",
+                    TaskStatus::Cancelled => "CANCELLED",
+                    TaskStatus::Failed => "FAILED",
+                };
+                let error_suffix = task
+                    .error
+                    .as_ref()
+                    .map(|e| format!(" - Error: {}", truncate_str(e, 50)))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "- **Last task:** \"{}\" - {} ({}s){}",
+                    truncate_str(&task.description, 50),
+                    status_str,
+                    task.duration_secs,
+                    error_suffix
+                ));
+            }
         }
 
         // Last error

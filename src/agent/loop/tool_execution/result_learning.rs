@@ -2,6 +2,7 @@ use super::project_dir::{
     extract_project_dir_from_project_inspect_output, extract_search_files_scanned_dir,
     project_inspect_reports_file_entries, search_files_result_no_matches,
 };
+use super::reflection::{record_tool_error, PendingReflectionRecovery, SemanticFailureInfo};
 use super::types::ToolExecutionOutcome;
 use crate::agent::loop_utils;
 use crate::agent::recall_guardrails::tool_result_indicates_no_evidence;
@@ -24,6 +25,7 @@ pub(super) struct ResultLearningEnv<'a> {
     pub emitter: &'a crate::events::EventEmitter,
     pub task_start: Instant,
     pub iteration: usize,
+    pub tool_arguments: &'a str,
     pub tool_summary: &'a str,
 }
 
@@ -39,6 +41,9 @@ pub(super) struct ResultLearningState<'a> {
     pub tool_transient_failure_count: &'a mut HashMap<String, usize>,
     pub tool_cooldown_until_iteration: &'a mut HashMap<String, usize>,
     pub pending_error_solution_ids: &'a mut Vec<i64>,
+    pub tool_error_history:
+        &'a mut HashMap<(String, String), Vec<super::reflection::ToolErrorEntry>>,
+    pub pending_reflection_recoveries: &'a mut HashMap<String, PendingReflectionRecovery>,
     pub tool_failure_patterns: &'a mut HashMap<(String, String), usize>,
     pub last_tool_failure: &'a mut Option<(String, String)>,
     pub in_session_learned: &'a mut HashSet<(String, String)>,
@@ -56,6 +61,11 @@ pub(super) struct ResultLearningState<'a> {
     pub known_project_dir: &'a mut Option<String>,
     pub dirs_with_project_inspect_file_evidence: &'a mut HashSet<String>,
     pub dirs_with_search_no_matches: &'a mut HashSet<String>,
+}
+
+pub(super) struct ResultLearningOutcome {
+    pub control_flow: Option<ToolExecutionOutcome>,
+    pub semantic_failure: Option<SemanticFailureInfo>,
 }
 
 fn cli_result_is_substantive(result_text: &str) -> bool {
@@ -172,10 +182,10 @@ fn record_semantic_failure_signature(
     tool_failure_signatures: &mut HashMap<(String, String), usize>,
     tool_name: &str,
     error_text: &str,
-) -> usize {
+) -> SemanticFailureInfo {
     let signature = derive_failure_signature(error_text);
     let count = tool_failure_signatures
-        .entry((tool_name.to_string(), signature))
+        .entry((tool_name.to_string(), signature.clone()))
         .or_insert(0);
     *count += 1;
     let repeated_count = *count;
@@ -185,19 +195,24 @@ fn record_semantic_failure_signature(
     if repeated_count > *per_tool {
         *per_tool = repeated_count;
     }
-    repeated_count
+    SemanticFailureInfo {
+        signature,
+        count: repeated_count,
+    }
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn apply_result_learning(
         &self,
         tc: &ToolCall,
         result_text: &mut String,
         is_error: bool,
         failure_class: Option<ToolFailureClass>,
+        execution_failure_kind: Option<ExecutionFailureKind>,
         env: &ResultLearningEnv<'_>,
         state: &mut ResultLearningState<'_>,
-    ) -> anyhow::Result<Option<ToolExecutionOutcome>> {
+    ) -> anyhow::Result<ResultLearningOutcome> {
         if is_error {
             *state.no_evidence_result_streak = 0;
             *state.iteration_had_tool_failures = true;
@@ -209,6 +224,28 @@ impl Agent {
 
             let base_error = strip_appended_diagnostics(result_text).to_string();
             let failure_class = failure_class.unwrap_or(ToolFailureClass::Semantic);
+            let mut semantic_failure = None;
+            match execution_failure_kind {
+                Some(ExecutionFailureKind::ToolContractFailure) => append_tool_result_notice(
+                    result_text,
+                    &ToolResultNotice::ToolContractFailureRetry {
+                        tool_name: tc.name.clone(),
+                    },
+                ),
+                Some(ExecutionFailureKind::EnvironmentFailure) => append_tool_result_notice(
+                    result_text,
+                    &ToolResultNotice::EnvironmentFailureGuidance {
+                        tool_name: tc.name.clone(),
+                    },
+                ),
+                Some(ExecutionFailureKind::LogicFailure) => append_tool_result_notice(
+                    result_text,
+                    &ToolResultNotice::LogicFailureReplan {
+                        tool_name: tc.name.clone(),
+                    },
+                ),
+                Some(ExecutionFailureKind::ToolInvocationFailure) | None => {}
+            }
             if matches!(failure_class, ToolFailureClass::Transient) {
                 state.pending_error_solution_ids.clear();
                 let transient_count = state
@@ -240,10 +277,26 @@ impl Agent {
                     );
                 }
             } else {
-                let semantic_count = record_semantic_failure_signature(
+                let failure = record_semantic_failure_signature(
                     state.tool_failure_count,
                     state.tool_failure_signatures,
                     &tc.name,
+                    &base_error,
+                );
+                let semantic_count = failure.count;
+                semantic_failure = Some(failure.clone());
+                clear_pending_reflection_recovery_on_failure(
+                    state.pending_reflection_recoveries,
+                    &tc.name,
+                    &failure.signature,
+                    env.iteration,
+                );
+                record_tool_error(
+                    state.tool_error_history,
+                    &tc.name,
+                    &failure.signature,
+                    env.iteration,
+                    env.tool_arguments,
                     &base_error,
                 );
 
@@ -473,7 +526,10 @@ impl Agent {
                 state.learning_ctx.first_error = Some(base_error);
             }
             state.learning_ctx.errors.push((result_text.clone(), false));
-            return Ok(None);
+            return Ok(ResultLearningOutcome {
+                control_flow: None,
+                semantic_failure,
+            });
         }
 
         if env.attempted_required_file_recheck {
@@ -568,7 +624,10 @@ impl Agent {
                 Some(reaffirmation.chars().take(200).collect()),
             )
             .await;
-            return Ok(Some(ToolExecutionOutcome::Return(Ok(reaffirmation))));
+            return Ok(ResultLearningOutcome {
+                control_flow: Some(ToolExecutionOutcome::Return(Ok(reaffirmation))),
+                semantic_failure: None,
+            });
         }
 
         if !env.restrict_to_personal_memory_tools
@@ -647,6 +706,29 @@ impl Agent {
                 });
             }
 
+            let reflection_solution_ids = take_pending_reflection_solution_ids_for_recovery(
+                state.pending_reflection_recoveries,
+                &tc.name,
+                env.iteration,
+            );
+            if !reflection_solution_ids.is_empty() {
+                let state_store = self.state.clone();
+                tokio::spawn(async move {
+                    for solution_id in reflection_solution_ids {
+                        if let Err(e) = state_store
+                            .update_error_solution_outcome(solution_id, true)
+                            .await
+                        {
+                            warn!(
+                                solution_id,
+                                error = %e,
+                                "Failed to record reflection learning success"
+                            );
+                        }
+                    }
+                });
+            }
+
             // In-session mini learning: if we saw repeated failures for a tool+pattern
             // and then recovered via a different tool, persist the workaround now.
             if let Some((failed_tool, failed_pattern)) = state.last_tool_failure.take() {
@@ -693,7 +775,10 @@ impl Agent {
             }
         }
 
-        Ok(None)
+        Ok(ResultLearningOutcome {
+            control_flow: None,
+            semantic_failure: None,
+        })
     }
 }
 
@@ -715,6 +800,54 @@ fn format_semantic_failure_coaching(semantic_count: usize, key_line: &str) -> To
         semantic_count,
         key_line: key_line.to_string(),
     }
+}
+
+pub(super) fn expire_stale_pending_reflection_recoveries(
+    pending_reflection_recoveries: &mut HashMap<String, PendingReflectionRecovery>,
+    current_iteration: usize,
+) {
+    pending_reflection_recoveries
+        .retain(|_, pending| pending.verify_on_iteration >= current_iteration);
+}
+
+fn clear_pending_reflection_recovery_on_failure(
+    pending_reflection_recoveries: &mut HashMap<String, PendingReflectionRecovery>,
+    tool_name: &str,
+    current_signature: &str,
+    current_iteration: usize,
+) {
+    if pending_reflection_recoveries
+        .get(tool_name)
+        .is_some_and(|pending| {
+            pending.signature != current_signature
+                || pending.verify_on_iteration <= current_iteration
+        })
+    {
+        pending_reflection_recoveries.remove(tool_name);
+    }
+}
+
+fn take_pending_reflection_solution_ids_for_recovery(
+    pending_reflection_recoveries: &mut HashMap<String, PendingReflectionRecovery>,
+    tool_name: &str,
+    current_iteration: usize,
+) -> Vec<i64> {
+    let Some(verify_on_iteration) = pending_reflection_recoveries
+        .get(tool_name)
+        .map(|pending| pending.verify_on_iteration)
+    else {
+        return Vec::new();
+    };
+    if verify_on_iteration != current_iteration {
+        if verify_on_iteration < current_iteration {
+            pending_reflection_recoveries.remove(tool_name);
+        }
+        return Vec::new();
+    }
+    pending_reflection_recoveries
+        .remove(tool_name)
+        .map(|pending| pending.solution_ids)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -774,8 +907,8 @@ mod tests {
             "read_file",
             "Error: missing required field `path`",
         );
-        assert_eq!(first, 1);
-        assert_eq!(second, 2);
+        assert_eq!(first.count, 1);
+        assert_eq!(second.count, 2);
         assert_eq!(counts.get("read_file").copied(), Some(2));
     }
 
@@ -803,9 +936,87 @@ mod tests {
             "Error: missing required field `path`",
         );
 
-        assert_eq!(first, 1);
-        assert_eq!(second_unique, 1);
-        assert_eq!(third_repeat, 2);
+        assert_eq!(first.count, 1);
+        assert_eq!(second_unique.count, 1);
+        assert_eq!(third_repeat.count, 2);
+    }
+
+    #[test]
+    fn reflection_verification_uses_current_pending_recovery_for_tool() {
+        let mut pending = HashMap::from([(
+            "http_request".to_string(),
+            PendingReflectionRecovery {
+                signature: "http 401 unauthorized".to_string(),
+                solution_ids: vec![22, 23],
+                verify_on_iteration: 4,
+            },
+        )]);
+
+        let ids =
+            take_pending_reflection_solution_ids_for_recovery(&mut pending, "http_request", 4);
+
+        assert_eq!(ids, vec![22, 23]);
+        assert!(!pending.contains_key("http_request"));
+    }
+
+    #[test]
+    fn reflection_verification_skips_later_successes_outside_recovery_turn() {
+        let mut pending = HashMap::from([(
+            "http_request".to_string(),
+            PendingReflectionRecovery {
+                signature: "http 401 unauthorized".to_string(),
+                solution_ids: vec![22, 23],
+                verify_on_iteration: 4,
+            },
+        )]);
+
+        let ids =
+            take_pending_reflection_solution_ids_for_recovery(&mut pending, "http_request", 5);
+
+        assert!(ids.is_empty());
+        assert!(!pending.contains_key("http_request"));
+    }
+
+    #[test]
+    fn changing_failure_signature_clears_pending_reflection_recovery() {
+        let mut pending = HashMap::from([(
+            "http_request".to_string(),
+            PendingReflectionRecovery {
+                signature: "http 401 unauthorized".to_string(),
+                solution_ids: vec![22, 23],
+                verify_on_iteration: 4,
+            },
+        )]);
+
+        clear_pending_reflection_recovery_on_failure(
+            &mut pending,
+            "http_request",
+            "http 404 not found",
+            3,
+        );
+
+        assert!(!pending.contains_key("http_request"));
+    }
+
+    #[test]
+    fn failed_recovery_attempt_clears_pending_reflection_recovery_even_with_same_signature() {
+        let mut pending = HashMap::from([(
+            "http_request".to_string(),
+            PendingReflectionRecovery {
+                signature: "http 401 unauthorized".to_string(),
+                solution_ids: vec![22, 23],
+                verify_on_iteration: 4,
+            },
+        )]);
+
+        clear_pending_reflection_recovery_on_failure(
+            &mut pending,
+            "http_request",
+            "http 401 unauthorized",
+            4,
+        );
+
+        assert!(!pending.contains_key("http_request"));
     }
 
     #[test]

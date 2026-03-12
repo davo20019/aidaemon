@@ -10,6 +10,17 @@ pub struct GoalTokenBudgetStatus {
 }
 
 /// Persisted runtime state for an active scheduled run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ScheduledRunHealth {
+    pub evidence_gain_count: usize,
+    pub total_successful_tool_calls: usize,
+    pub stall_count: usize,
+    pub consecutive_same_tool_count: usize,
+    pub consecutive_same_tool_unique_args: usize,
+    pub unrecovered_error_count: usize,
+}
+
+/// Persisted runtime state for an active scheduled run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScheduledRunState {
     pub goal_id: String,
@@ -17,6 +28,8 @@ pub struct ScheduledRunState {
     pub effective_budget_per_check: i64,
     pub tokens_used: i64,
     pub budget_extensions_count: usize,
+    #[serde(default)]
+    pub health: ScheduledRunHealth,
     pub created_at: String,
     pub updated_at: String,
 }

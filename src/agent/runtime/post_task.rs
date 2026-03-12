@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +12,33 @@ use crate::traits::StateStore;
 use super::{extract_key_error_line, semantic_failure_limit, MAX_CONSECUTIVE_SAME_TOOL};
 
 /// Context accumulated during handle_message for post-task learning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ReplayNoteCategory {
+    PlanRevision,
+    EvidenceGate,
+    ValidationFailure,
+    RetryReason,
+}
+
+impl ReplayNoteCategory {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::PlanRevision => "plan_revision",
+            Self::EvidenceGate => "evidence_gate",
+            Self::ValidationFailure => "validation_failure",
+            Self::RetryReason => "retry_reason",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ReplayNote {
+    pub(super) category: ReplayNoteCategory,
+    pub(super) code: String,
+    pub(super) summary: String,
+    pub(super) blocking: bool,
+}
+
 #[derive(Clone)]
 pub(super) struct LearningContext {
     pub(super) user_text: String,
@@ -25,6 +52,39 @@ pub(super) struct LearningContext {
     pub(super) completed_naturally: bool,
     pub(super) explicit_positive_signals: u32,
     pub(super) explicit_negative_signals: u32,
+    pub(super) replay_notes: Vec<ReplayNote>,
+}
+
+impl LearningContext {
+    pub(super) fn record_replay_note(
+        &mut self,
+        category: ReplayNoteCategory,
+        code: impl Into<String>,
+        summary: impl Into<String>,
+        blocking: bool,
+    ) {
+        const MAX_REPLAY_NOTES: usize = 24;
+
+        let code = code.into().trim().to_string();
+        let summary = summary.into().trim().to_string();
+        if code.is_empty() || summary.is_empty() {
+            return;
+        }
+
+        let note = ReplayNote {
+            category,
+            code,
+            summary,
+            blocking,
+        };
+        if self.replay_notes.contains(&note) {
+            return;
+        }
+        if self.replay_notes.len() >= MAX_REPLAY_NOTES {
+            self.replay_notes.remove(0);
+        }
+        self.replay_notes.push(note);
+    }
 }
 
 /// Process learning from a completed task - runs in background.
@@ -79,13 +139,13 @@ pub(super) async fn process_learning(
     }
 
     // 3. Learn error-solution if error was recovered
-    if let Some(error) = ctx.first_error {
+    if let Some(error) = ctx.first_error.clone() {
         if !ctx.recovery_actions.is_empty() {
             let solution = procedures::create_error_solution(
                 procedures::extract_error_pattern(&error),
                 domains.into_iter().next(),
                 procedures::summarize_solution(&ctx.recovery_actions),
-                Some(ctx.recovery_actions),
+                Some(ctx.recovery_actions.clone()),
             );
             if let Err(e) = state.insert_error_solution(&solution).await {
                 warn!(error_pattern = %solution.error_pattern, error = %e, "Failed to save error solution");
@@ -93,7 +153,111 @@ pub(super) async fn process_learning(
         }
     }
 
+    if !ctx.replay_notes.is_empty() {
+        record_reasoning_failure_patterns(state, &ctx, task_success).await;
+    }
+
     Ok(())
+}
+
+async fn record_reasoning_failure_patterns(
+    state: &Arc<dyn StateStore>,
+    ctx: &LearningContext,
+    task_success: bool,
+) {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for note in ctx.replay_notes.iter().filter(|note| note.blocking) {
+        let trigger_context = format!("{}:{}", note.category.as_str(), note.code);
+        let action = reasoning_action_for_note(note);
+        if !seen.insert((trigger_context.clone(), action.to_string())) {
+            continue;
+        }
+
+        let confidence = reasoning_confidence_for_note(note, task_success);
+        if let Err(e) = state
+            .record_behavior_pattern(
+                "reasoning_failure",
+                &note.summary,
+                Some(&trigger_context),
+                Some(action),
+                confidence,
+                1,
+            )
+            .await
+        {
+            warn!(
+                trigger_context = %trigger_context,
+                action = %action,
+                error = %e,
+                "Failed to save reasoning failure pattern"
+            );
+        }
+    }
+}
+
+fn reasoning_action_for_note(note: &ReplayNote) -> &'static str {
+    match note.code.as_str() {
+        "missing_pre_execution_evidence" => "gather_direct_evidence_before_mutation",
+        "plan_rejected" => "replan_first_risky_step_before_execution",
+        "critique_rejected" => "address_critique_and_replan",
+        "target_scope_violation" => "confirm_target_scope_before_mutation",
+        "tool_contract_violation" => "fix_tool_arguments_before_retry",
+        "contradictory_file_evidence" => "recheck_conflicting_state_before_completion",
+        "verification_pending" => "run_verification_before_claiming_success",
+        "verification_unavailable_in_phase" => "surface_partial_result_until_verification_can_run",
+        "validation_budget_exhausted" => "reduce_scope_when_validation_budget_exhausts",
+        "execution_budget_exhausted" => "reduce_scope_or_abandon_when_execution_budget_exhausts",
+        "retry_step" => "retry_only_when_failure_is_local_and_correctable",
+        "replan_required" => "replan_after_logic_or_environment_failure",
+        _ => "review_reasoning_trace_before_retry",
+    }
+}
+
+fn reasoning_confidence_for_note(note: &ReplayNote, task_success: bool) -> f32 {
+    let base = match note.code.as_str() {
+        "missing_pre_execution_evidence" | "verification_pending" => 0.78,
+        "target_scope_violation" => 0.84,
+        "plan_rejected" | "critique_rejected" => 0.72,
+        "contradictory_file_evidence" => 0.76,
+        "validation_budget_exhausted" | "execution_budget_exhausted" => 0.68,
+        "retry_step" | "replan_required" => 0.58,
+        _ => 0.52,
+    };
+    if task_success {
+        (base - 0.08_f32).clamp(0.25_f32, 0.96_f32)
+    } else {
+        (base + 0.06_f32).clamp(0.25_f32, 0.96_f32)
+    }
+}
+
+#[allow(dead_code)] // Used by targeted replay/learning tests and future replay surfacing.
+pub(in crate::agent) fn summarize_replay_notes(notes: &[ReplayNote]) -> String {
+    if notes.is_empty() {
+        return String::new();
+    }
+
+    let mut grouped: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for note in notes {
+        grouped
+            .entry(note.category.as_str())
+            .or_default()
+            .push(note.summary.clone());
+    }
+
+    let mut sections = Vec::new();
+    for (category, items) in grouped {
+        let unique: Vec<String> = items.into_iter().fold(Vec::new(), |mut acc, item| {
+            if !acc.contains(&item) {
+                acc.push(item);
+            }
+            acc
+        });
+        if unique.is_empty() {
+            continue;
+        }
+        sections.push(format!("{}: {}", category, unique.join(" | ")));
+    }
+    sections.join("\n")
 }
 
 /// Classify the stall cause from recent errors for actionable guidance.
@@ -519,7 +683,7 @@ pub(super) fn graceful_cap_response(learning_ctx: &LearningContext, _iterations:
 ///    (`unique * 2 > count`); if not diverse OR count ≥ `MAX_CONSECUTIVE_SAME_TOOL + 4`
 ///    → not productive
 /// 3. Error rate: unrecovered errors * 2 < max(1, total_successful)
-/// 4. Minimum 8 successful tool calls
+/// 4. Minimum 3 successful tool calls
 pub(super) fn is_productive(
     learning_ctx: &LearningContext,
     stall_count: usize,
@@ -555,10 +719,11 @@ pub(super) fn is_productive(
         return false;
     }
 
-    // 4. Minimum activity threshold — require meaningful progress, not just
-    // a few tool calls.  The old threshold of 3 was too low: an agent that
-    // made 3 calls and hit the budget would still qualify for auto-extension.
-    if total_successful_tool_calls < 8 {
+    // 4. Minimum activity threshold — require more than one or two lucky calls,
+    // but do not force long runs to hit a high fixed bar before they can
+    // continue. Three successful tool calls is enough to prove the run is
+    // underway without blocking short productive tasks.
+    if total_successful_tool_calls < 3 {
         return false;
     }
 
@@ -739,6 +904,10 @@ pub(in crate::agent) fn categorize_tool_calls(tool_calls: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use crate::traits::StateStore;
+    use std::sync::Arc;
 
     #[test]
     fn test_categorize_tool_calls_groups_correctly() {
@@ -799,6 +968,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            replay_notes: Vec::new(),
         };
         let result = graceful_budget_response(&ctx, 500_000);
         assert!(result.contains("processing limit"));
@@ -832,6 +1002,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            replay_notes: Vec::new(),
         };
         let result = graceful_budget_response(&ctx, 500_000);
         assert!(result.len() <= 1502); // 1500 + "…"
@@ -853,6 +1024,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            replay_notes: Vec::new(),
         };
 
         let result = graceful_goal_daily_budget_response(&ctx, 60, 60, true);
@@ -880,6 +1052,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            replay_notes: Vec::new(),
         };
         let result = graceful_partial_stall_response(&ctx, false, "deferred", &HashMap::new());
         assert!(result.contains("some progress"));
@@ -921,6 +1094,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            replay_notes: Vec::new(),
         }
     }
 
@@ -954,6 +1128,12 @@ mod tests {
         let ctx = make_learning_ctx();
         // Only 2 successful tool calls → below minimum
         assert!(!is_productive(&ctx, 0, 0, 0, 2));
+    }
+
+    #[test]
+    fn test_is_productive_short_productive_run() {
+        let ctx = make_learning_ctx();
+        assert!(is_productive(&ctx, 0, 0, 0, 3));
     }
 
     #[test]
@@ -1001,6 +1181,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            replay_notes: Vec::new(),
         }
     }
 
@@ -1075,6 +1256,75 @@ mod tests {
         let summary = format_tool_failure_summary(&tool_failure_count);
         assert!(summary.contains("- API access"));
         assert!(!summary.contains("other capability"));
+    }
+
+    #[test]
+    fn test_summarize_replay_notes_groups_categories() {
+        let summary = summarize_replay_notes(&[
+            ReplayNote {
+                category: ReplayNoteCategory::PlanRevision,
+                code: "plan_rejected".to_string(),
+                summary: "Rejected the first deploy step.".to_string(),
+                blocking: true,
+            },
+            ReplayNote {
+                category: ReplayNoteCategory::ValidationFailure,
+                code: "verification_pending".to_string(),
+                summary: "Verification was still pending.".to_string(),
+                blocking: true,
+            },
+        ]);
+        assert!(summary.contains("plan_revision: Rejected the first deploy step."));
+        assert!(summary.contains("validation_failure: Verification was still pending."));
+    }
+
+    #[tokio::test]
+    async fn test_process_learning_records_reasoning_failure_patterns() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 32, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+
+        let ctx = LearningContext {
+            user_text: "deploy the app".to_string(),
+            intent_domains: vec!["deploy".to_string()],
+            tool_calls: vec!["read_file(src/main.rs)".to_string()],
+            errors: Vec::new(),
+            first_error: None,
+            recovery_actions: Vec::new(),
+            start_time: Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 1,
+            replay_notes: vec![ReplayNote {
+                category: ReplayNoteCategory::ValidationFailure,
+                code: "verification_pending".to_string(),
+                summary: "Blocked completion until final verification could run.".to_string(),
+                blocking: true,
+            }],
+        };
+
+        process_learning(&(state.clone() as Arc<dyn StateStore>), ctx)
+            .await
+            .unwrap();
+
+        let patterns = state.get_behavior_patterns(0.0).await.unwrap();
+        let pattern = patterns
+            .iter()
+            .find(|pattern| pattern.pattern_type == "reasoning_failure")
+            .expect("reasoning failure pattern");
+        assert_eq!(
+            pattern.trigger_context.as_deref(),
+            Some("validation_failure:verification_pending")
+        );
+        assert_eq!(
+            pattern.action.as_deref(),
+            Some("run_verification_before_claiming_success")
+        );
     }
 
     #[test]

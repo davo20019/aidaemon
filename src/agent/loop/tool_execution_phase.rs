@@ -2,5 +2,6 @@
 mod phase_impl;
 
 pub(super) use phase_impl::{
-    extract_project_dir_hint_with_aliases, ToolExecutionCtx, ToolExecutionOutcome,
+    extract_project_dir_hint_with_aliases, PendingReflectionRecovery, ToolErrorEntry,
+    ToolExecutionCtx, ToolExecutionOutcome,
 };

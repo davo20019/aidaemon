@@ -105,19 +105,48 @@ use policy_signals::{
     build_policy_bundle, default_clarifying_question, detect_explicit_outcome_signal,
     tool_is_side_effecting,
 };
+#[path = "loop/evidence_state.rs"]
+mod evidence_state;
+pub(in crate::agent) use evidence_state::{
+    assess_pre_execution_evidence_gate, has_completed_side_effecting_tool_call,
+    record_successful_tool_evidence, EvidenceState,
+};
+#[path = "loop/validation_state.rs"]
+mod validation_state;
+pub(in crate::agent) use validation_state::{
+    build_abandon_request, build_partial_done_blocked_request, build_reduce_scope_request,
+    ApprovalState, LoopRepetitionReason, ValidationFailure, ValidationOutcome,
+};
+pub(crate) use validation_state::{
+    build_needs_approval_request, derive_executor_step_result, persist_executor_handoff_context,
+    persist_executor_result_context, ExecutorHandoff, ExecutorStepResult, PartialResult,
+    StepValidationOutcome, TaskValidationOutcome, ValidationState,
+};
+#[path = "loop/execution_state.rs"]
+mod execution_state;
+#[cfg(test)]
+pub(crate) use execution_state::ExecutionBudget;
+pub(crate) use execution_state::TargetScope;
+pub(in crate::agent) use execution_state::{
+    classify_step_execution_outcome, compile_step_execution_plan, select_initial_execution_budget,
+    ApprovalRequirement, ExecutionBudgetLimit, ExecutionPersistence, ExecutionState,
+    StepExecutionOutcome,
+};
 #[path = "loop/loop_utils.rs"]
 mod loop_utils;
 #[path = "policy/recall_guardrails.rs"]
 mod recall_guardrails;
 use loop_utils::{
-    build_task_boundary_hint, classify_tool_result_failure_with_context, extract_command_from_args,
+    build_task_boundary_hint, classify_execution_failure_kind,
+    classify_tool_result_failure_with_context, extract_command_from_args,
     extract_file_path_from_args, extract_key_error_line, extract_send_file_dedupe_key_from_args,
     fixup_message_ordering, hash_tool_call, is_trigger_session, semantic_failure_limit,
-    strip_appended_diagnostics, ToolFailureClass,
+    strip_appended_diagnostics, ExecutionFailureKind, ToolFailureClass,
 };
 #[path = "runtime/post_task.rs"]
 mod post_task;
 use post_task::LearningContext;
+pub(in crate::agent) use post_task::ReplayNoteCategory;
 #[path = "loop/stopping_conditions.rs"]
 mod stopping_conditions;
 #[path = "loop/tool_loop_state.rs"]
@@ -600,6 +629,24 @@ pub(in crate::agent) fn route_failsafe_active_for_session(session_id: &str) -> b
     active
 }
 
+#[cfg(test)]
+pub(crate) fn set_route_failsafe_for_session_for_test(session_id: &str, active: bool) {
+    let now = now_epoch_secs();
+    let Ok(mut monitor) = ROUTE_DRIFT_MONITOR.lock() else {
+        return;
+    };
+    if active {
+        let state = monitor
+            .sessions
+            .entry(session_id.to_string())
+            .or_insert_with(RouteDriftSessionState::default);
+        state.last_seen_epoch_secs = now;
+        state.failsafe_until_epoch_secs = now + ROUTE_DRIFT_FAILSAFE_DURATION_SECS;
+    } else {
+        monitor.sessions.remove(session_id);
+    }
+}
+
 struct PolicyRuntimeTunables {
     initialized: AtomicBool,
     // Stored as basis points (e.g. 0.55 => 5500) for lock-free updates.
@@ -1080,6 +1127,18 @@ struct ResumeCheckpoint {
     last_assistant_summary: Option<String>,
     last_tool_summary: Option<String>,
     last_error: Option<String>,
+    execution_snapshot: Option<ResumeExecutionSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct ResumeExecutionSnapshot {
+    execution_id: String,
+    current_step_id: Option<String>,
+    current_tool: Option<String>,
+    current_target: Option<String>,
+    last_outcome: Option<StepExecutionOutcome>,
+    background_handoff_active: bool,
+    idempotency_key: Option<String>,
 }
 
 impl ResumeCheckpoint {
@@ -1123,6 +1182,30 @@ impl ResumeCheckpoint {
         }
         if let Some(err) = &self.last_error {
             lines.push(format!("- Last error: {}", err));
+        }
+        if let Some(snapshot) = &self.execution_snapshot {
+            lines.push(format!("- Execution id: {}", snapshot.execution_id));
+            if let Some(step_id) = &snapshot.current_step_id {
+                lines.push(format!("- Last execution step: {}", step_id));
+            }
+            if let Some(tool) = &snapshot.current_tool {
+                lines.push(format!("- Last execution tool: {}", tool));
+            }
+            if let Some(target) = &snapshot.current_target {
+                lines.push(format!("- Last execution target: {}", target));
+            }
+            if let Some(outcome) = snapshot.last_outcome {
+                lines.push(format!("- Last execution outcome: {:?}", outcome));
+            }
+            if snapshot.background_handoff_active {
+                lines.push("- Background execution was active before interruption.".to_string());
+            }
+            if let Some(key) = &snapshot.idempotency_key {
+                lines.push(format!(
+                    "- Replay/idempotency key: {}",
+                    truncate_for_resume(key, 120)
+                ));
+            }
         }
         lines.push(
             "Resume from the next concrete step immediately. Re-run tools only if needed to verify or recover."
@@ -1303,6 +1386,72 @@ fn user_text_references_filesystem_path(user_text: &str) -> bool {
     }
 
     false
+}
+
+fn text_contains_any_phrase_as_words(text: &str, phrases: &[&str]) -> bool {
+    phrases
+        .iter()
+        .any(|phrase| contains_keyword_as_words(text, phrase))
+}
+
+fn text_has_explicit_project_scope_cues(text: &str) -> bool {
+    text_contains_any_phrase_as_words(
+        text,
+        &[
+            "project",
+            "repo",
+            "repository",
+            "workspace",
+            "directory",
+            "folder",
+            "codebase",
+            "code base",
+            "work in",
+            "inside",
+            "under",
+        ],
+    )
+}
+
+fn text_has_local_project_command_cues(text: &str, token: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower.ends_with('?') {
+        return false;
+    }
+
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let strong_local_verbs = [
+        "run", "build", "deploy", "publish", "restart", "reload", "commit", "push", "lint",
+        "format", "fmt", "compile", "test", "debug", "fix", "refactor", "edit",
+    ];
+    // Allow short adverbial prefixes ("now", "also", "please", "just", "quickly") before the verb
+    // so that "Now deploy blog.aidaemon.ai" is treated the same as "Deploy blog.aidaemon.ai".
+    const COMMAND_PREFIXES: &[&str] = &["now", "also", "please", "just", "quickly", "go"];
+    let starts_like_local_command = words
+        .iter()
+        .take(2)
+        .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_'))
+        .enumerate()
+        .any(|(i, word)| {
+            strong_local_verbs
+                .iter()
+                .any(|verb| word.eq_ignore_ascii_case(verb))
+                && (i == 0 || words.first().is_some_and(|w| COMMAND_PREFIXES.contains(w)))
+        });
+    if !starts_like_local_command {
+        return false;
+    }
+
+    let normalized_token = token
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.');
+    !normalized_token.is_empty() && contains_keyword_as_words(&lower, normalized_token)
+}
+
+fn should_allow_contextual_project_nickname_scope(text: &str, token: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    user_text_references_filesystem_path(text)
+        || text_has_explicit_project_scope_cues(&lower)
+        || text_has_local_project_command_cues(text, token)
 }
 
 fn user_explicitly_requests_local_file_inspection(user_text: &str) -> bool {
@@ -1490,6 +1639,11 @@ pub struct Agent {
     root_tools: Option<Vec<Arc<dyn Tool>>>,
     /// Emit structured decision points into the event store for self-diagnostics.
     record_decision_points: bool,
+    /// Test-only override for the execution budget selected at the start of
+    /// the agent loop. When `Some`, `select_initial_execution_budget` is
+    /// bypassed and this budget is used instead.
+    #[cfg(test)]
+    execution_budget_override: Option<ExecutionBudget>,
 }
 
 /// Blocked path patterns for auto-sent files (mirrors SendFileTool).
@@ -1748,6 +1902,7 @@ async fn persist_scheduled_run_state(
         effective_budget_per_check: status.effective_budget_per_check,
         tokens_used: status.tokens_used,
         budget_extensions_count: status.budget_extensions_count,
+        health: status.health.clone(),
         created_at: existing_created_at.unwrap_or_else(|| now.clone()),
         updated_at: now,
     };
@@ -1756,6 +1911,36 @@ async fn persist_scheduled_run_state(
 
 async fn clear_scheduled_run_state(state: &Arc<dyn StateStore>, goal_id: &str) {
     let _ = state.delete_scheduled_run_state(goal_id).await;
+}
+
+fn auto_dispatch_scheduled_run_extension_budget(
+    status: &GoalRunBudgetStatus,
+    max_budget_extensions: usize,
+    hard_token_cap: i64,
+) -> Option<i64> {
+    let old_budget = status.effective_budget_per_check;
+    let new_budget = old_budget
+        .saturating_mul(2)
+        .max(status.tokens_used.saturating_add(old_budget / 2))
+        .min(hard_token_cap);
+
+    let has_meaningful_progress = Agent::has_meaningful_budget_progress(
+        status.health.evidence_gain_count,
+        status.health.total_successful_tool_calls,
+    );
+    let clearly_unproductive =
+        Agent::scheduled_run_metrics_are_clearly_unproductive(&status.health);
+
+    if status.budget_extensions_count < max_budget_extensions
+        && old_budget < hard_token_cap
+        && new_budget > status.tokens_used
+        && has_meaningful_progress
+        && !clearly_unproductive
+    {
+        Some(new_budget)
+    } else {
+        None
+    }
 }
 
 async fn effective_goal_daily_budget(
@@ -1768,14 +1953,6 @@ async fn effective_goal_daily_budget(
         None
     };
     shared.or(goal.budget_daily)
-}
-
-fn is_processing_limit_reply(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with("I've reached my processing limit")
-        || trimmed.starts_with("This goal hit its daily processing budget")
-        || trimmed.starts_with("This scheduled goal hit its daily processing budget")
-        || trimmed.starts_with("This scheduled run hit its per-run processing budget")
 }
 
 /// Detect low-signal task-lead replies that should not be sent as the
@@ -1874,6 +2051,96 @@ fn looks_like_false_capability_denial_after_tool_success(text: &str) -> bool {
         || lower.contains("real-time information");
 
     guide_only && live_data_context
+}
+
+fn looks_like_evidence_grounding_challenge(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    let direct_grounding_challenges = [
+        "made them up",
+        "make them up",
+        "made that up",
+        "make that up",
+        "made this up",
+        "make this up",
+        "fabricated",
+        "invented",
+        "hallucinated",
+    ];
+    if direct_grounding_challenges
+        .iter()
+        .any(|phrase| contains_keyword_as_words(&lower, phrase))
+    {
+        return true;
+    }
+
+    let blocker_terms = [
+        "disabled",
+        "blocked",
+        "stopped",
+        "stop",
+        "failed",
+        "failure",
+        "error",
+        "errors",
+        "text-only",
+        "plain text",
+        "tool mode",
+        "couldn't",
+        "could not",
+        "unable",
+    ];
+    if contains_keyword_as_words(&lower, "why")
+        && blocker_terms
+            .iter()
+            .any(|term| contains_keyword_as_words(&lower, term))
+    {
+        return true;
+    }
+
+    let grounding_focus = [
+        "real", "really", "actually", "exact", "exactly", "quote", "quoted",
+    ];
+    let evidence_terms = [
+        "error", "errors", "result", "results", "output", "message", "messages", "line", "lines",
+        "status", "statuses", "id", "ids", "value", "values", "count", "counts", "failure",
+        "failures", "file", "files", "test", "tests", "api",
+    ];
+    let challenge_phrases = [
+        "where did you get that",
+        "show the exact output",
+        "show the exact result",
+        "what did it actually say",
+        "what did that actually say",
+        "what did the tool actually say",
+        "did it actually say",
+        "did that actually say",
+        "did it really say",
+        "did that really say",
+        "did it really return",
+        "did that really return",
+        "did it actually return",
+        "did that actually return",
+        "did it actually fail",
+        "did that actually fail",
+        "was that real",
+        "were those real",
+        "is that real",
+        "are those real",
+    ];
+
+    challenge_phrases
+        .iter()
+        .any(|phrase| contains_keyword_as_words(&lower, phrase))
+        || (grounding_focus
+            .iter()
+            .any(|word| contains_keyword_as_words(&lower, word))
+            && evidence_terms
+                .iter()
+                .any(|term| contains_keyword_as_words(&lower, term)))
 }
 
 pub(crate) fn goal_completion_response_indicates_incomplete_work(text: &str) -> bool {
@@ -2424,15 +2691,13 @@ pub fn spawn_background_task_lead(
                             if let Some(run_budget) = run_budget {
                                 if run_budget.tokens_used >= run_budget.effective_budget_per_check {
                                     let old_budget = run_budget.effective_budget_per_check;
-                                    let new_budget = old_budget
-                                        .saturating_mul(2)
-                                        .max(run_budget.tokens_used.saturating_add(old_budget / 2))
-                                        .min(AUTO_DISPATCH_HARD_TOKEN_CAP);
-                                    let can_extend = run_budget.budget_extensions_count
-                                        < AUTO_DISPATCH_MAX_BUDGET_EXTENSIONS
-                                        && old_budget < AUTO_DISPATCH_HARD_TOKEN_CAP
-                                        && new_budget > run_budget.tokens_used;
-                                    if can_extend {
+                                    if let Some(new_budget) =
+                                        auto_dispatch_scheduled_run_extension_budget(
+                                            &run_budget,
+                                            AUTO_DISPATCH_MAX_BUDGET_EXTENSIONS,
+                                            AUTO_DISPATCH_HARD_TOKEN_CAP,
+                                        )
+                                    {
                                         if let Some(registry) = goal_token_registry.as_ref() {
                                             if let Some(updated) = registry
                                                 .auto_extend_run_budget(&goal_id, new_budget)
@@ -2553,39 +2818,78 @@ pub fn spawn_background_task_lead(
                         )
                         .await;
 
-                    // Update task with result and deliver to channel
-                    let mut updated = task.clone();
+                    let mut latest_task = state.get_task(&task.id).await.ok().flatten();
                     match exec_result {
                         Ok(response) => {
-                            // Deliver executor result to the originating channel
-                            if !response.trim().is_empty() {
+                            let delivery_text = if !response.trim().is_empty() {
+                                response.clone()
+                            } else {
+                                latest_task
+                                    .as_ref()
+                                    .and_then(|task| {
+                                        task.result
+                                            .clone()
+                                            .filter(|result| !result.trim().is_empty())
+                                            .or_else(|| {
+                                                task.blocker
+                                                    .clone()
+                                                    .filter(|blocker| !blocker.trim().is_empty())
+                                            })
+                                    })
+                                    .unwrap_or_default()
+                            };
+
+                            if !delivery_text.trim().is_empty() {
                                 if let Some(hub_weak) = &hub {
                                     if let Some(hub_arc) = hub_weak.upgrade() {
-                                        let _ = hub_arc.send_text(&session_id, &response).await;
+                                        let _ =
+                                            hub_arc.send_text(&session_id, &delivery_text).await;
                                         any_executor_results_sent = true;
                                     }
                                 }
                             }
-                            updated.result = Some(response);
-                            updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                            if updated
-                                .result
-                                .as_deref()
-                                .is_some_and(is_processing_limit_reply)
-                            {
-                                updated.status = "blocked".to_string();
-                                updated.blocker = updated.result.clone();
-                            } else {
-                                updated.status = "completed".to_string();
-                                updated.blocker = None;
+
+                            if let Some(ref mut current_task) = latest_task {
+                                if current_task
+                                    .result
+                                    .as_deref()
+                                    .is_none_or(|result| result.trim().is_empty())
+                                    && !response.trim().is_empty()
+                                {
+                                    current_task.result = Some(response);
+                                    current_task.completed_at =
+                                        Some(chrono::Utc::now().to_rfc3339());
+                                    if !matches!(
+                                        current_task.status.as_str(),
+                                        "completed" | "blocked" | "failed"
+                                    ) {
+                                        current_task.status = "completed".to_string();
+                                        current_task.blocker = None;
+                                    }
+                                    let _ = state.update_task(current_task).await;
+                                }
                             }
                         }
                         Err(e) => {
-                            updated.status = "failed".to_string();
-                            updated.error = Some(e.to_string());
+                            if let Some(ref mut current_task) = latest_task {
+                                if !matches!(
+                                    current_task.status.as_str(),
+                                    "completed" | "blocked" | "failed"
+                                ) {
+                                    current_task.status = "failed".to_string();
+                                    current_task.error = Some(e.to_string());
+                                    current_task.completed_at =
+                                        Some(chrono::Utc::now().to_rfc3339());
+                                    let _ = state.update_task(current_task).await;
+                                }
+                            } else {
+                                let mut updated = task.clone();
+                                updated.status = "failed".to_string();
+                                updated.error = Some(e.to_string());
+                                let _ = state.update_task(&updated).await;
+                            }
                         }
                     }
-                    let _ = state.update_task(&updated).await;
                 }
 
                 if budget_exhausted {
@@ -3227,6 +3531,8 @@ impl Agent {
             inherited_project_scope,
             root_tools: None, // Root agent — its own tools ARE the root tools
             record_decision_points,
+            #[cfg(test)]
+            execution_budget_override: None,
         }
     }
 
@@ -3255,6 +3561,16 @@ impl Agent {
     #[cfg(test)]
     pub fn set_test_task_token_budget(&mut self, budget: Option<u64>) {
         self.task_token_budget = budget;
+    }
+
+    #[cfg(test)]
+    pub fn set_test_execution_budget_override(&mut self, budget: Option<ExecutionBudget>) {
+        self.execution_budget_override = budget;
+    }
+
+    #[cfg(test)]
+    pub fn set_test_daily_token_budget(&mut self, budget: Option<u64>) {
+        self.daily_token_budget = budget;
     }
 
     #[cfg(test)]
@@ -3371,6 +3687,8 @@ impl Agent {
             inherited_project_scope,
             root_tools,
             record_decision_points,
+            #[cfg(test)]
+            execution_budget_override: None,
         }
     }
 
@@ -3515,6 +3833,9 @@ impl Agent {
             .await;
 
         if let Some(goal_id) = scheduled_goal_to_clear.as_deref() {
+            if let Some(registry) = self.goal_token_registry.as_ref() {
+                registry.clear_run_budget(goal_id).await;
+            }
             clear_scheduled_run_state(&self.state, goal_id).await;
         }
 
@@ -3555,6 +3876,7 @@ impl Agent {
         for goal in active {
             if let Some(ref registry) = self.goal_token_registry {
                 registry.cancel(&goal.id).await;
+                registry.clear_run_budget(&goal.id).await;
             }
             clear_scheduled_run_state(&self.state, &goal.id).await;
 
@@ -3691,6 +4013,7 @@ mod final_reply_marker_tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            replay_notes: Vec::new(),
         };
         let mut tool_failure_count = HashMap::new();
         tool_failure_count.insert(

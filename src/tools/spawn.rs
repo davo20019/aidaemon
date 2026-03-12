@@ -670,10 +670,19 @@ impl SpawnAgentTool {
                 }
             }
             Ok(Err(e)) => Ok(format!("Sub-agent error: {}", e)),
-            Err(_) => Ok(format!(
-                "Sub-agent timed out after {} seconds",
-                self.timeout_secs
-            )),
+            Err(_) => {
+                if child_role == Some(AgentRole::Executor) {
+                    if let Some(task_id) = task_id {
+                        agent
+                            .mark_executor_task_timeout(task_id, self.timeout_secs)
+                            .await;
+                    }
+                }
+                Ok(format!(
+                    "Sub-agent timed out after {} seconds",
+                    self.timeout_secs
+                ))
+            }
         }
     }
 }

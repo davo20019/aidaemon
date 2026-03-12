@@ -7,6 +7,7 @@ pub(super) struct MessageBuildCtx<'a> {
     pub session_id: &'a str,
     pub iteration: usize,
     pub user_text: &'a str,
+    pub completed_tool_calls: &'a [String],
     pub model: &'a str,
     pub system_prompt: &'a str,
     pub pinned_memories: &'a [Message],
@@ -27,6 +28,9 @@ pub(super) struct MessageBuildData {
 }
 
 const EMPTY_RETRY_MAX_PARENT_CHARS: usize = 800;
+const EXECUTION_CHECKPOINT_MAX_REQUEST_CHARS: usize = 240;
+const EXECUTION_CHECKPOINT_MAX_ACTIVITY_CHARS: usize = 900;
+const EXECUTION_CHECKPOINT_MAX_EVIDENCE_CHARS: usize = 500;
 
 fn trimmed_message_content(message: &Value) -> Option<String> {
     message
@@ -94,6 +98,75 @@ fn build_empty_response_retry_messages(existing: &[Value], user_text: &str) -> V
     recovered
 }
 
+fn tool_is_low_info_for_checkpoint(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "write_file"
+            | "edit_file"
+            | "manage_memories"
+            | "manage_people"
+            | "remember_fact"
+            | "check_environment"
+    )
+}
+
+fn build_execution_checkpoint_message(
+    user_text: &str,
+    completed_tool_calls: &[String],
+    current_interaction: &[&Message],
+) -> Option<String> {
+    let trimmed_user = user_text.trim();
+    if trimmed_user.is_empty() || completed_tool_calls.is_empty() {
+        return None;
+    }
+
+    let activity = super::post_task::categorize_tool_calls(completed_tool_calls);
+    let latest_evidence = current_interaction.iter().rev().find_map(|message| {
+        if message.role != "tool" {
+            return None;
+        }
+        let tool_name = message.tool_name.as_deref().unwrap_or("").trim();
+        if tool_name.is_empty() || tool_is_low_info_for_checkpoint(tool_name) {
+            return None;
+        }
+        let content = message.primary_content()?;
+        let content = content.trim();
+        if content.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "- {}: {}",
+            tool_name,
+            truncate_for_resume(content, EXECUTION_CHECKPOINT_MAX_EVIDENCE_CHARS)
+        ))
+    });
+
+    let mut lines = vec![
+        "[SYSTEM] EXECUTION CHECKPOINT: You are still working on the same active request from this turn.".to_string(),
+        format!(
+            "Active request: {}",
+            truncate_for_resume(trimmed_user, EXECUTION_CHECKPOINT_MAX_REQUEST_CHARS)
+        ),
+    ];
+
+    if !activity.trim().is_empty() {
+        lines.push("Completed work so far:".to_string());
+        lines.push(truncate_for_resume(
+            activity.trim(),
+            EXECUTION_CHECKPOINT_MAX_ACTIVITY_CHARS,
+        ));
+    }
+
+    if let Some(evidence) = latest_evidence {
+        lines.push("Latest concrete evidence:".to_string());
+        lines.push(evidence);
+    }
+
+    lines.push("Continue from this checkpoint. Do NOT reset into a generic availability reply or ask what the user wants help with. Either take the next step for this request, answer with concrete results if it is complete, or state the blocker tied to this request.".to_string());
+
+    Some(lines.join("\n"))
+}
+
 impl Agent {
     pub(super) async fn run_message_build_phase(
         &self,
@@ -102,6 +175,7 @@ impl Agent {
         let session_id = ctx.session_id;
         let iteration = ctx.iteration;
         let user_text = ctx.user_text;
+        let completed_tool_calls = ctx.completed_tool_calls;
         let model = ctx.model;
         let system_prompt = ctx.system_prompt;
         let pinned_memories = ctx.pinned_memories;
@@ -408,6 +482,23 @@ impl Agent {
             }
         };
 
+        let execution_checkpoint = if iteration > 1 {
+            let current_boundary = deduped_msgs
+                .iter()
+                .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
+                .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
+            let current_interaction: Vec<&Message> = current_boundary
+                .map(|boundary| deduped_msgs.iter().skip(boundary).copied().collect())
+                .unwrap_or_default();
+            build_execution_checkpoint_message(
+                user_text,
+                completed_tool_calls,
+                &current_interaction,
+            )
+        } else {
+            None
+        };
+
         let old_interaction_assistant_ids: std::collections::HashSet<&str> = if let Some(boundary) =
             deduped_msgs
                 .iter()
@@ -590,6 +681,26 @@ impl Agent {
                     "role": "user",
                     "content": user_text,
                 }));
+            }
+        }
+
+        // Uploaded-file tasks should not inherit unrelated topical turns. The
+        // artifact marker is the anchor for the new task, so keep system
+        // guidance plus the current user request and drop earlier user/assistant
+        // exchanges when the turn is clearly a fresh uploaded-file request.
+        if ctx.is_new_task && user_text.contains("[File received:") {
+            if let Some(current_user_pos) = messages.iter().rposition(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
+            }) {
+                messages = messages
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(idx, message)| {
+                        let role = message.get("role").and_then(|r| r.as_str());
+                        (idx >= current_user_pos || role == Some("system")).then_some(message)
+                    })
+                    .collect();
             }
         }
 
@@ -780,6 +891,17 @@ impl Agent {
             }),
         );
 
+        if let Some(checkpoint) = execution_checkpoint {
+            messages.push(json!({
+                "role": "system",
+                "content": checkpoint,
+            }));
+            info!(
+                session_id,
+                iteration, "Injected execution checkpoint for in-progress task continuity"
+            );
+        }
+
         // Fresh-context isolation: when history is empty or only contains the current
         // user message (e.g. first message after /clear), inject a boundary marker to
         // prevent the LLM from drifting toward stale tool-call patterns from pinned
@@ -925,6 +1047,21 @@ mod tests {
         }
     }
 
+    fn tool_msg(name: &str, content: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: "test-session".to_string(),
+            role: "tool".to_string(),
+            content: Some(content.to_string()),
+            tool_call_id: Some(format!("tool-call-{}", uuid::Uuid::new_v4())),
+            tool_name: Some(name.to_string()),
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.5,
+            ..Message::runtime_defaults()
+        }
+    }
+
     #[test]
     fn empty_retry_preserves_parent_pair_and_current_user() {
         let messages = vec![
@@ -998,6 +1135,7 @@ mod tests {
             session_id: "test-session",
             iteration: 1,
             user_text: "Why?",
+            completed_tool_calls: &[],
             model: "mock-model",
             system_prompt: "You are a helpful test assistant.",
             pinned_memories: &pinned_memories,
@@ -1040,6 +1178,83 @@ mod tests {
         assert!(
             serialized.contains("Why?"),
             "current user message should remain present: {}",
+            serialized
+        );
+    }
+
+    #[tokio::test]
+    async fn later_iterations_include_execution_checkpoint_after_tool_progress() {
+        use crate::execution_policy::PolicyBundle;
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{ConversationSummary, MessageStore};
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .state
+            .append_message(&msg("user", "Find the system details and summarize them."))
+            .await
+            .expect("append user");
+        harness
+            .state
+            .append_message(&tool_msg(
+                "system_info",
+                "OS: macOS 15.0\nMemory: 16 GB\nHostname: dev-machine",
+            ))
+            .await
+            .expect("append tool");
+
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let pinned_memories: Vec<Message> = Vec::new();
+        let tool_defs: Vec<Value> = Vec::new();
+        let session_summary: Option<ConversationSummary> = None;
+        let mut pending_system_messages = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+        let completed_tool_calls = vec!["system_info({})".to_string()];
+
+        let mut ctx = MessageBuildCtx {
+            session_id: "test-session",
+            iteration: 2,
+            user_text: "Find the system details and summarize them.",
+            completed_tool_calls: &completed_tool_calls,
+            model: "mock-model",
+            system_prompt: "You are a helpful test assistant.",
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            session_summary: &session_summary,
+            pending_system_messages: &mut pending_system_messages,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+            is_new_task: false,
+        };
+
+        let built = harness
+            .agent
+            .run_message_build_phase(&mut ctx)
+            .await
+            .expect("message build");
+        let serialized = serde_json::to_string(&built.messages).expect("serialize messages");
+
+        assert!(
+            serialized.contains("EXECUTION CHECKPOINT"),
+            "later iterations should carry a live execution checkpoint: {}",
+            serialized
+        );
+        assert!(
+            serialized.contains("Find the system details and summarize them."),
+            "checkpoint should restate the active request: {}",
+            serialized
+        );
+        assert!(
+            serialized.contains("system_info"),
+            "checkpoint should include completed tool/evidence context: {}",
+            serialized
+        );
+        assert!(
+            serialized.contains("Do NOT reset into a generic availability reply"),
+            "checkpoint should explicitly block idle reset replies: {}",
             serialized
         );
     }

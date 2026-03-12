@@ -337,6 +337,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     let hub = Arc::new(
         ChannelHub::new(channel_bundle.channels.clone(), session_map)
             .with_queue_telemetry(queue_telemetry.clone())
+            .with_delivery_note_agent(agent.clone())
             .with_queue_policy(queue_policy.clone()),
     );
 

@@ -31,6 +31,7 @@ impl Agent {
         let mut last_assistant_summary: Option<String> = None;
         let mut last_tool_summary: Option<String> = None;
         let mut last_error: Option<String> = None;
+        let mut execution_snapshot: Option<ResumeExecutionSnapshot> = None;
 
         for event in &events {
             match event.event_type {
@@ -74,6 +75,76 @@ impl Agent {
                         last_error = Some(truncate_for_resume(&data.message, 180));
                     }
                 }
+                EventType::DecisionPoint => {
+                    let Ok(data) = event.parse_data::<DecisionPointData>() else {
+                        continue;
+                    };
+                    if data.decision_type != DecisionType::ExecutionStateSnapshot {
+                        continue;
+                    }
+                    let Some(state) = data
+                        .metadata
+                        .get("execution_state")
+                        .and_then(|value| value.as_object())
+                    else {
+                        continue;
+                    };
+                    let execution_id = state
+                        .get("execution_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                    let current_step = state
+                        .get("current_step")
+                        .and_then(|value| value.as_object());
+                    let last_outcome = state.get("last_outcome").cloned().and_then(|value| {
+                        serde_json::from_value::<StepExecutionOutcome>(value).ok()
+                    });
+                    let background_handoff_active = state
+                        .get("background_handoff_active")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    let current_step_id = current_step
+                        .and_then(|step| step.get("step_id"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                    let current_tool = current_step
+                        .and_then(|step| step.get("primary_tool"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                    let current_target = current_step
+                        .and_then(|step| step.get("expected_targets"))
+                        .and_then(|value| value.as_array())
+                        .and_then(|targets| targets.first())
+                        .and_then(|target| target.get("value"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            current_step
+                                .and_then(|step| step.get("target_scope"))
+                                .and_then(|value| value.get("allowed_targets"))
+                                .and_then(|value| value.as_array())
+                                .and_then(|targets| targets.first())
+                                .and_then(|target| target.get("value"))
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string)
+                        });
+                    let idempotency_key = current_step
+                        .and_then(|step| step.get("idempotency_key"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                    let Some(execution_id) = execution_id else {
+                        continue;
+                    };
+                    execution_snapshot = Some(ResumeExecutionSnapshot {
+                        execution_id,
+                        current_step_id,
+                        current_tool,
+                        current_target,
+                        last_outcome,
+                        background_handoff_active,
+                        idempotency_key,
+                    });
+                }
                 _ => {}
             }
         }
@@ -95,6 +166,7 @@ impl Agent {
             last_assistant_summary,
             last_tool_summary,
             last_error,
+            execution_snapshot,
         }))
     }
 

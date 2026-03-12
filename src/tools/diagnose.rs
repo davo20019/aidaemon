@@ -44,6 +44,17 @@ struct IntentGateRouteSample {
     route_reply_len: Option<usize>,
 }
 
+#[derive(Debug, Default, Clone)]
+struct ExecutionReplaySummary {
+    plan_revisions: Vec<String>,
+    evidence_gate_triggers: Vec<String>,
+    validation_failures: Vec<String>,
+    retry_reasons: Vec<String>,
+    plan_failure_evidence: Vec<crate::events::EvidenceRef>,
+    evidence_failure_evidence: Vec<crate::events::EvidenceRef>,
+    validation_failure_evidence: Vec<crate::events::EvidenceRef>,
+}
+
 impl DiagnoseTool {
     pub fn new(
         event_store: Arc<EventStore>,
@@ -275,7 +286,204 @@ impl DiagnoseTool {
         }
     }
 
-    fn build_deterministic_analysis(&self, events: &[Event]) -> DeterministicAnalysis {
+    fn push_unique_line(lines: &mut Vec<String>, line: String) {
+        if !line.is_empty() && !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+
+    fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
+        metadata
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn pretty_code(code: &str) -> String {
+        code.replace('_', " ")
+    }
+
+    fn build_execution_replay_summary(&self, events: &[Event]) -> ExecutionReplaySummary {
+        let mut summary = ExecutionReplaySummary::default();
+
+        for event in events {
+            if event.event_type != EventType::DecisionPoint {
+                continue;
+            }
+            let Ok(data) = event.parse_data::<DecisionPointData>() else {
+                continue;
+            };
+            let evidence = self.evidence_from_event(event);
+            let metadata = &data.metadata;
+            let tool = Self::metadata_string(metadata, "tool")
+                .unwrap_or_else(|| "unknown tool".to_string());
+            let target = Self::metadata_string(metadata, "target_hint")
+                .or_else(|| Self::metadata_string(metadata, "target"))
+                .unwrap_or_else(|| "unspecified target".to_string());
+
+            match data.decision_type {
+                DecisionType::ExecutionPlanningGate => {
+                    let gate_result = Self::metadata_string(metadata, "gate_result")
+                        .or_else(|| Self::metadata_string(metadata, "condition"))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let reason = Self::metadata_string(metadata, "reason");
+                    let mut line = format!(
+                        "Event #{}: {} for {} targeting {}.",
+                        event.id,
+                        Self::pretty_code(&gate_result),
+                        tool,
+                        target
+                    );
+                    if let Some(reason) = reason {
+                        line.push_str(&format!(" Reason: {}.", reason));
+                    }
+                    Self::push_unique_line(&mut summary.plan_revisions, line);
+                    if matches!(
+                        gate_result.as_str(),
+                        "plan_rejected" | "rejected" | "plan_unavailable" | "unavailable"
+                    ) {
+                        summary.plan_failure_evidence.push(evidence.clone());
+                    }
+                }
+                DecisionType::ExecutionCritiquePass => {
+                    let critique_result = Self::metadata_string(metadata, "critique_result")
+                        .or_else(|| Self::metadata_string(metadata, "condition"))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let detail = Self::metadata_string(metadata, "summary")
+                        .or_else(|| Self::metadata_string(metadata, "reason"));
+                    let mut line = format!(
+                        "Event #{}: {} for {} targeting {}.",
+                        event.id,
+                        Self::pretty_code(&critique_result),
+                        tool,
+                        target
+                    );
+                    if let Some(detail) = detail {
+                        line.push_str(&format!(" Detail: {}.", detail));
+                    }
+                    Self::push_unique_line(&mut summary.plan_revisions, line);
+                    if matches!(
+                        critique_result.as_str(),
+                        "critique_rejected"
+                            | "rejected"
+                            | "critique_invalid"
+                            | "invalid"
+                            | "critique_unavailable"
+                            | "unavailable"
+                    ) {
+                        summary.plan_failure_evidence.push(evidence.clone());
+                    }
+                }
+                DecisionType::EvidenceGate => {
+                    let evidence_kind = Self::metadata_string(metadata, "required_evidence_kind")
+                        .unwrap_or_else(|| "required evidence".to_string());
+                    let line = format!(
+                        "Event #{}: blocked {} until {} existed for {}.",
+                        event.id, tool, evidence_kind, target
+                    );
+                    Self::push_unique_line(&mut summary.evidence_gate_triggers, line);
+                    summary.evidence_failure_evidence.push(evidence.clone());
+                }
+                DecisionType::PostExecutionValidation => {
+                    let outcome = Self::metadata_string(metadata, "outcome")
+                        .unwrap_or_else(|| "validation_blocked".to_string());
+                    let reason = Self::metadata_string(metadata, "reason")
+                        .or_else(|| Self::metadata_string(metadata, "condition"))
+                        .unwrap_or_else(|| "validation_blocked".to_string());
+                    let line = format!(
+                        "Event #{}: {} because {}.",
+                        event.id,
+                        Self::pretty_code(&outcome),
+                        Self::pretty_code(&reason)
+                    );
+                    Self::push_unique_line(&mut summary.validation_failures, line);
+                    summary.validation_failure_evidence.push(evidence.clone());
+                }
+                DecisionType::ExecutionFailureClassification => {
+                    let condition = Self::metadata_string(metadata, "condition")
+                        .unwrap_or_else(|| "execution_failure".to_string());
+                    if matches!(
+                        condition.as_str(),
+                        "target_scope_violation" | "tool_contract_violation"
+                    ) {
+                        let line = format!(
+                            "Event #{}: {} on {}.",
+                            event.id,
+                            Self::pretty_code(&condition),
+                            tool
+                        );
+                        Self::push_unique_line(&mut summary.validation_failures, line);
+                        summary.plan_failure_evidence.push(evidence.clone());
+                    }
+                }
+                DecisionType::ExecutionStateSnapshot => {
+                    if let Some(condition) = Self::metadata_string(metadata, "condition") {
+                        if condition == "execution_budget_exhausted" {
+                            let limit = Self::metadata_string(metadata, "budget_limit")
+                                .unwrap_or_else(|| "execution budget".to_string());
+                            let line = format!(
+                                "Event #{}: execution budget exhausted on {}.",
+                                event.id,
+                                Self::pretty_code(&limit)
+                            );
+                            Self::push_unique_line(&mut summary.validation_failures, line);
+                            summary.validation_failure_evidence.push(evidence.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            if let Some(reason) = Self::metadata_string(metadata, "loop_repetition_reason") {
+                Self::push_unique_line(
+                    &mut summary.retry_reasons,
+                    format!(
+                        "Event #{}: loop repeated because {}.",
+                        event.id,
+                        Self::pretty_code(&reason)
+                    ),
+                );
+            }
+        }
+
+        summary
+    }
+
+    fn format_execution_replay_section(&self, summary: &ExecutionReplaySummary) -> String {
+        let mut out = String::from("### Execution Replay Summary\n");
+
+        let render_group = |out: &mut String, title: &str, items: &[String]| {
+            out.push_str(&format!("- {}:\n", title));
+            if items.is_empty() {
+                out.push_str("  - none\n");
+            } else {
+                for item in items.iter().take(5) {
+                    out.push_str(&format!("  - {}\n", item));
+                }
+            }
+        };
+
+        render_group(&mut out, "Plan revisions", &summary.plan_revisions);
+        render_group(
+            &mut out,
+            "Evidence gate triggers",
+            &summary.evidence_gate_triggers,
+        );
+        render_group(
+            &mut out,
+            "Validation failures",
+            &summary.validation_failures,
+        );
+        render_group(&mut out, "Retry reasons", &summary.retry_reasons);
+        out.trim_end().to_string()
+    }
+
+    fn build_deterministic_analysis(
+        &self,
+        events: &[Event],
+        replay_summary: &ExecutionReplaySummary,
+    ) -> DeterministicAnalysis {
         let mut first_error: Option<crate::events::EvidenceRef> = None;
         let mut task_end_failed: Option<(TaskEndData, crate::events::EvidenceRef)> = None;
         let mut approval_denied = Vec::new();
@@ -379,6 +587,63 @@ impl DiagnoseTool {
                 ),
             });
         }
+        if !replay_summary.plan_failure_evidence.is_empty() {
+            candidates.push(RootCauseCandidate {
+                category: FailureCategory::BadAssumption,
+                confidence: 0.84,
+                description:
+                    "Planning/scope signals show the selected target or first step was invalid before safe execution could continue."
+                        .to_string(),
+                evidence: replay_summary
+                    .plan_failure_evidence
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect(),
+                why_previous_step_looked_valid: Some(
+                    "The step looked executable at first, but structured planning or scope checks showed it targeted the wrong action or target."
+                        .to_string(),
+                ),
+            });
+        }
+        if !replay_summary.evidence_failure_evidence.is_empty() {
+            candidates.push(RootCauseCandidate {
+                category: FailureCategory::MissingContext,
+                confidence: 0.85,
+                description:
+                    "Execution was blocked because the agent did not have direct evidence for the target state yet."
+                        .to_string(),
+                evidence: replay_summary
+                    .evidence_failure_evidence
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect(),
+                why_previous_step_looked_valid: Some(
+                    "The intended action made sense, but required proof about the current target state was still missing."
+                        .to_string(),
+                ),
+            });
+        }
+        if !replay_summary.validation_failure_evidence.is_empty() {
+            candidates.push(RootCauseCandidate {
+                category: FailureCategory::PartialCompletionRegression,
+                confidence: 0.83,
+                description:
+                    "Execution made progress, but validation blocked completion or forced scope reduction before success could be claimed."
+                        .to_string(),
+                evidence: replay_summary
+                    .validation_failure_evidence
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect(),
+                why_previous_step_looked_valid: Some(
+                    "The last execution step looked productive, but the result still lacked the verification needed for a safe success claim."
+                        .to_string(),
+                ),
+            });
+        }
         if !loop_signals.is_empty() {
             candidates.push(RootCauseCandidate {
                 category: FailureCategory::AgentLoop,
@@ -465,6 +730,20 @@ impl DiagnoseTool {
                     "Verify task ends with `completed` instead of stall/failure.".to_string(),
                 ],
             ),
+            Some(FailureCategory::BadAssumption) => (
+                vec![
+                    "Reconfirm the exact target, repo, or first risky step before executing again."
+                        .to_string(),
+                    "Prefer the target/plan candidate that is backed by direct evidence instead of inference."
+                        .to_string(),
+                ],
+                vec![
+                    "Confirm a new planning or scope-check decision point accepts the revised target."
+                        .to_string(),
+                    "Confirm the next execution attempt stays within the corrected target scope."
+                        .to_string(),
+                ],
+            ),
             Some(FailureCategory::ProviderError) => (
                 vec![
                     "Retry with fallback model/provider and backoff.".to_string(),
@@ -484,6 +763,20 @@ impl DiagnoseTool {
                 vec![
                     "First previously failing tool call now returns success.".to_string(),
                     "Task completes without downstream failures.".to_string(),
+                ],
+            ),
+            Some(FailureCategory::PartialCompletionRegression) => (
+                vec![
+                    "Run the missing verification step or reduce scope before claiming success."
+                        .to_string(),
+                    "If verification cannot run in the current phase, surface a specific partial result instead of forcing completion."
+                        .to_string(),
+                ],
+                vec![
+                    "Confirm a post-execution validation event records a verified completion instead of `verification_pending`."
+                        .to_string(),
+                    "Confirm the final reply matches the validated scope and outcome."
+                        .to_string(),
                 ],
             ),
             _ => (
@@ -884,10 +1177,12 @@ Rules: no invented event IDs; confidence 0..1.",
         lines.join("\n")
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn format_diagnosis(
         &self,
         task_id: &str,
         analysis: &DeterministicAnalysis,
+        execution_replay_section: &str,
         route_health_alerts_section: &str,
         route_reason_trends_section: &str,
         context_scope_guards_section: &str,
@@ -941,6 +1236,8 @@ Rules: no invented event IDs; confidence 0..1.",
             out.push_str("No explicit misleading-validity signal detected.");
         }
 
+        out.push_str("\n\n");
+        out.push_str(execution_replay_section);
         out.push_str("\n\n");
         out.push_str(route_health_alerts_section);
         out.push_str("\n\n");
@@ -1286,11 +1583,13 @@ Rules: no invented event IDs; confidence 0..1.",
         }
 
         let timeline_text = self.timeline_text(&events);
-        let deterministic = self.build_deterministic_analysis(&events);
+        let replay_summary = self.build_execution_replay_summary(&events);
+        let deterministic = self.build_deterministic_analysis(&events, &replay_summary);
         let llm = self
             .llm_rank_candidates(&resolved_task, &timeline_text, &deterministic)
             .await;
         let merged = self.merge_llm_analysis(deterministic, llm, &events);
+        let execution_replay_section = self.format_execution_replay_section(&replay_summary);
         let route_health_alerts = self.build_route_health_alerts_section(session_id).await;
         let route_reason_trends = self.build_route_reason_trends_section(session_id).await;
         let context_scope_guards = self.build_context_scope_guards_section();
@@ -1300,6 +1599,7 @@ Rules: no invented event IDs; confidence 0..1.",
         Ok(self.format_diagnosis(
             &resolved_task,
             &merged,
+            &execution_replay_section,
             &route_health_alerts,
             &route_reason_trends,
             &context_scope_guards,
@@ -1866,6 +2166,117 @@ mod tests {
             .unwrap();
         assert!(res.contains("Diagnosis for Task t1"));
         assert!(res.contains("Most Likely Cause(s)"));
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_includes_execution_replay_summary() {
+        let tool = setup_tool().await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskStart,
+            TaskStartData {
+                task_id: "t-replay".to_string(),
+                description: "Deploy app".to_string(),
+                parent_task_id: None,
+                user_message: None,
+            },
+            Some("t-replay"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::DecisionPoint,
+            DecisionPointData {
+                decision_type: DecisionType::ExecutionPlanningGate,
+                task_id: "t-replay".to_string(),
+                iteration: 1,
+                severity: crate::events::DiagnosticSeverity::Warning,
+                code: Some("plan_rejected".to_string()),
+                metadata: json!({
+                    "condition": "plan_rejected",
+                    "gate_result": "rejected",
+                    "tool": "edit_file",
+                    "target_hint": "src/main.rs",
+                    "reason": "first action mutated the wrong file",
+                    "loop_repetition_reason": "plan_rejected"
+                }),
+                summary: "Structured pre-execution plan rejected".to_string(),
+            },
+            Some("t-replay"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::DecisionPoint,
+            DecisionPointData {
+                decision_type: DecisionType::EvidenceGate,
+                task_id: "t-replay".to_string(),
+                iteration: 2,
+                severity: crate::events::DiagnosticSeverity::Warning,
+                code: Some("missing_pre_execution_evidence".to_string()),
+                metadata: json!({
+                    "condition": "missing_pre_execution_evidence",
+                    "tool": "edit_file",
+                    "required_evidence_kind": "file_read",
+                    "target": "src/main.rs",
+                    "loop_repetition_reason": "missing_evidence"
+                }),
+                summary: "Evidence gate blocked edit".to_string(),
+            },
+            Some("t-replay"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::DecisionPoint,
+            DecisionPointData {
+                decision_type: DecisionType::PostExecutionValidation,
+                task_id: "t-replay".to_string(),
+                iteration: 3,
+                severity: crate::events::DiagnosticSeverity::Warning,
+                code: Some("verification_pending".to_string()),
+                metadata: json!({
+                    "outcome": "verify_again",
+                    "reason": "verification_pending",
+                    "loop_repetition_reason": "verification_pending"
+                }),
+                summary: "Verification still required".to_string(),
+            },
+            Some("t-replay"),
+        )
+        .await;
+        append_event(
+            &tool,
+            "s1",
+            EventType::TaskEnd,
+            TaskEndData {
+                task_id: "t-replay".to_string(),
+                status: TaskStatus::Failed,
+                duration_secs: 3,
+                iterations: 3,
+                tool_calls_count: 0,
+                error: Some("blocked".to_string()),
+                summary: None,
+            },
+            Some("t-replay"),
+        )
+        .await;
+
+        let res = tool
+            .call(r#"{"action":"diagnose","task_id":"t-replay","_session_id":"s1"}"#)
+            .await
+            .unwrap();
+        assert!(res.contains("### Execution Replay Summary"));
+        assert!(res.contains("Plan revisions"));
+        assert!(res.contains("Evidence gate triggers"));
+        assert!(res.contains("Validation failures"));
+        assert!(res.contains("Retry reasons"));
+        assert!(res.contains("plan rejected"));
+        assert!(res.contains("verification pending"));
     }
 
     #[tokio::test]

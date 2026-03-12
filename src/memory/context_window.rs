@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ContextWindowConfig;
 use crate::traits::{ModelProvider, StateStore};
+use crate::types::UserRole;
 
 /// Maximum concurrent background extraction LLM calls.
 static EXTRACTION_SEMAPHORE: std::sync::LazyLock<Semaphore> =
@@ -255,6 +256,40 @@ pub fn compress_tool_result(tool_name: &str, result: &str, max_chars: usize) -> 
     const MIN_HEAD_CHARS: usize = 120;
     const MIN_TAIL_CHARS: usize = 80;
 
+    if looks_like_structured_payload(result) {
+        // For structured payloads (JSON API responses), keep head + tail so the
+        // model sees the JSON summary/metadata at the top AND some complete items
+        // from deeper in the response.  Head-heavy ratio (70/30) because the
+        // summary and first items are most informative.
+        let available = max_chars.saturating_sub(ANNOTATION_OVERHEAD);
+        let struct_head = (available * 7) / 10;
+        let struct_tail = available.saturating_sub(struct_head);
+
+        if total_chars <= struct_head + struct_tail {
+            return result.to_string();
+        }
+
+        let head_end = byte_index_after_chars(result, struct_head);
+        let tail_start = byte_index_before_last_chars(result, struct_tail);
+        let omitted = total_chars.saturating_sub(struct_head + struct_tail);
+        let compressed = format!(
+            "{}\n\n[truncated {} chars from structured payload of {} total]\n\n{}",
+            &result[..head_end],
+            omitted,
+            total_chars,
+            &result[tail_start..]
+        );
+
+        debug!(
+            tool = tool_name,
+            original_len = total_chars,
+            compressed_len = compressed.len(),
+            "Compressed structured tool result"
+        );
+
+        return compressed;
+    }
+
     if max_chars <= ANNOTATION_OVERHEAD + MIN_HEAD_CHARS + MIN_TAIL_CHARS {
         let head_chars = max_chars.saturating_sub(ANNOTATION_OVERHEAD).max(1);
         let head_end = byte_index_after_chars(result, head_chars);
@@ -303,6 +338,14 @@ pub fn compress_tool_result(tool_name: &str, result: &str, max_chars: usize) -> 
     );
 
     compressed
+}
+
+fn looks_like_structured_payload(result: &str) -> bool {
+    let trimmed = result.trim_start();
+    trimmed.starts_with('{')
+        || (trimmed.starts_with('[') && !trimmed.starts_with("[UNTRUSTED"))
+        || result.contains("\nJSON summary:\n")
+        || result.contains("\nTop-level JSON array")
 }
 
 fn byte_index_after_chars(s: &str, char_count: usize) -> usize {
@@ -575,6 +618,7 @@ fn truncate_for_extraction(text: &str, max_len: usize) -> &str {
 
 /// Run progressive fact extraction in the background.
 /// Spawns a tokio task that extracts facts and stores them immediately.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_progressive_extraction(
     provider: Arc<dyn ModelProvider>,
     fast_model: String,
@@ -583,10 +627,13 @@ pub fn spawn_progressive_extraction(
     assistant_response: String,
     channel_id: Option<String>,
     visibility: crate::types::ChannelVisibility,
+    user_role: UserRole,
 ) {
     tokio::spawn(async move {
-        // Never extract or persist memory from untrusted public platforms.
-        if matches!(visibility, crate::types::ChannelVisibility::PublicExternal) {
+        // Never extract or persist owner memory from non-owners or untrusted public platforms.
+        if !user_role.can_persist_owner_memory()
+            || matches!(visibility, crate::types::ChannelVisibility::PublicExternal)
+        {
             return;
         }
 
@@ -640,8 +687,13 @@ pub fn spawn_incremental_summarization(
     session_id: String,
     threshold: usize,
     window: usize,
+    user_role: UserRole,
 ) {
     tokio::spawn(async move {
+        if !user_role.can_persist_owner_memory() {
+            return;
+        }
+
         let history = match state.get_history(&session_id, 100).await {
             Ok(h) => h,
             Err(e) => {
@@ -799,6 +851,23 @@ mod tests {
         assert!(result.contains("[truncated"));
         assert!(result.contains("HEAD:"));
         assert!(result.contains(":TAIL"));
+    }
+
+    #[test]
+    fn test_compress_tool_result_keeps_head_and_tail_for_structured_payloads() {
+        // Build a structured payload large enough to trigger compression
+        let json_body =
+            "{\n  \"items\": [\n".to_string() + &"    {\"id\":1},\n".repeat(100) + "  ]\n}";
+        let structured = format!(
+            "[UNTRUSTED EXTERNAL DATA from 'http_request']\nHTTP 200 OK\n\nJSON summary:\nitems: array(2 item(s))\n\n{}",
+            json_body
+        );
+        let result = compress_tool_result("http_request", &structured, 600);
+        assert!(result.contains("JSON summary:"));
+        assert!(result.contains("structured payload"));
+        // Head+tail: should contain both the beginning (JSON summary) and the
+        // end of the payload (closing braces from the JSON structure).
+        assert!(result.contains("]\n}"));
     }
 
     #[test]

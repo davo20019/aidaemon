@@ -852,8 +852,9 @@ pub struct StateConfig {
     /// remain in the database but are not included in the prompt.
     #[serde(default = "default_max_facts")]
     pub max_facts: usize,
-    /// Optional daily token budget. When set, LLM calls will be rejected
-    /// once cumulative daily usage exceeds this limit. Resets at midnight UTC.
+    /// Optional daily token budget. When set, cumulative daily usage is checked
+    /// before additional LLM work; productive runs may auto-extend temporarily,
+    /// otherwise further calls are rejected. Resets at midnight UTC.
     #[serde(default)]
     pub daily_token_budget: Option<u64>,
     /// Retention policies for automatic cleanup of old data.
@@ -1614,7 +1615,8 @@ pub struct SubagentsConfig {
     /// Optional time limit per task in seconds. Default: 1800 (30 minutes).
     #[serde(default = "default_task_timeout_secs")]
     pub task_timeout_secs: Option<u64>,
-    /// Token budget per task. When exceeded, agent gracefully summarizes and stops.
+    /// Token budget per task. When exceeded, productive runs may auto-extend
+    /// temporarily; otherwise the agent gracefully summarizes and stops.
     /// Defaults to 500,000. Set to 0 to disable (unlimited).
     #[serde(default = "default_task_token_budget")]
     pub task_token_budget: Option<u64>,
@@ -2130,7 +2132,7 @@ fn default_context_budget() -> usize {
     48000
 }
 fn default_tool_result_chars() -> usize {
-    2000
+    4000
 }
 fn default_summary_window() -> usize {
     6

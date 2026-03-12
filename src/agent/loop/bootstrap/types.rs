@@ -23,6 +23,7 @@ pub(in crate::agent) struct BootstrapData {
     pub is_reaffirmation_challenge_turn: bool,
     pub requests_external_verification: bool,
     pub restrict_to_personal_memory_tools: bool,
+    pub active_skill_names: Vec<String>,
     pub active_untrusted_external_reference_skills: Vec<String>,
     pub restrict_untrusted_external_reference_tools: bool,
     pub personal_memory_tool_call_cap: usize,

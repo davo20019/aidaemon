@@ -85,7 +85,16 @@ pub(super) fn intent_gate_schema_json() -> Value {
             },
             "complexity": {
                 "type": "string",
-                "enum": ["knowledge", "simple", "complex"]
+                "enum": [
+                    "knowledge",
+                    "read_only_investigation",
+                    "scoped_modification",
+                    "unscoped_modification",
+                    "deployment_or_external_write",
+                    "scheduled_action",
+                    "simple",
+                    "complex"
+                ]
             },
             "cancel_intent": { "type": "boolean" },
             "cancel_scope": { "type": "string" },

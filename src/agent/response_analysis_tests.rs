@@ -295,6 +295,7 @@ fn test_classify_stall_detects_deferred_no_tool_loop() {
         completed_naturally: false,
         explicit_positive_signals: 0,
         explicit_negative_signals: 0,
+        replay_notes: Vec::new(),
     };
 
     let (label, suggestion) = Agent::classify_stall(&learning_ctx);

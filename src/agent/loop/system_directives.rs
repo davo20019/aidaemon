@@ -28,6 +28,12 @@ pub(in crate::agent) enum SystemDirective {
         old_budget: i64,
         new_budget: i64,
     },
+    GlobalDailyBudgetAutoExtended {
+        old_budget: i64,
+        new_budget: i64,
+        extension: usize,
+        max_extensions: usize,
+    },
     GlobalDailyBudgetExtensionApproved {
         old_budget: i64,
         new_budget: i64,
@@ -52,7 +58,12 @@ pub(in crate::agent) enum SystemDirective {
     },
     DeferredToolCallRequired,
     DeferredProvideConcreteResults,
+    StructuredToolResultSynthesis {
+        tool_name: String,
+        excerpt: String,
+    },
     SuccessfulToolEvidenceMustBeUsed,
+    EvidenceGroundingRequired,
     LiveWorkPivotRequired,
     RecoveryModeModelSwitch,
     NoEvidenceRespondKnownUnknown,
@@ -104,6 +115,11 @@ pub(in crate::agent) enum SystemDirective {
     KnowledgeIntentDirectAnswer,
     DelegationModeActive,
     GoalCreationOwnerOnly,
+    ReflectionDiagnosis {
+        tool_name: String,
+        root_cause: String,
+        recommended_action: String,
+    },
 }
 
 impl SystemDirective {
@@ -142,6 +158,16 @@ impl SystemDirective {
                 "[SYSTEM] Task token budget extension approved by owner: {} -> {}. \
                  Continue working.",
                 old_budget, new_budget
+            ),
+            Self::GlobalDailyBudgetAutoExtended {
+                old_budget,
+                new_budget,
+                extension,
+                max_extensions,
+            } => format!(
+                "[SYSTEM] Global daily token budget auto-extended from {} to {} ({}/{} extensions). \
+                 Continue working.",
+                old_budget, new_budget, extension, max_extensions
             ),
             Self::GlobalDailyBudgetExtensionApproved {
                 old_budget,
@@ -189,7 +215,12 @@ impl SystemDirective {
             }
             Self::DeferredToolCallRequired => "[SYSTEM] HARD REQUIREMENT: your next reply MUST include at least one tool call. Do NOT return planning text like \"I'll do X\". Text-only replies are invalid for this request.".to_string(),
             Self::DeferredProvideConcreteResults => "[SYSTEM] You narrated future work instead of providing results. Execute any remaining required tools, or return concrete outcomes and blockers now.".to_string(),
+            Self::StructuredToolResultSynthesis { tool_name, excerpt } => format!(
+                "[SYSTEM] You already have the structured result from `{}`. Do NOT call more tools unless verification is still genuinely required. Summarize only what this result actually shows. For any tool-derived claim, only cite filenames, paths, status codes, errors, IDs, values, counts, test names, field names, or other specifics that appear in the excerpt. If any detail is missing or ambiguous, say so instead of inferring it.\n\nResult excerpt:\n{}",
+                tool_name, excerpt
+            ),
             Self::SuccessfulToolEvidenceMustBeUsed => "[SYSTEM] You already have successful live tool results in this turn. Do NOT claim you cannot browse, access current data, or only provide guidance. Use the actual tool results already in context and answer with concrete findings now.".to_string(),
+            Self::EvidenceGroundingRequired => "[SYSTEM] The user is challenging whether a previously mentioned result, error, or detail was real. Do NOT defend prior assistant prose from memory. Only claim filenames, paths, status codes, errors, IDs, values, counts, test names, lines, field names, or other specifics if they appear in actual tool evidence already in context. Quote the exact line when helpful. If the evidence is partial, ambiguous, or unavailable, say that plainly and ask to re-check rather than inferring missing details.".to_string(),
             Self::LiveWorkPivotRequired => "[SYSTEM] You summarized failed live attempts instead of completing the request. Do NOT stop with a \"What I tried\" / \"Current status\" summary while tools still remain. Change strategy now: if an API call returned HTTP 4xx or bad parameters, simplify the request, use `http_request` for APIs, keep `web_fetch` for readable pages only, or fall back to `web_search`/site search/browser and then answer with concrete findings.".to_string(),
             Self::RecoveryModeModelSwitch => "[SYSTEM] Recovery mode: a model switch was applied because prior replies kept promising actions without tool calls. Call the required tools now and return concrete results.".to_string(),
             Self::NoEvidenceRespondKnownUnknown => "[SYSTEM] You have searched across multiple tools and keep finding no evidence. Stop searching and respond with what is known/unknown.".to_string(),
@@ -272,7 +303,9 @@ impl SystemDirective {
                  3. Any test results or verification status\n\n\
                  Do NOT restate the original task or say what you would do next. \
                  Do NOT answer questions from old conversation history. \
-                 Focus only on concrete results and outcomes for the CURRENT task.",
+                 Focus only on concrete results and outcomes for the CURRENT task. \
+                 Do NOT promise future actions like \"let me try...\" or \"I'll search for...\" - your tools have been disabled.\n\
+                 Report what you found, what failed, and what the user can try instead.",
                 force_text_at, force_task_anchor, activity_section
             ),
             Self::EditStallWriteFileHint => "[SYSTEM] You have failed edit_file 3+ times in a row. The old_text is not matching the actual file content. STOP using edit_file. Instead:\n1. Use `read_file` to see the CURRENT file content\n2. Use `write_file` to rewrite the ENTIRE file with all your changes applied\n\nwrite_file is more reliable than edit_file when the file has been modified.".to_string(),
@@ -320,6 +353,17 @@ impl SystemDirective {
             Self::KnowledgeIntentDirectAnswer => "[SYSTEM] Consultant classified this turn as knowledge. Provide the best direct answer now. Use tools only if needed to verify or retrieve missing facts.".to_string(),
             Self::DelegationModeActive => "[SYSTEM] Delegation mode active. Use `cli_agent` for execution tasks. `terminal`, `browser`, and `run_command` are hidden in this turn.".to_string(),
             Self::GoalCreationOwnerOnly => "[SYSTEM] Creating goals is owner-only. Handle this request directly without creating a goal.".to_string(),
+            Self::ReflectionDiagnosis {
+                tool_name,
+                root_cause,
+                recommended_action,
+            } => format!(
+                "[SYSTEM] SELF-DIAGNOSIS for `{}`: {}.\n\
+                 ACTION REQUIRED: {}.\n\
+                 Do NOT repeat the same failing approach. \
+                 If you cannot fix the issue, report the actual error honestly to the user.",
+                tool_name, root_cause, recommended_action
+            ),
         }
     }
 }
@@ -367,6 +411,14 @@ mod tests {
     }
 
     #[test]
+    fn evidence_grounding_render_requires_exact_evidence() {
+        let rendered = SystemDirective::EvidenceGroundingRequired.render();
+        assert!(rendered.contains("result, error, or detail"));
+        assert!(rendered.contains("actual tool evidence"));
+        assert!(rendered.contains("rather than inferring"));
+    }
+
+    #[test]
     fn force_text_tool_limit_render_preserves_sections() {
         let rendered = SystemDirective::ForceTextToolLimitReached {
             force_text_at: 40,
@@ -387,7 +439,9 @@ mod tests {
                  3. Any test results or verification status\n\n\
                  Do NOT restate the original task or say what you would do next. \
                  Do NOT answer questions from old conversation history. \
-                 Focus only on concrete results and outcomes for the CURRENT task."
+                 Focus only on concrete results and outcomes for the CURRENT task. \
+                 Do NOT promise future actions like \"let me try...\" or \"I'll search for...\" - your tools have been disabled.\n\
+                 Report what you found, what failed, and what the user can try instead."
         );
     }
 
@@ -407,5 +461,21 @@ mod tests {
                      You MUST stop calling tools soon and respond about the user's request. \
                      Hard limit for this task is 40 tool calls.\nCurrent task: fix the parser"
         );
+    }
+
+    #[test]
+    fn reflection_diagnosis_render_includes_root_cause_and_action() {
+        let rendered = SystemDirective::ReflectionDiagnosis {
+            tool_name: "http_request".to_string(),
+            root_cause: "Using the wrong hostname for the API".to_string(),
+            recommended_action: "Change the base URL to https://example.com/api/v2".to_string(),
+        }
+        .render();
+
+        assert!(rendered.contains("SELF-DIAGNOSIS"));
+        assert!(rendered.contains("http_request"));
+        assert!(rendered.contains("wrong hostname"));
+        assert!(rendered.contains("Change the base URL"));
+        assert!(rendered.contains("Do NOT repeat the same failing approach"));
     }
 }

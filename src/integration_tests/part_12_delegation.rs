@@ -230,7 +230,7 @@ async fn test_hidden_tool_guess_is_blocked_when_not_in_current_tool_defs() {
         .agent
         .handle_message(
             "hidden_tool_guess_test",
-            "what time is it?",
+            "check the system specs on this machine",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -254,7 +254,11 @@ async fn test_hidden_tool_guess_is_blocked_when_not_in_current_tool_defs() {
         first_call_tool_names
     );
 
-    let second_call_has_hidden_tool_block = calls[1].messages.iter().any(|message| {
+    // The hidden cli_agent call is intercepted before tool execution:
+    // either by the text-only prelude check (plain-text redirect for
+    // non-mutation turns) or by the hidden-tool guard. Both inject a
+    // tool-role message for cli_agent that prevents execution.
+    let second_call_has_tool_block = calls[1].messages.iter().any(|message| {
         message.get("role").and_then(|role| role.as_str()) == Some("tool")
             && message.get("name").and_then(|name| name.as_str()) == Some("cli_agent")
             && message
@@ -262,12 +266,149 @@ async fn test_hidden_tool_guess_is_blocked_when_not_in_current_tool_defs() {
                 .and_then(|content| content.as_str())
                 .is_some_and(|content| {
                     content.contains("not available in your current tool list")
-                        && content.contains("Do NOT guess or force hidden tool names")
+                        || content.contains("should be answered directly in plain text")
                 })
     });
     assert!(
-        second_call_has_hidden_tool_block,
-        "second call messages did not contain the hidden-tool block notice: {:?}",
+        second_call_has_tool_block,
+        "second call messages did not contain a tool block notice: {:?}",
         calls[1].messages
+    );
+}
+
+#[tokio::test]
+async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "Updated /tmp/demo/src/main.rs and reran the scoped checks successfully.",
+    )]);
+    let harness = setup_full_stack_test_agent(provider).await.unwrap();
+    let agent = Arc::new(harness.agent);
+
+    let goal = Goal::new_finite("Patch the regression", "delegation-task-context");
+    harness.state.create_goal(&goal).await.unwrap();
+    let task = crate::traits::Task {
+        id: "task-structured-001".to_string(),
+        goal_id: goal.id.clone(),
+        description: "Patch /tmp/demo/src/main.rs".to_string(),
+        status: "claimed".to_string(),
+        priority: "high".to_string(),
+        task_order: 1,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: Some("task-lead".to_string()),
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        started_at: None,
+        completed_at: None,
+    };
+    harness.state.create_task(&task).await.unwrap();
+
+    let response = agent
+        .spawn_child(
+            "Patch the scoped regression in /tmp/demo",
+            "Patch /tmp/demo/src/main.rs",
+            None,
+            ChannelContext::private("test"),
+            UserRole::Owner,
+            Some(AgentRole::Executor),
+            Some(goal.id.as_str()),
+            Some(task.id.as_str()),
+            Some("/tmp/demo"),
+        )
+        .await
+        .unwrap();
+
+    assert!(response.contains("Updated /tmp/demo/src/main.rs"));
+
+    let updated = harness.state.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(updated.status, "completed");
+    let context: serde_json::Value =
+        serde_json::from_str(updated.context.as_deref().unwrap()).expect("task context should be json");
+    assert_eq!(
+        context["executor_handoff"]["task_id"].as_str(),
+        Some(task.id.as_str())
+    );
+    assert_eq!(
+        context["executor_result"]["task_outcome"].as_str(),
+        Some("task_done")
+    );
+    assert_eq!(
+        context["executor_handoff"]["target_scope"]["allowed_targets"][0]["value"].as_str(),
+        Some("/tmp/demo")
+    );
+}
+
+#[tokio::test]
+async fn test_executor_spawn_persists_needs_approval_blocker_result() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "report_blocker",
+            r#"{"reason":"Need approval to rotate the production credentials","outcome":"needs_approval","partial_work":"Validated the rotation script and staged the rollout notes","exact_need":"Owner approval to rotate the production credentials.","next_step":"Run the approved credential rotation and verify the service health.","target":"production credentials"}"#,
+        ),
+        MockProvider::text_response("Stopping after reporting the approval blocker."),
+    ]);
+    let harness = setup_full_stack_test_agent(provider).await.unwrap();
+    let agent = Arc::new(harness.agent);
+
+    let goal = Goal::new_finite("Rotate production credentials", "delegation-approval");
+    harness.state.create_goal(&goal).await.unwrap();
+    let task = crate::traits::Task {
+        id: "task-approval-001".to_string(),
+        goal_id: goal.id.clone(),
+        description: "Rotate the production credentials".to_string(),
+        status: "claimed".to_string(),
+        priority: "high".to_string(),
+        task_order: 1,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: Some("task-lead".to_string()),
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        started_at: None,
+        completed_at: None,
+    };
+    harness.state.create_task(&task).await.unwrap();
+
+    let response = agent
+        .spawn_child(
+            "Rotate the production credentials safely",
+            "Rotate the production credentials",
+            None,
+            ChannelContext::private("test"),
+            UserRole::Owner,
+            Some(AgentRole::Executor),
+            Some(goal.id.as_str()),
+            Some(task.id.as_str()),
+            Some("/tmp/demo"),
+        )
+        .await
+        .unwrap();
+
+    assert!(response.contains("Stopping after reporting"));
+
+    let updated = harness.state.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(updated.status, "blocked");
+    assert!(updated
+        .result
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Executor outcome: needs_approval"));
+    let context: serde_json::Value =
+        serde_json::from_str(updated.context.as_deref().unwrap()).expect("task context should be json");
+    assert_eq!(
+        context["executor_result"]["task_outcome"].as_str(),
+        Some("needs_approval")
     );
 }
