@@ -39,7 +39,7 @@ jobs:
           echo "linux_x86_64=$(sha256sum linux-x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Checkout tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: davo20019/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
