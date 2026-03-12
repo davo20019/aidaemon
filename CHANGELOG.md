@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.24] - 2026-03-12
+
+### Added
+
+- **`trigger_now` action for `manage_memories`**: Manually dispatch scheduled goals without waiting for the next cron tick.
+
+### Fixed
+
+- **Sub-sessions blocked by plain-text enforcement policy**: Spawned TaskLead/Executor agents were subject to the plain-text policy, which blocked terminal calls when the task description lacked known action verbs. Sub-sessions now always bypass this check.
+- **Scheduled goals restricted to management tools only**: Cron-triggered tasks were missing terminal/write_file/browser access. TaskLead and Executor agents spawned for scheduled goals now receive full tools.
+- **Validation rounds not extended by progress**: `max_validation_rounds` was the only budget dimension not extended by `extend_budget_on_progress()`, causing productive multi-step runs to hit budget exhaustion after just 3 completion-verification cycles.
+- **Missing action verbs in policy signals**: Added pull, push, run, execute, fetch, merge, start, stop, compile, download, clone, migrate to the `asks_change` signal list.
+
 ## [0.9.23] - 2026-03-12
 
 ### Added
