@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.25] - 2026-03-12
+
+### Changed
+
+- **Project scope extraction uses explicit paths only for current message**: Contextual nickname matching (e.g. "modern" resolving to `modern-plants-site`) is now skipped for the current user message to prevent false positives from common English words. Only explicit filesystem paths (`~/foo`, `/foo`, `./foo`) are extracted. History messages still use nickname matching.
+- **Primary project scope prefers text order over disk existence**: For current-turn scopes, the first extracted scope (text order) is used instead of preferring scopes that exist on disk. This fixes new-project creation where a false-positive match to an existing directory would override the user's explicit path.
+- **Scope-lock uses only user-explicit project scope**: `allowed_project_scope` no longer falls back to `known_project_dir` (inferred from tool results). This prevents history context pollution from locking the agent to the wrong project.
+- **Project dir injection no longer updates `known_project_dir`**: `resolve_injected_working_dir` fallback to a parent directory could downgrade from the correct target to a parent, causing subsequent tool calls to latch onto unrelated projects.
+- **`http_request` budget cap raised to 15**: Multi-step API workflows (posting threads, paginated APIs, auth+retry) legitimately need more sequential calls than the generic 8-call cap.
+- **CI workflows bumped to `actions/checkout@v5`**: Silences the Node.js 20 deprecation warning.
+
+### Fixed
+
+- **New project creation scoped to wrong existing project**: When creating a new project (e.g. `ai-news-hub-2026`), common words in the prompt could match existing project directories, causing the agent to scope-lock to the wrong project and edit files there instead.
+- **Budget exhaustion logging missing context**: Added session_id, task_id, iteration, and outcome to budget exhaustion and tool blocking warnings for easier debugging.
+
 ## [0.9.24] - 2026-03-12
 
 ### Added

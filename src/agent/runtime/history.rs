@@ -1691,6 +1691,29 @@ fn extract_project_scopes_from_text(
     max_scopes: usize,
     alias_roots: &[String],
 ) {
+    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots, false);
+}
+
+/// Extract only explicit filesystem paths (tokens with `~/`, `/`, `./`, etc.)
+/// from the text.  Contextual nickname matching (e.g. "modern" → modern-plants-site)
+/// is skipped.  Use this for the current user message to avoid false positives
+/// from common English words that happen to match project directory prefixes.
+fn extract_explicit_path_scopes_from_text(
+    text: &str,
+    scopes: &mut Vec<String>,
+    max_scopes: usize,
+    alias_roots: &[String],
+) {
+    extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots, true);
+}
+
+fn extract_project_scopes_from_text_inner(
+    text: &str,
+    scopes: &mut Vec<String>,
+    max_scopes: usize,
+    alias_roots: &[String],
+    paths_only: bool,
+) {
     for raw in text.split_whitespace() {
         if scopes.len() >= max_scopes {
             break;
@@ -1722,7 +1745,7 @@ fn extract_project_scopes_from_text(
         }
         let scope = if token_looks_like_project_scope_path(token, alias_roots) {
             normalize_project_scope_path_with_aliases(token, alias_roots)
-        } else {
+        } else if !paths_only {
             super::should_allow_contextual_project_nickname_scope(text, token)
                 .then(|| {
                     crate::tools::fs_utils::resolve_named_project_root(token, alias_roots)
@@ -1732,6 +1755,8 @@ fn extract_project_scopes_from_text(
                 })
                 .flatten()
                 .map(|path| path.to_string_lossy().to_string())
+        } else {
+            None
         };
         if let Some(scope) = scope {
             push_project_scope(scopes, scope, max_scopes);
@@ -1969,8 +1994,12 @@ impl Agent {
             GOAL_CONTEXT_MAX_PROJECT_HINTS,
             include_history_context,
         );
+        // For the current user message, only extract explicit filesystem paths
+        // (~/foo, /foo, ./foo) — NOT contextual nickname matches.  This prevents
+        // common English words like "modern" (in "modern website") from resolving
+        // to existing project directories like modern-plants-site.
         let mut current_project_scopes = Vec::new();
-        extract_project_scopes_from_text(
+        extract_explicit_path_scopes_from_text(
             current,
             &mut current_project_scopes,
             GOAL_CONTEXT_MAX_PROJECT_SCOPES,
@@ -2002,16 +2031,19 @@ impl Agent {
         );
         let allow_multi_project_scope =
             looks_like_multi_project_request(&current.to_ascii_lowercase());
-        // Prefer scopes extracted from the *current* user message over
-        // history scopes.  `choose_primary_project_scope` picks the first
-        // scope that is a real project root on disk – when a user asks to
-        // CREATE a new project (path doesn't exist yet) while the history
-        // contains an existing project, the history scope would win.
-        // By trying current-turn scopes first we guarantee the user's
-        // explicit path takes priority even if the directory hasn't been
-        // created yet.
+        // For current-turn scopes, use the FIRST extracted scope (text order)
+        // rather than `choose_primary_project_scope` which prefers scopes that
+        // exist as project roots on disk.  This is critical for new-project
+        // creation: the user's explicit path (e.g. ~/projects/ai-news-hub-2026)
+        // doesn't exist yet, but a false-positive nickname match (e.g.
+        // vite-cloudflare-project) DOES exist and would win the preference.
+        // The project-root preference is only appropriate for history scopes
+        // where we want to pick the most likely intended project among stale
+        // references.
         let primary_project_scope = resolve_primary_project_scope(
-            choose_primary_project_scope(&current_project_scopes)
+            current_project_scopes
+                .first()
+                .cloned()
                 .or_else(|| choose_primary_project_scope(&project_scopes)),
             self.inherited_project_scope.as_deref(),
             allow_multi_project_scope,

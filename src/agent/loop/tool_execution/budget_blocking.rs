@@ -127,6 +127,17 @@ impl Agent {
             // legitimately spawn many executors, but it must still be bounded
             // to prevent runaway LLM agent spawns.
             Some(ToolResultNotice::SpawnAgentBudgetBlocked { prior_calls }.render())
+        } else if tc.name == "http_request" && prior_calls >= 15 {
+            // http_request gets a higher cap than generic tools because
+            // multi-step API workflows (posting threads, paginated APIs,
+            // auth checks + retries) legitimately need many sequential calls.
+            Some(
+                ToolResultNotice::GenericToolBudgetBlocked {
+                    tool_name: tc.name.clone(),
+                    prior_calls,
+                }
+                .render(),
+            )
         } else if prior_calls >= 8
             && !matches!(
                 tc.name.as_str(),
@@ -166,6 +177,9 @@ impl Agent {
         };
 
         warn!(
+            session_id = %ctx.session_id,
+            task_id = %ctx.task_id,
+            iteration = ctx.iteration,
             tool = %tc.name,
             semantic_failures = prior_signature_failures,
             transient_failures = prior_transient_failures,

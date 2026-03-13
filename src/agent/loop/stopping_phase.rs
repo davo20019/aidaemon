@@ -458,6 +458,15 @@ impl Agent {
                 ),
                 true,
             );
+            warn!(
+                session_id,
+                task_id,
+                iteration,
+                outcome = ?request.outcome,
+                budget_limit = %limit.as_str(),
+                tool_calls = learning_ctx.tool_calls.len(),
+                "Execution budget exhausted — rendering HumanInterventionRequest"
+            );
             self.emit_warning_decision_point(
                 emitter,
                 task_id,

@@ -900,14 +900,16 @@ impl Agent {
                 known_project_dir.as_deref(),
             ) {
                 effective_arguments = updated_args;
-                injected_project_dir = Some(injected.clone());
-                let preserve_existing_target_scope = tc.name == "run_command"
-                    && known_project_dir
-                        .as_deref()
-                        .is_some_and(|known| known != injected.as_str());
-                if !preserve_existing_target_scope {
-                    known_project_dir = Some(injected);
-                }
+                injected_project_dir = Some(injected);
+                // Do NOT update known_project_dir from the injection result.
+                // resolve_injected_working_dir may fall back to a parent directory
+                // when the target doesn't exist yet (new project creation), which
+                // downgrades known_project_dir from the correct target (e.g.
+                // ai-news-hub-2026) to the parent (e.g. ~/projects).  Subsequent
+                // tool calls then latch onto an unrelated existing project inside
+                // that parent.  known_project_dir should only be updated from the
+                // model's explicit tool arguments (line 894) or from tool result
+                // learning (project_inspect / search_files).
             }
             let attempted_required_file_recheck = require_file_recheck_before_answer
                 && is_file_recheck_tool(&tc.name)
@@ -915,13 +917,16 @@ impl Agent {
 
             let internal_scope_violation =
                 raw_internal_scope_violation(&tc.arguments, session_id, resolved_goal_id);
+            // Scope-lock enforcement: only use `primary_project_scope` which is
+            // extracted from the user's explicit text (via resolve_turn_context).
+            // Do NOT fall back to `known_project_dir` — it is inferred from
+            // tool call results and can lock to the wrong project if the LLM's
+            // first tool call targets an incorrect directory (e.g. history
+            // context pollution causing a cd into an unrelated project).
+            // `known_project_dir` is still used for directory injection into
+            // tool arguments (see maybe_inject_project_dir_into_tool_args).
             let allowed_project_scope = (!turn_context.allow_multi_project_scope)
-                .then_some(
-                    turn_context
-                        .primary_project_scope
-                        .as_deref()
-                        .or(known_project_dir.as_deref()),
-                )
+                .then_some(turn_context.primary_project_scope.as_deref())
                 .flatten();
             let call_semantics = self
                 .tools
