@@ -1,9 +1,11 @@
+use super::execution_state::{ReconciliationMode, ReconciliationOverview};
 use super::recall_guardrails::filter_tool_defs_for_personal_memory;
 use super::response_phase::ResponsePhaseOutcome;
 use super::*;
 use crate::execution_policy::PolicyBundle;
 use crate::llm_markers::INTENT_GATE_MARKER;
 use crate::traits::ProviderResponse;
+use regex::Regex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompletionRecoveryCandidate {
@@ -168,6 +170,17 @@ fn is_trivial_tool_output(s: &str) -> bool {
         || (lower.starts_with("file written") && lower.len() < 100)
         || (lower.starts_with("wrote ") && lower.len() < 100)
         || looks_like_directory_listing(&lower)
+        || is_system_directive(&lower)
+}
+
+/// Detect internal system directives that were injected as tool results by
+/// the prelude retry path.  These should never be surfaced as user-facing
+/// completion replies.
+fn is_system_directive(lower: &str) -> bool {
+    lower.starts_with("[system]")
+        || lower.starts_with("[content filtered]")
+        || lower.contains("do not call side-effecting tools")
+        || lower.contains("write the requested content instead")
 }
 
 /// Detect `ls -la` style output: starts with "total N" and contains
@@ -478,6 +491,12 @@ fn completion_verification_still_required(
     turn_context: &TurnContext,
     completion_progress: &CompletionProgress,
 ) -> bool {
+    // Failed external mutations always block completion — regardless of contract.
+    // This is deterministic: the system checks the structured outcome, not the LLM.
+    if completion_progress.failed_external_mutation_count > 0 {
+        return true;
+    }
+
     let contract = &turn_context.completion_contract;
     let has_concrete_verification_reason = contract.explicit_verification_requested
         || !contract.verification_targets.is_empty()
@@ -489,6 +508,207 @@ fn completion_verification_still_required(
     contract.requires_observation
         && completion_progress.verification_pending
         && has_concrete_verification_reason
+}
+
+fn count_terms(count: usize) -> Vec<String> {
+    let mut terms = vec![count.to_string()];
+    let word = match count {
+        0 => Some("zero"),
+        1 => Some("one"),
+        2 => Some("two"),
+        3 => Some("three"),
+        4 => Some("four"),
+        5 => Some("five"),
+        6 => Some("six"),
+        7 => Some("seven"),
+        8 => Some("eight"),
+        9 => Some("nine"),
+        10 => Some("ten"),
+        _ => None,
+    };
+    if let Some(word) = word {
+        terms.push(word.to_string());
+    }
+    terms
+}
+
+fn parse_count_token(token: &str) -> Option<usize> {
+    match token {
+        "zero" => Some(0),
+        "one" => Some(1),
+        "two" => Some(2),
+        "three" => Some(3),
+        "four" => Some(4),
+        "five" => Some(5),
+        "six" => Some(6),
+        "seven" => Some(7),
+        "eight" => Some(8),
+        "nine" => Some(9),
+        "ten" => Some(10),
+        _ => token.parse::<usize>().ok(),
+    }
+}
+
+fn claims_unqualified_success(reply_lower: &str) -> bool {
+    if [
+        "successfully completed",
+        "posted!",
+        "all succeeded",
+        "done!",
+        "completed successfully",
+        "all tasks completed",
+    ]
+    .iter()
+    .any(|needle| reply_lower.contains(needle))
+    {
+        return true;
+    }
+
+    Regex::new(r"\ball\b(?:\W+\w+){0,4}\W+(?:completed|succeeded|successful|posted|done)\b")
+        .expect("valid success regex")
+        .is_match(reply_lower)
+}
+
+fn mentions_failure_or_partial(reply_lower: &str) -> bool {
+    [
+        "failed",
+        "partial",
+        "some attempts",
+        "some steps",
+        "couldn't",
+        "could not",
+        "retry",
+        "retried",
+        "error",
+        "unsuccessful",
+    ]
+    .iter()
+    .any(|needle| reply_lower.contains(needle))
+}
+
+fn extract_ratio_mentions(reply_lower: &str) -> Vec<(usize, usize)> {
+    let ratio_re = Regex::new(r"\b(\d+)\s*(?:/|of)\s*(\d+)\b").expect("valid ratio regex");
+    ratio_re
+        .captures_iter(reply_lower)
+        .filter_map(|captures| {
+            let left = captures.get(1)?.as_str().parse::<usize>().ok()?;
+            let right = captures.get(2)?.as_str().parse::<usize>().ok()?;
+            Some((left, right))
+        })
+        .collect()
+}
+
+fn extract_failure_count_mentions(reply_lower: &str) -> Vec<usize> {
+    let tokens: Vec<&str> = reply_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut counts = Vec::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        if !matches!(*token, "failed" | "failure" | "failures") {
+            continue;
+        }
+
+        let start = index.saturating_sub(3);
+        for lookback in (start..index).rev() {
+            if let Some(parsed) = parse_count_token(tokens[lookback]) {
+                counts.push(parsed);
+                break;
+            }
+        }
+    }
+
+    if reply_lower.contains("no failures")
+        || reply_lower.contains("none failed")
+        || reply_lower.contains("zero failed")
+    {
+        counts.push(0);
+    }
+
+    counts
+}
+
+fn contains_expected_ratio(reply_lower: &str, overview: &ReconciliationOverview) -> bool {
+    let ratio_digits = format!("{}/{}", overview.succeeded, overview.total);
+    let ratio_words = format!("{} of {}", overview.succeeded, overview.total);
+    let expected_noun = match overview.mode {
+        ReconciliationMode::AttemptLevel => "attempt",
+        ReconciliationMode::PlannedStepLevel => "planned step",
+    };
+    reply_lower.contains(&ratio_digits)
+        || reply_lower.contains(&ratio_words)
+        || reply_lower.contains(&format!(
+            "{} of {} {}",
+            overview.succeeded, overview.total, expected_noun
+        ))
+        || reply_lower.contains(&format!(
+            "{} of {} {}s",
+            overview.succeeded, overview.total, expected_noun
+        ))
+}
+
+fn contains_expected_failure_count(reply_lower: &str, expected_failed: usize) -> bool {
+    count_terms(expected_failed).into_iter().any(|term| {
+        [
+            format!("{term} failed"),
+            format!("{term} failure"),
+            format!("{term} failures"),
+            format!("{term} attempt failed"),
+            format!("{term} attempts failed"),
+            format!("{term} step failed"),
+            format!("{term} steps failed"),
+            format!("{term} planned step failed"),
+            format!("{term} planned steps failed"),
+            format!("{term} remaining failed"),
+        ]
+        .into_iter()
+        .any(|pattern| reply_lower.contains(&pattern))
+    })
+}
+
+fn reply_acknowledges_outcome_reconciliation(
+    reply: &str,
+    overview: &ReconciliationOverview,
+) -> bool {
+    let lower = reply.to_ascii_lowercase();
+    let ratio_mentions = extract_ratio_mentions(&lower);
+    if !ratio_mentions.is_empty()
+        && !ratio_mentions
+            .iter()
+            .any(|(left, right)| *left == overview.succeeded && *right == overview.total)
+    {
+        return false;
+    }
+
+    let failure_mentions = extract_failure_count_mentions(&lower);
+    if !failure_mentions.is_empty()
+        && failure_mentions
+            .iter()
+            .any(|mentioned_count| *mentioned_count != overview.failed)
+    {
+        return false;
+    }
+
+    if overview.failed == 0 {
+        return true;
+    }
+
+    if claims_unqualified_success(&lower) || !mentions_failure_or_partial(&lower) {
+        return false;
+    }
+
+    contains_expected_ratio(&lower, overview)
+        || contains_expected_failure_count(&lower, overview.failed)
+}
+
+fn build_outcome_reconciliation_fallback_reply(reconciliation: &str) -> String {
+    format!(
+        "I can't claim full success from the verified outcomes.\n\n{}\n\n\
+         I'm reporting the system-verified result directly because the previous draft did not \
+         accurately reflect the recorded verified outcomes.",
+        reconciliation
+    )
 }
 
 pub(super) struct CompletionCtx<'a> {
@@ -1224,159 +1444,201 @@ impl Agent {
             }
 
             if completion_verification_still_required(turn_context, &completion_progress) {
-                execution_state.record_validation_round();
-                validation_state.record_failure(ValidationFailure::VerificationPending);
-                execution_state.mark_persisted_now();
-                if matches!(
-                    execution_state.exhausted_limit(0, task_start.elapsed()),
-                    Some(ExecutionBudgetLimit::ValidationRounds)
-                ) {
-                    validation_state.record_failure(ValidationFailure::BudgetExhausted);
-                    learning_ctx.record_replay_note(
-                        ReplayNoteCategory::ValidationFailure,
-                        "validation_budget_exhausted",
-                        "Stopped final verification because the current validation budget was exhausted."
-                            .to_string(),
-                        true,
-                    );
-                    let made_progress = !learning_ctx.tool_calls.is_empty()
-                        || completion_progress.mutation_count > 0
-                        || completion_progress.observation_count > 0;
-                    let request = if made_progress {
-                        build_reduce_scope_request(
+                // Handle failed external mutations first — independent of observation contract
+                if completion_progress.failed_external_mutation_count > 0 {
+                    let reconciliation_overview = execution_state.build_reconciliation_overview();
+                    let reconciliation = reconciliation_overview
+                        .as_ref()
+                        .map(|overview| overview.summary.clone())
+                        .or_else(|| execution_state.build_attempt_reconciliation_summary())
+                        .unwrap_or_else(|| {
+                            "[SYSTEM] External mutation attempt reconciliation: one or more attempts failed."
+                                .to_string()
+                        });
+
+                    // First pass: send the verified reconciliation facts back through the LLM.
+                    if !completion_progress.external_mutation_reconciliation_attempted {
+                        pending_system_messages.push(SystemDirective::OutcomeReconciliation(
+                            reconciliation.clone(),
+                        ));
+                        completion_progress.mark_external_mutation_reconciliation_attempted();
+                        execution_state.record_validation_round();
+                        commit_state!();
+                        return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+                    }
+
+                    // Second pass: the reply was generated with reconciliation context.
+                    // Validate that reply against the ledger.
+                    if reconciliation_overview.as_ref().is_some_and(|overview| {
+                        !reply_acknowledges_outcome_reconciliation(&reply, overview)
+                    }) {
+                        reply = build_outcome_reconciliation_fallback_reply(&reconciliation);
+                    }
+
+                    completion_progress.clear_failed_external_mutation_gate();
+                    pending_external_action_ack = None;
+                }
+
+                // If the standard observation contract is also still pending, handle it
+                if completion_progress.verification_pending
+                    && turn_context.completion_contract.requires_observation
+                {
+                    execution_state.record_validation_round();
+                    validation_state.record_failure(ValidationFailure::VerificationPending);
+                    execution_state.mark_persisted_now();
+                    if matches!(
+                        execution_state.exhausted_limit(0, task_start.elapsed()),
+                        Some(ExecutionBudgetLimit::ValidationRounds)
+                    ) {
+                        validation_state.record_failure(ValidationFailure::BudgetExhausted);
+                        learning_ctx.record_replay_note(
+                            ReplayNoteCategory::ValidationFailure,
+                            "validation_budget_exhausted",
+                            "Stopped final verification because the current validation budget was exhausted."
+                                .to_string(),
+                            true,
+                        );
+                        let made_progress = !learning_ctx.tool_calls.is_empty()
+                            || completion_progress.mutation_count > 0
+                            || completion_progress.observation_count > 0;
+                        let request = if made_progress {
+                            build_reduce_scope_request(
+                                turn_context,
+                                learning_ctx,
+                                "I used the current validation budget and still do not have a confirmed final result.",
+                                "Confirm the narrower scope or exact verification target I should spend the next pass on.",
+                                "I will spend the next validation pass on the reduced scope and then report the confirmed outcome.",
+                            )
+                        } else {
+                            build_partial_done_blocked_request(
+                                turn_context,
+                                learning_ctx,
+                                "I used the current validation budget and still do not have a confirmed final result.",
+                                "A narrower scope, explicit permission to keep validating, or the exact verification target I should confirm.",
+                                "I will spend the next validation pass on a concrete re-check and then report the confirmed outcome.",
+                            )
+                        };
+                        self.emit_warning_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::PostExecutionValidation,
+                            "Surfacing partial result because validation budget is exhausted"
+                                .to_string(),
+                            json!({
+                                "condition": "validation_budget_exhausted",
+                                "outcome": request.outcome.clone(),
+                                "approval_state": request.approval_state.clone(),
+                                "validation_state": validation_state.clone(),
+                                "request": request.clone(),
+                                "validation_rounds_used": execution_state.validation_rounds_used,
+                                "validation_round_budget": execution_state.budget.max_validation_rounds,
+                                "execution_id": execution_state.execution_id,
+                            }),
+                        )
+                        .await;
+                        reply = request.render_user_message();
+                        pending_external_action_ack = None;
+                        completion_progress.verification_pending = false;
+                    } else if tool_defs.is_empty() || force_text_response {
+                        validation_state.note_retry(LoopRepetitionReason::VerificationPending);
+                        learning_ctx.record_replay_note(
+                            ReplayNoteCategory::ValidationFailure,
+                            "verification_unavailable_in_phase",
+                            "Verification was still required, but this phase could not run the needed read-only checks."
+                                .to_string(),
+                            true,
+                        );
+                        learning_ctx.record_replay_note(
+                            ReplayNoteCategory::RetryReason,
+                            "verification_pending",
+                            "Retried because verification was still pending at completion time."
+                                .to_string(),
+                            true,
+                        );
+                        let request = build_partial_done_blocked_request(
                             turn_context,
                             learning_ctx,
-                            "I used the current validation budget and still do not have a confirmed final result.",
-                            "Confirm the narrower scope or exact verification target I should spend the next pass on.",
-                            "I will spend the next validation pass on the reduced scope and then report the confirmed outcome.",
+                            "I completed part of the request, but the final outcome still needs a read-only verification step.",
+                            "A final read-only verification against the current target/output.",
+                            "Once verification is available, I will run that check and then report the confirmed result.",
+                        );
+                        self.emit_warning_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::PostExecutionValidation,
+                            "Surfacing partial result because post-execution verification cannot run in this phase"
+                                .to_string(),
+                            json!({
+                                "outcome": request.outcome.clone(),
+                                "approval_state": request.approval_state.clone(),
+                                "validation_state": validation_state.clone(),
+                                "request": request.clone(),
+                                "force_text_response": force_text_response,
+                                "tools_available": !tool_defs.is_empty(),
+                            }),
                         )
+                        .await;
+                        warn!(
+                            session_id,
+                            iteration,
+                            force_text_response,
+                            "Completion verification required but tools unavailable (empty or force-text); clearing guard"
+                        );
+                        reply = request.render_user_message();
+                        pending_external_action_ack = None;
+                        // Avoid deadlocks when tools cannot run in this phase, but
+                        // preserve the fact that verification did not happen in the reply itself.
+                        completion_progress.verification_pending = false;
                     } else {
-                        build_partial_done_blocked_request(
-                            turn_context,
-                            learning_ctx,
-                            "I used the current validation budget and still do not have a confirmed final result.",
-                            "A narrower scope, explicit permission to keep validating, or the exact verification target I should confirm.",
-                            "I will spend the next validation pass on a concrete re-check and then report the confirmed outcome.",
+                        validation_state.note_retry(LoopRepetitionReason::VerificationPending);
+                        learning_ctx.record_replay_note(
+                            ReplayNoteCategory::ValidationFailure,
+                            "verification_pending",
+                            "Blocked completion until the final verification step could run."
+                                .to_string(),
+                            true,
+                        );
+                        learning_ctx.record_replay_note(
+                            ReplayNoteCategory::RetryReason,
+                            "verification_pending",
+                            "Retried because verification was still pending at completion time."
+                                .to_string(),
+                            true,
+                        );
+                        self.emit_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::PostExecutionValidation,
+                            "Post-execution verification required before completion".to_string(),
+                            json!({
+                                "outcome": ValidationOutcome::VerifyAgain,
+                                "reason": "verification_pending",
+                                "loop_repetition_reason": validation_state.loop_repetition_reason,
+                                "target_hint": turn_context.completion_contract.primary_target_hint(),
+                                "completed_tool_calls": learning_ctx.tool_calls.len(),
+                                "verification_pending": completion_progress.verification_pending,
+                            }),
                         )
-                    };
-                    self.emit_warning_decision_point(
-                        emitter,
-                        task_id,
-                        iteration,
-                        DecisionType::PostExecutionValidation,
-                        "Surfacing partial result because validation budget is exhausted"
-                            .to_string(),
-                        json!({
-                            "condition": "validation_budget_exhausted",
-                            "outcome": request.outcome.clone(),
-                            "approval_state": request.approval_state.clone(),
-                            "validation_state": validation_state.clone(),
-                            "request": request.clone(),
-                            "validation_rounds_used": execution_state.validation_rounds_used,
-                            "validation_round_budget": execution_state.budget.max_validation_rounds,
-                            "execution_id": execution_state.execution_id,
-                        }),
-                    )
-                    .await;
-                    reply = request.render_user_message();
-                    pending_external_action_ack = None;
-                    completion_progress.verification_pending = false;
-                } else if tool_defs.is_empty() || force_text_response {
-                    validation_state.note_retry(LoopRepetitionReason::VerificationPending);
-                    learning_ctx.record_replay_note(
-                        ReplayNoteCategory::ValidationFailure,
-                        "verification_unavailable_in_phase",
-                        "Verification was still required, but this phase could not run the needed read-only checks."
-                            .to_string(),
-                        true,
-                    );
-                    learning_ctx.record_replay_note(
-                        ReplayNoteCategory::RetryReason,
-                        "verification_pending",
-                        "Retried because verification was still pending at completion time."
-                            .to_string(),
-                        true,
-                    );
-                    let request = build_partial_done_blocked_request(
-                        turn_context,
-                        learning_ctx,
-                        "I completed part of the request, but the final outcome still needs a read-only verification step.",
-                        "A final read-only verification against the current target/output.",
-                        "Once verification is available, I will run that check and then report the confirmed result.",
-                    );
-                    self.emit_warning_decision_point(
-                        emitter,
-                        task_id,
-                        iteration,
-                        DecisionType::PostExecutionValidation,
-                        "Surfacing partial result because post-execution verification cannot run in this phase"
-                            .to_string(),
-                        json!({
-                            "outcome": request.outcome.clone(),
-                            "approval_state": request.approval_state.clone(),
-                            "validation_state": validation_state.clone(),
-                            "request": request.clone(),
-                            "force_text_response": force_text_response,
-                            "tools_available": !tool_defs.is_empty(),
-                        }),
-                    )
-                    .await;
-                    warn!(
-                        session_id,
-                        iteration,
-                        force_text_response,
-                        "Completion verification required but tools unavailable (empty or force-text); clearing guard"
-                    );
-                    reply = request.render_user_message();
-                    pending_external_action_ack = None;
-                    // Avoid deadlocks when tools cannot run in this phase, but
-                    // preserve the fact that verification did not happen in the reply itself.
-                    completion_progress.verification_pending = false;
-                } else {
-                    validation_state.note_retry(LoopRepetitionReason::VerificationPending);
-                    learning_ctx.record_replay_note(
-                        ReplayNoteCategory::ValidationFailure,
-                        "verification_pending",
-                        "Blocked completion until the final verification step could run."
-                            .to_string(),
-                        true,
-                    );
-                    learning_ctx.record_replay_note(
-                        ReplayNoteCategory::RetryReason,
-                        "verification_pending",
-                        "Retried because verification was still pending at completion time."
-                            .to_string(),
-                        true,
-                    );
-                    self.emit_decision_point(
-                        emitter,
-                        task_id,
-                        iteration,
-                        DecisionType::PostExecutionValidation,
-                        "Post-execution verification required before completion".to_string(),
-                        json!({
-                            "outcome": ValidationOutcome::VerifyAgain,
-                            "reason": "verification_pending",
-                            "loop_repetition_reason": validation_state.loop_repetition_reason,
-                            "target_hint": turn_context.completion_contract.primary_target_hint(),
-                            "completed_tool_calls": learning_ctx.tool_calls.len(),
-                            "verification_pending": completion_progress.verification_pending,
-                        }),
-                    )
-                    .await;
-                    stall_count = stall_count.saturating_add(1);
-                    consecutive_clean_iterations = 0;
-                    pending_system_messages.push(SystemDirective::CompletionVerificationRequired {
-                        target_hint: turn_context.completion_contract.primary_target_hint(),
-                    });
-                    warn!(
-                        session_id,
-                        iteration,
-                        stall_count,
-                        "Blocking completion until request outcome verification is performed"
-                    );
-                    commit_state!();
-                    return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+                        .await;
+                        stall_count = stall_count.saturating_add(1);
+                        consecutive_clean_iterations = 0;
+                        pending_system_messages.push(
+                            SystemDirective::CompletionVerificationRequired {
+                                target_hint: turn_context.completion_contract.primary_target_hint(),
+                            },
+                        );
+                        warn!(
+                            session_id,
+                            iteration,
+                            stall_count,
+                            "Blocking completion until request outcome verification is performed"
+                        );
+                        commit_state!();
+                        return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+                    }
                 }
             }
 
@@ -1794,18 +2056,53 @@ impl Agent {
 mod tests {
     use super::{
         build_activity_summary_reply, build_completion_fallback_reply,
-        build_force_text_deferred_completion_reply, build_structured_tool_output_completion_reply,
-        build_tool_output_completion_reply, choose_completion_recovery_candidate,
-        extract_structured_tool_output_excerpt, looks_like_idle_reengagement_reply,
+        build_force_text_deferred_completion_reply, build_outcome_reconciliation_fallback_reply,
+        build_structured_tool_output_completion_reply, build_tool_output_completion_reply,
+        choose_completion_recovery_candidate, extract_structured_tool_output_excerpt,
+        looks_like_idle_reengagement_reply, reply_acknowledges_outcome_reconciliation,
         should_enforce_no_tool_text_when_tools_required,
         should_recover_completion_from_tool_output, CompletionRecoveryCandidate,
     };
+    use crate::agent::execution_state::{ReconciliationMode, ReconciliationOverview};
     use crate::agent::post_task::LearningContext;
     use crate::agent::{
         build_partial_done_blocked_request, history::CompletionTaskKind, CompletionContract,
         TurnContext, VerificationTarget, VerificationTargetKind,
     };
     use chrono::Utc;
+
+    fn attempt_overview(succeeded: usize, total: usize, failed: usize) -> ReconciliationOverview {
+        ReconciliationOverview {
+            mode: ReconciliationMode::AttemptLevel,
+            total,
+            succeeded,
+            failed,
+            failed_step_indices: Vec::new(),
+            summary: format!(
+                "[SYSTEM] External mutation attempt reconciliation: {} of {} attempts succeeded, {} failed.",
+                succeeded, total, failed
+            ),
+        }
+    }
+
+    fn planned_step_overview(
+        succeeded: usize,
+        total: usize,
+        failed: usize,
+        failed_step_indices: Vec<usize>,
+    ) -> ReconciliationOverview {
+        ReconciliationOverview {
+            mode: ReconciliationMode::PlannedStepLevel,
+            total,
+            succeeded,
+            failed,
+            failed_step_indices,
+            summary: format!(
+                "[SYSTEM] Planned-step reconciliation: {} of {} planned steps completed.",
+                succeeded, total
+            ),
+        }
+    }
 
     #[test]
     fn tool_output_reply_is_result_focused() {
@@ -1892,6 +2189,19 @@ mod tests {
             "total 24\ndrwxr-xr-x  3 user  wheel  96 Mar  4 21:08 __pycache__\n-rw-r--r--  1 user  wheel  1041 Mar  4 21:09 regex_engine.py\n-rw-r--r--  1 user  wheel  4972 Mar  4 21:03 test_regex.py",
             false,
         ).is_none());
+        // System directives stored as fake tool results should be trivial
+        assert!(build_tool_output_completion_reply(
+            "web_search",
+            "[SYSTEM] This request should be answered directly in plain text. Do not call side-effecting tools for it. Write the requested content instead.",
+            false,
+        )
+        .is_none());
+        assert!(build_tool_output_completion_reply(
+            "web_fetch",
+            "[CONTENT FILTERED] This request should be answered directly in plain text.",
+            false,
+        )
+        .is_none());
         // Substantive output should still work
         assert!(build_tool_output_completion_reply(
             "terminal",
@@ -2143,6 +2453,77 @@ mod tests {
             true,
             0,
             1
+        ));
+    }
+
+    #[test]
+    fn reply_acknowledges_reconciliation_with_failure_mention() {
+        let reconciliation = attempt_overview(2, 3, 1);
+        assert!(reply_acknowledges_outcome_reconciliation(
+            "I posted 2 of 3 tweets, and 1 failed with a 403 error",
+            &reconciliation
+        ));
+    }
+
+    #[test]
+    fn reply_does_not_acknowledge_reconciliation_with_unqualified_success() {
+        let reconciliation = attempt_overview(2, 3, 1);
+        assert!(!reply_acknowledges_outcome_reconciliation(
+            "All tweets successfully completed!",
+            &reconciliation
+        ));
+    }
+
+    #[test]
+    fn fallback_reply_contains_reconciliation() {
+        let reconciliation = "[SYSTEM] 1 of 3 attempts failed.";
+        let fallback = build_outcome_reconciliation_fallback_reply(reconciliation);
+        assert!(fallback.contains("1 of 3 attempts failed"));
+        assert!(fallback.contains("system-verified"));
+    }
+
+    #[test]
+    fn reply_contradicting_failure_count_is_rejected() {
+        let reconciliation = attempt_overview(2, 3, 1);
+        // Claims 0 failures when ledger says 1 failed
+        assert!(!reply_acknowledges_outcome_reconciliation(
+            "I retried and 0 failed — all good now!",
+            &reconciliation
+        ));
+        assert!(!reply_acknowledges_outcome_reconciliation(
+            "I retried and there were no failures in the end",
+            &reconciliation
+        ));
+    }
+
+    #[test]
+    fn reply_acknowledging_correct_failure_count_is_accepted() {
+        let reconciliation = attempt_overview(2, 3, 1);
+        assert!(reply_acknowledges_outcome_reconciliation(
+            "2 of 3 attempts succeeded, and 1 failed with a 403 error",
+            &reconciliation
+        ));
+    }
+
+    #[test]
+    fn no_failure_reconciliation_always_accepted() {
+        let reconciliation = attempt_overview(3, 3, 0);
+        assert!(reply_acknowledges_outcome_reconciliation(
+            "All 3 tweets posted successfully!",
+            &reconciliation
+        ));
+    }
+
+    #[test]
+    fn planned_step_reply_must_match_structured_counts() {
+        let reconciliation = planned_step_overview(4, 5, 1, vec![5]);
+        assert!(!reply_acknowledges_outcome_reconciliation(
+            "All 5 planned steps completed successfully.",
+            &reconciliation
+        ));
+        assert!(reply_acknowledges_outcome_reconciliation(
+            "4 of 5 planned steps completed; 1 planned step failed.",
+            &reconciliation
         ));
     }
 }

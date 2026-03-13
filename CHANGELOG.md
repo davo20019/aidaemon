@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.26] - 2026-03-13
+
+### Added
+
+- **Outcome ledger**: Structured `OutcomeEntry` records for every tool call attempt, tracking success/failure, HTTP status, external mutation flag, and planned step association. Powers deterministic reconciliation at completion time.
+- **Linear intent plan**: `LinearIntentPlan` with ordered `LinearIntentStep` entries allows the execution state to track multi-step workflows (e.g. "post 5 tweets"), advancing a cursor after each external success.
+- **Outcome reconciliation at completion**: When external mutations fail, a two-pass reconciliation injects verified facts into the LLM context and validates the reply against the ledger. If the reply misrepresents the outcome (wrong ratios, claims unqualified success despite failures), a system-generated fallback reply is used instead.
+- **`ReconciliationOverview`**: Structured summary with attempt-level or planned-step-level mode, success/failure counts, and failed step indices for precise outcome reporting.
+- **Heartbeat liveness check**: Heartbeat loop now detects and logs when the event loop appears stalled.
+- **`ToolSemantics.external_mutation` field**: Explicit flag for tools that mutate external state, used by the outcome ledger to distinguish reads from writes.
+- **System directive `OutcomeReconciliation`**: Injects verified reconciliation facts into the LLM context during the completion phase.
+
+### Changed
+
+- **Completion phase handles failed external mutations before observation contract**: Failed external mutations now block completion independently and trigger reconciliation before the standard verification flow runs.
+- **`http_request` response handling improved**: Better structured error extraction, HTTP status propagation to outcome ledger, and response truncation for large payloads.
+- **System directive detection in completion**: Internal directives (`[SYSTEM]`, `[CONTENT FILTERED]`) are now classified as trivial tool output to prevent them from leaking as user-facing replies.
+- **Terminal tool propagates external mutation semantics**: Terminal commands with external side effects are tracked in the outcome ledger.
+- **Sanitization expanded**: New patterns for filtering leaked internal reconciliation markers from user-facing output.
+- **Tool prelude phase supports linear intent plan installation**: Detected multi-step external workflows get a structured plan installed into execution state before the first tool call.
+- **Turn context tracks explicit scheduled-run and multi-target intent patterns**: History-based scope extraction improved for batch/multi-target requests.
+
+### Fixed
+
+- **LLM claiming "all succeeded" when some external mutations failed**: Outcome reconciliation detects misrepresented success claims and substitutes a system-verified reply.
+- **Completion loop deadlocked when verification required but tools unavailable**: Verification pending flag is now cleared when tools cannot run, with the partial result surfaced to the user.
+
 ## [0.9.25] - 2026-03-12
 
 ### Changed

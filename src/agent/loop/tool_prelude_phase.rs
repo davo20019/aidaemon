@@ -1,3 +1,4 @@
+use super::execution_state::LinearIntentStep;
 use super::*;
 use crate::execution_policy::{PolicyBundle, VerifyLevel};
 use crate::traits::ProviderResponse;
@@ -45,6 +46,8 @@ pub(crate) struct PlanState {
     pub(crate) requires_verification: bool,
     pub(crate) risky_actions: Vec<String>,
     pub(crate) version: u32,
+    #[serde(default)]
+    pub(crate) planned_steps: Vec<PlannedAction>,
 }
 
 impl PlanState {
@@ -64,6 +67,17 @@ impl PlanState {
             .into_iter()
             .map(|action| action.trim().to_string())
             .filter(|action| !action.is_empty())
+            .collect();
+        self.planned_steps = self
+            .planned_steps
+            .into_iter()
+            .map(|mut step| {
+                step.tool = step.tool.trim().to_string();
+                step.target = step.target.trim().to_string();
+                step.description = step.description.trim().to_string();
+                step
+            })
+            .filter(|step| !step.tool.is_empty())
             .collect();
         if self.version == 0 {
             self.version = 1;
@@ -123,7 +137,20 @@ fn pre_execution_plan_schema_json() -> Value {
                 "type": "array",
                 "items": { "type": "string" }
             },
-            "version": { "type": "integer", "minimum": 1 }
+            "version": { "type": "integer", "minimum": 1 },
+            "planned_steps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool": { "type": "string" },
+                        "target": { "type": "string" },
+                        "description": { "type": "string" }
+                    },
+                    "required": ["tool", "target", "description"],
+                    "additionalProperties": false
+                }
+            }
         },
         "required": [
             "goal",
@@ -280,6 +307,30 @@ fn validate_pre_execution_plan(
     }
     if plan.version == 0 {
         return Err("missing_plan_version");
+    }
+    if !plan.planned_steps.is_empty() {
+        // First planned step must match first_action (tool + target when present)
+        let first_step = &plan.planned_steps[0];
+        if !first_step
+            .tool
+            .eq_ignore_ascii_case(&plan.first_action.tool)
+        {
+            return Err("planned_steps_first_action_mismatch");
+        }
+        if !plan.first_action.target.is_empty()
+            && (first_step.target.is_empty()
+                || !first_step
+                    .target
+                    .eq_ignore_ascii_case(&plan.first_action.target))
+        {
+            return Err("planned_steps_first_action_target_mismatch");
+        }
+        // Every planned step must have tool and description
+        for step in &plan.planned_steps {
+            if step.tool.is_empty() || step.description.is_empty() {
+                return Err("planned_steps_incomplete_entry");
+            }
+        }
     }
     Ok(())
 }
@@ -785,6 +836,29 @@ impl Agent {
                     ) {
                         Ok(()) => {
                             execution_state.set_plan_version(plan.version);
+                            // Clear any stale plan from previous iterations before
+                            // conditionally installing a new one.
+                            execution_state.active_linear_intent_plan = None;
+                            if !plan.planned_steps.is_empty() {
+                                execution_state.install_linear_intent_plan(
+                                    plan.version,
+                                    plan.planned_steps
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(idx, step)| LinearIntentStep {
+                                            step_id: format!(
+                                                "plan-v{}-step-{}",
+                                                plan.version,
+                                                idx + 1
+                                            ),
+                                            step_index: idx + 1,
+                                            tool: step.tool.clone(),
+                                            target: step.target.clone(),
+                                            description: step.description.clone(),
+                                        })
+                                        .collect(),
+                                );
+                            }
                             validation_state.set_plan(plan.version, &plan.success_criteria);
                             validation_state.clear_loop_repetition_reason();
                             learning_ctx.record_replay_note(
@@ -882,6 +956,10 @@ impl Agent {
                                             .await;
                                             }
                                             Ok(()) => {
+                                                // Clear stale linear intent plan — rejected
+                                                // critique means the plan that produced it
+                                                // is invalid.
+                                                execution_state.active_linear_intent_plan = None;
                                                 validation_state.record_failure(
                                                     ValidationFailure::CritiqueRejected,
                                                 );
@@ -1121,5 +1199,55 @@ impl Agent {
         }
 
         Ok(ToolPreludeOutcome::Proceed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_plan() -> PlanState {
+        PlanState {
+            goal: "Post a thread".to_string(),
+            success_criteria: vec!["all steps completed".to_string()],
+            first_action: PlannedAction {
+                tool: "http_request".to_string(),
+                target: "https://api.example.com/posts/1".to_string(),
+                description: "Post tweet 1".to_string(),
+            },
+            requires_verification: true,
+            risky_actions: vec!["Posting externally".to_string()],
+            version: 1,
+            planned_steps: vec![PlannedAction {
+                tool: "http_request".to_string(),
+                target: "https://api.example.com/posts/1".to_string(),
+                description: "Post tweet 1".to_string(),
+            }],
+        }
+    }
+
+    fn base_tool_call() -> ToolCall {
+        ToolCall {
+            id: "tc_1".to_string(),
+            name: "http_request".to_string(),
+            arguments: "{}".to_string(),
+            extra_content: None,
+        }
+    }
+
+    #[test]
+    fn validate_pre_execution_plan_rejects_missing_first_step_target() {
+        let mut plan = base_plan();
+        plan.planned_steps[0].target.clear();
+        let tc = base_tool_call();
+        let result = validate_pre_execution_plan(&plan, &tc, Some(&plan.first_action.target));
+        assert_eq!(result, Err("planned_steps_first_action_target_mismatch"));
+    }
+
+    #[test]
+    fn validate_pre_execution_plan_accepts_matching_first_step_target() {
+        let plan = base_plan();
+        let tc = base_tool_call();
+        assert!(validate_pre_execution_plan(&plan, &tc, Some(&plan.first_action.target)).is_ok());
     }
 }

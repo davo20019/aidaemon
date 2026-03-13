@@ -650,6 +650,16 @@ pub(super) fn classify_tool_result_failure_with_context(
                 return None;
             }
         }
+        // Structured HTTP status takes priority over text scraping
+        if let Some(status) = meta.http_status {
+            if let Some(kind) = classify_http_status(status) {
+                return Some(kind);
+            }
+            // 2xx/3xx with structured status → definitively not an error for HTTP tools
+            if matches!(tool_name, "http_request" | "web_fetch") {
+                return None;
+            }
+        }
     }
     classify_tool_result_failure_with_args(tool_name, result_text, tool_arguments)
 }
@@ -1202,6 +1212,51 @@ mod tool_error_detection_tests {
             false,
         );
         assert_eq!(classified, Some(ExecutionFailureKind::LogicFailure));
+    }
+
+    #[test]
+    fn classify_uses_structured_http_status_over_text_scraping() {
+        let meta = crate::traits::ToolCallMetadata {
+            http_status: Some(403),
+            ..Default::default()
+        };
+        let result = classify_tool_result_failure_with_context(
+            "http_request",
+            "some response body without status line",
+            None,
+            Some(&meta),
+        );
+        assert_eq!(result, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn classify_structured_http_status_transient() {
+        let meta = crate::traits::ToolCallMetadata {
+            http_status: Some(429),
+            ..Default::default()
+        };
+        let result = classify_tool_result_failure_with_context(
+            "http_request",
+            "rate limited",
+            None,
+            Some(&meta),
+        );
+        assert_eq!(result, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn classify_structured_http_200_is_not_error() {
+        let meta = crate::traits::ToolCallMetadata {
+            http_status: Some(200),
+            ..Default::default()
+        };
+        let result = classify_tool_result_failure_with_context(
+            "http_request",
+            "success body",
+            None,
+            Some(&meta),
+        );
+        assert_eq!(result, None);
     }
 }
 

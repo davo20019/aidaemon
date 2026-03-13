@@ -120,6 +120,14 @@ pub(in crate::agent) enum SystemDirective {
         root_cause: String,
         recommended_action: String,
     },
+    /// Injected immediately after an external mutation tool call fails.
+    ExternalMutationFailed {
+        tool_name: String,
+        status_code: Option<u16>,
+        error_hint: String,
+    },
+    /// Injected before final response when the outcome ledger has mixed results.
+    OutcomeReconciliation(String),
 }
 
 impl SystemDirective {
@@ -364,6 +372,22 @@ impl SystemDirective {
                  If you cannot fix the issue, report the actual error honestly to the user.",
                 tool_name, root_cause, recommended_action
             ),
+            Self::ExternalMutationFailed {
+                tool_name,
+                status_code,
+                error_hint,
+            } => {
+                let status_part = status_code
+                    .map(|c| format!(" (HTTP {})", c))
+                    .unwrap_or_default();
+                format!(
+                    "[SYSTEM] The previous `{}`{} FAILED: {}. \
+                     Do NOT proceed as if it succeeded. Either retry with corrected \
+                     parameters, or acknowledge the failure in your response.",
+                    tool_name, status_part, error_hint
+                )
+            }
+            Self::OutcomeReconciliation(summary) => summary.clone(),
         }
     }
 }
@@ -477,5 +501,28 @@ mod tests {
         assert!(rendered.contains("wrong hostname"));
         assert!(rendered.contains("Change the base URL"));
         assert!(rendered.contains("Do NOT repeat the same failing approach"));
+    }
+
+    #[test]
+    fn external_mutation_failed_directive_renders() {
+        let directive = SystemDirective::ExternalMutationFailed {
+            tool_name: "http_request".to_string(),
+            status_code: Some(403),
+            error_hint: "duplicate content".to_string(),
+        };
+        let rendered = directive.render();
+        assert!(rendered.contains("[SYSTEM]"));
+        assert!(rendered.contains("FAILED"));
+        assert!(rendered.contains("403"));
+        assert!(rendered.contains("http_request"));
+        assert!(rendered.contains("Do NOT proceed as if it succeeded"));
+    }
+
+    #[test]
+    fn outcome_reconciliation_directive_renders() {
+        let directive =
+            SystemDirective::OutcomeReconciliation("[SYSTEM] 1 of 2 attempts failed.".to_string());
+        let rendered = directive.render();
+        assert!(rendered.contains("1 of 2 attempts failed"));
     }
 }

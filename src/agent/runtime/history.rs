@@ -100,6 +100,12 @@ pub(super) struct CompletionProgress {
     pub mutation_count: usize,
     pub verification_count: usize,
     pub verification_pending: bool,
+    /// Count of external mutation attempts that failed (4xx/5xx, etc.)
+    pub failed_external_mutation_count: usize,
+    /// Count of external mutation attempts that succeeded
+    pub successful_external_mutation_count: usize,
+    /// True after we have already given the LLM one reconciliation-informed retry.
+    pub external_mutation_reconciliation_attempted: bool,
 }
 
 impl CompletionProgress {
@@ -126,6 +132,23 @@ impl CompletionProgress {
             self.verification_pending = false;
             self.verification_count = self.verification_count.saturating_add(1);
         }
+    }
+
+    pub(super) fn mark_failed_external_mutation(&mut self) {
+        self.failed_external_mutation_count += 1;
+    }
+
+    pub(super) fn mark_successful_external_mutation(&mut self) {
+        self.successful_external_mutation_count += 1;
+    }
+
+    pub(super) fn mark_external_mutation_reconciliation_attempted(&mut self) {
+        self.external_mutation_reconciliation_attempted = true;
+    }
+
+    pub(super) fn clear_failed_external_mutation_gate(&mut self) {
+        self.failed_external_mutation_count = 0;
+        self.external_mutation_reconciliation_attempted = false;
     }
 }
 
@@ -314,6 +337,60 @@ fn looks_like_context_dependent_followup_question(lower_text: &str) -> bool {
     text_contains_any_phrase(lower_text, &explanation_cues)
         && (text_contains_any_phrase(lower_text, &deictic_markers)
             || text_contains_any_phrase(lower_text, &shared_context_markers))
+}
+
+/// Detect messages that explicitly reference a prior unanswered request:
+/// "You didn't respond my question", "answer my question", "you ignored my request".
+/// These are meta-commentary about the prior interaction and must keep context.
+fn looks_like_unanswered_request_reference(lower: &str) -> bool {
+    if lower.chars().count() > 120 {
+        return false;
+    }
+    let complaint_cues = [
+        "didn't respond",
+        "didn't answer",
+        "did not respond",
+        "did not answer",
+        "didn't reply",
+        "did not reply",
+        "never responded",
+        "never answered",
+        "never replied",
+        "ignored",
+        "skipped",
+        "didn't address",
+        "did not address",
+        "what about",
+    ];
+    let response_verbs = ["answer", "respond", "reply", "address"];
+    let prior_request_references = [
+        "my question",
+        "my request",
+        "my message",
+        "my earlier question",
+        "my earlier request",
+        "my last question",
+        "my last request",
+        "what i asked",
+        "the question i asked",
+        "the request i made",
+    ];
+
+    let references_prior_request = prior_request_references
+        .iter()
+        .any(|phrase| contains_keyword_as_words(lower, phrase));
+    if !references_prior_request {
+        return false;
+    }
+
+    let has_complaint_cue = complaint_cues
+        .iter()
+        .any(|phrase| contains_keyword_as_words(lower, phrase));
+    let asks_for_response = response_verbs
+        .iter()
+        .any(|phrase| contains_keyword_as_words(lower, phrase));
+
+    has_complaint_cue || asks_for_response
 }
 
 fn looks_like_artifact_inspection_request(lower_text: &str) -> bool {
@@ -1152,6 +1229,14 @@ fn classify_followup_mode(
     }
 
     if prev_assistant.is_some() && looks_like_context_dependent_followup_question(&lower) {
+        reasons.push(TurnContextReason::ContextDependentQuestion);
+        return (FollowupMode::Followup, reasons);
+    }
+
+    // Messages that reference a prior unanswered request ("You didn't respond
+    // my question", "answer my question", "you ignored my request") must keep
+    // prior context so the LLM can find the original question.
+    if prev_assistant.is_some() && looks_like_unanswered_request_reference(&lower) {
         reasons.push(TurnContextReason::ContextDependentQuestion);
         return (FollowupMode::Followup, reasons);
     }
@@ -2339,6 +2424,60 @@ mod tests {
     }
 
     #[test]
+    fn unanswered_request_complaint_classified_as_followup() {
+        let prev = "I searched for AI news and found several results.";
+        let current = "You didn't respond my question";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+
+    #[test]
+    fn answer_my_question_classified_as_followup() {
+        let prev = "Here is the latest result excerpt.";
+        let current = "answer my question please";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+
+    #[test]
+    fn ignored_my_request_classified_as_followup() {
+        let prev = "I posted the deployment logs.";
+        let current = "You ignored my request";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+
+    #[test]
+    fn what_about_my_request_classified_as_followup() {
+        let prev = "I summarized the bug reports.";
+        let current = "What about my request?";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+
+    #[test]
+    fn unanswered_request_reference_uses_word_boundaries() {
+        let prev = "I searched the docs and posted the summary.";
+        let current = "Please answer myquestion now";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+
+    #[test]
+    fn unanswered_complaint_without_prev_assistant_stays_new_task() {
+        // No previous assistant message — can't be a followup
+        let current = "You didn't respond my question";
+        let (mode, reasons) = classify_followup_mode(current, None);
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+
+    #[test]
     fn project_hint_extraction_finds_project_name() {
         let history = vec![
             msg(
@@ -3483,5 +3622,32 @@ mod tests {
             "explicit local scope cue should still allow nickname resolution: {:?}",
             targets
         );
+    }
+
+    #[test]
+    fn failed_external_mutation_tracking() {
+        let contract = CompletionContract {
+            task_kind: CompletionTaskKind::Deliver,
+            expects_mutation: true,
+            requires_observation: false,
+            ..Default::default()
+        };
+        let mut progress = CompletionProgress::new(&contract);
+        assert_eq!(progress.failed_external_mutation_count, 0);
+        assert!(!progress.external_mutation_reconciliation_attempted);
+
+        progress.mark_failed_external_mutation();
+        assert_eq!(progress.failed_external_mutation_count, 1);
+        assert!(!progress.external_mutation_reconciliation_attempted);
+
+        progress.mark_successful_external_mutation();
+        assert_eq!(progress.successful_external_mutation_count, 1);
+
+        progress.mark_external_mutation_reconciliation_attempted();
+        assert!(progress.external_mutation_reconciliation_attempted);
+
+        progress.clear_failed_external_mutation_gate();
+        assert_eq!(progress.failed_external_mutation_count, 0);
+        assert!(!progress.external_mutation_reconciliation_attempted);
     }
 }

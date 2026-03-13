@@ -8,7 +8,9 @@ use super::project_dir::{
 };
 use super::result_learning::{ResultLearningEnv, ResultLearningState};
 use super::types::{ToolExecutionCtx, ToolExecutionOutcome};
-use crate::agent::execution_state::{extract_target_hints_from_arguments, StepExecutionPlan};
+use crate::agent::execution_state::{
+    extract_target_hints_from_arguments, OutcomeEntry, StepExecutionPlan,
+};
 use crate::agent::recall_guardrails::is_personal_memory_tool;
 use crate::agent::*;
 use crate::traits::{ToolCallSemantics, ToolTargetHint, ToolTargetHintKind};
@@ -16,6 +18,21 @@ use crate::utils::{truncate_str, truncate_with_note};
 
 const TOOL_COMPLETE_SUMMARY_MAX_CHARS: usize = 140;
 const EXTERNAL_ACTION_ACK_MAX_CHARS: usize = 500;
+
+/// Extract a short error summary line from tool result text.
+fn extract_error_summary_line(result_text: &str) -> Option<String> {
+    result_text
+        .lines()
+        .find(|l| {
+            l.contains("API ERROR")
+                || l.contains("Error")
+                || l.contains("error")
+                || l.contains("Forbidden")
+                || l.contains("Unauthorized")
+                || l.contains("BLOCKED")
+        })
+        .map(|l| l.chars().take(200).collect())
+}
 
 fn raw_internal_scope_violation(
     raw_arguments: &str,
@@ -210,6 +227,44 @@ fn target_hint_allowed_for_step(
         }
         _ => false,
     }
+}
+
+fn json_contains_string_value(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(candidate) => candidate.eq_ignore_ascii_case(expected),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| json_contains_string_value(item, expected)),
+        Value::Object(map) => map
+            .values()
+            .any(|value| json_contains_string_value(value, expected)),
+        _ => false,
+    }
+}
+
+fn linear_intent_step_matches_tool_call(
+    step: &crate::agent::execution_state::LinearIntentStep,
+    tool_name: &str,
+    effective_arguments: &str,
+) -> bool {
+    if !step.tool.eq_ignore_ascii_case(tool_name) {
+        return false;
+    }
+    if step.target.is_empty() {
+        return true;
+    }
+
+    let candidate_targets = extract_target_hints_from_arguments(effective_arguments);
+    if candidate_targets
+        .iter()
+        .any(|target| target.value.eq_ignore_ascii_case(&step.target))
+    {
+        return true;
+    }
+
+    serde_json::from_str::<Value>(effective_arguments)
+        .ok()
+        .is_some_and(|value| json_contains_string_value(&value, &step.target))
 }
 
 fn target_scope_violation_for_tool_call(
@@ -1412,6 +1467,61 @@ impl Agent {
                     validation_state.clear_loop_repetition_reason();
                 }
             }
+
+            // Record structured outcome in the ledger
+            {
+                let caps = available_capabilities
+                    .get(&tc.name)
+                    .copied()
+                    .unwrap_or_default();
+                let is_external_mutation =
+                    caps.external_side_effect && result_metadata.semantics.mutates_state();
+                let error_summary = if is_error {
+                    extract_error_summary_line(&result_text)
+                } else {
+                    None
+                };
+                let planned_step = if is_external_mutation {
+                    execution_state
+                        .current_linear_intent_step()
+                        .filter(|step| {
+                            linear_intent_step_matches_tool_call(
+                                step,
+                                &tc.name,
+                                &effective_arguments,
+                            )
+                        })
+                        .cloned()
+                } else {
+                    None
+                };
+                let expected_step_count = execution_state
+                    .active_linear_intent_plan
+                    .as_ref()
+                    .map(|plan| plan.steps.len());
+                let plan_version = execution_state
+                    .active_linear_intent_plan
+                    .as_ref()
+                    .map(|plan| plan.plan_version);
+                execution_state.record_outcome(OutcomeEntry {
+                    tool_name: tc.name.clone(),
+                    success: !is_error,
+                    http_status: result_metadata.http_status,
+                    is_external_mutation,
+                    error_summary,
+                    iteration,
+                    plan_version,
+                    planned_step_id: planned_step.as_ref().map(|s| s.step_id.clone()),
+                    planned_step_index: planned_step.as_ref().map(|s| s.step_index),
+                    planned_step_description: planned_step.as_ref().map(|s| s.description.clone()),
+                    expected_step_count,
+                });
+                // Advance linear intent step pointer on successful external mutation
+                if !is_error && planned_step.is_some() {
+                    execution_state.advance_linear_intent_step_after_external_success();
+                }
+            }
+
             self.emit_decision_point(
                 emitter,
                 task_id,
@@ -1600,6 +1710,10 @@ impl Agent {
                 validation_state.clear_loop_repetition_reason();
                 if semantics.mutates_state() {
                     completion_progress.mark_mutation(&turn_context.completion_contract);
+                    // Track external mutation success for the completion gate
+                    if caps.external_side_effect {
+                        completion_progress.mark_successful_external_mutation();
+                    }
                 }
                 if semantics.observes_state() {
                     let can_verify =
@@ -1627,6 +1741,22 @@ impl Agent {
                 }
             } else {
                 pending_external_action_ack = None;
+                // Track failed external mutations — arms the completion gate
+                let caps = available_capabilities
+                    .get(&tc.name)
+                    .copied()
+                    .unwrap_or_default();
+                if caps.external_side_effect && result_metadata.semantics.mutates_state() {
+                    completion_progress.mark_failed_external_mutation();
+                    // Inject directive so the LLM cannot ignore the failure
+                    let error_hint = extract_error_summary_line(&result_text)
+                        .unwrap_or_else(|| "request failed".to_string());
+                    pending_system_messages.push(SystemDirective::ExternalMutationFailed {
+                        tool_name: tc.name.clone(),
+                        status_code: result_metadata.http_status,
+                        error_hint,
+                    });
+                }
                 if matches!(
                     execution_state.last_outcome,
                     Some(StepExecutionOutcome::NonrecoverableFailure)
@@ -1801,7 +1931,9 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::execution_state::RetryPolicy;
+    use crate::agent::execution_state::{
+        default_execution_budget, BudgetTier, ExecutionPersistence, ExecutionState, RetryPolicy,
+    };
     use crate::traits::ToolCallEffect;
 
     #[test]
@@ -2161,5 +2293,77 @@ mod tests {
         assert!(message.contains("widgets-api"));
         assert!(message.contains("linear-api"));
         assert!(message.contains("explicitly for local file or repository inspection"));
+    }
+
+    #[test]
+    fn linear_intent_step_match_requires_declared_target_when_present() {
+        let step = crate::agent::execution_state::LinearIntentStep {
+            step_id: "plan-v1-step-2".to_string(),
+            step_index: 2,
+            tool: "http_request".to_string(),
+            target: "https://api.example.com/tweet-2".to_string(),
+            description: "Post tweet 2".to_string(),
+        };
+
+        assert!(!linear_intent_step_matches_tool_call(
+            &step,
+            "http_request",
+            r#"{"url":"https://api.example.com/tweet-3","method":"POST"}"#
+        ));
+        assert!(linear_intent_step_matches_tool_call(
+            &step,
+            "http_request",
+            r#"{"url":"https://api.example.com/tweet-2","method":"POST"}"#
+        ));
+    }
+
+    #[test]
+    fn unmatched_success_does_not_advance_linear_intent_cursor() {
+        let mut execution_state = ExecutionState::new(
+            BudgetTier::None,
+            default_execution_budget(BudgetTier::None),
+            ExecutionPersistence::Ephemeral,
+        );
+        execution_state.install_linear_intent_plan(
+            1,
+            vec![
+                crate::agent::execution_state::LinearIntentStep {
+                    step_id: "plan-v1-step-1".to_string(),
+                    step_index: 1,
+                    tool: "http_request".to_string(),
+                    target: "https://api.example.com/tweet-1".to_string(),
+                    description: "Post tweet 1".to_string(),
+                },
+                crate::agent::execution_state::LinearIntentStep {
+                    step_id: "plan-v1-step-2".to_string(),
+                    step_index: 2,
+                    tool: "http_request".to_string(),
+                    target: "https://api.example.com/tweet-2".to_string(),
+                    description: "Post tweet 2".to_string(),
+                },
+            ],
+        );
+
+        let planned_step = execution_state
+            .current_linear_intent_step()
+            .filter(|step| {
+                linear_intent_step_matches_tool_call(
+                    step,
+                    "http_request",
+                    r#"{"url":"https://api.example.com/tweet-2","method":"POST"}"#,
+                )
+            })
+            .cloned();
+        if planned_step.is_some() {
+            execution_state.advance_linear_intent_step_after_external_success();
+        }
+
+        assert_eq!(
+            execution_state
+                .current_linear_intent_step()
+                .expect("step should remain active")
+                .step_index,
+            1
+        );
     }
 }

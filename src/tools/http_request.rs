@@ -13,9 +13,10 @@ use crate::tools::sanitize::{sanitize_external_content, sanitize_output, wrap_un
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::validate_url_for_ssrf;
 use crate::traits::{
-    Tool, ToolCallSemantics, ToolCapabilities, ToolTargetHintKind, ToolVerificationMode,
+    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolTargetHintKind, ToolVerificationMode,
 };
-use crate::types::ApprovalResponse;
+use crate::types::{ApprovalResponse, StatusUpdate};
 
 /// Timeout for approval requests (5 minutes).
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
@@ -1005,115 +1006,10 @@ impl HttpRequestTool {
 
         Ok((response, redirect_count))
     }
-}
 
-/// Simple percent-decoding for form-encoded body params.
-fn percent_decode(s: &str) -> String {
-    let mut result = Vec::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) =
-                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
-            {
-                result.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        if bytes[i] == b'+' {
-            result.push(b' ');
-        } else {
-            result.push(bytes[i]);
-        }
-        i += 1;
-    }
-    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
-}
-
-/// RFC 3986 percent-encoding for OAuth signature base string.
-fn percent_encode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() * 2);
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                result.push(byte as char);
-            }
-            _ => {
-                result.push_str(&format!("%{:02X}", byte));
-            }
-        }
-    }
-    result
-}
-
-#[async_trait]
-impl Tool for HttpRequestTool {
-    fn name(&self) -> &str {
-        "http_request"
-    }
-
-    fn description(&self) -> &str {
-        "Make authenticated HTTP requests to external APIs"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "name": "http_request",
-            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only. Pass only the real endpoint URL in `url`; keep `auth_profile`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Write operations require user approval.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "method": {
-                        "type": "string",
-                        "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
-                        "description": "HTTP method"
-                    },
-                    "url": {
-                        "type": "string",
-                        "description": "Full HTTPS endpoint URL only. Do NOT append tool arguments like auth_profile, headers, body, content_type, timeout_secs, follow_redirects, or max_response_bytes to this URL."
-                    },
-                    "auth_profile": {
-                        "type": "string",
-                        "description": "Top-level auth profile name (e.g. 'twitter', 'stripe'). Do not embed this in the URL."
-                    },
-                    "headers": {
-                        "type": "object",
-                        "description": "Top-level additional non-auth request headers"
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Top-level request body (JSON string, form data, etc.). Do not embed this in the URL."
-                    },
-                    "content_type": {
-                        "type": "string",
-                        "description": "Top-level Content-Type header (auto-detected if omitted)"
-                    },
-                    "query_params": {
-                        "type": "object",
-                        "description": "Actual remote query parameters appended to the URL. Do not place tool control args here."
-                    },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "description": "Request timeout in seconds (default 30, max 120)"
-                    },
-                    "follow_redirects": {
-                        "type": "boolean",
-                        "description": "Follow redirects (default true, max 5 hops)"
-                    },
-                    "max_response_bytes": {
-                        "type": "integer",
-                        "description": "Maximum response size in bytes (default 1MB, max 5MB)"
-                    }
-                },
-                "required": ["method", "url"],
-                "additionalProperties": false
-            }
-        })
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+    /// Core implementation shared by `call()` and `call_with_status_outcome()`.
+    /// Returns the formatted output string and the HTTP status code (if one was observed).
+    async fn execute(&self, arguments: &str) -> anyhow::Result<(String, Option<u16>)> {
         let mut args: Value = serde_json::from_str(arguments)?;
 
         // Parse parameters
@@ -1156,21 +1052,24 @@ impl Tool for HttpRequestTool {
 
         // Step 1: HTTPS enforcement
         if parsed_url.scheme() != "https" {
-            return Ok("Request blocked: only HTTPS URLs are allowed".to_string());
+            return Ok((
+                "Request blocked: only HTTPS URLs are allowed".to_string(),
+                None,
+            ));
         }
 
         // Step 2: SSRF validation
         if let Err(reason) = validate_url_for_ssrf(&url) {
-            return Ok(format!("Request blocked: {}", reason));
+            return Ok((format!("Request blocked: {}", reason), None));
         }
 
         // Step 3: Catch malformed tool calls where tool-only args were stuffed into the URL.
         let leaked_tool_params = Self::embedded_tool_params_in_url(&parsed_url);
         if !leaked_tool_params.is_empty() {
-            return Ok(format!(
+            return Ok((format!(
                 "Request blocked: tool-only parameters were embedded in the URL ({}). Put them in the top-level `http_request` arguments instead of `url`.",
                 leaked_tool_params.join(", ")
-            ));
+            ), None));
         }
         if !recovered_tool_params.is_empty() {
             warn!(
@@ -1183,10 +1082,10 @@ impl Tool for HttpRequestTool {
         // Step 4: Block manual credential headers so auth always flows through profiles.
         let blocked_headers = Self::blocked_manual_auth_headers(custom_headers);
         if !blocked_headers.is_empty() {
-            return Ok(format!(
+            return Ok((format!(
                 "Request blocked: credential-bearing headers are not allowed in `headers` ({}). Configure an auth_profile instead.",
                 blocked_headers.join(", ")
-            ));
+            ), None));
         }
 
         // Step 5: Resolve auth profile and check domain
@@ -1203,9 +1102,12 @@ impl Tool for HttpRequestTool {
                 .iter()
                 .any(|d| Self::domain_matches(request_host, d));
             if !domain_ok {
-                return Ok(format!(
+                return Ok((
+                    format!(
                     "Request blocked: domain '{}' is not in the allowed domains for profile '{}'",
                     request_host, name
+                ),
+                    None,
                 ));
             }
             Some(p)
@@ -1229,11 +1131,12 @@ impl Tool for HttpRequestTool {
         );
         let (_, has_secrets) = sanitize_output(&check_parts);
         if has_secrets {
-            return Ok(
+            return Ok((
                 "Request blocked: outbound data appears to contain secrets or credentials. \
                  Review the URL, body, and headers for leaked API keys or tokens."
                     .to_string(),
-            );
+                None,
+            ));
         }
 
         // Step 8: Classify risk and request approval
@@ -1280,7 +1183,7 @@ impl Tool for HttpRequestTool {
                         .await;
                 }
                 ApprovalResponse::Deny => {
-                    return Ok("Request denied by user".to_string());
+                    return Ok(("Request denied by user".to_string(), None));
                 }
             }
         }
@@ -1292,7 +1195,7 @@ impl Tool for HttpRequestTool {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
         if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
-            return Ok(format!("Unsupported method: {}", method));
+            return Ok((format!("Unsupported method: {}", method), None));
         }
 
         let (mut response, mut redirect_count) = self
@@ -1423,6 +1326,7 @@ aidaemon did not attempt an OAuth refresh because this profile is not bearer-tok
 
         // Build result with response details
         let status_code = status.as_u16();
+        let captured_status = Some(status_code);
         let mut result = format!(
             "HTTP {} {}\n",
             status_code,
@@ -1503,7 +1407,137 @@ aidaemon did not attempt an OAuth refresh because this profile is not bearer-tok
         result.push_str(&sanitized_body);
 
         // Wrap as untrusted external data
-        Ok(wrap_untrusted_output("http_request", &result))
+        Ok((
+            wrap_untrusted_output("http_request", &result),
+            captured_status,
+        ))
+    }
+}
+
+/// Simple percent-decoding for form-encoded body params.
+fn percent_decode(s: &str) -> String {
+    let mut result = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                result.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            result.push(b' ');
+        } else {
+            result.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
+}
+
+/// RFC 3986 percent-encoding for OAuth signature base string.
+fn percent_encode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() * 2);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                result.push(byte as char);
+            }
+            _ => {
+                result.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    result
+}
+
+#[async_trait]
+impl Tool for HttpRequestTool {
+    fn name(&self) -> &str {
+        "http_request"
+    }
+
+    fn description(&self) -> &str {
+        "Make authenticated HTTP requests to external APIs"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "http_request",
+            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only. Pass only the real endpoint URL in `url`; keep `auth_profile`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Write operations require user approval.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                        "description": "HTTP method"
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Full HTTPS endpoint URL only. Do NOT append tool arguments like auth_profile, headers, body, content_type, timeout_secs, follow_redirects, or max_response_bytes to this URL."
+                    },
+                    "auth_profile": {
+                        "type": "string",
+                        "description": "Top-level auth profile name (e.g. 'twitter', 'stripe'). Do not embed this in the URL."
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Top-level additional non-auth request headers"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Top-level request body (JSON string, form data, etc.). Do not embed this in the URL."
+                    },
+                    "content_type": {
+                        "type": "string",
+                        "description": "Top-level Content-Type header (auto-detected if omitted)"
+                    },
+                    "query_params": {
+                        "type": "object",
+                        "description": "Actual remote query parameters appended to the URL. Do not place tool control args here."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Request timeout in seconds (default 30, max 120)"
+                    },
+                    "follow_redirects": {
+                        "type": "boolean",
+                        "description": "Follow redirects (default true, max 5 hops)"
+                    },
+                    "max_response_bytes": {
+                        "type": "integer",
+                        "description": "Maximum response size in bytes (default 1MB, max 5MB)"
+                    }
+                },
+                "required": ["method", "url"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.execute(arguments).await.map(|(output, _)| output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let _ = status_tx;
+        let (output, http_status) = self.execute(arguments).await?;
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                http_status,
+                ..Default::default()
+            },
+        })
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -2187,5 +2221,33 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Unknown auth profile"));
+    }
+
+    #[tokio::test]
+    async fn call_with_status_outcome_returns_none_for_validation_failure() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let outcome = tool
+            .call_with_status_outcome(
+                r#"{"method": "GET", "url": "http://example.com/api"}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.metadata.http_status.is_none());
+        assert!(outcome.output.contains("HTTPS") || outcome.output.contains("http"));
+    }
+
+    #[tokio::test]
+    async fn call_and_call_with_status_outcome_produce_same_output() {
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(1);
+        let tool1 = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx1);
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(1);
+        let tool2 = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx2);
+
+        let args = r#"{"method": "GET", "url": "http://example.com/api"}"#;
+        let call_result = tool1.call(args).await.unwrap();
+        let outcome_result = tool2.call_with_status_outcome(args, None).await.unwrap();
+        assert_eq!(call_result, outcome_result.output);
     }
 }

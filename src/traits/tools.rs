@@ -199,6 +199,10 @@ pub struct ToolCallMetadata {
     /// Transport/runtime failure outside normal tool semantics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_error: Option<String>,
+    /// HTTP status code for API tools (http_request, web_fetch).
+    /// Populated at the tool boundary — not scraped from result text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
     /// Optional final user-facing reply. When set, the root agent may close the
     /// turn directly from the tool result instead of running another LLM pass.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -746,5 +750,20 @@ mod tests {
         let tool = RememberTool;
         let semantics = tool.call_semantics("{}");
         assert!(semantics.mutates_state());
+    }
+
+    #[test]
+    fn tool_call_metadata_http_status_defaults_to_none() {
+        let meta = ToolCallMetadata::default();
+        assert_eq!(meta.http_status, None);
+    }
+
+    #[test]
+    fn tool_call_metadata_with_http_status() {
+        let meta = ToolCallMetadata {
+            http_status: Some(201),
+            ..Default::default()
+        };
+        assert_eq!(meta.http_status, Some(201));
     }
 }

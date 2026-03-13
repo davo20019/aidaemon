@@ -1035,6 +1035,27 @@ impl HeartbeatCoordinator {
             }
         }
 
+        // ── Advance schedule BEFORE creating task to prevent race-condition
+        //    double-fires. If task creation fails afterwards, we skip one firing
+        //    (harmless) rather than risk duplicate fires from concurrent ticks.
+        let advanced_next_run = if schedule.is_one_shot {
+            // Park one-shot far in the future; we delete it after successful task creation.
+            (now + chrono::Duration::hours(24)).to_rfc3339()
+        } else if let Ok(next) = crate::cron_utils::compute_next_run(&schedule.cron_expr) {
+            next.to_rfc3339()
+        } else {
+            warn!(schedule_id = %schedule.id, cron = %schedule.cron_expr, "Failed to compute next run for recurring schedule");
+            return Ok(());
+        };
+
+        schedule.last_run_at = Some(now_ts.clone());
+        schedule.next_run_at = advanced_next_run;
+        schedule.updated_at = now_ts.clone();
+        if let Err(e) = self.state.update_goal_schedule(&schedule).await {
+            warn!(schedule_id = %schedule.id, error = %e, "Failed to advance schedule before task creation — skipping to avoid potential duplicate");
+            return Ok(());
+        }
+
         // Create a pending task for this scheduled run.
         let task = crate::traits::Task {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1072,13 +1093,7 @@ impl HeartbeatCoordinator {
             completed_at: None,
         };
 
-        if let Err(e) = self.state.create_task(&task).await {
-            // Avoid hot-looping on persistent DB errors.
-            schedule.next_run_at = (now + chrono::Duration::minutes(5)).to_rfc3339();
-            schedule.updated_at = now_ts.clone();
-            let _ = self.state.update_goal_schedule(&schedule).await;
-            return Err(e);
-        }
+        self.state.create_task(&task).await?;
 
         // Update goal timestamp.
         let mut updated_goal = goal.clone();
@@ -1088,20 +1103,12 @@ impl HeartbeatCoordinator {
             warn!(goal_id = %goal.id, error = %e, "Failed to update goal timestamp after schedule fire");
         }
 
-        // Advance schedule state.
+        // Clean up one-shot schedules after successful task creation.
+        // (Recurring schedules were already advanced before task creation.)
         if schedule.is_one_shot {
             if let Err(e) = self.state.delete_goal_schedule(&schedule.id).await {
                 warn!(schedule_id = %schedule.id, error = %e, "Failed to delete one-shot schedule after fire");
             }
-        } else if let Ok(next) = crate::cron_utils::compute_next_run(&schedule.cron_expr) {
-            schedule.last_run_at = Some(now_ts.clone());
-            schedule.next_run_at = next.to_rfc3339();
-            schedule.updated_at = now_ts.clone();
-            if let Err(e) = self.state.update_goal_schedule(&schedule).await {
-                warn!(schedule_id = %schedule.id, error = %e, "Failed to advance recurring schedule — may cause duplicate fire on next tick");
-            }
-        } else {
-            warn!(schedule_id = %schedule.id, cron = %schedule.cron_expr, "Failed to compute next run for recurring schedule");
         }
 
         info!(

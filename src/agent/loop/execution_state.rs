@@ -10,6 +10,67 @@ use crate::traits::{
     ToolTargetHintKind,
 };
 
+/// Structured record of a single tool call attempt outcome.
+/// Accumulated in the outcome ledger for reconciliation.
+/// Note: this tracks *attempts*, not intended actions. A retry that
+/// succeeds after a failure produces two entries, not one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutcomeEntry {
+    pub tool_name: String,
+    pub success: bool,
+    pub http_status: Option<u16>,
+    /// True only when the tool has `external_side_effect` capability AND
+    /// semantics indicate state mutation. Terminal-based curl calls are
+    /// NOT tracked (no structured status code).
+    pub is_external_mutation: bool,
+    pub error_summary: Option<String>,
+    pub iteration: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_step_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_step_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_step_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_step_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconciliationMode {
+    AttemptLevel,
+    PlannedStepLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReconciliationOverview {
+    pub mode: ReconciliationMode,
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub failed_step_indices: Vec<usize>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinearIntentStep {
+    pub step_id: String,
+    pub step_index: usize, // 1-based
+    pub tool: String,
+    pub target: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LinearIntentPlan {
+    pub plan_version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<LinearIntentStep>,
+    #[serde(default)]
+    pub current_step_cursor: usize, // 0-based cursor into `steps`
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetTier {
@@ -134,6 +195,11 @@ pub struct ExecutionState {
     pub tool_calls_used: usize,
     pub validation_rounds_used: usize,
     pub steps_used: usize,
+    /// Structured outcome ledger — one entry per tool call attempt.
+    #[serde(default)]
+    pub outcome_ledger: Vec<OutcomeEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_linear_intent_plan: Option<LinearIntentPlan>,
 }
 
 impl ExecutionState {
@@ -162,6 +228,8 @@ impl ExecutionState {
             tool_calls_used: 0,
             validation_rounds_used: 0,
             steps_used: 0,
+            outcome_ledger: Vec::new(),
+            active_linear_intent_plan: None,
         }
     }
 
@@ -224,6 +292,296 @@ impl ExecutionState {
         self.background_handoff_active =
             matches!(outcome, StepExecutionOutcome::BackgroundDetached);
         self.last_outcome = Some(outcome);
+    }
+
+    pub fn record_outcome(&mut self, entry: OutcomeEntry) {
+        self.outcome_ledger.push(entry);
+    }
+
+    pub fn install_linear_intent_plan(&mut self, plan_version: u32, steps: Vec<LinearIntentStep>) {
+        if steps.is_empty() {
+            self.active_linear_intent_plan = None;
+            return;
+        }
+        self.active_linear_intent_plan = Some(LinearIntentPlan {
+            plan_version,
+            steps,
+            current_step_cursor: 0,
+        });
+    }
+
+    pub fn current_linear_intent_step(&self) -> Option<&LinearIntentStep> {
+        let plan = self.active_linear_intent_plan.as_ref()?;
+        plan.steps.get(plan.current_step_cursor)
+    }
+
+    pub fn advance_linear_intent_step_after_external_success(&mut self) {
+        let Some(plan) = self.active_linear_intent_plan.as_mut() else {
+            return;
+        };
+        // Allow cursor to advance past the last step (cursor == len means all done).
+        // current_linear_intent_step() will return None once cursor >= len.
+        if plan.current_step_cursor < plan.steps.len() {
+            plan.current_step_cursor += 1;
+        }
+    }
+
+    /// True if any external mutation attempt failed.
+    pub fn has_failed_external_mutations(&self) -> bool {
+        self.outcome_ledger
+            .iter()
+            .any(|e| e.is_external_mutation && !e.success)
+    }
+
+    pub fn failed_external_mutation_count(&self) -> usize {
+        self.outcome_ledger
+            .iter()
+            .filter(|e| e.is_external_mutation && !e.success)
+            .count()
+    }
+
+    pub fn successful_external_mutation_count(&self) -> usize {
+        self.outcome_ledger
+            .iter()
+            .filter(|e| e.is_external_mutation && e.success)
+            .count()
+    }
+
+    pub(crate) fn build_attempt_reconciliation_overview(&self) -> Option<ReconciliationOverview> {
+        if !self.has_failed_external_mutations() {
+            return None;
+        }
+        let total = self
+            .outcome_ledger
+            .iter()
+            .filter(|e| e.is_external_mutation)
+            .count();
+        let succeeded = self.successful_external_mutation_count();
+        let failed = self.failed_external_mutation_count();
+
+        let mut summary = format!(
+            "[SYSTEM] External mutation attempt reconciliation: {} of {} attempts succeeded, {} failed.",
+            succeeded, total, failed,
+        );
+        for entry in self
+            .outcome_ledger
+            .iter()
+            .filter(|e| e.is_external_mutation && !e.success)
+        {
+            let status = entry
+                .http_status
+                .map(|s| format!(" (HTTP {})", s))
+                .unwrap_or_default();
+            let error = entry.error_summary.as_deref().unwrap_or("unknown error");
+            summary.push_str(&format!(
+                "\n  - {} at iteration {}{}: {}",
+                entry.tool_name, entry.iteration, status, error,
+            ));
+        }
+        summary.push_str(
+            "\nYour response must accurately reflect which attempts succeeded and which failed. \
+             If retries resolved earlier failures, say so explicitly.",
+        );
+
+        Some(ReconciliationOverview {
+            mode: ReconciliationMode::AttemptLevel,
+            total,
+            succeeded,
+            failed,
+            failed_step_indices: Vec::new(),
+            summary,
+        })
+    }
+
+    /// Build a reconciliation summary of external mutation attempts.
+    /// Returns None if all external mutations succeeded.
+    pub fn build_attempt_reconciliation_summary(&self) -> Option<String> {
+        self.build_attempt_reconciliation_overview()
+            .map(|overview| overview.summary)
+    }
+
+    pub(crate) fn build_reconciliation_overview(&self) -> Option<ReconciliationOverview> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let latest_plan_version = self
+            .active_linear_intent_plan
+            .as_ref()
+            .map(|plan| plan.plan_version)
+            .or_else(|| {
+                self.outcome_ledger
+                    .iter()
+                    .filter(|entry| entry.is_external_mutation)
+                    .filter_map(|entry| entry.plan_version)
+                    .max()
+            });
+
+        let Some(latest_plan_version) = latest_plan_version else {
+            return self.build_attempt_reconciliation_overview();
+        };
+
+        let planned_entries: Vec<&OutcomeEntry> = self
+            .outcome_ledger
+            .iter()
+            .filter(|entry| {
+                entry.is_external_mutation
+                    && entry.planned_step_id.is_some()
+                    && entry.plan_version == Some(latest_plan_version)
+            })
+            .collect();
+
+        if planned_entries.is_empty() {
+            return self.build_attempt_reconciliation_overview();
+        }
+
+        let active_plan = self
+            .active_linear_intent_plan
+            .as_ref()
+            .filter(|plan| plan.plan_version == latest_plan_version);
+
+        let mut by_step: BTreeMap<(usize, String), Vec<&OutcomeEntry>> = BTreeMap::new();
+        for entry in planned_entries {
+            let Some(step_id) = entry.planned_step_id.clone() else {
+                continue;
+            };
+            let step_index = entry.planned_step_index.unwrap_or(usize::MAX);
+            by_step
+                .entry((step_index, step_id))
+                .or_default()
+                .push(entry);
+        }
+
+        if by_step.is_empty() {
+            return self.build_attempt_reconciliation_overview();
+        }
+
+        let expected_steps = active_plan
+            .map(|plan| plan.steps.len())
+            .or_else(|| {
+                by_step
+                    .values()
+                    .flat_map(|entries| {
+                        entries.iter().filter_map(|entry| entry.expected_step_count)
+                    })
+                    .max()
+            })
+            .unwrap_or(by_step.len());
+
+        let succeeded = by_step
+            .values()
+            .filter(|entries| entries.iter().any(|entry| entry.success))
+            .count();
+
+        let mut failed_step_indices = BTreeSet::new();
+        let mut summary = format!(
+            "[SYSTEM] Planned-step reconciliation: {} of {} planned steps completed.",
+            succeeded, expected_steps
+        );
+
+        if let Some(plan) = active_plan {
+            for step in &plan.steps {
+                let key = (step.step_index, step.step_id.clone());
+                if let Some(entries) = by_step.get(&key) {
+                    let attempts = entries.len();
+                    let succeeded_this_step = entries.iter().any(|entry| entry.success);
+                    let final_failure = entries.iter().rev().find(|entry| !entry.success);
+                    if succeeded_this_step && attempts > 1 {
+                        summary.push_str(&format!(
+                            "\n  - Step {} ({}) succeeded after {} attempts.",
+                            step.step_index, step.description, attempts
+                        ));
+                    } else if succeeded_this_step {
+                        summary.push_str(&format!(
+                            "\n  - Step {} ({}) succeeded.",
+                            step.step_index, step.description
+                        ));
+                    } else if let Some(failure) = final_failure {
+                        failed_step_indices.insert(step.step_index);
+                        let status = failure
+                            .http_status
+                            .map(|code| format!(" (HTTP {})", code))
+                            .unwrap_or_default();
+                        let error = failure.error_summary.as_deref().unwrap_or("unknown error");
+                        summary.push_str(&format!(
+                            "\n  - Step {} ({}) failed after {} attempts{}: {}",
+                            step.step_index, step.description, attempts, status, error
+                        ));
+                    } else {
+                        failed_step_indices.insert(step.step_index);
+                        summary.push_str(&format!(
+                            "\n  - Step {} ({}) was not completed.",
+                            step.step_index, step.description
+                        ));
+                    }
+                } else {
+                    failed_step_indices.insert(step.step_index);
+                    summary.push_str(&format!(
+                        "\n  - Step {} ({}) was not completed.",
+                        step.step_index, step.description
+                    ));
+                }
+            }
+        } else {
+            for ((step_index, _step_id), entries) in &by_step {
+                let attempts = entries.len();
+                let description = entries
+                    .iter()
+                    .find_map(|entry| entry.planned_step_description.as_deref())
+                    .unwrap_or("unnamed step");
+                let succeeded_this_step = entries.iter().any(|entry| entry.success);
+                let final_failure = entries.iter().rev().find(|entry| !entry.success);
+
+                if succeeded_this_step && attempts > 1 {
+                    summary.push_str(&format!(
+                        "\n  - Step {} ({}) succeeded after {} attempts.",
+                        step_index, description, attempts
+                    ));
+                } else if succeeded_this_step {
+                    summary.push_str(&format!(
+                        "\n  - Step {} ({}) succeeded.",
+                        step_index, description
+                    ));
+                } else if let Some(failure) = final_failure {
+                    failed_step_indices.insert(*step_index);
+                    let status = failure
+                        .http_status
+                        .map(|code| format!(" (HTTP {})", code))
+                        .unwrap_or_default();
+                    let error = failure.error_summary.as_deref().unwrap_or("unknown error");
+                    summary.push_str(&format!(
+                        "\n  - Step {} ({}) failed after {} attempts{}: {}",
+                        step_index, description, attempts, status, error
+                    ));
+                }
+            }
+
+            for step_index in 1..=expected_steps {
+                let seen = by_step.keys().any(|(idx, _)| *idx == step_index);
+                if !seen {
+                    failed_step_indices.insert(step_index);
+                }
+            }
+
+            if expected_steps > by_step.len() {
+                summary.push_str(&format!(
+                    "\n  - {} planned step(s) were not completed.",
+                    expected_steps - by_step.len()
+                ));
+            }
+        }
+
+        let failed = expected_steps.saturating_sub(succeeded);
+        summary.push_str(
+            "\nYour response must accurately reflect which planned steps completed and which remain failed.",
+        );
+
+        Some(ReconciliationOverview {
+            mode: ReconciliationMode::PlannedStepLevel,
+            total: expected_steps,
+            succeeded,
+            failed,
+            failed_step_indices: failed_step_indices.into_iter().collect(),
+            summary,
+        })
     }
 
     /// Extend the budget when a tool call completes successfully.
@@ -1029,5 +1387,338 @@ mod tests {
             None,
             "Productive run should never exhaust budget, even with realistic wall-clock time"
         );
+    }
+
+    fn test_execution_state() -> ExecutionState {
+        ExecutionState::new(
+            BudgetTier::None,
+            default_execution_budget(BudgetTier::None),
+            ExecutionPersistence::Ephemeral,
+        )
+    }
+
+    #[test]
+    fn outcome_ledger_starts_empty() {
+        let state = test_execution_state();
+        assert!(state.outcome_ledger.is_empty());
+    }
+
+    #[test]
+    fn outcome_ledger_records_success() {
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: true,
+            http_status: Some(201),
+            is_external_mutation: true,
+            error_summary: None,
+            iteration: 1,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        assert_eq!(state.outcome_ledger.len(), 1);
+        assert!(state.outcome_ledger[0].success);
+    }
+
+    #[test]
+    fn outcome_ledger_tracks_failed_external_mutations() {
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: false,
+            http_status: Some(403),
+            is_external_mutation: true,
+            error_summary: Some("duplicate content".to_string()),
+            iteration: 1,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        assert!(state.has_failed_external_mutations());
+        assert_eq!(state.failed_external_mutation_count(), 1);
+    }
+
+    #[test]
+    fn outcome_ledger_ignores_non_external_failures() {
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "read_file".to_string(),
+            success: false,
+            http_status: None,
+            is_external_mutation: false,
+            error_summary: Some("file not found".to_string()),
+            iteration: 1,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        assert!(!state.has_failed_external_mutations());
+    }
+
+    #[test]
+    fn attempt_reconciliation_none_when_all_succeeded() {
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: true,
+            http_status: Some(201),
+            is_external_mutation: true,
+            error_summary: None,
+            iteration: 1,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        assert!(state.build_attempt_reconciliation_summary().is_none());
+    }
+
+    #[test]
+    fn attempt_reconciliation_present_when_failures_exist() {
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: true,
+            http_status: Some(201),
+            is_external_mutation: true,
+            error_summary: None,
+            iteration: 1,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: false,
+            http_status: Some(403),
+            is_external_mutation: true,
+            error_summary: Some("duplicate content".to_string()),
+            iteration: 2,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        let summary = state.build_attempt_reconciliation_summary().unwrap();
+        assert!(summary.contains("attempts"));
+        assert!(summary.contains("1") && summary.contains("2"));
+        assert!(summary.contains("failed"));
+        assert!(summary.contains("403"));
+        assert!(summary.contains("duplicate content"));
+    }
+
+    #[test]
+    fn attempt_reconciliation_says_attempts_not_actions() {
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: false,
+            http_status: Some(403),
+            is_external_mutation: true,
+            error_summary: Some("dup".to_string()),
+            iteration: 1,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        let summary = state.build_attempt_reconciliation_summary().unwrap();
+        assert!(summary.contains("attempt"));
+        assert!(!summary.contains("action"));
+    }
+
+    #[test]
+    fn install_linear_intent_plan_sets_current_step_identity() {
+        let mut state = test_execution_state();
+        state.install_linear_intent_plan(
+            3,
+            vec![
+                LinearIntentStep {
+                    step_id: "plan-v3-step-1".to_string(),
+                    step_index: 1,
+                    tool: "http_request".to_string(),
+                    target: "tweet-1".to_string(),
+                    description: "Post tweet 1".to_string(),
+                },
+                LinearIntentStep {
+                    step_id: "plan-v3-step-2".to_string(),
+                    step_index: 2,
+                    tool: "http_request".to_string(),
+                    target: "tweet-2".to_string(),
+                    description: "Post tweet 2".to_string(),
+                },
+            ],
+        );
+        let current = state.current_linear_intent_step().unwrap();
+        assert_eq!(current.step_id, "plan-v3-step-1");
+        assert_eq!(current.step_index, 1);
+    }
+
+    #[test]
+    fn advance_linear_intent_step_on_success_moves_forward() {
+        let mut state = test_execution_state();
+        state.install_linear_intent_plan(
+            1,
+            vec![
+                LinearIntentStep {
+                    step_id: "plan-v1-step-1".to_string(),
+                    step_index: 1,
+                    tool: "http_request".to_string(),
+                    target: "tweet-1".to_string(),
+                    description: "Post tweet 1".to_string(),
+                },
+                LinearIntentStep {
+                    step_id: "plan-v1-step-2".to_string(),
+                    step_index: 2,
+                    tool: "http_request".to_string(),
+                    target: "tweet-2".to_string(),
+                    description: "Post tweet 2".to_string(),
+                },
+            ],
+        );
+        // First advance: step 1 → step 2
+        state.advance_linear_intent_step_after_external_success();
+        let current = state.current_linear_intent_step().unwrap();
+        assert_eq!(current.step_index, 2);
+
+        // Second advance: step 2 → past end (cursor retires)
+        state.advance_linear_intent_step_after_external_success();
+        assert!(
+            state.current_linear_intent_step().is_none(),
+            "cursor should retire past the last step"
+        );
+
+        // Further advances are no-ops
+        state.advance_linear_intent_step_after_external_success();
+        assert!(state.current_linear_intent_step().is_none());
+    }
+
+    #[test]
+    fn planned_step_reconciliation_groups_retry_under_one_step() {
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: false,
+            http_status: Some(403),
+            is_external_mutation: true,
+            error_summary: Some("duplicate content".to_string()),
+            iteration: 1,
+            plan_version: Some(1),
+            planned_step_id: Some("plan-v1-step-2".to_string()),
+            planned_step_index: Some(2),
+            planned_step_description: Some("Post tweet 2".to_string()),
+            expected_step_count: Some(5),
+        });
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: true,
+            http_status: Some(201),
+            is_external_mutation: true,
+            error_summary: None,
+            iteration: 2,
+            plan_version: Some(1),
+            planned_step_id: Some("plan-v1-step-2".to_string()),
+            planned_step_index: Some(2),
+            planned_step_description: Some("Post tweet 2".to_string()),
+            expected_step_count: Some(5),
+        });
+        let summary = state.build_reconciliation_overview().unwrap().summary;
+        assert!(summary.contains("step"));
+        assert!(summary.contains("5"));
+        assert!(summary.contains("Post tweet 2"));
+        assert!(summary.contains("succeeded after 2 attempts"));
+    }
+
+    #[test]
+    fn planned_step_reconciliation_uses_latest_plan_version_only() {
+        let mut state = test_execution_state();
+        state.install_linear_intent_plan(
+            2,
+            vec![
+                LinearIntentStep {
+                    step_id: "plan-v2-step-1".to_string(),
+                    step_index: 1,
+                    tool: "http_request".to_string(),
+                    target: "tweet-1".to_string(),
+                    description: "Post tweet 1".to_string(),
+                },
+                LinearIntentStep {
+                    step_id: "plan-v2-step-2".to_string(),
+                    step_index: 2,
+                    tool: "http_request".to_string(),
+                    target: "tweet-2".to_string(),
+                    description: "Post tweet 2".to_string(),
+                },
+            ],
+        );
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: true,
+            http_status: Some(201),
+            is_external_mutation: true,
+            error_summary: None,
+            iteration: 1,
+            plan_version: Some(1),
+            planned_step_id: Some("plan-v1-step-1".to_string()),
+            planned_step_index: Some(1),
+            planned_step_description: Some("Old tweet 1".to_string()),
+            expected_step_count: Some(3),
+        });
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: true,
+            http_status: Some(201),
+            is_external_mutation: true,
+            error_summary: None,
+            iteration: 2,
+            plan_version: Some(2),
+            planned_step_id: Some("plan-v2-step-1".to_string()),
+            planned_step_index: Some(1),
+            planned_step_description: Some("Post tweet 1".to_string()),
+            expected_step_count: Some(2),
+        });
+
+        let overview = state.build_reconciliation_overview().unwrap();
+        assert_eq!(overview.mode, ReconciliationMode::PlannedStepLevel);
+        assert_eq!(overview.total, 2);
+        assert_eq!(overview.succeeded, 1);
+        assert_eq!(overview.failed, 1);
+        assert_eq!(overview.failed_step_indices, vec![2]);
+        assert!(!overview.summary.contains("Old tweet 1"));
+        assert!(overview
+            .summary
+            .contains("Step 2 (Post tweet 2) was not completed."));
+    }
+
+    #[test]
+    fn reconciliation_falls_back_to_attempt_level_without_step_identity() {
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: false,
+            http_status: Some(403),
+            is_external_mutation: true,
+            error_summary: Some("duplicate content".to_string()),
+            iteration: 1,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        let summary = state.build_reconciliation_overview().unwrap().summary;
+        assert!(summary.contains("attempt"));
     }
 }
