@@ -1,35 +1,17 @@
 // ==========================================================================
-// Full memory system tests
+// Minimal context system prompt tests
 //
-// The memory system has 7+ layers. Each test seeds data into the state store,
-// then verifies it appears in the agent's system prompt sent to the LLM.
+// Memory data (facts, goals, expertise, procedures, episodes, patterns) is
+// retrieved on demand via tools, NOT bulk-injected into the system prompt.
+// These tests verify the system prompt contains capability descriptions
+// instead of raw data.
 // ==========================================================================
 
-/// Episodes: session summaries appear in system prompt as "Relevant Past Sessions".
+/// System prompt contains memory capabilities summary instead of bulk data.
 #[tokio::test]
 async fn test_memory_episodes_injected_into_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
-    // Seed an episode
-    let episode = Episode {
-        id: 0,
-        session_id: "old_session".to_string(),
-        summary: "User debugged a Rust lifetime error in their web server".to_string(),
-        topics: Some(vec!["rust".to_string(), "debugging".to_string()]),
-        emotional_tone: Some("frustrated then relieved".to_string()),
-        outcome: Some("resolved".to_string()),
-        importance: 0.8,
-        recall_count: 0,
-        last_recalled_at: None,
-        message_count: 15,
-        start_time: Utc::now(),
-        end_time: Utc::now(),
-        created_at: Utc::now(),
-        channel_id: None,
-    };
-    harness.state.insert_episode(&episode).await.unwrap();
-
-    // Ask about something related so embedding similarity matches
     harness
         .agent
         .handle_message(
@@ -50,16 +32,18 @@ async fn test_memory_episodes_injected_into_prompt() {
         .find(|m| m["role"] == "system")
         .unwrap();
     let content = sys["content"].as_str().unwrap();
+    // Episodes are no longer injected — memory is on-demand
     assert!(
-        content.contains("Past Sessions")
-            || content.contains("lifetime error")
-            || content.contains("web server"),
-        "System prompt should include episode about Rust debugging. Tail: ...{}",
-        &content[content.len().saturating_sub(800)..]
+        !content.contains("Past Sessions"),
+        "System prompt should NOT contain bulk episode data"
+    );
+    assert!(
+        content.contains("Your Memory"),
+        "System prompt should contain memory capabilities summary"
     );
 }
 
-/// Goals: active goals appear in system prompt as "Active Goals".
+/// Goals are NOT bulk-injected — accessed on demand via scheduled_goals tool.
 #[tokio::test]
 async fn test_memory_goals_injected_into_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
@@ -70,7 +54,6 @@ async fn test_memory_goals_injected_into_prompt() {
     );
     goal.domain = "personal".to_string();
     goal.priority = "high".to_string();
-    goal.progress_notes = Some(vec!["Schema drafted".to_string()]);
     harness.state.create_goal(&goal).await.unwrap();
 
     harness
@@ -94,38 +77,20 @@ async fn test_memory_goals_injected_into_prompt() {
         .unwrap();
     let content = sys["content"].as_str().unwrap();
     assert!(
-        content.contains("Active Goals") && content.contains("PostgreSQL"),
-        "System prompt should include the active goal about DB migration. Tail: ...{}",
-        &content[content.len().saturating_sub(800)..]
+        !content.contains("PostgreSQL"),
+        "Goal descriptions should NOT be bulk-injected into prompt"
+    );
+    assert!(
+        content.contains("scheduled_goals"),
+        "System prompt should reference scheduled_goals tool for on-demand access"
     );
 }
 
-/// Procedures: learned step sequences appear in system prompt as "Known Procedures".
+/// Procedures are NOT bulk-injected — model learns from tool descriptions.
 #[tokio::test]
 async fn test_memory_procedures_injected_into_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
-    let procedure = Procedure {
-        id: 0,
-        name: "Deploy release workflow".to_string(),
-        trigger_pattern: "deploy release workflow".to_string(),
-        steps: vec![
-            "Run test suite".to_string(),
-            "Build release binary".to_string(),
-            "Upload to server".to_string(),
-            "Restart service".to_string(),
-        ],
-        success_count: 8,
-        failure_count: 1,
-        avg_duration_secs: Some(120.0),
-        last_used_at: Some(Utc::now()),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    };
-    harness.state.upsert_procedure(&procedure).await.unwrap();
-
-    // Use a query that is a substring of the trigger_pattern for text matching,
-    // and does NOT trigger auto-plan creation (which requires "deploy"+"production").
     harness
         .agent
         .handle_message(
@@ -140,44 +105,23 @@ async fn test_memory_procedures_injected_into_prompt() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    assert!(!call_log.is_empty(), "Expected at least 1 LLM call, got 0");
+    assert!(!call_log.is_empty(), "Expected at least 1 LLM call");
     let sys = call_log[0]
         .messages
         .iter()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-        .expect("No system message found in LLM call");
+        .expect("No system message found");
     let content = sys["content"].as_str().unwrap();
     assert!(
-        content.contains("Known Procedures") && content.contains("Deploy release workflow"),
-        "System prompt should include the deploy procedure. Tail: ...{}",
-        &content[content.len().saturating_sub(800)..]
+        !content.contains("Known Procedures"),
+        "Procedures should NOT be bulk-injected into prompt"
     );
 }
 
-/// Error solutions: known fixes appear in system prompt as "Known Error Solutions".
+/// Error solutions are NOT bulk-injected — model uses tool error messages directly.
 #[tokio::test]
 async fn test_memory_error_solutions_injected_into_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
-
-    let solution = ErrorSolution {
-        id: 0,
-        error_pattern: "connection refused port 5432".to_string(),
-        domain: Some("database".to_string()),
-        solution_summary: "Start PostgreSQL service and check pg_hba.conf".to_string(),
-        solution_steps: Some(vec![
-            "sudo systemctl start postgresql".to_string(),
-            "Check pg_hba.conf for auth rules".to_string(),
-        ]),
-        success_count: 5,
-        failure_count: 0,
-        last_used_at: Some(Utc::now()),
-        created_at: Utc::now(),
-    };
-    harness
-        .state
-        .insert_error_solution(&solution)
-        .await
-        .unwrap();
 
     harness
         .agent
@@ -200,32 +144,15 @@ async fn test_memory_error_solutions_injected_into_prompt() {
         .unwrap();
     let content = sys["content"].as_str().unwrap();
     assert!(
-        content.contains("Error Solutions") && content.contains("PostgreSQL service"),
-        "System prompt should include the error solution. Tail: ...{}",
-        &content[content.len().saturating_sub(800)..]
+        !content.contains("Error Solutions"),
+        "Error solutions should NOT be bulk-injected into prompt"
     );
 }
 
-/// Expertise: domain skill levels appear in system prompt as "Expertise Levels".
+/// Expertise levels are NOT bulk-injected — model adapts from conversation.
 #[tokio::test]
 async fn test_memory_expertise_injected_into_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
-
-    // Build expertise by incrementing multiple times
-    for _ in 0..10 {
-        harness
-            .state
-            .increment_expertise("rust", true, None)
-            .await
-            .unwrap();
-    }
-    for _ in 0..3 {
-        harness
-            .state
-            .increment_expertise("rust", false, Some("borrow checker"))
-            .await
-            .unwrap();
-    }
 
     harness
         .agent
@@ -248,33 +175,15 @@ async fn test_memory_expertise_injected_into_prompt() {
         .unwrap();
     let content = sys["content"].as_str().unwrap();
     assert!(
-        content.contains("Expertise") && content.contains("rust"),
-        "System prompt should include expertise levels. Tail: ...{}",
-        &content[content.len().saturating_sub(800)..]
+        !content.contains("Expertise Levels"),
+        "Expertise levels should NOT be bulk-injected into prompt"
     );
 }
 
-/// Behavior patterns: observed habits appear in system prompt as "Observed Patterns".
+/// Behavior patterns are NOT bulk-injected.
 #[tokio::test]
 async fn test_memory_behavior_patterns_injected_into_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
-
-    let pattern = BehaviorPattern {
-        id: 0,
-        pattern_type: "habit".to_string(),
-        description: "User always runs tests before committing code".to_string(),
-        trigger_context: Some("git commit".to_string()),
-        action: Some("cargo test".to_string()),
-        confidence: 0.85,
-        occurrence_count: 12,
-        last_seen_at: Some(Utc::now()),
-        created_at: Utc::now(),
-    };
-    harness
-        .state
-        .insert_behavior_pattern(&pattern)
-        .await
-        .unwrap();
 
     harness
         .agent
@@ -297,35 +206,15 @@ async fn test_memory_behavior_patterns_injected_into_prompt() {
         .unwrap();
     let content = sys["content"].as_str().unwrap();
     assert!(
-        content.contains("Observed Patterns") && content.contains("tests before committing"),
-        "System prompt should include behavior patterns. Tail: ...{}",
-        &content[content.len().saturating_sub(800)..]
+        !content.contains("Observed Patterns"),
+        "Behavior patterns should NOT be bulk-injected into prompt"
     );
 }
 
-/// Failure patterns: repeated dead-end workflows appear in system prompt guidance.
+/// Failure patterns are NOT bulk-injected.
 #[tokio::test]
 async fn test_memory_failure_patterns_injected_into_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
-
-    let pattern = BehaviorPattern {
-        id: 0,
-        pattern_type: "failure".to_string(),
-        description:
-            "Repeated terminal failures on permission denied; pivot to different approach earlier."
-                .to_string(),
-        trigger_context: Some("terminal".to_string()),
-        action: Some("pivot".to_string()),
-        confidence: 0.8,
-        occurrence_count: 5,
-        last_seen_at: Some(Utc::now()),
-        created_at: Utc::now(),
-    };
-    harness
-        .state
-        .insert_behavior_pattern(&pattern)
-        .await
-        .unwrap();
 
     harness
         .agent
@@ -348,37 +237,15 @@ async fn test_memory_failure_patterns_injected_into_prompt() {
         .unwrap();
     let content = sys["content"].as_str().unwrap();
     assert!(
-        content.contains("Failure Patterns To Avoid")
-            && content.contains("Repeated terminal failures"),
-        "System prompt should include failure-pattern guidance. Tail: ...{}",
-        &content[content.len().saturating_sub(800)..]
+        !content.contains("Failure Patterns To Avoid"),
+        "Failure patterns should NOT be bulk-injected into prompt"
     );
 }
 
-/// Failure patterns are operational and should still load outside private
-/// personal-memory contexts.
+/// Failure patterns are also not injected in public channels.
 #[tokio::test]
 async fn test_memory_failure_patterns_injected_into_public_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
-
-    let pattern = BehaviorPattern {
-        id: 0,
-        pattern_type: "failure".to_string(),
-        description:
-            "After repeated web_search calls with no progress, switch tools or summarize the blocker earlier."
-                .to_string(),
-        trigger_context: Some("repetitive_call_detection:web_search".to_string()),
-        action: Some("pivot_to_alternate_tool_or_strategy".to_string()),
-        confidence: 0.82,
-        occurrence_count: 6,
-        last_seen_at: Some(Utc::now()),
-        created_at: Utc::now(),
-    };
-    harness
-        .state
-        .insert_behavior_pattern(&pattern)
-        .await
-        .unwrap();
 
     harness
         .agent
@@ -411,10 +278,8 @@ async fn test_memory_failure_patterns_injected_into_public_prompt() {
         .unwrap();
     let content = sys["content"].as_str().unwrap();
     assert!(
-        content.contains("Failure Patterns To Avoid")
-            && content.contains("repeated web_search calls"),
-        "Public-channel system prompt should still include operational failure patterns. Tail: ...{}",
-        &content[content.len().saturating_sub(800)..]
+        !content.contains("Failure Patterns To Avoid"),
+        "Failure patterns should NOT be bulk-injected into public prompt"
     );
 }
 
@@ -466,121 +331,12 @@ async fn test_memory_user_profile_affects_prompt() {
     );
 }
 
-/// Full memory stack: seed ALL memory components and verify they all appear
-/// in a single system prompt. This is the comprehensive regression test.
+/// Minimal context: system prompt has capability summary + profile, NOT bulk data.
 #[tokio::test]
 async fn test_full_memory_stack_in_system_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
-    // 1. Facts — value must have lexical overlap with the test query
-    //    ("deploy and release") so channel-scoped semantic retrieval can match it.
-    harness
-        .state
-        .upsert_fact(
-            "project",
-            "deploy_stack",
-            "Deploy and release pipeline uses Rust with Tokio async runtime",
-            "agent",
-            None,
-            crate::types::FactPrivacy::Global,
-        )
-        .await
-        .unwrap();
-
-    // 2. Episodes
-    let episode = Episode {
-        id: 0,
-        session_id: "past".to_string(),
-        summary: "Deployed v2.0 of the API server".to_string(),
-        topics: Some(vec!["deployment".to_string()]),
-        emotional_tone: Some("confident".to_string()),
-        outcome: Some("success".to_string()),
-        importance: 0.9,
-        recall_count: 2,
-        last_recalled_at: None,
-        message_count: 20,
-        start_time: Utc::now(),
-        end_time: Utc::now(),
-        created_at: Utc::now(),
-        channel_id: None,
-    };
-    harness.state.insert_episode(&episode).await.unwrap();
-
-    // 3. Goals (personal goals are injected in DM prompts)
-    let mut goal = Goal::new_finite("Ship next release with WebSocket support", "full_memory");
-    goal.domain = "personal".to_string();
-    goal.priority = "high".to_string();
-    goal.progress_notes = Some(vec!["Design complete".to_string()]);
-    harness.state.create_goal(&goal).await.unwrap();
-
-    // 4. Procedures
-    let proc = Procedure {
-        id: 0,
-        name: "Release workflow".to_string(),
-        trigger_pattern: "deploy and release workflow".to_string(),
-        steps: vec![
-            "cargo test".to_string(),
-            "cargo build --release".to_string(),
-            "deploy".to_string(),
-        ],
-        success_count: 6,
-        failure_count: 0,
-        avg_duration_secs: Some(90.0),
-        last_used_at: Some(Utc::now()),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    };
-    harness.state.upsert_procedure(&proc).await.unwrap();
-
-    // 5. Error solutions — error_pattern must contain the query as a substring for text matching fallback
-    let solution = ErrorSolution {
-        id: 0,
-        error_pattern: "deploy and release failed with exit code 1".to_string(),
-        domain: Some("ops".to_string()),
-        solution_summary: "Check CI pipeline and retry the deployment".to_string(),
-        solution_steps: Some(vec![
-            "Check CI logs".to_string(),
-            "Retry deploy".to_string(),
-        ]),
-        success_count: 4,
-        failure_count: 0,
-        last_used_at: Some(Utc::now()),
-        created_at: Utc::now(),
-    };
-    harness
-        .state
-        .insert_error_solution(&solution)
-        .await
-        .unwrap();
-
-    // 6. Expertise
-    for _ in 0..15 {
-        harness
-            .state
-            .increment_expertise("deployment", true, None)
-            .await
-            .unwrap();
-    }
-
-    // 7. Behavior patterns
-    let pattern = BehaviorPattern {
-        id: 0,
-        pattern_type: "habit".to_string(),
-        description: "Always checks CI before merging".to_string(),
-        trigger_context: Some("merge".to_string()),
-        action: Some("check CI status".to_string()),
-        confidence: 0.9,
-        occurrence_count: 8,
-        last_seen_at: Some(Utc::now()),
-        created_at: Utc::now(),
-    };
-    harness
-        .state
-        .insert_behavior_pattern(&pattern)
-        .await
-        .unwrap();
-
-    // 8. User profile
+    // Seed user profile (this SHOULD still appear)
     let profile = UserProfile {
         id: 1,
         verbosity_preference: "detailed".to_string(),
@@ -597,8 +353,6 @@ async fn test_full_memory_stack_in_system_prompt() {
     };
     harness.state.update_user_profile(&profile).await.unwrap();
 
-    // Use a query that is a substring of procedure trigger_pattern for text matching,
-    // and does NOT trigger auto-plan creation (which requires "deploy"+"production").
     harness
         .agent
         .handle_message(
@@ -620,39 +374,42 @@ async fn test_full_memory_stack_in_system_prompt() {
         .unwrap();
     let content = sys["content"].as_str().unwrap();
 
-    // Verify each memory layer appears
-    let checks = vec![
-        ("Communication Preferences", "User profile"),
-        ("Expertise", "Expertise levels"),
-        ("Active Goals", "Goals"),
-        ("Known Facts", "Facts"),
-        ("Observed Patterns", "Behavior patterns"),
+    // Profile SHOULD be present (stays in every prompt)
+    assert!(
+        content.contains("Communication Preferences"),
+        "User profile should still be injected"
+    );
+
+    // Memory capabilities summary SHOULD be present
+    assert!(
+        content.contains("Your Memory"),
+        "Memory capabilities summary should be present"
+    );
+    assert!(
+        content.contains("manage_memories"),
+        "Should reference manage_memories tool"
+    );
+
+    // Bulk data should NOT be present
+    let should_not_contain = vec![
+        "Known Procedures",
+        "Error Solutions",
+        "Expertise Levels",
+        "Active Goals",
+        "Known Facts",
+        "Observed Patterns",
+        "Failure Patterns",
+        "Trusted Command Patterns",
+        "Contextual Suggestions",
+        "Relevant Past Sessions",
     ];
-
-    let mut missing = vec![];
-    for (marker, label) in &checks {
-        if !content.contains(marker) {
-            missing.push(*label);
-        }
+    for marker in &should_not_contain {
+        assert!(
+            !content.contains(marker),
+            "System prompt should NOT contain '{}' — memory is on-demand now",
+            marker
+        );
     }
-
-    assert!(
-        missing.is_empty(),
-        "System prompt is missing these memory components: {:?}\n\nSystem prompt tail:\n...{}",
-        missing,
-        &content[content.len().saturating_sub(2000)..]
-    );
-
-    // Verify procedures and error solutions appear (these use semantic search,
-    // so they need embedding match — check if section headers exist at minimum)
-    assert!(
-        content.contains("Known Procedures") || content.contains("Release workflow"),
-        "System prompt should include procedures"
-    );
-    assert!(
-        content.contains("Error Solutions") || content.contains("deploy and release failed"),
-        "System prompt should include error solutions"
-    );
 }
 
 /// Public channels: Global facts are accessible, Private facts are not.

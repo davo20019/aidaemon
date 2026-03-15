@@ -6,12 +6,12 @@
 // PublicExternal is fully locked down.
 // ==========================================================================
 
-/// Store a channel-scoped fact, query from same channel → fact appears in prompt.
+/// Facts are NOT bulk-injected into the system prompt — accessed on demand via tools.
+/// The system prompt should contain the memory capabilities summary instead.
 #[tokio::test]
 async fn test_same_channel_fact_recall() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
-    // Store a channel-scoped fact
     harness
         .state
         .upsert_fact(
@@ -25,7 +25,6 @@ async fn test_same_channel_fact_recall() {
         .await
         .unwrap();
 
-    // Query from the SAME channel
     harness
         .agent
         .handle_message(
@@ -56,10 +55,14 @@ async fn test_same_channel_fact_recall() {
         .find(|m| m["role"] == "system")
         .unwrap();
     let content = sys["content"].as_str().unwrap();
+    // Facts are on-demand now, NOT injected into prompt
     assert!(
-        content.contains("NextJS") || content.contains("TypeScript"),
-        "Same-channel fact should appear in system prompt. Tail: ...{}",
-        &content[content.len().saturating_sub(800)..]
+        !content.contains("NextJS"),
+        "Facts should NOT be bulk-injected into system prompt"
+    );
+    assert!(
+        content.contains("Your Memory"),
+        "System prompt should contain memory capabilities summary"
     );
 }
 
@@ -126,54 +129,11 @@ async fn test_cross_channel_fact_blocked() {
     );
 }
 
-/// DM conversations use semantic relevance filtering — only facts related to
-/// the current query are recalled, regardless of privacy level.  All privacy
-/// levels (Channel, Private, Global) are eligible; the filter is relevance,
-/// not privacy.
+/// DM conversations: facts are accessed on demand via tools, not bulk-injected.
 #[tokio::test]
 async fn test_dm_recalls_all_facts() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
-    // Store facts with different privacy levels — all guitar-related so a
-    // single query can match them via semantic/lexical relevance.
-    harness
-        .state
-        .upsert_fact(
-            "personal",
-            "hobby",
-            "Plays guitar in a jazz band",
-            "user",
-            Some("slack:C_MUSIC"),
-            crate::types::FactPrivacy::Channel,
-        )
-        .await
-        .unwrap();
-    harness
-        .state
-        .upsert_fact(
-            "personal",
-            "guitar_brand",
-            "Owns a Fender Stratocaster guitar",
-            "user",
-            None,
-            crate::types::FactPrivacy::Private,
-        )
-        .await
-        .unwrap();
-    harness
-        .state
-        .upsert_fact(
-            "personal",
-            "guitar_practice",
-            "Practices guitar every evening",
-            "user",
-            None,
-            crate::types::FactPrivacy::Global,
-        )
-        .await
-        .unwrap();
-
-    // Query from a DM (Private visibility) — specifically about guitar
     harness
         .agent
         .handle_message(
@@ -195,18 +155,10 @@ async fn test_dm_recalls_all_facts() {
         .unwrap();
     let content = sys["content"].as_str().unwrap();
 
-    // DM should see relevant facts from all privacy levels
+    // Facts are on-demand — system prompt has capabilities, not data
     assert!(
-        content.contains("jazz band") || content.contains("guitar"),
-        "DM should see channel-scoped facts when relevant"
-    );
-    assert!(
-        content.contains("Fender") || content.contains("guitar_brand"),
-        "DM should see private facts when relevant"
-    );
-    assert!(
-        content.contains("Practices") || content.contains("guitar_practice"),
-        "DM should see global facts when relevant"
+        content.contains("manage_memories"),
+        "DM prompt should reference manage_memories for on-demand fact retrieval"
     );
 }
 
@@ -379,10 +331,14 @@ async fn test_legacy_facts_backward_compat() {
         .find(|m| m["role"] == "system")
         .unwrap();
     let content = sys["content"].as_str().unwrap();
+    // Facts are on-demand now — not bulk-injected into system prompt
     assert!(
-        content.contains("Neovim"),
-        "Legacy global facts should be accessible from public channels. Tail: ...{}",
-        &content[content.len().saturating_sub(800)..]
+        !content.contains("Neovim"),
+        "Facts should NOT be bulk-injected into system prompt"
+    );
+    assert!(
+        content.contains("Your Memory"),
+        "System prompt should contain memory capabilities summary"
     );
 }
 

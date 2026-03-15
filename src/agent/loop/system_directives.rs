@@ -92,6 +92,9 @@ pub(in crate::agent) enum SystemDirective {
         force_task_anchor: String,
         activity_section: String,
     },
+    ResearchSynthesisNudge {
+        consecutive_searches: usize,
+    },
     EditStallWriteFileHint,
     DuplicateSendFileAlreadySent,
     HardPolicyToolBudgetReached {
@@ -128,6 +131,8 @@ pub(in crate::agent) enum SystemDirective {
     },
     /// Injected before final response when the outcome ledger has mixed results.
     OutcomeReconciliation(String),
+    /// Task plan context injected each iteration so the model sees its plan.
+    TaskPlanContext(String),
 }
 
 impl SystemDirective {
@@ -316,6 +321,15 @@ impl SystemDirective {
                  Report what you found, what failed, and what the user can try instead.",
                 force_text_at, force_task_anchor, activity_section
             ),
+            Self::ResearchSynthesisNudge { consecutive_searches } => format!(
+                "[SYSTEM] You have done {} consecutive web searches. \
+                 PAUSE and evaluate: do you have enough information to answer the user's question?\n\n\
+                 - If YES: Stop searching and synthesize a comprehensive response from the evidence you already gathered.\n\
+                 - If NO: Continue searching, but use a DIFFERENT search strategy (different keywords, a specific source, or web_fetch on a promising URL from your results).\n\n\
+                 Most questions can be answered well with 2-3 good searches. More searches with similar queries \
+                 will return similar results. Synthesize what you have rather than searching for perfection.",
+                consecutive_searches
+            ),
             Self::EditStallWriteFileHint => "[SYSTEM] You have failed edit_file 3+ times in a row. The old_text is not matching the actual file content. STOP using edit_file. Instead:\n1. Use `read_file` to see the CURRENT file content\n2. Use `write_file` to rewrite the ENTIRE file with all your changes applied\n\nwrite_file is more reliable than edit_file when the file has been modified.".to_string(),
             Self::DuplicateSendFileAlreadySent => "[SYSTEM] The requested file was already sent in this task. Stop calling send_file and reply with plain text only.".to_string(),
             Self::HardPolicyToolBudgetReached { policy_tool_budget } => format!(
@@ -388,6 +402,7 @@ impl SystemDirective {
                 )
             }
             Self::OutcomeReconciliation(summary) => summary.clone(),
+            Self::TaskPlanContext(plan) => plan.clone(),
         }
     }
 }

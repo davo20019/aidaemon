@@ -114,8 +114,10 @@ pub(in crate::agent) use evidence_state::{
 #[path = "loop/validation_state.rs"]
 mod validation_state;
 pub(in crate::agent) use validation_state::{
-    build_abandon_request, build_partial_done_blocked_request, build_reduce_scope_request,
-    ApprovalState, LoopRepetitionReason, ValidationFailure, ValidationOutcome,
+    build_abandon_request, build_partial_done_blocked_request,
+    build_partial_done_blocked_request_with_plan, build_reduce_scope_request,
+    build_reduce_scope_request_with_plan, ApprovalState, LoopRepetitionReason, ValidationFailure,
+    ValidationOutcome,
 };
 pub(crate) use validation_state::{
     build_needs_approval_request, derive_executor_step_result, persist_executor_handoff_context,

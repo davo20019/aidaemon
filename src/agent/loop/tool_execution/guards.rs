@@ -234,15 +234,16 @@ impl Agent {
             consecutive_same_tool_arg_hashes.clear();
             consecutive_same_tool_arg_hashes.insert(call_hash);
         }
-        // Read-only tools get a higher threshold instead of complete exemption.
-        // A 3-file debugging task may need ~5 reads, but 10+ reads in a row
-        // with low argument diversity is a stuck loop, not productive work.
-        let read_only_higher_threshold = matches!(
+        // Read-only and research tools get a higher threshold instead of
+        // complete exemption. A debugging task may need ~5 reads, and a
+        // research task legitimately needs multiple searches with different
+        // queries. But 16+ in a row still indicates a stuck loop.
+        let higher_threshold_tool = matches!(
             tc.name.as_str(),
-            "read_file" | "search_files" | "check_environment"
+            "read_file" | "search_files" | "check_environment" | "web_search" | "web_fetch"
         );
-        let effective_same_tool_limit = if read_only_higher_threshold {
-            MAX_CONSECUTIVE_SAME_TOOL + 4 // 12 for read tools
+        let effective_same_tool_limit = if higher_threshold_tool {
+            MAX_CONSECUTIVE_SAME_TOOL + 4 // 12 for read/research tools
         } else {
             MAX_CONSECUTIVE_SAME_TOOL
         };
@@ -484,11 +485,11 @@ fn repetitive_redirect_threshold_for_call(tool_name: &str, arguments: &str) -> u
         // Large read-only payloads are expensive to reacquire. Redirect the
         // second identical GET/fetch and replay the cached result instead.
         2
-    } else if matches!(tool_name, "read_file" | "search_files") {
-        // Read-only tools need a higher threshold because context truncation
-        // in long sessions drops their results, forcing legitimate re-reads.
-        // Blocking at 3 prevents the agent from ever reaching the write phase
-        // in multi-file debugging tasks.
+    } else if matches!(tool_name, "read_file" | "search_files" | "web_search") {
+        // Read-only and research tools need a higher threshold because context
+        // truncation drops their results, and research tasks legitimately need
+        // multiple searches with different queries. Blocking at 3 kills
+        // research tasks before the agent can synthesize an answer.
         6
     } else {
         REPETITIVE_REDIRECT_THRESHOLD
@@ -528,13 +529,20 @@ mod tests {
     }
 
     #[test]
-    fn raises_redirect_threshold_for_read_only_tools() {
+    fn raises_redirect_threshold_for_read_only_and_research_tools() {
         assert_eq!(
             repetitive_redirect_threshold_for_call("read_file", r#"{"path":"/tmp/foo.py"}"#),
             6
         );
         assert_eq!(
             repetitive_redirect_threshold_for_call("search_files", r#"{"query":"bug"}"#),
+            6
+        );
+        assert_eq!(
+            repetitive_redirect_threshold_for_call(
+                "web_search",
+                r#"{"query":"AI agents research"}"#
+            ),
             6
         );
         // Other tools use default threshold

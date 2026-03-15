@@ -107,8 +107,6 @@ const DEFAULT_TERMINAL_AGENT: &str = "codex";
 const TELEGRAM_EXPANDABLE_TRIGGER_CHARS: usize = 1_800;
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 const TELEGRAM_EXPANDABLE_WRAPPER_LEN: usize = "<blockquote expandable></blockquote>".len();
-const TELEGRAM_EXPANDABLE_MAX_ESCAPED_CHARS: usize =
-    TELEGRAM_MAX_MESSAGE_LEN - TELEGRAM_EXPANDABLE_WRAPPER_LEN;
 const TELEGRAM_WEBAPP_TYPE_AGENT_MESSAGE: &str = "aidaemon.telegram.agent_message.v1";
 const TELEGRAM_WEBAPP_TYPE_CONTINUE_COMPUTER: &str = "aidaemon.telegram.open_on_computer.v1";
 const TELEGRAM_WEBAPP_MAX_TEXT_CHARS: usize = 2_000;
@@ -5494,7 +5492,7 @@ async fn send_full_or_expandable_reply(
 ) -> anyhow::Result<()> {
     let plain = strip_latex(markdown);
     if plain.chars().count() > TELEGRAM_EXPANDABLE_TRIGGER_CHARS {
-        return send_expandable_blockquote_reply(bot, chat_id, &plain).await;
+        return send_expandable_blockquote_reply(bot, chat_id, markdown).await;
     }
     send_markdown_chunks_or_fallback_result(bot, chat_id, markdown).await
 }
@@ -5502,14 +5500,21 @@ async fn send_full_or_expandable_reply(
 async fn send_expandable_blockquote_reply(
     bot: &Bot,
     chat_id: ChatId,
-    plain: &str,
+    markdown: &str,
 ) -> anyhow::Result<()> {
-    let chunks = split_for_expandable_blockquote(plain, TELEGRAM_EXPANDABLE_MAX_ESCAPED_CHARS);
+    let html_body = markdown_to_telegram_html(markdown);
+    let plain = strip_latex(markdown);
+    let max_chunk = TELEGRAM_MAX_MESSAGE_LEN - TELEGRAM_EXPANDABLE_WRAPPER_LEN;
+    let html_chunks = split_message(&html_body, max_chunk);
+    let plain_chunks = split_message(&plain, max_chunk);
     let mut first_err: Option<anyhow::Error> = None;
-    for chunk in chunks {
-        let escaped = html_escape(&chunk);
-        let html = format!("<blockquote expandable>{}</blockquote>", escaped);
-        if let Err(e) = send_html_or_fallback(bot, chat_id, &html, &chunk).await {
+    for (i, html_chunk) in html_chunks.iter().enumerate() {
+        let wrapped = format!("<blockquote expandable>{}</blockquote>", html_chunk);
+        let plain_chunk = plain_chunks
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or(html_chunk.as_str());
+        if let Err(e) = send_html_or_fallback(bot, chat_id, &wrapped, plain_chunk).await {
             warn!("Failed to send expandable Telegram message: {}", e);
             if first_err.is_none() {
                 first_err = Some(anyhow::anyhow!("Failed to send Telegram message: {}", e));
@@ -5521,36 +5526,6 @@ async fn send_expandable_blockquote_reply(
         return Err(err);
     }
     Ok(())
-}
-
-fn split_for_expandable_blockquote(text: &str, max_escaped_chars: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut current_escaped_len = 0usize;
-
-    for ch in text.chars() {
-        let add = match ch {
-            '&' => 5,       // "&amp;"
-            '<' | '>' => 4, // "&lt;" / "&gt;"
-            _ => 1,
-        };
-        if current_escaped_len + add > max_escaped_chars && !current.is_empty() {
-            out.push(current);
-            current = String::new();
-            current_escaped_len = 0;
-        }
-        current.push(ch);
-        current_escaped_len += add;
-    }
-
-    if !current.is_empty() {
-        out.push(current);
-    }
-
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
 }
 
 /// Spawn a TelegramChannel in a background task.
@@ -5665,29 +5640,6 @@ mod tests {
             crate::normalize_terminal_agent_permission_aliases(Some("codex"), args.clone());
         assert!(!rewrote);
         assert_eq!(normalized, args);
-    }
-
-    #[test]
-    fn split_for_expandable_blockquote_keeps_short_text_in_one_chunk() {
-        let chunks = split_for_expandable_blockquote("short reply", 100);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], "short reply");
-    }
-
-    #[test]
-    fn split_for_expandable_blockquote_respects_escaped_limit() {
-        let text = "A&B<C>D";
-        // Escaped length is 1 + 5 + 1 + 4 + 1 + 4 + 1 = 17
-        let chunks = split_for_expandable_blockquote(text, 10);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], "A&B");
-        assert_eq!(chunks[1], "<C>D");
-    }
-
-    #[test]
-    fn split_for_expandable_blockquote_handles_empty_text() {
-        let chunks = split_for_expandable_blockquote("", 10);
-        assert_eq!(chunks, vec![String::new()]);
     }
 
     #[test]

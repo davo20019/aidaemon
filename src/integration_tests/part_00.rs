@@ -12,10 +12,7 @@ use crate::testing::{
 };
 use crate::tools::{EditFileTool, ReadFileTool};
 use crate::traits::store_prelude::*;
-use crate::traits::{
-    BehaviorPattern, Episode, ErrorSolution, Goal, Procedure, ProviderResponse, StateStore,
-    UserProfile,
-};
+use crate::traits::{Goal, Procedure, ProviderResponse, StateStore, UserProfile};
 use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
 use chrono::Utc;
 use serde_json::json;

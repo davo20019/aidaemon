@@ -380,6 +380,37 @@ impl Agent {
             recent_tool_names,
             iteration_had_tool_failures,
         );
+
+        self.apply_research_synthesis_nudge(session_id, pending_system_messages, recent_tool_names);
+    }
+
+    fn apply_research_synthesis_nudge(
+        &self,
+        session_id: &str,
+        pending_system_messages: &mut Vec<SystemDirective>,
+        recent_tool_names: &VecDeque<String>,
+    ) {
+        // Research synthesis nudge: after 3+ consecutive web searches, nudge
+        // the model to evaluate whether it has enough evidence to answer.
+        // This lets the model reason about information sufficiency instead of
+        // relying on hard numeric limits.
+        const RESEARCH_NUDGE_THRESHOLD: usize = 3;
+        let research_tools = ["web_search", "web_fetch"];
+        let consecutive_searches = recent_tool_names
+            .iter()
+            .rev()
+            .take_while(|name| research_tools.contains(&name.as_str()))
+            .count();
+
+        if consecutive_searches >= RESEARCH_NUDGE_THRESHOLD {
+            pending_system_messages.push(SystemDirective::ResearchSynthesisNudge {
+                consecutive_searches,
+            });
+            info!(
+                session_id,
+                consecutive_searches, "Research synthesis nudge injected"
+            );
+        }
     }
 
     fn apply_edit_stall_write_hint(

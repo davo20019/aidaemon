@@ -955,7 +955,10 @@ pub fn build_system_prompt(
 }
 
 /// Extended context for memory-rich system prompts.
+/// Most fields are retained for on-demand memory tools even though they are
+/// no longer bulk-injected into the system prompt.
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct MemoryContext<'a> {
     pub facts: &'a [Fact],
     pub episodes: &'a [Episode],
@@ -983,6 +986,7 @@ pub struct MemoryContext<'a> {
 /// and behavior patterns in addition to facts and skills.
 /// Replace known user IDs (e.g., `U04S8KSS932`) with display names in text.
 /// Matches both bare IDs and `<@USERID>` Slack mention format.
+#[allow(dead_code)]
 fn resolve_user_ids(text: &str, user_id_map: &HashMap<String, String>) -> String {
     if user_id_map.is_empty() {
         return text.to_string();
@@ -1007,9 +1011,9 @@ pub fn build_system_prompt_with_memory(
     skills: &[Skill],
     active: &[&Skill],
     memory: &MemoryContext,
-    max_facts: usize,
-    suggestions: Option<&[crate::memory::proactive::Suggestion]>,
-    user_id_map: &HashMap<String, String>,
+    _max_facts: usize,
+    _suggestions: Option<&[crate::memory::proactive::Suggestion]>,
+    _user_id_map: &HashMap<String, String>,
 ) -> String {
     let mut prompt = base.to_string();
 
@@ -1033,191 +1037,17 @@ pub fn build_system_prompt_with_memory(
         }
     }
 
-    // 2. Expertise Levels
-    if !memory.expertise.is_empty() {
-        prompt.push_str("\n\n## Your Expertise Levels\n");
-        prompt.push_str("| Domain | Level | Confidence |\n|--------|-------|------------|\n");
-        for exp in memory.expertise.iter().take(10) {
-            prompt.push_str(&format!(
-                "| {} | {} | {:.0}% |\n",
-                exp.domain,
-                exp.current_level,
-                exp.confidence_score * 100.0
-            ));
-        }
-    }
+    // 2. Memory capabilities summary (on-demand retrieval replaces bulk injection)
+    prompt.push_str(
+        "\n\n## Your Memory\n\
+         You have persistent memory across sessions. When you need user context, look it up — do not guess:\n\
+         - User facts (preferences, personal info, projects): use `manage_memories(action='search', query='...')` or `manage_memories(action='list')`\n\
+         - Scheduled goals and reminders: use `scheduled_goals(action='list_scheduled')` or `scheduled_goals(action='list_scheduled_matching', query='...')`\n\
+         - Contacts and relationships: use `manage_people(action='list')` or `manage_people(action='view', name='...')`\n\
+         - To store new facts: use `remember_fact`\n",
+    );
 
-    // 3. Known Procedures (high success rate)
-    let good_procedures: Vec<&Procedure> = memory
-        .procedures
-        .iter()
-        .filter(|p| p.success_count > p.failure_count && p.success_count >= 1)
-        .take(5)
-        .collect();
-    if !good_procedures.is_empty() {
-        prompt.push_str("\n\n## Known Procedures\n");
-        prompt.push_str("I've successfully used these approaches before:\n");
-        for proc in good_procedures {
-            let success_rate = proc.success_count as f32
-                / (proc.success_count + proc.failure_count) as f32
-                * 100.0;
-            prompt.push_str(&format!(
-                "- **{}** (trigger: '{}', {:.0}% success): {}\n",
-                proc.name,
-                truncate(&proc.trigger_pattern, 30),
-                success_rate,
-                proc.steps.first().map(|s| s.as_str()).unwrap_or("...")
-            ));
-        }
-    }
-
-    // 4. Known Error Fixes (high success rate)
-    let good_solutions: Vec<&ErrorSolution> = memory
-        .error_solutions
-        .iter()
-        .filter(|s| s.success_count > s.failure_count && s.success_count >= 1)
-        .take(5)
-        .collect();
-    if !good_solutions.is_empty() {
-        prompt.push_str("\n\n## Known Error Solutions\n");
-        prompt.push_str("I've resolved these types of errors before:\n");
-        for sol in good_solutions {
-            prompt.push_str(&format!(
-                "- **{}**: {} ({}x successful)\n",
-                truncate(&sol.error_pattern, 50),
-                sol.solution_summary,
-                sol.success_count
-            ));
-        }
-    }
-
-    // 5. Active Goals
-    let active_goals: Vec<&Goal> = memory
-        .goals
-        .iter()
-        .filter(|g| g.status == "active")
-        .take(5)
-        .collect();
-    if !active_goals.is_empty() {
-        prompt.push_str("\n\n## Active Goals\n");
-        prompt.push_str("The user is working toward:\n");
-        for goal in active_goals {
-            let priority_marker = match goal.priority.as_str() {
-                "high" => "🔴",
-                "medium" => "🟡",
-                _ => "⚪",
-            };
-            prompt.push_str(&format!("- {} {}\n", priority_marker, goal.description));
-        }
-    }
-
-    // 6. Known Facts (with history indication)
-    let capped_facts = if memory.facts.len() > max_facts {
-        &memory.facts[..max_facts]
-    } else {
-        memory.facts
-    };
-    if !capped_facts.is_empty() {
-        prompt.push_str("\n\n## Known Facts\n");
-        for f in capped_facts {
-            let history_marker = if f.recall_count > 3 {
-                " (frequently used)"
-            } else {
-                ""
-            };
-            let resolved_key = resolve_user_ids(&f.key, user_id_map);
-            let resolved_value = resolve_user_ids(&f.value, user_id_map);
-            // Sanitize fact values to prevent prompt injection via stored data
-            let sanitized_value = sanitize_external_content(&resolved_value);
-            prompt.push_str(&format!(
-                "- [{}] {}: {}{}\n",
-                f.category, resolved_key, sanitized_value, history_marker
-            ));
-        }
-    }
-
-    // 6b. Cross-Channel Hints (facts from other channels — redacted values)
-    if !memory.cross_channel_hints.is_empty() {
-        prompt.push_str("\n\n## Cross-Channel Context — CONFIDENTIAL\n");
-        prompt.push_str("You have relevant info from other conversations. You may mention that you have info,\n\
-                         but NEVER reveal the actual values — they are redacted below.\n\
-                         If the owner approves sharing, use `share_memory` tool to make the info permanently shareable here.\n");
-        for f in memory.cross_channel_hints.iter().take(5) {
-            let resolved_key = resolve_user_ids(&f.key, user_id_map);
-            prompt.push_str(&format!(
-                "- [{}] {}: <confidential> (from another channel)\n",
-                f.category, resolved_key
-            ));
-        }
-    }
-
-    // 7. Relevant Past Experiences
-    if !memory.episodes.is_empty() {
-        prompt.push_str("\n\n## Relevant Past Sessions\n");
-        for ep in memory.episodes.iter().take(3) {
-            let tone = ep.emotional_tone.as_deref().unwrap_or("neutral");
-            let outcome = ep.outcome.as_deref().unwrap_or("unknown");
-            prompt.push_str(&format!(
-                "- {} (tone: {}, outcome: {})\n",
-                truncate(&ep.summary, 100),
-                tone,
-                outcome
-            ));
-        }
-    }
-
-    // 8. Behavior Patterns (high confidence)
-    let failure_patterns: Vec<&BehaviorPattern> = memory
-        .patterns
-        .iter()
-        .filter(|p| p.pattern_type == "failure" && p.confidence >= 0.5)
-        .take(3)
-        .collect();
-    if !failure_patterns.is_empty() {
-        prompt.push_str("\n\n## Failure Patterns To Avoid\n");
-        for pattern in failure_patterns {
-            prompt.push_str(&format!("- {}\n", pattern.description));
-        }
-    }
-
-    let confident_patterns: Vec<&BehaviorPattern> = memory
-        .patterns
-        .iter()
-        .filter(|p| p.pattern_type != "failure" && p.confidence >= 0.7)
-        .take(3)
-        .collect();
-    if !confident_patterns.is_empty() {
-        prompt.push_str("\n\n## Observed Patterns\n");
-        for pattern in confident_patterns {
-            prompt.push_str(&format!("- {}\n", pattern.description));
-        }
-    }
-
-    // 9. Trusted Command Patterns
-    if !memory.trusted_command_patterns.is_empty() {
-        prompt.push_str("\n\n## Trusted Command Patterns\n");
-        prompt.push_str("These command patterns have been approved multiple times and will have reduced approval friction:\n");
-        for (pattern, count) in memory.trusted_command_patterns.iter().take(10) {
-            prompt.push_str(&format!("- `{}` (approved {}x)\n", pattern, count));
-        }
-        prompt.push_str(
-            "\nWhen suggesting terminal commands, prefer simpler commands over complex pipelines. ",
-        );
-        prompt.push_str("If a pipeline is necessary, explain why each part is needed.\n");
-    }
-
-    // 10. Contextual Suggestions (if user likes them)
-    if let Some(suggestions) = suggestions {
-        if !suggestions.is_empty() {
-            prompt.push_str("\n\n## Contextual Suggestions\n");
-            prompt.push_str("Consider these if relevant (do not force):\n");
-            for s in suggestions.iter().take(3) {
-                prompt.push_str(&format!("- {}\n", s.text));
-            }
-        }
-    }
-
-    // 11. People Privacy Rules (BEFORE data — agent sees constraints first)
+    // 3. People Privacy Rules (BEFORE data — agent sees constraints first)
     if !memory.people.is_empty() || memory.current_person.is_some() {
         prompt.push_str("\n\n## People Privacy Rules\n\
             - You ARE transparent about: adapting communication style, learning from conversations\n\
@@ -1229,34 +1059,7 @@ pub fn build_system_prompt_with_memory(
             - When proactively reminding the owner about dates/events, do so naturally (\"By the way, someone's birthday is coming up next week!\")\n");
     }
 
-    // 12. People Context (only when people data exists)
-    if !memory.people.is_empty() {
-        prompt.push_str("\n\n## People You Know\n");
-        for p in memory.people.iter().take(20) {
-            let rel = p.relationship.as_deref().unwrap_or("contact");
-            let style = p
-                .communication_style
-                .as_deref()
-                .map(|s| format!(", style: {}", s))
-                .unwrap_or_default();
-            let lang = p
-                .language_preference
-                .as_deref()
-                .map(|l| format!(", language: {}", l))
-                .unwrap_or_default();
-            prompt.push_str(&format!("- **{}** ({}){}{}\n", p.name, rel, style, lang));
-        }
-    }
-
-    // 12b. Owner Facts (in owner DMs, show the owner's stored personal facts)
-    if memory.current_person.is_none() && !memory.current_person_facts.is_empty() {
-        prompt.push_str("\n\n## About the Owner\nStored facts about you:\n");
-        for f in memory.current_person_facts.iter().take(15) {
-            prompt.push_str(&format!("- [{}] {}: {}\n", f.category, f.key, f.value));
-        }
-    }
-
-    // 13. Current Speaker Context (when talking to a known person who is not the owner)
+    // 12. Current Speaker Context (when talking to a known person who is not the owner)
     if let Some(person) = memory.current_person {
         prompt.push_str(&format!(
             "\n\n## Current Speaker Context\nYou are talking to {} ",
@@ -1318,6 +1121,7 @@ pub fn build_system_prompt_with_memory(
     prompt
 }
 
+#[allow(dead_code)]
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()

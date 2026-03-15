@@ -387,9 +387,10 @@ impl Agent {
 
             validation_state.record_failure(ValidationFailure::BudgetExhausted);
             let request = if made_progress {
-                build_reduce_scope_request(
+                build_reduce_scope_request_with_plan(
                     turn_context,
                     learning_ctx,
+                    Some(execution_state),
                     format!(
                         "I hit the current execution budget limit ({}) before I could safely continue.",
                         limit.as_str()
@@ -424,9 +425,10 @@ impl Agent {
                     "I will stop this execution path here instead of pretending partial work exists when no concrete step completed.",
                 )
             } else {
-                build_partial_done_blocked_request(
+                build_partial_done_blocked_request_with_plan(
                     turn_context,
                     learning_ctx,
+                    Some(execution_state),
                     format!(
                         "I hit the current execution budget limit ({}) before I could safely continue.",
                         limit.as_str()
@@ -537,15 +539,21 @@ impl Agent {
                 // Build a richer response that includes an activity summary
                 // so the user knows what was accomplished before the background
                 // task was started, not just the technical "moved to background" text.
+                // NOTE: We use display_tool_call() to convert "tool_name(args)" to
+                // a user-friendly format that won't be stripped by
+                // strip_tool_name_references() (which replaces raw tool_name(...)
+                // patterns with "that").
                 let reply = if learning_ctx.tool_calls.is_empty() {
                     background_ack.clone()
                 } else {
-                    let actions: Vec<&str> =
-                        learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
                     let mut summary =
                         String::from("Here's what I did before the background task started:\n");
-                    for (i, call) in actions.iter().enumerate() {
-                        summary.push_str(&format!("{}. {}\n", i + 1, call));
+                    for (i, call) in learning_ctx.tool_calls.iter().enumerate() {
+                        summary.push_str(&format!(
+                            "{}. {}\n",
+                            i + 1,
+                            post_task::display_tool_call(call)
+                        ));
                     }
                     summary.push_str(&format!("\n{}", background_ack));
                     summary

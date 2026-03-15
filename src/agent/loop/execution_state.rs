@@ -636,6 +636,32 @@ impl ExecutionState {
         }
     }
 
+    /// Promote budget if a captured task plan indicates higher complexity
+    /// than the initial keyword-based selection predicted.
+    /// Only promotes upward — never reduces an existing budget.
+    pub fn promote_budget_for_plan(&mut self, step_count: usize) {
+        if step_count < 3 {
+            return;
+        }
+        if !matches!(self.budget_tier, BudgetTier::None | BudgetTier::Small) {
+            return;
+        }
+        let promoted = default_execution_budget(BudgetTier::Standard);
+        self.budget.max_llm_calls = self.budget.max_llm_calls.max(promoted.max_llm_calls);
+        self.budget.max_tool_calls = self.budget.max_tool_calls.max(promoted.max_tool_calls);
+        self.budget.max_steps = self.budget.max_steps.max(promoted.max_steps);
+        self.budget.max_wall_clock_ms = self
+            .budget
+            .max_wall_clock_ms
+            .max(promoted.max_wall_clock_ms);
+        tracing::info!(
+            step_count,
+            new_max_tool_calls = self.budget.max_tool_calls,
+            new_max_llm_calls = self.budget.max_llm_calls,
+            "Budget promoted for multi-step task plan"
+        );
+    }
+
     pub fn exhausted_limit(
         &self,
         task_tokens_used: u64,
@@ -1720,5 +1746,58 @@ mod tests {
         });
         let summary = state.build_reconciliation_overview().unwrap().summary;
         assert!(summary.contains("attempt"));
+    }
+
+    #[test]
+    fn promote_budget_for_plan_none_to_standard() {
+        let mut state = ExecutionState::new(
+            BudgetTier::None,
+            default_execution_budget(BudgetTier::None),
+            ExecutionPersistence::Ephemeral,
+        );
+        let original_llm_calls = state.budget.max_llm_calls;
+        let original_wall_clock = state.budget.max_wall_clock_ms;
+        state.promote_budget_for_plan(4);
+        let standard = default_execution_budget(BudgetTier::Standard);
+        // None tier has lower llm_calls and wall_clock than Standard
+        assert!(state.budget.max_llm_calls >= standard.max_llm_calls);
+        assert!(state.budget.max_llm_calls > original_llm_calls);
+        assert!(state.budget.max_wall_clock_ms > original_wall_clock);
+    }
+
+    #[test]
+    fn promote_budget_for_plan_small_to_standard() {
+        let mut state = ExecutionState::new(
+            BudgetTier::Small,
+            default_execution_budget(BudgetTier::Small),
+            ExecutionPersistence::Ephemeral,
+        );
+        state.promote_budget_for_plan(3);
+        let standard = default_execution_budget(BudgetTier::Standard);
+        assert!(state.budget.max_llm_calls >= standard.max_llm_calls);
+    }
+
+    #[test]
+    fn no_promote_for_small_plan() {
+        let mut state = ExecutionState::new(
+            BudgetTier::None,
+            default_execution_budget(BudgetTier::None),
+            ExecutionPersistence::Ephemeral,
+        );
+        let original = state.budget.max_tool_calls;
+        state.promote_budget_for_plan(2);
+        assert_eq!(state.budget.max_tool_calls, original);
+    }
+
+    #[test]
+    fn no_promote_for_standard_plus() {
+        let mut state = ExecutionState::new(
+            BudgetTier::Standard,
+            default_execution_budget(BudgetTier::Standard),
+            ExecutionPersistence::Ephemeral,
+        );
+        let original = state.budget.max_tool_calls;
+        state.promote_budget_for_plan(5);
+        assert_eq!(state.budget.max_tool_calls, original);
     }
 }

@@ -103,6 +103,10 @@ pub struct TerminalTool {
     event_store: Option<Arc<EventStore>>,
     state: Option<Arc<dyn StateStore>>,
     hub: OnceLock<Weak<ChannelHub>>,
+    /// Weak reference to the agent, used to re-engage the agent loop when
+    /// a background terminal command completes so the agent can process the
+    /// output and continue working on the original task.
+    agent: OnceLock<Weak<crate::agent::Agent>>,
 }
 
 /// Check if a command string contains shell operators.
@@ -461,6 +465,7 @@ impl TerminalTool {
             event_store: None,
             state: None,
             hub: OnceLock::new(),
+            agent: OnceLock::new(),
         }
     }
 
@@ -481,6 +486,12 @@ impl TerminalTool {
 
     fn get_hub(&self) -> Option<Arc<ChannelHub>> {
         self.hub.get().and_then(|w| w.upgrade())
+    }
+
+    /// Set agent reference so background command completions can re-engage
+    /// the agent loop to process the output and continue the original task.
+    pub fn set_agent(&self, agent: Weak<crate::agent::Agent>) {
+        let _ = self.agent.set(agent);
     }
 
     async fn is_allowed(&self, command: &str) -> bool {
@@ -1260,9 +1271,12 @@ impl TerminalTool {
 
                 // Deterministic completion delivery: notify user when background command finishes
                 // even if the agent loop ends before an explicit `action="check"` call.
+                // Also re-engages the agent loop so it can process the output and continue
+                // working on the original task.
                 let mut notifier_started = false;
                 let state_for_notify = self.state.clone();
                 let hub_for_notify = self.get_hub();
+                let agent_for_notify = self.agent.get().and_then(|w| w.upgrade());
                 if state_for_notify.is_some() || hub_for_notify.is_some() {
                     let goal_id_for_notify = notify_goal_id.unwrap_or("").to_string();
                     let session_for_notify = notify_session_id.trim().to_string();
@@ -1300,6 +1314,9 @@ impl TerminalTool {
                             );
 
                             let mut completion_rx = completion_rx;
+                            // Capture completion output for agent re-engagement
+                            #[allow(unused_assignments)]
+                            let mut completion_output_for_agent: Option<String> = None;
                             let mut ping_interval = tokio::time::interval(Duration::from_secs(
                                 BACKGROUND_PROGRESS_INTERVAL_SECS,
                             ));
@@ -1413,6 +1430,8 @@ impl TerminalTool {
                                                 );
                                             }
                                         }
+                                        // Save output for agent re-engagement after loop
+                                        completion_output_for_agent = Some(output);
                                         break;
                                     }
                                     _ = ping_interval.tick() => {
@@ -1507,6 +1526,79 @@ impl TerminalTool {
                                             }
                                         }
                                         } // close else for ping_count cap
+                                    }
+                                }
+                            }
+
+                            // Re-engage the agent loop so it can process the background
+                            // command output and continue working on the original task.
+                            // The agent has full session history so it can pick up context.
+                            //
+                            // NOTE: This bypasses the channel's task queue, similar to
+                            // spawn_background_task_lead in heartbeat. If the user sends
+                            // a new message at the exact same time, both could execute
+                            // concurrently. In practice this is rare since the background
+                            // command finishes long after the user's original request.
+                            if let Some(output) = completion_output_for_agent {
+                                let output_trimmed = output.trim();
+                                let is_trivial = output_trimmed.is_empty()
+                                    || output_trimmed == "(no output)"
+                                    || output_trimmed.len() < 5;
+                                if is_trivial {
+                                    info!(
+                                        pid,
+                                        "Skipping agent re-engagement: trivial background command output"
+                                    );
+                                } else if let Some(ref agent) = agent_for_notify {
+                                    let followup = format!(
+                                        "[Background command completed]\n\
+                                         Command: `{}`\n\
+                                         Output:\n{}\n\n\
+                                         Continue with the task using this output. \
+                                         Provide a concise summary of the findings.",
+                                        command_summary, output
+                                    );
+                                    info!(
+                                        pid,
+                                        session_id = %session_for_notify,
+                                        command = %command_for_notify,
+                                        "Re-engaging agent loop to process background command output"
+                                    );
+                                    match agent
+                                        .handle_message(
+                                            &session_for_notify,
+                                            &followup,
+                                            None,
+                                            crate::types::UserRole::Owner,
+                                            crate::types::ChannelContext::internal(),
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        Ok(reply) => {
+                                            // Send the agent's analysis to the user
+                                            if !reply.trim().is_empty() {
+                                                if let Some(ref hub) = hub_for_notify {
+                                                    if let Err(e) = hub
+                                                        .send_text(&session_for_notify, &reply)
+                                                        .await
+                                                    {
+                                                        warn!(
+                                                            pid,
+                                                            error = %e,
+                                                            "Failed to deliver agent follow-up for background command"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                pid,
+                                                error = %e,
+                                                "Agent re-engagement failed for background command"
+                                            );
+                                        }
                                     }
                                 }
                             }

@@ -348,8 +348,11 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
 
     // Give terminal a reference to the hub so background command progress/completion
     // can be delivered immediately (not only via heartbeat queue polling).
+    // Also give it a weak agent reference so background completions can re-engage
+    // the agent loop to process the output and continue the original task.
     if let Some(tt) = terminal_tool {
         tt.set_hub(Arc::downgrade(&hub));
+        tt.set_agent(Arc::downgrade(&agent));
     }
     if let Some(cat) = cli_agent_tool {
         cat.set_hub(Arc::downgrade(&hub));
@@ -1606,33 +1609,19 @@ Each retry must build on what you learned — never repeat an approach that alre
 **NEVER use `terminal` with `cat`, `head`, or `tail` to read files.** Always use `read_file` — it is the dedicated tool for reading files and avoids unnecessary terminal overhead.
 
 ## Memory
-You have persistent memory across sessions: facts (long-term knowledge about the user), \
-episodic memory (past session summaries), procedural memory (learned workflows), \
-goals, expertise levels, and behavior patterns.
+You have persistent memory across sessions. Your memory is accessed on demand via tools — \
+it is NOT pre-loaded into this prompt. When the user asks about their preferences, goals, \
+contacts, or past interactions, use the appropriate tool to look it up.
 
-Reference memories conversationally: \"Since you mentioned X last time...\" \
-Use `remember_fact` ONLY for stable, long-term knowledge about the user — preferences, personal info, \
-environment details, communication patterns, and established relationships. \
-Do NOT save task-scoped research, reference material gathered for a specific project, or content being built \
-(e.g., product prices, API docs, website copy). If the information is only useful for the current task and not \
-about the user personally, do not store it as a fact. \
-For personal goals/habits the user wants tracked over time, use `manage_memories` (create_personal_goal/list_goals/complete_goal/abandon_goal). \
-Do NOT store goals as facts. \
-When the user says things like \"learn this\", \"remember this\", or \"save these\", and they are sharing user/profile facts, use `remember_fact` (use the `facts` array for multiple items). \
-Do NOT call `manage_memories` or `scheduled_goal_runs` for fact storage. \
+**Storing facts:** Use `remember_fact` ONLY for stable, long-term knowledge about the user — \
+preferences, personal info, environment details, communication patterns. \
+Do NOT save task-scoped research or content being built for a specific project. \
+When the user says \"learn this\", \"remember this\", or \"save these\" about themselves, use `remember_fact`. \
 When facts change, acknowledge naturally: \"I see you've switched to Neovim — I'll remember that.\"
 
-### Memory Recall Rules (STRICT)
-- **Only state what you explicitly know.** When recalling facts about the user, ONLY include information \
-that is present in your injected facts or was directly stated in the current conversation. \
-NEVER infer, guess, or extrapolate unstated details. For example, if you know someone uses AWS and Go, \
-do NOT assume they also use Docker, Kubernetes, or any other technology unless explicitly stored.
-- **\"I don't know\" is always valid.** When asked about something not in your facts or conversation, \
-say \"I don't have that stored\" — do NOT search the filesystem, web, or any other source to find \
-personal information (phone numbers, addresses, SSNs, etc.) that was never provided by the user.
-- **Never fabricate personal data.** If a user asks for their phone number, email, or other personal \
-details and you don't have them stored, say so. NEVER construct plausible-sounding personal data \
-(like area-code-matching phone numbers) and NEVER store fabricated data as facts.
+**Recalling facts:** Use `manage_memories(action='search', query='...')` to look up stored facts. \
+Only state what your tools return. NEVER infer, guess, or fabricate personal data. \
+\"I don't have that stored\" is always a valid answer.
 
 ## Planning
 Before using any tool, pause and resolve the user's intent:

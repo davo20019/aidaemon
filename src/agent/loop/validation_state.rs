@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use crate::agent::{post_task, LearningContext, TurnContext};
 use crate::traits::{Task, ToolTargetHint};
 
-use super::execution_state::TargetScope;
+use super::execution_state::{ExecutionState, LinearIntentPlan, OutcomeEntry, TargetScope};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutedAction {
@@ -696,8 +696,31 @@ pub fn build_partial_done_blocked_request(
     exact_need: impl Into<String>,
     next_step: impl Into<String>,
 ) -> HumanInterventionRequest {
+    build_partial_done_blocked_request_with_plan(
+        turn_context,
+        learning_ctx,
+        None,
+        blocker,
+        exact_need,
+        next_step,
+    )
+}
+
+pub fn build_partial_done_blocked_request_with_plan(
+    turn_context: &TurnContext,
+    learning_ctx: &LearningContext,
+    execution_state: Option<&ExecutionState>,
+    blocker: impl Into<String>,
+    exact_need: impl Into<String>,
+    next_step: impl Into<String>,
+) -> HumanInterventionRequest {
     let blocker = blocker.into();
-    let partial_result = summarize_partial_result(turn_context, learning_ctx, blocker.clone());
+    let partial_result = summarize_partial_result_with_plan(
+        turn_context,
+        learning_ctx,
+        execution_state,
+        blocker.clone(),
+    );
 
     HumanInterventionRequest {
         outcome: ValidationOutcome::PartialDoneBlocked,
@@ -723,6 +746,24 @@ pub fn build_reduce_scope_request(
     exact_need: impl Into<String>,
     next_step: impl Into<String>,
 ) -> HumanInterventionRequest {
+    build_reduce_scope_request_with_plan(
+        turn_context,
+        learning_ctx,
+        None,
+        blocker,
+        exact_need,
+        next_step,
+    )
+}
+
+pub fn build_reduce_scope_request_with_plan(
+    turn_context: &TurnContext,
+    learning_ctx: &LearningContext,
+    execution_state: Option<&ExecutionState>,
+    blocker: impl Into<String>,
+    exact_need: impl Into<String>,
+    next_step: impl Into<String>,
+) -> HumanInterventionRequest {
     let blocker = blocker.into();
     HumanInterventionRequest {
         outcome: ValidationOutcome::ReduceScope,
@@ -736,9 +777,10 @@ pub fn build_reduce_scope_request(
             "I will stop here instead of silently continuing beyond the current safe scope."
                 .to_string(),
         ),
-        partial_result: Some(summarize_partial_result(
+        partial_result: Some(summarize_partial_result_with_plan(
             turn_context,
             learning_ctx,
+            execution_state,
             blocker,
         )),
     }
@@ -774,31 +816,57 @@ fn summarize_partial_result(
     learning_ctx: &LearningContext,
     blocker: String,
 ) -> PartialResult {
-    let completed_work_summary = if learning_ctx.tool_calls.is_empty() {
-        "No executable work completed yet.".to_string()
-    } else {
-        let summary = post_task::categorize_tool_calls(&learning_ctx.tool_calls);
-        if summary.trim().is_empty() {
-            format!(
-                "Completed {} tool action(s).",
-                learning_ctx.tool_calls.len()
-            )
+    summarize_partial_result_with_plan(turn_context, learning_ctx, None, blocker)
+}
+
+pub(crate) fn summarize_partial_result_with_plan(
+    turn_context: &TurnContext,
+    learning_ctx: &LearningContext,
+    execution_state: Option<&ExecutionState>,
+    blocker: String,
+) -> PartialResult {
+    let completed_work_summary =
+        if let Some(plan) = execution_state.and_then(|es| es.active_linear_intent_plan.as_ref()) {
+            format_plan_for_blocked_message(plan, execution_state.unwrap())
+        } else if let Some(reconciliation) =
+            execution_state.and_then(|es| es.build_reconciliation_overview())
+        {
+            reconciliation.summary
+        } else if !learning_ctx.tool_calls.is_empty() {
+            let summary = post_task::categorize_tool_calls(&learning_ctx.tool_calls);
+            if summary.trim().is_empty() {
+                format!(
+                    "Completed {} tool action(s).",
+                    learning_ctx.tool_calls.len()
+                )
+            } else {
+                summary.trim().to_string()
+            }
         } else {
-            summary.trim().to_string()
-        }
-    };
+            "No executable work completed yet.".to_string()
+        };
+
     let artifacts = turn_context
         .completion_contract
         .primary_target_hint()
         .into_iter()
         .collect();
-    let remaining_work = if turn_context.completion_contract.requires_observation {
-        vec!["Run the final verification step and confirm the result.".to_string()]
-    } else if learning_ctx.tool_calls.is_empty() {
-        vec!["Resume the next concrete step once the blocker is resolved.".to_string()]
-    } else {
-        vec!["Synthesize the observed result into the final user-facing answer.".to_string()]
-    };
+
+    let remaining_work =
+        if let Some(plan) = execution_state.and_then(|es| es.active_linear_intent_plan.as_ref()) {
+            plan.steps
+                .iter()
+                .filter(|s| s.step_index > plan.current_step_cursor)
+                .map(|s| s.description.clone())
+                .take(3)
+                .collect()
+        } else if turn_context.completion_contract.requires_observation {
+            vec!["Run the final verification step and confirm the result.".to_string()]
+        } else if learning_ctx.tool_calls.is_empty() {
+            vec!["Resume the next concrete step once the blocker is resolved.".to_string()]
+        } else {
+            vec!["Synthesize the observed result into the final user-facing answer.".to_string()]
+        };
 
     PartialResult {
         completed_work_summary,
@@ -806,6 +874,82 @@ fn summarize_partial_result(
         blocker,
         remaining_work,
     }
+}
+
+fn format_plan_for_blocked_message(
+    plan: &LinearIntentPlan,
+    execution_state: &ExecutionState,
+) -> String {
+    let has_outcomes = execution_state
+        .outcome_ledger
+        .iter()
+        .any(|e| e.planned_step_id.is_some());
+
+    let mut lines = Vec::new();
+
+    if has_outcomes {
+        for step in &plan.steps {
+            let outcomes: Vec<&OutcomeEntry> = execution_state
+                .outcome_ledger
+                .iter()
+                .filter(|e| e.planned_step_id.as_deref() == Some(&step.step_id))
+                .collect();
+
+            if outcomes.is_empty() {
+                if step.step_index <= plan.current_step_cursor {
+                    lines.push(format!(
+                        "\u{2705} Step {}: {}",
+                        step.step_index, step.description
+                    ));
+                } else {
+                    lines.push(format!(
+                        "\u{2b1c} Step {}: {}",
+                        step.step_index, step.description
+                    ));
+                }
+            } else if let Some(last) = outcomes.last() {
+                if last.success {
+                    lines.push(format!(
+                        "\u{2705} Step {}: {}",
+                        step.step_index, step.description
+                    ));
+                } else {
+                    let err = last.error_summary.as_deref().unwrap_or("unknown error");
+                    let err = crate::utils::truncate_str(err, 100);
+                    let attempts = outcomes.len();
+                    lines.push(format!(
+                        "\u{274c} Step {}: {} \u{2014} {} ({} attempt{})",
+                        step.step_index,
+                        step.description,
+                        err,
+                        attempts,
+                        if attempts == 1 { "" } else { "s" }
+                    ));
+                }
+            }
+        }
+    } else {
+        lines.push("Plan:".to_string());
+        for step in &plan.steps {
+            lines.push(format!("{}. {}", step.step_index, step.description));
+        }
+        let total = execution_state.outcome_ledger.len();
+        let succeeded = execution_state
+            .outcome_ledger
+            .iter()
+            .filter(|e| e.success)
+            .count();
+        if total > 0 {
+            lines.push(format!(
+                "\nTool results: {} tool calls completed ({} succeeded, {} failed).",
+                total,
+                succeeded,
+                total - succeeded
+            ));
+        }
+    }
+
+    lines.join("\n")
 }
 
 #[cfg(test)]

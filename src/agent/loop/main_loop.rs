@@ -237,6 +237,57 @@ impl Agent {
         let mut evidence_gain_count: usize = 0;
         let mut evidence_state = EvidenceState::default();
         let mut validation_state = ValidationState::default();
+
+        // Task-start planning call: generate a structured plan before the main loop.
+        // Skipped for conversational queries, short messages, and acknowledgments.
+        // Disabled in test builds to avoid consuming mock provider responses.
+        #[cfg(not(test))]
+        {
+            use super::bootstrap_phase::task_planning::{generate_task_plan, should_skip_planning};
+            use crate::agent::execution_state::LinearIntentStep;
+            if !should_skip_planning(
+                &turn_context.completion_contract.task_kind,
+                user_text,
+                false,
+            ) {
+                let plan_opt = if let Some(ref router) = llm_router {
+                    generate_task_plan(llm_provider.clone(), router, user_text).await
+                } else {
+                    None
+                };
+                if let Some(plan) = plan_opt {
+                    let linear_steps: Vec<LinearIntentStep> = plan
+                        .steps
+                        .iter()
+                        .enumerate()
+                        .map(|(i, step)| LinearIntentStep {
+                            step_id: format!("task-plan-step-{}", i + 1),
+                            step_index: i + 1,
+                            tool: step.tool_hint.clone().unwrap_or_default(),
+                            target: String::new(),
+                            description: step.description.clone(),
+                        })
+                        .collect();
+
+                    let step_count = linear_steps.len();
+                    execution_state.install_linear_intent_plan(1, linear_steps);
+
+                    if !plan.success_criteria.is_empty() {
+                        validation_state.set_plan(1, &plan.success_criteria);
+                    }
+
+                    execution_state.promote_budget_for_plan(step_count);
+
+                    info!(
+                        session_id,
+                        goal = %plan.goal,
+                        step_count,
+                        "Task plan installed and budget evaluated"
+                    );
+                }
+            }
+        }
+
         // Track which error solutions were injected so we can credit them on recovery.
         let mut pending_error_solution_ids: Vec<i64> = Vec::new();
         let mut tool_error_history: HashMap<(String, String), Vec<ToolErrorEntry>> = HashMap::new();
@@ -712,6 +763,24 @@ impl Agent {
                         ResponsePhaseOutcome::Return(result) => return result,
                         ResponsePhaseOutcome::ProceedToToolExecution => {}
                     }
+                }
+            }
+
+            // Inject task plan context into the model's messages each iteration.
+            // (Plan is only generated in non-test builds, so this is a no-op in tests
+            // unless a plan was installed by the prelude phase.)
+            if let Some(ref plan) = execution_state.active_linear_intent_plan {
+                if !plan.steps.is_empty() {
+                    let mut plan_text = String::from("## Task Plan\n");
+                    for step in &plan.steps {
+                        plan_text.push_str(&format!("{}. {}\n", step.step_index, step.description));
+                    }
+                    // Cap at ~1200 chars (~300 tokens)
+                    if plan_text.len() > 1200 {
+                        plan_text.truncate(crate::utils::floor_char_boundary(&plan_text, 1200));
+                        plan_text.push_str("\n...");
+                    }
+                    pending_system_messages.push(SystemDirective::TaskPlanContext(plan_text));
                 }
             }
 

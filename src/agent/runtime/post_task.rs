@@ -822,6 +822,46 @@ fn redact_error_line_for_summary(key_line: &str) -> String {
 }
 
 /// Categorize tool calls into a human-readable activity summary.
+/// Convert a raw `"tool_name(args)"` entry into a user-friendly display string.
+///
+/// This avoids the `tool_name(...)` format that `strip_tool_name_references`
+/// would replace with "that".  Output uses "Display Name — args" instead.
+pub(in crate::agent) fn display_tool_call(call: &str) -> String {
+    let (name, args) = match call.find('(') {
+        Some(idx) => {
+            let n = &call[..idx];
+            let a = call[idx + 1..].trim_end_matches(')');
+            (n, a)
+        }
+        None => (call, ""),
+    };
+    let display_name = match name {
+        "manage_memories" => "Searched memories",
+        "remember_fact" => "Saved to memory",
+        "search_files" => "Searched files",
+        "read_file" => "Read file",
+        "write_file" => "Wrote file",
+        "edit_file" => "Edited file",
+        "terminal" | "run_command" => "Ran command",
+        "web_search" => "Web search",
+        "web_fetch" => "Fetched URL",
+        "http_request" => "HTTP request",
+        "goal_trace" => "Checked goal history",
+        "tool_trace" => "Checked tool history",
+        "manage_goals" | "scheduled_goal_runs" => "Checked goals",
+        "send_file" => "Sent file",
+        "list_files" | "project_inspect" => "Listed files",
+        "spawn_agent" => "Spawned agent",
+        "cli_agent" => "Delegated to agent",
+        _ => name,
+    };
+    if args.is_empty() {
+        display_name.to_string()
+    } else {
+        format!("{} — {}", display_name, args)
+    }
+}
+
 ///
 /// Parses entries like `"read_file(Hero.jsx)"` and `"terminal(\`pip install fpdf\`)"` into
 /// grouped categories so the next interaction can understand what was already done.
@@ -937,6 +977,60 @@ mod tests {
     fn test_categorize_tool_calls_empty() {
         let result = categorize_tool_calls(&[]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_display_tool_call_survives_sanitization() {
+        use crate::tools::sanitize::sanitize_user_facing_reply;
+
+        let tool_calls = vec![
+            "manage_memories(search)",
+            "manage_memories(list_scheduled)",
+            "search_files(twitter|schedule|cancelled|removed)",
+            "goal_trace()",
+            "terminal(`cd /tmp && find ~ -type d -name \"aidaemon\"`)",
+            "read_file(src/main.rs)",
+            "write_file(output.txt)",
+            "web_search(rust async patterns)",
+        ];
+
+        let mut summary = String::from("Here's what I did before the background task started:\n");
+        for (i, call) in tool_calls.iter().enumerate() {
+            summary.push_str(&format!("{}. {}\n", i + 1, display_tool_call(call)));
+        }
+
+        let sanitized = sanitize_user_facing_reply(&summary);
+
+        // The sanitized output should NOT contain "that" replacements
+        assert!(
+            !sanitized.contains("\n1. that\n"),
+            "display_tool_call output was stripped by sanitizer: {}",
+            sanitized
+        );
+        // Should preserve meaningful content
+        assert!(
+            sanitized.contains("Searched memories"),
+            "sanitized: {}",
+            sanitized
+        );
+        assert!(
+            sanitized.contains("Searched files"),
+            "sanitized: {}",
+            sanitized
+        );
+        assert!(
+            sanitized.contains("Checked goal history"),
+            "sanitized: {}",
+            sanitized
+        );
+        assert!(
+            sanitized.contains("Ran command"),
+            "sanitized: {}",
+            sanitized
+        );
+        assert!(sanitized.contains("Read file"), "sanitized: {}", sanitized);
+        assert!(sanitized.contains("Wrote file"), "sanitized: {}", sanitized);
+        assert!(sanitized.contains("Web search"), "sanitized: {}", sanitized);
     }
 
     #[test]

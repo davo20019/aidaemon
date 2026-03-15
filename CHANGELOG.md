@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.27] - 2026-03-14
+
+### Added
+
+- **Task-start planning**: LLM-driven planning call before the main loop generates a structured `TaskPlan` with goal, steps, tool hints, and success criteria. Installed as a `LinearIntentPlan` and injected into the model context each iteration.
+- **Budget promotion for multi-step plans**: When a captured task plan has 3+ steps and the initial budget tier is None/Small, the budget is promoted to Standard to avoid premature exhaustion.
+- **Dialogue state persistence**: New `DialogueState` system tracks open questions, user responses, and resolution status across turns. Stored in SQLite via `dialogue_state` table.
+- **Scheduled goals tool**: New `ScheduledGoalsTool` for managing scheduled goal operations directly.
+- **`display_tool_call()` helper**: Converts raw tool call strings (e.g. `manage_memories(search)`) to human-friendly display names that survive sanitization.
+- **Task plan context injection**: Each loop iteration receives the current plan as a `TaskPlanContext` system directive.
+- **Terminal background command re-engagement**: After sending completion notifications, the terminal tool re-engages the agent via `handle_message()` with a synthetic follow-up containing the command output for analysis.
+
+### Changed
+
+- **Blocked/partial result messages include plan progress**: `build_reduce_scope_request` and `build_partial_done_blocked_request` now include plan step completion status and remaining work from the linear intent plan.
+- **Activity summaries use `display_tool_call()`**: Background detach summaries in `stopping_phase.rs` now use human-friendly display names instead of raw tool call format, preventing the sanitizer from stripping them to "that".
+- **Skills matching simplified**: Removed redundant matching logic in `skills/mod.rs`.
+- **Telegram channel cleanup**: Simplified message handling logic.
+- **Guard thresholds adjusted**: Tool execution guards updated for better multi-step task support.
+
+### Fixed
+
+- **Sanitizer stripping activity summaries**: Raw `tool_name(args)` format in activity summaries matched `strip_tool_name_references()` regex, replacing all entries with "that". Fixed by using `display_tool_call()`.
+- **Background command notifications without agent analysis**: Completion notifications were sent to the user as raw output with no agent processing. Agent now re-engages to analyze the output.
+
 ## [0.9.26] - 2026-03-13
 
 ### Added

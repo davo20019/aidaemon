@@ -2150,7 +2150,8 @@ async fn test_memory_system_prompt_enrichment() {
         .await
         .unwrap();
 
-    // Check that the system prompt in turn 2 includes the seeded fact
+    // Facts are on-demand now — system prompt should NOT contain the seeded fact,
+    // but SHOULD contain the memory capabilities summary.
     let call_log = harness.provider.call_log.lock().await;
     let turn2_call = &call_log[1];
     let system_msg = turn2_call
@@ -2161,19 +2162,11 @@ async fn test_memory_system_prompt_enrichment() {
     let system_content = system_msg["content"].as_str().unwrap_or("");
 
     assert!(
-        system_content.contains("React") || system_content.contains("TypeScript"),
-        "System prompt should include the seeded fact about React/TypeScript. \
-         System prompt tail: ...{}",
-        &system_content[system_content.len().saturating_sub(500)..]
+        !system_content.contains("React with TypeScript"),
+        "Facts should NOT be bulk-injected into system prompt"
     );
-
-    // Also verify history carries forward (turn 2 has more messages than turn 1)
-    let turn1_msgs = call_log[0].messages.len();
-    let turn2_msgs = call_log[1].messages.len();
     assert!(
-        turn2_msgs > turn1_msgs,
-        "Turn 2 should include turn 1 history: {} vs {}",
-        turn2_msgs,
-        turn1_msgs
+        system_content.contains("Your Memory") || system_content.contains("manage_memories"),
+        "System prompt should contain memory capabilities summary"
     );
 }
