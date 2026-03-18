@@ -358,83 +358,87 @@ impl Agent {
             .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
             .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
 
-        // Use the sticky is_new_task flag from TurnContext (computed once at loop start).
-        // This prevents mid-loop reclassification: when the agent loop runs 10+ iterations,
-        // the loaded history shifts as tool results accumulate. Recomputing word-overlap
-        // each iteration could flip is_new_task from false→true, collapsing context and
-        // causing the model to lose track of its in-progress work.
-        let is_new_task = ctx.is_new_task;
-
-        // Trim old conversation pairs to prevent context pollution.
-        // Two modes:
-        // - New task (is_new_task): keep only the immediately prior user/assistant
-        //   turn as carryover, plus identity-critical snippets. This preserves
-        //   short clarifications even when follow-up classification misses.
-        // - Follow-up (!is_new_task): keep at most 3 old user-assistant pairs.
-        // Without this isolation, prior user/assistant turns leak into unrelated
-        // tasks in the same chat session and the model "answers across tasks".
+        // Adaptive sliding window: keep `window_size` prior conversation pairs.
+        // Instead of branching on is_new_task (brittle classifier), we compute how
+        // many old pairs fit within 30% of the available token budget. This naturally
+        // adapts: large contexts keep more history, small contexts keep less.
         let deduped_msgs: Vec<&Message> = if let Some(boundary) = collapse_boundary {
-            if is_new_task {
-                let mut carryover_indices = std::collections::HashSet::new();
-                if let Some(previous_user_idx) = deduped_msgs[..boundary]
-                    .iter()
-                    .rposition(|m| m.role == "user")
-                {
-                    carryover_indices.insert(previous_user_idx);
-                    for (idx, message) in deduped_msgs
-                        .iter()
-                        .enumerate()
-                        .take(boundary)
-                        .skip(previous_user_idx + 1)
-                    {
-                        if message.role == "assistant" {
-                            carryover_indices.insert(idx);
-                        }
-                    }
-                }
-                let trimmed: Vec<&Message> = deduped_msgs
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(i, _)| {
-                        *i >= boundary
-                            || identity_preserve_indices.contains(i)
-                            || carryover_indices.contains(i)
-                    })
-                    .map(|(_, m)| m)
-                    .collect();
-                if trimmed.len() < pre_collapse_len {
-                    info!(
-                        session_id,
-                        old_messages_trimmed = pre_collapse_len - trimmed.len(),
-                        "Dropped stale pre-boundary conversation for new task"
-                    );
-                }
-                trimmed
+            use crate::memory::context_window::estimate_tokens;
+
+            // Identify old user-assistant pair boundaries.
+            let old_user_positions: Vec<usize> = deduped_msgs
+                .iter()
+                .enumerate()
+                .filter(|(i, m)| *i < boundary && m.role == "user")
+                .map(|(i, _)| i)
+                .collect();
+
+            if old_user_positions.is_empty() {
+                deduped_msgs
             } else {
-                let max_old_pairs = 3usize;
-                let old_user_positions: Vec<usize> = deduped_msgs
+                // Build skeleton token estimates for each old pair.
+                // A "pair" spans from one user message to the next (or to the boundary).
+                let skeleton_pairs: Vec<(usize, usize)> = old_user_positions
                     .iter()
                     .enumerate()
-                    .filter(|(i, m)| *i < boundary && m.role == "user")
-                    .map(|(i, _)| i)
+                    .map(|(pair_idx, &user_pos)| {
+                        let pair_end = if pair_idx + 1 < old_user_positions.len() {
+                            old_user_positions[pair_idx + 1]
+                        } else {
+                            boundary
+                        };
+                        let user_tokens = estimate_tokens(
+                            deduped_msgs[user_pos].content.as_deref().unwrap_or(""),
+                        );
+                        let assistant_tokens: usize = deduped_msgs[user_pos + 1..pair_end]
+                            .iter()
+                            .filter(|m| m.role == "assistant")
+                            .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
+                            .sum();
+                        (user_tokens, assistant_tokens)
+                    })
                     .collect();
-                let keep_from = if old_user_positions.len() > max_old_pairs {
-                    old_user_positions[old_user_positions.len() - max_old_pairs]
+
+                // Compute available budget: model context - system prompt - tool defs - pinned memories.
+                let system_tokens = estimate_tokens(system_prompt);
+                let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
+                let tools_tokens = estimate_tokens(&tools_json);
+                let pinned_tokens: usize = pinned_memories
+                    .iter()
+                    .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
+                    .sum();
+                // Use a reasonable default context window (128k tokens).
+                // The exact model budget doesn't matter much — we only use 30% of
+                // the remainder, so over-estimating is safe.
+                let model_budget = 128_000usize;
+                let available_budget =
+                    model_budget.saturating_sub(system_tokens + tools_tokens + pinned_tokens);
+
+                let window_size =
+                    super::sliding_window::calculate_window_size(&skeleton_pairs, available_budget);
+
+                // Keep the last `window_size` old pairs + everything at/after boundary.
+                let keep_from = if window_size == 0 {
+                    boundary
+                } else if old_user_positions.len() > window_size {
+                    old_user_positions[old_user_positions.len() - window_size]
                 } else {
                     0
                 };
+
                 let trimmed: Vec<&Message> = deduped_msgs
                     .into_iter()
                     .enumerate()
-                    .filter(|(i, _)| *i >= keep_from)
+                    .filter(|(i, _)| *i >= keep_from || identity_preserve_indices.contains(i))
                     .map(|(_, m)| m)
                     .collect();
                 if trimmed.len() < pre_collapse_len {
                     info!(
                         session_id,
                         old_pairs_trimmed = pre_collapse_len - trimmed.len(),
-                        max_old_pairs,
-                        "Trimmed old conversation pairs to protect current-task context"
+                        window_size,
+                        available_budget,
+                        "Adaptive sliding window: trimmed old conversation pairs"
                     );
                 }
                 trimmed

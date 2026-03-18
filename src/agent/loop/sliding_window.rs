@@ -127,7 +127,10 @@ fn extract_terminal_outcome(result: &str) -> String {
     // can arise when `to_lowercase()` changes string length.
     for line in result.lines().rev() {
         let lower = line.to_lowercase();
-        if let Some(pos) = lower.find("exit_code:").or_else(|| lower.find("exit code:")) {
+        if let Some(pos) = lower
+            .find("exit_code:")
+            .or_else(|| lower.find("exit code:"))
+        {
             let after_match = &lower[pos..];
             if let Some(code) = after_match
                 .split(':')
@@ -193,6 +196,96 @@ fn extract_write_outcome(result: &str) -> String {
     }
 }
 
+/// Calculate how many prior conversation pairs fit within a token budget.
+///
+/// Returns `min(5, pairs_that_fit_in_30%_of_budget)`.
+/// Iterates from most recent (end of slice) backward, accumulating token estimates
+/// until 30% of the available budget is exhausted.
+///
+/// Each element of `skeleton_pairs` is `(user_token_estimate, assistant_token_estimate)`.
+pub(super) fn calculate_window_size(
+    skeleton_pairs: &[(usize, usize)],
+    available_budget: usize,
+) -> usize {
+    let budget_30pct = available_budget * 30 / 100;
+    let mut used = 0usize;
+    let mut count = 0usize;
+
+    for &(user_tokens, assistant_tokens) in skeleton_pairs.iter().rev() {
+        let pair_cost = user_tokens + assistant_tokens;
+        if used + pair_cost > budget_30pct {
+            break;
+        }
+        used += pair_cost;
+        count += 1;
+        if count >= 5 {
+            break;
+        }
+    }
+
+    count
+}
+
+/// Extract a skeleton from a sequence of messages belonging to one interaction.
+///
+/// The skeleton preserves signal while minimizing tokens:
+/// - **User messages**: kept as-is (text content preserved).
+/// - **Assistant messages with text**: text content preserved, `tool_calls` stripped.
+/// - **Assistant messages without text** (tool-call-only): content replaced with
+///   `"[Action completed]"` so there is always a response to the user message.
+///   Dropping the message entirely would leave a dangling user message which can
+///   trigger "completion compulsion" in models.
+/// - **Tool messages** (`role: "tool"`): dropped entirely.
+/// - **System messages**: dropped.
+pub(super) fn extract_skeleton(messages: &[Value]) -> Vec<Value> {
+    let mut result = Vec::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+        match role {
+            "user" => {
+                // Keep user messages as-is
+                result.push(msg.clone());
+            }
+            "assistant" => {
+                let has_text = msg
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| !s.trim().is_empty());
+
+                if has_text {
+                    // Keep text content, strip tool_calls
+                    let mut skeleton = serde_json::json!({
+                        "role": "assistant",
+                        "content": msg.get("content").unwrap(),
+                    });
+                    // Preserve any extra fields like "name" but NOT "tool_calls"
+                    if let Some(obj) = msg.as_object() {
+                        for (key, val) in obj {
+                            if key != "role" && key != "content" && key != "tool_calls" {
+                                skeleton[key] = val.clone();
+                            }
+                        }
+                    }
+                    result.push(skeleton);
+                } else {
+                    // No text content (tool-call-only assistant message)
+                    // Replace with placeholder to prevent dangling user messages
+                    result.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": "[Action completed]",
+                    }));
+                }
+            }
+            // Drop tool messages and system messages
+            _ => {}
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,11 +312,7 @@ mod tests {
 
     #[test]
     fn test_terminal_no_exit_code() {
-        let result = summarize_tool_result(
-            "terminal",
-            r#"{"command": "echo hello"}"#,
-            "hello",
-        );
+        let result = summarize_tool_result("terminal", r#"{"command": "echo hello"}"#, "hello");
         assert_eq!(result, "terminal: echo hello -> completed");
     }
 
@@ -286,53 +375,36 @@ mod tests {
 
     #[test]
     fn test_http_request_default_method() {
-        let result = summarize_tool_result(
-            "http_request",
-            r#"{"url": "example.com"}"#,
-            "200 OK",
-        );
+        let result = summarize_tool_result("http_request", r#"{"url": "example.com"}"#, "200 OK");
         assert_eq!(result, "http_request: GET example.com -> 200 OK");
     }
 
     #[test]
     fn test_read_file_line_count() {
         let content = "line 1\nline 2\nline 3\nline 4\nline 5";
-        let result = summarize_tool_result(
-            "read_file",
-            r#"{"path": "src/main.rs"}"#,
-            content,
-        );
+        let result = summarize_tool_result("read_file", r#"{"path": "src/main.rs"}"#, content);
         assert_eq!(result, "read_file: src/main.rs -> 5 lines");
     }
 
     #[test]
     fn test_read_file_single_line() {
-        let result = summarize_tool_result(
-            "read_file",
-            r#"{"path": "VERSION"}"#,
-            "1.0.0",
-        );
+        let result = summarize_tool_result("read_file", r#"{"path": "VERSION"}"#, "1.0.0");
         assert_eq!(result, "read_file: VERSION -> 1 line");
     }
 
     #[test]
     fn test_read_file_empty() {
-        let result = summarize_tool_result(
-            "read_file",
-            r#"{"path": "empty.txt"}"#,
-            "",
-        );
+        let result = summarize_tool_result("read_file", r#"{"path": "empty.txt"}"#, "");
         assert_eq!(result, "read_file: empty.txt -> empty");
     }
 
     #[test]
     fn test_read_file_many_lines() {
-        let content = (1..=245).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let result = summarize_tool_result(
-            "read_file",
-            r#"{"path": "src/main.rs"}"#,
-            &content,
-        );
+        let content = (1..=245)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = summarize_tool_result("read_file", r#"{"path": "src/main.rs"}"#, &content);
         assert_eq!(result, "read_file: src/main.rs -> 245 lines");
     }
 
@@ -408,21 +480,14 @@ mod tests {
 
     #[test]
     fn test_unknown_tool_with_string_arg() {
-        let result = summarize_tool_result(
-            "custom_tool",
-            r#"{"task": "do_thing", "count": 5}"#,
-            "done",
-        );
+        let result =
+            summarize_tool_result("custom_tool", r#"{"task": "do_thing", "count": 5}"#, "done");
         assert_eq!(result, "custom_tool: do_thing -> completed");
     }
 
     #[test]
     fn test_unknown_tool_no_string_args() {
-        let result = summarize_tool_result(
-            "custom_tool",
-            r#"{"count": 5, "flag": true}"#,
-            "done",
-        );
+        let result = summarize_tool_result("custom_tool", r#"{"count": 5, "flag": true}"#, "done");
         assert_eq!(result, "custom_tool: -> completed");
     }
 
@@ -478,7 +543,10 @@ mod tests {
             r#"{"method": "GET", "url": "example.com/missing"}"#,
             "404 Not Found",
         );
-        assert_eq!(result, "http_request: GET example.com/missing -> 404 Not Found");
+        assert_eq!(
+            result,
+            "http_request: GET example.com/missing -> 404 Not Found"
+        );
     }
 
     #[test]
@@ -494,5 +562,178 @@ mod tests {
         assert!(!looks_like_http_status("no status here"));
         assert!(!looks_like_http_status("600 is not valid"));
         assert!(!looks_like_http_status("99 too short"));
+    }
+
+    // ─── calculate_window_size tests ───
+
+    #[test]
+    fn test_window_size_all_five_fit() {
+        // 5 small pairs: each ~50 tokens. Budget 10000 → 30% = 3000. All fit easily.
+        let pairs = vec![(25, 25); 5];
+        assert_eq!(calculate_window_size(&pairs, 10000), 5);
+    }
+
+    #[test]
+    fn test_window_size_budget_limited() {
+        // 5 pairs, each ~500 tokens. Budget 4000 → 30% = 1200. Only 2 fit (1000 < 1200 < 1500).
+        let pairs = vec![(250, 250); 5];
+        assert_eq!(calculate_window_size(&pairs, 4000), 2);
+    }
+
+    #[test]
+    fn test_window_size_tiny_budget_zero() {
+        // Budget 100 → 30% = 30. Each pair is 200 tokens. None fit.
+        let pairs = vec![(100, 100); 3];
+        assert_eq!(calculate_window_size(&pairs, 100), 0);
+    }
+
+    #[test]
+    fn test_window_size_empty_pairs() {
+        assert_eq!(calculate_window_size(&[], 10000), 0);
+    }
+
+    #[test]
+    fn test_window_size_large_budget_caps_at_five() {
+        // 10 pairs, huge budget. Should cap at 5.
+        let pairs = vec![(10, 10); 10];
+        assert_eq!(calculate_window_size(&pairs, 1_000_000), 5);
+    }
+
+    #[test]
+    fn test_window_size_exactly_at_boundary() {
+        // 30% of 1000 = 300. 3 pairs of 100 each = 300. Should fit exactly 3.
+        let pairs = vec![(50, 50); 5];
+        assert_eq!(calculate_window_size(&pairs, 1000), 3);
+    }
+
+    #[test]
+    fn test_window_size_just_over_boundary() {
+        // 30% of 1000 = 300. 3 pairs: 101 each = 303 > 300. Only 2 fit.
+        let pairs = vec![(51, 50); 5];
+        assert_eq!(calculate_window_size(&pairs, 1000), 2);
+    }
+
+    // ─── extract_skeleton tests ───
+
+    #[test]
+    fn test_skeleton_strips_tool_calls_from_assistant() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "Hello"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "Let me check that.",
+                "tool_calls": [{"id": "tc1", "function": {"name": "read_file", "arguments": "{}"}}]
+            }),
+        ];
+        let skeleton = extract_skeleton(&messages);
+        assert_eq!(skeleton.len(), 2);
+        assert_eq!(skeleton[0]["role"], "user");
+        assert_eq!(skeleton[0]["content"], "Hello");
+        assert_eq!(skeleton[1]["role"], "assistant");
+        assert_eq!(skeleton[1]["content"], "Let me check that.");
+        assert!(skeleton[1].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_skeleton_drops_tool_results() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "Read my file"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc1", "function": {"name": "read_file", "arguments": "{}"}}]
+            }),
+            serde_json::json!({"role": "tool", "content": "file contents here...", "tool_call_id": "tc1", "name": "read_file"}),
+            serde_json::json!({"role": "assistant", "content": "Here are the contents of your file."}),
+        ];
+        let skeleton = extract_skeleton(&messages);
+        assert_eq!(skeleton.len(), 3); // user, [Action completed], assistant
+                                       // No tool messages
+        assert!(skeleton.iter().all(|m| m["role"] != "tool"));
+    }
+
+    #[test]
+    fn test_skeleton_replaces_empty_assistant_with_action_completed() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "Write to file"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc1", "function": {"name": "write_file", "arguments": "{}"}}]
+            }),
+        ];
+        let skeleton = extract_skeleton(&messages);
+        assert_eq!(skeleton.len(), 2);
+        assert_eq!(skeleton[1]["role"], "assistant");
+        assert_eq!(skeleton[1]["content"], "[Action completed]");
+    }
+
+    #[test]
+    fn test_skeleton_replaces_empty_string_assistant_with_action_completed() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "Do something"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "   ",
+                "tool_calls": [{"id": "tc1", "function": {"name": "terminal", "arguments": "{}"}}]
+            }),
+        ];
+        let skeleton = extract_skeleton(&messages);
+        assert_eq!(skeleton.len(), 2);
+        assert_eq!(skeleton[1]["content"], "[Action completed]");
+    }
+
+    #[test]
+    fn test_skeleton_drops_system_messages() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "You are helpful."}),
+            serde_json::json!({"role": "user", "content": "Hello"}),
+            serde_json::json!({"role": "assistant", "content": "Hi!"}),
+        ];
+        let skeleton = extract_skeleton(&messages);
+        assert_eq!(skeleton.len(), 2);
+        assert_eq!(skeleton[0]["role"], "user");
+        assert_eq!(skeleton[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_skeleton_handles_multiple_interactions() {
+        let messages = vec![
+            // First interaction
+            serde_json::json!({"role": "user", "content": "What time is it?"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc1", "function": {"name": "terminal", "arguments": r#"{"command":"date"}"#}}]
+            }),
+            serde_json::json!({"role": "tool", "content": "Mon Mar 17 12:00:00 UTC 2025", "tool_call_id": "tc1", "name": "terminal"}),
+            serde_json::json!({"role": "assistant", "content": "It's noon on March 17th."}),
+            // Second interaction
+            serde_json::json!({"role": "user", "content": "Write a greeting"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "I'll write that for you.",
+                "tool_calls": [{"id": "tc2", "function": {"name": "write_file", "arguments": "{}"}}]
+            }),
+            serde_json::json!({"role": "tool", "content": "File written successfully", "tool_call_id": "tc2", "name": "write_file"}),
+            serde_json::json!({"role": "assistant", "content": "Done! I wrote the greeting file."}),
+        ];
+        let skeleton = extract_skeleton(&messages);
+        // Expected: user, [Action completed], assistant, user, assistant (stripped), assistant
+        assert_eq!(skeleton.len(), 6);
+        assert!(skeleton.iter().all(|m| m["role"] != "tool"));
+        assert_eq!(skeleton[0]["content"], "What time is it?");
+        assert_eq!(skeleton[1]["content"], "[Action completed]"); // tool-call-only assistant
+        assert_eq!(skeleton[2]["content"], "It's noon on March 17th.");
+        assert_eq!(skeleton[3]["content"], "Write a greeting");
+        assert_eq!(skeleton[4]["content"], "I'll write that for you."); // tool_calls stripped
+        assert!(skeleton[4].get("tool_calls").is_none());
+        assert_eq!(skeleton[5]["content"], "Done! I wrote the greeting file.");
+    }
+
+    #[test]
+    fn test_skeleton_empty_input() {
+        let skeleton = extract_skeleton(&[]);
+        assert!(skeleton.is_empty());
     }
 }
