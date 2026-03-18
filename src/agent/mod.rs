@@ -177,6 +177,8 @@ pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) use history::VerificationTarget;
 pub(in crate::agent) use history::VerificationTargetKind;
+#[path = "loop/compaction.rs"]
+mod compaction;
 #[path = "runtime/llm.rs"]
 mod llm;
 #[path = "loop/llm_phase.rs"]
