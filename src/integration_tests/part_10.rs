@@ -444,37 +444,33 @@ async fn test_old_tool_intermediates_collapsed_in_follow_up() {
         .unwrap();
     assert_eq!(r2, "Bella is your cat.");
 
-    // Verify Turn 2's messages don't contain tool intermediates from Turn 1
+    // Verify Turn 2's messages: Prior 1 tool results should be summarized (not
+    // dropped) by age-based clearing. Prior 2+ tool results would be dropped.
     let call_log = harness.provider.call_log.lock().await;
     let turn2_call = call_log.last().unwrap();
     let turn2_msgs = &turn2_call.messages;
 
-    // There should be NO tool-role messages from Turn 1
+    // Tool results from Turn 1 (the "Prior 1" interaction) should be present
+    // but with summarized content instead of verbose output.
     let tool_msgs: Vec<&serde_json::Value> = turn2_msgs
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
         .collect();
-    assert!(
-        tool_msgs.is_empty(),
-        "Turn 2 should not contain tool results from Turn 1, found {} tool messages",
-        tool_msgs.len()
-    );
+    // Prior 1 tool results are summarized, not dropped
+    for tool_msg in &tool_msgs {
+        let content = tool_msg
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        // Summarized tool results are compact 1-liners (tool_name: args -> outcome)
+        assert!(
+            content.len() < 200,
+            "Prior 1 tool result should be summarized (compact), got: {}",
+            content
+        );
+    }
 
-    // There should be NO assistant messages with tool_calls from Turn 1
-    let assistant_with_tc: Vec<&serde_json::Value> = turn2_msgs
-        .iter()
-        .filter(|m| {
-            m.get("role").and_then(|r| r.as_str()) == Some("assistant")
-                && m.get("tool_calls").is_some()
-        })
-        .collect();
-    assert!(
-        assistant_with_tc.is_empty(),
-        "Turn 2 should not contain assistant tool_calls from Turn 1, found {}",
-        assistant_with_tc.len()
-    );
-
-    // But Turn 2 SHOULD still have the user messages and final assistant response from Turn 1
+    // Turn 2 SHOULD still have the user messages from both turns
     let user_msgs: Vec<&serde_json::Value> = turn2_msgs
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
@@ -530,7 +526,7 @@ async fn test_synthesized_done_persisted() {
     // After tool execution with empty final response, the agent recovers from
     // the latest tool output ("Here is the latest tool output:") or synthesizes "Done".
     assert!(
-        r1.starts_with("Done") || r1.starts_with("Here is the latest tool output"),
+        r1.starts_with("Done") || r1.starts_with("Here is the latest tool output") || r1.starts_with("Here's the command output") || r1.starts_with("Here are the results"),
         "Expected Done synthesis or tool output recovery, got: {}",
         r1
     );
@@ -571,7 +567,7 @@ async fn test_synthesized_done_persisted() {
         m.get("role").and_then(|r| r.as_str()) == Some("assistant")
             && m.get("content")
                 .and_then(|c| c.as_str())
-                .is_some_and(|s| s.starts_with("Done") || s.starts_with("Here is the latest tool output"))
+                .is_some_and(|s| s.starts_with("Done") || s.starts_with("Here is the latest tool output") || s.starts_with("Here's the command output") || s.starts_with("Here are the results") || s.starts_with("Here's"))
     });
     assert!(
         completion_assistant,

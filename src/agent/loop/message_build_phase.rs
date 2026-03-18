@@ -283,16 +283,43 @@ impl Agent {
             );
         }
         let pre_collapse_len = deduped_msgs.len();
+        // Find "Prior 1" start: the user message immediately before the boundary.
+        // Tool results in [prior_1_start, boundary) are summarized (not dropped).
+        // Tool results before prior_1_start are dropped entirely (Prior 2+).
+        let prior_1_start: Option<usize> = last_user_pos.and_then(|boundary| {
+            deduped_msgs[..boundary]
+                .iter()
+                .rposition(|m| m.role == "user")
+        });
+        // Collect message IDs of tool results in the Prior 1 range for summary
+        // replacement during JSON conversion. We collect IDs (not indices) because
+        // the Vec is rebuilt by the filter below.
+        let prior_1_tool_ids: std::collections::HashSet<String> =
+            if let (Some(p1_start), Some(boundary)) = (prior_1_start, last_user_pos) {
+                deduped_msgs[p1_start..boundary]
+                    .iter()
+                    .filter(|m| m.role == "tool")
+                    .map(|m| m.id.clone())
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
         let deduped_msgs: Vec<&Message> = if let Some(boundary) = last_user_pos {
+            let p1 = prior_1_start.unwrap_or(boundary);
             deduped_msgs
                 .into_iter()
                 .enumerate()
                 .filter(|(i, m)| {
                     if *i >= boundary {
                         true // current interaction: keep everything
+                    } else if *i >= p1 {
+                        // Prior 1 interaction: keep tool results (they will be
+                        // summarized during JSON conversion), keep everything else
+                        true
                     } else {
-                        // old interactions: drop tool results only; assistant messages
-                        // survive (orphan stripping handles their tool_calls in JSON conversion)
+                        // Prior 2+ interactions: drop tool results only; assistant
+                        // messages survive (orphan stripping handles their
+                        // tool_calls in JSON conversion)
                         m.role != "tool" || identity_preserve_indices.contains(i)
                     }
                 })
@@ -334,10 +361,12 @@ impl Agent {
                 .collect()
         };
         let collapsed = pre_collapse_len.saturating_sub(deduped_msgs.len());
-        if collapsed > 0 {
+        if collapsed > 0 || !prior_1_tool_ids.is_empty() {
             info!(
                 session_id,
-                collapsed, "Collapsed tool results from previous interactions"
+                dropped = collapsed,
+                summarized = prior_1_tool_ids.len(),
+                "Age-based tool result clearing: dropped Prior 2+ results, summarizing Prior 1 results"
             );
         }
 
@@ -544,6 +573,30 @@ impl Agent {
             .filter_map(|m| m.tool_call_id.as_deref())
             .collect();
 
+        // Build lookup: tool_call_id → (tool_name, arguments_json) from assistant
+        // messages. Used to generate 1-line summaries for Prior 1 tool results.
+        let tool_call_info: std::collections::HashMap<String, (String, String)> =
+            if !prior_1_tool_ids.is_empty() {
+                let mut map = std::collections::HashMap::new();
+                for m in deduped_msgs.iter() {
+                    if m.role == "assistant" {
+                        if let Some(tc_json) = &m.tool_calls_json {
+                            if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
+                                for tc in &tcs {
+                                    map.insert(
+                                        tc.id.clone(),
+                                        (tc.name.clone(), tc.arguments.clone()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                map
+            } else {
+                std::collections::HashMap::new()
+            };
+
         let mut messages: Vec<Value> = deduped_msgs
             .iter()
             // Skip tool results with empty/missing tool_name
@@ -554,7 +607,35 @@ impl Agent {
                 // append marker text (e.g. "[prior turn]") because LLMs tend
                 // to echo such markers, producing empty or garbage replies.
                 let is_old_assistant = old_interaction_assistant_ids.contains(m.id.as_str());
-                let content = if is_old_assistant {
+
+                // Age-based tool result summarization: Prior 1 tool results get
+                // their verbose content replaced with a deterministic 1-line summary.
+                // Exception: identity-critical tool results keep their full content.
+                let is_identity_critical = m
+                    .content
+                    .as_deref()
+                    .is_some_and(text_relates_to_critical_identity);
+                let content = if m.role == "tool"
+                    && prior_1_tool_ids.contains(&m.id)
+                    && !is_identity_critical
+                {
+                    let tc_id = m.tool_call_id.as_deref().unwrap_or("");
+                    let (tool_name, args_json) = tool_call_info
+                        .get(tc_id)
+                        .map(|(n, a)| (n.as_str(), a.as_str()))
+                        .unwrap_or_else(|| {
+                            (
+                                m.tool_name.as_deref().unwrap_or("unknown"),
+                                "",
+                            )
+                        });
+                    let result_content = m.content.as_deref().unwrap_or("");
+                    Some(super::sliding_window::summarize_tool_result(
+                        tool_name,
+                        args_json,
+                        result_content,
+                    ))
+                } else if is_old_assistant {
                     m.content.as_ref().map(|c| {
                         if c.len() > MAX_OLD_ASSISTANT_CONTENT_CHARS {
                             let truncated: String =
@@ -626,10 +707,15 @@ impl Agent {
                             if m.content.is_none() {
                                 obj["content"] = Value::Null;
                             }
-                        } else if m.content.is_none() {
+                        } else if m.content.is_none()
+                            || m.content
+                                .as_deref()
+                                .is_some_and(|c| c.trim().is_empty())
+                        {
                             // Assistant message had tool_calls but all were orphaned,
-                            // and no text content — drop it entirely
-                            return None;
+                            // and no text content — replace with [Action completed] to
+                            // prevent dangling user messages (completion compulsion bug)
+                            obj["content"] = json!("[Action completed]");
                         }
                     }
                 }
@@ -1091,7 +1177,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_task_message_build_keeps_only_immediately_prior_turn() {
+    async fn sliding_window_retains_pairs_that_fit_budget() {
         use crate::execution_policy::PolicyBundle;
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::{ConversationSummary, MessageStore};
@@ -1159,24 +1245,26 @@ mod tests {
             .expect("message build");
         let serialized = serde_json::to_string(&built.messages).expect("serialize messages");
 
+        // Adaptive sliding window keeps all pairs that fit within 30% of the
+        // token budget. Both small pairs easily fit, so all are retained.
         assert!(
             serialized.contains("blog.aidaemon.ai"),
-            "new-task prompt should retain the immediately prior user turn: {}",
+            "immediately prior user turn should be retained: {}",
             serialized
         );
         assert!(
             serialized.contains("Which posts should I update?"),
-            "new-task prompt should retain the immediately prior assistant turn: {}",
+            "immediately prior assistant turn should be retained: {}",
             serialized
         );
         assert!(
-            !serialized.contains("Older task"),
-            "new-task prompt should drop older pre-boundary turns: {}",
+            serialized.contains("Older task"),
+            "older pair within budget should be retained by sliding window: {}",
             serialized
         );
         assert!(
-            !serialized.contains("Older answer"),
-            "new-task prompt should drop older pre-boundary assistant turns: {}",
+            serialized.contains("Older answer"),
+            "older assistant within budget should be retained: {}",
             serialized
         );
         assert!(

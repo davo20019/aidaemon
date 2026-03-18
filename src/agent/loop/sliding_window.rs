@@ -4,8 +4,7 @@
 //! with compact summaries in old conversation pairs, preserving context while
 //! reducing token count.
 
-// Not yet wired into the message build phase — will be used by a later task.
-#![allow(dead_code)]
+// Used by message_build_phase.rs for age-based tool result summarization.
 
 use serde_json::Value;
 
