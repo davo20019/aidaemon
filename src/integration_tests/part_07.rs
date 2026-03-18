@@ -197,13 +197,17 @@ async fn test_orchestration_simple_uses_full_loop_with_all_tools() {
     // Simple tasks now use the full agent loop with all tools available.
     // Verify the agent can complete a simple task through the full loop.
     let provider = MockProvider::with_responses(vec![
-        // 1st call: first routing pass
+        // 1st call: first routing pass (INTENT_GATE classification)
         MockProvider::text_response(
             "I'll help with that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
         ),
-        // 2nd call: full agent loop makes a tool call
+        // 2nd call: tool prelude forces tool use after text-only INTENT_GATE
         MockProvider::tool_call_response("system_info", "{}"),
-        // 3rd call: full agent loop returns final response
+        // 3rd-5th calls: final response, repeated to survive mutation-contract
+        // nudges ("run" triggers expects_mutation=true → up to 2 extra iterations
+        // before text response is accepted).
+        MockProvider::text_response("Diagnostics complete. All systems normal."),
+        MockProvider::text_response("Diagnostics complete. All systems normal."),
         MockProvider::text_response("Diagnostics complete. All systems normal."),
     ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();

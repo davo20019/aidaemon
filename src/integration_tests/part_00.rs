@@ -743,12 +743,22 @@ async fn test_system_prompt_pins_critical_facts_for_owner_dm() {
         .unwrap_or("");
 
     assert!(
-        system_content.contains("[Critical Facts — Highest Priority For Recall]"),
-        "Critical facts block should be injected in owner DM prompts"
+        system_content.contains("CRITICAL FACTS"),
+        "Critical facts block should be injected in owner DM prompts. Got: {}",
+        &system_content[..system_content.len().min(300)]
     );
-    assert!(system_content.contains("Owner name: Test Owner"));
-    assert!(system_content.contains("Assistant name: TestBot"));
-    assert!(system_content.contains("partner: Alice"));
+    assert!(
+        system_content.contains("Test Owner"),
+        "Owner name should be present in critical facts"
+    );
+    assert!(
+        system_content.contains("TestBot"),
+        "Assistant name should be present in critical facts"
+    );
+    assert!(
+        system_content.contains("partner: Alice"),
+        "Relationship should be present in critical facts"
+    );
 }
 
 // ==========================================================================

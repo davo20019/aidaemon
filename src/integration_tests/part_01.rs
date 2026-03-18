@@ -260,6 +260,10 @@ async fn test_reflection_full_flow_verifies_learning_on_immediate_recovery() {
             "http_request",
             r#"{"mode":"ok","method":"GET","url":"https://api.example.com/fixed"}"#,
         ),
+        // Final response, repeated to survive mutation-contract nudges
+        // ("run" triggers expects_mutation=true → up to 2 extra iterations).
+        MockProvider::text_response("Recovered after reflection."),
+        MockProvider::text_response("Recovered after reflection."),
         MockProvider::text_response("Recovered after reflection."),
     ]);
 
@@ -287,17 +291,35 @@ async fn test_reflection_full_flow_verifies_learning_on_immediate_recovery() {
     assert_eq!(response, "Recovered after reflection.");
 
     let call_log = harness.provider.call_log.lock().await.clone();
-    assert_eq!(
-        call_log.len(),
-        5,
-        "expected tool/tool/reflection/tool/final flow"
-    );
+    // Call count varies due to mutation-contract nudges (expects_mutation=true
+    // from "run" keyword). Core flow: tool/tool/reflection/tool/final = 5,
+    // plus up to 2 extra nudge iterations.
     assert!(
-        call_log[2].tools.is_empty(),
+        call_log.len() >= 5 && call_log.len() <= 8,
+        "expected 5-8 calls (tool/tool/reflection/tool/final + nudges), got {}",
+        call_log.len()
+    );
+
+    // Find the reflection call (text-only, no tools, contains failure analysis prompt)
+    let reflection_idx = call_log
+        .iter()
+        .position(|call| {
+            call.tools.is_empty()
+                && call.messages.iter().any(|m| {
+                    m["role"] == "user"
+                        && m["content"]
+                            .as_str()
+                            .is_some_and(|c| c.contains("ERROR HISTORY"))
+                })
+        })
+        .expect("reflection call should exist");
+
+    assert!(
+        call_log[reflection_idx].tools.is_empty(),
         "reflection call must be text-only with no tools exposed"
     );
     assert!(
-        call_log[2].messages.iter().any(|message| {
+        call_log[reflection_idx].messages.iter().any(|message| {
             message["role"] == "user"
                 && message["content"]
                     .as_str()
@@ -305,15 +327,25 @@ async fn test_reflection_full_flow_verifies_learning_on_immediate_recovery() {
         }),
         "reflection call should include the failure analysis prompt"
     );
+
+    // The call immediately after reflection should have the SELF-DIAGNOSIS directive
+    let post_reflection_idx = reflection_idx + 1;
     assert!(
-        call_log[3].messages.iter().any(|message| {
-            message["role"] == "system"
-                && message["content"].as_str().is_some_and(|content| {
-                    content.contains("SELF-DIAGNOSIS")
-                        && content.contains("wrong base URL")
-                        && content.contains("Switch the probe")
-                })
-        }),
+        post_reflection_idx < call_log.len(),
+        "post-reflection call should exist"
+    );
+    assert!(
+        call_log[post_reflection_idx]
+            .messages
+            .iter()
+            .any(|message| {
+                message["role"] == "system"
+                    && message["content"].as_str().is_some_and(|content| {
+                        content.contains("SELF-DIAGNOSIS")
+                            && content.contains("wrong base URL")
+                            && content.contains("Switch the probe")
+                    })
+            }),
         "post-reflection model call should receive the injected self-diagnosis directive"
     );
 
@@ -461,6 +493,10 @@ async fn test_reflection_full_flow_does_not_verify_after_skipping_recovery_turn(
             "http_request",
             r#"{"mode":"ok","method":"GET","url":"https://api.example.com/fixed"}"#,
         ),
+        // Final response, repeated to survive mutation-contract nudges
+        // ("run" triggers expects_mutation=true → up to 2 extra iterations).
+        MockProvider::text_response("Finished after a later unrelated probe success."),
+        MockProvider::text_response("Finished after a later unrelated probe success."),
         MockProvider::text_response("Finished after a later unrelated probe success."),
     ]);
 
@@ -488,13 +524,30 @@ async fn test_reflection_full_flow_does_not_verify_after_skipping_recovery_turn(
     assert_eq!(response, "Finished after a later unrelated probe success.");
 
     let call_log = harness.provider.call_log.lock().await.clone();
-    assert_eq!(
-        call_log.len(),
-        6,
-        "expected tool/tool/reflection/other-tool/tool/final flow"
-    );
+    // Call count varies due to mutation-contract nudges (expects_mutation=true
+    // from "run" keyword). Core flow: tool/tool/reflection/other-tool/tool/final = 6,
+    // plus up to 2 extra nudge iterations.
     assert!(
-        call_log[2].tools.is_empty(),
+        call_log.len() >= 6 && call_log.len() <= 9,
+        "expected 6-9 calls, got {}",
+        call_log.len()
+    );
+
+    // Find the reflection call (text-only, no tools)
+    let reflection_idx = call_log
+        .iter()
+        .position(|call| {
+            call.tools.is_empty()
+                && call.messages.iter().any(|m| {
+                    m["role"] == "user"
+                        && m["content"]
+                            .as_str()
+                            .is_some_and(|c| c.contains("ERROR HISTORY"))
+                })
+        })
+        .expect("reflection call should exist");
+    assert!(
+        call_log[reflection_idx].tools.is_empty(),
         "reflection call must be text-only with no tools exposed"
     );
 

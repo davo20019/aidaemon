@@ -5,7 +5,7 @@
 /// should be injected to separate old context from the current task.
 ///
 /// Scenario: Turn 1 asks "Why?", Turn 2 asks to find a file.
-/// Turn 2's LLM calls should see a [TASK BOUNDARY] marker separating the old "Why?"
+/// Turn 2's LLM calls should see a [Current Task] marker separating the old "Why?"
 /// from the current request, preventing the model from responding to old context.
 #[tokio::test]
 async fn test_task_boundary_injected_between_turns() {
@@ -53,7 +53,7 @@ async fn test_task_boundary_injected_between_turns() {
         .unwrap();
 
     // Verify: any LLM call for Turn 2 that includes old "Why?" context
-    // must also have a [TASK BOUNDARY] marker separating old from new.
+    // must also have a [Current Task] marker separating old from new.
     let call_log = harness.provider.call_log.lock().await;
     assert!(
         call_log.len() >= 2,
@@ -88,14 +88,14 @@ async fn test_task_boundary_injected_between_turns() {
             m.get("role").and_then(|r| r.as_str()) == Some("system")
                 && m.get("content")
                     .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.contains("[TASK BOUNDARY]"))
+                    .is_some_and(|s| s.contains("[Current Task]"))
         });
         // If old context is present, boundary must be too. If old context was dropped, that's fine.
         !has_old_user || has_boundary
     });
     assert!(
         turn2_calls_ok,
-        "All Turn 2 LLM calls must have [TASK BOUNDARY] when old user context is present"
+        "All Turn 2 LLM calls must have [Current Task] when old user context is present"
     );
 }
 
