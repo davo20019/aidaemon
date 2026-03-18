@@ -207,6 +207,8 @@ mod tool_execution_phase;
 mod tool_prelude_phase;
 #[path = "loop/tool_result_notices.rs"]
 mod tool_result_notices;
+#[path = "loop/sliding_window.rs"]
+mod sliding_window;
 
 pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
 use system_prompt::{build_tool_loop_system_prompt, format_goal_context, ToolLoopPromptStyle};
