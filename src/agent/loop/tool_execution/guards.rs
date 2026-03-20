@@ -257,6 +257,7 @@ impl Agent {
             tc.name.as_str(),
             "read_file"
                 | "search_files"
+                | "manage_goal_tasks"
                 | "check_environment"
                 | "web_search"
                 | "web_fetch"
