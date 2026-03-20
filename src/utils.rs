@@ -195,3 +195,41 @@ mod tests {
         }
     }
 }
+
+/// Extract a JSON object from LLM output, handling code fences and preamble text.
+/// Tries direct parse first, then falls back to finding `{...}` bounds.
+pub fn extract_json_object(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let candidate = if trimmed.starts_with("```") {
+        trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```JSON")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+            .to_string()
+    } else {
+        trimmed.to_string()
+    };
+    if serde_json::from_str::<serde_json::Value>(&candidate)
+        .ok()
+        .is_some_and(|v| v.is_object())
+    {
+        return Some(candidate);
+    }
+
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let sliced = raw[start..=end].trim().to_string();
+    if serde_json::from_str::<serde_json::Value>(&sliced)
+        .ok()
+        .is_some_and(|v| v.is_object())
+    {
+        Some(sliced)
+    } else {
+        None
+    }
+}

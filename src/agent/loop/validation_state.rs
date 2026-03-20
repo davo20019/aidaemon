@@ -689,6 +689,7 @@ pub fn build_needs_approval_request(
     }
 }
 
+#[allow(dead_code)]
 pub fn build_partial_done_blocked_request(
     turn_context: &TurnContext,
     learning_ctx: &LearningContext,
@@ -739,6 +740,7 @@ pub fn build_partial_done_blocked_request_with_plan(
     }
 }
 
+#[allow(dead_code)]
 pub fn build_reduce_scope_request(
     turn_context: &TurnContext,
     learning_ctx: &LearningContext,

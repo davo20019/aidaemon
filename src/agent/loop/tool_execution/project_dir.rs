@@ -325,7 +325,22 @@ pub(super) fn scope_allows_project_dir(scope_path: &str, candidate_path: &str) -
     let Some(candidate) = crate::tools::fs_utils::validate_path(candidate_path).ok() else {
         return true;
     };
-    candidate.starts_with(scope)
+    // Allow descendant paths (original behavior)
+    if candidate.starts_with(&scope) {
+        return true;
+    }
+    // Allow ancestor paths up to 2 levels above the scope.
+    // This lets users search parent directories (e.g. "find Rust projects in ~/projects/"
+    // when scope is locked to ~/projects/aidaemon/). The bot can already reach these via
+    // terminal, so blocking search_files just forces a worse fallback.
+    if scope.starts_with(&candidate) {
+        let relative = scope
+            .strip_prefix(&candidate)
+            .unwrap_or(std::path::Path::new(""));
+        let depth = relative.components().count();
+        return depth <= 2;
+    }
+    false
 }
 
 pub(super) fn is_file_recheck_tool(tool_name: &str) -> bool {
@@ -584,9 +599,16 @@ mod tests {
     }
 
     #[test]
-    fn scope_allows_only_descendant_paths() {
+    fn scope_allows_descendant_and_near_ancestor_paths() {
+        // Descendant: always allowed
         assert!(scope_allows_project_dir("/tmp/a", "/tmp/a/src"));
+        // Sibling: blocked
         assert!(!scope_allows_project_dir("/tmp/a", "/tmp/b/src"));
+        // Ancestor up to 2 levels: allowed
+        assert!(scope_allows_project_dir("/tmp/a/b", "/tmp/a")); // 1 level up
+        assert!(scope_allows_project_dir("/tmp/a/b/c", "/tmp/a")); // 2 levels up
+                                                                   // Ancestor more than 2 levels: blocked
+        assert!(!scope_allows_project_dir("/tmp/a/b/c/d", "/tmp/a")); // 3 levels up
     }
 
     #[test]

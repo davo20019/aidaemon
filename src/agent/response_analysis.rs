@@ -197,6 +197,59 @@ pub(super) fn is_substantive_text_response(text: &str, min_len: usize) -> bool {
     substantive_len >= min_len
 }
 
+/// Heuristic: does the user's message look like a multi-part request that
+/// warrants a detailed response?  We check for numbered lists, explanation
+/// keywords, and conjunction-heavy compound tasks.
+pub(super) fn looks_like_multi_part_request(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+
+    // Count numbered/lettered items: "1)", "2)", "a)", "b)", "step 1", etc.
+    let numbered_items = {
+        let re = regex::Regex::new(r"(?:^|\s)(?:\d+[.)]\s|[a-e][.)]\s|step\s+\d)").unwrap();
+        re.find_iter(&lower).count()
+    };
+    if numbered_items >= 2 {
+        return true;
+    }
+
+    // Explanation keywords: user explicitly wants reasoning
+    let explanation_words = [
+        "explain why",
+        "explain how",
+        "tell me why",
+        "describe how",
+        "show me",
+        "what did you",
+        "summarize what",
+        "thorough review",
+        "find all",
+        "list all",
+        "review it",
+        "review the",
+        "audit",
+    ];
+    let has_explanation_request = explanation_words.iter().any(|w| lower.contains(w));
+
+    // Compound task indicators
+    let compound_signals = [
+        "also ",
+        "then ",
+        "after that",
+        "additionally",
+        "finally ",
+        "and then",
+        "before ",
+        "as well",
+    ];
+    let compound_count = compound_signals
+        .iter()
+        .filter(|s| lower.contains(*s))
+        .count();
+
+    // Multi-part if explanation requested, or ≥2 compound signals
+    has_explanation_request || compound_count >= 2
+}
+
 /// Remove leaked text-only control markers and pseudo tool-call text.
 #[cfg(test)]
 pub(super) fn sanitize_response_analysis(analysis: &str) -> String {

@@ -11,6 +11,9 @@ pub(in crate::agent) enum SystemDirective {
     FreshConversationContext,
     EmptyResponseRetry,
     TruncationRecoveryUseWriteFile,
+    TruncationRecoveryTextContinuation {
+        truncated_tail: String,
+    },
     ToolModeDisabledPlainText,
     TaskTokenBudgetWarning {
         used: u64,
@@ -95,7 +98,11 @@ pub(in crate::agent) enum SystemDirective {
     ResearchSynthesisNudge {
         consecutive_searches: usize,
     },
+    MemorySearchSaturation {
+        consecutive_memory_calls: usize,
+    },
     EditStallWriteFileHint,
+    BuildFixCycleNudge,
     DuplicateSendFileAlreadySent,
     HardPolicyToolBudgetReached {
         policy_tool_budget: usize,
@@ -111,9 +118,18 @@ pub(in crate::agent) enum SystemDirective {
         coaching: String,
     },
     HardToolLimitReached,
+    /// A specific tool hit its per-tool call limit but other tools remain
+    /// available. The model should switch to a different tool.
+    SpecificToolBlocked {
+        tool_name: String,
+    },
     BackgroundHandoff {
         notifications_active: bool,
     },
+    /// A background process was launched but the user's request has more
+    /// steps (e.g., "start server in background, then test it with curl").
+    /// The agent should continue working on the remaining steps.
+    BackgroundProcessContinue,
     SchedulingOwnerOnly,
     KnowledgeIntentDirectAnswer,
     DelegationModeActive,
@@ -133,6 +149,16 @@ pub(in crate::agent) enum SystemDirective {
     OutcomeReconciliation(String),
     /// Task plan context injected each iteration so the model sees its plan.
     TaskPlanContext(String),
+    /// The completion contract expects a file mutation (write/rewrite/create)
+    /// but no write_file or edit_file tool was called.  Nudge the model to
+    /// complete the requested file modification before declaring completion.
+    MutationStillRequired,
+    /// The model produced a very short response after significant work (many
+    /// tool calls) for a multi-part request. Nudge it to provide a comprehensive
+    /// response addressing all parts of the user's request.
+    ResponseQualityNudge {
+        user_text_hint: String,
+    },
 }
 
 impl SystemDirective {
@@ -142,6 +168,14 @@ impl SystemDirective {
             Self::FreshConversationContext => "This is a fresh conversation context. There are no previous tasks. Focus exclusively on the current user request. Do not reference or repeat tool calls from any prior context.".to_string(),
             Self::EmptyResponseRetry => "[SYSTEM] Your previous reply was empty (no text and no tool calls). This retry is running with reduced conversation history to recover. You MUST either (1) call the required tools, or (2) reply with a concrete blocker and the missing info. Do NOT return an empty response.".to_string(),
             Self::TruncationRecoveryUseWriteFile => "[SYSTEM] Your previous response was cut off because it exceeded the maximum output token limit. Do NOT generate long content inline. Instead, use the write_file tool to save long content (articles, code, etc.) to a file, then summarize what you wrote in a short reply. Keep your direct response brief.".to_string(),
+            Self::TruncationRecoveryTextContinuation { truncated_tail } => format!(
+                "[SYSTEM] Your previous text response was cut off mid-sentence due to output token limits. \
+                 The partial response has been saved. Continue your response from EXACTLY where it was cut off. \
+                 Your response was cut off at: \"...{}\"\n\n\
+                 IMPORTANT: Start your continuation directly from the cutoff point. Do NOT repeat content \
+                 that was already generated. Keep the continuation brief and complete the thought.",
+                truncated_tail
+            ),
             Self::ToolModeDisabledPlainText => "[SYSTEM] Tool mode is disabled for this turn. Respond with plain text only. Do NOT emit tool calls.".to_string(),
             Self::TaskTokenBudgetWarning {
                 used,
@@ -310,15 +344,14 @@ impl SystemDirective {
             } => format!(
                 "[SYSTEM] Tool limit reached ({} calls). No more tool calls available.\n\
                  {}{}\
-                 You MUST now respond with a concise summary:\n\
+                 IMPORTANT: First, ANSWER any questions the user asked — check their request \
+                 carefully and respond to every part you can from what you already know or discovered.\n\
+                 Then briefly summarize:\n\
                  1. What you accomplished (files modified, bugs fixed, features added)\n\
-                 2. What remains unfinished and why\n\
-                 3. Any test results or verification status\n\n\
-                 Do NOT restate the original task or say what you would do next. \
-                 Do NOT answer questions from old conversation history. \
-                 Focus only on concrete results and outcomes for the CURRENT task. \
-                 Do NOT promise future actions like \"let me try...\" or \"I'll search for...\" - your tools have been disabled.\n\
-                 Report what you found, what failed, and what the user can try instead.",
+                 2. What remains unfinished and why\n\n\
+                 Do NOT list iteration numbers or raw tool names in your response. \
+                 Do NOT promise future actions like \"let me try...\" — your tools have been disabled.\n\
+                 Write a natural, user-friendly response — not a system log.",
                 force_text_at, force_task_anchor, activity_section
             ),
             Self::ResearchSynthesisNudge { consecutive_searches } => format!(
@@ -330,7 +363,18 @@ impl SystemDirective {
                  will return similar results. Synthesize what you have rather than searching for perfection.",
                 consecutive_searches
             ),
+            Self::MemorySearchSaturation { consecutive_memory_calls } => format!(
+                "[SYSTEM] You have called memory tools {} times in a row. \
+                 STOP searching memory and RESPOND to the user NOW.\n\n\
+                 You already have the information you need from your earlier searches. \
+                 Synthesize what you found and compose your reply. \
+                 If you stored new facts, confirm what was stored. \
+                 If you searched for existing facts, share what you found.\n\n\
+                 Do NOT call manage_memories or remember_fact again.",
+                consecutive_memory_calls
+            ),
             Self::EditStallWriteFileHint => "[SYSTEM] You have failed edit_file 3+ times in a row. The old_text is not matching the actual file content. STOP using edit_file. Instead:\n1. Use `read_file` to see the CURRENT file content\n2. Use `write_file` to rewrite the ENTIRE file with all your changes applied\n\nwrite_file is more reliable than edit_file when the file has been modified.".to_string(),
+            Self::BuildFixCycleNudge => "[SYSTEM] DETECTED: Build-fix cycle. You have been alternating between editing files and running build/test commands many times without converging. STOP and take a different approach:\n1. Use `read_file` to see the CURRENT state of the file\n2. Think carefully about ALL the errors at once\n3. Use `write_file` to rewrite the ENTIRE file with ALL fixes applied in one shot\n4. Only then run the build/test command ONCE\n\nDo NOT continue making incremental edits — rewrite the file completely.".to_string(),
             Self::DuplicateSendFileAlreadySent => "[SYSTEM] The requested file was already sent in this task. Stop calling send_file and reply with plain text only.".to_string(),
             Self::HardPolicyToolBudgetReached { policy_tool_budget } => format!(
                 "[SYSTEM] Hard tool budget reached ({} calls). No more tool calls available.\n\n\
@@ -362,6 +406,13 @@ impl SystemDirective {
                  3. Any test results or verification status\n\n\
                  Do NOT restate the original task or say what you would do next. \
                  Focus only on concrete results and outcomes.".to_string(),
+            Self::SpecificToolBlocked { tool_name } => format!(
+                "[SYSTEM] The `{}` tool has reached its call limit for this task and is no longer available. \
+                 However, your OTHER tools (write_file, edit_file, terminal, etc.) are still fully available. \
+                 Continue working on the task using your remaining tools. Do NOT give up or summarize — \
+                 proceed with the next step of the user's request.",
+                tool_name
+            ),
             Self::BackgroundHandoff {
                 notifications_active,
             } => {
@@ -371,6 +422,7 @@ impl SystemDirective {
                     "[SYSTEM] A background task was moved to the background. Do NOT call additional tools or poll status in this turn. Reply to the user now with the current status.".to_string()
                 }
             }
+            Self::BackgroundProcessContinue => "[SYSTEM] A background process was launched successfully and is now running. Continue with the remaining steps of the user's request (e.g., testing endpoints, verifying output). The background process is already running — proceed directly with the next action.".to_string(),
             Self::SchedulingOwnerOnly => "[SYSTEM] Scheduling goals is owner-only. Handle this request directly without creating a goal.".to_string(),
             Self::KnowledgeIntentDirectAnswer => "[SYSTEM] Consultant classified this turn as knowledge. Provide the best direct answer now. Use tools only if needed to verify or retrieve missing facts.".to_string(),
             Self::DelegationModeActive => "[SYSTEM] Delegation mode active. Use `cli_agent` for execution tasks. `terminal`, `browser`, and `run_command` are hidden in this turn.".to_string(),
@@ -403,6 +455,18 @@ impl SystemDirective {
             }
             Self::OutcomeReconciliation(summary) => summary.clone(),
             Self::TaskPlanContext(plan) => plan.clone(),
+            Self::MutationStillRequired => "[SYSTEM] INCOMPLETE: Your request requires modifying or creating a file, but you have NOT called write_file or edit_file yet. You have the information from your reads — now WRITE the file. Use write_file to save the result, then provide a brief summary of what you changed.".to_string(),
+            Self::ResponseQualityNudge { user_text_hint } => format!(
+                "[SYSTEM] Your response was too brief and did not address the user's full request. \
+                 The user asked: \"{}\"\n\n\
+                 You completed significant work using multiple tools. Now write a comprehensive response that:\n\
+                 1. Explains WHAT you did (each change/action)\n\
+                 2. Explains WHY you made each choice\n\
+                 3. Shows relevant results (test output, file paths, etc.)\n\
+                 4. Answers any specific questions the user asked\n\n\
+                 Do NOT just dump raw tool output. Write a clear, structured response.",
+                user_text_hint
+            ),
         }
     }
 }
@@ -472,15 +536,14 @@ mod tests {
             "[SYSTEM] Tool limit reached (40 calls). No more tool calls available.\n\
                  User's request: fix tests\n\n\
 \nHere is what you actually did (use this as ground truth):\n1. terminal(...)\n\
-                 You MUST now respond with a concise summary:\n\
+                 IMPORTANT: First, ANSWER any questions the user asked — check their request \
+                 carefully and respond to every part you can from what you already know or discovered.\n\
+                 Then briefly summarize:\n\
                  1. What you accomplished (files modified, bugs fixed, features added)\n\
-                 2. What remains unfinished and why\n\
-                 3. Any test results or verification status\n\n\
-                 Do NOT restate the original task or say what you would do next. \
-                 Do NOT answer questions from old conversation history. \
-                 Focus only on concrete results and outcomes for the CURRENT task. \
-                 Do NOT promise future actions like \"let me try...\" or \"I'll search for...\" - your tools have been disabled.\n\
-                 Report what you found, what failed, and what the user can try instead."
+                 2. What remains unfinished and why\n\n\
+                 Do NOT list iteration numbers or raw tool names in your response. \
+                 Do NOT promise future actions like \"let me try...\" — your tools have been disabled.\n\
+                 Write a natural, user-friendly response — not a system log."
         );
     }
 
@@ -531,6 +594,27 @@ mod tests {
         assert!(rendered.contains("403"));
         assert!(rendered.contains("http_request"));
         assert!(rendered.contains("Do NOT proceed as if it succeeded"));
+    }
+
+    #[test]
+    fn truncation_text_continuation_render_includes_tail() {
+        let rendered = SystemDirective::TruncationRecoveryTextContinuation {
+            truncated_tail: "according to my".to_string(),
+        }
+        .render();
+        assert!(rendered.contains("[SYSTEM]"));
+        assert!(rendered.contains("cut off mid-sentence"));
+        assert!(rendered.contains("according to my"));
+        assert!(rendered.contains("Continue your response"));
+        assert!(rendered.contains("Do NOT repeat content"));
+    }
+
+    #[test]
+    fn mutation_still_required_render_mentions_write_file() {
+        let rendered = SystemDirective::MutationStillRequired.render();
+        assert!(rendered.contains("[SYSTEM]"));
+        assert!(rendered.contains("write_file"));
+        assert!(rendered.contains("NOT called"));
     }
 
     #[test]

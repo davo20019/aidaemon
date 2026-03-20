@@ -60,6 +60,19 @@ pub struct LinearIntentStep {
     pub tool: String,
     pub target: String,
     pub description: String,
+    /// Number of tool calls made while this step was current.
+    #[serde(default)]
+    pub tool_calls_on_step: usize,
+    /// Whether this step has been marked complete (by re-planner or outcome ledger).
+    #[serde(default)]
+    pub completed: bool,
+    /// Evidence summary when step was marked complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_evidence: Option<String>,
+    /// Tool call count at which the re-planner last evaluated this step.
+    /// Prevents re-triggering on every single round after threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_evaluated_at: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -69,6 +82,86 @@ pub struct LinearIntentPlan {
     pub steps: Vec<LinearIntentStep>,
     #[serde(default)]
     pub current_step_cursor: usize, // 0-based cursor into `steps`
+}
+
+impl LinearIntentPlan {
+    /// Record tool calls on the current step.
+    pub fn record_tool_calls_on_current(&mut self, count: usize) {
+        if let Some(step) = self.steps.get_mut(self.current_step_cursor) {
+            step.tool_calls_on_step += count;
+        }
+    }
+
+    /// Check if re-planner should fire for the current step.
+    /// Triggers every REPLAN_INTERVAL tool calls (not every single call).
+    pub fn current_step_needs_replan(&self) -> bool {
+        const REPLAN_INTERVAL: usize = 2;
+        let Some(step) = self.steps.get(self.current_step_cursor) else {
+            return false;
+        };
+        if step.completed || step.tool_calls_on_step < 2 {
+            return false;
+        }
+        let last_eval = step.last_evaluated_at.unwrap_or(0);
+        step.tool_calls_on_step >= last_eval + REPLAN_INTERVAL
+    }
+
+    /// Mark the current step as evaluated at the current tool call count.
+    pub fn mark_current_step_evaluated(&mut self) {
+        if let Some(step) = self.steps.get_mut(self.current_step_cursor) {
+            step.last_evaluated_at = Some(step.tool_calls_on_step);
+        }
+    }
+
+    /// Mark the current step as complete and advance the cursor.
+    pub fn complete_current_step_with_evidence(&mut self, evidence: String) {
+        if let Some(step) = self.steps.get_mut(self.current_step_cursor) {
+            step.completed = true;
+            step.completion_evidence = Some(evidence);
+        }
+        if self.current_step_cursor < self.steps.len() {
+            self.current_step_cursor += 1;
+        }
+    }
+
+    /// Check if all steps are complete (cursor past last step).
+    #[allow(dead_code)]
+    pub fn all_steps_complete(&self) -> bool {
+        self.current_step_cursor >= self.steps.len()
+    }
+
+    /// Format plan with progress markers for LLM context injection.
+    pub fn format_with_progress(&self) -> String {
+        let mut result = String::from("## Task Plan\n");
+        for step in &self.steps {
+            let marker = if step.completed {
+                "[DONE]"
+            } else if step.step_index == self.current_step_cursor + 1 {
+                "[CURRENT]"
+            } else {
+                ""
+            };
+
+            if marker.is_empty() {
+                result.push_str(&format!("{}. {}\n", step.step_index, step.description));
+            } else {
+                result.push_str(&format!(
+                    "{}. {} {}",
+                    step.step_index, marker, step.description
+                ));
+                if let Some(ref evidence) = step.completion_evidence {
+                    let ev = crate::utils::truncate_str(evidence, 100);
+                    result.push_str(&format!(" \u{2014} {}", ev));
+                }
+                result.push('\n');
+            }
+        }
+        if result.len() > 2000 {
+            result.truncate(crate::utils::floor_char_boundary(&result, 2000));
+            result.push_str("\n...");
+        }
+        result
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -200,6 +293,11 @@ pub struct ExecutionState {
     pub outcome_ledger: Vec<OutcomeEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_linear_intent_plan: Option<LinearIntentPlan>,
+    /// Cumulative milliseconds lost to LLM provider timeouts.  These are NOT
+    /// the agent's fault (provider slowness, not agent stalling) and should be
+    /// excluded from the wall-clock budget check.
+    #[serde(default)]
+    pub provider_timeout_ms: u64,
 }
 
 impl ExecutionState {
@@ -230,6 +328,7 @@ impl ExecutionState {
             steps_used: 0,
             outcome_ledger: Vec::new(),
             active_linear_intent_plan: None,
+            provider_timeout_ms: 0,
         }
     }
 
@@ -326,20 +425,6 @@ impl ExecutionState {
         }
     }
 
-    /// True if any external mutation attempt failed.
-    pub fn has_failed_external_mutations(&self) -> bool {
-        self.outcome_ledger
-            .iter()
-            .any(|e| e.is_external_mutation && !e.success)
-    }
-
-    pub fn failed_external_mutation_count(&self) -> usize {
-        self.outcome_ledger
-            .iter()
-            .filter(|e| e.is_external_mutation && !e.success)
-            .count()
-    }
-
     pub fn successful_external_mutation_count(&self) -> usize {
         self.outcome_ledger
             .iter()
@@ -347,27 +432,98 @@ impl ExecutionState {
             .count()
     }
 
+    /// Returns failures that have NOT been corrected by a later success.
+    ///
+    /// A failure is "corrected" if:
+    /// 1. There is a later success for the same tool_name (direct retry), OR
+    /// 2. ALL remaining failures occurred before the latest success of ANY tool
+    ///    (the agent recovered overall — handles tool switching, e.g. run_command→terminal).
+    ///
+    /// Also filters out failures with no error summary (unknown errors / false positives).
+    pub fn uncorrected_failed_mutations(&self) -> Vec<&OutcomeEntry> {
+        let failures: Vec<&OutcomeEntry> = self
+            .outcome_ledger
+            .iter()
+            .filter(|e| e.is_external_mutation && !e.success)
+            .collect();
+
+        if failures.is_empty() {
+            return Vec::new();
+        }
+
+        // Filter out failures with no error summary (unknown errors / false positives)
+        let failures_with_summary: Vec<&OutcomeEntry> = failures
+            .into_iter()
+            .filter(|e| e.error_summary.is_some())
+            .collect();
+
+        if failures_with_summary.is_empty() {
+            return Vec::new();
+        }
+
+        // Step 1: Remove failures corrected by a later success of the same tool
+        let uncorrected: Vec<&OutcomeEntry> = failures_with_summary
+            .into_iter()
+            .filter(|fail| {
+                !self.outcome_ledger.iter().any(|e| {
+                    e.is_external_mutation
+                        && e.success
+                        && e.tool_name == fail.tool_name
+                        && e.iteration > fail.iteration
+                })
+            })
+            .collect();
+
+        if uncorrected.is_empty() {
+            return Vec::new();
+        }
+
+        // Step 2: If ALL remaining failures occurred before the latest success
+        // (any tool), the agent recovered overall. This handles tool switching
+        // (e.g., run_command fails, bot switches to terminal and succeeds).
+        let max_success_iter = self
+            .outcome_ledger
+            .iter()
+            .filter(|e| e.is_external_mutation && e.success)
+            .map(|e| e.iteration)
+            .max();
+
+        if let Some(max_success) = max_success_iter {
+            let still_uncorrected: Vec<&OutcomeEntry> = uncorrected
+                .into_iter()
+                .filter(|e| e.iteration > max_success)
+                .collect();
+            return still_uncorrected;
+        }
+
+        uncorrected
+    }
+
+    /// True if there are external mutation failures that were NOT corrected
+    /// by later successes.
+    pub fn has_uncorrected_failed_external_mutations(&self) -> bool {
+        !self.uncorrected_failed_mutations().is_empty()
+    }
+
     pub(crate) fn build_attempt_reconciliation_overview(&self) -> Option<ReconciliationOverview> {
-        if !self.has_failed_external_mutations() {
+        let uncorrected = self.uncorrected_failed_mutations();
+        if uncorrected.is_empty() {
             return None;
         }
+
         let total = self
             .outcome_ledger
             .iter()
             .filter(|e| e.is_external_mutation)
             .count();
         let succeeded = self.successful_external_mutation_count();
-        let failed = self.failed_external_mutation_count();
+        let failed = uncorrected.len();
 
         let mut summary = format!(
             "[SYSTEM] External mutation attempt reconciliation: {} of {} attempts succeeded, {} failed.",
             succeeded, total, failed,
         );
-        for entry in self
-            .outcome_ledger
-            .iter()
-            .filter(|e| e.is_external_mutation && !e.success)
-        {
+        for entry in &uncorrected {
             let status = entry
                 .http_status
                 .map(|s| format!(" (HTTP {})", s))
@@ -378,10 +534,9 @@ impl ExecutionState {
                 entry.tool_name, entry.iteration, status, error,
             ));
         }
-        summary.push_str(
-            "\nYour response must accurately reflect which attempts succeeded and which failed. \
-             If retries resolved earlier failures, say so explicitly.",
-        );
+        // NOTE: Do NOT embed meta-instructions in the summary — the LLM may parrot
+        // them verbatim to the user.  The completion phase adds behavioural guidance
+        // as a separate system message when needed.
 
         Some(ReconciliationOverview {
             mode: ReconciliationMode::AttemptLevel,
@@ -570,9 +725,8 @@ impl ExecutionState {
         }
 
         let failed = expected_steps.saturating_sub(succeeded);
-        summary.push_str(
-            "\nYour response must accurately reflect which planned steps completed and which remain failed.",
-        );
+        // NOTE: Do NOT embed meta-instructions in the summary — the LLM may parrot
+        // them verbatim to the user.
 
         Some(ReconciliationOverview {
             mode: ReconciliationMode::PlannedStepLevel,
@@ -693,10 +847,13 @@ impl ExecutionState {
         {
             return Some(ExecutionBudgetLimit::ValidationRounds);
         }
-        if self.budget.max_wall_clock_ms > 0
-            && execution_elapsed_ms >= self.budget.max_wall_clock_ms
-        {
-            return Some(ExecutionBudgetLimit::WallClock);
+        if self.budget.max_wall_clock_ms > 0 {
+            // Subtract time lost to provider timeouts — those are external
+            // delays, not agent stalling, and shouldn't penalise the budget.
+            let effective_elapsed = execution_elapsed_ms.saturating_sub(self.provider_timeout_ms);
+            if effective_elapsed >= self.budget.max_wall_clock_ms {
+                return Some(ExecutionBudgetLimit::WallClock);
+            }
         }
         None
     }
@@ -715,7 +872,7 @@ pub fn default_execution_budget(tier: BudgetTier) -> ExecutionBudget {
             max_llm_calls: 14,
             max_tool_calls: 24,
             max_validation_rounds: 3,
-            max_wall_clock_ms: 180_000,
+            max_wall_clock_ms: 300_000,
         },
         BudgetTier::Small => ExecutionBudget {
             max_steps: 16,
@@ -723,7 +880,7 @@ pub fn default_execution_budget(tier: BudgetTier) -> ExecutionBudget {
             max_llm_calls: 14,
             max_tool_calls: 14,
             max_validation_rounds: 3,
-            max_wall_clock_ms: 180_000,
+            max_wall_clock_ms: 300_000,
         },
         BudgetTier::Standard => ExecutionBudget {
             max_steps: 24,
@@ -886,13 +1043,52 @@ pub fn select_initial_execution_budget(
     }
 
     if has_mutation_request {
-        let tier = if has_scoped_target {
+        // Multi-step tasks that include both creation AND verification/testing
+        // need more budget than simple scoped edits.
+        let has_verification_step = [
+            "test",
+            "run",
+            "verify",
+            "execute",
+            "demonstrate",
+            "show me",
+            "show the results",
+            "check",
+        ]
+        .iter()
+        .any(|kw| contains_keyword_as_words(&lower, kw));
+
+        // Tasks that involve research or multi-phase work (web search, reading
+        // existing files for context, sequential "then" steps) need Standard
+        // budget even when the final target is a scoped file path.
+        let has_research_or_multi_phase = [
+            "search the web",
+            "web search",
+            "search online",
+            "look up online",
+            "then create",
+            "then write",
+            "then make",
+            "and create",
+            "and write",
+            "and make",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+            || (contains_keyword_as_words(&lower, "search")
+                && contains_keyword_as_words(&lower, "create"));
+
+        let needs_standard = has_verification_step || has_research_or_multi_phase;
+
+        let tier = if has_scoped_target && !needs_standard {
             BudgetTier::Small
         } else {
             BudgetTier::Standard
         };
-        let route_kind = if has_scoped_target {
+        let route_kind = if has_scoped_target && !needs_standard {
             "scoped_modification"
+        } else if has_scoped_target {
+            "scoped_modification_with_verification"
         } else {
             "unscoped_modification"
         };
@@ -905,11 +1101,16 @@ pub fn select_initial_execution_budget(
     }
 
     if has_read_only_investigation {
-        let tier = BudgetTier::None;
+        // Previously BudgetTier::None — but this stripped tools for queries
+        // that legitimately need them (e.g., "what time is it in tokyo?"
+        // needs web_search). Use Standard as the minimum so tools are always
+        // available. The model self-decides whether to use them.
+        let tier = BudgetTier::Standard;
         return promote_contextual_followup_budget(tier, "read_only_investigation", turn_context);
     }
 
-    let tier = BudgetTier::None;
+    // Previously BudgetTier::None — same rationale as above.
+    let tier = BudgetTier::Standard;
     let route_kind = if turn_context.completion_contract.requires_observation {
         "read_only_investigation"
     } else {
@@ -1076,6 +1277,25 @@ mod tests {
     }
 
     #[test]
+    fn research_plus_create_gets_standard_not_small() {
+        // "Search the web ... then create a file at path.md" should get Standard
+        // budget, not Small, even though it has a scoped target (.md).
+        let turn_context = TurnContext::default();
+        let (tier, route_kind, _budget) = select_initial_execution_budget(
+            "Search the web for the top 3 Rust crates then create a markdown file at ~/projects/blog/drafts/rust-crates-2025.md",
+            &turn_context,
+            0,
+            AgentRole::Orchestrator,
+        );
+        assert_eq!(
+            tier,
+            BudgetTier::Standard,
+            "research+create should get Standard budget"
+        );
+        assert_eq!(route_kind, "scoped_modification_with_verification");
+    }
+
+    #[test]
     fn delegated_work_starts_with_extended_budget() {
         let (tier, route_kind, budget) = select_initial_execution_budget(
             "fix the deployment",
@@ -1201,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_turns_use_none_budget() {
+    fn knowledge_turns_use_standard_budget() {
         let turn_context = TurnContext {
             completion_contract: CompletionContract::default(),
             ..TurnContext::default()
@@ -1212,7 +1432,7 @@ mod tests {
             0,
             AgentRole::Orchestrator,
         );
-        assert_eq!(tier, BudgetTier::None);
+        assert_eq!(tier, BudgetTier::Standard);
         assert_eq!(route_kind, "knowledge");
     }
 
@@ -1230,14 +1450,14 @@ mod tests {
     }
 
     #[test]
-    fn read_only_investigation_uses_none_budget() {
+    fn read_only_investigation_uses_standard_budget() {
         let (tier, route_kind, _) = select_initial_execution_budget(
             "inspect the latest logs and show me the current status",
             &TurnContext::default(),
             0,
             AgentRole::Orchestrator,
         );
-        assert_eq!(tier, BudgetTier::None);
+        assert_eq!(tier, BudgetTier::Standard);
         assert_eq!(route_kind, "read_only_investigation");
     }
 
@@ -1307,14 +1527,15 @@ mod tests {
             })],
             ..TurnContext::default()
         };
-        let (tier, route_kind, budget) = select_initial_execution_budget(
+        let (tier, _route_kind, budget) = select_initial_execution_budget(
             "Which one is most relevant to skin cancer?",
             &turn_context,
             0,
             AgentRole::Orchestrator,
         );
+        // Tier is Standard regardless of followup context since the
+        // base tier is now Standard (no longer None/Small that needed promotion).
         assert_eq!(tier, BudgetTier::Standard);
-        assert_eq!(route_kind, "contextual_followup");
         assert_eq!(budget.max_tokens, 0);
     }
 
@@ -1465,8 +1686,7 @@ mod tests {
             planned_step_description: None,
             expected_step_count: None,
         });
-        assert!(state.has_failed_external_mutations());
-        assert_eq!(state.failed_external_mutation_count(), 1);
+        assert!(state.has_uncorrected_failed_external_mutations());
     }
 
     #[test]
@@ -1485,7 +1705,7 @@ mod tests {
             planned_step_description: None,
             expected_step_count: None,
         });
-        assert!(!state.has_failed_external_mutations());
+        assert!(!state.has_uncorrected_failed_external_mutations());
     }
 
     #[test]
@@ -1566,6 +1786,165 @@ mod tests {
     }
 
     #[test]
+    fn corrected_failure_same_tool_skips_reconciliation() {
+        // Failure at iter 3, then success of SAME tool at iter 7 → corrected
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "run_command".to_string(),
+            success: false,
+            http_status: None,
+            is_external_mutation: true,
+            error_summary: Some("could not find Cargo.toml".to_string()),
+            iteration: 3,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        state.record_outcome(OutcomeEntry {
+            tool_name: "run_command".to_string(),
+            success: true,
+            http_status: None,
+            is_external_mutation: true,
+            error_summary: None,
+            iteration: 7,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        assert!(state.uncorrected_failed_mutations().is_empty());
+        assert!(!state.has_uncorrected_failed_external_mutations());
+        assert!(state.build_attempt_reconciliation_summary().is_none());
+    }
+
+    #[test]
+    fn corrected_failure_different_tool_skips_reconciliation() {
+        // Failure via run_command at iter 9, then success via terminal at iter 15
+        // → corrected (all failures before last success)
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "run_command".to_string(),
+            success: false,
+            http_status: None,
+            is_external_mutation: true,
+            error_summary: Some("could not find Cargo.toml".to_string()),
+            iteration: 9,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        state.record_outcome(OutcomeEntry {
+            tool_name: "terminal".to_string(),
+            success: true,
+            http_status: None,
+            is_external_mutation: true,
+            error_summary: None,
+            iteration: 15,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        assert!(state.uncorrected_failed_mutations().is_empty());
+        assert!(!state.has_uncorrected_failed_external_mutations());
+        assert!(state.build_attempt_reconciliation_summary().is_none());
+    }
+
+    #[test]
+    fn uncorrected_failure_after_last_success_triggers_reconciliation() {
+        // Success at iter 5, then failure at iter 10 → uncorrected
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "terminal".to_string(),
+            success: true,
+            http_status: None,
+            is_external_mutation: true,
+            error_summary: None,
+            iteration: 5,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: false,
+            http_status: Some(500),
+            is_external_mutation: true,
+            error_summary: Some("server error".to_string()),
+            iteration: 10,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        assert_eq!(state.uncorrected_failed_mutations().len(), 1);
+        assert!(state.has_uncorrected_failed_external_mutations());
+        assert!(state.build_attempt_reconciliation_summary().is_some());
+    }
+
+    #[test]
+    fn mixed_corrected_and_uncorrected_failures() {
+        // run_command FAIL at iter 3 (corrected by terminal SUCCESS at iter 15)
+        // http_request FAIL at iter 20 (after last success → uncorrected)
+        let mut state = test_execution_state();
+        state.record_outcome(OutcomeEntry {
+            tool_name: "run_command".to_string(),
+            success: false,
+            http_status: None,
+            is_external_mutation: true,
+            error_summary: Some("not found".to_string()),
+            iteration: 3,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        state.record_outcome(OutcomeEntry {
+            tool_name: "terminal".to_string(),
+            success: true,
+            http_status: None,
+            is_external_mutation: true,
+            error_summary: None,
+            iteration: 15,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        state.record_outcome(OutcomeEntry {
+            tool_name: "http_request".to_string(),
+            success: false,
+            http_status: Some(500),
+            is_external_mutation: true,
+            error_summary: Some("deploy failed".to_string()),
+            iteration: 20,
+            plan_version: None,
+            planned_step_id: None,
+            planned_step_index: None,
+            planned_step_description: None,
+            expected_step_count: None,
+        });
+        let uncorrected = state.uncorrected_failed_mutations();
+        assert_eq!(uncorrected.len(), 1);
+        assert_eq!(uncorrected[0].tool_name, "http_request");
+        assert_eq!(uncorrected[0].iteration, 20);
+        let summary = state.build_attempt_reconciliation_summary().unwrap();
+        assert!(summary.contains("deploy failed"));
+        assert!(!summary.contains("not found")); // corrected failure excluded
+    }
+
+    #[test]
     fn install_linear_intent_plan_sets_current_step_identity() {
         let mut state = test_execution_state();
         state.install_linear_intent_plan(
@@ -1577,6 +1956,10 @@ mod tests {
                     tool: "http_request".to_string(),
                     target: "tweet-1".to_string(),
                     description: "Post tweet 1".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
                 },
                 LinearIntentStep {
                     step_id: "plan-v3-step-2".to_string(),
@@ -1584,6 +1967,10 @@ mod tests {
                     tool: "http_request".to_string(),
                     target: "tweet-2".to_string(),
                     description: "Post tweet 2".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
                 },
             ],
         );
@@ -1604,6 +1991,10 @@ mod tests {
                     tool: "http_request".to_string(),
                     target: "tweet-1".to_string(),
                     description: "Post tweet 1".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
                 },
                 LinearIntentStep {
                     step_id: "plan-v1-step-2".to_string(),
@@ -1611,6 +2002,10 @@ mod tests {
                     tool: "http_request".to_string(),
                     target: "tweet-2".to_string(),
                     description: "Post tweet 2".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
                 },
             ],
         );
@@ -1679,6 +2074,10 @@ mod tests {
                     tool: "http_request".to_string(),
                     target: "tweet-1".to_string(),
                     description: "Post tweet 1".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
                 },
                 LinearIntentStep {
                     step_id: "plan-v2-step-2".to_string(),
@@ -1686,6 +2085,10 @@ mod tests {
                     tool: "http_request".to_string(),
                     target: "tweet-2".to_string(),
                     description: "Post tweet 2".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
                 },
             ],
         );
@@ -1799,5 +2202,119 @@ mod tests {
         let original = state.budget.max_tool_calls;
         state.promote_budget_for_plan(5);
         assert_eq!(state.budget.max_tool_calls, original);
+    }
+
+    #[test]
+    fn plan_step_replan_debounce() {
+        let mut plan = LinearIntentPlan {
+            plan_version: 1,
+            steps: vec![LinearIntentStep {
+                step_id: "s1".into(),
+                step_index: 1,
+                tool: String::new(),
+                target: String::new(),
+                description: "Explore".into(),
+                tool_calls_on_step: 0,
+                completed: false,
+                completion_evidence: None,
+                last_evaluated_at: None,
+            }],
+            current_step_cursor: 0,
+        };
+
+        assert!(!plan.current_step_needs_replan());
+        plan.record_tool_calls_on_current(1);
+        assert!(!plan.current_step_needs_replan());
+        plan.record_tool_calls_on_current(1);
+        assert!(plan.current_step_needs_replan());
+
+        plan.mark_current_step_evaluated();
+        assert!(!plan.current_step_needs_replan());
+
+        plan.record_tool_calls_on_current(1);
+        assert!(!plan.current_step_needs_replan());
+        plan.record_tool_calls_on_current(1);
+        assert!(plan.current_step_needs_replan());
+    }
+
+    #[test]
+    fn plan_complete_step_advances_cursor() {
+        let mut plan = LinearIntentPlan {
+            plan_version: 1,
+            steps: vec![
+                LinearIntentStep {
+                    step_id: "s1".into(),
+                    step_index: 1,
+                    tool: String::new(),
+                    target: String::new(),
+                    description: "Explore".into(),
+                    tool_calls_on_step: 3,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
+                },
+                LinearIntentStep {
+                    step_id: "s2".into(),
+                    step_index: 2,
+                    tool: String::new(),
+                    target: String::new(),
+                    description: "Create".into(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
+                },
+            ],
+            current_step_cursor: 0,
+        };
+
+        plan.complete_current_step_with_evidence("Found 12 posts".into());
+        assert_eq!(plan.current_step_cursor, 1);
+        assert!(plan.steps[0].completed);
+        assert_eq!(
+            plan.steps[0].completion_evidence.as_deref(),
+            Some("Found 12 posts")
+        );
+        assert!(!plan.all_steps_complete());
+
+        plan.complete_current_step_with_evidence("Done".into());
+        assert!(plan.all_steps_complete());
+    }
+
+    #[test]
+    fn plan_format_with_progress_shows_markers() {
+        let plan = LinearIntentPlan {
+            plan_version: 1,
+            steps: vec![
+                LinearIntentStep {
+                    step_id: "s1".into(),
+                    step_index: 1,
+                    tool: String::new(),
+                    target: String::new(),
+                    description: "Explore posts".into(),
+                    tool_calls_on_step: 3,
+                    completed: true,
+                    completion_evidence: Some("Found 12 posts".into()),
+                    last_evaluated_at: Some(2),
+                },
+                LinearIntentStep {
+                    step_id: "s2".into(),
+                    step_index: 2,
+                    tool: String::new(),
+                    target: String::new(),
+                    description: "Create post 1".into(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
+                },
+            ],
+            current_step_cursor: 1,
+        };
+
+        let formatted = plan.format_with_progress();
+        assert!(formatted.contains("[DONE] Explore posts"));
+        assert!(formatted.contains("Found 12 posts"));
+        assert!(formatted.contains("[CURRENT] Create post 1"));
     }
 }

@@ -57,7 +57,9 @@ impl Tool for EditFileTool {
             external_side_effect: false,
             needs_approval: true,
             idempotent: false,
-            high_impact_write: true,
+            // Not high-impact: find-and-replace with safe failure on ambiguity.
+            // The approval flow already gates this; critique overhead is excessive.
+            high_impact_write: false,
         }
     }
 

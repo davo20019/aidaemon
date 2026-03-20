@@ -493,3 +493,216 @@ fn test_contains_keyword_as_words() {
     ));
     assert!(contains_keyword_as_words("(deploy)", "deploy"));
 }
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_memory_storage_with_date() {
+    // "Remember my birthday is October 15" should NOT trigger scheduling
+    let detected =
+        detect_schedule_heuristic("Remember that my birthday is October 15 and I love sushi");
+    assert!(
+        detected.is_none(),
+        "Memory-storage intent with date should not trigger schedule: got {:?}",
+        detected
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_remember_my_date() {
+    let detected = detect_schedule_heuristic("Remember my anniversary is June 20th");
+    assert!(detected.is_none());
+}
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_note_that_date() {
+    let detected = detect_schedule_heuristic("Note that I was born on March 5th");
+    assert!(detected.is_none());
+}
+
+#[test]
+fn test_detect_schedule_heuristic_allows_remind_me_with_date() {
+    // "Remind me on October 15" IS a scheduling request
+    let detected = detect_schedule_heuristic("Remind me to buy a gift on October 15");
+    assert!(
+        detected.is_some(),
+        "Scheduling intent should still trigger: got None"
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_allows_schedule_with_memory_verb() {
+    // "Remember to remind me" — has both memory and scheduling verbs, scheduling wins
+    let detected = detect_schedule_heuristic("Remember that you need to remind me on March 5th");
+    assert!(
+        detected.is_some(),
+        "When both memory and scheduling verbs present, scheduling should win"
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_remember_these_facts_with_date() {
+    // "remember these facts" includes a birthday date — should NOT trigger scheduling
+    let detected = detect_schedule_heuristic(
+        "I want you to remember these important facts about me: 1) My favorite programming language is Rust, \
+         2) I prefer dark mode, 3) My birthday is July 15th, 4) I'm allergic to shellfish, 5) My dog's name is Luna.",
+    );
+    assert!(
+        detected.is_none(),
+        "Remember-these-facts with embedded date should not trigger schedule: got {:?}",
+        detected
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_facts_about_me_with_date() {
+    // "facts about me" context without explicit memory verb
+    let detected = detect_schedule_heuristic(
+        "Here are some facts about me: my birthday is March 10th and I like coffee",
+    );
+    assert!(
+        detected.is_none(),
+        "Facts-about-me context with date should not trigger schedule: got {:?}",
+        detected
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_store_these_with_date() {
+    let detected = detect_schedule_heuristic(
+        "Store these details: I was born on December 25th, I work at Acme Corp",
+    );
+    assert!(
+        detected.is_none(),
+        "Store-these with date should not trigger schedule"
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_compound_message_with_date() {
+    // Compound message where date is in a fact-storage sub-task
+    let detected = detect_schedule_heuristic(
+        "I need you to do 3 things: (1) Remember that my birthday is October 15. \
+         (2) Check the blog post. (3) Create a Python script.",
+    );
+    assert!(
+        detected.is_none(),
+        "Compound message with memory intent should not trigger schedule"
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_background_command_completion() {
+    // Background command output contains dates from find/ls output
+    let detected = detect_schedule_heuristic(
+        "[Background command completed]\n\
+         Command: `cd '/Users/test/projects' && chmod +x script.sh && ./script.sh`\n\
+         Output:\nMar 16 13:22:51 2026 - /Users/test/projects/file.db\n\
+         Jan 5 09:00:00 2026 - /Users/test/projects/data.csv",
+    );
+    assert!(
+        detected.is_none(),
+        "Background command output with dates should not trigger schedule"
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_file_edit_with_dates() {
+    // User asks to finish a file that mentions dates in its content scope.
+    let detected = detect_schedule_heuristic(
+        "I noticed my social-media-plan.md got cut off mid-sentence. Can you finish it? \
+         Read the current file, then append the remaining content starting from where it \
+         was truncated. The plan should cover the full 2 weeks (March 18 through March 31) \
+         as originally intended.",
+    );
+    assert!(
+        detected.is_none(),
+        "File editing request with dates should not trigger schedule"
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_file_creation_with_dates() {
+    // User asks to create a file covering a date range.
+    let detected = detect_schedule_heuristic(
+        "Create a file ~/projects/blog/social-media-plan.md with a 2-week calendar \
+         from March 18 to March 31 that promotes my blog posts.",
+    );
+    assert!(
+        detected.is_none(),
+        "File creation request with dates should not trigger schedule"
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_truncated_file_fix() {
+    // User says a file was truncated and needs fixing.
+    let detected = detect_schedule_heuristic(
+        "The file output.json was truncated on March 20. Read it and complete the \
+         missing entries through March 31.",
+    );
+    assert!(
+        detected.is_none(),
+        "Truncated file fix request with dates should not trigger schedule"
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_still_works_with_file_and_schedule_verb() {
+    // A genuine scheduling request that also mentions a file.
+    let detected =
+        detect_schedule_heuristic("Remind me on March 18 to edit the file ~/projects/plan.md");
+    assert!(
+        detected.is_some(),
+        "Scheduling request with file ref should still trigger schedule"
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_past_tense_date_recall() {
+    // "What did we talk about ... March 3rd?" is a recall query, not scheduling.
+    // The bare month-day "March 3rd" should NOT trigger scheduling without a verb.
+    let detected =
+        detect_schedule_heuristic("What did we talk about two weeks ago around March 3rd?");
+    assert!(
+        detected.is_none(),
+        "Past-tense recall with bare date should not trigger schedule: got {:?}",
+        detected
+    );
+}
+
+#[test]
+fn test_detect_schedule_heuristic_ignores_bare_date_without_verb() {
+    // Bare month-day in various non-scheduling contexts.
+    for input in [
+        "The deadline was March 10",
+        "We deployed on March 12",
+        "What happened on January 5th?",
+        "The incident on February 20th needs a postmortem",
+        "My birthday is March 15",
+    ] {
+        let detected = detect_schedule_heuristic(input);
+        assert!(
+            detected.is_none(),
+            "Bare date without scheduling verb should not trigger schedule for: {input}"
+        );
+    }
+}
+
+#[test]
+fn test_detect_schedule_heuristic_fires_with_scheduling_verb_and_date() {
+    // Month-day WITH a scheduling verb should still fire.
+    for (input, expected_some) in [
+        ("Remind me on March 5th to check the server", true),
+        ("Schedule a review for October 15", true),
+        ("Alert me on January 20th about the renewal", true),
+        ("Notify me on December 1st when the sale starts", true),
+        ("Check what happened on March 3rd", false),
+    ] {
+        let detected = detect_schedule_heuristic(input);
+        assert_eq!(
+            detected.is_some(),
+            expected_some,
+            "Expected is_some={expected_some} for: {input}, got {:?}",
+            detected
+        );
+    }
+}

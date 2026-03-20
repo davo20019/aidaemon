@@ -1066,19 +1066,58 @@ impl CliAgentTool {
             }
         }
 
+        // Spatial awareness: list ~/projects/ contents so sub-agents can discover
+        // files/projects outside the current working directory.
+        let mut projects_listing_text = String::new();
+        if let Some(home) = dirs::home_dir() {
+            let projects_dir = home.join("projects");
+            if let Ok(mut entries) = tokio::fs::read_dir(&projects_dir).await {
+                let mut dirs_list: Vec<String> = Vec::new();
+                let mut files_list: Vec<String> = Vec::new();
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    if let Ok(ft) = entry.file_type().await {
+                        if ft.is_dir() {
+                            dirs_list.push(format!("  {}/", name));
+                        } else if ft.is_file() {
+                            files_list.push(format!("  {}", name));
+                        }
+                    }
+                    if dirs_list.len() + files_list.len() >= 80 {
+                        break;
+                    }
+                }
+                dirs_list.sort();
+                files_list.sort();
+                if !dirs_list.is_empty() || !files_list.is_empty() {
+                    let mut listing = format!("{}:\n", projects_dir.display());
+                    let mut all_entries = dirs_list;
+                    all_entries.append(&mut files_list);
+                    listing.push_str(&all_entries.join("\n"));
+                    projects_listing_text = listing;
+                }
+            }
+        }
+
         // Fit within budget by truncating lower-priority sections first.
         let total = active_goal_text.len()
             + project_docs_text.len()
             + facts_text.len()
             + files_text.len()
+            + projects_listing_text.len()
             + context_text.len();
         if total > budget {
             let goal_budget = budget / 10;
             let docs_budget = budget * 3 / 10;
-            let facts_budget = budget * 3 / 10;
+            let facts_budget = budget * 2 / 10;
             let files_budget = budget * 2 / 10;
-            let context_budget =
-                budget.saturating_sub(goal_budget + docs_budget + facts_budget + files_budget);
+            let projects_budget = budget / 10;
+            let context_budget = budget.saturating_sub(
+                goal_budget + docs_budget + facts_budget + files_budget + projects_budget,
+            );
 
             if active_goal_text.len() > goal_budget {
                 active_goal_text = active_goal_text.chars().take(goal_budget).collect();
@@ -1095,6 +1134,13 @@ impl CliAgentTool {
             if files_text.len() > files_budget {
                 files_text = files_text.chars().take(files_budget).collect();
                 files_text.push_str("...[truncated]");
+            }
+            if projects_listing_text.len() > projects_budget {
+                projects_listing_text = projects_listing_text
+                    .chars()
+                    .take(projects_budget)
+                    .collect();
+                projects_listing_text.push_str("...[truncated]");
             }
             if context_text.len() > context_budget {
                 context_text = context_text.chars().take(context_budget).collect();
@@ -1113,6 +1159,12 @@ impl CliAgentTool {
         }
         if !files_text.is_empty() {
             parts.push(format!("## Project Files\n{}", files_text));
+        }
+        if !projects_listing_text.is_empty() {
+            parts.push(format!(
+                "## Available Project Directories\n{}",
+                projects_listing_text
+            ));
         }
         if !context_text.is_empty() {
             parts.push(format!("## Conversation Context\n{}", context_text));

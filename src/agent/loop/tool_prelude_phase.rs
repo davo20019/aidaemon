@@ -246,12 +246,16 @@ fn extract_target_preview(arguments: &str) -> Option<String> {
 }
 
 fn turn_prefers_plain_text_completion(turn_context: &TurnContext) -> bool {
-    turn_context
-        .completion_contract
-        .connected_content_mode
-        .is_authoring_only()
-        || (!turn_context.completion_contract.expects_mutation
-            && !turn_context.completion_contract.requires_observation)
+    // ConnectedContentMode::DraftOnly is deliberately excluded here.
+    // Keyword-based "authoring only" classification is too brittle —
+    // "create 3 blog posts in ~/projects/X and commit" gets misclassified
+    // as DraftOnly because it matches "create" + "posts".  The LLM is
+    // better at deciding whether tools are needed; hard-blocking them
+    // based on keyword heuristics causes false tool disablement.
+    // The DraftOnly signal is still used downstream for budget/contract
+    // hints, just not for hard tool blocking.
+    !turn_context.completion_contract.expects_mutation
+        && !turn_context.completion_contract.requires_observation
 }
 
 fn summarize_tool_arguments(arguments: &str) -> Value {
@@ -362,9 +366,13 @@ fn should_run_pre_execution_critique(
         return false;
     }
 
+    // Critique is expensive (~2 extra LLM calls, 1-3 min).  Reserve it for
+    // genuinely high-risk operations.  `needs_approval` alone should NOT
+    // trigger critique — the interactive approval flow already gates those
+    // tools separately.  Routine file writes (write_file, edit_file) were
+    // being critiqued on every attempt, causing 7+ min delays for simple tasks.
     capabilities.high_impact_write
         || capabilities.external_side_effect
-        || capabilities.needs_approval
         || matches!(policy_bundle.policy.verify_level, VerifyLevel::Full)
         || policy_bundle.risk_score >= 0.67
         || policy_bundle.uncertainty_score >= 0.45
@@ -452,6 +460,7 @@ impl Agent {
                 strict: true,
             },
             tool_choice: ToolChoiceMode::None,
+            ..ChatOptions::default()
         };
         let response = llm_provider
             .chat_with_options(model, &messages, &[], &options)
@@ -515,6 +524,7 @@ impl Agent {
                 strict: true,
             },
             tool_choice: ToolChoiceMode::None,
+            ..ChatOptions::default()
         };
         let response = llm_provider
             .chat_with_options(model, &messages, &[], &options)
@@ -804,7 +814,16 @@ impl Agent {
 
         let first_risky_tool_call =
             first_side_effecting_tool_call(self, resp, available_capabilities).cloned();
+        // Gate: only request the pre-execution plan once per task.
+        // Skip if: (a) a side-effecting tool already completed successfully
+        // (learning_ctx tracks it), OR (b) a plan was already accepted
+        // (current_plan_version is set).  Without check (b), a critique
+        // rejection causes ContinueLoop without executing the tool, so the
+        // learning_ctx guard stays false and the plan is re-requested every
+        // iteration — adding 2 extra LLM calls (plan + critique) per loop.
+        let plan_already_generated = execution_state.current_plan_version.is_some();
         if self.depth == 0
+            && !plan_already_generated
             && !has_completed_side_effecting_tool_call(learning_ctx, available_capabilities)
         {
             if let Some(first_risky_tool_call) = first_risky_tool_call {
@@ -855,6 +874,10 @@ impl Agent {
                                             tool: step.tool.clone(),
                                             target: step.target.clone(),
                                             description: step.description.clone(),
+                                            tool_calls_on_step: 0,
+                                            completed: false,
+                                            completion_evidence: None,
+                                            last_evaluated_at: None,
                                         })
                                         .collect(),
                                 );

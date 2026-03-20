@@ -240,8 +240,7 @@ impl Agent {
 
         // Task-start planning call: generate a structured plan before the main loop.
         // Skipped for conversational queries, short messages, and acknowledgments.
-        // Disabled in test builds to avoid consuming mock provider responses.
-        #[cfg(not(test))]
+        // In tests, MockProvider silently intercepts planning calls (skip_planning_calls=true).
         {
             use super::bootstrap_phase::task_planning::{generate_task_plan, should_skip_planning};
             use crate::agent::execution_state::LinearIntentStep;
@@ -250,8 +249,41 @@ impl Agent {
                 user_text,
                 false,
             ) {
+                // Build conversation context from recent messages for the planner.
+                // This ensures the planner sees the same narrative as the main LLM,
+                // preventing intent loss across multi-hop follow-ups.
+                let planner_context = {
+                    let mut ctx_parts = Vec::new();
+                    if let Some(ref summary) = session_summary {
+                        if !summary.summary.is_empty() {
+                            ctx_parts.push(format!("[Session Summary] {}", summary.summary));
+                        }
+                    }
+                    for msg in &turn_context.recent_messages {
+                        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        if !content.is_empty() {
+                            ctx_parts.push(format!(
+                                "- {}: {}",
+                                role.chars().next().unwrap_or('?').to_uppercase(),
+                                content
+                            ));
+                        }
+                    }
+                    if ctx_parts.is_empty() {
+                        None
+                    } else {
+                        Some(ctx_parts.join("\n"))
+                    }
+                };
                 let plan_opt = if let Some(ref router) = llm_router {
-                    generate_task_plan(llm_provider.clone(), router, user_text).await
+                    generate_task_plan(
+                        llm_provider.clone(),
+                        router,
+                        user_text,
+                        planner_context.as_deref(),
+                    )
+                    .await
                 } else {
                     None
                 };
@@ -266,6 +298,10 @@ impl Agent {
                             tool: step.tool_hint.clone().unwrap_or_default(),
                             target: String::new(),
                             description: step.description.clone(),
+                            tool_calls_on_step: 0,
+                            completed: false,
+                            completion_evidence: None,
+                            last_evaluated_at: None,
                         })
                         .collect();
 
@@ -311,6 +347,11 @@ impl Agent {
         // Force-stop flag: when true, strip tools from next LLM call to force
         // a text response. Activated after too many tool calls without settling.
         let mut force_text_response = false;
+        // Safety net: count consecutive iterations where force_text_response was
+        // active.  After MAX_FORCE_TEXT_ITERATIONS the loop hard-returns the last
+        // text regardless of completion/consultant analysis.
+        let mut force_text_iterations: usize = 0;
+        const MAX_FORCE_TEXT_ITERATIONS: usize = 3;
         let mut budget_warning_sent = false;
         let mut effective_task_budget = self.task_token_budget;
         let mut effective_daily_budget = self.daily_token_budget;
@@ -348,6 +389,13 @@ impl Agent {
         let mut empty_response_retry_used = false;
         let mut empty_response_retry_pending = false;
         let mut empty_response_retry_note: Option<String> = None;
+        // Accumulated text from a truncated text response; prepended on next iteration.
+        let mut truncated_text_prefix: Option<String> = None;
+        // Counts consecutive LLM calls truncated with all tokens on thinking;
+        // the next call uses escalating recovery (low → off → force text).
+        let mut thinking_truncation_count: u8 = 0;
+        // Cumulative ms lost to LLM provider timeouts (excluded from wall-clock budget).
+        let mut provider_timeout_ms: u64 = 0;
         // Idempotency guard for send_file within a single task execution.
         let mut successful_send_file_keys: HashSet<String> = HashSet::new();
         // Inject cli_agent completion nudges at most once per phase
@@ -638,6 +686,63 @@ impl Agent {
                 }
             }
 
+            // Safety net: if force-text mode has been active for too many
+            // consecutive iterations, hard-return whatever the LLM last produced.
+            // This prevents infinite force-text loops where the response/completion
+            // phase keeps deciding to continue despite having no tools.
+            if force_text_response {
+                force_text_iterations += 1;
+                if force_text_iterations > MAX_FORCE_TEXT_ITERATIONS {
+                    warn!(
+                        session_id,
+                        iteration,
+                        force_text_iterations,
+                        "Force-text safety net: exceeded max consecutive force-text iterations, hard-stopping"
+                    );
+                    let fallback = self
+                        .latest_non_system_tool_output_excerpt(session_id, 2000)
+                        .await
+                        .unwrap_or_else(|| {
+                            "I ran into a processing limit. Please try again or rephrase your request.".to_string()
+                        });
+                    let assistant_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "assistant".to_string(),
+                        content: Some(fallback.clone()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.3,
+                        ..Message::runtime_defaults()
+                    };
+                    let _ = self
+                        .append_assistant_message_with_event(
+                            &emitter,
+                            &assistant_msg,
+                            "force_text_safety_net",
+                            None,
+                            None,
+                        )
+                        .await;
+                    self.emit_task_end(
+                        &emitter,
+                        &task_id,
+                        TaskStatus::Completed,
+                        task_start,
+                        iteration,
+                        task_tokens_used as usize,
+                        None,
+                        Some(fallback.clone()),
+                    )
+                    .await;
+                    return Ok(fallback);
+                }
+            } else {
+                force_text_iterations = 0;
+            }
+
             info!(
                 iteration,
                 session_id,
@@ -766,21 +871,102 @@ impl Agent {
                 }
             }
 
-            // Inject task plan context into the model's messages each iteration.
-            // (Plan is only generated in non-test builds, so this is a no-op in tests
-            // unless a plan was installed by the prelude phase.)
+            // Inject task plan context with progress markers into the model's context.
             if let Some(ref plan) = execution_state.active_linear_intent_plan {
                 if !plan.steps.is_empty() {
-                    let mut plan_text = String::from("## Task Plan\n");
-                    for step in &plan.steps {
-                        plan_text.push_str(&format!("{}. {}\n", step.step_index, step.description));
-                    }
-                    // Cap at ~1200 chars (~300 tokens)
-                    if plan_text.len() > 1200 {
-                        plan_text.truncate(crate::utils::floor_char_boundary(&plan_text, 1200));
-                        plan_text.push_str("\n...");
-                    }
+                    let plan_text = plan.format_with_progress();
                     pending_system_messages.push(SystemDirective::TaskPlanContext(plan_text));
+                }
+            }
+
+            // Compaction: on the first iteration, detect whether the conversation
+            // history needs compacting and run it synchronously before message build.
+            // This ensures the session_summary is fresh for context injection.
+            if iteration == 1 && self.context_window_config.enabled {
+                if let Some(ref router) = llm_router {
+                    // Count user-message pairs and compute idle gap.
+                    let history = self
+                        .state
+                        .get_history(session_id, 100)
+                        .await
+                        .unwrap_or_default();
+                    let total_pairs = history.iter().filter(|m| m.role == "user").count();
+                    let idle_gap_seconds = history
+                        .last()
+                        .map(|m| {
+                            let now = Utc::now();
+                            now.signed_duration_since(m.created_at).num_seconds().max(0) as u64
+                        })
+                        .unwrap_or(0);
+
+                    let window_size = self.context_window_config.summary_window;
+                    let compaction_trigger = super::compaction::detect_compaction_trigger(
+                        total_pairs,
+                        window_size,
+                        idle_gap_seconds,
+                        user_text,
+                    );
+
+                    if let Some(ref trigger) = compaction_trigger {
+                        info!(
+                            session_id,
+                            ?trigger,
+                            total_pairs,
+                            idle_gap_seconds,
+                            window_size,
+                            "Compaction trigger detected"
+                        );
+
+                        // Convert history messages to JSON Value array for the compaction prompt.
+                        let messages_to_compact: Vec<Value> = history
+                            .iter()
+                            .map(|m| {
+                                let mut msg = json!({ "role": m.role });
+                                if let Some(ref content) = m.content {
+                                    msg["content"] = json!(content);
+                                }
+                                if let Some(ref name) = m.tool_name {
+                                    msg["name"] = json!(name);
+                                }
+                                msg
+                            })
+                            .collect();
+
+                        let last_message_id = history.last().map(|m| m.id.as_str()).unwrap_or("");
+
+                        match tokio::time::timeout(
+                            Duration::from_secs(15),
+                            super::compaction::run_and_store_compaction(
+                                llm_provider.clone(),
+                                router,
+                                self.state.as_ref(),
+                                session_id,
+                                session_summary.clone(),
+                                &messages_to_compact,
+                                total_pairs,
+                                last_message_id,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                // Reload the summary so message build uses the fresh version.
+                                session_summary = self
+                                    .state
+                                    .get_conversation_summary(session_id)
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                info!(session_id, "Synchronous compaction completed");
+                            }
+                            Ok(Err(e)) => {
+                                warn!(session_id, error = %e, "Synchronous compaction failed");
+                            }
+                            Err(_) => {
+                                warn!(session_id, "Synchronous compaction timed out (15s)");
+                            }
+                        }
+                    }
                 }
             }
 
@@ -840,6 +1026,9 @@ impl Agent {
                     tools_required_for_turn: needs_tools_for_turn,
                     max_budget_extensions,
                     hard_token_cap,
+                    truncated_text_prefix: &mut truncated_text_prefix,
+                    provider_timeout_ms: &mut provider_timeout_ms,
+                    thinking_truncation_count: &mut thinking_truncation_count,
                 })
                 .await?;
             let mut resp = match llm_outcome {
@@ -847,6 +1036,9 @@ impl Agent {
                     if execution_state.execution_budget_applies() {
                         execution_state.record_llm_call();
                     }
+                    // Propagate accumulated timeout to execution state so
+                    // wall-clock budget excludes provider-caused delays.
+                    execution_state.provider_timeout_ms = provider_timeout_ms;
                     continue;
                 }
                 LlmPhaseOutcome::Return(result) => {
@@ -958,6 +1150,9 @@ impl Agent {
                 ToolPreludeOutcome::Proceed => {}
             }
 
+            // Capture baseline for tracking tool calls per plan step
+            let tool_calls_before_execution = learning_ctx.tool_calls.len();
+
             let tool_execution_outcome = self
                 .run_tool_execution_phase(&mut ToolExecutionCtx {
                     resp: &resp,
@@ -1034,6 +1229,52 @@ impl Agent {
             match tool_execution_outcome {
                 ToolExecutionOutcome::Return(result) => return result,
                 ToolExecutionOutcome::NextIteration => {}
+            }
+
+            // Re-planner: track tool calls on current plan step and evaluate
+            // whether the step is complete. Uses delta of learning_ctx.tool_calls
+            // to count ALL calls this round (including failures).
+            {
+                let tool_calls_this_round = learning_ctx
+                    .tool_calls
+                    .len()
+                    .saturating_sub(tool_calls_before_execution);
+                if let Some(ref mut plan) = execution_state.active_linear_intent_plan {
+                    plan.record_tool_calls_on_current(tool_calls_this_round);
+                }
+                if let Some(ref mut plan) = execution_state.active_linear_intent_plan {
+                    if plan.current_step_needs_replan() {
+                        plan.mark_current_step_evaluated();
+                        if let Some(step) = plan.steps.get(plan.current_step_cursor).cloned() {
+                            use super::bootstrap_phase::task_planning::{
+                                evaluate_step_completion, summarize_tool_calls_for_replan,
+                            };
+                            let tool_summary =
+                                summarize_tool_calls_for_replan(&learning_ctx.tool_calls, 8);
+                            if let Some(ref router) = llm_router {
+                                if let Some(evidence) = evaluate_step_completion(
+                                    llm_provider.clone(),
+                                    router,
+                                    &step.description,
+                                    &tool_summary,
+                                )
+                                .await
+                                {
+                                    if let Some(ref mut plan) =
+                                        execution_state.active_linear_intent_plan
+                                    {
+                                        plan.complete_current_step_with_evidence(evidence);
+                                        info!(
+                                            session_id,
+                                            completed_step = plan.current_step_cursor - 1,
+                                            "Re-planner advanced plan to next step"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

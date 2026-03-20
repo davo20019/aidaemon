@@ -56,6 +56,9 @@ pub(in crate::agent) enum ToolResultNotice {
     ErrorCoaching {
         key_line: String,
     },
+    PermissionDeniedCoaching {
+        key_line: String,
+    },
     SemanticFailureCoaching {
         semantic_count: usize,
         key_line: String,
@@ -257,6 +260,16 @@ Do NOT repeat the same call. Change approach, reduce scope, or tell the user wha
          Do NOT repeat the same command. Analyze what this error means and use a DIFFERENT approach.\n\
          If the error indicates something doesn't exist or isn't available, \
          research alternatives before trying again.",
+                key_line
+            ),
+            Self::PermissionDeniedCoaching { key_line } => format!(
+                "[SYSTEM] PERMISSION ERROR — \"{}\"\n\
+         This path is NOT writable (system directory, wrong permissions, or read-only). \
+         Do NOT retry the same path. Instead:\n\
+         1. Explain to the user WHY the operation failed (permission denied)\n\
+         2. Suggest an alternative writable location (e.g., home directory ~/)\n\
+         3. If the user insists, they need to run the operation manually with sudo\n\
+         Do NOT keep retrying write_file/edit_file to the same path.",
                 key_line
             ),
             Self::SemanticFailureCoaching {

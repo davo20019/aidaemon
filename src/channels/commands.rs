@@ -237,8 +237,25 @@ impl CommandContext {
     }
 
     async fn handle_clear(&self, session_id: &str) -> String {
+        // Cancel any running tasks for this session so the agent loop aborts
+        // immediately instead of continuing to burn tokens after /clear.
+        let cancelled = self
+            .task_registry
+            .cancel_running_for_session(session_id)
+            .await;
+
         match self.agent.clear_session(session_id).await {
-            Ok(_) => "Context cleared. Starting fresh.".to_string(),
+            Ok(_) => {
+                if cancelled.is_empty() {
+                    "Context cleared. Starting fresh.".to_string()
+                } else {
+                    format!(
+                        "Context cleared. Starting fresh. ({} running task{} cancelled.)",
+                        cancelled.len(),
+                        if cancelled.len() == 1 { "" } else { "s" }
+                    )
+                }
+            }
             Err(e) => format!("Failed to clear context: {}", e),
         }
     }

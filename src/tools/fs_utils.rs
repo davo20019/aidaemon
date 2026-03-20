@@ -75,6 +75,43 @@ pub const PROJECT_ROOT_MARKERS: &[&str] = &[
     "Package.swift",
 ];
 
+/// Like [`validate_path`], but with smart project-directory fallback.
+///
+/// When a relative path doesn't exist under cwd, this checks `~/projects/<path>`
+/// before giving up. This avoids expensive `find ~` searches when the user
+/// references a project by name (e.g., "blog.aidaemon.ai").
+pub fn resolve_project_dir(path: &str) -> anyhow::Result<PathBuf> {
+    let direct = validate_path(path)?;
+    if direct.exists() && direct.is_dir() {
+        return Ok(direct);
+    }
+
+    // Only attempt fallback for simple names (not absolute, no path separators in
+    // the original input). This prevents ~/projects/../../../etc/passwd tricks.
+    let trimmed = path.trim();
+    if trimmed.starts_with('/')
+        || trimmed.starts_with('~')
+        || trimmed.contains('/')
+        || trimmed.contains("..")
+    {
+        anyhow::bail!("Not a valid directory: {}", path);
+    }
+
+    // Try ~/projects/<name>
+    if let Some(home) = dirs::home_dir() {
+        let fallback = home.join("projects").join(trimmed);
+        if fallback.exists() && fallback.is_dir() {
+            return Ok(fallback);
+        }
+    }
+
+    anyhow::bail!(
+        "Not a valid directory: {} (also checked ~/projects/{})",
+        path,
+        trimmed
+    )
+}
+
 /// Resolves `~` and validates path safety. Returns canonical path.
 pub fn validate_path(path: &str) -> anyhow::Result<PathBuf> {
     let expanded = shellexpand::tilde(path).to_string();

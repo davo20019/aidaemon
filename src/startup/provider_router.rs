@@ -38,7 +38,8 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
                 config.extra_headers.clone(),
                 config.max_tokens,
             )
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
+            .map_err(|e| anyhow::anyhow!("{}", e))?
+            .with_reasoning_effort(config.reasoning_effort.clone()),
         ),
         ProviderKind::XaiNative => Arc::new(
             crate::providers::XaiNativeProvider::new_with_options(

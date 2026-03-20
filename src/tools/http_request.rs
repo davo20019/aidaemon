@@ -1050,17 +1050,22 @@ impl HttpRequestTool {
             .min(ABSOLUTE_MAX_RESPONSE_BYTES);
         let custom_headers = args["headers"].as_object();
 
-        // Step 1: HTTPS enforcement
-        if parsed_url.scheme() != "https" {
+        // Step 1: HTTPS enforcement (with localhost exception for local dev/testing)
+        let is_localhost = parsed_url
+            .host_str()
+            .is_some_and(|h| h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "0.0.0.0");
+        if parsed_url.scheme() != "https" && !is_localhost {
             return Ok((
-                "Request blocked: only HTTPS URLs are allowed".to_string(),
+                "Request blocked: only HTTPS URLs are allowed (exception: localhost)".to_string(),
                 None,
             ));
         }
 
-        // Step 2: SSRF validation
-        if let Err(reason) = validate_url_for_ssrf(&url) {
-            return Ok((format!("Request blocked: {}", reason), None));
+        // Step 2: SSRF validation (skip for localhost — local dev/testing)
+        if !is_localhost {
+            if let Err(reason) = validate_url_for_ssrf(&url) {
+                return Ok((format!("Request blocked: {}", reason), None));
+            }
         }
 
         // Step 3: Catch malformed tool calls where tool-only args were stuffed into the URL.

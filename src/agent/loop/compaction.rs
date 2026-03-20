@@ -64,10 +64,14 @@ pub(crate) fn detect_compaction_trigger(
 /// Tracks user-message IDs that are pending compaction.
 ///
 /// The cap of 3 prevents unbounded accumulation if compaction calls are slow.
+/// Currently unused — compaction runs synchronously. Will be used when async
+/// compaction is implemented as a future optimization.
+#[allow(dead_code)]
 pub(crate) struct PendingCompaction {
     pub pair_ids: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl PendingCompaction {
     pub fn new() -> Self {
         Self {
@@ -240,7 +244,7 @@ pub(crate) async fn run_compaction(
 }
 
 /// Run compaction and persist the resulting summary.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) async fn run_and_store_compaction(
     provider: Arc<dyn ModelProvider>,
     router: &Router,

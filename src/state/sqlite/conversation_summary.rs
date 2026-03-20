@@ -30,9 +30,18 @@ impl crate::traits::ConversationSummaryStore for SqliteStateStore {
         &self,
         summary: &ConversationSummary,
     ) -> anyhow::Result<()> {
+        // Monotonic guard: only update if new message_count is higher than existing.
+        // Prevents out-of-order race condition when two async compaction tasks complete
+        // in wrong order — older summaries can never overwrite newer ones.
         sqlx::query(
-            "INSERT OR REPLACE INTO conversation_summaries (session_id, summary, message_count, last_message_id, updated_at)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO conversation_summaries (session_id, summary, message_count, last_message_id, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(session_id) DO UPDATE SET
+               summary = excluded.summary,
+               message_count = excluded.message_count,
+               last_message_id = excluded.last_message_id,
+               updated_at = excluded.updated_at
+             WHERE excluded.message_count > conversation_summaries.message_count",
         )
         .bind(&summary.session_id)
         .bind(&summary.summary)

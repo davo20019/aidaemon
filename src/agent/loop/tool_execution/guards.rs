@@ -36,8 +36,23 @@ impl Agent {
             .iter()
             .filter(|&&h| h == call_hash)
             .count();
-        let repetitive_redirect_threshold =
-            repetitive_redirect_threshold_for_call(&tc.name, &tc.arguments);
+        let repetitive_redirect_threshold = {
+            let base = repetitive_redirect_threshold_for_call(&tc.name, &tc.arguments);
+            // Edit-test cycles: when terminal is interleaved with edits, the
+            // agent is legitimately re-running tests after code changes.  Give
+            // the same headroom as read-only/research tools (6) so the cycle
+            // can finish naturally instead of stalling mid-fix.
+            if base == REPETITIVE_REDIRECT_THRESHOLD
+                && tc.name == "terminal"
+                && recent_tool_names
+                    .iter()
+                    .any(|n| n == "edit_file" || n == "write_file")
+            {
+                6
+            } else {
+                base
+            }
+        };
 
         // Soft redirect: skip execution and coach the LLM to adapt.
         // This fires BEFORE the hard stall, giving the agent a chance
@@ -234,27 +249,32 @@ impl Agent {
             consecutive_same_tool_arg_hashes.clear();
             consecutive_same_tool_arg_hashes.insert(call_hash);
         }
-        // Read-only and research tools get a higher threshold instead of
-        // complete exemption. A debugging task may need ~5 reads, and a
-        // research task legitimately needs multiple searches with different
-        // queries. But 16+ in a row still indicates a stuck loop.
+        // Read-only, research, and multi-purpose tools get a higher threshold
+        // instead of complete exemption.  `terminal` is the most versatile tool
+        // — a multi-step task (mkdir, pip install, start server, curl x6, kill)
+        // legitimately chains 12-16 terminal calls with different args.
         let higher_threshold_tool = matches!(
             tc.name.as_str(),
-            "read_file" | "search_files" | "check_environment" | "web_search" | "web_fetch"
+            "read_file"
+                | "search_files"
+                | "check_environment"
+                | "web_search"
+                | "web_fetch"
+                | "terminal"
         );
         let effective_same_tool_limit = if higher_threshold_tool {
-            MAX_CONSECUTIVE_SAME_TOOL + 4 // 12 for read/research tools
+            MAX_CONSECUTIVE_SAME_TOOL + 8 // 16 for versatile/research tools
         } else {
             MAX_CONSECUTIVE_SAME_TOOL
         };
         if consecutive_same_tool.1 >= effective_same_tool_limit {
             let total = consecutive_same_tool.1;
             let unique = consecutive_same_tool_arg_hashes.len();
-            // Diverse args get a small bonus (+4), not a full bypass.
-            // Even with different commands, 20+ consecutive same-tool
+            // Diverse args get a bonus (+8), not a full bypass.
+            // Even with different commands, 24+ consecutive same-tool
             // calls without switching tools indicates a stuck loop.
             let is_diverse = unique * 2 > total;
-            let diverse_limit = MAX_CONSECUTIVE_SAME_TOOL + 4;
+            let diverse_limit = MAX_CONSECUTIVE_SAME_TOOL + 8;
             self.emit_warning_decision_point(
                 emitter,
                 task_id,

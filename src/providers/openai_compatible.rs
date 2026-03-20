@@ -21,6 +21,10 @@ pub struct OpenAiCompatibleProvider {
     extra_headers: HashMap<String, String>,
     is_cloudflare_gateway: bool,
     max_tokens: Option<u32>,
+    /// When set, includes the `reasoning` parameter in requests to enable
+    /// thinking/reasoning tokens (supported by OpenRouter, Anthropic, etc.).
+    /// Values: "low", "medium", "high", "xhigh"
+    pub reasoning_effort: Option<String>,
 }
 
 impl Drop for OpenAiCompatibleProvider {
@@ -131,7 +135,14 @@ impl OpenAiCompatibleProvider {
             gateway_token: gateway_token.map(|s| s.to_string()),
             extra_headers: extra_headers.unwrap_or_default(),
             max_tokens,
+            reasoning_effort: None,
         })
+    }
+
+    /// Enable reasoning/thinking tokens with the given effort level.
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
     }
 
     fn with_auth_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -199,12 +210,18 @@ impl OpenAiCompatibleProvider {
             "messages": messages_cleaned,
         });
 
-        if let Some(max_tokens) = self.max_tokens {
+        // Per-call override takes priority (e.g. billing-aware retry with reduced cap).
+        if let Some(override_mt) = options.max_tokens_override {
+            body["max_tokens"] = json!(override_mt);
+        } else if let Some(max_tokens) = self.max_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
 
         if !tools.is_empty() {
             body["tools"] = json!(tools);
+            // Enable parallel tool calls so the model can batch independent
+            // tool invocations in a single turn, reducing iteration count.
+            body["parallel_tool_calls"] = json!(true);
         }
         if !tools.is_empty() {
             match &options.tool_choice {
@@ -223,6 +240,25 @@ impl OpenAiCompatibleProvider {
                 tool_choice = ?options.tool_choice,
                 "Ignoring non-auto tool_choice because no tools were provided"
             );
+        }
+
+        // Include reasoning/thinking tokens when configured.
+        // Works with any OpenAI-compatible provider that supports the
+        // `reasoning` parameter (e.g., thinking models like Kimi K2 Thinking,
+        // DeepSeek R1, Claude with extended thinking).
+        // Per-call override takes priority (e.g., truncation recovery reduces thinking).
+        // "off" means: disable reasoning entirely (don't include the parameter).
+        let effective_reasoning = options
+            .reasoning_effort_override
+            .as_deref()
+            .or(self.reasoning_effort.as_deref());
+        if let Some(effort) = effective_reasoning {
+            if effort != "off" {
+                body["reasoning"] = json!({
+                    "effort": effort,
+                });
+            }
+            // else: "off" → omit reasoning param to disable thinking entirely
         }
 
         match &options.response_mode {
@@ -270,6 +306,18 @@ impl ModelProvider for OpenAiCompatibleProvider {
         options: &ChatOptions,
     ) -> anyhow::Result<ProviderResponse> {
         let body = self.build_request_body(model, messages, tools, options);
+
+        // DEBUG: Log tool count and reasoning config sent to provider
+        let tool_count = body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let has_reasoning = body.get("reasoning").is_some();
+        info!(
+            model,
+            tool_count, has_reasoning, "Sending request to LLM provider"
+        );
 
         let url = format!("{}/chat/completions", self.base_url);
         info!(
@@ -418,11 +466,40 @@ impl ModelProvider for OpenAiCompatibleProvider {
             None
         };
 
+        // Extract reasoning/thinking tokens from the response.
+        // OpenRouter returns reasoning as `message.reasoning` (string) or
+        // `message.reasoning_details` (array of objects with `text` field).
+        let thinking = message
+            .get("reasoning")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                message
+                    .get("reasoning_details")
+                    .and_then(|v| v.as_array())
+                    .map(|details| {
+                        details
+                            .iter()
+                            .filter_map(|d| d.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|s| !s.is_empty())
+            });
+
+        if thinking.is_some() {
+            info!(
+                model,
+                thinking_len = thinking.as_ref().map(|t| t.len()).unwrap_or(0),
+                "Reasoning tokens received from provider"
+            );
+        }
+
         Ok(ProviderResponse {
             content,
             tool_calls,
             usage,
-            thinking: None,
+            thinking,
             response_note,
         })
     }
@@ -587,6 +664,7 @@ mod tests {
                 strict: true,
             },
             tool_choice: ToolChoiceMode::Required,
+            ..ChatOptions::default()
         };
 
         let body = provider.build_request_body("gpt-4o-mini", &messages, &tools, &options);
@@ -608,6 +686,7 @@ mod tests {
         let options = ChatOptions {
             response_mode: ResponseMode::JsonObject,
             tool_choice: ToolChoiceMode::Required,
+            ..ChatOptions::default()
         };
 
         let body = provider.build_request_body("gpt-4o-mini", &messages, &[], &options);

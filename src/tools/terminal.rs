@@ -113,14 +113,37 @@ pub struct TerminalTool {
 /// Used for prefix matching - we don't allow prefix matches for commands with operators
 /// since "cargo" shouldn't match "cargo test | bash".
 fn contains_shell_operator(cmd: &str) -> bool {
-    for ch in [';', '|', '`', '\n'] {
-        if cmd.contains(ch) {
-            return true;
-        }
-    }
-    for op in ["&&", "||", "$(", ">(", "<("] {
-        if cmd.contains(op) {
-            return true;
+    // Must be quote-aware: operators inside single/double quotes are not shell operators
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < len {
+        let b = bytes[i];
+        match b {
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                i += 1;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                i += 1;
+            }
+            b'\\' if (in_double || in_single) && i + 1 < len => {
+                i += 2; // skip escaped char
+            }
+            _ if in_single || in_double => {
+                i += 1; // inside quotes, skip
+            }
+            b';' | b'|' | b'`' | b'\n' => return true,
+            b'&' if i + 1 < len && bytes[i + 1] == b'&' => return true,
+            b'$' if i + 1 < len && bytes[i + 1] == b'(' => return true,
+            b'>' if i + 1 < len && bytes[i + 1] == b'(' => return true,
+            b'<' if i + 1 < len && bytes[i + 1] == b'(' => return true,
+            _ => {
+                i += 1;
+            }
         }
     }
     false
@@ -128,14 +151,32 @@ fn contains_shell_operator(cmd: &str) -> bool {
 
 /// Split a chained command into individual segments by pipe, semicolon, &&, ||.
 /// Used by session-approval to extract per-segment binary names.
+/// Quote-aware: operators inside single/double quotes are not treated as separators.
 fn split_command_segments(cmd: &str) -> Vec<&str> {
     let mut segments = Vec::new();
     let mut start = 0;
     let bytes = cmd.as_bytes();
     let len = bytes.len();
     let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
     while i < len {
-        match bytes[i] {
+        let b = bytes[i];
+        match b {
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                i += 1;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                i += 1;
+            }
+            b'\\' if (in_double || in_single) && i + 1 < len => {
+                i += 2; // skip escaped char
+            }
+            _ if in_single || in_double => {
+                i += 1; // inside quotes, skip
+            }
             b'|' if i + 1 < len && bytes[i + 1] == b'|' => {
                 segments.push(&cmd[start..i]);
                 i += 2;
@@ -214,9 +255,11 @@ fn has_recursive_grep_scope_controls(command: &str) -> bool {
         || lower.contains("-dskip")
 }
 
-/// Detect `python3 -c "..."` commands that perform file I/O.
-/// These should use read_file/write_file tools instead of terminal.
-fn is_python_c_with_file_io(command: &str) -> bool {
+/// Detect `python3 -c "..."` commands that perform file **write** I/O.
+/// Read-only operations (ast.parse, open().read(), json.load) are allowed
+/// since there's no dedicated tool equivalent for validation/syntax checks.
+/// Only file writes should use write_file/edit_file tools instead.
+fn is_python_c_with_file_write_io(command: &str) -> bool {
     // Split by shell operators to check each segment
     let lower = command.to_ascii_lowercase();
 
@@ -249,23 +292,31 @@ fn is_python_c_with_file_io(command: &str) -> bool {
                     } else {
                         String::new()
                     };
-                    let file_io_patterns = [
-                        "open(",
-                        "with open",
-                        ".read(",
+
+                    // Only block file WRITE operations — read-only is fine.
+                    let file_write_patterns = [
                         ".write(",
-                        ".readlines(",
                         ".writelines(",
-                        "read_text(",
                         "write_text(",
-                        "json.load",
-                        "json.dump",
-                        "os.walk",
-                        "os.listdir",
+                        // json.dump( writes to file; json.dumps( returns string (safe)
+                        "json.dump(",
                     ];
-                    if file_io_patterns.iter().any(|p| code.contains(p)) {
+                    if file_write_patterns.iter().any(|p| code.contains(p)) {
                         return true;
                     }
+
+                    // Check for open() with explicit write/append mode
+                    if code.contains("open(") {
+                        let write_modes = [
+                            "'w'", "\"w\"", "'a'", "\"a\"", "'x'", "\"x\"", "'wb'", "\"wb\"",
+                            "'ab'", "\"ab\"", "'xb'", "\"xb\"", "'w+'", "\"w+\"", "'a+'", "\"a+\"",
+                            "'r+'", "\"r+\"",
+                        ];
+                        if write_modes.iter().any(|m| code.contains(m)) {
+                            return true;
+                        }
+                    }
+
                     break;
                 }
             }
@@ -1554,8 +1605,10 @@ impl TerminalTool {
                                         "[Background command completed]\n\
                                          Command: `{}`\n\
                                          Output:\n{}\n\n\
-                                         Continue with the task using this output. \
-                                         Provide a concise summary of the findings.",
+                                         This command was part of your previous task. \
+                                         Check your session history for the original user request \
+                                         and continue where you left off. Use the output above \
+                                         to proceed with the remaining steps of the task.",
                                         command_summary, output
                                     );
                                     info!(
@@ -2031,16 +2084,16 @@ impl Tool for TerminalTool {
                     }
                 }
 
-                // Soft-block python3 -c with file I/O: redirects to read_file/write_file
+                // Soft-block python3 -c with file WRITE I/O: redirects to write_file/edit_file
                 // which are safer, faster, and don't require approval.
-                if is_python_c_with_file_io(command) {
+                // Read-only operations (ast.parse, open().read(), json.load) are allowed
+                // since there's no dedicated tool for validation/syntax checks.
+                if is_python_c_with_file_write_io(command) {
                     return Ok(ToolCallOutcome::from_output(
-                        "Blocked: `python3 -c` with file I/O is not allowed through terminal.\n\n\
+                        "Blocked: `python3 -c` with file write I/O is not allowed through terminal.\n\n\
                          Use dedicated tools instead:\n\
-                         - `read_file` to read file contents\n\
                          - `write_file` to create or overwrite files\n\
-                         - `edit_file` to modify specific parts of a file\n\
-                         - `search_files` to search for patterns in files\n\n\
+                         - `edit_file` to modify specific parts of a file\n\n\
                          These tools are faster, do not require approval, and handle \
                          encoding/quoting correctly."
                             .to_string(),
@@ -2200,16 +2253,8 @@ impl Tool for TerminalTool {
                     // Trusted scheduled tasks bypass approval
                     info!(command = %command, session = %args._session_id, "Auto-approved: trusted scheduled task");
                     false
-                } else if !is_allowed {
-                    true
-                } else if assessment.level == RiskLevel::Critical
-                    && self.permission_mode != PermissionMode::Yolo
-                {
-                    // Even with wildcard/prefix approval, Critical commands require explicit approval
-                    info!(command = %command, risk = %assessment.level, "Forcing approval: critical command despite prefix match");
-                    true
                 } else {
-                    false
+                    !is_allowed
                 };
 
                 if needs_approval {
@@ -3155,5 +3200,63 @@ mod tests {
             "quoted heredoc should NOT be soft-blocked, got: {}",
             response
         );
+    }
+
+    #[test]
+    fn test_split_command_segments_respects_quotes() {
+        // Simple chained command — should split at &&
+        let segs = split_command_segments("cd ~/projects && python3 test.py");
+        assert_eq!(segs, vec!["cd ~/projects", "python3 test.py"]);
+
+        // Semicolons inside double quotes — should NOT split
+        let segs = split_command_segments(r#"python3 -c "import os; print(os.getcwd())""#);
+        assert_eq!(segs.len(), 1);
+        assert!(segs[0].contains("import os; print"));
+
+        // Semicolons inside single quotes — should NOT split
+        let segs = split_command_segments("python3 -c 'x=1; y=2; print(x+y)'");
+        assert_eq!(segs.len(), 1);
+
+        // Mix: real && outside quotes + ; inside quotes
+        let segs =
+            split_command_segments(r#"cd ~/projects && python3 -c "import sys; print(sys.path)""#);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0], "cd ~/projects");
+        assert!(segs[1].starts_with("python3 -c"));
+        assert!(segs[1].contains("import sys; print"));
+
+        // Pipe inside quotes should not split
+        let segs = split_command_segments(r#"echo "hello | world""#);
+        assert_eq!(segs.len(), 1);
+
+        // Real pipe outside quotes should split
+        let segs = split_command_segments("ls -la | grep test");
+        assert_eq!(segs, vec!["ls -la", "grep test"]);
+    }
+
+    #[test]
+    fn test_contains_shell_operator_respects_quotes() {
+        // Semicolon inside double quotes — not a shell operator
+        assert!(!contains_shell_operator(
+            r#"python3 -c "import os; print(1)""#
+        ));
+
+        // Semicolon inside single quotes — not a shell operator
+        assert!(!contains_shell_operator("python3 -c 'x=1; y=2'"));
+
+        // Real semicolon outside quotes — IS a shell operator
+        assert!(contains_shell_operator("echo hello; echo world"));
+
+        // && outside quotes
+        assert!(contains_shell_operator("cd /tmp && ls"));
+
+        // && inside quotes — not a shell operator
+        assert!(!contains_shell_operator(r#"echo "a && b""#));
+
+        // Pipe inside quotes — not a shell operator
+        assert!(!contains_shell_operator(r#"echo "hello | world""#));
+
+        // Real pipe
+        assert!(contains_shell_operator("ls | grep test"));
     }
 }

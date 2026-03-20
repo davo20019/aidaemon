@@ -49,6 +49,11 @@ pub struct MockProvider {
     response_delays: Mutex<Vec<Duration>>,
     pub call_log: Mutex<Vec<MockChatCall>>,
     reject_non_default_options: bool,
+    /// When true (default), planning/re-planner LLM calls are silently
+    /// intercepted with an empty response (causing generate_task_plan()
+    /// to return None). Preserves existing test behavior — no plan
+    /// generated, no call_log entry, no plan context in prompts.
+    pub skip_planning_calls: bool,
 }
 
 impl MockProvider {
@@ -59,6 +64,7 @@ impl MockProvider {
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
+            skip_planning_calls: true,
         }
     }
 
@@ -69,6 +75,7 @@ impl MockProvider {
             response_delays: Mutex::new(Vec::new()),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
+            skip_planning_calls: true,
         }
     }
 
@@ -82,6 +89,7 @@ impl MockProvider {
             response_delays: Mutex::new(response_delays),
             call_log: Mutex::new(Vec::new()),
             reject_non_default_options: false,
+            skip_planning_calls: true,
         }
     }
 
@@ -152,6 +160,25 @@ impl ModelProvider for MockProvider {
         tools: &[Value],
         options: &ChatOptions,
     ) -> anyhow::Result<ProviderResponse> {
+        // Silently intercept planning/re-planner calls: return empty response
+        // (causes generate_task_plan() to return None) without recording in call_log.
+        if self.skip_planning_calls {
+            let is_planning_call = messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("task planner") || s.contains("progress evaluator"))
+            });
+            if is_planning_call {
+                return Ok(ProviderResponse {
+                    content: None,
+                    tool_calls: vec![],
+                    usage: None,
+                    thinking: None,
+                    response_note: None,
+                });
+            }
+        }
+
         // Record the call
         self.call_log.lock().await.push(MockChatCall {
             model: model.to_string(),

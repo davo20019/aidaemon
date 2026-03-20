@@ -15,6 +15,9 @@ pub(super) struct CriticalFactSummary {
     pub owner_name: Option<String>,
     pub assistant_name: Option<String>,
     pub relationships: Vec<String>,
+    /// Key personal facts about the owner (birthday, location, pets, preferences)
+    /// that should always be available in context without tool calls.
+    pub personal_facts: Vec<String>,
 }
 
 pub(super) fn is_personal_memory_tool(name: &str) -> bool {
@@ -187,6 +190,69 @@ pub(super) fn extract_critical_fact_summary(facts: &[Fact]) -> CriticalFactSumma
                 }
             }
         }
+
+        // Extract key personal facts (birthday, location, pets, food, hobbies, etc.)
+        if summary.personal_facts.len() < 12 {
+            let is_personal_cat = matches!(
+                lower_cat.as_str(),
+                "personal"
+                    | "preference"
+                    | "family"
+                    | "profile"
+                    | "user"
+                    | "identity"
+                    | "lifestyle"
+                    | "food"
+                    | "pet"
+                    | "pets"
+                    | "location"
+                    | "hobby"
+                    | "hobbies"
+            );
+            let is_personal_key = lower_key.contains("birthday")
+                || lower_key.contains("birth_date")
+                || lower_key.contains("location")
+                || lower_key.contains("city")
+                || lower_key.contains("country")
+                || lower_key.contains("pet")
+                || lower_key.contains("food")
+                || lower_key.contains("cuisine")
+                || lower_key.contains("hobby")
+                || lower_key.contains("language")
+                || lower_key.contains("coffee")
+                || lower_key.contains("drink")
+                || lower_key.contains("children")
+                || lower_key.contains("daughters")
+                || lower_key.contains("sons")
+                || lower_key.contains("family");
+            // Skip keys already handled as owner_name/assistant_name/relationships
+            let is_handled = matches!(
+                lower_key.as_str(),
+                "name"
+                    | "owner_name"
+                    | "user_name"
+                    | "full_name"
+                    | "my_name"
+                    | "owner"
+                    | "assistant_name"
+                    | "bot_name"
+                    | "ai_name"
+                    | "daemon_name"
+            ) || relationship_label_for_key(&lower_key).is_some();
+
+            if (is_personal_cat || is_personal_key) && !is_handled {
+                let clean_value = value
+                    .trim_matches(|c: char| matches!(c, '"' | '\'' | '`'))
+                    .trim();
+                if !clean_value.is_empty() && clean_value.len() <= 200 {
+                    let line = format!("{}: {}", key, clean_value);
+                    let dedupe = line.to_ascii_lowercase();
+                    if seen_relationships.insert(dedupe) {
+                        summary.personal_facts.push(line);
+                    }
+                }
+            }
+        }
     }
 
     summary
@@ -222,24 +288,32 @@ pub(super) fn deterministic_reply_for_critical_query(
 
 pub(super) fn build_critical_facts_prompt_block(summary: &CriticalFactSummary) -> Option<String> {
     let mut lines = vec![
-        "[Critical Facts — Highest Priority For Recall]".to_string(),
-        "When asked about identity/profile basics, answer from this block first.".to_string(),
+        "═══ CRITICAL FACTS — USE THESE EXACT VALUES ═══".to_string(),
+        "IMPORTANT: When asked about any fact below, reply with the EXACT value shown here."
+            .to_string(),
+        "Do NOT substitute, paraphrase, or infer different values from training data.".to_string(),
     ];
 
     if let Some(owner_name) = summary.owner_name.as_ref() {
-        lines.push(format!("- Owner name: {}", owner_name));
+        lines.push(format!("• Owner name → {}", owner_name));
     }
     if let Some(assistant_name) = summary.assistant_name.as_ref() {
-        lines.push(format!("- Assistant name: {}", assistant_name));
+        lines.push(format!("• Assistant name → {}", assistant_name));
     }
     if !summary.relationships.is_empty() {
-        lines.push("- Key relationships:".to_string());
         for rel in summary.relationships.iter().take(4) {
-            lines.push(format!("  - {}", rel));
+            lines.push(format!("• {}", rel));
         }
     }
+    if !summary.personal_facts.is_empty() {
+        for fact in summary.personal_facts.iter().take(12) {
+            lines.push(format!("• {}", fact));
+        }
+    }
+    lines.push("═══════════════════════════════════════════════".to_string());
 
-    if lines.len() <= 2 {
+    // Need at least header + one fact + footer = 4 lines minimum
+    if lines.len() <= 4 {
         None
     } else {
         Some(lines.join("\n"))
@@ -335,7 +409,7 @@ pub(super) fn looks_like_personal_memory_store_request(user_text: &str) -> bool 
         || contains_keyword_as_words(&lower, "update my")
 }
 
-pub(super) fn looks_like_personal_memory_recall_question(user_text: &str) -> bool {
+pub(crate) fn looks_like_personal_memory_recall_question(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return false;
@@ -685,6 +759,7 @@ mod tests {
             owner_name: Some("Test Owner".to_string()),
             assistant_name: Some("TestBot".to_string()),
             relationships: vec!["children: Sofia".to_string()],
+            personal_facts: vec![],
         };
         assert_eq!(
             deterministic_reply_for_critical_query(CriticalFactQuery::OwnerName, &summary),

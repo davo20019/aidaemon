@@ -625,8 +625,22 @@ impl TelegramChannel {
                         error = %err,
                         "Failed to initialize Telegram webhook mode, falling back to long polling"
                     );
+                    let _ = self.bot.delete_webhook().send().await;
                 }
             }
+        }
+
+        // Clear any stale webhook before starting long polling. If a webhook
+        // was previously set (e.g., via `/setup lowlatency apply`) but we're
+        // now falling back to polling, Telegram will keep sending updates to
+        // the old webhook URL and getUpdates will return nothing.
+        info!(name = %bot_username, "Clearing any existing webhook before starting long polling");
+        if let Err(err) = self.bot.delete_webhook().send().await {
+            warn!(
+                name = %bot_username,
+                error = %err,
+                "Failed to delete webhook before long polling (updates may not arrive)"
+            );
         }
 
         dispatcher.dispatch().await;
@@ -2038,6 +2052,19 @@ impl TelegramChannel {
         }
 
         const MAX_FILES_PER_REPLY: usize = 3;
+
+        // If the reply mentions many file paths, it's a search result or directory
+        // listing — not a "here's the file I created" scenario.  Skip auto-send
+        // to avoid spamming the chat with unrelated file uploads.
+        const AUTO_SEND_SKIP_THRESHOLD: usize = 8;
+        if candidate_paths.len() > AUTO_SEND_SKIP_THRESHOLD {
+            debug!(
+                count = candidate_paths.len(),
+                "Skipping auto-file-send: too many candidate paths (likely a listing)"
+            );
+            return;
+        }
+
         let sendable_paths: HashSet<String> = crate::agent::extract_file_paths_from_text(reply)
             .into_iter()
             .collect();

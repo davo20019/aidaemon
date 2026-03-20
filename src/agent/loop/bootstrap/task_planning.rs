@@ -44,14 +44,23 @@ pub(crate) async fn generate_task_plan(
     provider: Arc<dyn ModelProvider>,
     router: &Router,
     user_text: &str,
+    conversation_context: Option<&str>,
 ) -> Option<TaskPlan> {
     let model = router.select(crate::router::Tier::Primary).to_string();
 
     let system = "You are a task planner. Analyze the user request and return a JSON plan. \
                   Return ONLY valid JSON, no markdown fences.";
 
+    // Include conversation context from the sliding window so the planner
+    // has the same narrative as the main LLM. Without this, short follow-ups
+    // like "and for ibuprofen?" lose the original intent from earlier turns.
+    let context_block = conversation_context
+        .filter(|ctx| !ctx.is_empty())
+        .map(|ctx| format!("Recent conversation context:\n{}\n\n", ctx))
+        .unwrap_or_default();
+
     let user_prompt = format!(
-        "Analyze this user request and create a step-by-step plan.\n\n\
+        "{}Analyze this user request and create a step-by-step plan.\n\n\
          User request: \"{}\"\n\n\
          Return JSON only:\n\
          {{\n  \
@@ -68,7 +77,18 @@ pub(crate) async fn generate_task_plan(
          - Each step should be a concrete action, not vague \
            (\"search memory for twitter schedule\" not \"investigate\")\n\
          - tool_hint is advisory — helps understand step type\n\
-         - success_criteria: what does \"done\" look like?",
+         - success_criteria: what does \"done\" look like?\n\
+         - IMPORTANT: When the request contains MULTIPLE distinct actions \
+           (create + run, write + execute + fix, build + deploy + verify), \
+           each action MUST be its own step. Never collapse \"create X then run it\" \
+           into a single step.\n\
+         - When the task involves creating a file that processes other files, \
+           ALWAYS start with an inspection step to understand the target files' format.\n\n\
+         Examples of compound task decomposition:\n\
+         \"Create a script and run it\" → 3 steps: inspect target files, create script, run script\n\
+         \"Write tests then fix any failures\" → 3 steps: write tests, run tests, fix failures\n\
+         \"Build a checker, run it, fix issues\" → 4 steps: inspect files, create checker, run checker, fix reported issues",
+        context_block,
         truncate_str(user_text, 500)
     );
 
@@ -96,16 +116,15 @@ pub(crate) async fn generate_task_plan(
 
     let content = result.content.as_deref().unwrap_or("");
 
-    // Strip markdown code fences if present
-    let json_str = content
-        .trim()
-        .strip_prefix("```json")
-        .or_else(|| content.trim().strip_prefix("```"))
-        .and_then(|s| s.strip_suffix("```"))
-        .unwrap_or(content)
-        .trim();
+    let json_str = match crate::utils::extract_json_object(content) {
+        Some(s) => s,
+        None => {
+            warn!("Task planning response: no valid JSON found");
+            return None;
+        }
+    };
 
-    let parsed: TaskPlanResponse = match serde_json::from_str(json_str) {
+    let parsed: TaskPlanResponse = match serde_json::from_str(&json_str) {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "Task planning response unparseable");
@@ -118,6 +137,36 @@ pub(crate) async fn generate_task_plan(
     }
 
     let mut steps = parsed.steps;
+
+    // For compound tasks (user asked to create+run, write+execute+fix, etc.),
+    // ensure the plan has enough steps. If the LLM collapsed everything into
+    // 1-2 steps, append execution/verification steps.
+    if steps.len() < 3 && looks_like_compound_task(user_text) {
+        let has_execution_step = steps.iter().any(|s| {
+            let d = s.description.to_lowercase();
+            d.contains("run") || d.contains("execute") || d.contains("test")
+        });
+        if !has_execution_step {
+            steps.push(TaskPlanStep {
+                description: "Run/execute the created artifact and capture output".to_string(),
+                tool_hint: Some("terminal".to_string()),
+            });
+        }
+        let has_fix_step = steps.iter().any(|s| {
+            let d = s.description.to_lowercase();
+            d.contains("fix") || d.contains("repair") || d.contains("resolve")
+        });
+        let lower = user_text.to_lowercase();
+        if !has_fix_step
+            && (lower.contains("fix") || lower.contains("repair") || lower.contains("resolve"))
+        {
+            steps.push(TaskPlanStep {
+                description: "Fix any issues found in the previous step".to_string(),
+                tool_hint: Some("edit_file".to_string()),
+            });
+        }
+    }
+
     steps.truncate(MAX_PLAN_STEPS);
 
     info!(
@@ -133,24 +182,172 @@ pub(crate) async fn generate_task_plan(
     })
 }
 
+/// Detect compound tasks that involve multiple distinct actions.
+/// e.g., "create X then run it", "write a script and execute it, fix issues"
+fn looks_like_compound_task(user_text: &str) -> bool {
+    let lower = user_text.to_lowercase();
+
+    // Use word-boundary matching to avoid false positives from filenames
+    // like "checker.py" matching "check".
+    let has_word = |kw: &str| crate::agent::contains_keyword_as_words(&lower, kw);
+
+    // Count distinct action categories present
+    let create_actions = ["create", "write", "build", "make", "generate"];
+    let execute_actions = ["run", "execute", "test", "launch", "start"];
+    let fix_actions = ["fix", "repair", "resolve", "correct", "patch"];
+    // Multi-word phrases use .contains() since they're specific enough
+    let verify_phrases = ["show me", "show me the"];
+
+    let mut categories = 0u8;
+    if create_actions.iter().any(|a| has_word(a)) {
+        categories += 1;
+    }
+    if execute_actions.iter().any(|a| has_word(a)) {
+        categories += 1;
+    }
+    if fix_actions.iter().any(|a| has_word(a)) {
+        categories += 1;
+    }
+    if has_word("verify")
+        || has_word("check")
+        || has_word("display")
+        || has_word("report")
+        || verify_phrases.iter().any(|p| lower.contains(p))
+    {
+        categories += 1;
+    }
+
+    // Compound if 2+ distinct action categories
+    categories >= 2
+}
+
 /// Determine whether the task-start planning call should be skipped.
+/// Only skip for acknowledgments and control commands.
+/// Do NOT skip based on task_kind — even "conversational" queries like
+/// "what time is it in tokyo?" may need tools and benefit from a plan.
 pub(crate) fn should_skip_planning(
-    task_kind: &crate::agent::CompletionTaskKind,
+    _task_kind: &crate::agent::CompletionTaskKind,
     user_text: &str,
     is_acknowledgment: bool,
 ) -> bool {
-    use crate::agent::CompletionTaskKind;
-
-    if matches!(task_kind, CompletionTaskKind::Conversational) {
-        return true;
-    }
-    if user_text.len() < 15 {
-        return true;
-    }
     if is_acknowledgment {
         return true;
     }
+
+    // Control commands — not tasks that need a plan.
+    let lower = user_text.trim().to_lowercase();
+    let control_commands = [
+        "cancel",
+        "stop",
+        "nevermind",
+        "never mind",
+        "abort",
+        "forget it",
+        "forget that",
+        "nvm",
+    ];
+    if control_commands.iter().any(|cmd| lower == *cmd) {
+        return true;
+    }
+
     false
+}
+
+/// Re-planner: evaluates whether the current plan step is complete.
+///
+/// Called after each tool execution round when the current step has had
+/// enough tool calls since the last evaluation. Uses a focused LLM
+/// prompt to judge step completion.
+///
+/// Returns Some(evidence) if the step is complete, None if not or on failure.
+pub(crate) async fn evaluate_step_completion(
+    provider: Arc<dyn ModelProvider>,
+    router: &Router,
+    step_description: &str,
+    tool_results_summary: &str,
+) -> Option<String> {
+    let model = router.select(crate::router::Tier::Primary).to_string();
+
+    let prompt = format!(
+        "You are evaluating whether a task step is complete.\n\n\
+         Current step: \"{}\"\n\n\
+         Tool results from this step:\n{}\n\n\
+         Has the agent gathered enough information or completed enough work \
+         to move to the next step? Be practical \u{2014} if the key information \
+         has been found, the step is complete even if more could theoretically \
+         be explored.\n\n\
+         Return JSON only:\n\
+         {{\"complete\": true/false, \"evidence\": \"brief summary of what was accomplished\"}}",
+        step_description,
+        truncate_str(tool_results_summary, 1500)
+    );
+
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "You are a task progress evaluator. Return ONLY valid JSON."
+        }),
+        json!({ "role": "user", "content": prompt }),
+    ];
+
+    let result = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        provider.chat(&model, &messages, &[]),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
+            warn!(error = %e, "Re-planner call failed");
+            return None;
+        }
+        Err(_) => {
+            warn!("Re-planner call timed out (10s)");
+            return None;
+        }
+    };
+
+    let content = result.content.as_deref().unwrap_or("");
+    let json_str = crate::utils::extract_json_object(content)?;
+
+    #[derive(Deserialize)]
+    struct ReplanResult {
+        complete: bool,
+        #[serde(default)]
+        evidence: String,
+    }
+
+    match serde_json::from_str::<ReplanResult>(&json_str) {
+        Ok(r) if r.complete => {
+            info!(evidence = %r.evidence, "Re-planner: step complete");
+            Some(r.evidence)
+        }
+        Ok(_) => {
+            info!("Re-planner: step not yet complete");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "Re-planner response parse failed");
+            None
+        }
+    }
+}
+
+/// Build a summary of recent tool calls for the re-planner prompt.
+pub(crate) fn summarize_tool_calls_for_replan(tool_calls: &[String], max_entries: usize) -> String {
+    tool_calls
+        .iter()
+        .rev()
+        .take(max_entries)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|call| {
+            let display = crate::agent::post_task::display_tool_call(call);
+            format!("- {}", display)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -158,19 +355,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_skip_conversational() {
+    fn test_does_not_skip_conversational_with_enough_text() {
         use crate::agent::CompletionTaskKind;
-        assert!(should_skip_planning(
+        // Conversational task_kind no longer causes skip — even simple
+        // queries may need tools (e.g., "what time is it in tokyo?").
+        assert!(!should_skip_planning(
             &CompletionTaskKind::Conversational,
-            "hello there how are you",
+            "hello there how are you doing today",
             false
         ));
     }
 
     #[test]
-    fn test_should_skip_short_text() {
+    fn test_should_not_skip_short_text() {
         use crate::agent::CompletionTaskKind;
-        assert!(should_skip_planning(&CompletionTaskKind::Find, "hi", false));
+        // Short text no longer skips — "fix bug" or "deploy it" are valid tasks.
+        assert!(!should_skip_planning(
+            &CompletionTaskKind::Find,
+            "hi",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_control_commands() {
+        use crate::agent::CompletionTaskKind;
+        assert!(should_skip_planning(
+            &CompletionTaskKind::Conversational,
+            "cancel",
+            false
+        ));
+        assert!(should_skip_planning(
+            &CompletionTaskKind::Conversational,
+            "stop",
+            false
+        ));
+        assert!(should_skip_planning(
+            &CompletionTaskKind::Conversational,
+            "nevermind",
+            false
+        ));
+        assert!(should_skip_planning(
+            &CompletionTaskKind::Conversational,
+            "nvm",
+            false
+        ));
+        assert!(should_skip_planning(
+            &CompletionTaskKind::Conversational,
+            "abort",
+            false
+        ));
     }
 
     #[test]
@@ -232,5 +466,45 @@ mod tests {
         let mut plan_steps = steps;
         plan_steps.truncate(MAX_PLAN_STEPS);
         assert_eq!(plan_steps.len(), 7);
+    }
+
+    #[test]
+    fn test_compound_task_create_and_run() {
+        assert!(looks_like_compound_task(
+            "Create a Python script and run it to check all blog posts"
+        ));
+    }
+
+    #[test]
+    fn test_compound_task_create_run_fix() {
+        assert!(looks_like_compound_task(
+            "Write a checker script, execute it, and fix any issues found"
+        ));
+    }
+
+    #[test]
+    fn test_compound_task_build_and_verify() {
+        assert!(looks_like_compound_task(
+            "Build the project and show me the test results"
+        ));
+    }
+
+    #[test]
+    fn test_not_compound_simple_create() {
+        assert!(!looks_like_compound_task(
+            "Create a Python script at ~/projects/blog/tools/checker.py"
+        ));
+    }
+
+    #[test]
+    fn test_not_compound_simple_question() {
+        assert!(!looks_like_compound_task("What time is it in Tokyo?"));
+    }
+
+    #[test]
+    fn test_compound_task_generate_and_test() {
+        assert!(looks_like_compound_task(
+            "Generate unit tests for the router module, then run them"
+        ));
     }
 }

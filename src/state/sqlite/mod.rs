@@ -177,7 +177,8 @@ impl SqliteStateStore {
         }
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(10)
+            .acquire_timeout(std::time::Duration::from_secs(30))
             .connect_with(opts)
             .await?;
 

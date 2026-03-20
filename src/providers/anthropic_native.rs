@@ -242,9 +242,10 @@ impl AnthropicNativeProvider {
         };
         let anthropic_tools = self.convert_tools(effective_tools);
 
+        let effective_max_tokens = options.max_tokens_override.unwrap_or(self.max_tokens);
         let mut body = json!({
             "model": model,
-            "max_tokens": self.max_tokens,
+            "max_tokens": effective_max_tokens,
             "messages": converted_msgs,
         });
 
@@ -708,6 +709,7 @@ mod tests {
         let options = ChatOptions {
             response_mode: ResponseMode::Text,
             tool_choice: ToolChoiceMode::Required,
+            ..ChatOptions::default()
         };
 
         let body = p.build_request_body("claude-3-5-sonnet-20241022", &messages, &tools, &options);
@@ -724,6 +726,7 @@ mod tests {
         let options = ChatOptions {
             response_mode: ResponseMode::Text,
             tool_choice: ToolChoiceMode::Specific("search_files".to_string()),
+            ..ChatOptions::default()
         };
 
         let body = p.build_request_body("claude-3-5-sonnet-20241022", &messages, &tools, &options);
@@ -740,6 +743,7 @@ mod tests {
         let options = ChatOptions {
             response_mode: ResponseMode::Text,
             tool_choice: ToolChoiceMode::None,
+            ..ChatOptions::default()
         };
 
         let body = p.build_request_body("claude-3-5-sonnet-20241022", &messages, &tools, &options);
@@ -759,6 +763,7 @@ mod tests {
         let options = ChatOptions {
             response_mode: ResponseMode::Text,
             tool_choice: ToolChoiceMode::None,
+            ..ChatOptions::default()
         };
 
         let body = p.build_request_body("claude-3-5-sonnet-20241022", &messages, &tools, &options);

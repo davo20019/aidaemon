@@ -43,6 +43,14 @@ pub enum ToolChoiceMode {
 pub struct ChatOptions {
     pub response_mode: ResponseMode,
     pub tool_choice: ToolChoiceMode,
+    /// Override the provider's configured max_tokens for this call only.
+    /// Used for billing-aware retry: when a 402 tells us how many tokens
+    /// we can afford, we retry with a reduced cap instead of cascading.
+    pub max_tokens_override: Option<u32>,
+    /// Override the provider's configured reasoning_effort for this call only.
+    /// Used for truncation recovery: when a thinking model spends all tokens on
+    /// reasoning with no usable output, the retry reduces effort to "low".
+    pub reasoning_effort_override: Option<String>,
 }
 
 /// Model provider — sends messages + tool defs to an LLM, gets back response.

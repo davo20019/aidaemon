@@ -278,11 +278,74 @@ fn extract_path_args(args: &[String]) -> Vec<String> {
             continue;
         }
 
+        // Skip chmod-style mode arguments (symbolic: +x, u+x, go-w, a=rwx;
+        // numeric: 755, 0644).  These are NOT paths.
+        if is_chmod_mode_arg(arg) {
+            continue;
+        }
+
         // Looks like a path argument
         paths.push(arg.clone());
     }
 
     paths
+}
+
+/// Recognise chmod permission-mode arguments so they are not mistaken for paths.
+/// Matches symbolic modes like `+x`, `u+x`, `go-rw`, `a=rwx,u+s` and numeric
+/// modes like `755`, `0644`.
+fn is_chmod_mode_arg(arg: &str) -> bool {
+    let bytes = arg.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+
+    // Numeric mode: 3-4 octal digits, optionally prefixed with 0
+    if bytes.len() >= 3
+        && bytes.len() <= 4
+        && bytes.iter().all(|b| b.is_ascii_digit() && *b <= b'7')
+    {
+        return true;
+    }
+
+    // Symbolic mode: [ugoa]*[+-=][rwxXstugo]+ possibly comma-separated
+    // Examples: +x, u+x, go-rw, a=rwx, u+s,g-w
+    for part in arg.split(',') {
+        let part_bytes = part.as_bytes();
+        if part_bytes.is_empty() {
+            return false;
+        }
+        // Find the operator position (+, -, =)
+        let op_pos = part_bytes
+            .iter()
+            .position(|b| *b == b'+' || *b == b'-' || *b == b'=');
+        match op_pos {
+            Some(pos) => {
+                // Before the operator: must be [ugoa]* (can be empty)
+                if !part_bytes[..pos]
+                    .iter()
+                    .all(|b| matches!(b, b'u' | b'g' | b'o' | b'a'))
+                {
+                    return false;
+                }
+                // After the operator: must be [rwxXstugo]+ (non-empty)
+                let after = &part_bytes[pos + 1..];
+                if after.is_empty()
+                    || !after.iter().all(|b| {
+                        matches!(
+                            b,
+                            b'r' | b'w' | b'x' | b'X' | b's' | b't' | b'u' | b'g' | b'o'
+                        )
+                    })
+                {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -600,5 +663,80 @@ mod tests {
                 .contains(&"/tmp/new_project/file".to_string()),
             "path under mkdir'd dir should be verified"
         );
+    }
+
+    #[tokio::test]
+    async fn test_chmod_mode_args_not_treated_as_paths() {
+        let tracker = VerificationTracker::new();
+        let sid = "test-session";
+
+        // Record the file path
+        tracker.record_seen_path(sid, "/tmp/script.sh").await;
+
+        // chmod +x should not flag "+x" as an unverified path
+        let warning = tracker
+            .check_modifying_command(sid, "chmod +x /tmp/script.sh")
+            .await;
+        assert!(warning.is_none(), "chmod +x on verified path should pass");
+
+        // chmod u+x should not flag "u+x"
+        let warning = tracker
+            .check_modifying_command(sid, "chmod u+x /tmp/script.sh")
+            .await;
+        assert!(warning.is_none(), "chmod u+x on verified path should pass");
+
+        // chmod 755 should not flag "755"
+        let warning = tracker
+            .check_modifying_command(sid, "chmod 755 /tmp/script.sh")
+            .await;
+        assert!(warning.is_none(), "chmod 755 on verified path should pass");
+
+        // chmod go-rw should not flag "go-rw"
+        let warning = tracker
+            .check_modifying_command(sid, "chmod go-rw /tmp/script.sh")
+            .await;
+        assert!(
+            warning.is_none(),
+            "chmod go-rw on verified path should pass"
+        );
+
+        // chmod a=rwx should not flag "a=rwx"
+        let warning = tracker
+            .check_modifying_command(sid, "chmod a=rwx /tmp/script.sh")
+            .await;
+        assert!(
+            warning.is_none(),
+            "chmod a=rwx on verified path should pass"
+        );
+
+        // Unverified file should still warn (only the file, not the mode)
+        let warning = tracker
+            .check_modifying_command(sid, "chmod +x /srv/unknown.sh")
+            .await;
+        assert!(warning.is_some());
+        let w = warning.unwrap();
+        assert_eq!(w.unverified_paths, vec!["/srv/unknown.sh".to_string()]);
+    }
+
+    #[test]
+    fn test_is_chmod_mode_arg() {
+        // Symbolic modes
+        assert!(is_chmod_mode_arg("+x"));
+        assert!(is_chmod_mode_arg("u+x"));
+        assert!(is_chmod_mode_arg("go-rw"));
+        assert!(is_chmod_mode_arg("a=rwx"));
+        assert!(is_chmod_mode_arg("u+s,g-w"));
+        assert!(is_chmod_mode_arg("+X"));
+
+        // Numeric modes
+        assert!(is_chmod_mode_arg("755"));
+        assert!(is_chmod_mode_arg("0644"));
+        assert!(is_chmod_mode_arg("777"));
+
+        // Not modes
+        assert!(!is_chmod_mode_arg("/tmp/file"));
+        assert!(!is_chmod_mode_arg("hello"));
+        assert!(!is_chmod_mode_arg(""));
+        assert!(!is_chmod_mode_arg("999")); // 9 is not octal
     }
 }

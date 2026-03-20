@@ -263,12 +263,14 @@ impl XaiNativeProvider {
             "input": input
         });
 
-        if let Some(max_tokens) = self.max_tokens {
+        let effective_max_tokens = options.max_tokens_override.or(self.max_tokens);
+        if let Some(max_tokens) = effective_max_tokens {
             body["max_output_tokens"] = json!(max_tokens);
         }
 
         if !converted_tools.is_empty() {
             body["tools"] = json!(converted_tools);
+            body["parallel_tool_calls"] = json!(true);
             match &options.tool_choice {
                 ToolChoiceMode::Auto => {}
                 ToolChoiceMode::None => body["tool_choice"] = json!("none"),

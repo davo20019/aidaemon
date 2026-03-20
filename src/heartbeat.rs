@@ -843,6 +843,13 @@ impl HeartbeatCoordinator {
                                 task_results_summary.chars().take(3500).collect::<String>()
                             ),
                         )
+                    } else if crate::tools::manage_goal_tasks::goal_completion_summary_indicates_not_finished(&task_results_summary) {
+                        // The summary contains verification-blocked or incomplete-work
+                        // language (e.g., "I'm blocked from safely finishing").
+                        // Don't present this as "Goal completed:" — the user already
+                        // received the actual result via the agent's direct reply.
+                        // Suppress the misleading notification entirely.
+                        continue;
                     } else {
                         (
                             "completed",

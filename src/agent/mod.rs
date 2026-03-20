@@ -88,7 +88,10 @@ mod response_analysis;
 use response_analysis::has_action_promise;
 #[cfg(test)]
 use response_analysis::sanitize_response_analysis;
-use response_analysis::{is_substantive_text_response, looks_like_deferred_action_response};
+use response_analysis::{
+    is_substantive_text_response, looks_like_deferred_action_response,
+    looks_like_multi_part_request,
+};
 #[path = "intent/intent_routing.rs"]
 mod intent_routing;
 use intent_routing::{
@@ -113,6 +116,7 @@ pub(in crate::agent) use evidence_state::{
 };
 #[path = "loop/validation_state.rs"]
 mod validation_state;
+#[allow(unused_imports)]
 pub(in crate::agent) use validation_state::{
     build_abandon_request, build_partial_done_blocked_request,
     build_partial_done_blocked_request_with_plan, build_reduce_scope_request,
@@ -191,6 +195,8 @@ mod message_build_phase;
 mod models;
 #[path = "runtime/resume.rs"]
 mod resume;
+#[path = "loop/sliding_window.rs"]
+mod sliding_window;
 #[path = "runtime/spawn.rs"]
 mod spawn;
 #[path = "loop/stopping_phase.rs"]
@@ -209,8 +215,6 @@ mod tool_execution_phase;
 mod tool_prelude_phase;
 #[path = "loop/tool_result_notices.rs"]
 mod tool_result_notices;
-#[path = "loop/sliding_window.rs"]
-mod sliding_window;
 
 pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
 use system_prompt::{build_tool_loop_system_prompt, format_goal_context, ToolLoopPromptStyle};
@@ -1628,6 +1632,9 @@ pub struct Agent {
     /// Session IDs that have granted schedule confirmation for this process lifetime.
     /// Allows schedule creation to auto-confirm after an explicit AllowSession/AllowAlways.
     schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    /// Models that recently returned 402 billing errors. Maps model name → failure time.
+    /// Shared across parent/child agents. Entries expire after BILLING_FAIL_CACHE_TTL.
+    billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,
     /// Weak self-reference for background task spawning.
     /// Set after Arc creation via `set_self_ref()`.
     self_ref: RwLock<Option<Weak<Agent>>>,
@@ -2348,11 +2355,16 @@ pub fn spawn_background_task_lead(
         let dispatch_channel_ctx = channel_ctx.clone();
         let fallback_user_role = user_role;
 
-        // Heartbeat dispatch may claim a temporary "trigger" task before spawning this
-        // background lead. Release that temporary claim back to `pending` so the real
-        // unit of work is not skipped.
-        if let Some(trigger_task_id) = dispatch_trigger_task_id {
-            match state.get_task(&trigger_task_id).await {
+        // Heartbeat dispatch claims a "trigger" task before spawning this background
+        // lead. Keep it in "running" state (not "pending") so dispatch_pending_tasks
+        // won't re-dispatch it on the next tick. The task lead will process it through
+        // its normal flow (manage_goal_tasks / auto-dispatch).
+        //
+        // Previously this released the claim back to "pending", which created a race:
+        // the next heartbeat tick would see the task as orphaned-pending and re-dispatch
+        // it, causing duplicate execution (e.g., double tweet posts).
+        if let Some(ref trigger_task_id) = dispatch_trigger_task_id {
+            match state.get_task(trigger_task_id).await {
                 Ok(Some(task))
                     if (task.status == "claimed" || task.status == "running")
                         && task
@@ -2361,16 +2373,15 @@ pub fn spawn_background_task_lead(
                             .is_some_and(|aid| aid.starts_with("heartbeat-dispatch-")) =>
                 {
                     let mut updated = task.clone();
-                    updated.status = "pending".to_string();
-                    updated.agent_id = None;
-                    updated.started_at = None;
-                    updated.completed_at = None;
+                    updated.status = "running".to_string();
+                    updated.agent_id = Some(format!("task-lead-{}", goal_id));
+                    // Keep started_at from the claim so dispatch sees it as active
                     if let Err(e) = state.update_task(&updated).await {
                         warn!(
                             task_id = %trigger_task_id,
                             goal_id = %goal_id,
                             error = %e,
-                            "Failed to release dispatch trigger task claim"
+                            "Failed to update dispatch trigger task to running"
                         );
                     }
                 }
@@ -2900,6 +2911,35 @@ pub fn spawn_background_task_lead(
 
                 if budget_exhausted {
                     break;
+                }
+            }
+        }
+
+        // Mark the trigger task as completed now that the task lead and auto-dispatch
+        // have finished. The trigger task was kept in "running" to prevent duplicate
+        // dispatch; now finalize it so it doesn't appear stuck.
+        if let Some(ref trigger_task_id) = dispatch_trigger_task_id {
+            if let Ok(Some(trigger_task)) = state.get_task(trigger_task_id).await {
+                if trigger_task.status == "running" || trigger_task.status == "claimed" {
+                    let mut updated = trigger_task;
+                    let success = result.is_ok();
+                    updated.status = if success {
+                        "completed".to_string()
+                    } else {
+                        "failed".to_string()
+                    };
+                    updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    if !success {
+                        updated.error = result.as_ref().err().map(|e| e.to_string());
+                    }
+                    if let Err(e) = state.update_task(&updated).await {
+                        warn!(
+                            task_id = %trigger_task_id,
+                            goal_id = %goal_id,
+                            error = %e,
+                            "Failed to finalize dispatch trigger task"
+                        );
+                    }
                 }
             }
         }
@@ -3530,6 +3570,7 @@ impl Agent {
             goal_token_registry,
             hub: RwLock::new(hub),
             schedule_approved_sessions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+            billing_failed_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             self_ref: RwLock::new(None),
             context_window_config,
             policy_config,
@@ -3642,6 +3683,7 @@ impl Agent {
         goal_token_registry: Option<GoalTokenRegistry>,
         hub: Option<Weak<ChannelHub>>,
         schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
+        billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,
         record_decision_points: bool,
         context_window_config: crate::config::ContextWindowConfig,
         policy_config: PolicyConfig,
@@ -3686,6 +3728,7 @@ impl Agent {
             goal_token_registry,
             hub: RwLock::new(hub),
             schedule_approved_sessions,
+            billing_failed_models,
             self_ref: RwLock::new(None),
             context_window_config,
             policy_config,
@@ -3798,7 +3841,14 @@ impl Agent {
     /// Channels pass `Some(heartbeat)` so the typing indicator can detect stalls;
     /// sub-agents, triggers, and tests pass `None`.
     fn sanitize_final_reply_markers(reply: &str) -> String {
-        crate::tools::sanitize::sanitize_user_facing_reply(reply)
+        // NOTE: The primary sanitization pass already runs in completion_phase.rs.
+        // This second pass is a lightweight safety net that only strips control
+        // markers that the model may echo verbatim.  We intentionally do NOT
+        // call the full `sanitize_user_facing_reply` again — double sanitization
+        // can reduce a valid reply to empty when the first pass already transformed
+        // tool-name references into generic prose that the second pass then matches
+        // as a different pattern.
+        crate::tools::sanitize::strip_leaked_control_markers(reply)
     }
 
     pub async fn handle_message(

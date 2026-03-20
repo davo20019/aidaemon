@@ -3174,6 +3174,70 @@ async fn test_upsert_fact_semantic_dedup_no_false_merge() {
     );
 }
 
+/// Cross-entity dedup guard: "carlos_birthday" must NOT merge with "birthday"
+/// because the extra token "carlos" is a person name, not a modifier like
+/// "preferred" or "current". Without this guard, storing a friend's birthday
+/// would overwrite the owner's birthday.
+#[tokio::test]
+async fn test_upsert_fact_semantic_dedup_cross_entity_guard() {
+    let (store, _db) = setup_test_store().await;
+
+    // Owner's birthday
+    store
+        .upsert_fact(
+            "user",
+            "birthday",
+            "October 15",
+            "user",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+
+    // Carlos's birthday — should NOT overwrite owner's
+    store
+        .upsert_fact(
+            "user",
+            "carlos_birthday",
+            "March 22",
+            "consolidation",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+
+    let facts = store.get_facts(Some("user")).await.unwrap();
+    let birthday_facts: Vec<_> = facts
+        .iter()
+        .filter(|f| f.key.contains("birthday"))
+        .collect();
+
+    assert_eq!(
+        birthday_facts.len(),
+        2,
+        "Owner birthday and Carlos birthday should be separate facts: got {:?}",
+        birthday_facts
+            .iter()
+            .map(|f| format!("{}={}", f.key, f.value))
+            .collect::<Vec<_>>()
+    );
+
+    // Verify owner's birthday is unchanged
+    let owner_bday = facts.iter().find(|f| f.key == "birthday");
+    assert!(owner_bday.is_some(), "Owner birthday should still exist");
+    assert_eq!(owner_bday.unwrap().value, "October 15");
+
+    // Verify Carlos's birthday is stored separately
+    let carlos_bday = facts.iter().find(|f| f.key == "carlos_birthday");
+    assert!(
+        carlos_bday.is_some(),
+        "Carlos birthday should be a separate fact"
+    );
+    assert_eq!(carlos_bday.unwrap().value, "March 22");
+}
+
 // ==================== Episode Unique Constraint Tests (BUG-9) ====================
 
 #[tokio::test]

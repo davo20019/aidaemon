@@ -42,6 +42,11 @@ impl Agent {
         None
     }
 
+    /// Per-attempt timeout for each individual provider call inside
+    /// cascade_fallback / billing retry.  Prevents a single hung provider
+    /// from blocking the entire recovery chain.
+    const CASCADE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
+
     /// Try provider-local model fallbacks first, then configured alternate
     /// providers and their model chains. On success, returns the response for
     /// this call only (no persistent provider/model downgrade).
@@ -80,15 +85,17 @@ impl Agent {
                 "Primary-provider fallback attempt"
             );
 
-            match provider
-                .chat_with_options(&fallback, messages, tool_defs, options)
-                .await
+            match tokio::time::timeout(
+                Self::CASCADE_ATTEMPT_TIMEOUT,
+                provider.chat_with_options(&fallback, messages, tool_defs, options),
+            )
+            .await
             {
-                Ok(resp) => {
+                Ok(Ok(resp)) => {
                     self.stamp_lastgood().await;
                     return Ok(resp);
                 }
-                Err(retry_err) => match retry_err.downcast::<ProviderError>() {
+                Ok(Err(retry_err)) => match retry_err.downcast::<ProviderError>() {
                     Ok(provider_err) => {
                         final_err = provider_err;
                         tried.push(fallback);
@@ -96,6 +103,16 @@ impl Agent {
                     }
                     Err(other) => return Err(other),
                 },
+                Err(_elapsed) => {
+                    warn!(
+                        model = %fallback,
+                        attempt,
+                        timeout_secs = Self::CASCADE_ATTEMPT_TIMEOUT.as_secs(),
+                        "Cascade fallback attempt timed out, trying next"
+                    );
+                    tried.push(fallback);
+                    attempt += 1;
+                }
             }
         }
 
@@ -108,22 +125,34 @@ impl Agent {
                     "Provider failover attempt"
                 );
 
-                match target
-                    .provider()
-                    .chat_with_options(&model, messages, tool_defs, options)
-                    .await
+                match tokio::time::timeout(
+                    Self::CASCADE_ATTEMPT_TIMEOUT,
+                    target
+                        .provider()
+                        .chat_with_options(&model, messages, tool_defs, options),
+                )
+                .await
                 {
-                    Ok(resp) => {
+                    Ok(Ok(resp)) => {
                         self.stamp_lastgood().await;
                         return Ok(resp);
                     }
-                    Err(retry_err) => match retry_err.downcast::<ProviderError>() {
+                    Ok(Err(retry_err)) => match retry_err.downcast::<ProviderError>() {
                         Ok(provider_err) => {
                             final_err = provider_err;
                             attempt += 1;
                         }
                         Err(other) => return Err(other),
                     },
+                    Err(_elapsed) => {
+                        warn!(
+                            model = %model,
+                            attempt,
+                            timeout_secs = Self::CASCADE_ATTEMPT_TIMEOUT.as_secs(),
+                            "Provider failover attempt timed out, trying next"
+                        );
+                        attempt += 1;
+                    }
                 }
             }
         }
@@ -187,13 +216,18 @@ impl Agent {
         Ok(None)
     }
 
+    /// How long a billing failure is cached before we re-try that model.
+    /// After this window the model is attempted again (credits may have been added).
+    const BILLING_FAIL_CACHE_TTL: Duration = Duration::from_secs(10 * 60); // 10 minutes
+
     /// Attempt an LLM call with error-classified recovery:
     /// - RateLimit → exponential backoff retries, then cascade fallback
     /// - Timeout/Network/ServerError → exponential backoff retries, then cascade fallback
     /// - MalformedResponse(Parse) → exponential backoff retries, then cascade fallback
     /// - MalformedResponse(Shape/Unknown) → single retry (no cascade fallback)
     /// - NotFound → cascade fallback immediately
-    /// - Auth/Billing → return user-facing error immediately
+    /// - Billing → cached skip + cascade fallback (avoids repeated 402s)
+    /// - Auth → return user-facing error immediately
     ///
     /// Cascade fallback now means:
     /// 1. Other models on the current provider
@@ -207,6 +241,40 @@ impl Agent {
         tool_defs: &[Value],
         options: &ChatOptions,
     ) -> anyhow::Result<crate::traits::ProviderResponse> {
+        // --- Billing failure cache: skip models that recently 402'd ---
+        {
+            let cache = self.billing_failed_models.read().await;
+            if let Some(failed_at) = cache.get(model) {
+                if failed_at.elapsed() < Self::BILLING_FAIL_CACHE_TTL {
+                    info!(
+                        model,
+                        elapsed_secs = failed_at.elapsed().as_secs(),
+                        ttl_secs = Self::BILLING_FAIL_CACHE_TTL.as_secs(),
+                        "Skipping model — cached billing failure, cascading to fallback"
+                    );
+                    let billing_err = ProviderError {
+                        kind: ProviderErrorKind::Billing,
+                        status: Some(402),
+                        message: format!("Cached billing failure for {model}"),
+                        retry_after_secs: None,
+                        affordable_tokens: None,
+                        malformed_reason: None,
+                    };
+                    return self
+                        .cascade_fallback(
+                            &provider,
+                            router.as_ref(),
+                            model,
+                            messages,
+                            tool_defs,
+                            options,
+                            &billing_err,
+                        )
+                        .await;
+                }
+            }
+        }
+
         match provider
             .chat_with_options(model, messages, tool_defs, options)
             .await
@@ -233,9 +301,86 @@ impl Agent {
                     provider_kind_metric_label(self.llm_runtime.snapshot().provider_kind());
 
                 match provider_err.kind {
-                    // --- Non-retryable: tell the user, stop ---
-                    ProviderErrorKind::Auth | ProviderErrorKind::Billing => {
+                    // --- Auth: non-retryable (invalid API key) ---
+                    ProviderErrorKind::Auth => {
                         Err(anyhow::anyhow!("{}", provider_err.user_message()))
+                    }
+
+                    // --- Billing (402): try reduced max_tokens first, then cascade ---
+                    // If the 402 tells us how many tokens we can afford, retry the
+                    // same model with a reduced cap. This avoids falling back to a
+                    // weaker free model when the primary still has partial budget.
+                    ProviderErrorKind::Billing => {
+                        const MIN_USEFUL_TOKENS: u32 = 512;
+                        if let Some(affordable) = provider_err.affordable_tokens {
+                            if affordable >= MIN_USEFUL_TOKENS
+                                && options.max_tokens_override.is_none()
+                            {
+                                // Leave a small margin so the request fits comfortably.
+                                let reduced = affordable.saturating_sub(100).max(MIN_USEFUL_TOKENS);
+                                info!(
+                                    model,
+                                    affordable,
+                                    reduced,
+                                    "Billing 402 with affordable tokens — retrying with reduced max_tokens"
+                                );
+                                let mut reduced_options = options.clone();
+                                reduced_options.max_tokens_override = Some(reduced);
+                                match tokio::time::timeout(
+                                    Self::CASCADE_ATTEMPT_TIMEOUT,
+                                    provider.chat_with_options(
+                                        model,
+                                        messages,
+                                        tool_defs,
+                                        &reduced_options,
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(resp)) => {
+                                        self.stamp_lastgood().await;
+                                        return Ok(resp);
+                                    }
+                                    Ok(Err(retry_err)) => {
+                                        warn!(
+                                            model,
+                                            reduced,
+                                            error = %retry_err,
+                                            "Reduced max_tokens retry also failed; cascading to fallback"
+                                        );
+                                    }
+                                    Err(_elapsed) => {
+                                        warn!(
+                                            model,
+                                            reduced,
+                                            timeout_secs =
+                                                Self::CASCADE_ATTEMPT_TIMEOUT.as_secs(),
+                                            "Reduced max_tokens retry timed out; cascading to fallback"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // Cache the billing failure so subsequent iterations skip this model.
+                        {
+                            let mut cache = self.billing_failed_models.write().await;
+                            cache.insert(model.to_string(), Instant::now());
+                            // Prune expired entries while we hold the lock.
+                            cache.retain(|_, t| t.elapsed() < Self::BILLING_FAIL_CACHE_TTL);
+                        }
+
+                        warn!("Billing error on primary model, trying cascade fallback");
+                        self.cascade_fallback(
+                            &provider,
+                            router.as_ref(),
+                            model,
+                            messages,
+                            tool_defs,
+                            options,
+                            &provider_err,
+                        )
+                        .await
                     }
                     ProviderErrorKind::BadRequest => {
                         if *options != ChatOptions::default() {

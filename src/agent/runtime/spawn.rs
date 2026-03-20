@@ -35,11 +35,35 @@ impl Agent {
             // Scheduled goals: include Action tools so TaskLead can execute directly
             full_tools.to_vec()
         } else {
-            full_tools
+            // Start with Management + Universal tools.
+            let mut base: Vec<Arc<dyn Tool>> = full_tools
                 .iter()
                 .filter(|t| matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal))
                 .cloned()
-                .collect()
+                .collect();
+            // Always include essential Action tools as a direct-execution fallback.
+            // When cli_agent or spawn_agent fail (auth errors, budget blocks, depth
+            // limits), the TaskLead needs basic file and terminal access to avoid
+            // wasting iterations retrying broken delegation paths.
+            const ESSENTIAL_ACTION_TOOLS: &[&str] = &[
+                "read_file",
+                "write_file",
+                "edit_file",
+                "terminal",
+                "search_files",
+                "web_search",
+                "web_fetch",
+                "project_inspect",
+            ];
+            for tool in full_tools {
+                if tool.tool_role() == ToolRole::Action
+                    && ESSENTIAL_ACTION_TOOLS.contains(&tool.name())
+                    && !base.iter().any(|t| t.name() == tool.name())
+                {
+                    base.push(tool.clone());
+                }
+            }
+            base
         };
 
         let has_cli_agent = if let Some(cli_tool) = full_tools
@@ -434,6 +458,7 @@ impl Agent {
             self.goal_token_registry.clone(),
             hub,
             self.schedule_approved_sessions.clone(),
+            self.billing_failed_models.clone(),
             self.record_decision_points,
             self.context_window_config.clone(),
             self.policy_config.clone(),
@@ -998,7 +1023,11 @@ impl Agent {
              file writes), execute them directly. For complex multi-step work, you may still delegate \
              to executors via the workflow below."
         } else {
-            "Your job is to plan and delegate work. You MUST NOT execute tasks yourself."
+            "Your primary job is to plan and delegate work via executors or cli_agent. \
+             However, you also have direct access to essential tools (read_file, write_file, \
+             edit_file, terminal, search_files). Use delegation first, but if delegation fails \
+             (cli_agent errors, spawn_agent blocked, executor failures), switch to direct \
+             execution with your own tools rather than retrying broken delegation paths."
         };
 
         let mut prompt = format!(
@@ -1051,7 +1080,7 @@ impl Agent {
                  When calling `cli_agent`, use `action=\"run\"` and include a non-empty `prompt` describing the work.\n\
                  Pass `working_dir` whenever the task targets a specific repo or directory.\n\
                  Example: `cli_agent(action=\"run\", prompt=\"Inspect the latest service logs, patch the root cause, run cargo fmt, and run the narrowest relevant tests\", working_dir=\"/absolute/project/path\")`.\n\
-                 Note: Executors spawned via `spawn_agent` still have direct file tools (`read_file`, `write_file`, `edit_file`, `search_files`), but when `cli_agent` is available they do NOT have `terminal`, `browser`, or `run_command`.",
+                 Note: If cli_agent fails repeatedly (auth errors, timeouts, environment issues), do NOT keep retrying. Switch to using your direct tools (read_file, write_file, edit_file, terminal) to complete the work yourself.",
             );
         }
 
@@ -1282,7 +1311,7 @@ mod tests {
         assert!(prompt.contains("claim the task and use `spawn_agent`"));
         assert!(prompt.contains("action=\"run\""));
         assert!(prompt.contains("working_dir"));
-        assert!(prompt.contains("do NOT have `terminal`, `browser`, or `run_command`"));
+        assert!(prompt.contains("do NOT keep retrying"));
     }
 
     #[test]
@@ -1300,16 +1329,20 @@ mod tests {
     }
 
     #[test]
-    fn non_scheduled_task_lead_prompt_prohibits_direct_execution() {
+    fn non_scheduled_task_lead_prompt_allows_fallback_direct_execution() {
         let prompt =
             Agent::build_task_lead_prompt("goal_4", "deploy blog", None, 1, 3, false, false);
         assert!(
-            prompt.contains("MUST NOT execute tasks yourself"),
-            "Non-scheduled task lead should prohibit direct execution"
+            prompt.contains("plan and delegate work"),
+            "Non-scheduled task lead should prefer delegation"
+        );
+        assert!(
+            prompt.contains("switch to direct execution"),
+            "Non-scheduled task lead should allow fallback to direct execution"
         );
         assert!(
             !prompt.contains("full tool access including `terminal`"),
-            "Non-scheduled task lead should NOT mention terminal access"
+            "Non-scheduled task lead should NOT mention full tool access"
         );
     }
 }

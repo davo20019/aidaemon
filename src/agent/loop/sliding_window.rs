@@ -236,6 +236,7 @@ pub(super) fn calculate_window_size(
 ///   trigger "completion compulsion" in models.
 /// - **Tool messages** (`role: "tool"`): dropped entirely.
 /// - **System messages**: dropped.
+#[allow(dead_code)] // Will be used when async compaction is implemented
 pub(super) fn extract_skeleton(messages: &[Value]) -> Vec<Value> {
     let mut result = Vec::new();
 

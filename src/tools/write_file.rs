@@ -36,7 +36,7 @@ impl Tool for WriteFileTool {
                     },
                     "create_dirs": {
                         "type": "boolean",
-                        "description": "Create parent directories if they don't exist (default: false)"
+                        "description": "Create parent directories if they don't exist (default: true)"
                     }
                 },
                 "required": ["path", "content"],
@@ -55,7 +55,11 @@ impl Tool for WriteFileTool {
             external_side_effect: false,
             needs_approval: true,
             idempotent: false,
-            high_impact_write: true,
+            // Not high-impact: creates backups before overwriting, user-scoped
+            // file system only.  The approval flow (`needs_approval`) already
+            // gates this tool; the pre-execution critique pipeline is too
+            // expensive (~3 min, 2 extra LLM calls) for routine file writes.
+            high_impact_write: false,
         }
     }
 
@@ -89,7 +93,7 @@ impl Tool for WriteFileTool {
             .or_else(|| args["data"].as_str())
             .or_else(|| args["text"].as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: content"))?;
-        let create_dirs = args["create_dirs"].as_bool().unwrap_or(false);
+        let create_dirs = args["create_dirs"].as_bool().unwrap_or(true);
 
         if content.len() > MAX_CONTENT_SIZE {
             anyhow::bail!(
@@ -249,10 +253,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_no_parent_dir() {
+    async fn test_write_auto_creates_parent_dirs_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("auto_created").join("file.txt");
+        let args = json!({
+            "path": file_path.to_str().unwrap(),
+            "content": "hello"
+        })
+        .to_string();
+
+        let result = WriteFileTool.call(&args).await.unwrap();
+        assert!(result.contains("Created"));
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_write_no_parent_dir_when_create_dirs_false() {
         let args = json!({
             "path": "/tmp/nonexistent_dir_12345/file.txt",
-            "content": "hello"
+            "content": "hello",
+            "create_dirs": false
         })
         .to_string();
 

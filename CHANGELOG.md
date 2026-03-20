@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.28] - 2026-03-19
+
+### Added
+
+- **Sliding window context management**: New `sliding_window` module with deterministic 1-line tool result summaries (e.g., "terminal: cargo test -> exit 0") for compact context preservation.
+- **Adaptive sliding window**: Budget-aware `calculate_window_size()` replaces brittle `is_new_task` branching — returns min(5, pairs fitting in 30% of available token budget).
+- **Age-based tool result clearing**: 3-tier system replaces binary keep/drop — current interaction keeps all, Prior 1 gets 1-line summaries, Prior 2+ drops entirely.
+- **Compaction module**: Trigger detection (idle gap, file upload, window overflow), pending-pair tracking with cap of 3, LLM-based summarization prompts (initial and incremental modes).
+- **Skeleton extraction**: `extract_skeleton()` utility for future compaction module use.
+
+### Changed
+
+- **Orphaned assistant messages preserved**: Messages with all tool_calls stripped now get "[Action completed]" content instead of being dropped, preventing dangling user messages that trigger completion compulsion.
+- **Identity-critical tool results exempt from summarization**: Tool results critical to identity/context are preserved verbatim through the sliding window.
+
+### Fixed
+
+- **Integration test updates**: 6 tests updated for sliding window context changes — task boundary markers, critical facts format, mutation-contract nudge iterations, reflection test assertions.
+
 ## [0.9.27] - 2026-03-14
 
 ### Added

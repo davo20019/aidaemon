@@ -188,14 +188,15 @@ async fn test_spawn_child_task_lead_scopes_tools_via_shared_builder() {
         "tool names: {:?}",
         names
     );
+    // TaskLeads now include essential Action tools as fallback for when delegation fails.
     assert!(
-        !names.contains(&"terminal".to_string()),
-        "tool names: {:?}",
+        names.contains(&"terminal".to_string()),
+        "TaskLead should have terminal as fallback: {:?}",
         names
     );
     assert!(
         !names.contains(&"browser".to_string()),
-        "tool names: {:?}",
+        "browser should NOT be in essential action tools: {:?}",
         names
     );
 }

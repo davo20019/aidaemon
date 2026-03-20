@@ -476,22 +476,62 @@ impl Tool for ManageMemoriesTool {
 
                 let facts = self.state.get_all_facts_with_provenance().await?;
                 let query_lower = query.to_lowercase();
-                let matches: Vec<_> = facts
+                // Split query into individual words and score facts by how many
+                // words match.  A query like "cat name coffee" finds facts
+                // containing any of those words, ranked by match count so the
+                // most relevant results come first.
+                let query_words: Vec<&str> = query_lower
+                    .split_whitespace()
+                    .filter(|w| w.len() >= 2) // skip single-char noise
+                    .collect();
+                let mut scored: Vec<(&crate::traits::Fact, usize)> = facts
                     .iter()
-                    .filter(|f| {
-                        f.key.to_lowercase().contains(&query_lower)
-                            || f.value.to_lowercase().contains(&query_lower)
-                            || f.category.to_lowercase().contains(&query_lower)
+                    .filter_map(|f| {
+                        let key_lower = f.key.to_lowercase();
+                        let val_lower = f.value.to_lowercase();
+                        let cat_lower = f.category.to_lowercase();
+                        // Full-phrase match gets max score.
+                        if key_lower.contains(&query_lower)
+                            || val_lower.contains(&query_lower)
+                            || cat_lower.contains(&query_lower)
+                        {
+                            return Some((f, query_words.len().max(1) + 1));
+                        }
+                        // Otherwise score by number of matching words.
+                        if query_words.is_empty() {
+                            return None;
+                        }
+                        let word_hits = query_words
+                            .iter()
+                            .filter(|w| {
+                                key_lower.contains(*w)
+                                    || val_lower.contains(*w)
+                                    || cat_lower.contains(*w)
+                            })
+                            .count();
+                        // Require at least half the query words to match,
+                        // so single-word overlaps (e.g. "language" hitting
+                        // every language-related fact) don't flood results.
+                        let min_hits =
+                            if query_words.len() >= 3 { 2 } else { 1 };
+                        if word_hits >= min_hits {
+                            Some((f, word_hits))
+                        } else {
+                            None
+                        }
                     })
                     .collect();
+                scored.sort_by(|a, b| b.1.cmp(&a.1));
+                let matches: Vec<_> = scored.iter().map(|(f, _)| *f).collect();
 
                 if matches.is_empty() {
                     return Ok(format!("No memories matching '{}'.", query));
                 }
 
-                let limit = args.limit.unwrap_or(20).clamp(1, 200);
+                let limit = args.limit.unwrap_or(10).clamp(1, 200);
                 let mut output = format!(
-                    "**Search results for '{}'** (showing {} of {} matches)\n\n",
+                    "══ Stored facts matching '{}' ({} of {} matches) ══\n\
+                     IMPORTANT: Use these EXACT values when answering — do not substitute or infer.\n\n",
                     query,
                     matches.len().min(limit),
                     matches.len()
@@ -500,7 +540,7 @@ impl Tool for ManageMemoriesTool {
                     let privacy_label = f.privacy.to_string();
                     let channel_label = f.channel_id.as_deref().unwrap_or("global");
                     output.push_str(&format!(
-                        "- [{}] **{}**: {} (privacy: {}, from: {})\n",
+                        "• [{}] {} → \"{}\" (privacy: {}, from: {})\n",
                         f.category, f.key, f.value, privacy_label, channel_label
                     ));
                 }

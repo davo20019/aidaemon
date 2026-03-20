@@ -520,6 +520,16 @@ impl MemoryManager {
 
             let entry = sessions.entry(session_id).or_default();
             for turn in events {
+                // CRITICAL: Skip assistant messages to prevent hallucination
+                // feedback loops.  If the bot hallucinates a wrong fact value
+                // (e.g. "cat name is Pixel" when the real answer is "Luna"),
+                // including that text here causes the consolidation LLM to
+                // extract the hallucinated value, which then overwrites the
+                // correct user-originated fact.  Only user messages and tool
+                // results contain ground-truth information.
+                if turn.role.as_str() == "assistant" {
+                    continue;
+                }
                 let Some(content) = turn.content.clone() else {
                     continue;
                 };
@@ -2116,6 +2126,19 @@ fn parse_consolidation_response(text: &str) -> anyhow::Result<Vec<ExtractedFact>
     };
 
     let facts: Vec<ExtractedFact> = serde_json::from_str(json_str)?;
+
+    // Filter out facts with empty/meaningless values to prevent hallucination
+    let facts = facts
+        .into_iter()
+        .filter(|f| {
+            let v = f.value.trim();
+            !v.is_empty()
+                && !v.eq_ignore_ascii_case("none")
+                && !v.eq_ignore_ascii_case("null")
+                && !v.eq_ignore_ascii_case("n/a")
+                && !v.eq_ignore_ascii_case("unknown")
+        })
+        .collect();
     Ok(facts)
 }
 

@@ -10,6 +10,9 @@ pub struct ProviderError {
     pub malformed_reason: Option<MalformedResponseReason>,
     /// Seconds to wait before retrying (from 429 Retry-After header or body).
     pub retry_after_secs: Option<u64>,
+    /// For 402 Billing errors: the max tokens the account can actually afford,
+    /// parsed from messages like "can only afford 6917".
+    pub affordable_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,12 +66,21 @@ impl ProviderError {
             None
         };
 
+        // For 402 billing errors, parse affordable token count from the message.
+        // OpenRouter format: "can only afford 6917"
+        let affordable_tokens = if kind == ProviderErrorKind::Billing {
+            extract_affordable_tokens(body)
+        } else {
+            None
+        };
+
         Self {
             kind,
             status: Some(status),
             message: truncate_body(body),
             malformed_reason: None,
             retry_after_secs,
+            affordable_tokens,
         }
     }
 
@@ -79,6 +91,7 @@ impl ProviderError {
             message: message.into(),
             malformed_reason: None,
             retry_after_secs: None,
+            affordable_tokens: None,
         }
     }
 
@@ -94,6 +107,7 @@ impl ProviderError {
             message: err.to_string(),
             malformed_reason: None,
             retry_after_secs: None,
+            affordable_tokens: None,
         }
     }
 
@@ -104,6 +118,7 @@ impl ProviderError {
             message: message.into(),
             malformed_reason: Some(MalformedResponseReason::Parse),
             retry_after_secs: None,
+            affordable_tokens: None,
         }
     }
 
@@ -114,6 +129,7 @@ impl ProviderError {
             message: message.into(),
             malformed_reason: Some(MalformedResponseReason::Shape),
             retry_after_secs: None,
+            affordable_tokens: None,
         }
     }
 
@@ -228,6 +244,32 @@ fn extract_retry_after(body: &str) -> Option<u64> {
         })
 }
 
+/// Parse affordable token count from a 402 billing error message.
+/// Handles OpenRouter format: "can only afford 6917"
+fn extract_affordable_tokens(body: &str) -> Option<u32> {
+    // Try JSON first: {"error":{"message":"...can only afford 6917..."}}
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        let msg = v["error"]["message"]
+            .as_str()
+            .or_else(|| v["message"].as_str())
+            .unwrap_or("");
+        if let Some(n) = parse_affordable_from_text(msg) {
+            return Some(n);
+        }
+    }
+    // Fallback: search the raw body text
+    parse_affordable_from_text(body)
+}
+
+fn parse_affordable_from_text(text: &str) -> Option<u32> {
+    // Pattern: "can only afford <number>"
+    let marker = "can only afford ";
+    let pos = text.find(marker)?;
+    let after = &text[pos + marker.len()..];
+    let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num_str.parse::<u32>().ok().filter(|&n| n > 0)
+}
+
 /// Truncate a string to at most `max_len` bytes, respecting UTF-8 char boundaries.
 /// Avoids panicking on multi-byte characters.
 fn truncate_body(body: &str) -> String {
@@ -276,5 +318,28 @@ mod tests {
         let msg = err.recovery_failed_message();
         assert!(msg.contains("remained rate limited during recovery"));
         assert!(!msg.contains("Retrying"));
+    }
+
+    #[test]
+    fn billing_402_parses_affordable_tokens_from_openrouter() {
+        let body = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 16384 tokens, but can only afford 6917. To increase, visit https://openrouter.ai/settings/credits","code":402}}"#;
+        let err = ProviderError::from_status(402, body);
+        assert_eq!(err.kind, ProviderErrorKind::Billing);
+        assert_eq!(err.affordable_tokens, Some(6917));
+    }
+
+    #[test]
+    fn billing_402_no_affordable_tokens_when_missing() {
+        let body = r#"{"error":{"message":"Insufficient credits","code":402}}"#;
+        let err = ProviderError::from_status(402, body);
+        assert_eq!(err.kind, ProviderErrorKind::Billing);
+        assert_eq!(err.affordable_tokens, None);
+    }
+
+    #[test]
+    fn billing_402_affordable_zero_returns_none() {
+        let body = r#"{"error":{"message":"can only afford 0 tokens","code":402}}"#;
+        let err = ProviderError::from_status(402, body);
+        assert_eq!(err.affordable_tokens, None);
     }
 }

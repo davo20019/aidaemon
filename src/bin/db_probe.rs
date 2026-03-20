@@ -740,6 +740,67 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // === Goal Scheduling Diagnostics ===
+    println!("\n== Active Scheduled Goals ==");
+    let sched_goals = sqlx::query(
+        r#"SELECT g.id, substr(g.description, 1, 100) AS desc, g.goal_type, g.session_id,
+                  s.id AS sched_id, s.cron_expr, s.fire_policy, s.is_paused, s.is_one_shot,
+                  s.last_run_at, s.next_run_at, s.original_schedule
+           FROM goals g
+           JOIN goal_schedules s ON s.goal_id = g.id
+           WHERE g.status = 'active' AND g.domain = 'orchestration'
+           ORDER BY s.next_run_at ASC"#,
+    )
+    .fetch_all(&pool)
+    .await?;
+    if sched_goals.is_empty() {
+        println!("(none)");
+    } else {
+        for r in &sched_goals {
+            println!(
+                "- goal={} sched={} cron='{}' policy={} paused={} one_shot={}\n  next={} last={}\n  desc={}",
+                &r.get::<String, _>("id")[..8],
+                &r.get::<String, _>("sched_id")[..8],
+                r.get::<String, _>("cron_expr"),
+                r.get::<String, _>("fire_policy"),
+                r.get::<i64, _>("is_paused"),
+                r.get::<i64, _>("is_one_shot"),
+                r.get::<String, _>("next_run_at"),
+                r.try_get::<Option<String>, _>("last_run_at").unwrap_or(None).unwrap_or_else(|| "never".to_string()),
+                r.get::<String, _>("desc"),
+            );
+        }
+    }
+
+    println!("\n== Recent Scheduled Tasks (last 10) ==");
+    let sched_tasks = sqlx::query(
+        r#"SELECT t.id, t.goal_id, substr(t.description, 1, 80) AS desc, t.status,
+                  t.created_at, t.started_at, t.completed_at, t.retry_count, t.agent_id
+           FROM tasks t
+           WHERE t.description LIKE 'Scheduled check:%' OR t.description LIKE 'Execute scheduled goal:%'
+           ORDER BY t.created_at DESC LIMIT 10"#,
+    )
+    .fetch_all(&pool)
+    .await?;
+    if sched_tasks.is_empty() {
+        println!("(none)");
+    } else {
+        for r in &sched_tasks {
+            println!(
+                "- task={} goal={} status={} retry={} agent={}\n  created={} started={} completed={}\n  desc={}",
+                &r.get::<String, _>("id")[..8],
+                &r.get::<String, _>("goal_id")[..8],
+                r.get::<String, _>("status"),
+                r.get::<i64, _>("retry_count"),
+                r.try_get::<Option<String>, _>("agent_id").unwrap_or(None).unwrap_or_else(|| "none".to_string()),
+                &r.get::<String, _>("created_at")[..19],
+                r.try_get::<Option<String>, _>("started_at").unwrap_or(None).map(|s| s[..19].to_string()).unwrap_or_else(|| "none".to_string()),
+                r.try_get::<Option<String>, _>("completed_at").unwrap_or(None).map(|s| s[..19].to_string()).unwrap_or_else(|| "none".to_string()),
+                r.get::<String, _>("desc"),
+            );
+        }
+    }
+
     pool.close().await;
     Ok(())
 }

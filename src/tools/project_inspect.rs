@@ -175,11 +175,8 @@ fn parse_project_paths(args: &Value) -> anyhow::Result<Vec<String>> {
 }
 
 async fn inspect_project(path_str: &str) -> anyhow::Result<String> {
-    let project_dir = fs_utils::validate_path(path_str)?;
-
-    if !project_dir.exists() || !project_dir.is_dir() {
-        anyhow::bail!("Not a valid directory: {}", path_str);
-    }
+    // Use resolve_project_dir for smart fallback to ~/projects/<name>
+    let project_dir = fs_utils::resolve_project_dir(path_str)?;
 
     let mut output = String::new();
     output.push_str(&format!("# Project: {}\n\n", project_dir.display()));

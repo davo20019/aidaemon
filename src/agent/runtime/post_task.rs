@@ -874,16 +874,35 @@ pub(in crate::agent) fn categorize_tool_calls(tool_calls: &[String]) -> String {
     let mut external_reads: Vec<&str> = Vec::new();
     let mut other: Vec<&str> = Vec::new();
 
+    let mut failed_mutations: Vec<&str> = Vec::new();
+
     for entry in tool_calls {
+        // Detect and strip [FAILED] suffix — failed tool calls are tracked
+        // separately so activity summaries don't claim success on failures.
+        let (clean_entry, is_failed) = if let Some(stripped) = entry.strip_suffix(" [FAILED]") {
+            (stripped, true)
+        } else {
+            (entry.as_str(), false)
+        };
+
         // Parse "tool_name(summary)" format
-        let (name, args) = match entry.find('(') {
+        let (name, args) = match clean_entry.find('(') {
             Some(idx) => {
-                let name = &entry[..idx];
-                let args = entry[idx + 1..].trim_end_matches(')');
+                let name = &clean_entry[..idx];
+                let args = clean_entry[idx + 1..].trim_end_matches(')');
                 (name, args)
             }
-            None => (entry.as_str(), ""),
+            None => (clean_entry, ""),
         };
+
+        // Failed write/edit operations go to a separate bucket.
+        if is_failed && matches!(name, "write_file" | "edit_file") {
+            if !args.is_empty() {
+                failed_mutations.push(args);
+            }
+            continue;
+        }
+
         match name {
             "read_file" => files_read.push(args),
             "write_file" | "edit_file" => files_written.push(args),
@@ -925,6 +944,13 @@ pub(in crate::agent) fn categorize_tool_calls(tool_calls: &[String]) -> String {
     if !external_reads.is_empty() {
         let items: Vec<&str> = external_reads.iter().copied().take(8).collect();
         sections.push(format!("External sources checked: {}", items.join(", ")));
+    }
+    if !failed_mutations.is_empty() {
+        let items: Vec<&str> = failed_mutations.iter().copied().take(5).collect();
+        sections.push(format!(
+            "Failed writes (permission/error): {}",
+            items.join(", ")
+        ));
     }
 
     if sections.is_empty() {

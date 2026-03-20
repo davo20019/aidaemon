@@ -431,14 +431,36 @@ fn summarize_completed_tool_result(result_text: &str) -> String {
     truncate_str(summary.trim(), TOOL_COMPLETE_SUMMARY_MAX_CHARS)
 }
 
+fn has_nonzero_exit_code(text: &str) -> bool {
+    // Detect "[exit code: N]" where N != 0.
+    if let Some(pos) = text.to_ascii_lowercase().find("[exit code:") {
+        let after = &text[pos + 11..];
+        let code_str: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == ' ')
+            .collect();
+        if let Ok(code) = code_str.trim().parse::<i32>() {
+            return code != 0;
+        }
+    }
+    false
+}
+
 fn build_external_action_completion_ack(result_text: &str) -> String {
     let primary = crate::traits::extract_primary_message_content(result_text, &[]);
     let excerpt = primary.trim();
+    let has_error = has_nonzero_exit_code(excerpt);
+    let status = if has_error {
+        "The requested action finished with errors."
+    } else {
+        "The requested action completed successfully."
+    };
     if excerpt.is_empty() || is_trivial_success_excerpt(excerpt) {
-        "The requested action completed successfully.".to_string()
+        status.to_string()
     } else {
         format!(
-            "The requested action completed successfully.\n\nLatest result:\n{}",
+            "{}\n\nLatest result:\n{}",
+            status,
             truncate_with_note(excerpt, EXTERNAL_ACTION_ACK_MAX_CHARS)
         )
     }
@@ -701,6 +723,7 @@ impl Agent {
 
         let mut successful_tool_calls = 0;
         let mut iteration_had_tool_failures = false;
+        let mut hard_block_streak: usize = 0;
         info!(
             session_id,
             iteration,
@@ -1206,12 +1229,23 @@ impl Agent {
                     continue;
                 }
                 ToolBlockKind::HardBlock => {
-                    // Permanent block (semantic failure limit, unknown tool, call
-                    // count limit). Activate force-text so the next LLM call
-                    // strips all tools and forces a text response. Without this,
-                    // weak models keep retrying the same blocked tool indefinitely.
-                    force_text_response = true;
-                    pending_system_messages.push(SystemDirective::HardToolLimitReached);
+                    // A specific tool hit its limit (semantic failures, call
+                    // count, etc.). Track consecutive hard-blocks so we can
+                    // distinguish "model hit web_search limit but should still
+                    // use write_file" from "model keeps retrying the same blocked
+                    // tool every iteration."
+                    hard_block_streak += 1;
+                    if hard_block_streak >= 3 {
+                        // Model is stuck retrying blocked tools — force text.
+                        force_text_response = true;
+                        pending_system_messages.push(SystemDirective::HardToolLimitReached);
+                    } else {
+                        // First/second block — tell the model this tool is done
+                        // but other tools are still available.
+                        pending_system_messages.push(SystemDirective::SpecificToolBlocked {
+                            tool_name: tc.name.clone(),
+                        });
+                    }
                     continue;
                 }
             }
@@ -1242,6 +1276,28 @@ impl Agent {
                         continue;
                     }
                     LoopPatternGuardOutcome::Return(outcome) => {
+                        // Plan-aware stall override: when a plan exists and the
+                        // model is stuck exploring, don't kill the task. Instead,
+                        // force-advance the plan step. The next main loop
+                        // iteration will inject the updated plan with [DONE] on
+                        // the stalled step and [CURRENT] on the next step.
+                        if let Some(ref mut plan) = execution_state.active_linear_intent_plan {
+                            if !plan.all_steps_complete() {
+                                plan.complete_current_step_with_evidence(
+                                    "Force-advanced: stall detected".to_string(),
+                                );
+                                tracing::info!(
+                                    session_id,
+                                    advanced_step = plan.current_step_cursor - 1,
+                                    "Plan step force-advanced due to stall detection — \
+                                     returning to main loop for next iteration"
+                                );
+                                // Return NextIteration so the main loop runs the
+                                // re-planner and re-injects the updated plan.
+                                commit_state!();
+                                return Ok(ToolExecutionOutcome::NextIteration);
+                            }
+                        }
                         commit_state!();
                         return Ok(outcome);
                     }
@@ -1407,14 +1463,6 @@ impl Agent {
                 }
             }
 
-            // Track tool call for learning
-            let tool_summary = format!(
-                "{}({})",
-                tc.name,
-                summarize_tool_args(&tc.name, &effective_arguments)
-            );
-            learning_ctx.tool_calls.push(tool_summary.clone());
-
             // Track tool failures across iterations using structured detection
             // (prefixes, JSON error payloads, HTTP statuses, non-zero exit codes).
             let failure_class = classify_tool_result_failure_with_context(
@@ -1431,6 +1479,21 @@ impl Agent {
                 false,
             );
             let is_error = failure_class.is_some();
+
+            // Track tool call for learning — mark failures so activity summaries
+            // don't claim files were written when writes actually failed.
+            let tool_summary = format!(
+                "{}({})",
+                tc.name,
+                summarize_tool_args(&tc.name, &effective_arguments)
+            );
+            if is_error {
+                learning_ctx
+                    .tool_calls
+                    .push(format!("{} [FAILED]", tool_summary));
+            } else {
+                learning_ctx.tool_calls.push(tool_summary.clone());
+            }
             execution_state.complete_current_step(classify_step_execution_outcome(
                 is_error,
                 background_detached,
@@ -1727,6 +1790,18 @@ impl Agent {
                     completion_progress.mark_observation(
                         &turn_context.completion_contract,
                         can_verify && matched_contract,
+                    );
+                }
+                // send_file success means the artifact was delivered to the
+                // user — this IS verification.  Clear the pending flag so the
+                // completion gate doesn't block a perfectly successful task.
+                if tc.name == "send_file" && completion_progress.verification_pending {
+                    completion_progress.verification_pending = false;
+                    completion_progress.verification_count =
+                        completion_progress.verification_count.saturating_add(1);
+                    info!(
+                        session_id,
+                        iteration, "send_file success cleared verification_pending"
                     );
                 }
                 if completion_progress.verification_pending {
@@ -2303,6 +2378,10 @@ mod tests {
             tool: "http_request".to_string(),
             target: "https://api.example.com/tweet-2".to_string(),
             description: "Post tweet 2".to_string(),
+            tool_calls_on_step: 0,
+            completed: false,
+            completion_evidence: None,
+            last_evaluated_at: None,
         };
 
         assert!(!linear_intent_step_matches_tool_call(
@@ -2333,6 +2412,10 @@ mod tests {
                     tool: "http_request".to_string(),
                     target: "https://api.example.com/tweet-1".to_string(),
                     description: "Post tweet 1".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
                 },
                 crate::agent::execution_state::LinearIntentStep {
                     step_id: "plan-v1-step-2".to_string(),
@@ -2340,6 +2423,10 @@ mod tests {
                     tool: "http_request".to_string(),
                     target: "https://api.example.com/tweet-2".to_string(),
                     description: "Post tweet 2".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
                 },
             ],
         );

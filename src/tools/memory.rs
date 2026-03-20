@@ -104,7 +104,7 @@ impl Tool for RememberFactTool {
                     },
                     "value": {
                         "type": "string",
-                        "description": "The single fact to remember"
+                        "description": "The fact to remember. To DELETE a fact, set value to empty string or 'delete' — this removes the fact entirely."
                     },
                     "facts": {
                         "type": "array",
@@ -122,7 +122,7 @@ impl Tool for RememberFactTool {
                                 },
                                 "value": {
                                     "type": "string",
-                                    "description": "The fact to remember"
+                                    "description": "The fact to remember. To DELETE a fact, set value to empty string or 'delete'."
                                 }
                             },
                             "required": ["category", "key", "value"]
@@ -184,6 +184,32 @@ impl Tool for RememberFactTool {
                     "Rejected [{}] {}: use manage_memories(create_personal_goal) for goals",
                     entry.category, entry.key
                 ));
+                continue;
+            }
+
+            // Empty/whitespace-only value or explicit deletion markers → delete the fact
+            let trimmed = entry.value.trim();
+            let is_deletion = trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("none")
+                || trimmed.eq_ignore_ascii_case("null")
+                || trimmed.eq_ignore_ascii_case("n/a")
+                || trimmed.eq_ignore_ascii_case("delete")
+                || trimmed.eq_ignore_ascii_case("remove")
+                || trimmed.eq_ignore_ascii_case("deleted")
+                || trimmed.eq_ignore_ascii_case("removed");
+            if is_deletion {
+                let deleted = self
+                    .state
+                    .delete_fact_by_key(&entry.category, &entry.key)
+                    .await?;
+                if deleted {
+                    results.push(format!("Deleted: [{}] {}", entry.category, entry.key));
+                } else {
+                    results.push(format!(
+                        "Not found (nothing to delete): [{}] {}",
+                        entry.category, entry.key
+                    ));
+                }
                 continue;
             }
 

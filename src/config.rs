@@ -415,6 +415,11 @@ pub struct ProviderConfig {
     pub extra_headers: Option<HashMap<String, String>>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Reasoning effort level for thinking models. When set, includes the
+    /// `reasoning` parameter in requests to enable thinking/reasoning tokens.
+    /// Values: "low", "medium", "high"
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub models: ModelsConfig,
     /// Ordered cross-provider fallback chain.

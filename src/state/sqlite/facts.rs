@@ -347,6 +347,56 @@ impl crate::traits::FactStore for SqliteStateStore {
                         continue;
                     }
 
+                    // Entity-scoping guard: prevent cross-entity dedup.
+                    //
+                    // When one key is a strict superset of the other (e.g.,
+                    // "carlos_birthday" ⊃ "birthday"), the extra tokens could
+                    // be either a modifier (safe to dedup: "preferred_editor"
+                    // vs "editor") or an entity prefix (dangerous: "carlos_birthday"
+                    // vs "birthday" belong to different people).
+                    //
+                    // We allow dedup only when ALL extra tokens are known
+                    // qualifiers/modifiers. If any extra token is unknown
+                    // (likely a person name or entity identifier), skip dedup.
+                    if is_subset && new_count != existing_count {
+                        const SAFE_MODIFIERS: &[&str] = &[
+                            "preferred",
+                            "favorite",
+                            "fav",
+                            "default",
+                            "primary",
+                            "current",
+                            "previous",
+                            "old",
+                            "new",
+                            "last",
+                            "first",
+                            "main",
+                            "secondary",
+                            "alternate",
+                            "alt",
+                            "other",
+                            "work",
+                            "home",
+                            "personal",
+                            "daily",
+                            "weekly",
+                            "morning",
+                            "evening",
+                            "night",
+                        ];
+                        let (larger, smaller) = if new_count > existing_count {
+                            (&new_tokens, &existing_tokens)
+                        } else {
+                            (&existing_tokens, &new_tokens)
+                        };
+                        let extra: Vec<&&str> = larger.difference(smaller).collect();
+                        let all_modifiers = extra.iter().all(|t| SAFE_MODIFIERS.contains(t));
+                        if !all_modifiers {
+                            continue;
+                        }
+                    }
+
                     let existing_key_text = build_dedup_key_text(category_clean, &existing_key);
                     if let Ok(existing_vec) = self.embedding_service.embed(existing_key_text).await
                     {
@@ -398,8 +448,34 @@ impl crate::traits::FactStore for SqliteStateStore {
             .ok()
             .map(|v| encode_embedding(&v));
 
-        if let Some((old_id, _old_key, old_value)) = existing {
-            // If the value is different, mark old as superseded and insert new
+        if let Some((old_id, _old_key, old_value)) = &existing {
+            // If the value is different, mark old as superseded and insert new.
+            //
+            // Source priority guard: consolidation-derived facts MUST NOT
+            // overwrite facts that were stored by the user (via remember_fact,
+            // user_message, etc.).  The consolidation pipeline processes
+            // conversation history and can inadvertently extract wrong values
+            // from hallucinated assistant messages.  User-originated facts are
+            // always ground truth.
+            if old_value != value && source == "consolidation" {
+                let existing_source: Option<String> =
+                    sqlx::query_scalar("SELECT source FROM facts WHERE id = ?")
+                        .bind(old_id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                let is_user_originated = existing_source
+                    .as_deref()
+                    .is_some_and(|s| s != "consolidation");
+                if is_user_originated {
+                    tracing::info!(
+                        category = category_clean,
+                        key = key_clean,
+                        existing_source = ?existing_source,
+                        "Consolidation skipped: refusing to overwrite user-originated fact"
+                    );
+                    return Ok(());
+                }
+            }
             if old_value != value {
                 sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
                     .bind(&now)
@@ -475,16 +551,30 @@ impl crate::traits::FactStore for SqliteStateStore {
                     Err(e) => return Err(e.into()),
                 }
             } else {
-                // Same value - update timestamp/source and backfill embedding if missing
-                sqlx::query(
-                    "UPDATE facts SET source = ?, updated_at = ?, embedding = COALESCE(embedding, ?) WHERE id = ?",
-                )
-                .bind(source)
-                .bind(&now)
-                .bind(&embedding_blob)
-                .bind(old_id)
-                .execute(&self.pool)
-                .await?;
+                // Same value — update timestamp and backfill embedding.
+                // When the new source is consolidation, keep the original
+                // (higher-trust) source intact. Only promote the source when
+                // the caller is a user-originated path (remember_fact, etc.).
+                if source == "consolidation" {
+                    sqlx::query(
+                        "UPDATE facts SET updated_at = ?, embedding = COALESCE(embedding, ?) WHERE id = ?",
+                    )
+                    .bind(&now)
+                    .bind(&embedding_blob)
+                    .bind(old_id)
+                    .execute(&self.pool)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        "UPDATE facts SET source = ?, updated_at = ?, embedding = COALESCE(embedding, ?) WHERE id = ?",
+                    )
+                    .bind(source)
+                    .bind(&now)
+                    .bind(&embedding_blob)
+                    .bind(old_id)
+                    .execute(&self.pool)
+                    .await?;
+                }
             }
         } else {
             // No existing fact - insert new with embedding
@@ -565,6 +655,94 @@ impl crate::traits::FactStore for SqliteStateStore {
                 Err(e) => return Err(e.into()),
             }
         }
+
+        // ── Post-store conflict sweep ──────────────────────────────────
+        //
+        // When the user explicitly stores a fact via remember_fact (source
+        // == "agent"), scan other active facts in the same category for
+        // semantically similar entries that represent stale/conflicting
+        // values for the same concept stored under a different key.
+        //
+        // Example: user says "my coffee is cappuccino" → stored as
+        // (preference, coffee_preference).  We also supersede
+        // (preference, beverage = "coffee (cold brew)") which is the same
+        // concept under a different key that escaped key-level dedup.
+        //
+        // Guards:
+        // - Only for source=="agent" (user-explicit, not consolidation/test)
+        // - Full-fact embedding similarity > 0.82 (stricter than key dedup)
+        // - Lexical overlap: at least one significant word from the new
+        //   fact's key or value must appear in the other fact's key or value
+        //   (prevents cross-concept supersession in the same category)
+        if source == "agent" {
+            if let Some(ref new_emb_blob) = embedding_blob {
+                if let Ok(new_vec) = decode_embedding(new_emb_blob) {
+                    let others = sqlx::query(
+                        "SELECT id, key, value, embedding FROM facts
+                         WHERE category = ? AND superseded_at IS NULL
+                           AND key != ?
+                           AND embedding IS NOT NULL",
+                    )
+                    .bind(category_clean)
+                    .bind(&key_for_write)
+                    .fetch_all(&self.pool)
+                    .await
+                    .unwrap_or_default();
+
+                    // Build keyword set from the new fact's key + value for
+                    // lexical overlap guard.  Only words ≥3 chars to skip
+                    // noise like "a", "is", "my".
+                    let new_words: std::collections::HashSet<String> = key_clean
+                        .split(|c: char| !c.is_alphanumeric())
+                        .chain(value.split(|c: char| !c.is_alphanumeric()))
+                        .filter(|w| w.len() >= 3)
+                        .map(|w| w.to_ascii_lowercase())
+                        .collect();
+
+                    for row in &others {
+                        let other_id: i64 = row.get("id");
+                        let other_key: String = row.get("key");
+                        let other_value: String = row.get("value");
+                        let blob: Vec<u8> = row.get("embedding");
+
+                        // Lexical overlap guard: at least one meaningful word
+                        // from the new fact must appear in the other fact.
+                        let other_text =
+                            format!("{} {}", other_key, other_value).to_ascii_lowercase();
+                        let has_overlap = new_words.iter().any(|w| other_text.contains(w.as_str()));
+                        if !has_overlap {
+                            continue;
+                        }
+
+                        if let Ok(other_vec) = decode_embedding(&blob) {
+                            let sim = crate::memory::math::cosine_similarity(&new_vec, &other_vec);
+                            // High similarity on full-fact embedding (value-aware)
+                            // means these facts describe the same concept.  Only
+                            // supersede if the values actually differ (otherwise
+                            // it's a harmless duplicate that adds context).
+                            if sim > 0.82 && other_value != value {
+                                tracing::info!(
+                                    category = category_clean,
+                                    new_key = key_clean,
+                                    new_value = value,
+                                    conflicting_key = other_key.as_str(),
+                                    conflicting_value = other_value.as_str(),
+                                    similarity = sim,
+                                    "Conflict sweep: superseding stale fact with different key"
+                                );
+                                let _ =
+                                    sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
+                                        .bind(&now)
+                                        .bind(other_id)
+                                        .execute(&self.pool)
+                                        .await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -968,6 +1146,22 @@ impl crate::traits::FactStore for SqliteStateStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn delete_fact_by_key(&self, category: &str, key: &str) -> anyhow::Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        // Canonicalize: lowercase, trim, strip [brackets]
+        let cat_clean = category.trim().to_lowercase();
+        let key_clean = key.trim().to_lowercase();
+        let result = sqlx::query(
+            "UPDATE facts SET superseded_at = ? WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&cat_clean)
+        .bind(&key_clean)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn get_all_facts_with_provenance(&self) -> anyhow::Result<Vec<Fact>> {

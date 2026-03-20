@@ -788,6 +788,17 @@ fn format_error_coaching(key_line: &str) -> Option<ToolResultNotice> {
     if key_line.is_empty() {
         return None;
     }
+    let lower = key_line.to_ascii_lowercase();
+    // Permission-denied errors get specific guidance instead of generic coaching.
+    if lower.contains("permission denied")
+        || lower.contains("access denied")
+        || lower.contains("operation not permitted")
+        || lower.contains("read-only file system")
+    {
+        return Some(ToolResultNotice::PermissionDeniedCoaching {
+            key_line: key_line.to_string(),
+        });
+    }
     Some(ToolResultNotice::ErrorCoaching {
         key_line: key_line.to_string(),
     })

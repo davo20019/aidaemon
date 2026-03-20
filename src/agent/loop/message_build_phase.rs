@@ -623,12 +623,7 @@ impl Agent {
                     let (tool_name, args_json) = tool_call_info
                         .get(tc_id)
                         .map(|(n, a)| (n.as_str(), a.as_str()))
-                        .unwrap_or_else(|| {
-                            (
-                                m.tool_name.as_deref().unwrap_or("unknown"),
-                                "",
-                            )
-                        });
+                        .unwrap_or_else(|| (m.tool_name.as_deref().unwrap_or("unknown"), ""));
                     let result_content = m.content.as_deref().unwrap_or("");
                     Some(super::sliding_window::summarize_tool_result(
                         tool_name,
@@ -708,9 +703,7 @@ impl Agent {
                                 obj["content"] = Value::Null;
                             }
                         } else if m.content.is_none()
-                            || m.content
-                                .as_deref()
-                                .is_some_and(|c| c.trim().is_empty())
+                            || m.content.as_deref().is_some_and(|c| c.trim().is_empty())
                         {
                             // Assistant message had tool_calls but all were orphaned,
                             // and no text content — replace with [Action completed] to
@@ -838,22 +831,21 @@ impl Agent {
                     let has_different_task = prev_user_content.as_deref() != Some(user_text)
                         && prev_user_content.is_some();
                     if has_different_task {
+                        // Softer marker that tells the LLM which message is current
+                        // without telling it to ignore prior context. The old [TASK BOUNDARY]
+                        // marker aggressively instructed the LLM to ignore prior messages,
+                        // which broke follow-up references like "the ones within 20 miles".
                         let marker = json!({
                             "role": "system",
-                            "content": "[TASK BOUNDARY] The user has started a NEW, UNRELATED task below. \
-                                        Previous tasks in this session are COMPLETED — do NOT \
-                                        reference, revisit, or repeat them. Focus EXCLUSIVELY \
-                                        on the new request. If the new task asks to create files, \
-                                        search the web, write code, or perform any action, you MUST \
-                                        use the appropriate tools — do NOT answer with information \
-                                        from previous tasks instead."
+                            "content": "[Current Task] The message below is the user's current request. \
+                                        Prior messages are conversation history for context."
                         });
                         messages.insert(current_pos, marker);
                         info!(
                             session_id,
                             iteration,
                             user_messages = user_positions.len(),
-                            "Task boundary marker injected before current user message"
+                            "Current task marker injected before current user message"
                         );
                     }
                 }
@@ -980,6 +972,21 @@ impl Agent {
                 "content": effective_system_prompt,
             }),
         );
+
+        // Inject compaction summary as the second message (after system prompt).
+        // This gives the LLM a condensed overview of earlier conversation turns
+        // that were trimmed by the sliding window, preserving continuity.
+        if let Some(ref summary) = session_summary {
+            if !summary.summary.is_empty() {
+                messages.insert(
+                    1,
+                    json!({
+                        "role": "system",
+                        "content": format!("[Session Summary]\n{}", summary.summary),
+                    }),
+                );
+            }
+        }
 
         if let Some(checkpoint) = execution_checkpoint {
             messages.push(json!({

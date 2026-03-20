@@ -96,6 +96,11 @@ pub trait FactStore: Send + Sync {
         Ok(())
     }
 
+    /// Soft-delete a fact by category and key. Returns true if a fact was found and deleted.
+    async fn delete_fact_by_key(&self, _category: &str, _key: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Get all active facts with provenance info for memory management display.
     async fn get_all_facts_with_provenance(&self) -> anyhow::Result<Vec<super::Fact>> {
         self.get_facts(None).await

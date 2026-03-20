@@ -142,6 +142,7 @@ impl Agent {
             "manage_people",
             "remember_fact",
             "check_environment", // diagnostic: lists installed tools, never a task result
+            "cli_agent",         // sub-agent raw output is file metadata, never user-facing
         ];
 
         let clean_tool_content = |msg: &crate::traits::Message| -> Option<(String, String)> {
@@ -516,82 +517,199 @@ impl Agent {
 
         if self.depth == 0 {
             if let Some(background_ack) = pending_background_ack.take() {
-                info!(
-                    session_id,
-                    iteration,
-                    total_successful_tool_calls,
-                    tool_calls = learning_ctx.tool_calls.len(),
-                    "Background handoff: stopping loop and returning summary"
-                );
-                self.emit_decision_point(
-                    emitter,
-                    task_id,
-                    iteration,
-                    DecisionType::StoppingCondition,
-                    "Stopping condition fired: deterministic background handoff".to_string(),
-                    json!({
-                        "condition":"background_detach_handoff",
-                        "total_successful_tool_calls": total_successful_tool_calls
-                    }),
-                )
-                .await;
+                // Detect multi-step user requests that imply work beyond just
+                // launching a background process.  When the user's message
+                // contains sequencing markers ("and then", "test it", etc.)
+                // AND we are well within budget, continue the loop so the
+                // agent can handle the remaining steps (e.g., test a server
+                // that was just launched in the background).
+                let user_implies_more_steps = {
+                    let lower = user_text.trim().to_ascii_lowercase();
+                    // Multi-step indicators: sequencing, testing, verification
+                    let has_sequencing_keywords = lower.contains("and then")
+                        || lower.contains("then ")
+                        || lower.contains("after that")
+                        || lower.contains("also ")
+                        || lower.contains("test it")
+                        || lower.contains("test the")
+                        || lower.contains("test all")
+                        || lower.contains("verify")
+                        || lower.contains("check if")
+                        || lower.contains("make sure")
+                        || lower.contains("try it")
+                        || lower.contains("connect to")
+                        || lower.contains("show me")
+                        || lower.contains("kill the")
+                        || lower.contains("stop the")
+                        || lower.contains("when done")
+                        || lower.contains("when finished")
+                        || lower.contains("once it")
+                        || lower.contains("afterwards")
+                        || (lower.contains(" and ") && lower.len() > 60);
 
-                // Build a richer response that includes an activity summary
-                // so the user knows what was accomplished before the background
-                // task was started, not just the technical "moved to background" text.
-                // NOTE: We use display_tool_call() to convert "tool_name(args)" to
-                // a user-friendly format that won't be stripped by
-                // strip_tool_name_references() (which replaces raw tool_name(...)
-                // patterns with "that").
-                let reply = if learning_ctx.tool_calls.is_empty() {
-                    background_ack.clone()
+                    // Heuristic: multi-sentence instructions with action verbs
+                    // indicate multiple steps even without explicit sequencing words.
+                    // Count sentences that start with an imperative action verb.
+                    let has_multi_sentence_actions = if !has_sequencing_keywords {
+                        let action_verbs = [
+                            "test",
+                            "run",
+                            "start",
+                            "stop",
+                            "kill",
+                            "create",
+                            "build",
+                            "deploy",
+                            "send",
+                            "show",
+                            "check",
+                            "verify",
+                            "curl",
+                            "open",
+                            "write",
+                            "read",
+                            "delete",
+                            "remove",
+                            "install",
+                            "setup",
+                            "set up",
+                            "configure",
+                            "execute",
+                            "launch",
+                            "use",
+                            "try",
+                            "make",
+                            "add",
+                            "update",
+                            "fetch",
+                            "call",
+                            "hit",
+                            "restart",
+                        ];
+                        let sentences: Vec<&str> = lower
+                            .split(['.', '!', '\n'])
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        let action_sentence_count = sentences
+                            .iter()
+                            .filter(|s| {
+                                action_verbs.iter().any(|v| {
+                                    s.starts_with(v)
+                                        || s.starts_with(&format!("- {}", v))
+                                        || s.starts_with(&format!("* {}", v))
+                                })
+                            })
+                            .count();
+                        // 3+ action sentences = multi-step request
+                        action_sentence_count >= 3
+                    } else {
+                        false
+                    };
+
+                    has_sequencing_keywords || has_multi_sentence_actions
+                };
+                let budget_cap = hard_cap.unwrap_or(60);
+                let well_within_budget = total_successful_tool_calls < (budget_cap / 2);
+
+                if user_implies_more_steps && well_within_budget {
+                    info!(
+                        session_id,
+                        iteration,
+                        total_successful_tool_calls,
+                        "Background process launched but LLM indicates more work — continuing loop"
+                    );
+                    // The tool execution phase already pushed BackgroundHandoff
+                    // (which says "do NOT call additional tools") and set
+                    // force_text_response = true.  Remove that directive and
+                    // replace it with BackgroundProcessContinue so the LLM
+                    // knows to keep working on remaining steps.
+                    pending_system_messages
+                        .retain(|d| !matches!(d, SystemDirective::BackgroundHandoff { .. }));
+                    pending_system_messages.push(SystemDirective::BackgroundProcessContinue);
+                    // Re-enable tools so the LLM can call curl / other tools
+                    // for the remaining steps.
+                    force_text_response = false;
+                    commit_state!();
+                    // Fall through to ContinueLoop below
                 } else {
-                    let mut summary =
-                        String::from("Here's what I did before the background task started:\n");
-                    for (i, call) in learning_ctx.tool_calls.iter().enumerate() {
-                        summary.push_str(&format!(
-                            "{}. {}\n",
-                            i + 1,
-                            post_task::display_tool_call(call)
-                        ));
-                    }
-                    summary.push_str(&format!("\n{}", background_ack));
-                    summary
-                };
+                    info!(
+                        session_id,
+                        iteration,
+                        total_successful_tool_calls,
+                        tool_calls = learning_ctx.tool_calls.len(),
+                        "Background handoff: stopping loop and returning summary"
+                    );
+                    self.emit_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::StoppingCondition,
+                        "Stopping condition fired: deterministic background handoff".to_string(),
+                        json!({
+                            "condition":"background_detach_handoff",
+                            "total_successful_tool_calls": total_successful_tool_calls
+                        }),
+                    )
+                    .await;
 
-                let assistant_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "assistant".to_string(),
-                    content: Some(reply.clone()),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.5,
-                    ..Message::runtime_defaults()
-                };
-                self.append_assistant_message_with_event(
-                    emitter,
-                    &assistant_msg,
-                    &model,
-                    None,
-                    None,
-                )
-                .await?;
-                self.emit_task_end(
-                    emitter,
-                    task_id,
-                    TaskStatus::Completed,
-                    task_start,
-                    iteration,
-                    learning_ctx.tool_calls.len(),
-                    None,
-                    Some(reply.chars().take(200).collect()),
-                )
-                .await;
-                commit_state!();
-                return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
+                    // Build a richer response that includes an activity summary
+                    // so the user knows what was accomplished before the background
+                    // task was started, not just the technical "moved to background" text.
+                    // NOTE: We use display_tool_call() to convert "tool_name(args)" to
+                    // a user-friendly format that won't be stripped by
+                    // strip_tool_name_references() (which replaces raw tool_name(...)
+                    // patterns with "that").
+                    let reply = if learning_ctx.tool_calls.is_empty() {
+                        background_ack.clone()
+                    } else {
+                        let mut summary =
+                            String::from("Here's what I did before the background task started:\n");
+                        for (i, call) in learning_ctx.tool_calls.iter().enumerate() {
+                            summary.push_str(&format!(
+                                "{}. {}\n",
+                                i + 1,
+                                post_task::display_tool_call(call)
+                            ));
+                        }
+                        summary.push_str(&format!("\n{}", background_ack));
+                        summary
+                    };
+
+                    let assistant_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "assistant".to_string(),
+                        content: Some(reply.clone()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.5,
+                        ..Message::runtime_defaults()
+                    };
+                    self.append_assistant_message_with_event(
+                        emitter,
+                        &assistant_msg,
+                        &model,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    self.emit_task_end(
+                        emitter,
+                        task_id,
+                        TaskStatus::Completed,
+                        task_start,
+                        iteration,
+                        learning_ctx.tool_calls.len(),
+                        None,
+                        Some(reply.chars().take(200).collect()),
+                    )
+                    .await;
+                    commit_state!();
+                    return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
+                }
             }
         }
 
@@ -1467,8 +1585,8 @@ impl Agent {
                 .iter()
                 .filter(|(_, recovered)| !recovered)
                 .count();
-            let meaningful_progress = (total_successful_tool_calls >= 3
-                || evidence_gain_count >= 2)
+            let meaningful_progress = (total_successful_tool_calls >= 5
+                || evidence_gain_count >= 3)
                 && total_successful_tool_calls > unrecovered_errors;
             if meaningful_progress {
                 warn!(

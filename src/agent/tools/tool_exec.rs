@@ -186,12 +186,12 @@ impl Agent {
                 if result.is_ok() {
                     if let Some(ref tracker) = self.verification_tracker {
                         match name {
-                            "terminal" => {
+                            "terminal" | "run_command" => {
                                 if let Some(cmd) = extract_command_from_args(&enriched_args) {
                                     tracker.record_from_command(session_id, &cmd).await;
                                 }
                             }
-                            "send_file" => {
+                            "send_file" | "read_file" | "write_file" | "edit_file" => {
                                 if let Some(path) = extract_file_path_from_args(&enriched_args) {
                                     tracker.record_seen_path(session_id, &path).await;
                                 }

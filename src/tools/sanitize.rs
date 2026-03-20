@@ -109,6 +109,11 @@ static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"(?si)<function_calls>\s*.*?</function_calls>").unwrap(),
         Regex::new(r"(?m)^[^\S\n]*</?(?:function_calls|invoke)\b[^>]*>[^\n]*$").unwrap(),
         Regex::new(r"(?m)^[^\S\n]*<parameter\b[^>]*>.*?</parameter>[^\n]*$").unwrap(),
+        // Multi-line <parameter=...>...</parameter> blocks — some models use
+        // `<parameter=command>` (equals-sign format) instead of `<parameter name="command">`.
+        // Also catches `</function>` closing tags.
+        Regex::new(r"(?si)<parameter=[^>]*>.*?</parameter>").unwrap(),
+        Regex::new(r"(?m)^[^\S\n]*</function>[^\n]*$").unwrap(),
         // Raw function call markers (e.g. "functions.terminal:0 {...}").
         // Whole-line and inline variants.
         Regex::new(r"(?m)^[^\S\n]*functions\.\w+:\d+[^\n]*$").unwrap(),
@@ -256,6 +261,25 @@ pub fn strip_diagnostic_blocks(content: &str) -> String {
     result.trim().to_string()
 }
 
+/// Meta-instruction patterns that the LLM may parrot from system directives.
+/// These are behavioural guidance meant for the LLM, not the user.
+static META_INSTRUCTION_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Your response must accurately reflect\b[^\n]*").unwrap(),
+        Regex::new(r"(?i)If retries resolved earlier failures,?\s*say so explicitly\.?").unwrap(),
+        Regex::new(r"(?i)---\s*API ERROR\s*---").unwrap(),
+    ]
+});
+
+/// Strip meta-instructions that the LLM may have parroted from system directives.
+fn strip_meta_instructions(content: &str) -> String {
+    let mut result = content.to_string();
+    for pattern in META_INSTRUCTION_PATTERNS.iter() {
+        result = pattern.replace_all(&result, "").to_string();
+    }
+    result
+}
+
 /// Sanitize text before it is shown to end users.
 pub fn sanitize_user_facing_reply(reply: &str) -> String {
     let prior_turn_cleaned = reply
@@ -266,7 +290,68 @@ pub fn sanitize_user_facing_reply(reply: &str) -> String {
     let blocks_cleaned = strip_diagnostic_blocks(&prior_turn_cleaned);
     let control_cleaned = strip_internal_control_markers(&blocks_cleaned);
     let identity_cleaned = strip_model_identity_leaks(&control_cleaned);
-    strip_tool_name_references(&identity_cleaned)
+    let meta_cleaned = strip_meta_instructions(&identity_cleaned);
+    strip_tool_name_references(&meta_cleaned)
+}
+
+/// Lightweight second-pass sanitizer for `handle_message()`.
+///
+/// Unlike the full `sanitize_user_facing_reply()`, this catches control
+/// markers (`[SYSTEM]`, `[DIAGNOSTIC]`, model identity leaks, `[prior turn]`)
+/// that the model may echo verbatim, plus raw tool-call protocol tokens.
+///
+/// It intentionally does **not** re-run `strip_tool_name_references()`, which
+/// is the aggressive pass that replaces `tool_name(args)` patterns with "that".
+/// Double-running that pass can reduce valid prose to empty when the first pass
+/// already transformed references into generic text that the second pass then
+/// erroneously matches as a different pattern.
+pub fn strip_leaked_control_markers(reply: &str) -> String {
+    // Phase 1: prior turn markers (lightweight string replace)
+    let cleaned = reply
+        .replace(" [prior turn, truncated]", "")
+        .replace(" [prior turn]", "")
+        .replace("[prior turn, truncated]", "")
+        .replace("[prior turn]", "");
+
+    // Phase 2: diagnostic blocks + control markers + model identity
+    let cleaned = strip_diagnostic_blocks(&cleaned);
+    let cleaned = strip_internal_control_markers(&cleaned);
+    let cleaned = strip_model_identity_leaks(&cleaned);
+
+    // Phase 3: raw tool-call protocol tokens only (NOT tool-name references)
+    static LEAKED_TOKEN_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+        vec![
+            Regex::new(r"(?m)^[^\S\n]*<\|tool_call[^|]*\|>?[^\n]*$").unwrap(),
+            Regex::new(r"<\|tool_call[^|]*\|>?").unwrap(),
+            Regex::new(r"<\|tool_calls?_section_(?:begin|end)\|>?").unwrap(),
+            Regex::new(r"(?m)^[^\S\n]*</?tool_call>\s*\w*[^\n]*$").unwrap(),
+            Regex::new(r"(?m)^[^\S\n]*</?arg_(?:key|value)>[^\n]*$").unwrap(),
+            Regex::new(r"</?(?:tool_call|arg_(?:key|value))>").unwrap(),
+            Regex::new(r"(?si)<function_calls>\s*.*?</function_calls>").unwrap(),
+            Regex::new(r"(?m)^[^\S\n]*</?(?:function_calls|invoke)\b[^>]*>[^\n]*$").unwrap(),
+            Regex::new(r"(?m)^[^\S\n]*<parameter\b[^>]*>.*?</parameter>[^\n]*$").unwrap(),
+            Regex::new(r"(?si)<parameter=[^>]*>.*?</parameter>").unwrap(),
+            Regex::new(r"(?m)^[^\S\n]*</function>[^\n]*$").unwrap(),
+            Regex::new(r"(?m)^[^\S\n]*functions\.\w+:\d+[^\n]*$").unwrap(),
+            Regex::new(r"functions\.\w+:\d+\s*\{[^}]*\}").unwrap(),
+        ]
+    });
+    let segments = split_preserving_code_blocks(&cleaned);
+    let mut result = String::with_capacity(cleaned.len());
+    for (text, is_code) in &segments {
+        if *is_code {
+            result.push_str(text);
+        } else {
+            let mut segment = text.clone();
+            for pat in LEAKED_TOKEN_PATTERNS.iter() {
+                segment = pat.replace_all(&segment, "").to_string();
+            }
+            result.push_str(&segment);
+        }
+    }
+    static EXCESS_NEWLINES2: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
+    let result = EXCESS_NEWLINES2.replace_all(&result, "\n\n").to_string();
+    result.trim().to_string()
 }
 
 /// Split text into segments of (text, is_code_block).
@@ -1067,6 +1152,26 @@ mod tests {
         assert!(!result.contains("tail -n 300"));
         assert!(result.contains("I'll read the most recent 300 lines"));
         assert!(result.contains("Here's what I found."));
+    }
+
+    #[test]
+    fn test_strip_parameter_equals_format_tool_call() {
+        // Models like GLM emit `<parameter=command>` (equals format) instead of
+        // `<parameter name="command">`. Multi-line content with </function> tag.
+        let input = "<parameter=command>\ncd '/Users/test/projects' && sed -n '335,420p' /Users/test/src/config.rs\n</parameter>\n</function>";
+        let result = strip_diagnostic_blocks(input);
+        assert!(
+            !result.contains("<parameter"),
+            "parameter=command format should be stripped: {result}"
+        );
+        assert!(
+            !result.contains("</function>"),
+            "</function> closing tag should be stripped: {result}"
+        );
+        assert!(
+            !result.contains("sed -n"),
+            "command content should be stripped: {result}"
+        );
     }
 
     #[test]

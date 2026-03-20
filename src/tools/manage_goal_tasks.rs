@@ -31,6 +31,28 @@ impl ManageGoalTasksTool {
         )
     }
 
+    /// Resolve a potentially short task ID to the full UUID by prefix-matching
+    /// against all tasks in the current goal. Returns the full ID if exactly one
+    /// task matches the prefix, otherwise returns the original string unchanged.
+    async fn resolve_task_id(&self, task_id: &str) -> String {
+        // If it's already a full UUID (36 chars with dashes), skip resolution
+        if task_id.len() >= 36 {
+            return task_id.to_string();
+        }
+        // Try exact lookup first
+        if let Ok(Some(_)) = self.state.get_task(task_id).await {
+            return task_id.to_string();
+        }
+        // Prefix-match against all tasks in this goal
+        if let Ok(tasks) = self.state.get_tasks_for_goal(&self.goal_id).await {
+            let matches: Vec<&Task> = tasks.iter().filter(|t| t.id.starts_with(task_id)).collect();
+            if matches.len() == 1 {
+                return matches[0].id.clone();
+            }
+        }
+        task_id.to_string()
+    }
+
     fn truncate_result_for_tool_output(text: &str, max_chars: usize) -> String {
         let truncated: String = text.chars().take(max_chars).collect();
         if text.chars().count() > max_chars {
@@ -130,6 +152,8 @@ pub(crate) fn goal_completion_summary_indicates_not_finished(summary: &str) -> b
 
     [
         "i completed part of the request",
+        "i'm blocked from safely finishing",
+        "blocked from safely finishing",
         "haven't verified the final outcome",
         "have not verified the final outcome",
         "haven't verified yet",
@@ -527,10 +551,12 @@ impl ManageGoalTasksTool {
     }
 
     async fn update_task(&self, args: &ManageGoalTasksArgs) -> anyhow::Result<String> {
-        let task_id = args
+        let raw_task_id = args
             .task_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("update_task requires 'task_id'"))?;
+        let task_id = self.resolve_task_id(raw_task_id).await;
+        let task_id = task_id.as_str();
 
         let Some(mut task) = self.state.get_task(task_id).await? else {
             return Ok(self.task_not_found_message(task_id).await);
@@ -585,10 +611,12 @@ impl ManageGoalTasksTool {
     }
 
     async fn claim_task(&self, args: &ManageGoalTasksArgs) -> anyhow::Result<String> {
-        let task_id = args
+        let raw_task_id = args
             .task_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("claim_task requires 'task_id'"))?;
+        let task_id = self.resolve_task_id(raw_task_id).await;
+        let task_id = task_id.as_str();
 
         let Some(task) = self.state.get_task(task_id).await? else {
             return Ok(self.task_not_found_message(task_id).await);
@@ -617,10 +645,12 @@ impl ManageGoalTasksTool {
     }
 
     async fn retry_task(&self, args: &ManageGoalTasksArgs) -> anyhow::Result<String> {
-        let task_id = args
+        let raw_task_id = args
             .task_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("retry_task requires 'task_id'"))?;
+        let task_id = self.resolve_task_id(raw_task_id).await;
+        let task_id = task_id.as_str();
 
         let Some(mut task) = self.state.get_task(task_id).await? else {
             return Ok(self.task_not_found_message(task_id).await);
@@ -772,10 +802,12 @@ impl ManageGoalTasksTool {
     }
 
     async fn resolve_blocker(&self, args: &ManageGoalTasksArgs) -> anyhow::Result<String> {
-        let task_id = args
+        let raw_task_id = args
             .task_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("resolve_blocker requires 'task_id'"))?;
+        let task_id = self.resolve_task_id(raw_task_id).await;
+        let task_id = task_id.as_str();
 
         let Some(mut task) = self.state.get_task(task_id).await? else {
             return Ok(self.task_not_found_message(task_id).await);

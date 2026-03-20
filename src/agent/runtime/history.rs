@@ -52,7 +52,6 @@ pub(super) enum CompletionTaskKind {
     #[default]
     Conversational,
     Answer,
-    Compose,
     Check,
     Find,
     Change,
@@ -106,6 +105,14 @@ pub(super) struct CompletionProgress {
     pub successful_external_mutation_count: usize,
     /// True after we have already given the LLM one reconciliation-informed retry.
     pub external_mutation_reconciliation_attempted: bool,
+    /// Cumulative count of times the verification guard blocked completion.
+    /// Unlike `stall_count` (which is shared with other stall mechanisms and
+    /// gets reset), this counter only increments and is used as a safety valve
+    /// to prevent infinite verification loops.
+    pub verification_block_count: usize,
+    /// Count of times the response-quality nudge has been injected.
+    /// Used to prevent infinite nudge loops — only fire once.
+    pub quality_nudge_count: usize,
 }
 
 impl CompletionProgress {
@@ -257,6 +264,43 @@ fn looks_like_style_followup(lower_text: &str) -> bool {
         "whatever you think",
     ];
     style_markers.iter().any(|m| lower_text.contains(m))
+}
+
+/// Detect strong followup indicators that override the length heuristic.
+/// These are phrases that unambiguously reference prior conversation context,
+/// e.g. "follow-up on the newsletter you just created".
+fn has_strong_followup_indicators(lower_text: &str) -> bool {
+    // Explicit followup phrases
+    let followup_phrases = [
+        "follow-up on",
+        "follow up on",
+        "following up on",
+        "back to the",
+        "back to what you",
+        "continuing from",
+        "continuation of",
+        "regarding what you",
+        "about what you just",
+    ];
+    if followup_phrases.iter().any(|p| lower_text.contains(p)) {
+        return true;
+    }
+    // Recency markers that reference something the agent just did
+    let recency_refs = [
+        "you just created",
+        "you just made",
+        "you just wrote",
+        "you just generated",
+        "you just built",
+        "you just saved",
+        "we just discussed",
+        "we just talked about",
+        "the one you just",
+        "the file you just",
+        "the script you just",
+        "that you just",
+    ];
+    recency_refs.iter().any(|r| lower_text.contains(r))
 }
 
 fn looks_like_context_dependent_followup_question(lower_text: &str) -> bool {
@@ -957,10 +1001,43 @@ fn infer_completion_signals(
     let asks_change = text_contains_any_phrase(
         lower_text,
         &[
-            "change", "update", "edit", "write", "create", "delete", "remove", "deploy", "build",
-            "connect", "set up", "setup", "install", "restart", "reload", "enable", "disable",
-            "remember", "store", "save", "note", "pull", "push", "run", "execute", "fetch",
-            "merge", "start", "stop", "compile", "download", "clone", "migrate",
+            "change",
+            "update",
+            "edit",
+            "write",
+            "rewrite",
+            "overwrite",
+            "modify",
+            "replace",
+            "create",
+            "delete",
+            "remove",
+            "deploy",
+            "build",
+            "connect",
+            "set up",
+            "setup",
+            "install",
+            "restart",
+            "reload",
+            "enable",
+            "disable",
+            "remember",
+            "store",
+            "save",
+            "note",
+            "pull",
+            "push",
+            "run",
+            "execute",
+            "fetch",
+            "merge",
+            "start",
+            "stop",
+            "compile",
+            "download",
+            "clone",
+            "migrate",
         ],
     );
     let visible_state_problem = text_contains_any_phrase(
@@ -1051,6 +1128,54 @@ fn infer_completion_signals(
             ],
         );
 
+    // If the message is a question AND the only change-triggering keywords are
+    // memory verbs ("remember", "store", "save", "note"), demote asks_change
+    // to false. "What did I ask you to remember?" is recall, not mutation.
+    let asks_change = if asks_change && is_question {
+        // If only memory verbs triggered asks_change, it's a recall question.
+        // Check if any NON-memory change keyword is present.
+        text_contains_any_phrase(
+            lower_text,
+            &[
+                "change",
+                "update",
+                "edit",
+                "write",
+                "rewrite",
+                "overwrite",
+                "modify",
+                "replace",
+                "create",
+                "delete",
+                "remove",
+                "deploy",
+                "build",
+                "connect",
+                "set up",
+                "setup",
+                "install",
+                "restart",
+                "reload",
+                "enable",
+                "disable",
+                "pull",
+                "push",
+                "run",
+                "execute",
+                "fetch",
+                "merge",
+                "start",
+                "stop",
+                "compile",
+                "download",
+                "clone",
+                "migrate",
+            ],
+        )
+    } else {
+        asks_change
+    };
+
     CompletionSignals {
         is_question,
         asks_schedule,
@@ -1109,18 +1234,17 @@ fn infer_completion_contract(text: &str, alias_roots: &[String]) -> CompletionCo
     let verification_targets = extract_verification_targets(text, alias_roots);
     let signals = infer_completion_signals(&lower, &verification_targets);
     let connected_content_mode = super::intent_routing::classify_connected_content_mode(text);
-    let mut task_kind = infer_completion_task_kind(&signals);
-    if matches!(
-        connected_content_mode,
-        super::intent_routing::ConnectedContentMode::DraftOnly
-    ) {
-        task_kind = CompletionTaskKind::Compose;
-    }
+    let task_kind = infer_completion_task_kind(&signals);
+    // DraftOnly used to override task_kind to Compose and force
+    // expects_mutation=false, but this caused false tool disablement
+    // for requests like "create blog posts in ~/projects/X and commit".
+    // Keyword-based content-mode classification is too brittle to make
+    // hard execution decisions.  DraftOnly is now advisory only — it
+    // still influences system prompt hints and budget routing but does
+    // not override the signal-derived task kind or mutation expectation.
 
     let expects_mutation = if connected_content_mode.expects_live_delivery() {
         true
-    } else if connected_content_mode.is_authoring_only() {
-        false
     } else {
         matches!(
             task_kind,
@@ -1186,6 +1310,22 @@ fn classify_followup_mode(
         return (FollowupMode::NewTask, reasons);
     }
     let lower = trimmed.to_ascii_lowercase();
+
+    // Synthetic re-engagement messages from background command completions
+    // must always be follow-ups so the original task context is preserved.
+    if trimmed.starts_with("[Background command completed]") {
+        reasons.push(TurnContextReason::ExplicitFollowup);
+        return (FollowupMode::Followup, reasons);
+    }
+
+    // Strong followup indicators that should override the length heuristic.
+    // Phrases like "follow-up on the X you just created" clearly reference
+    // prior context regardless of message length.
+    if has_strong_followup_indicators(&lower) && !looks_like_explicit_task_switch(&lower) {
+        reasons.push(TurnContextReason::ExplicitFollowup);
+        return (FollowupMode::Followup, reasons);
+    }
+
     let is_short = trimmed.chars().count() <= 260;
     if !is_short || looks_like_explicit_task_switch(&lower) {
         reasons.push(TurnContextReason::DefaultNewTask);
@@ -1867,6 +2007,59 @@ fn choose_primary_project_scope(scopes: &[String]) -> Option<String> {
         .or_else(|| scopes.first().cloned())
 }
 
+/// When the user mentions multiple paths in a single message (e.g.
+/// `~/projects/blog/posts/file.md` and `~/projects/blog/tweets.md`),
+/// compute the narrowest scope that encompasses ALL mentioned paths.
+///
+/// Without this, only the first scope is used, and writes to sibling
+/// directories are blocked by the scope guard (e.g. scope locks to
+/// `/blog/posts` but the user also asked to write `/blog/tweets.md`).
+fn unify_current_turn_scopes(scopes: &[String]) -> Option<String> {
+    if scopes.len() <= 1 {
+        return scopes.first().cloned();
+    }
+    // Fast path: if one scope is a parent of ALL others, use it directly
+    for scope in scopes {
+        let prefix = format!("{}/", scope.trim_end_matches('/'));
+        if scopes
+            .iter()
+            .all(|other| other == scope || other.starts_with(&prefix))
+        {
+            return Some(scope.clone());
+        }
+    }
+    // No single scope is an ancestor of all others — compute common ancestor
+    let components: Vec<Vec<&str>> = scopes.iter().map(|s| s.split('/').collect()).collect();
+    let first = &components[0];
+    let mut common_len = 0;
+    for i in 0..first.len() {
+        if components.iter().all(|c| c.get(i) == first.get(i)) {
+            common_len = i + 1;
+        } else {
+            break;
+        }
+    }
+    if common_len == 0 {
+        return scopes.first().cloned();
+    }
+    let ancestor: String = first[..common_len].join("/");
+    // Safety: the ancestor should be at most 1 level shallower than the
+    // shallowest input scope. This prevents computing an overly broad
+    // scope (like /Users/name/projects) when unrelated project paths
+    // appear together.
+    let min_depth = scopes
+        .iter()
+        .map(|s| s.matches('/').count())
+        .min()
+        .unwrap_or(0);
+    let ancestor_depth = ancestor.matches('/').count();
+    if ancestor_depth >= min_depth.saturating_sub(1) {
+        Some(ancestor)
+    } else {
+        scopes.first().cloned()
+    }
+}
+
 fn turn_allows_inherited_project_scope(
     current_user_text: &str,
     current_user_scopes: &[String],
@@ -2020,6 +2213,8 @@ impl Agent {
             classify_followup_mode(current, prev_assistant.as_deref());
 
         let mut goal_user_text = current.to_string();
+        // Mismatch preflight: still used for project scope divergence detection
+        // (affects scope extraction below), but no longer gates goal_user_text enrichment.
         if followup_mode != FollowupMode::NewTask {
             let mismatch_preflight_drop = prev_user.as_deref().is_some_and(|prev| {
                 has_project_scope_divergence_with_aliases(
@@ -2040,27 +2235,25 @@ impl Agent {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        if followup_mode != FollowupMode::NewTask {
-            if let Some(prev_user_text) = prev_user
-                .as_deref()
-                .filter(|prev| !prev.trim().eq_ignore_ascii_case(current))
-            {
-                let mut combined = String::new();
-                combined.push_str("Original request:\n");
-                combined.push_str(&truncate_for_resume(prev_user_text.trim(), 2000));
-                if let Some(prev_assistant_text) = prev_assistant.as_deref() {
-                    let trimmed = prev_assistant_text.trim();
-                    if !trimmed.is_empty() && trimmed.contains('?') {
-                        combined.push_str("\n\nAssistant asked:\n");
-                        combined.push_str(&truncate_for_resume(trimmed, 800));
-                    }
-                }
-                combined.push_str("\n\nFollow-up:\n");
-                combined.push_str(&truncate_for_resume(current, 800));
-                goal_user_text = combined;
-            }
-        } else {
-            let (sanitized, changed) = sanitize_carryover_blocks(current);
+        // Always enrich goal_user_text with prior user message, regardless of
+        // classification. The sliding window provides conversational context to
+        // the main LLM, and the enriched goal_user_text provides it to the task
+        // planner. Without this, short follow-ups like "the ones within 20 miles"
+        // are useless for planning.
+        if let Some(prev_user_text) = prev_user
+            .as_deref()
+            .filter(|prev| !prev.trim().eq_ignore_ascii_case(current))
+        {
+            let mut combined = String::new();
+            combined.push_str("Original request:\n");
+            combined.push_str(&truncate_for_resume(prev_user_text.trim(), 2000));
+            combined.push_str("\n\nCurrent request:\n");
+            combined.push_str(current);
+            goal_user_text = combined;
+        }
+        // Sanitize carryover blocks regardless of mode (they can appear in any message)
+        {
+            let (sanitized, changed) = sanitize_carryover_blocks(&goal_user_text);
             if changed {
                 reasons.push(TurnContextReason::CarryoverSanitized);
                 POLICY_METRICS
@@ -2072,7 +2265,9 @@ impl Agent {
             }
         }
 
-        let include_history_context = followup_mode != FollowupMode::NewTask;
+        // Classification no longer gates history inclusion — the sliding window
+        // in message_build_phase handles this unconditionally.
+        let include_history_context = true;
         let project_hints = extract_project_hints_from_history(
             &history,
             current,
@@ -2116,19 +2311,20 @@ impl Agent {
         );
         let allow_multi_project_scope =
             looks_like_multi_project_request(&current.to_ascii_lowercase());
-        // For current-turn scopes, use the FIRST extracted scope (text order)
-        // rather than `choose_primary_project_scope` which prefers scopes that
-        // exist as project roots on disk.  This is critical for new-project
-        // creation: the user's explicit path (e.g. ~/projects/ai-news-hub-2026)
-        // doesn't exist yet, but a false-positive nickname match (e.g.
-        // vite-cloudflare-project) DOES exist and would win the preference.
+        // For current-turn scopes, unify all explicitly mentioned paths into a
+        // single scope that encompasses them all.  When the user mentions paths
+        // in different subdirectories (e.g. ~/projects/blog/posts/file.md and
+        // ~/projects/blog/tweets.md), the unified scope is their common ancestor
+        // (~/projects/blog/) so writes to sibling directories aren't blocked.
+        //
+        // Falls back to `.first()` for single-scope messages, preserving the
+        // text-order priority that's critical for new-project creation (the
+        // user's explicit path may not exist yet on disk).
         // The project-root preference is only appropriate for history scopes
         // where we want to pick the most likely intended project among stale
         // references.
         let primary_project_scope = resolve_primary_project_scope(
-            current_project_scopes
-                .first()
-                .cloned()
+            unify_current_turn_scopes(&current_project_scopes)
                 .or_else(|| choose_primary_project_scope(&project_scopes)),
             self.inherited_project_scope.as_deref(),
             allow_multi_project_scope,
@@ -2643,6 +2839,72 @@ mod tests {
     }
 
     #[test]
+    fn unify_scopes_single_entry_returns_it() {
+        let scopes = vec!["/Users/david/projects/blog".to_string()];
+        assert_eq!(
+            unify_current_turn_scopes(&scopes),
+            Some("/Users/david/projects/blog".to_string())
+        );
+    }
+
+    #[test]
+    fn unify_scopes_empty_returns_none() {
+        let scopes: Vec<String> = vec![];
+        assert_eq!(unify_current_turn_scopes(&scopes), None);
+    }
+
+    #[test]
+    fn unify_scopes_parent_child_returns_parent() {
+        // User mentions ~/projects/blog/posts/file.md and ~/projects/blog/tweets.md
+        // which normalize to /blog/posts and /blog respectively
+        let scopes = vec![
+            "/Users/david/projects/blog/posts".to_string(),
+            "/Users/david/projects/blog".to_string(),
+        ];
+        assert_eq!(
+            unify_current_turn_scopes(&scopes),
+            Some("/Users/david/projects/blog".to_string())
+        );
+    }
+
+    #[test]
+    fn unify_scopes_siblings_returns_common_ancestor() {
+        // User mentions ~/projects/blog/posts/file.md and ~/projects/blog/output/index.html
+        let scopes = vec![
+            "/Users/david/projects/blog/posts".to_string(),
+            "/Users/david/projects/blog/output".to_string(),
+        ];
+        assert_eq!(
+            unify_current_turn_scopes(&scopes),
+            Some("/Users/david/projects/blog".to_string())
+        );
+    }
+
+    #[test]
+    fn unify_scopes_different_projects_returns_first_when_ancestor_too_shallow() {
+        // Two unrelated projects — common ancestor /tmp is too shallow (only 1 slash)
+        let scopes = vec!["/tmp/project-a".to_string(), "/tmp/project-b".to_string()];
+        // Common ancestor /tmp has depth 1, min scope depth is 1,
+        // ancestor_depth (1) >= min_depth-1 (0) → allowed.
+        // This is OK because for such shallow paths, multi_project_scope
+        // should handle the case.
+        assert_eq!(unify_current_turn_scopes(&scopes), Some("/tmp".to_string()));
+    }
+
+    #[test]
+    fn unify_scopes_three_paths_same_project() {
+        let scopes = vec![
+            "/Users/david/projects/blog/posts".to_string(),
+            "/Users/david/projects/blog/output".to_string(),
+            "/Users/david/projects/blog/scripts".to_string(),
+        ];
+        assert_eq!(
+            unify_current_turn_scopes(&scopes),
+            Some("/Users/david/projects/blog".to_string())
+        );
+    }
+
+    #[test]
     fn current_turn_scope_beats_history_scope_even_when_not_yet_on_disk() {
         // Reproduces the bug where a user asks to CREATE a new project
         // (~/projects/ai-news-hub) but the scope lock latches onto an
@@ -2886,13 +3148,32 @@ mod tests {
     }
 
     #[test]
-    fn connected_content_draft_only_request_uses_compose_contract() {
+    fn rewrite_request_expects_mutation() {
+        let contract = infer_completion_contract(
+            "Rewrite ~/projects/blog/tweets.md so the thread better promotes the blog content.",
+            &[],
+        );
+        assert_eq!(contract.task_kind, CompletionTaskKind::Change);
+        assert!(contract.expects_mutation);
+    }
+
+    #[test]
+    fn connected_content_draft_only_request_preserves_signal_derived_task_kind() {
+        // DraftOnly is advisory only — it no longer overrides task_kind to
+        // Compose or forces expects_mutation=false.  The signal-derived
+        // classification is preserved so that tool blocking decisions are
+        // based on actual intent signals, not keyword-based content mode.
         let contract = infer_completion_contract("Help me write a tweet about our launch.", &[]);
-        assert_eq!(contract.task_kind, CompletionTaskKind::Compose);
-        assert!(!contract.expects_mutation);
         assert_eq!(
             contract.connected_content_mode,
             super::super::intent_routing::ConnectedContentMode::DraftOnly
+        );
+        // task_kind comes from signals, not content mode override — DraftOnly
+        // no longer forces Compose.
+        assert!(
+            contract.expects_mutation
+                || contract.task_kind == CompletionTaskKind::Conversational
+                || contract.task_kind == CompletionTaskKind::Answer
         );
     }
 
@@ -2907,6 +3188,32 @@ mod tests {
         assert_eq!(
             contract.connected_content_mode,
             super::super::intent_routing::ConnectedContentMode::DraftThenDeliver
+        );
+    }
+
+    #[test]
+    fn recall_question_about_remembered_facts_does_not_expect_mutation() {
+        // "What did I ask you to remember?" contains "remember" but is a
+        // recall question, not a mutation request. Should NOT expect mutation.
+        let contract = infer_completion_contract(
+            "What do you know about my coding preferences? What did I ask you to remember?",
+            &[],
+        );
+        assert!(
+            !contract.expects_mutation,
+            "Recall question about 'remember' should not expect mutation, got task_kind={:?}",
+            contract.task_kind
+        );
+    }
+
+    #[test]
+    fn store_request_with_remember_does_expect_mutation() {
+        // "Remember that I prefer dark themes" is a store request, not recall.
+        let contract =
+            infer_completion_contract("Remember that I prefer dark themes and large fonts", &[]);
+        assert!(
+            contract.expects_mutation,
+            "Store request with 'remember' should expect mutation"
         );
     }
 
@@ -3326,7 +3633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_turn_context_omits_history_context_for_new_tasks() {
+    async fn build_turn_context_includes_history_for_all_modes() {
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::MessageStore;
 
@@ -3352,16 +3659,11 @@ mod tests {
             .build_turn_context_from_recent_history("test-session", "Why?")
             .await;
 
-        assert_eq!(turn_context.followup_mode, Some(FollowupMode::NewTask));
+        // Classification still runs (may be NewTask), but history is always included
+        // because the sliding window handles context unconditionally.
         assert!(
-            turn_context.recent_messages.is_empty(),
-            "new tasks should not include prior recent_messages: {:?}",
-            turn_context.recent_messages
-        );
-        assert!(
-            turn_context.project_hints.is_empty(),
-            "new tasks should not inherit prior project hints: {:?}",
-            turn_context.project_hints
+            !turn_context.recent_messages.is_empty(),
+            "recent_messages should always be included regardless of classification"
         );
     }
 
@@ -3446,8 +3748,12 @@ mod tests {
             .await;
 
         assert_eq!(turn_context.followup_mode, Some(FollowupMode::NewTask));
-        assert_eq!(turn_context.goal_user_text, current);
-        assert!(turn_context.recent_messages.is_empty());
+        // goal_user_text always contains the current request
+        assert!(
+            turn_context.goal_user_text.contains(current),
+            "goal_user_text should contain current request: {}",
+            turn_context.goal_user_text
+        );
         assert_eq!(
             turn_context.completion_contract.task_kind,
             CompletionTaskKind::Schedule

@@ -171,6 +171,19 @@ struct ScheduleMatch {
     end: usize,
 }
 
+/// Check whether a schedule string is a bare month-day pattern (e.g. "March 3rd",
+/// "on October 15th at 3pm").  Bare month-day patterns are ambiguous — they could
+/// be references to past events, facts, or recall rather than scheduling requests.
+/// Callers should require additional scheduling context (a verb like "remind" or
+/// "schedule") before treating these as scheduling intent.
+pub fn is_bare_month_day_pattern(schedule_raw: &str) -> bool {
+    let trimmed = schedule_raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    RE_SCHEDULE_MONTH_DAY.is_match(trimmed)
+}
+
 /// Extract the first schedule phrase from arbitrary user text.
 ///
 /// Returns `(schedule_raw, is_one_shot)` when a schedule is detected.

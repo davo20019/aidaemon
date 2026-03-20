@@ -45,12 +45,12 @@ impl Agent {
     ) {
         // Read-saturation: three-tier escalation for excessive consecutive reads.
         //
-        // Tier 1 (4+ reads): Gentle nudge — suggest the agent start writing.
-        // Tier 2 (7+ reads): Hard escalation — strip read tools from tool_defs
+        // Tier 1 (3+ reads): Forceful nudge — command the agent to start acting.
+        // Tier 2 (5+ reads): Hard escalation — strip read tools from tool_defs
         //   so the model literally cannot call read_file.
         // Restore: when consecutive_reads drops below threshold, restore read tools.
-        const READ_SATURATION_THRESHOLD: usize = 4;
-        const READ_SATURATION_ESCALATION: usize = 7;
+        const READ_SATURATION_THRESHOLD: usize = 3;
+        const READ_SATURATION_ESCALATION: usize = 5;
         let read_only_tools = [
             "read_file",
             "search_files",
@@ -80,10 +80,12 @@ impl Agent {
             .take_while(|name| is_read_only(name.as_str()))
             .count();
 
-        // Also check a sliding window: if 8+ of the last 10 tools are reads,
+        // Also check a sliding window: if 7+ of the last 8 tools are reads,
         // escalate even if a single write_file broke the consecutive streak.
+        // (Was 5/6 but that's too aggressive for legitimate multi-file tasks
+        //  like "read blog post + read existing tweets + write new tweets".)
         const SLIDING_WINDOW: usize = 8;
-        const SLIDING_READ_THRESHOLD: usize = 6;
+        const SLIDING_READ_THRESHOLD: usize = 7;
         let window_read_count = recent_tool_names
             .iter()
             .rev()
@@ -381,7 +383,100 @@ impl Agent {
             iteration_had_tool_failures,
         );
 
+        self.apply_memory_search_saturation_controls(
+            session_id,
+            pending_system_messages,
+            tool_defs,
+            recent_tool_names,
+        );
+
         self.apply_research_synthesis_nudge(session_id, pending_system_messages, recent_tool_names);
+
+        self.apply_build_fix_cycle_nudge(
+            session_id,
+            iteration,
+            pending_system_messages,
+            recent_tool_names,
+        );
+    }
+
+    fn apply_memory_search_saturation_controls(
+        &self,
+        session_id: &str,
+        pending_system_messages: &mut Vec<SystemDirective>,
+        tool_defs: &mut Vec<Value>,
+        recent_tool_names: &VecDeque<String>,
+    ) {
+        // Memory search saturation: after many consecutive memory tool calls
+        // (manage_memories, remember_fact), the model is often stuck in a search
+        // loop trying to verify facts or searching with slightly different queries.
+        //
+        // Tier 1 (4+ consecutive): Nudge — tell model to stop and respond.
+        // Tier 2 (7+ consecutive OR sliding window): Strip memory tools so the
+        //   model literally cannot call them.
+        const MEMORY_NUDGE_THRESHOLD: usize = 4;
+        const MEMORY_STRIP_THRESHOLD: usize = 7;
+        let memory_tools = ["manage_memories", "remember_fact", "manage_people"];
+        let is_memory_tool = |name: &str| -> bool { memory_tools.contains(&name) };
+
+        let consecutive_memory_calls = recent_tool_names
+            .iter()
+            .rev()
+            .take_while(|name| is_memory_tool(name.as_str()))
+            .count();
+
+        // Sliding window: if 6+ of the last 8 tools are memory tools, escalate
+        // even if a single non-memory tool broke the consecutive streak.
+        const SLIDING_WINDOW: usize = 8;
+        const SLIDING_MEMORY_THRESHOLD: usize = 6;
+        let window_memory_count = recent_tool_names
+            .iter()
+            .rev()
+            .take(SLIDING_WINDOW)
+            .filter(|name| is_memory_tool(name.as_str()))
+            .count();
+        let window_total = recent_tool_names.len().min(SLIDING_WINDOW);
+        let sliding_saturated =
+            window_total >= SLIDING_WINDOW && window_memory_count >= SLIDING_MEMORY_THRESHOLD;
+
+        let tool_def_name = |def: &Value| -> String {
+            def.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+
+        if consecutive_memory_calls >= MEMORY_STRIP_THRESHOLD || sliding_saturated {
+            let before_len = tool_defs.len();
+            tool_defs.retain(|def| {
+                let name = tool_def_name(def);
+                !is_memory_tool(&name)
+            });
+            let stripped = before_len.saturating_sub(tool_defs.len());
+            pending_system_messages.push(SystemDirective::MemorySearchSaturation {
+                consecutive_memory_calls,
+            });
+            info!(
+                session_id,
+                consecutive_memory_calls,
+                window_memory_count,
+                sliding_saturated,
+                stripped_tools = stripped,
+                "Memory search saturation escalation — memory tools stripped"
+            );
+            return;
+        }
+
+        if consecutive_memory_calls >= MEMORY_NUDGE_THRESHOLD {
+            pending_system_messages.push(SystemDirective::MemorySearchSaturation {
+                consecutive_memory_calls,
+            });
+            info!(
+                session_id,
+                consecutive_memory_calls, "Memory search saturation nudge injected"
+            );
+        }
     }
 
     fn apply_research_synthesis_nudge(
@@ -420,23 +515,95 @@ impl Agent {
         recent_tool_names: &VecDeque<String>,
         iteration_had_tool_failures: bool,
     ) {
-        // If the last 3+ tool calls are all edit_file and the current iteration
-        // had failures, strongly nudge the model to use write_file instead.
-        // The model often gets stuck retrying edit_file with slightly wrong
-        // old_text rather than rewriting the whole file.
-        if !iteration_had_tool_failures {
-            return;
+        // Nudge the model to use write_file instead of edit_file when it appears
+        // stuck in an edit loop.  Two detection modes:
+        //
+        // 1. Strict consecutive: 3+ consecutive edit_file calls with failures.
+        // 2. Sliding window: in the last 8 tool calls, if 4+ are edit_file and
+        //    the pattern includes interleaved read_file (classic failed-edit
+        //    retry: edit→read→edit→read...), inject the hint.  This catches
+        //    loops where the model alternates between reading the file and
+        //    retrying edits.
+        // Mode 1: strict consecutive (requires current iteration to have failures)
+        if iteration_had_tool_failures {
+            let consecutive_edits = recent_tool_names
+                .iter()
+                .rev()
+                .take_while(|name| name.as_str() == "edit_file")
+                .count();
+            if consecutive_edits >= 3 {
+                pending_system_messages.push(SystemDirective::EditStallWriteFileHint);
+                info!(
+                    session_id,
+                    consecutive_edits, "Edit-stall write_file hint injected (consecutive)"
+                );
+                return;
+            }
         }
-        let consecutive_edits = recent_tool_names
+
+        // Mode 2: sliding window — edit/read interleave pattern.
+        // Check regardless of current iteration failures — the model often
+        // alternates between terminal (succeeds) and edit_file (fails),
+        // so the failure guard would prevent detection on terminal iterations.
+        const WINDOW: usize = 8;
+        const EDIT_THRESHOLD: usize = 4;
+        let window: Vec<&str> = recent_tool_names
             .iter()
             .rev()
-            .take_while(|name| name.as_str() == "edit_file")
-            .count();
-        if consecutive_edits >= 3 {
+            .take(WINDOW)
+            .map(|s| s.as_str())
+            .collect();
+        let edit_count = window.iter().filter(|&&n| n == "edit_file").count();
+        let read_count = window.iter().filter(|&&n| n == "read_file").count();
+        if edit_count >= EDIT_THRESHOLD && read_count >= 1 {
             pending_system_messages.push(SystemDirective::EditStallWriteFileHint);
             info!(
                 session_id,
-                consecutive_edits, "Edit-stall write_file hint injected"
+                edit_count, read_count, "Edit-stall write_file hint injected (sliding window)"
+            );
+        }
+    }
+
+    /// Detect build→edit→build→edit cycles (common with weaker models).
+    /// When the agent keeps alternating between running build/test commands
+    /// and editing files without converging, nudge it to step back and
+    /// write the complete file from scratch.
+    fn apply_build_fix_cycle_nudge(
+        &self,
+        session_id: &str,
+        iteration: usize,
+        pending_system_messages: &mut Vec<SystemDirective>,
+        recent_tool_names: &VecDeque<String>,
+    ) {
+        // Only activate after enough iterations to be confident it's a cycle
+        const MIN_ITERATION: usize = 15;
+        if iteration < MIN_ITERATION {
+            return;
+        }
+
+        const WINDOW: usize = 10;
+        let build_tools = ["terminal", "run_command"];
+        let modify_tools = ["write_file", "edit_file"];
+
+        let window: Vec<&str> = recent_tool_names
+            .iter()
+            .rev()
+            .take(WINDOW)
+            .map(|s| s.as_str())
+            .collect();
+
+        let build_count = window.iter().filter(|&&n| build_tools.contains(&n)).count();
+        let modify_count = window
+            .iter()
+            .filter(|&&n| modify_tools.contains(&n))
+            .count();
+
+        // Both building and modifying heavily in the same window = cycle
+        if build_count >= 3 && modify_count >= 3 {
+            pending_system_messages.push(SystemDirective::BuildFixCycleNudge);
+            info!(
+                session_id,
+                iteration, build_count, modify_count, "Build-fix cycle nudge injected"
             );
         }
     }

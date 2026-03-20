@@ -1135,6 +1135,7 @@ mod tests {
         let options = ChatOptions {
             response_mode: ResponseMode::Text,
             tool_choice: ToolChoiceMode::Required,
+            ..ChatOptions::default()
         };
 
         let (body, text_only_mode, include_grounding, disable_fn_calling) =
@@ -1174,6 +1175,7 @@ mod tests {
                 strict: true,
             },
             tool_choice: ToolChoiceMode::Auto,
+            ..ChatOptions::default()
         };
 
         let (body, _, _, _) = p.build_request_body(system_instruction, contents, &[], &options);

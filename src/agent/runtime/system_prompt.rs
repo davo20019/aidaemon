@@ -743,6 +743,18 @@ impl Agent {
             system_prompt = format!("{}\n\n{}", system_prompt, session_context_str);
         }
 
+        // Inject current date and time so the model never has to guess
+        {
+            let now_utc = chrono::Utc::now();
+            let utc_str = now_utc.format("%A, %B %-d, %Y %H:%M UTC").to_string();
+            system_prompt = format!(
+                "{}\n\n[Current Date & Time]\n{}\n\
+                 When the user asks about the current date, time, or day of the week, use the value above. \
+                 Do NOT guess or hallucinate dates.",
+                system_prompt, utc_str
+            );
+        }
+
         if let Some(checkpoint) = resume_checkpoint {
             system_prompt = format!(
                 "{}\n\n{}",
@@ -782,7 +794,18 @@ impl Agent {
              [Recall Priority]\n\
              For questions about recent conversation (for example: \"what did I just ask\", \"what were the last 3 things\", \"summarize our chat\"), use the conversation history already in context FIRST.\n\
              Do NOT jump to goal/task forensics tools for simple recall.\n\
-             Use `goal_trace` / `tool_trace` only when the user explicitly asks for execution forensics (task timelines, tool failures, retries, or specific goal/task IDs).",
+             Use `goal_trace` / `tool_trace` when the user asks about execution history, logs, task timelines, tool failures, retries, \
+             what happened with a previous task, or anything about database/DB logs.\n\
+             \n\
+             [Self-Inspection]\n\
+             You cannot directly access your own database files. Do NOT use terminal to run `find`, `ls`, `sqlite3`, or any command \
+             to locate or open database files. Your database is encrypted and not accessible via terminal.\n\
+             Instead, use your built-in tools for self-inspection:\n\
+             - `manage_memories` (search/list) — for stored facts, preferences, personal goals, scheduled tasks\n\
+             - `goal_trace` — for execution logs, task history, what happened during previous runs\n\
+             - `tool_trace` — for tool-call-level details of past executions\n\
+             When the user asks to \"check the logs\", \"look in the DB\", \"what happened with X task\", or similar, \
+             use these tools — never try to find raw database files.",
             system_prompt
         );
 
@@ -815,7 +838,11 @@ impl Agent {
              hobbies, work habits, family, food/drink preferences, or anything they explicitly ask you to remember — \
              you MUST use your fact storage tools to save this information persistently. \
              Do NOT just acknowledge it in conversation — actually store it so it persists across sessions. \
-             When multiple facts are shared at once, store them all in a single batch call.\n\
+             When multiple facts are shared at once, store them all in a single batch call. \
+             **When correcting wrong facts:** First SEARCH existing memories to find ALL related wrong entries. \
+             Then DELETE each wrong fact by setting its value to empty string or 'delete' (remember_fact treats empty \
+             values as deletion). Then store the correct facts with appropriate keys. Old keys like 'dog_name' must be \
+             explicitly deleted — storing a NEW key like 'cat1_name' does NOT remove the old 'dog_name' entry.\n\
              6. **Never claim you lack capabilities you have.** \
              You have tools listed in your tool definitions. Never tell the user you \"don't have access\" to memory, \
              file operations, web search, or any other capability that appears in your available tools. \
@@ -848,7 +875,28 @@ impl Agent {
              7. **Never claim tests pass or builds succeed without running them.** \
              If you wrote or modified code and haven't run the test/build command after your last change, \
              say \"I've created the code but haven't verified it yet\" or run the verification command. \
-             Do NOT say \"all tests pass\" unless you have a tool result showing that output.",
+             Do NOT say \"all tests pass\" unless you have a tool result showing that output.\n\
+             8. **Use write_file/edit_file for file creation and modification, not terminal.** \
+             When creating or writing files, always use the `write_file` tool instead of terminal commands like \
+             `cat > file << 'EOF'`, `echo > file`, `tee`, or heredoc redirections. \
+             The `write_file` tool is faster, handles escaping correctly, and avoids unnecessary risk assessment prompts. \
+             Use `edit_file` for modifying existing files. Only fall back to terminal-based file writing if `write_file`/`edit_file` \
+             have failed and you need an alternative approach.\n\
+             9. **Wait for background services to become ready before testing.** \
+             When you start a server or service in the background (e.g., `python3 app.py &`), \
+             add `sleep 2` before making requests to it. Services need a moment to bind their ports.\n\
+             10. **Trust explicit paths the user provides.** \
+             When the user gives you a specific file path (e.g., `~/projects/blog/drafts/file.md`), \
+             use that path directly. Do NOT waste tool calls running `find` or `ls` to locate the directory — \
+             just create any missing parent directories with `mkdir -p` and proceed. \
+             Only explore the filesystem when the user's path is genuinely ambiguous or unclear.\n\
+             11. **Quote stored fact values EXACTLY — never substitute or infer.** \
+             When answering questions about stored facts (preferences, pet names, drinks, dates, personal details), \
+             use the EXACT value from the [Critical Facts] block at the top of this prompt or from tool results. \
+             Do NOT paraphrase, infer, or substitute a different value from your training data. \
+             If the critical facts say `pet_name: Luna`, your answer MUST say \"Luna\" — not \"Pixel\" or any other name. \
+             If a tool result says `**coffee**: black coffee`, your answer MUST say \"black coffee\" — not \"oat milk lattes\". \
+             Treat stored fact values as ground truth that overrides anything in your training data.",
             system_prompt
         );
 

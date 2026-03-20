@@ -1,5 +1,53 @@
+use std::collections::HashSet;
+
 use super::*;
 use crate::traits::ProviderResponse;
+
+/// Check if the continuation text has significant word overlap with the prefix,
+/// indicating the LLM re-started from scratch instead of continuing.
+fn has_significant_overlap(prefix: &str, continuation: &str) -> bool {
+    let normalize = |s: &str| -> Vec<String> {
+        s.split_whitespace()
+            .map(|w| {
+                w.trim_matches(|c: char| c.is_ascii_punctuation())
+                    .to_lowercase()
+            })
+            .filter(|w| w.len() > 2)
+            .collect()
+    };
+
+    let prefix_words = normalize(prefix);
+    let cont_words = normalize(continuation);
+
+    if prefix_words.is_empty() || cont_words.is_empty() {
+        return false;
+    }
+
+    // Build a set of distinctive phrases (3-word windows) from the prefix
+    let prefix_trigrams: HashSet<String> = prefix_words.windows(3).map(|w| w.join(" ")).collect();
+
+    // Check how many of the first 30 trigrams from the continuation
+    // appear in the prefix
+    let cont_trigrams: Vec<String> = cont_words
+        .windows(3)
+        .take(30)
+        .map(|w| w.join(" "))
+        .collect();
+
+    if cont_trigrams.is_empty() {
+        return false;
+    }
+
+    let overlap_count = cont_trigrams
+        .iter()
+        .filter(|t| prefix_trigrams.contains(*t))
+        .count();
+
+    // If ≥25% of the first 30 continuation trigrams already appeared in
+    // the prefix, the model re-started instead of continuing.
+    let ratio = overlap_count as f64 / cont_trigrams.len() as f64;
+    ratio >= 0.25
+}
 
 pub(super) enum LlmPhaseOutcome {
     ContinueLoop,
@@ -43,6 +91,18 @@ pub(super) struct LlmPhaseCtx<'a> {
     pub tools_required_for_turn: bool,
     pub max_budget_extensions: usize,
     pub hard_token_cap: i64,
+    /// Accumulated text from a previous truncated text response.  When set,
+    /// the current iteration's text content is prepended with this prefix
+    /// so the user sees the full answer.
+    pub truncated_text_prefix: &'a mut Option<String>,
+    /// Accumulates milliseconds lost to LLM provider timeouts so the
+    /// wall-clock budget can exclude them (provider slowness ≠ agent stalling).
+    pub provider_timeout_ms: &'a mut u64,
+    /// Counts consecutive iterations where the response was truncated with all
+    /// tokens spent on thinking and no usable output.  Escalating recovery:
+    /// 1 → reasoning_effort = "low", 2 → disable reasoning entirely,
+    /// 3+ → force text with no tools and no reasoning.
+    pub thinking_truncation_count: &'a mut u8,
 }
 
 impl Agent {
@@ -135,7 +195,10 @@ impl Agent {
         let tools_required_for_turn = ctx.tools_required_for_turn;
         let max_budget_extensions = ctx.max_budget_extensions;
         let hard_token_cap = ctx.hard_token_cap;
-        let timeout_after_external_action = Duration::from_secs(20);
+        let truncated_text_prefix = &mut *ctx.truncated_text_prefix;
+        let provider_timeout_ms = &mut *ctx.provider_timeout_ms;
+        let thinking_truncation_count = &mut *ctx.thinking_truncation_count;
+        let timeout_after_external_action = Duration::from_secs(90);
 
         // Identity manipulation detection: if the user's message contains obvious
         // injection patterns, prepend a strong system reminder to the messages so
@@ -239,6 +302,46 @@ impl Agent {
             tool_defs
         };
         let mut llm_options = ChatOptions::default();
+        // Escalating recovery for thinking-model truncation.
+        // Count tracks how many consecutive iterations were truncated with all
+        // tokens spent on thinking and no usable output.
+        if *thinking_truncation_count > 0 {
+            match *thinking_truncation_count {
+                1 => {
+                    // First retry: reduce reasoning effort to "low"
+                    llm_options.reasoning_effort_override = Some("low".to_string());
+                    info!(
+                        session_id,
+                        iteration,
+                        count = *thinking_truncation_count,
+                        "Thinking truncation retry: reducing reasoning_effort to low"
+                    );
+                }
+                2 => {
+                    // Second retry: disable reasoning entirely
+                    llm_options.reasoning_effort_override = Some("off".to_string());
+                    info!(
+                        session_id,
+                        iteration,
+                        count = *thinking_truncation_count,
+                        "Thinking truncation retry: disabling reasoning entirely"
+                    );
+                }
+                _ => {
+                    // Third+ retry: disable reasoning AND force text-only
+                    llm_options.reasoning_effort_override = Some("off".to_string());
+                    llm_options.tool_choice = ToolChoiceMode::None;
+                    warn!(
+                        session_id,
+                        iteration,
+                        count = *thinking_truncation_count,
+                        "Thinking truncation retry: forcing text-only with no reasoning"
+                    );
+                }
+            }
+            // Don't reset the count here — it gets reset when a successful
+            // response is received (below).
+        }
         if force_text_response {
             llm_options.tool_choice = ToolChoiceMode::None;
         } else if tools_required_for_turn
@@ -264,91 +367,82 @@ impl Agent {
             );
         }
 
+        // Always enforce a timeout — never allow unbounded LLM calls.
+        // The configured timeout is used if set; otherwise a generous default
+        // prevents hung provider calls from blocking the agent loop forever.
+        const DEFAULT_LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360);
         let effective_llm_timeout = if pending_external_action_ack.is_some() {
-            Some(
-                self.llm_call_timeout
-                    .map(|timeout| timeout.min(timeout_after_external_action))
-                    .unwrap_or(timeout_after_external_action),
-            )
-        } else {
             self.llm_call_timeout
+                .map(|timeout| timeout.min(timeout_after_external_action))
+                .unwrap_or(timeout_after_external_action)
+        } else {
+            self.llm_call_timeout.unwrap_or(DEFAULT_LLM_TIMEOUT)
         };
-        let mut resp = match effective_llm_timeout {
-            Some(timeout_dur) => {
-                match tokio::time::timeout(
-                    timeout_dur,
-                    self.call_llm_with_recovery(
-                        llm_provider,
-                        llm_router,
-                        model,
-                        messages,
-                        effective_tools,
-                        &llm_options,
-                    ),
-                )
-                .await
-                {
-                    Ok(result) => result?,
-                    Err(_elapsed) => {
-                        warn!(
+        let timeout_dur = effective_llm_timeout;
+        let mut resp = match tokio::time::timeout(
+            timeout_dur,
+            self.call_llm_with_recovery(
+                llm_provider,
+                llm_router,
+                model,
+                messages,
+                effective_tools,
+                &llm_options,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                // Record the timeout duration so the wall-clock budget
+                // can exclude time lost to provider slowness.
+                *provider_timeout_ms += timeout_dur.as_millis() as u64;
+                warn!(
+                    session_id,
+                    iteration,
+                    timeout_secs = timeout_dur.as_secs(),
+                    "LLM call timed out"
+                );
+                let _ = emitter
+                    .emit(
+                        EventType::Error,
+                        ErrorData::llm_error(
+                            format!("LLM call timed out after {}s", timeout_dur.as_secs()),
+                            Some(task_id.to_string()),
+                        )
+                        .with_context("llm_call_timeout"),
+                    )
+                    .await;
+                learning_ctx.errors.push((
+                    format!("LLM call timed out after {}s", timeout_dur.as_secs()),
+                    false,
+                ));
+                if let Some(reply) = pending_external_action_ack.take() {
+                    if let Some(last_error) = learning_ctx.errors.last_mut() {
+                        last_error.1 = true;
+                    }
+                    info!(
+                        session_id,
+                        iteration,
+                        timeout_secs = timeout_dur.as_secs(),
+                        "Returning deterministic completion after post-action LLM timeout"
+                    );
+                    let result = self
+                        .finalize_external_action_timeout_ack(
+                            emitter,
+                            task_id,
                             session_id,
                             iteration,
-                            timeout_secs = timeout_dur.as_secs(),
-                            "LLM call timed out"
-                        );
-                        let _ = emitter
-                            .emit(
-                                EventType::Error,
-                                ErrorData::llm_error(
-                                    format!("LLM call timed out after {}s", timeout_dur.as_secs()),
-                                    Some(task_id.to_string()),
-                                )
-                                .with_context("llm_call_timeout"),
-                            )
-                            .await;
-                        learning_ctx.errors.push((
-                            format!("LLM call timed out after {}s", timeout_dur.as_secs()),
-                            false,
-                        ));
-                        if let Some(reply) = pending_external_action_ack.take() {
-                            if let Some(last_error) = learning_ctx.errors.last_mut() {
-                                last_error.1 = true;
-                            }
-                            info!(
-                                session_id,
-                                iteration,
-                                timeout_secs = timeout_dur.as_secs(),
-                                "Returning deterministic completion after post-action LLM timeout"
-                            );
-                            let result = self
-                                .finalize_external_action_timeout_ack(
-                                    emitter,
-                                    task_id,
-                                    session_id,
-                                    iteration,
-                                    task_start,
-                                    learning_ctx,
-                                    model,
-                                    reply,
-                                )
-                                .await;
-                            return Ok(LlmPhaseOutcome::Return(result));
-                        }
-                        *stall_count += 1;
-                        return Ok(LlmPhaseOutcome::ContinueLoop);
-                    }
+                            task_start,
+                            learning_ctx,
+                            model,
+                            reply,
+                        )
+                        .await;
+                    return Ok(LlmPhaseOutcome::Return(result));
                 }
-            }
-            None => {
-                self.call_llm_with_recovery(
-                    llm_provider,
-                    llm_router,
-                    model,
-                    messages,
-                    effective_tools,
-                    &llm_options,
-                )
-                .await?
+                *stall_count += 1;
+                return Ok(LlmPhaseOutcome::ContinueLoop);
             }
         };
         touch_heartbeat(heartbeat);
@@ -704,6 +798,8 @@ impl Agent {
         if !resp.tool_calls.is_empty() || has_non_empty_content {
             *empty_response_retry_pending = false;
             *empty_response_retry_note = None;
+            // Reset thinking-truncation counter on any successful response.
+            *thinking_truncation_count = 0;
         }
 
         // Token-limit truncation recovery: if the response was cut off at the
@@ -714,14 +810,97 @@ impl Agent {
             .as_ref()
             .is_some_and(|n| n.contains("truncated"));
         if is_truncated && resp.tool_calls.is_empty() && !has_non_empty_content {
+            *thinking_truncation_count = thinking_truncation_count.saturating_add(1);
             warn!(
                 session_id,
                 iteration,
+                consecutive_truncations = *thinking_truncation_count,
                 "Response truncated at token limit with no usable output — injecting retry nudge"
             );
             pending_system_messages.push(SystemDirective::TruncationRecoveryUseWriteFile);
             *stall_count += 1;
             return Ok(LlmPhaseOutcome::ContinueLoop);
+        }
+
+        // Text response truncation continuation: if the response was cut off
+        // mid-sentence but has partial text content, save the partial text and
+        // ask the model to continue from where it left off.  This prevents
+        // sending half-finished sentences to the user.
+        //
+        // Detection: explicit `is_truncated` from finish_reason=length, OR
+        // heuristic: text-only response that ends mid-sentence (no terminal
+        // punctuation).  Some free-tier models report finish_reason=stop even
+        // when they hit an internal output cap.
+        let probable_text_truncation = if has_non_empty_content && resp.tool_calls.is_empty() {
+            let partial = resp.content.as_deref().unwrap_or("");
+            let trimmed_end = partial.trim_end();
+            let ends_mid_sentence = !trimmed_end.is_empty()
+                && !trimmed_end.ends_with('.')
+                && !trimmed_end.ends_with('!')
+                && !trimmed_end.ends_with('?')
+                && !trimmed_end.ends_with("```")
+                && !trimmed_end.ends_with('"')
+                && !trimmed_end.ends_with(')')
+                && !trimmed_end.ends_with(':')
+                && !trimmed_end.ends_with('}')
+                && !trimmed_end.ends_with(']')
+                && !trimmed_end.ends_with(';');
+            // Require the explicit flag OR the heuristic (ends mid-sentence
+            // AND the response is very long — short/medium responses that just
+            // omit final punctuation are almost always complete).
+            // Previous threshold of 20 words caused false positives on recall
+            // responses, haikus, and other short-form text without terminal
+            // punctuation.
+            ends_mid_sentence && (is_truncated || trimmed_end.split_whitespace().count() > 200)
+        } else {
+            false
+        };
+
+        if probable_text_truncation && truncated_text_prefix.is_none() {
+            let partial = resp.content.as_deref().unwrap_or("");
+            let tail_chars: String = partial
+                .chars()
+                .rev()
+                .take(80)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            warn!(
+                session_id,
+                iteration,
+                partial_len = partial.len(),
+                is_truncated,
+                tail = %tail_chars,
+                "Text response truncated mid-sentence — requesting continuation"
+            );
+            *truncated_text_prefix = Some(partial.to_string());
+            pending_system_messages.push(SystemDirective::TruncationRecoveryTextContinuation {
+                truncated_tail: tail_chars,
+            });
+            return Ok(LlmPhaseOutcome::ContinueLoop);
+        }
+
+        // If there is a saved truncated text prefix from a previous iteration,
+        // merge it with the continuation.  If the LLM re-started from scratch
+        // instead of continuing, detect the overlap and use only the new
+        // (complete) response to avoid sending duplicated text.
+        if let Some(prefix) = truncated_text_prefix.take() {
+            let continuation = resp.content.as_deref().unwrap_or("").trim_start();
+            if continuation.is_empty() {
+                resp.content = Some(prefix);
+            } else if has_significant_overlap(&prefix, continuation) {
+                // LLM generated a new complete response — use it instead of
+                // concatenating (which would duplicate content).
+                info!(
+                    session_id,
+                    iteration,
+                    "Truncation continuation has significant overlap with prefix — using continuation only"
+                );
+                // continuation is already in resp.content
+            } else {
+                resp.content = Some(format!("{}{}", prefix, continuation));
+            }
         }
 
         // Hard force-text mode: if the model still emits tool calls after
@@ -744,5 +923,55 @@ impl Agent {
         }
 
         Ok(LlmPhaseOutcome::Proceed(resp))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlap_detects_duplicate_response() {
+        let prefix = "Based on my memory:\n\nYour dog's name: Luna 🐕\n\
+                       What you like to eat: Sushi 🍣\n\n---\n\n\
+                       Haiku about your weekend hobby (hiking):\n\n\
+                       Boots on rocky trails\nMountains call, the summit waits\n\
+                       Weekend peace is found";
+        let continuation = "Based on what I have stored in memory:\n\n\
+                            Your dog's name: Luna 🐕\nYour favorite food: Sushi 🍣\n\n\
+                            And here's a haiku about your weekend hobby (hiking):\n\n\
+                            Boots on rocky trails\nMountains call, the summit waits\n\
+                            Weekend peace is found";
+        assert!(
+            has_significant_overlap(prefix, continuation),
+            "Should detect duplicate response with overlapping content"
+        );
+    }
+
+    #[test]
+    fn overlap_allows_genuine_continuation() {
+        let prefix = "Let me explain the three main architectural patterns used in \
+                       modern web development. First, the Model-View-Controller (MVC) \
+                       pattern separates concerns into three distinct components that";
+        let continuation = "interact through well-defined interfaces. The Model handles \
+                            data and business logic, the View renders the user interface, \
+                            and the Controller processes user input and coordinates between them.";
+        assert!(
+            !has_significant_overlap(prefix, continuation),
+            "Should allow genuine continuation with no overlap"
+        );
+    }
+
+    #[test]
+    fn overlap_empty_inputs() {
+        assert!(!has_significant_overlap("", "hello world"));
+        assert!(!has_significant_overlap("hello world", ""));
+        assert!(!has_significant_overlap("", ""));
+    }
+
+    #[test]
+    fn overlap_short_inputs() {
+        assert!(!has_significant_overlap("hi", "hi"));
+        assert!(!has_significant_overlap("a b", "a b"));
     }
 }

@@ -108,15 +108,218 @@ fn is_schedule_reference_query(user_text: &str) -> bool {
 /// omits schedule fields in [INTENT_GATE].
 ///
 /// Returns (schedule_raw, is_one_shot).
+///
+/// This heuristic is intentionally conservative: it only overrides the LLM's
+/// classification when there is strong evidence of scheduling intent.  Bare
+/// month-day dates (e.g. "March 3rd") are ambiguous — they could be recall,
+/// facts, or past references — so we require a scheduling verb alongside them.
+/// More specific patterns like "in 2h" or "tomorrow at 3pm" are inherently
+/// forward-looking and don't need the extra verb check.
 pub(super) fn detect_schedule_heuristic(user_text: &str) -> Option<(String, bool)> {
     let text = user_text.trim();
     if text.is_empty() {
         return None;
     }
+    // Synthetic follow-up messages from background command completions contain
+    // command output that often includes dates (e.g., `find -mmin` timestamps).
+    // These are never scheduling requests.
+    if text.starts_with("[Background command completed]") {
+        return None;
+    }
     if is_schedule_reference_query(text) {
         return None;
     }
-    crate::cron_utils::extract_schedule_from_text(text)
+    if is_memory_storage_intent(text) {
+        return None;
+    }
+    if is_file_operation_with_dates(text) {
+        return None;
+    }
+
+    let result = crate::cron_utils::extract_schedule_from_text(text)?;
+
+    // Bare month-day patterns ("March 3rd", "on October 15th") are ambiguous —
+    // they appear in recall queries, fact storage, past-tense references, etc.
+    // Only treat them as scheduling when the text also contains an explicit
+    // scheduling verb (remind, schedule, alert, notify, etc.).  This trusts the
+    // LLM's classification for bare-date messages and only overrides when there
+    // is unambiguous scheduling intent.
+    if crate::cron_utils::is_bare_month_day_pattern(&result.0) && !has_scheduling_action_verb(text)
+    {
+        return None;
+    }
+
+    Some(result)
+}
+
+/// Detect memory/fact-storage intent so that date mentions like "my birthday is
+/// October 15" are not hijacked by the schedule extractor.
+///
+/// Returns true when the message is clearly asking the agent to remember or
+/// store information (which may incidentally contain a date).
+fn is_memory_storage_intent(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    // Memory-storage verb phrases — user wants to store a fact, not schedule.
+    let memory_verbs = [
+        "remember that",
+        "remember my",
+        "remember i",
+        "remember these",
+        "remember this",
+        "remember the following",
+        "note that",
+        "note my",
+        "note these",
+        "note this",
+        "save that",
+        "save these",
+        "save this",
+        "store these",
+        "store this",
+        "store that",
+        "keep in mind",
+        "keep track of",
+        "don't forget",
+        "do not forget",
+        "memorize",
+    ];
+    let has_memory_verb = memory_verbs
+        .iter()
+        .any(|kw| contains_keyword_as_words(&lower, kw));
+
+    // Also detect fact-storage context even without a leading verb:
+    // "facts about me", "things about me", "info about me"
+    let fact_storage_context = [
+        "facts about me",
+        "things about me",
+        "info about me",
+        "information about me",
+        "details about me",
+    ];
+    let has_fact_context = fact_storage_context.iter().any(|kw| lower.contains(kw));
+
+    if !has_memory_verb && !has_fact_context {
+        return false;
+    }
+
+    // Confirm the date appears in a fact-stating context, not a scheduling one.
+    // If the message also contains explicit scheduling verbs, let the scheduler win.
+    let scheduling_verbs = [
+        "schedule",
+        "remind me",
+        "set a reminder",
+        "alert me",
+        "notify me",
+        "ping me",
+        "wake me",
+    ];
+    let has_scheduling_verb = scheduling_verbs
+        .iter()
+        .any(|kw| contains_keyword_as_words(&lower, kw));
+
+    !has_scheduling_verb
+}
+
+/// Check whether the user text contains an explicit scheduling action verb.
+///
+/// Used to gate bare month-day pattern matches (e.g. "March 3rd") — these are
+/// too ambiguous on their own (could be recall, facts, past references) and
+/// should only trigger scheduling when paired with a clear scheduling verb.
+fn has_scheduling_action_verb(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let verbs = [
+        "remind",
+        "reminder",
+        "remind me",
+        "schedule",
+        "set a reminder",
+        "alert me",
+        "notify me",
+        "ping me",
+        "follow up",
+    ];
+    verbs.iter().any(|kw| contains_keyword_as_words(&lower, kw))
+}
+
+/// Detect file-editing/coding intent so that date mentions in messages like
+/// "finish the plan covering March 18 through March 31" or "append to file.md
+/// starting from where it was truncated" are not hijacked by the schedule extractor.
+///
+/// Returns true when the message contains both file-operation verbs AND file path
+/// references, indicating the dates are part of file content, not a scheduling request.
+fn is_file_operation_with_dates(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    // File-operation verb phrases — user wants to create/edit/read/fix files.
+    let file_verbs = [
+        "read the",
+        "read my",
+        "read file",
+        "read_file",
+        "write_file",
+        "write file",
+        "write to",
+        "edit_file",
+        "edit file",
+        "edit the",
+        "edit my",
+        "append",
+        "finish it",
+        "finish the",
+        "complete the",
+        "fix the file",
+        "fix my file",
+        "fix the script",
+        "fix my script",
+        "update the file",
+        "update my file",
+        "create a file",
+        "create a script",
+        "got cut off",
+        "was truncated",
+        "got truncated",
+    ];
+    let has_file_verb = file_verbs.iter().any(|kw| lower.contains(kw));
+
+    if !has_file_verb {
+        return false;
+    }
+
+    // Must also contain a file-path-like reference to confirm the dates are
+    // about file content, not scheduling. Matches:
+    //   ~/projects/..., ./foo.md, /path/to/file, file.md, file.json, etc.
+    static FILE_PATH_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?:~/|[.~/]\S*\.\w{1,10}|\S+\.\w{2,5}(?:\s|$))").expect("file path regex")
+    });
+    let has_file_ref = FILE_PATH_RE.is_match(&lower);
+
+    if !has_file_ref {
+        return false;
+    }
+
+    // If the message also contains explicit scheduling verbs, let the scheduler win.
+    let scheduling_verbs = [
+        "schedule",
+        "remind me",
+        "set a reminder",
+        "alert me",
+        "notify me",
+    ];
+    let has_scheduling_verb = scheduling_verbs
+        .iter()
+        .any(|kw| contains_keyword_as_words(&lower, kw));
+
+    !has_scheduling_verb
 }
 
 /// Detect recurring-intent language when the user did not provide concrete timing.

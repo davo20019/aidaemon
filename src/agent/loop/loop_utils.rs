@@ -643,7 +643,28 @@ pub(super) fn classify_tool_result_failure_with_context(
         }
         if let Some(code) = meta.exit_code {
             if code != 0 {
-                return Some(ToolFailureClass::Semantic);
+                // Test runners exit non-zero when tests fail — that's expected
+                // informational output, not a tool failure.  Let the LLM read
+                // and interpret the test results instead of entering a repair loop.
+                let is_test_runner = tool_arguments.is_some_and(|args| {
+                    let lower = args.to_ascii_lowercase();
+                    lower.contains("test")
+                        || lower.contains("pytest")
+                        || lower.contains("jest")
+                        || lower.contains("mocha")
+                        || lower.contains("rspec")
+                        || lower.contains("cargo test")
+                        || lower.contains("go test")
+                        || lower.contains("phpunit")
+                        || lower.contains("unittest")
+                        || lower.contains("npm run test")
+                        || lower.contains("yarn test")
+                        || lower.contains("make test")
+                });
+                if !is_test_runner {
+                    return Some(ToolFailureClass::Semantic);
+                }
+                // Test runner with failures: not an error, let LLM interpret
             }
             // Explicit terminal success should not be reclassified by text scanning.
             if matches!(tool_name, "terminal" | "run_command") {
@@ -1542,11 +1563,17 @@ pub(super) fn extract_command_from_args(args_json: &str) -> Option<String> {
         .and_then(|v| v.get("command")?.as_str().map(String::from))
 }
 
-/// Extract the "file_path" field from tool arguments JSON (for send_file tool).
+/// Extract the file path from tool arguments JSON.  Checks common aliases
+/// used by send_file (`file_path`), write_file/read_file/edit_file (`path`,
+/// `file_path`, `file`, `filename`).
 pub(super) fn extract_file_path_from_args(args_json: &str) -> Option<String> {
-    serde_json::from_str::<Value>(args_json)
-        .ok()
-        .and_then(|v| v.get("file_path")?.as_str().map(String::from))
+    let v: Value = serde_json::from_str(args_json).ok()?;
+    for key in ["file_path", "path", "file", "filename"] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    None
 }
 
 /// Build a stable dedupe key for send_file calls within a single task.
