@@ -1076,7 +1076,9 @@ mod tests {
         }
     }
 
-    async fn test_tool(config_path: PathBuf) -> anyhow::Result<(ManageOAuthTool, OAuthGateway)> {
+    async fn test_tool(
+        config_path: PathBuf,
+    ) -> anyhow::Result<(ManageOAuthTool, OAuthGateway, NamedTempFile)> {
         let db_file = NamedTempFile::new()?;
         let db_path = db_file.path().display().to_string();
         let embedding_service = Arc::new(EmbeddingService::new()?);
@@ -1102,6 +1104,7 @@ mod tests {
                 approval_tx,
             ),
             gateway,
+            db_file,
         ))
     }
 
@@ -1113,7 +1116,7 @@ mod tests {
     async fn register_provider_persists_and_hot_registers_custom_oauth_provider() {
         let config_file = NamedTempFile::new().unwrap();
         write_minimal_config(config_file.path());
-        let (tool, gateway) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
 
         let result = tool
             .call(
@@ -1149,7 +1152,7 @@ mod tests {
     async fn register_provider_supports_client_credentials_auth_type() {
         let config_file = NamedTempFile::new().unwrap();
         write_minimal_config(config_file.path());
-        let (tool, gateway) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
 
         let result = tool
             .call(
@@ -1217,7 +1220,7 @@ allowed_domains = ["api.linear.app"]
             env_file.path().to_string_lossy().to_string(),
         );
 
-        let (tool, gateway) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
         let config_provider = OAuthProviderConfig {
             display_name: Some("Linear".to_string()),
             auth_type: "oauth2_pkce".to_string(),
@@ -1269,7 +1272,7 @@ allowed_domains = ["api.linear.app"]
     async fn describe_provider_surfaces_localhost_callback_warning() {
         let config_file = NamedTempFile::new().unwrap();
         write_minimal_config(config_file.path());
-        let (tool, gateway) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
         gateway
             .register_provider(crate::oauth::providers::get_builtin_provider("twitter").unwrap())
             .await;
@@ -1310,7 +1313,7 @@ allowed_domains = ["api.linear.app"]
 
         let config_file = NamedTempFile::new().unwrap();
         write_minimal_config(config_file.path());
-        let (tool, gateway) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
         gateway
             .register_provider(OAuthProvider {
                 name: "linear".to_string(),
@@ -1412,7 +1415,7 @@ allowed_domains = ["api.linear.app"]
             crate::RUNTIME_ENV_FILE_ENV_KEY,
             env_file.path().to_string_lossy().to_string(),
         );
-        let (tool, _gateway) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        let (tool, _gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
 
         tool.state_store
             .save_oauth_connection(&crate::traits::OAuthConnection {
@@ -1458,7 +1461,7 @@ allowed_domains = ["api.linear.app"]
             crate::RUNTIME_ENV_FILE_ENV_KEY,
             env_file.path().to_string_lossy().to_string(),
         );
-        let (tool, _gateway) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        let (tool, _gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
 
         tool.state_store
             .save_oauth_connection(&crate::traits::OAuthConnection {
