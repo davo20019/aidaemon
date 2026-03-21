@@ -2265,14 +2265,11 @@ impl Agent {
             }
         }
 
-        // Classification no longer gates history inclusion — the sliding window
-        // in message_build_phase handles this unconditionally.
-        let include_history_context = true;
         let project_hints = extract_project_hints_from_history(
             &history,
             current,
             GOAL_CONTEXT_MAX_PROJECT_HINTS,
-            include_history_context,
+            true,
         );
         // For the current user message, only extract explicit filesystem paths
         // (~/foo, /foo, ./foo) — NOT contextual nickname matches.  This prevents
@@ -2306,7 +2303,7 @@ impl Agent {
             &history,
             current,
             GOAL_CONTEXT_MAX_PROJECT_SCOPES,
-            include_history_context && allow_scope_carryover,
+            allow_scope_carryover,
             &self.path_aliases.projects,
         );
         let allow_multi_project_scope =
@@ -2334,11 +2331,10 @@ impl Agent {
             infer_completion_contract(&goal_user_text, &self.path_aliases.projects);
         TurnContext {
             goal_user_text,
-            recent_messages: if include_history_context {
-                extract_recent_parent_messages(&history, GOAL_CONTEXT_RECENT_MESSAGES_LIMIT)
-            } else {
-                Vec::new()
-            },
+            recent_messages: extract_recent_parent_messages(
+                &history,
+                GOAL_CONTEXT_RECENT_MESSAGES_LIMIT,
+            ),
             project_hints,
             primary_project_scope,
             allow_multi_project_scope,

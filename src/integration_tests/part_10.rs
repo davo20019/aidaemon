@@ -99,15 +99,23 @@ async fn test_task_boundary_injected_between_turns() {
     );
 }
 
-/// Regression: artifact-inspection requests with uploaded-file context should not
-/// carry over the immediately prior topical conversation. The uploaded artifact
-/// is the anchor, not the previous assistant question.
+/// File-upload requests are handled by the sliding window and compaction system.
+/// With the adaptive sliding window, small prior pairs may be retained if they
+/// fit within the token budget. The compaction trigger fires on file uploads
+/// without referential language, producing a summary for subsequent context.
+/// This test verifies that the uploaded-file message is always present in the
+/// Turn 2 context and that a task boundary marker separates it from any
+/// retained prior conversation.
 #[tokio::test]
-async fn test_uploaded_artifact_request_drops_previous_topic_context() {
+async fn test_uploaded_artifact_request_has_task_boundary() {
     let provider = MockProvider::with_responses(vec![
+        // Turn 1 response
         MockProvider::text_response(
             "Would you like me to get more detailed information for any specific trial(s)?",
         ),
+        // Compaction LLM call (file upload triggers compaction)
+        MockProvider::text_response("Summary of prior conversation."),
+        // Turn 2 response
         MockProvider::text_response("I reviewed the uploaded document and identified the issue."),
     ]);
 
@@ -143,6 +151,7 @@ async fn test_uploaded_artifact_request_drops_previous_topic_context() {
     let call_log = harness.provider.call_log.lock().await;
     let turn2_call = call_log.last().expect("turn 2 call");
 
+    // The file-upload message must be present in Turn 2 context.
     assert!(
         turn2_call.messages.iter().any(|m| {
             m.get("role").and_then(|r| r.as_str()) == Some("user")
@@ -153,13 +162,14 @@ async fn test_uploaded_artifact_request_drops_previous_topic_context() {
         "Turn 2 should include the uploaded-file context"
     );
 
+    // A task boundary marker should separate prior history from the current request.
     assert!(
-        !turn2_call.messages.iter().any(|m| {
+        turn2_call.messages.iter().any(|m| {
             m.get("content")
                 .and_then(|c| c.as_str())
-                .is_some_and(|s| s.contains("NCT06737964") || s.contains("specific trial"))
+                .is_some_and(|s| s.contains("[Current Task]"))
         }),
-        "Uploaded artifact request should not include the previous trial topic in Turn 2 context: {:?}",
+        "Turn 2 should have a task boundary marker: {:?}",
         turn2_call.messages
     );
 }
@@ -759,5 +769,114 @@ async fn test_old_short_assistant_response_preserved_unmodified() {
     assert_eq!(
         content, "It is 4.",
         "Short old assistant content should be preserved unmodified"
+    );
+}
+
+// ==================== Compaction Integration Tests ====================
+
+/// When a session exceeds the sliding window size, compaction should fire
+/// and produce a summary in the DB. Subsequent turns should see the
+/// [Session Summary] in their LLM context.
+#[tokio::test]
+async fn test_compaction_fires_on_window_overflow() {
+    // The default ContextWindowConfig has enabled=true, summary_window=6.
+    // We need 7+ turns to exceed the window. Each turn consumes 1 mock response.
+    // Window overflow compaction runs asynchronously, so we provide extra
+    // responses (compaction calls also consume from the mock queue).
+    // Turns 7+ each trigger async compaction: 1 extra response per turn.
+    let mut responses = Vec::new();
+    // Turns 1-6: 1 response each (no compaction triggered)
+    for i in 1..=6 {
+        responses.push(MockProvider::text_response(&format!("Response {}", i)));
+    }
+    // Turn 7: compaction fires (async) + main response = 2 responses
+    responses.push(MockProvider::text_response("Mock response"));
+    responses.push(MockProvider::text_response("Response 7"));
+    // Turn 8: compaction fires again (async, incremental) + main response = 2 responses
+    responses.push(MockProvider::text_response("Mock response"));
+    responses.push(MockProvider::text_response("Response 8"));
+    // Extra safety margin for any additional LLM calls
+    for _ in 0..4 {
+        responses.push(MockProvider::text_response("Mock response"));
+    }
+
+    let provider = MockProvider::with_responses(responses);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    // Run 7 turns to trigger window overflow compaction.
+    for i in 1..=7 {
+        let _ = harness
+            .agent
+            .handle_message(
+                "compaction_test",
+                &format!("Question {} about topic {}", i, i),
+                None,
+                UserRole::Owner,
+                ChannelContext::private("test"),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Allow the async compaction task to complete.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Verify: summary should exist in DB after window overflow.
+    let summary = harness
+        .state
+        .get_conversation_summary("compaction_test")
+        .await
+        .unwrap();
+    assert!(
+        summary.is_some(),
+        "Compaction summary should exist in DB after window overflow"
+    );
+    let summary = summary.unwrap();
+    assert!(
+        !summary.summary.is_empty(),
+        "Compaction summary should not be empty"
+    );
+
+    // Turn 8: the summary should be injected into LLM context.
+    let _ = harness
+        .agent
+        .handle_message(
+            "compaction_test",
+            "Question 8 about topic 8",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Allow Turn 8's async compaction to settle.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Verify: Turn 8's LLM call should include [Session Summary].
+    let call_log = harness.provider.call_log.lock().await;
+    let turn8_call = call_log.last().expect("should have Turn 8 call");
+    let has_summary = turn8_call.messages.iter().any(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("system")
+            && m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("[Session Summary]"))
+    });
+    assert!(
+        has_summary,
+        "Turn 8's LLM context should include [Session Summary] from compaction"
+    );
+
+    // Verify: Turn 8 should have a [Current Task] boundary marker.
+    let has_boundary = turn8_call.messages.iter().any(|m| {
+        m.get("content")
+            .and_then(|c| c.as_str())
+            .is_some_and(|s| s.contains("[Current Task]"))
+    });
+    assert!(
+        has_boundary,
+        "Turn 8's LLM context should include [Current Task] boundary marker"
     );
 }

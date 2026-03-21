@@ -17,10 +17,6 @@ pub(super) struct MessageBuildCtx<'a> {
     pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub empty_response_retry_pending: bool,
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
-    /// Sticky flag computed once at the start of the agent loop from
-    /// `TurnContext::followup_mode`. Prevents mid-loop reclassification
-    /// that causes context collapse when history shifts between iterations.
-    pub is_new_task: bool,
 }
 
 pub(super) struct MessageBuildData {
@@ -388,9 +384,9 @@ impl Agent {
             .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
 
         // Adaptive sliding window: keep `window_size` prior conversation pairs.
-        // Instead of branching on is_new_task (brittle classifier), we compute how
-        // many old pairs fit within 30% of the available token budget. This naturally
-        // adapts: large contexts keep more history, small contexts keep less.
+        // We compute how many old pairs fit within 30% of the available token
+        // budget. This naturally adapts: large contexts keep more history, small
+        // contexts keep less.
         let deduped_msgs: Vec<&Message> = if let Some(boundary) = collapse_boundary {
             use crate::memory::context_window::estimate_tokens;
 
@@ -443,8 +439,28 @@ impl Agent {
                 let available_budget =
                     model_budget.saturating_sub(system_tokens + tools_tokens + pinned_tokens);
 
-                let window_size =
+                let computed_window_size =
                     super::sliding_window::calculate_window_size(&skeleton_pairs, available_budget);
+
+                // Idle gap reset: after 2+ hours of inactivity, don't inject stale
+                // raw messages into the window — they'd appear as if typed seconds ago.
+                // The compaction summary (if available) provides historical context instead.
+                let idle_gap_detected = boundary > 0
+                    && deduped_msgs
+                        .get(boundary.saturating_sub(1))
+                        .is_some_and(|m| {
+                            let now = chrono::Utc::now();
+                            now.signed_duration_since(m.created_at).num_seconds() > 7200
+                        });
+                let window_size = if idle_gap_detected {
+                    info!(
+                        session_id,
+                        "Idle gap detected (>2h): resetting sliding window to 0"
+                    );
+                    0
+                } else {
+                    computed_window_size
+                };
 
                 // Keep the last `window_size` old pairs + everything at/after boundary.
                 let keep_from = if window_size == 0 {
@@ -764,26 +780,6 @@ impl Agent {
                     "role": "user",
                     "content": user_text,
                 }));
-            }
-        }
-
-        // Uploaded-file tasks should not inherit unrelated topical turns. The
-        // artifact marker is the anchor for the new task, so keep system
-        // guidance plus the current user request and drop earlier user/assistant
-        // exchanges when the turn is clearly a fresh uploaded-file request.
-        if ctx.is_new_task && user_text.contains("[File received:") {
-            if let Some(current_user_pos) = messages.iter().rposition(|m| {
-                m.get("role").and_then(|r| r.as_str()) == Some("user")
-                    && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
-            }) {
-                messages = messages
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(idx, message)| {
-                        let role = message.get("role").and_then(|r| r.as_str());
-                        (idx >= current_user_pos || role == Some("system")).then_some(message)
-                    })
-                    .collect();
             }
         }
 
@@ -1242,7 +1238,6 @@ mod tests {
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             status_tx: &status_tx,
-            is_new_task: true,
         };
 
         let built = harness
@@ -1326,7 +1321,6 @@ mod tests {
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             status_tx: &status_tx,
-            is_new_task: false,
         };
 
         let built = harness
@@ -1355,6 +1349,177 @@ mod tests {
             serialized.contains("Do NOT reset into a generic availability reply"),
             "checkpoint should explicitly block idle reset replies: {}",
             serialized
+        );
+    }
+
+    /// After 2+ hours idle, the sliding window should NOT include old pairs —
+    /// only the compaction summary provides historical context.
+    #[tokio::test]
+    async fn idle_gap_resets_sliding_window_to_zero() {
+        use crate::execution_policy::PolicyBundle;
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{ConversationSummary, MessageStore};
+        use chrono::Duration as ChronoDuration;
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+
+        // Insert old messages with timestamps > 2 hours ago.
+        let old_time = Utc::now() - ChronoDuration::hours(3);
+        let old_user = Message {
+            created_at: old_time,
+            ..msg("user", "Old stale question from 3 hours ago")
+        };
+        let old_assistant = Message {
+            created_at: old_time,
+            ..msg("assistant", "Old stale answer from 3 hours ago")
+        };
+        harness
+            .state
+            .append_message(&old_user)
+            .await
+            .expect("append old user");
+        harness
+            .state
+            .append_message(&old_assistant)
+            .await
+            .expect("append old assistant");
+
+        // Insert current user message (now).
+        harness
+            .state
+            .append_message(&msg("user", "Fresh question now"))
+            .await
+            .expect("append current user");
+
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let pinned_memories: Vec<Message> = Vec::new();
+        let tool_defs: Vec<Value> = Vec::new();
+        let session_summary: Option<ConversationSummary> = None;
+        let mut pending_system_messages = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+
+        let mut ctx = MessageBuildCtx {
+            session_id: "test-session",
+            iteration: 1,
+            user_text: "Fresh question now",
+            completed_tool_calls: &[],
+            model: "mock-model",
+            system_prompt: "You are a helpful test assistant.",
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            session_summary: &session_summary,
+            pending_system_messages: &mut pending_system_messages,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+
+        let built = harness
+            .agent
+            .run_message_build_phase(&mut ctx)
+            .await
+            .expect("message build");
+        let serialized = serde_json::to_string(&built.messages).expect("serialize messages");
+
+        // Old stale messages should NOT be present after idle gap reset.
+        assert!(
+            !serialized.contains("Old stale question from 3 hours ago"),
+            "idle gap should reset window to 0, removing old stale pairs: {}",
+            serialized
+        );
+        assert!(
+            !serialized.contains("Old stale answer from 3 hours ago"),
+            "idle gap should reset window to 0, removing old stale assistant: {}",
+            serialized
+        );
+
+        // Current user message must still be present.
+        assert!(
+            serialized.contains("Fresh question now"),
+            "current user message should always be present: {}",
+            serialized
+        );
+    }
+
+    /// When a session summary is present, it should be injected as a
+    /// [Session Summary] system message after the system prompt.
+    #[tokio::test]
+    async fn session_summary_injected_when_present() {
+        use crate::execution_policy::PolicyBundle;
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{ConversationSummary, MessageStore};
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+
+        harness
+            .state
+            .append_message(&msg("user", "Current question"))
+            .await
+            .expect("append user");
+
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let pinned_memories: Vec<Message> = Vec::new();
+        let tool_defs: Vec<Value> = Vec::new();
+        let session_summary = Some(ConversationSummary {
+            session_id: "test-session".to_string(),
+            summary: "User previously asked about deploying a blog. Config was created."
+                .to_string(),
+            message_count: 5,
+            last_message_id: "old-msg-id".to_string(),
+            updated_at: Utc::now(),
+        });
+        let mut pending_system_messages = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+
+        let mut ctx = MessageBuildCtx {
+            session_id: "test-session",
+            iteration: 1,
+            user_text: "Current question",
+            completed_tool_calls: &[],
+            model: "mock-model",
+            system_prompt: "You are a helpful test assistant.",
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            session_summary: &session_summary,
+            pending_system_messages: &mut pending_system_messages,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+
+        let built = harness
+            .agent
+            .run_message_build_phase(&mut ctx)
+            .await
+            .expect("message build");
+        let serialized = serde_json::to_string(&built.messages).expect("serialize messages");
+
+        // Summary should be injected as a system message.
+        assert!(
+            serialized.contains("[Session Summary]"),
+            "session summary should be injected as [Session Summary]: {}",
+            serialized
+        );
+        assert!(
+            serialized.contains("deploying a blog"),
+            "session summary content should be present: {}",
+            serialized
+        );
+
+        // The summary should appear as a system message (role=system).
+        let has_summary_system_msg = built.messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("system")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("[Session Summary]"))
+        });
+        assert!(
+            has_summary_system_msg,
+            "summary should be a system-role message"
         );
     }
 }

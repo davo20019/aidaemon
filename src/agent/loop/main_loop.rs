@@ -154,9 +154,6 @@ impl Agent {
             .followup_mode
             .map(|mode| mode.as_str())
             .unwrap_or("unknown");
-        // Sticky new-task flag: computed once from TurnContext and reused across
-        // all iterations. Prevents mid-loop reclassification when history shifts.
-        let is_new_task = turn_context.followup_mode == Some(FollowupMode::NewTask);
         let turn_context_reasons: Vec<&'static str> = turn_context
             .reasons
             .iter()
@@ -880,90 +877,131 @@ impl Agent {
             }
 
             // Compaction: on the first iteration, detect whether the conversation
-            // history needs compacting and run it synchronously before message build.
-            // This ensures the session_summary is fresh for context injection.
+            // history needs compacting. IdleGap and FileUpload triggers run
+            // synchronously (user just arrived or uploaded a file — latency is
+            // acceptable). WindowOverflow runs asynchronously in the background
+            // so it doesn't add 15s latency to every message once the conversation
+            // exceeds the window size. The aging pair stays in the sliding window
+            // until the background compaction completes.
             if iteration == 1 && self.context_window_config.enabled {
-                if let Some(ref router) = llm_router {
-                    // Count user-message pairs and compute idle gap.
-                    let history = self
-                        .state
-                        .get_history(session_id, 100)
-                        .await
-                        .unwrap_or_default();
-                    let total_pairs = history.iter().filter(|m| m.role == "user").count();
-                    let idle_gap_seconds = history
-                        .last()
-                        .map(|m| {
-                            let now = Utc::now();
-                            now.signed_duration_since(m.created_at).num_seconds().max(0) as u64
-                        })
-                        .unwrap_or(0);
+                // Count user-message pairs and compute idle gap.
+                let history = self
+                    .state
+                    .get_history(session_id, 100)
+                    .await
+                    .unwrap_or_default();
+                let total_pairs = history.iter().filter(|m| m.role == "user").count();
+                let idle_gap_seconds = history
+                    .last()
+                    .map(|m| {
+                        let now = Utc::now();
+                        now.signed_duration_since(m.created_at).num_seconds().max(0) as u64
+                    })
+                    .unwrap_or(0);
 
-                    let window_size = self.context_window_config.summary_window;
-                    let compaction_trigger = super::compaction::detect_compaction_trigger(
+                let window_size = self.context_window_config.summary_window;
+                let compaction_trigger = super::compaction::detect_compaction_trigger(
+                    total_pairs,
+                    window_size,
+                    idle_gap_seconds,
+                    user_text,
+                );
+
+                if let Some(ref trigger) = compaction_trigger {
+                    info!(
+                        session_id,
+                        ?trigger,
                         total_pairs,
-                        window_size,
                         idle_gap_seconds,
-                        user_text,
+                        window_size,
+                        "Compaction trigger detected"
                     );
 
-                    if let Some(ref trigger) = compaction_trigger {
-                        info!(
-                            session_id,
-                            ?trigger,
-                            total_pairs,
-                            idle_gap_seconds,
-                            window_size,
-                            "Compaction trigger detected"
-                        );
+                    // Convert history messages to JSON Value array for the compaction prompt.
+                    let messages_to_compact: Vec<Value> = history
+                        .iter()
+                        .map(|m| {
+                            let mut msg = json!({ "role": m.role });
+                            if let Some(ref content) = m.content {
+                                msg["content"] = json!(content);
+                            }
+                            if let Some(ref name) = m.tool_name {
+                                msg["name"] = json!(name);
+                            }
+                            msg
+                        })
+                        .collect();
 
-                        // Convert history messages to JSON Value array for the compaction prompt.
-                        let messages_to_compact: Vec<Value> = history
-                            .iter()
-                            .map(|m| {
-                                let mut msg = json!({ "role": m.role });
-                                if let Some(ref content) = m.content {
-                                    msg["content"] = json!(content);
+                    let last_message_id = history.last().map(|m| m.id.as_str()).unwrap_or("");
+
+                    match trigger {
+                        super::compaction::CompactionTrigger::WindowOverflow { .. } => {
+                            // Async — don't block the user's response. The aging
+                            // pair is already in the sliding window (we haven't
+                            // removed it). On the next turn the summary's
+                            // last_message_id will cover it.
+                            let provider = llm_provider.clone();
+                            let compaction_model = model.clone();
+                            let state = self.state.clone();
+                            let sid = session_id.to_string();
+                            let summary_clone = session_summary.clone();
+                            let msgs = messages_to_compact.clone();
+                            let msg_count = total_pairs;
+                            let last_id = last_message_id.to_string();
+                            tokio::spawn(async move {
+                                if let Err(e) = super::compaction::run_and_store_compaction(
+                                    provider,
+                                    &compaction_model,
+                                    state.as_ref(),
+                                    &sid,
+                                    summary_clone,
+                                    &msgs,
+                                    msg_count,
+                                    &last_id,
+                                )
+                                .await
+                                {
+                                    warn!(session_id = %sid, error = %e, "Background compaction failed");
                                 }
-                                if let Some(ref name) = m.tool_name {
-                                    msg["name"] = json!(name);
-                                }
-                                msg
-                            })
-                            .collect();
-
-                        let last_message_id = history.last().map(|m| m.id.as_str()).unwrap_or("");
-
-                        match tokio::time::timeout(
-                            Duration::from_secs(15),
-                            super::compaction::run_and_store_compaction(
-                                llm_provider.clone(),
-                                router,
-                                self.state.as_ref(),
+                            });
+                            info!(
                                 session_id,
-                                session_summary.clone(),
-                                &messages_to_compact,
-                                total_pairs,
-                                last_message_id,
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {
-                                // Reload the summary so message build uses the fresh version.
-                                session_summary = self
-                                    .state
-                                    .get_conversation_summary(session_id)
-                                    .await
-                                    .ok()
-                                    .flatten();
-                                info!(session_id, "Synchronous compaction completed");
-                            }
-                            Ok(Err(e)) => {
-                                warn!(session_id, error = %e, "Synchronous compaction failed");
-                            }
-                            Err(_) => {
-                                warn!(session_id, "Synchronous compaction timed out (15s)");
+                                "Background compaction spawned for window overflow"
+                            );
+                        }
+                        _ => {
+                            // IdleGap / FileUpload — run synchronously (15s timeout).
+                            match tokio::time::timeout(
+                                Duration::from_secs(15),
+                                super::compaction::run_and_store_compaction(
+                                    llm_provider.clone(),
+                                    &model,
+                                    self.state.as_ref(),
+                                    session_id,
+                                    session_summary.clone(),
+                                    &messages_to_compact,
+                                    total_pairs,
+                                    last_message_id,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    // Reload the summary so message build uses the fresh version.
+                                    session_summary = self
+                                        .state
+                                        .get_conversation_summary(session_id)
+                                        .await
+                                        .ok()
+                                        .flatten();
+                                    info!(session_id, "Synchronous compaction completed");
+                                }
+                                Ok(Err(e)) => {
+                                    warn!(session_id, error = %e, "Synchronous compaction failed");
+                                }
+                                Err(_) => {
+                                    warn!(session_id, "Synchronous compaction timed out (15s)");
+                                }
                             }
                         }
                     }
@@ -985,7 +1023,6 @@ impl Agent {
                     pending_system_messages: &mut pending_system_messages,
                     empty_response_retry_pending,
                     status_tx: &status_tx,
-                    is_new_task,
                 })
                 .await?;
 

@@ -1,4 +1,3 @@
-use crate::router::{Router, Tier};
 use crate::traits::{ConversationSummary, ModelProvider, StateStore};
 use crate::utils::floor_char_boundary;
 use chrono::Utc;
@@ -210,16 +209,15 @@ pub(crate) fn build_compaction_prompt(
 #[allow(dead_code)]
 pub(crate) async fn run_compaction(
     provider: Arc<dyn ModelProvider>,
-    router: &Router,
+    model: &str,
     existing_summary: Option<&str>,
     messages_to_compact: &[Value],
 ) -> anyhow::Result<String> {
-    let model = router.select(Tier::Primary).to_string();
     let messages = build_compaction_prompt(existing_summary, messages_to_compact);
 
     let result = match tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        provider.chat(&model, &messages, &[]),
+        provider.chat(model, &messages, &[]),
     )
     .await
     {
@@ -247,7 +245,7 @@ pub(crate) async fn run_compaction(
 #[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) async fn run_and_store_compaction(
     provider: Arc<dyn ModelProvider>,
-    router: &Router,
+    model: &str,
     state: &dyn StateStore,
     session_id: &str,
     existing_summary: Option<ConversationSummary>,
@@ -257,7 +255,7 @@ pub(crate) async fn run_and_store_compaction(
 ) -> anyhow::Result<()> {
     let existing_text = existing_summary.as_ref().map(|s| s.summary.as_str());
 
-    let summary_text = run_compaction(provider, router, existing_text, messages_to_compact).await?;
+    let summary_text = run_compaction(provider, model, existing_text, messages_to_compact).await?;
 
     let summary = ConversationSummary {
         session_id: session_id.to_string(),
