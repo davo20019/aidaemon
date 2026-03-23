@@ -3872,6 +3872,7 @@ impl TerminalBridge {
         let mut salt_hash = Sha256::new();
         salt_hash.update(relay_session_id.as_bytes());
         let salt = salt_hash.finalize();
+        #[allow(deprecated)]
         let hk = Hkdf::<Sha256>::new(Some(&salt), shared.raw_secret_bytes().as_slice());
         let mut key = [0u8; 32];
         hk.expand(KEY_INFO, &mut key)
@@ -5448,6 +5449,7 @@ impl TerminalBridge {
 
             let aad = format!("{}:{}", crypto.session_id, counter);
             let plaintext = match crypto.cipher.decrypt(
+                #[allow(deprecated)]
                 Nonce::from_slice(&iv),
                 Payload {
                     msg: &ct,
@@ -5820,6 +5822,7 @@ impl TerminalBridge {
         let ct = crypto
             .cipher
             .encrypt(
+                #[allow(deprecated)]
                 Nonce::from_slice(&iv),
                 Payload {
                     msg: &plaintext,
@@ -6659,6 +6662,7 @@ mod tests {
         let mut salt_hash = Sha256::new();
         salt_hash.update(relay_session_id.as_bytes());
         let salt = salt_hash.finalize();
+        #[allow(deprecated)]
         let hk = Hkdf::<Sha256>::new(Some(&salt), shared.raw_secret_bytes().as_slice());
         let mut key = [0u8; 32];
         hk.expand(KEY_INFO, &mut key)
@@ -6708,6 +6712,7 @@ mod tests {
         let mut salt_hash = Sha256::new();
         salt_hash.update("relay-session-wrong".as_bytes());
         let salt = salt_hash.finalize();
+        #[allow(deprecated)]
         let hk = Hkdf::<Sha256>::new(Some(&salt), shared.raw_secret_bytes().as_slice());
         let mut key = [0u8; 32];
         hk.expand(KEY_INFO, &mut key)

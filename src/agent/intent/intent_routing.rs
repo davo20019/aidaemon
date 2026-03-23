@@ -54,7 +54,7 @@ impl ConnectedContentMode {
 ///
 /// Works for single keywords ("deploy"), multi-word phrases ("set up"),
 /// and contractions ("i'll check").
-pub(super) fn contains_keyword_as_words(text: &str, keyword: &str) -> bool {
+pub(crate) fn contains_keyword_as_words(text: &str, keyword: &str) -> bool {
     let normalize = |w: &str| -> String {
         w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
             .to_lowercase()

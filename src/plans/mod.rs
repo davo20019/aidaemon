@@ -6,7 +6,7 @@
 //! - Provides explicit step-by-step progress tracking
 //! - Supports resume capability for long-running tasks
 
-mod detection;
+pub mod detection;
 mod generation;
 mod recovery;
 mod store;

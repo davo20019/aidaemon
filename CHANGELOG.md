@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.31] - 2026-03-22
+
+### Added
+
+- **Plan detection heuristics**: Automatic detection of multi-step tasks, high-stakes operations (deploy, publish, release, migrate), sequential markers, and verification requirements — injects structured execution guidance into the agent loop.
+- **Plan suggestion system directive**: New `PlanSuggestion` variant in `SystemDirective` injects plan hints for both simple and complex intents via orchestration routes.
+- **Pre-flight and verification guidance**: Orchestrator spawn prompt now includes mandatory prerequisite checks before external-state mutations and post-execution verification steps.
+- **Expanded budget keywords**: Added `fixing`, `retry`, `redo`, `rerun`, `try again`, `do it again` to budget tier selection and completion signal inference for better task classification.
+
+### Changed
+
+- **Rust toolchain**: Updated to Rust 1.94.0 (from 1.93.0).
+- **Dependency updates**: 89 crate dependencies updated to latest compatible versions — notably tokio 1.50.0, chrono 0.4.44, futures 0.3.32, rustls 0.23.37, uuid 1.22.0, serde_with 3.18.0, image 0.25.10.
+- **Standard budget wall clock**: Increased from 600s to 900s to prevent premature budget exhaustion on slower models.
+- **`contains_keyword_as_words` visibility**: Widened from `pub(super)` to `pub(crate)` for reuse in plan detection module.
+- **Plans detection module**: Made `pub` for access from orchestration routes.
+
+### Fixed
+
+- **`generic-array` deprecation warnings**: Suppressed deprecation warnings for `GenericArray::from_slice` and `as_slice` in `terminal_bridge.rs` crypto code (upstream `generic-array` 0.14.9 deprecates in favor of 1.x API).
+
 ## [0.9.28] - 2026-03-19
 
 ### Added

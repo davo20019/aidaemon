@@ -1,6 +1,8 @@
 //! Plan detection heuristics.
 //!
 //! Determines when a task should have a plan created for it.
+//! Detects multi-step tasks, high-stakes operations, and tasks requiring
+//! post-execution verification.
 
 /// Reasons why a plan should be created.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +35,31 @@ impl PlanTrigger {
     }
 }
 
+/// Word-boundary keyword matching (same semantics as `contains_keyword_as_words`
+/// in `agent/intent/intent_routing.rs`). Avoids substring false positives.
+fn has_keyword(text: &str, keyword: &str) -> bool {
+    let normalize = |w: &str| -> String {
+        w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
+            .to_lowercase()
+    };
+    let text_words: Vec<String> = text
+        .split_whitespace()
+        .map(normalize)
+        .filter(|w| !w.is_empty())
+        .collect();
+    let kw_words: Vec<String> = keyword
+        .split_whitespace()
+        .map(normalize)
+        .filter(|w| !w.is_empty())
+        .collect();
+    if kw_words.is_empty() {
+        return false;
+    }
+    text_words
+        .windows(kw_words.len())
+        .any(|window| window == kw_words.as_slice())
+}
+
 /// Analyze a user message to determine if a plan should be created.
 pub fn should_create_plan(user_message: &str) -> PlanTrigger {
     let trimmed = user_message.trim();
@@ -41,9 +68,6 @@ pub fn should_create_plan(user_message: &str) -> PlanTrigger {
     }
 
     // Explicit command mode (no lexical guessing).
-    // Examples:
-    // - /plan auto production deployment
-    // - /plan suggest break into phases
     let lower = trimmed.to_ascii_lowercase();
     if let Some(rest) = lower.strip_prefix("/plan auto") {
         let reason = rest.trim();
@@ -68,6 +92,142 @@ pub fn should_create_plan(user_message: &str) -> PlanTrigger {
     }
     if let Some(reason) = parse_plan_marker(trimmed, "PLAN_SUGGEST") {
         return PlanTrigger::Suggest(reason);
+    }
+
+    // --- Heuristic detection ---
+
+    // Short messages (< 8 words) are unlikely multi-step tasks.
+    let word_count = trimmed.split_whitespace().count();
+    if word_count < 8 {
+        return PlanTrigger::None;
+    }
+
+    // High-stakes external operations: deploy, publish, release, migrate, etc.
+    // These always benefit from structured execution with verification.
+    let external_ops: &[&str] = &[
+        "deploy",
+        "publish",
+        "release",
+        "migrate",
+        "push to production",
+        "push to prod",
+        "ship to production",
+        "go live",
+    ];
+    for op in external_ops {
+        if has_keyword(&lower, op) {
+            return PlanTrigger::Suggest(format!("task involving {}", op));
+        }
+    }
+
+    // Sequential markers: explicit multi-step intent.
+    let sequential_markers: &[&str] = &[
+        "first",
+        "then",
+        "after that",
+        "once that",
+        "and then",
+        "next",
+        "finally",
+        "step 1",
+        "step 2",
+        "1.",
+    ];
+    let seq_count = sequential_markers
+        .iter()
+        .filter(|m| has_keyword(&lower, m))
+        .count();
+    if seq_count >= 2 {
+        return PlanTrigger::Suggest("multi-step task with sequential dependencies".to_string());
+    }
+
+    // Verification-required markers: user explicitly wants confirmation.
+    let verify_markers: &[&str] = &[
+        "and verify",
+        "and validate",
+        "and confirm",
+        "make sure",
+        "and check",
+        "and test",
+    ];
+    let has_verify = verify_markers.iter().any(|m| has_keyword(&lower, m));
+    if has_verify {
+        // Only suggest if there's also an action verb (not just "make sure X is true").
+        let action_verbs: &[&str] = &[
+            "deploy",
+            "build",
+            "create",
+            "install",
+            "configure",
+            "set up",
+            "update",
+            "push",
+            "run",
+            "execute",
+            "write",
+            "generate",
+            "migrate",
+        ];
+        if action_verbs.iter().any(|v| has_keyword(&lower, v)) {
+            return PlanTrigger::Suggest(
+                "task with action and verification requirement".to_string(),
+            );
+        }
+    }
+
+    // Multi-sentence imperative detection: 3+ sentences starting with
+    // imperative verbs = likely multi-step task.
+    let sentences: Vec<&str> = trimmed
+        .split(['.', '!', '\n'])
+        .map(|s| s.trim())
+        .filter(|s| s.len() > 3)
+        .collect();
+    if sentences.len() >= 3 {
+        let imperative_verbs: &[&str] = &[
+            "deploy",
+            "build",
+            "create",
+            "install",
+            "configure",
+            "set up",
+            "update",
+            "push",
+            "run",
+            "execute",
+            "write",
+            "generate",
+            "migrate",
+            "publish",
+            "release",
+            "commit",
+            "add",
+            "remove",
+            "delete",
+            "fix",
+            "check",
+            "verify",
+            "test",
+            "start",
+            "stop",
+            "kill",
+            "restart",
+            "open",
+            "close",
+            "send",
+            "fetch",
+            "download",
+            "upload",
+        ];
+        let imperative_count = sentences
+            .iter()
+            .filter(|s| {
+                let s_lower = s.to_ascii_lowercase();
+                imperative_verbs.iter().any(|v| s_lower.starts_with(v))
+            })
+            .count();
+        if imperative_count >= 3 {
+            return PlanTrigger::Suggest("multi-step task with multiple actions".to_string());
+        }
     }
 
     PlanTrigger::None
@@ -96,16 +256,18 @@ fn parse_plan_marker(text: &str, marker: &str) -> Option<String> {
     None
 }
 
-/// Get a prompt hint for suggesting plan creation to the LLM.
+/// Get a prompt hint for suggesting structured execution to the LLM.
 pub fn get_plan_suggestion_prompt(trigger: &PlanTrigger) -> Option<String> {
     match trigger {
         PlanTrigger::Suggest(reason) => Some(format!(
-            "\n\n**Note:** This looks like a {} that might benefit from a step-by-step plan. \
-             Consider using the `plan_manager` tool with action=\"create\" to break it down into discrete steps. \
-             This helps with tracking progress and enables recovery if something goes wrong.",
+            "[SYSTEM] This looks like a {} that requires structured execution. \
+             Break it into discrete steps BEFORE executing. For each step that modifies external state \
+             (deploys, publishes, sends, pushes), include a verification step that confirms the change \
+             was applied correctly. Check prerequisites (committed changes, installed dependencies, \
+             correct configuration) before executing mutations. Never claim success without verification.",
             reason
         )),
-        PlanTrigger::AutoCreate(_) => None, // Auto-created, no need to suggest
+        PlanTrigger::AutoCreate(_) => None,
         PlanTrigger::None => None,
     }
 }
@@ -150,24 +312,111 @@ mod tests {
         );
     }
 
+    // --- Heuristic detection tests ---
+
     #[test]
-    fn test_no_heuristic_plan_detection() {
-        let trigger = should_create_plan("Deploy the app to production");
-        assert_eq!(trigger, PlanTrigger::None);
-
-        let trigger = should_create_plan("Create a plan for the feature");
-        assert_eq!(trigger, PlanTrigger::None);
-
-        let trigger = should_create_plan("First do A, then do B");
-        assert_eq!(trigger, PlanTrigger::None);
+    fn test_short_messages_no_plan() {
+        // Short messages never trigger heuristic detection.
+        assert_eq!(should_create_plan("Deploy the app"), PlanTrigger::None);
+        assert_eq!(should_create_plan("fix the bug"), PlanTrigger::None);
+        assert_eq!(should_create_plan("what time is it"), PlanTrigger::None);
     }
 
     #[test]
-    fn test_plan_suggestion_prompt() {
-        let trigger = PlanTrigger::Suggest("refactoring task".to_string());
+    fn test_deploy_heuristic() {
+        let trigger =
+            should_create_plan("Deploy the latest changes to Cloudflare Pages and check the site");
+        assert!(trigger.should_plan());
+        assert!(matches!(trigger, PlanTrigger::Suggest(_)));
+    }
+
+    #[test]
+    fn test_publish_heuristic() {
+        let trigger = should_create_plan(
+            "Publish the new version of the package to npm and update the changelog",
+        );
+        assert!(trigger.should_plan());
+    }
+
+    #[test]
+    fn test_release_heuristic() {
+        let trigger =
+            should_create_plan("Release version 2.0 with the new features and tag it in git");
+        assert!(trigger.should_plan());
+    }
+
+    #[test]
+    fn test_migrate_heuristic() {
+        let trigger = should_create_plan(
+            "Migrate the database schema to add the new user_preferences table and verify",
+        );
+        assert!(trigger.should_plan());
+    }
+
+    #[test]
+    fn test_sequential_markers() {
+        let trigger = should_create_plan(
+            "First commit the changes, then build the project, and finally push to the remote",
+        );
+        assert!(trigger.should_plan());
+        assert!(matches!(trigger, PlanTrigger::Suggest(ref r) if r.contains("sequential")));
+    }
+
+    #[test]
+    fn test_verification_with_action() {
+        // "deploy" fires the external-ops heuristic first.
+        let trigger = should_create_plan(
+            "Build the project and deploy it, and verify the site loads correctly",
+        );
+        assert!(trigger.should_plan());
+
+        // Without a high-stakes keyword, verification + action triggers separately.
+        let trigger = should_create_plan(
+            "Run the build pipeline and generate the artifacts, and verify the output is correct",
+        );
+        assert!(trigger.should_plan());
+        assert!(matches!(trigger, PlanTrigger::Suggest(ref r) if r.contains("verification")));
+    }
+
+    #[test]
+    fn test_multi_sentence_imperative() {
+        let trigger = should_create_plan(
+            "Start the dev server. Run the test suite. Check the coverage report. Kill the server.",
+        );
+        assert!(trigger.should_plan());
+        assert!(matches!(trigger, PlanTrigger::Suggest(ref r) if r.contains("multiple actions")));
+    }
+
+    #[test]
+    fn test_simple_questions_no_plan() {
+        assert_eq!(
+            should_create_plan("What is the current status of the deployment pipeline?"),
+            PlanTrigger::None
+        );
+        assert_eq!(
+            should_create_plan("Can you explain how the router module works?"),
+            PlanTrigger::None
+        );
+    }
+
+    #[test]
+    fn test_single_action_no_plan() {
+        // Single actions without sequential/verification markers don't trigger.
+        assert_eq!(
+            should_create_plan("Create a new file called config.toml with the database settings"),
+            PlanTrigger::None
+        );
+    }
+
+    #[test]
+    fn test_plan_suggestion_prompt_content() {
+        let trigger = PlanTrigger::Suggest("multi-step task".to_string());
         let prompt = get_plan_suggestion_prompt(&trigger);
         assert!(prompt.is_some());
-        assert!(prompt.unwrap().contains("refactoring task"));
+        let text = prompt.unwrap();
+        assert!(text.contains("structured execution"));
+        assert!(text.contains("verification"));
+        assert!(text.contains("prerequisites"));
 
         let trigger = PlanTrigger::None;
         assert!(get_plan_suggestion_prompt(&trigger).is_none());

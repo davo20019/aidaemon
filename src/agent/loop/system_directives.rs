@@ -159,6 +159,11 @@ pub(in crate::agent) enum SystemDirective {
     ResponseQualityNudge {
         user_text_hint: String,
     },
+    /// Injected when plan detection heuristics identify a multi-step task
+    /// that benefits from structured execution with verification.
+    PlanSuggestion {
+        hint: String,
+    },
 }
 
 impl SystemDirective {
@@ -467,6 +472,7 @@ impl SystemDirective {
                  Do NOT just dump raw tool output. Write a clear, structured response.",
                 user_text_hint
             ),
+            Self::PlanSuggestion { hint } => hint.clone(),
         }
     }
 }

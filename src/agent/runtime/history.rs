@@ -1038,6 +1038,12 @@ fn infer_completion_signals(
             "download",
             "clone",
             "migrate",
+            "fix",
+            "retry",
+            "redo",
+            "rerun",
+            "try again",
+            "do it again",
         ],
     );
     let visible_state_problem = text_contains_any_phrase(
@@ -1067,6 +1073,7 @@ fn infer_completion_signals(
             lower_text,
             &[
                 "fix",
+                "fixing",
                 "debug",
                 "diagnose",
                 "troubleshoot",
@@ -1170,6 +1177,12 @@ fn infer_completion_signals(
                 "download",
                 "clone",
                 "migrate",
+                "fix",
+                "retry",
+                "redo",
+                "rerun",
+                "try again",
+                "do it again",
             ],
         )
     } else {

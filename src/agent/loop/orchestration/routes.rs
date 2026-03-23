@@ -1131,6 +1131,19 @@ impl Agent {
                 "Simple intent — loaded tools for orchestrator"
             );
         }
+
+        // Inject plan suggestion when heuristics detect a multi-step task.
+        let plan_trigger = crate::plans::detection::should_create_plan(ctx.user_text);
+        if let Some(hint) = crate::plans::detection::get_plan_suggestion_prompt(&plan_trigger) {
+            info!(
+                ctx.session_id,
+                reason = ?plan_trigger.reason(),
+                "Plan detection triggered for simple intent"
+            );
+            ctx.pending_system_messages
+                .push(SystemDirective::PlanSuggestion { hint });
+        }
+
         info!(
             ctx.session_id,
             "Simple intent — continuing to full agent loop"
@@ -1167,6 +1180,12 @@ impl Agent {
                     tool_count = ctx.tool_defs.len(),
                     "Complex non-owner request: filtered competing execution tools for delegation mode"
                 );
+            }
+            // Inject plan suggestion for non-owner complex intents going through direct loop.
+            let plan_trigger = crate::plans::detection::should_create_plan(ctx.user_text);
+            if let Some(hint) = crate::plans::detection::get_plan_suggestion_prompt(&plan_trigger) {
+                ctx.pending_system_messages
+                    .push(SystemDirective::PlanSuggestion { hint });
             }
             ctx.pending_system_messages
                 .push(SystemDirective::GoalCreationOwnerOnly);

@@ -888,7 +888,7 @@ pub fn default_execution_budget(tier: BudgetTier) -> ExecutionBudget {
             max_llm_calls: 18,
             max_tool_calls: 24,
             max_validation_rounds: 3,
-            max_wall_clock_ms: 600_000,
+            max_wall_clock_ms: 900_000,
         },
         BudgetTier::Extended => ExecutionBudget {
             max_steps: 16,
@@ -984,6 +984,7 @@ pub fn select_initial_execution_budget(
                 "update",
                 "change",
                 "fix",
+                "fixing",
                 "implement",
                 "refactor",
                 "create",
@@ -997,6 +998,11 @@ pub fn select_initial_execution_budget(
                 "restart",
                 "send",
                 "schedule",
+                "retry",
+                "redo",
+                "rerun",
+                "try again",
+                "do it again",
             ]
             .iter()
             .any(|kw| contains_keyword_as_words(&lower, kw)));

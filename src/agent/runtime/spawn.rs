@@ -1059,7 +1059,16 @@ impl Agent {
              - Always check list_tasks before spawning the next executor\n\
              - If an executor reports a blocker, inspect the recorded task status/result and resolve it or adjust the plan\n\
              - Executors persist a structured handoff/result contract onto the claimed task record; do not treat vague prose alone as proof of completion\n\
-             - When finishing the goal, your final reply MUST include concrete executor results (outputs, paths, data), not just \"goal completed\""
+             - When finishing the goal, your final reply MUST include concrete executor results (outputs, paths, data), not just \"goal completed\"\n\n\
+             ## Pre-flight and Verification\n\
+             - Before any task that modifies external state (deploy, publish, push, send, upload, migrate), \
+             create a prerequisite-check task that verifies readiness (e.g., all changes committed, \
+             dependencies installed, credentials valid, build passing)\n\
+             - After any task that modifies external state, ALWAYS create a verification task that \
+             confirms the change was applied correctly (e.g., fetch the live URL, query the database, \
+             check the published package version)\n\
+             - Never mark the goal as complete until the verification task passes\n\
+             - If verification fails, create a remediation task to fix the issue and re-verify"
         );
 
         if let Some(ctx) = goal_context {
