@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.35] - 2026-05-10
+
+### Changed
+
+- **Conversation boundary detection now uses explicit turn IDs**: `Message` gains a `turn_id: Option<String>` field. At the start of each turn, the agent generates a per-session turn id (set to the user message's own id) and stashes it on `Agent::current_turn_ids`. Every message persisted during the turn — assistant replies, tool results, synthetic injections — is auto-stamped by `append_message_canonical` reading from that map. `message_build_phase` then finds the current-task boundary by `turn_id` match instead of inferring from message content, which had a known race where the same text sent twice could anchor on the wrong instance and keep an unrelated tool chain as "current interaction." Content match is retained as a fallback for messages from before this field existed (NULL turn_id, or hydrated from events).
+
+### Fixed
+
+- **`test_compaction_fires_on_window_overflow` flake under coverage instrumentation**: The Turn 8 assertion took `call_log.last()` and used a 200ms post-turn sleep. Under slow runners (coverage), `last()` could land on an async compaction call rather than the main Turn 8 call, missing the `[Session Summary]` marker. The check now scans the last 4 calls so order doesn't matter, and the sleep matches the 1000ms used by the earlier assertion in the same test.
+
 ## [0.9.34] - 2026-05-10
 
 ### Added

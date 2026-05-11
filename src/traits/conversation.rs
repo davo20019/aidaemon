@@ -225,6 +225,14 @@ pub struct Message {
     #[serde(skip)] // Don't serialize embedding to JSON (client doesn't need it)
     #[allow(dead_code)] // Reserved for semantic-memory paths that may be feature-gated.
     pub embedding: Option<Vec<f32>>,
+    /// Conversation turn this message belongs to. Stamped automatically by
+    /// the agent when persisting messages, so boundary detection can group
+    /// all messages from a single user turn (user message + assistant
+    /// replies + tool calls + tool results) without inferring from content.
+    /// `None` for messages written before this field existed or by code
+    /// paths that bypass the auto-stamping layer (tests, migrations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 fn default_importance() -> f32 {
@@ -245,6 +253,7 @@ impl Default for Message {
             annotations: Vec::new(),
             importance: default_importance(),
             embedding: None,
+            turn_id: None,
         }
     }
 }

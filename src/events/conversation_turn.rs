@@ -187,6 +187,11 @@ impl ConversationTurn {
             annotations: self.annotations,
             importance: 0.5,
             embedding: None,
+            // turn_id is not currently part of the event payload, so messages
+            // reconstructed from events on hydrate carry None here. Boundary
+            // detection falls back to content matching for these — same
+            // behavior as before this field existed.
+            turn_id: None,
         }
     }
 }

@@ -74,10 +74,25 @@ impl Agent {
             .await;
 
         // 1. Persist the user message
+        //
+        // The user message's own id is also the turn_id for this conversation
+        // turn. We stash it on the agent so every subsequent message written
+        // during this turn (assistant replies, tool results) is auto-stamped
+        // with the same turn_id by `append_message_canonical`. This lets
+        // boundary detection in `message_build_phase` group the turn without
+        // inferring from message content — historically a source of bugs when
+        // the same text is sent twice or arrives out of order.
+        let user_msg_id = Uuid::new_v4().to_string();
+        self.current_turn_ids
+            .write()
+            .await
+            .insert(session_id.to_string(), user_msg_id.clone());
+
         let user_msg = Message {
             content: Some(user_text.to_string()),
             importance: 0.5, // Will be updated by score_message below
-            ..Message::new_runtime(Uuid::new_v4().to_string(), session_id, "user")
+            turn_id: Some(user_msg_id.clone()),
+            ..Message::new_runtime(user_msg_id, session_id, "user")
         };
         // Calculate heuristic score immediately
         let score = crate::memory::scoring::score_message(&user_msg);

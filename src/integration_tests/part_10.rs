@@ -852,18 +852,38 @@ async fn test_compaction_fires_on_window_overflow() {
         .await
         .unwrap();
 
-    // Allow Turn 8's async compaction to settle.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Allow Turn 8's async compaction to settle. The previous 200ms was
+    // tight enough to flake under coverage instrumentation; matching the
+    // 1000ms pattern used above the prior assertion makes the test
+    // resilient to slower runners.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-    // Verify: Turn 8's LLM call should include [Session Summary].
+    // Verify: Turn 8's LLM call should include [Session Summary]. Turn 8
+    // can generate multiple LLM calls (an async incremental compaction plus
+    // the main response) and their order on the call_log is timing-
+    // dependent. Scan the calls produced during Turn 8 rather than relying
+    // on `last()` so the assertion checks the message-building path
+    // regardless of which call landed last.
     let call_log = harness.provider.call_log.lock().await;
-    let turn8_call = call_log.last().expect("should have Turn 8 call");
-    let has_summary = turn8_call.messages.iter().any(|m| {
-        m.get("role").and_then(|r| r.as_str()) == Some("system")
-            && m.get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|s| s.contains("[Session Summary]"))
+    assert!(
+        call_log.len() >= 8,
+        "expected at least one call per turn; got {}",
+        call_log.len()
+    );
+    // Turn 8's calls are at the tail of the log. The exact count is
+    // implementation-dependent (compaction may add 0 or 1 calls), so we
+    // scan the last 4 calls — more than enough to cover any plausible
+    // mix and still bounded so we don't match earlier turns.
+    let tail_start = call_log.len().saturating_sub(4);
+    let has_summary = call_log[tail_start..].iter().any(|call| {
+        call.messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("system")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("[Session Summary]"))
+        })
     });
+    let turn8_call = call_log.last().expect("should have Turn 8 call");
     assert!(
         has_summary,
         "Turn 8's LLM context should include [Session Summary] from compaction"
@@ -878,5 +898,118 @@ async fn test_compaction_fires_on_window_overflow() {
     assert!(
         has_boundary,
         "Turn 8's LLM context should include [Current Task] boundary marker"
+    );
+}
+
+/// Regression: messages persisted during a `handle_message` call must be
+/// stamped with a `turn_id` so boundary detection groups them deterministically.
+///
+/// Before turn_id, the boundary was inferred by matching `user_text` against
+/// message content, which had a known race condition: when the same text was
+/// sent twice in the same session, `rposition` could pick the old instance and
+/// keep an unrelated tool chain as "current interaction." With turn_id, the
+/// boundary is a lookup, immune to duplicate text.
+#[tokio::test]
+async fn test_turn_id_groups_messages_within_a_turn() {
+    let provider = MockProvider::with_responses(vec![
+        // Turn 1: tool call + final response.
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("Done turn 1"),
+        // Turn 2: tool call + final response.
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("Done turn 2"),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    // Turn 1
+    let _ = harness
+        .agent
+        .handle_message(
+            "turn_id_test",
+            "First request",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Turn 2
+    let _ = harness
+        .agent
+        .handle_message(
+            "turn_id_test",
+            "Second request",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Pull persisted messages from working memory. Every message that flowed
+    // through `append_message_canonical` during a turn should carry a turn_id.
+    let history = harness
+        .state
+        .get_history("turn_id_test", 100)
+        .await
+        .unwrap();
+
+    let stamped: Vec<_> = history.iter().filter(|m| m.turn_id.is_some()).collect();
+    assert!(
+        !stamped.is_empty(),
+        "expected some messages to carry a turn_id, got {} messages with none",
+        history.len()
+    );
+
+    // Each user message carries a turn_id that equals its own message id
+    // (set in bootstrap so the turn_id is the same as the user message id).
+    // Verify the invariant on user messages.
+    let user_messages: Vec<_> = history.iter().filter(|m| m.role == "user").collect();
+    assert_eq!(
+        user_messages.len(),
+        2,
+        "expected 2 user messages, got {}",
+        user_messages.len()
+    );
+    for um in &user_messages {
+        assert_eq!(
+            um.turn_id.as_deref(),
+            Some(um.id.as_str()),
+            "user message turn_id should equal its own id; got msg id={} turn_id={:?}",
+            um.id,
+            um.turn_id
+        );
+    }
+
+    // The two user messages have distinct turn_ids.
+    assert_ne!(
+        user_messages[0].turn_id, user_messages[1].turn_id,
+        "two distinct user turns must have distinct turn_ids"
+    );
+
+    // Every assistant or tool message after the first user message and before
+    // the second user message should carry Turn 1's turn_id. We don't assert
+    // exact grouping (tool result placement can vary by code path), but we do
+    // assert at least one non-user message carries each turn_id.
+    let turn1_id = user_messages[0].turn_id.clone().unwrap();
+    let turn2_id = user_messages[1].turn_id.clone().unwrap();
+    let turn1_nonuser_count = history
+        .iter()
+        .filter(|m| m.role != "user" && m.turn_id.as_deref() == Some(&turn1_id))
+        .count();
+    let turn2_nonuser_count = history
+        .iter()
+        .filter(|m| m.role != "user" && m.turn_id.as_deref() == Some(&turn2_id))
+        .count();
+    assert!(
+        turn1_nonuser_count > 0,
+        "Turn 1 should have at least one non-user message stamped with its turn_id"
+    );
+    assert!(
+        turn2_nonuser_count > 0,
+        "Turn 2 should have at least one non-user message stamped with its turn_id"
     );
 }

@@ -1656,6 +1656,12 @@ pub struct Agent {
     root_tools: Option<Vec<Arc<dyn Tool>>>,
     /// Emit structured decision points into the event store for self-diagnostics.
     record_decision_points: bool,
+    /// Per-session conversation turn IDs. Populated at the start of each
+    /// `handle_message_impl` and read by `append_message_canonical` so every
+    /// message written during a turn is stamped with the same `turn_id`.
+    /// `message_build_phase` uses this stamp to find the current-task
+    /// boundary without inferring from message content.
+    current_turn_ids: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     /// Test-only override for the execution budget selected at the start of
     /// the agent loop. When `Some`, `select_initial_execution_budget` is
     /// bypassed and this budget is used instead.
@@ -3582,6 +3588,7 @@ impl Agent {
             inherited_project_scope,
             root_tools: None, // Root agent — its own tools ARE the root tools
             record_decision_points,
+            current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             #[cfg(test)]
             execution_budget_override: None,
         }
@@ -3740,6 +3747,7 @@ impl Agent {
             inherited_project_scope,
             root_tools,
             record_decision_points,
+            current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             #[cfg(test)]
             execution_budget_override: None,
         }

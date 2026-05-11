@@ -2356,7 +2356,32 @@ impl Agent {
     }
 
     pub(super) async fn append_message_canonical(&self, msg: &Message) -> anyhow::Result<()> {
-        self.state.append_message(msg).await
+        // Auto-stamp turn_id from the per-session map so every message
+        // written during a turn shares the same id. Messages that already
+        // carry a turn_id (e.g., the user message in bootstrap, which sets
+        // its own id) are left alone.
+        if msg.turn_id.is_some() {
+            return self.state.append_message(msg).await;
+        }
+        let turn_id = self
+            .current_turn_ids
+            .read()
+            .await
+            .get(&msg.session_id)
+            .cloned();
+        match turn_id {
+            Some(tid) => {
+                let mut stamped = msg.clone();
+                stamped.turn_id = Some(tid);
+                self.state.append_message(&stamped).await
+            }
+            None => {
+                // No active turn for this session — preserve old behavior.
+                // This path covers background tasks, sub-agent flows, and
+                // test scaffolding that bypass `handle_message_impl`.
+                self.state.append_message(msg).await
+            }
+        }
     }
 
     pub(super) async fn append_user_message_with_event(

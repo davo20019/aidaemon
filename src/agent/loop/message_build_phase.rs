@@ -209,6 +209,7 @@ impl Agent {
         let user_msg_present =
             last_user_msg.is_some_and(|m| m.content.as_deref() == Some(user_text));
         if !user_msg_present && !user_text.is_empty() {
+            let synthetic_turn_id = self.current_turn_ids.read().await.get(session_id).cloned();
             recent_history.push(Message {
                 id: format!("synthetic-user-{}", uuid::Uuid::new_v4()),
                 session_id: session_id.to_string(),
@@ -219,6 +220,7 @@ impl Agent {
                 tool_calls_json: None,
                 created_at: chrono::Utc::now(),
                 importance: 1.0,
+                turn_id: synthetic_turn_id,
                 ..Message::runtime_defaults()
             });
             info!(
@@ -264,12 +266,30 @@ impl Agent {
             })
             .collect();
         // Find the boundary between old and current interactions.
-        // If the current user_text is already in the history, use its position.
-        // Otherwise, the DB write hasn't committed yet (race condition) — treat
-        // ALL loaded messages as "old" so we collapse their tool results.
-        let last_user_pos: Option<usize> = deduped_msgs
-            .iter()
-            .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text));
+        //
+        // Primary: match by `turn_id`. Every message written during this
+        // turn was auto-stamped with the same id by `append_message_canonical`,
+        // so the first user-role message with the current turn_id marks the
+        // boundary — no content inference, no race-condition window where the
+        // same text sent twice picks the wrong instance.
+        //
+        // Fallback: content match against `user_text`. Covers messages
+        // persisted before this field existed and any code path that bypasses
+        // the auto-stamping layer.
+        let current_turn_id: Option<String> =
+            self.current_turn_ids.read().await.get(session_id).cloned();
+        let last_user_pos: Option<usize> = current_turn_id
+            .as_deref()
+            .and_then(|tid| {
+                deduped_msgs
+                    .iter()
+                    .position(|m| m.role == "user" && m.turn_id.as_deref() == Some(tid))
+            })
+            .or_else(|| {
+                deduped_msgs
+                    .iter()
+                    .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
+            });
         if last_user_pos.is_none() {
             warn!(
                 session_id,
