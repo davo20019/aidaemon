@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.34] - 2026-05-10
+
+### Added
+
+- **LLM intent classifier (module + empirical bench)**: New `agent::llm_classifier` module exposing `classify_intent()`, a fail-open fast-model call that returns a coarse-grained intent class (`schedule_one_shot`, `schedule_recurring`, `memory_storage`, `memory_recall`, `action`, `knowledge_question`, `other`). Hard 5-second timeout, output capped at 20 tokens via `ChatOptions::max_tokens_override` so per-call cost stays trivial, token usage tracked under `background:intent_classifier`. Ships with 9 unit tests (parse, round-trip, timeout, fail-open, prompt-vocabulary invariants).
+- **`intent_classifier_bench` ignored integration test**: Runs the classifier against a 27-case hand-curated corpus and reports agreement vs the heuristic baseline plus per-call latency. Run with `cargo test --lib intent_classifier_bench_run_corpus -- --ignored --nocapture`. Initial result on `google/gemini-2.5-flash` via OpenRouter: 88.9% agreement, 462ms average latency, 0 failures. Disagreements include legitimate LLM wins on implicit fact-sharing the regex misses, and one heuristic win on a compound recall+action task. Conclusion: the LLM classifier is good as a shadow signal but not good enough at this latency to replace the heuristic. A follow-up release will wire it as fire-and-forget shadow mode (off by default).
+
 ## [0.9.33] - 2026-05-10
 
 ### Changed

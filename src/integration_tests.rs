@@ -12,3 +12,4 @@ include!("integration_tests/part_10.rs");
 include!("integration_tests/part_11.rs");
 include!("integration_tests/part_12_delegation.rs");
 include!("integration_tests/scheduler_flaw.rs");
+include!("integration_tests/intent_classifier_bench.rs");

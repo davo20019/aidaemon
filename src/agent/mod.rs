@@ -96,6 +96,8 @@ use response_analysis::{
 mod intent_keywords;
 #[path = "intent/intent_routing.rs"]
 mod intent_routing;
+#[path = "intent/llm_classifier.rs"]
+pub mod llm_classifier;
 use intent_routing::{
     classify_intent_complexity, contains_keyword_as_words, infer_intent_gate,
     is_internal_maintenance_intent, IntentComplexity,
