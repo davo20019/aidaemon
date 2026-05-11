@@ -16,6 +16,7 @@ const MAX_RESULTS: usize = 200;
 const DEFAULT_MAX_RESULTS: usize = 50;
 const MAX_FILES_SCANNED: usize = 10_000;
 const MAX_DEPTH: usize = 20;
+const MAX_CONTENT_SEARCH_FILE_SIZE: u64 = 1024 * 1024; // 1 MiB per file
 
 #[async_trait]
 impl Tool for SearchFilesTool {
@@ -122,7 +123,7 @@ impl Tool for SearchFilesTool {
         };
 
         let mut results = Vec::new();
-        let mut files_scanned = 0;
+        let mut stats = SearchStats::default();
 
         walk_dir(
             &search_dir,
@@ -131,7 +132,7 @@ impl Tool for SearchFilesTool {
             max_results,
             0,
             &mut results,
-            &mut files_scanned,
+            &mut stats,
         )
         .await;
 
@@ -145,12 +146,16 @@ impl Tool for SearchFilesTool {
         if results.is_empty() {
             let mut output = format!(
                 "No matches found ({} files scanned in {})",
-                files_scanned,
+                stats.files_scanned,
                 search_dir.display()
             );
             if let Some(note) = &default_path_note {
                 output.push('\n');
                 output.push_str(note);
+            }
+            if stats.oversized_files_skipped > 0 {
+                output.push('\n');
+                output.push_str(&oversized_note(stats.oversized_files_skipped));
             }
             return Ok(output);
         }
@@ -164,9 +169,13 @@ impl Tool for SearchFilesTool {
             "Found {} match{} ({} files scanned in {}):\n\n",
             results.len(),
             if results.len() == 1 { "" } else { "es" },
-            files_scanned,
+            stats.files_scanned,
             search_dir.display()
         ));
+        if stats.oversized_files_skipped > 0 {
+            output.push_str(&oversized_note(stats.oversized_files_skipped));
+            output.push_str("\n\n");
+        }
 
         for result in &results {
             output.push_str(&result.format());
@@ -184,9 +193,24 @@ impl Tool for SearchFilesTool {
     }
 }
 
+fn oversized_note(count: usize) -> String {
+    format!(
+        "Skipped {} oversized file{} larger than {} bytes during content search.",
+        count,
+        if count == 1 { "" } else { "s" },
+        MAX_CONTENT_SEARCH_FILE_SIZE
+    )
+}
+
 struct SearchResult {
     path: PathBuf,
     matches: Vec<(usize, String)>, // (line_number, line_content)
+}
+
+#[derive(Default)]
+struct SearchStats {
+    files_scanned: usize,
+    oversized_files_skipped: usize,
 }
 
 impl SearchResult {
@@ -231,10 +255,12 @@ fn walk_dir<'a>(
     max_results: usize,
     depth: usize,
     results: &'a mut Vec<SearchResult>,
-    files_scanned: &'a mut usize,
+    stats: &'a mut SearchStats,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        if depth > MAX_DEPTH || results.len() >= max_results || *files_scanned >= MAX_FILES_SCANNED
+        if depth > MAX_DEPTH
+            || results.len() >= max_results
+            || stats.files_scanned >= MAX_FILES_SCANNED
         {
             return;
         }
@@ -247,7 +273,7 @@ fn walk_dir<'a>(
         let mut subdirs = Vec::new();
 
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if results.len() >= max_results || *files_scanned >= MAX_FILES_SCANNED {
+            if results.len() >= max_results || stats.files_scanned >= MAX_FILES_SCANNED {
                 break;
             }
 
@@ -276,10 +302,16 @@ fn walk_dir<'a>(
                 }
             }
 
-            *files_scanned += 1;
+            stats.files_scanned += 1;
 
             // If content pattern specified, search contents
             if let Some(ref content_re) = content_regex {
+                if let Ok(metadata) = entry.metadata().await {
+                    if metadata.len() > MAX_CONTENT_SEARCH_FILE_SIZE {
+                        stats.oversized_files_skipped += 1;
+                        continue;
+                    }
+                }
                 if let Ok(content) = tokio::fs::read_to_string(&path).await {
                     let mut matches = Vec::new();
                     for (i, line) in content.lines().enumerate() {
@@ -315,7 +347,7 @@ fn walk_dir<'a>(
                 max_results,
                 depth + 1,
                 results,
-                files_scanned,
+                stats,
             )
             .await;
         }
@@ -378,6 +410,24 @@ mod tests {
         assert!(result.contains("a.txt"));
         assert!(result.contains("hello world"));
         assert!(!result.contains("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_content_search_skips_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut large = vec![b'a'; 1_048_577];
+        large.extend_from_slice(b"\nneedle_in_large_file\n");
+        std::fs::write(dir.path().join("large.log"), large).unwrap();
+
+        let args = json!({
+            "pattern": "needle_in_large_file",
+            "path": dir.path().to_str().unwrap()
+        })
+        .to_string();
+
+        let result = SearchFilesTool.call(&args).await.unwrap();
+        assert!(!result.contains("needle_in_large_file"));
+        assert!(result.contains("Skipped 1 oversized file"));
     }
 
     #[tokio::test]

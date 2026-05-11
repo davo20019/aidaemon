@@ -471,7 +471,7 @@ async fn detect_goal_spikes(pool: &SqlitePool) -> anyhow::Result<Vec<GoalSpike>>
     }
 
     let mut spikes: Vec<GoalSpike> = by_goal.into_values().collect();
-    spikes.sort_by(|a, b| b.tokens_15m.cmp(&a.tokens_15m));
+    spikes.sort_by_key(|spike| std::cmp::Reverse(spike.tokens_15m));
     Ok(spikes)
 }
 

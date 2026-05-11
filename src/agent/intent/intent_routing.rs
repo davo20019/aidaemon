@@ -834,6 +834,25 @@ fn has_content_delivery_verb(user_text: &str) -> bool {
     )
 }
 
+fn looks_like_direct_reply_format_instruction(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    contains_any_as_words(
+        &lower,
+        &[
+            "reply with",
+            "reply only with",
+            "respond with",
+            "respond only with",
+            "answer with",
+            "answer only with",
+        ],
+    )
+}
+
 fn has_content_live_delivery_cue(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -981,6 +1000,7 @@ pub(super) fn classify_connected_content_mode(user_text: &str) -> ConnectedConte
         return ConnectedContentMode::None;
     }
 
+    let has_connected_target = mentions_connected_api_target(&lower);
     let has_existing_payload = mentions_existing_connected_content_payload(&lower);
     let has_live_delivery_cue = has_content_live_delivery_cue(&lower);
     let has_delivery_verb = has_content_delivery_verb(&lower);
@@ -988,6 +1008,14 @@ pub(super) fn classify_connected_content_mode(user_text: &str) -> ConnectedConte
     let has_new_payload_shape = has_content_new_payload_shape(&lower);
     let has_copywriting_cue = has_content_copywriting_cue(&lower);
     let needs_new_copy = has_drafting_verb || has_new_payload_shape || has_copywriting_cue;
+
+    if !has_connected_target
+        && !has_existing_payload
+        && !has_live_delivery_cue
+        && looks_like_direct_reply_format_instruction(&lower)
+    {
+        return ConnectedContentMode::None;
+    }
 
     if has_explicit_do_not_deliver_cue(&lower) {
         return ConnectedContentMode::DraftOnly;
@@ -1396,6 +1424,47 @@ mod intent_routing_path_override_tests {
             d.needs_tools.is_none(),
             "expected needs_tools=None for generic capability question, got {:?}",
             d.needs_tools
+        );
+    }
+
+    #[test]
+    fn infer_intent_gate_does_not_force_tools_for_simple_reply_format_request() {
+        let d = infer_intent_gate(
+            "Chrome smoke test 2026-03-30T02:27:33.908Z: what is 2+2? Reply with just 4.",
+            "",
+        );
+        assert!(
+            d.needs_tools.is_none(),
+            "expected needs_tools=None for simple reply-format request, got {:?}",
+            d.needs_tools
+        );
+    }
+
+    #[test]
+    fn classify_connected_content_mode_ignores_generic_reply_formatting() {
+        assert_eq!(
+            classify_connected_content_mode(
+                "Chrome smoke test 2026-03-30T02:27:33.908Z: what is 2+2? Reply with just 4."
+            ),
+            ConnectedContentMode::None
+        );
+        assert_eq!(
+            classify_connected_api_intent(
+                "Chrome smoke test 2026-03-30T02:27:33.908Z: what is 2+2? Reply with just 4."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_connected_content_mode_keeps_explicit_live_reply_requests() {
+        assert_eq!(
+            classify_connected_content_mode("Reply to this tweet right now."),
+            ConnectedContentMode::DeliverOnly
+        );
+        assert_eq!(
+            classify_connected_api_intent("Reply to this tweet right now."),
+            Some(ConnectedApiIntent::WriteAction)
         );
     }
 

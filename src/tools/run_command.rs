@@ -8,32 +8,36 @@ use super::daemon_guard::detect_daemonization_primitives;
 use super::fs_utils;
 
 pub struct RunCommandTool;
-const SAFE_NPM_PREFIX_HINT: &str = "`npm test`, `npm run`, `npm ls`, `npm outdated`, `npm audit`";
+const SAFE_NPM_PREFIX_HINT: &str =
+    "`npm test`, `npm ls`, `npm outdated`, `npm audit` (note: `npm run` and `npx` require `terminal` approval)";
 
 /// Safe command prefixes that don't require terminal approval flow.
+///
+/// Anything that executes arbitrary repo-defined scripts (Makefiles, npm
+/// `run`/`exec`, `cargo run`, `cargo bench`, `gradle`/`mvn` build files,
+/// `go generate`, `npx`-downloaded packages) is intentionally OMITTED. Such
+/// commands can run unbounded code from the working tree or the network and
+/// must go through the terminal approval flow instead.
 const SAFE_PREFIXES: &[&str] = &[
-    // Build & test
+    // Build & test — only bounded sub-commands. `cargo run`, `cargo bench`,
+    // `go generate`, `npm run`/`npx`/`yarn run`/`bun run`,
+    // `make`/`cmake`/`gradle`/`mvn` are deliberately excluded — they execute
+    // arbitrary repo-defined code.
     "cargo build",
     "cargo test",
     "cargo check",
     "cargo clippy",
     "cargo fmt",
     "cargo doc",
-    "cargo bench",
-    "cargo run",
     "cargo tree",
     "cargo metadata",
     "npm test",
-    "npm run",
     "npm ls",
     "npm outdated",
     "npm audit",
-    "npx",
     "yarn test",
-    "yarn run",
     "yarn lint",
     "bun test",
-    "bun run",
     "pytest",
     "python -m pytest",
     "python3 -m pytest",
@@ -41,13 +45,8 @@ const SAFE_PREFIXES: &[&str] = &[
     "go build",
     "go vet",
     "go mod",
-    "go generate",
     "jest",
     "vitest",
-    "make",
-    "cmake",
-    "gradle",
-    "mvn",
     // Formatting & linting
     "rustfmt",
     "black",
@@ -110,7 +109,7 @@ impl Tool for RunCommandTool {
     fn schema(&self) -> Value {
         json!({
             "name": "run_command",
-            "description": "Run safe build, test, lint, and inspection commands without approval flow. Only allows whitelisted command prefixes (cargo, pytest, go, git read-only, ls, etc.). npm is limited to test/run/list/audit-style commands; for installs and arbitrary commands, use terminal instead.",
+            "description": "Run safe build, test, lint, and inspection commands without approval flow. Only allows whitelisted command prefixes (cargo build/test/check/clippy/fmt/doc, pytest, go build/test, git read-only, ls, etc.). Excludes anything that runs arbitrary repo-defined scripts: `cargo run`, `cargo bench`, `npm run`, `npx`, `yarn run`, `bun run`, `make`, `cmake`, `gradle`, `mvn`. For installs and arbitrary commands, use terminal instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -369,6 +368,42 @@ mod tests {
         assert!(!is_safe_command("git reset --hard"));
         assert!(!is_safe_command("sudo apt install"));
         assert!(!is_safe_command("chmod 777 /etc"));
+
+        // Regression: arbitrary-code prefixes are NOT safe and must go
+        // through `terminal` instead. These wrap repo-defined scripts or
+        // network-downloaded packages.
+        assert!(
+            !is_safe_command("cargo run"),
+            "cargo run executes arbitrary main.rs and must require approval"
+        );
+        assert!(!is_safe_command("cargo run --release -- --evil"));
+        assert!(
+            !is_safe_command("cargo bench"),
+            "cargo bench executes arbitrary bench harnesses"
+        );
+        assert!(
+            !is_safe_command("npm run build"),
+            "npm run executes arbitrary package.json scripts"
+        );
+        assert!(!is_safe_command("npm run anything-here"));
+        assert!(
+            !is_safe_command("npx some-package"),
+            "npx downloads and runs arbitrary packages"
+        );
+        assert!(!is_safe_command("yarn run dev"));
+        assert!(!is_safe_command("bun run start"));
+        assert!(
+            !is_safe_command("go generate ./..."),
+            "go generate executes arbitrary commands from source comments"
+        );
+        assert!(
+            !is_safe_command("make"),
+            "make executes arbitrary Makefiles"
+        );
+        assert!(!is_safe_command("make install"));
+        assert!(!is_safe_command("cmake --build ."));
+        assert!(!is_safe_command("gradle build"));
+        assert!(!is_safe_command("mvn package"));
     }
 
     #[tokio::test]

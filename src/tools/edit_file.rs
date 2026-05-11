@@ -55,10 +55,11 @@ impl Tool for EditFileTool {
         ToolCapabilities {
             read_only: false,
             external_side_effect: false,
-            needs_approval: true,
+            needs_approval: false,
             idempotent: false,
             // Not high-impact: find-and-replace with safe failure on ambiguity.
-            // The approval flow already gates this; critique overhead is excessive.
+            // Dedicated file tools are intentionally available without terminal
+            // approval. Sensitive paths are blocked before editing.
             high_impact_write: false,
         }
     }
@@ -104,6 +105,14 @@ impl Tool for EditFileTool {
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
         let path = fs_utils::validate_path(path_str)?;
+
+        // Block sensitive paths (~/.ssh/*, ~/.aws/*, ~/.gnupg/*, *.env, etc.)
+        // mirroring `write_file`. Even though `edit_file` only does
+        // find-and-replace, it can still mutate credentials in place, so the
+        // same blocklist applies.
+        if fs_utils::is_sensitive_path(&path) {
+            anyhow::bail!("Cannot edit sensitive path: {}", path_str);
+        }
 
         if !path.exists() {
             anyhow::bail!("File not found: {}", path_str);
@@ -402,5 +411,41 @@ mod tests {
 
         let result = EditFileTool.call(&args).await;
         assert!(result.is_err());
+    }
+
+    /// Regression: edit_file must refuse to touch sensitive paths
+    /// (~/.ssh/*, *.env, ~/.gnupg/*, etc.) the same way write_file does.
+    /// Without this guard, the agent could rewrite SSH keys or env files
+    /// in place via find-and-replace.
+    #[tokio::test]
+    async fn test_edit_file_blocks_sensitive_path() {
+        // Use a path under HOME/.ssh which `is_sensitive_path` flags.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let ssh_path = format!("{}/.ssh/edit_file_sensitivity_probe", home);
+
+        let args = json!({
+            "path": ssh_path,
+            "old_text": "a",
+            "new_text": "b"
+        })
+        .to_string();
+
+        let result = EditFileTool.call(&args).await;
+        assert!(result.is_err(), "expected error for sensitive path");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("sensitive"),
+            "expected 'sensitive' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_edit_file_capabilities_match_no_approval_tool_guidance() {
+        let caps = EditFileTool.capabilities();
+        assert!(
+            !caps.needs_approval,
+            "edit_file is documented as a dedicated file tool that does not require approval"
+        );
+        assert!(!caps.high_impact_write);
     }
 }

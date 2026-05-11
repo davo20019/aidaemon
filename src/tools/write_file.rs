@@ -53,12 +53,12 @@ impl Tool for WriteFileTool {
         ToolCapabilities {
             read_only: false,
             external_side_effect: false,
-            needs_approval: true,
+            needs_approval: false,
             idempotent: false,
             // Not high-impact: creates backups before overwriting, user-scoped
-            // file system only.  The approval flow (`needs_approval`) already
-            // gates this tool; the pre-execution critique pipeline is too
-            // expensive (~3 min, 2 extra LLM calls) for routine file writes.
+            // file system only, and dedicated file tools are intentionally
+            // available without terminal approval. Sensitive paths are blocked
+            // before writing.
             high_impact_write: false,
         }
     }
@@ -280,5 +280,15 @@ mod tests {
         let result = WriteFileTool.call(&args).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Parent directory"));
+    }
+
+    #[test]
+    fn test_write_file_capabilities_match_no_approval_tool_guidance() {
+        let caps = WriteFileTool.capabilities();
+        assert!(
+            !caps.needs_approval,
+            "write_file is documented as a dedicated file tool that does not require approval"
+        );
+        assert!(!caps.high_impact_write);
     }
 }

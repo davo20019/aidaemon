@@ -106,20 +106,14 @@ impl Skill {
                             .filter(|s| !s.is_empty())
                             .collect();
                     }
-                    "origin" => {
-                        if !value.is_empty() {
-                            origin = Some(value.to_string());
-                        }
+                    "origin" if !value.is_empty() => {
+                        origin = Some(value.to_string());
                     }
-                    "source" => {
-                        if !value.is_empty() {
-                            source = Some(value.to_string());
-                        }
+                    "source" if !value.is_empty() => {
+                        source = Some(value.to_string());
                     }
-                    "source_url" => {
-                        if !value.is_empty() {
-                            source_url = Some(value.to_string());
-                        }
+                    "source_url" if !value.is_empty() => {
+                        source_url = Some(value.to_string());
                     }
                     _ => {}
                 }

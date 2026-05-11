@@ -4794,8 +4794,10 @@ impl TerminalBridge {
     where
         S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     {
-        let text = match msg {
-            Message::Text(t) => t,
+        // tokio-tungstenite 0.29+ wraps text payloads in `Utf8Bytes`. Coerce
+        // both arms to `String` for downstream JSON parsing.
+        let text: String = match msg {
+            Message::Text(t) => t.to_string(),
             Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
             Message::Ping(_) | Message::Pong(_) => return Ok(()),
             Message::Close(_) => return Ok(()),
@@ -5493,10 +5495,8 @@ impl TerminalBridge {
                         }
                     }
                 }
-                "control" => {
-                    if payload.get("action").and_then(|v| v.as_str()) == Some("stop") {
-                        remove_reason = Some("stop requested by client");
-                    }
+                "control" if payload.get("action").and_then(|v| v.as_str()) == Some("stop") => {
+                    remove_reason = Some("stop requested by client");
                 }
                 "resize" => {
                     let cols = payload

@@ -203,13 +203,11 @@ fn find_previous_turns(
                     }
                 }
             }
-            "assistant" => {
-                if saw_current_user && prev_assistant.is_none() {
-                    if let Some(content) = msg.content.as_deref() {
-                        let trimmed = content.trim();
-                        if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(current_user_text) {
-                            prev_assistant = Some(trimmed.to_string());
-                        }
+            "assistant" if saw_current_user && prev_assistant.is_none() => {
+                if let Some(content) = msg.content.as_deref() {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(current_user_text) {
+                        prev_assistant = Some(trimmed.to_string());
                     }
                 }
             }

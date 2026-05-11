@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon"
-version = "0.9.31"
+version = "0.9.32"
 edition = "2021"
 description = "A personal AI agent that runs as a background daemon, accessible via Telegram, Slack, or Discord, with tool use, MCP integration, and persistent memory"
 license = "MIT"
@@ -63,6 +63,10 @@ aes-gcm = { version = "0.10", optional = true }
 portable-pty = { version = "0.8", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# keyring v4 dropped feature flags and moved `Entry` to `keyring-core`. The
+# refactor is invasive (requires explicit `use_native_store` calls and
+# rewriting every `keyring::Entry::new(...)` site); staying on v3 until that
+# migration is scoped separately.
 keyring = { version = "3", features = ["apple-native"] }
 tikv-jemallocator = "0.6"
 

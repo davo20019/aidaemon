@@ -1070,11 +1070,10 @@ impl Agent {
             let est_msg_tokens_u64 = est_msg_tokens as u64;
             let est_tool_tokens_u64 = est_tool_tokens as u64;
             let est_total_tokens_u64 = est_total_tokens as u64;
-            let est_tool_share_bps = if est_total_tokens_u64 > 0 {
-                est_tool_tokens_u64.saturating_mul(10_000) / est_total_tokens_u64
-            } else {
-                0
-            };
+            let est_tool_share_bps = est_tool_tokens_u64
+                .saturating_mul(10_000)
+                .checked_div(est_total_tokens_u64)
+                .unwrap_or(0);
 
             // Runtime signal: quantify prompt overhead from tool schemas before each LLM call.
             POLICY_METRICS

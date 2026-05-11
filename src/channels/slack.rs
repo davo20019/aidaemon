@@ -262,7 +262,9 @@ impl SlackChannel {
 
             match msg {
                 tokio_tungstenite::tungstenite::Message::Text(text) => {
-                    let envelope: Value = match serde_json::from_str(&text) {
+                    // tokio-tungstenite 0.29+ wraps text payloads in `Utf8Bytes`;
+                    // borrow `&str` via Deref for downstream parsing.
+                    let envelope: Value = match serde_json::from_str(text.as_str()) {
                         Ok(v) => v,
                         Err(e) => {
                             warn!("Failed to parse Slack envelope: {}", e);
@@ -2053,7 +2055,7 @@ fn restore_mentions_from_cache(text: &str, cache: &HashMap<String, String>) -> S
     let mut result = text.to_string();
     // Sort by name length descending so "Jane Smith" matches before "Jane"
     let mut entries: Vec<_> = cache.iter().collect();
-    entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.1.len()));
     for (user_id, name) in entries {
         let mention = format!("@{}", name);
         if result.contains(&mention) {

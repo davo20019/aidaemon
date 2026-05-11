@@ -946,6 +946,7 @@ mod tests {
         let db_path = db_file.path().display().to_string();
         let embedding_service = Arc::new(EmbeddingService::new()?);
         let state = Arc::new(SqliteStateStore::new(&db_path, 32, None, embedding_service).await?);
+        std::mem::forget(db_file);
         let profiles: SharedHttpProfiles = Arc::new(RwLock::new(HashMap::new()));
         Ok(OAuthGateway::new(
             state as Arc<dyn StateStore>,

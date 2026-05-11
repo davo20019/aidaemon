@@ -264,7 +264,16 @@ async fn test_untrusted_tool_output_framing() {
         is_trusted_tool("system_info"),
         "system_info should be trusted"
     );
-    assert!(is_trusted_tool("terminal"), "terminal should be trusted");
+    // `terminal` output can include arbitrary remote bytes (e.g. via `curl`),
+    // so it must be wrapped as untrusted. Same for `read_channel_history`.
+    assert!(
+        !is_trusted_tool("terminal"),
+        "terminal output must be wrapped as untrusted"
+    );
+    assert!(
+        !is_trusted_tool("read_channel_history"),
+        "channel history must be wrapped as untrusted"
+    );
     assert!(
         !is_trusted_tool("web_search"),
         "web_search should be untrusted"

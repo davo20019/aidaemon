@@ -385,8 +385,23 @@ impl Tool for ManageMemoriesTool {
                 Ok(output)
             }
             "forget" => {
-                let key = args.key.as_deref().ok_or_else(|| anyhow::anyhow!("'key' is required for forget action"))?;
+                let key_raw = args.key.as_deref().ok_or_else(|| anyhow::anyhow!("'key' is required for forget action"))?;
                 let category = args.category.as_deref().ok_or_else(|| anyhow::anyhow!("'category' is required for forget action"))?;
+
+                // Reject empty / whitespace-only / too-short keys. A blank key would
+                // make substring matching ("fk.contains(&key_lower)") true for every
+                // fact, wiping the store. A single character is also too broad to be
+                // a safe substring match across all facts.
+                let key = key_raw.trim();
+                if key.is_empty() {
+                    anyhow::bail!("'key' must not be empty or whitespace for forget action");
+                }
+                if key.chars().count() < 2 {
+                    anyhow::bail!(
+                        "'key' must be at least 2 characters for forget action (got {:?}); use manage_memories(action='list') to see exact keys",
+                        key
+                    );
+                }
 
                 // Canonicalize the requested key for fuzzy matching
                 let canon = |k: &str| -> String {
@@ -405,50 +420,63 @@ impl Tool for ManageMemoriesTool {
                 };
 
                 let key_canonical = canon(key);
+                let key_lower = key.to_lowercase();
 
-                // Try matching: exact → canonical → substring
-                let facts = self.state.get_facts(Some(category)).await?;
-                let fact = facts
-                    .iter()
-                    .find(|f| f.key == key && f.superseded_at.is_none())
-                    .or_else(|| {
-                        facts.iter().find(|f| {
-                            f.superseded_at.is_none() && canon(&f.key) == key_canonical
-                        })
-                    })
-                    .or_else(|| {
-                        // Substring match: key contains the search term or vice versa
-                        let key_lower = key.to_lowercase();
-                        facts.iter().find(|f| {
-                            f.superseded_at.is_none() && {
-                                let fk = f.key.to_lowercase();
-                                fk.contains(&key_lower) || key_lower.contains(&fk)
-                            }
-                        })
-                    });
-
-                // If no match in the specified category, try all categories
-                let found = if let Some(f) = fact {
-                    Some((f.id, f.category.clone(), f.key.clone()))
-                } else {
-                    let all_facts = self.state.get_facts(None).await?;
-                    all_facts.iter().find(|f| {
-                        f.superseded_at.is_none() && {
-                            let fk = canon(&f.key);
-                            fk == key_canonical
-                                || f.key == key
-                                || f.key.to_lowercase().contains(&key.to_lowercase())
-                                || key.to_lowercase().contains(&f.key.to_lowercase())
-                        }
-                    }).map(|f| (f.id, f.category.clone(), f.key.clone()))
+                // Within the explicitly-requested category, allow fuzzy matching
+                // (exact, canonical, substring) — the caller is targeting a known
+                // category so substring is acceptable.
+                let matches_key_in_category = |f: &crate::traits::Fact| -> bool {
+                    if f.superseded_at.is_some() {
+                        return false;
+                    }
+                    let fk = f.key.to_lowercase();
+                    let fk_canon = canon(&f.key);
+                    f.key == key
+                        || fk_canon == key_canonical
+                        || fk.contains(&key_lower)
+                        || key_lower.contains(&fk)
                 };
 
-                match found {
-                    Some((id, cat, k)) => {
-                        self.state.delete_fact(id).await?;
-                        Ok(format!("Forgotten: [{}] {}", cat, k))
+                // Across OTHER categories (the "duplicate sweep") only accept exact
+                // or canonical matches. Substring matching outside the requested
+                // category is too broad and can delete unrelated facts.
+                let matches_key_cross_category = |f: &crate::traits::Fact| -> bool {
+                    if f.superseded_at.is_some() {
+                        return false;
                     }
-                    None => Ok(format!("No active fact found matching key '{}' in any category. Use manage_memories(action='list') to see stored facts and their exact keys.", key)),
+                    f.key == key || canon(&f.key) == key_canonical
+                };
+
+                let mut to_delete: Vec<(i64, String, String)> = Vec::new();
+                let mut seen_ids = std::collections::HashSet::new();
+
+                let facts = self.state.get_facts(Some(category)).await?;
+                for f in &facts {
+                    if matches_key_in_category(f) && seen_ids.insert(f.id) {
+                        to_delete.push((f.id, f.category.clone(), f.key.clone()));
+                    }
+                }
+
+                // Also check OTHER categories for exact/canonical duplicates only.
+                let all_facts = self.state.get_facts(None).await?;
+                for f in &all_facts {
+                    if f.category == category {
+                        continue;
+                    }
+                    if matches_key_cross_category(f) && seen_ids.insert(f.id) {
+                        to_delete.push((f.id, f.category.clone(), f.key.clone()));
+                    }
+                }
+
+                if to_delete.is_empty() {
+                    Ok(format!("No active fact found matching key '{}' in any category. Use manage_memories(action='list') to see stored facts and their exact keys.", key))
+                } else {
+                    let mut forgotten = Vec::new();
+                    for (id, cat, k) in &to_delete {
+                        self.state.delete_fact(*id).await?;
+                        forgotten.push(format!("[{}] {}", cat, k));
+                    }
+                    Ok(format!("Forgotten {} fact(s): {}", forgotten.len(), forgotten.join(", ")))
                 }
             }
             "set_privacy" => {
@@ -521,7 +549,7 @@ impl Tool for ManageMemoriesTool {
                         }
                     })
                     .collect();
-                scored.sort_by(|a, b| b.1.cmp(&a.1));
+                scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
                 let matches: Vec<_> = scored.iter().map(|(f, _)| *f).collect();
 
                 if matches.is_empty() {
@@ -2752,5 +2780,216 @@ mod tests {
             goals.iter().all(|g| g.description != "Partial failure"),
             "No goal should be created when any schedule fails to parse"
         );
+    }
+
+    /// Regression: an empty / whitespace `key` to `forget` previously matched
+    /// every fact via `fk.contains("")` and wiped all active facts across all
+    /// categories. The action must refuse to run instead.
+    #[tokio::test]
+    async fn forget_rejects_empty_or_whitespace_key() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        for (cat, key, val) in [
+            ("preferences", "favorite_color", "blue"),
+            ("preferences", "favorite_food", "tacos"),
+            ("personal", "birthday", "1990-01-01"),
+        ] {
+            state
+                .upsert_fact(cat, key, val, "test", None, FactPrivacy::Global)
+                .await
+                .unwrap();
+        }
+
+        for blank in ["", "   ", "\t", "\n"] {
+            let err = tool
+                .call(
+                    &json!({
+                        "action": "forget",
+                        "category": "preferences",
+                        "key": blank,
+                    })
+                    .to_string(),
+                )
+                .await
+                .expect_err("blank key must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("empty") || msg.contains("whitespace"),
+                "expected refusal message, got {msg:?}"
+            );
+        }
+
+        // All facts should still be present.
+        let remaining = state.get_facts(None).await.unwrap();
+        let active = remaining
+            .iter()
+            .filter(|f| f.superseded_at.is_none())
+            .count();
+        assert_eq!(active, 3, "no facts should have been deleted");
+    }
+
+    /// Regression: single-character keys are also too broad to use for substring
+    /// matching across the fact store.
+    #[tokio::test]
+    async fn forget_rejects_single_character_key() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        state
+            .upsert_fact(
+                "preferences",
+                "favorite_color",
+                "blue",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        let err = tool
+            .call(
+                &json!({
+                    "action": "forget",
+                    "category": "preferences",
+                    "key": "a",
+                })
+                .to_string(),
+            )
+            .await
+            .expect_err("single-character key must be rejected");
+        assert!(err.to_string().contains("at least 2 characters"));
+
+        let remaining = state.get_facts(None).await.unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|f| f.superseded_at.is_none())
+                .count(),
+            1
+        );
+    }
+
+    /// Substring matching is still allowed within the explicitly-requested
+    /// category — the caller knows what they are targeting there.
+    #[tokio::test]
+    async fn forget_substring_matches_within_requested_category() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        state
+            .upsert_fact(
+                "preferences",
+                "favorite_color",
+                "blue",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        state
+            .upsert_fact(
+                "personal",
+                "color_of_car",
+                "red",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "forget",
+                    "category": "preferences",
+                    "key": "color",
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Forgotten"), "got: {result}");
+
+        // Only the `preferences` fact (substring match) should be gone.
+        // The `personal.color_of_car` substring match must NOT be deleted
+        // because cross-category sweep only allows exact/canonical matches.
+        let remaining = state.get_facts(None).await.unwrap();
+        let active: Vec<_> = remaining
+            .iter()
+            .filter(|f| f.superseded_at.is_none())
+            .collect();
+        assert_eq!(active.len(), 1, "got: {active:?}");
+        assert_eq!(active[0].category, "personal");
+        assert_eq!(active[0].key, "color_of_car");
+    }
+
+    /// Cross-category sweep should still catch exact-key duplicates (the
+    /// original "in case duplicates exist elsewhere" intent), but only via
+    /// exact or canonical match — never substring.
+    #[tokio::test]
+    async fn forget_cross_category_only_exact_or_canonical() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        // Exact duplicate across categories should be cleaned up.
+        state
+            .upsert_fact(
+                "preferences",
+                "favorite_color",
+                "blue",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        state
+            .upsert_fact(
+                "personal",
+                "favorite_color",
+                "blue",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        // An unrelated fact whose key contains "color" — must NOT be deleted.
+        state
+            .upsert_fact(
+                "personal",
+                "color_of_car",
+                "red",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "forget",
+                    "category": "preferences",
+                    "key": "favorite_color",
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Forgotten 2 fact"), "got: {result}");
+
+        let remaining = state.get_facts(None).await.unwrap();
+        let active: Vec<_> = remaining
+            .iter()
+            .filter(|f| f.superseded_at.is_none())
+            .collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].key, "color_of_car");
     }
 }

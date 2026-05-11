@@ -489,24 +489,23 @@ fn classify_single_segment(segment: &str) -> RiskAssessment {
     // Cloud provider / infrastructure commands with destructive sub-commands
     let has_sub = |sub: &str| parts.iter().skip(1).any(|a| a == sub);
     match base_cmd {
-        "find" => {
-            if uses_find_delete(&parts) {
-                level = std::cmp::max(level, RiskLevel::High);
-                warnings.push("'find -delete' removes files immediately".to_string());
-                if find_roots(&parts)
-                    .iter()
-                    .any(|root| is_broad_or_sensitive_delete_target(root))
-                {
-                    level = RiskLevel::Critical;
-                    warnings.push("'find -delete' targets a broad or sensitive path".to_string());
-                }
+        "find" if uses_find_delete(&parts) => {
+            level = std::cmp::max(level, RiskLevel::High);
+            warnings.push("'find -delete' removes files immediately".to_string());
+            if find_roots(&parts)
+                .iter()
+                .any(|root| is_broad_or_sensitive_delete_target(root))
+            {
+                level = RiskLevel::Critical;
+                warnings.push("'find -delete' targets a broad or sensitive path".to_string());
             }
         }
-        "wrangler" | "npx" if parts.iter().any(|a| a == "wrangler") => {
-            if has_sub("delete") || has_sub("destroy") {
-                level = std::cmp::max(level, RiskLevel::High);
-                warnings.push("Cloud resource deletion (wrangler)".to_string());
-            }
+        "wrangler" | "npx"
+            if parts.iter().any(|a| a == "wrangler")
+                && (has_sub("delete") || has_sub("destroy")) =>
+        {
+            level = std::cmp::max(level, RiskLevel::High);
+            warnings.push("Cloud resource deletion (wrangler)".to_string());
         }
         "terraform" => {
             if has_sub("destroy") {
@@ -517,26 +516,21 @@ fn classify_single_segment(segment: &str) -> RiskAssessment {
                 warnings.push("'terraform apply' modifies infrastructure".to_string());
             }
         }
-        "kubectl" => {
-            if has_sub("delete") {
-                level = std::cmp::max(level, RiskLevel::High);
-                warnings.push("'kubectl delete' removes Kubernetes resources".to_string());
-            }
+        "kubectl" if has_sub("delete") => {
+            level = std::cmp::max(level, RiskLevel::High);
+            warnings.push("'kubectl delete' removes Kubernetes resources".to_string());
         }
-        "aws" => {
-            if parts
-                .iter()
-                .any(|a| a.contains("delete") || a.contains("remove") || a.contains("terminate"))
-            {
-                level = std::cmp::max(level, RiskLevel::High);
-                warnings.push("AWS destructive operation".to_string());
-            }
+        "aws"
+            if parts.iter().any(|a| {
+                a.contains("delete") || a.contains("remove") || a.contains("terminate")
+            }) =>
+        {
+            level = std::cmp::max(level, RiskLevel::High);
+            warnings.push("AWS destructive operation".to_string());
         }
-        "gcloud" => {
-            if has_sub("delete") || has_sub("destroy") {
-                level = std::cmp::max(level, RiskLevel::High);
-                warnings.push("Google Cloud destructive operation".to_string());
-            }
+        "gcloud" if has_sub("delete") || has_sub("destroy") => {
+            level = std::cmp::max(level, RiskLevel::High);
+            warnings.push("Google Cloud destructive operation".to_string());
         }
         _ => {}
     }
