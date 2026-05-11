@@ -395,18 +395,15 @@ pub(super) fn looks_like_personal_memory_store_request(user_text: &str) -> bool 
     if lower.is_empty() {
         return false;
     }
-    // Imperative store verbs at the start or after common prefixes
-    contains_keyword_as_words(&lower, "remember")
-        || contains_keyword_as_words(&lower, "memorize")
-        || contains_keyword_as_words(&lower, "store")
-        || contains_keyword_as_words(&lower, "save")
-        || contains_keyword_as_words(&lower, "note that")
-        || contains_keyword_as_words(&lower, "keep in mind")
-        || contains_keyword_as_words(&lower, "learn that")
-        || contains_keyword_as_words(&lower, "learn this")
-        || contains_keyword_as_words(&lower, "record that")
-        || contains_keyword_as_words(&lower, "record this")
-        || contains_keyword_as_words(&lower, "update my")
+    // Recall guardrail is the lenient site: a false positive here just keeps
+    // the tool palette wider, while a false negative blocks a legitimate
+    // store request. Combine the lenient single-word verbs with the strict
+    // multi-word phrases so any keyword recognized by the schedule gate is
+    // also recognized here.
+    crate::agent::intent_keywords::MEMORY_STORE_LENIENT_VERBS
+        .iter()
+        .chain(crate::agent::intent_keywords::MEMORY_STORE_STRICT_PHRASES.iter())
+        .any(|kw| contains_keyword_as_words(&lower, kw))
 }
 
 pub(crate) fn looks_like_personal_memory_recall_question(user_text: &str) -> bool {

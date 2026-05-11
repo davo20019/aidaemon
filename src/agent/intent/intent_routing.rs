@@ -164,60 +164,26 @@ fn is_memory_storage_intent(user_text: &str) -> bool {
     }
 
     // Memory-storage verb phrases — user wants to store a fact, not schedule.
-    let memory_verbs = [
-        "remember that",
-        "remember my",
-        "remember i",
-        "remember these",
-        "remember this",
-        "remember the following",
-        "note that",
-        "note my",
-        "note these",
-        "note this",
-        "save that",
-        "save these",
-        "save this",
-        "store these",
-        "store this",
-        "store that",
-        "keep in mind",
-        "keep track of",
-        "don't forget",
-        "do not forget",
-        "memorize",
-    ];
-    let has_memory_verb = memory_verbs
+    // Uses the strict (multi-word) precision level: this classifier gates the
+    // schedule heuristic, so a false positive would silently swallow a real
+    // reminder request.
+    let has_memory_verb = crate::agent::intent_keywords::MEMORY_STORE_STRICT_PHRASES
         .iter()
         .any(|kw| contains_keyword_as_words(&lower, kw));
 
-    // Also detect fact-storage context even without a leading verb:
-    // "facts about me", "things about me", "info about me"
-    let fact_storage_context = [
-        "facts about me",
-        "things about me",
-        "info about me",
-        "information about me",
-        "details about me",
-    ];
-    let has_fact_context = fact_storage_context.iter().any(|kw| lower.contains(kw));
+    // Fact-storage context phrases catch messages without a leading verb
+    // (e.g., "here are some facts about me").
+    let has_fact_context = crate::agent::intent_keywords::MEMORY_STORE_FACT_CONTEXTS
+        .iter()
+        .any(|kw| lower.contains(kw));
 
     if !has_memory_verb && !has_fact_context {
         return false;
     }
 
-    // Confirm the date appears in a fact-stating context, not a scheduling one.
-    // If the message also contains explicit scheduling verbs, let the scheduler win.
-    let scheduling_verbs = [
-        "schedule",
-        "remind me",
-        "set a reminder",
-        "alert me",
-        "notify me",
-        "ping me",
-        "wake me",
-    ];
-    let has_scheduling_verb = scheduling_verbs
+    // If the message also contains explicit scheduling verbs, let the
+    // scheduler win — the date is meant as a trigger, not a fact.
+    let has_scheduling_verb = crate::agent::intent_keywords::SCHEDULING_VERB_PHRASES
         .iter()
         .any(|kw| contains_keyword_as_words(&lower, kw));
 

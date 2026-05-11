@@ -92,6 +92,8 @@ use response_analysis::{
     is_substantive_text_response, looks_like_deferred_action_response,
     looks_like_multi_part_request,
 };
+#[path = "intent/keywords.rs"]
+mod intent_keywords;
 #[path = "intent/intent_routing.rs"]
 mod intent_routing;
 use intent_routing::{

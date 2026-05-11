@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.33] - 2026-05-10
+
+### Changed
+
+- **Centralized intent keyword constants**: Memory-storage / scheduling vocabulary previously duplicated between `intent_routing::is_memory_storage_intent` and `policy::recall_guardrails::looks_like_personal_memory_store_request` now lives in a single `intent_keywords` module. Two precision levels (strict multi-word phrases, lenient single-word verbs) make the false-positive trade-off explicit per call site. Fixes a recurring drift pattern where adding a verb in one detector silently bypassed the other. Invariant test guards against future drift.
+
 ## [0.9.32] - 2026-05-10
 
 ### Security
