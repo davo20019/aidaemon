@@ -78,6 +78,7 @@ async fn test_delegation_executor_hides_competing_tools_when_cli_agent_available
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -120,6 +121,7 @@ async fn test_delegation_executor_keeps_competing_tools_when_cli_agent_unavailab
             ChannelContext::private("test"),
             UserRole::Owner,
             Some(AgentRole::Executor),
+            None,
             None,
             None,
             None,
@@ -167,6 +169,7 @@ async fn test_spawn_child_task_lead_scopes_tools_via_shared_builder() {
             UserRole::Owner,
             Some(AgentRole::TaskLead),
             Some(goal.id.as_str()),
+            None,
             None,
             None,
         )
@@ -321,6 +324,7 @@ async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
             Some(goal.id.as_str()),
             Some(task.id.as_str()),
             Some("/tmp/demo"),
+            None,
         )
         .await
         .unwrap();
@@ -393,6 +397,7 @@ async fn test_executor_spawn_persists_needs_approval_blocker_result() {
             Some(goal.id.as_str()),
             Some(task.id.as_str()),
             Some("/tmp/demo"),
+            None,
         )
         .await
         .unwrap();

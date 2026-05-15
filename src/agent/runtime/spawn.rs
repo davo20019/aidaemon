@@ -1,4 +1,5 @@
 use super::*;
+use crate::traits::SpecialistKind;
 
 struct TaskLeadSpec {
     tools: Vec<Arc<dyn Tool>>,
@@ -8,6 +9,100 @@ struct TaskLeadSpec {
 }
 
 impl Agent {
+    pub(crate) fn select_specialist_kind(
+        role: AgentRole,
+        mission: &str,
+        task: &str,
+    ) -> SpecialistKind {
+        match role {
+            AgentRole::TaskLead => return SpecialistKind::TaskLead,
+            AgentRole::Orchestrator => return SpecialistKind::Generic,
+            AgentRole::Executor => {}
+        }
+
+        let text = format!("{} {}", mission, task).to_ascii_lowercase();
+        let has_marker = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+        let has_word = |needles: &[&str]| {
+            needles
+                .iter()
+                .any(|needle| contains_keyword_as_words(&text, needle))
+        };
+
+        if has_marker(&[".md", "write-up"])
+            || has_word(&[
+                "markdown",
+                "report",
+                "document",
+                "writeup",
+                "save it as",
+                "create a file",
+                "write a file",
+            ])
+        {
+            return SpecialistKind::ArtifactWriter;
+        }
+
+        // Check browser-verifier BEFORE Code so a task like "open the homepage
+        // in the browser and run the smoke test" isn't captured by Code's
+        // `test` keyword.
+        if has_word(&[
+            "browser",
+            "web page",
+            "website",
+            "screenshot",
+            "playwright",
+            "verify ui",
+            "localhost",
+        ]) {
+            return SpecialistKind::BrowserVerifier;
+        }
+
+        // `test` is intentionally specific (`cargo test`, `unit test`, `pytest`)
+        // to avoid matching incidental uses like "smoke test in the browser".
+        if has_marker(&[".rs", ".ts", ".tsx", ".js", ".py"])
+            || has_word(&[
+                "cargo",
+                "cargo test",
+                "unit test",
+                "pytest",
+                "bug",
+                "code",
+                "compile",
+                "refactor",
+                "implement",
+            ])
+        {
+            return SpecialistKind::Code;
+        }
+
+        if has_word(&["review", "audit", "inspect", "risk", "regression"]) {
+            return SpecialistKind::Review;
+        }
+
+        if has_word(&[
+            "research",
+            "look up",
+            "web search",
+            "current",
+            "latest",
+            "source",
+            "sources",
+            "investigate",
+        ]) {
+            return SpecialistKind::Research;
+        }
+
+        if has_word(&["draft", "email", "message", "reply", "comms"]) {
+            return SpecialistKind::CommsDraft;
+        }
+
+        SpecialistKind::Executor
+    }
+
+    pub(crate) fn build_specialist_session_id(kind: SpecialistKind, id: Uuid) -> String {
+        format!("specialist:{}:{}", kind.as_str(), id)
+    }
+
     fn collect_full_child_tools(&self) -> Vec<Arc<dyn Tool>> {
         self.root_tools
             .as_ref()
@@ -497,7 +592,11 @@ impl Agent {
         goal_id: Option<&str>,
         task_id: Option<&str>,
         inherited_project_scope: Option<&str>,
+        arg_specialist: Option<&str>,
     ) -> anyhow::Result<String> {
+        // Task 12 will consume `arg_specialist` for specialist kind resolution.
+        // For now we only thread it through to keep the call sites stable.
+        let _ = arg_specialist;
         if self.depth >= self.max_depth {
             anyhow::bail!(
                 "Cannot spawn sub-agent: max recursion depth ({}) reached",
@@ -709,12 +808,14 @@ impl Agent {
         cancel_token_override: Option<tokio_util::sync::CancellationToken>,
         inherited_project_scope: Option<&str>,
     ) -> anyhow::Result<String> {
-        let child_session = format!("sub-{}-{}", child_depth, Uuid::new_v4());
+        let specialist_kind = Self::select_specialist_kind(role, mission, task);
+        let child_session = Self::build_specialist_session_id(specialist_kind, Uuid::new_v4());
 
         info!(
             parent_depth = self.depth,
             child_depth,
             child_session = %child_session,
+            specialist_kind = specialist_kind.as_str(),
             mission,
             ?role,
             "Spawning sub-agent"
@@ -729,6 +830,7 @@ impl Agent {
                     EventType::SubAgentSpawn,
                     SubAgentSpawnData {
                         child_session_id: child_session.clone(),
+                        specialist_kind: Some(specialist_kind.as_str().to_string()),
                         mission: mission.to_string(),
                         task: task.chars().take(500).collect(),
                         depth: child_depth as u32,
@@ -810,6 +912,7 @@ impl Agent {
                     EventType::SubAgentComplete,
                     SubAgentCompleteData {
                         child_session_id: child_session,
+                        specialist_kind: Some(specialist_kind.as_str().to_string()),
                         success,
                         result_summary: summary,
                         duration_secs: duration.as_secs(),
@@ -919,12 +1022,14 @@ impl Agent {
                 "Task Lead for goal: {}",
                 &goal_description[..goal_description.len().min(100)]
             );
-            let child_session = format!("sub-{}-{}", child_depth, Uuid::new_v4());
+            let specialist_kind = SpecialistKind::TaskLead;
+            let child_session = Self::build_specialist_session_id(specialist_kind, Uuid::new_v4());
 
             info!(
                 parent_depth = self.depth,
                 child_depth,
                 child_session = %child_session,
+                specialist_kind = specialist_kind.as_str(),
                 goal_id,
                 "Spawning task lead"
             );
@@ -940,6 +1045,7 @@ impl Agent {
                         EventType::SubAgentSpawn,
                         SubAgentSpawnData {
                             child_session_id: child_session.clone(),
+                            specialist_kind: Some(specialist_kind.as_str().to_string()),
                             mission: mission.clone(),
                             task: input_text.chars().take(500).collect(),
                             depth: child_depth as u32,
@@ -995,6 +1101,7 @@ impl Agent {
                         EventType::SubAgentComplete,
                         SubAgentCompleteData {
                             child_session_id: child_session,
+                            specialist_kind: Some(specialist_kind.as_str().to_string()),
                             success,
                             result_summary: summary,
                             duration_secs: duration.as_secs(),
@@ -1228,6 +1335,93 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::Agent;
+    use crate::traits::{AgentRole, SpecialistKind};
+    use uuid::Uuid;
+
+    #[test]
+    fn specialist_kind_prefers_artifact_writer_for_report_files() {
+        let kind = Agent::select_specialist_kind(
+            AgentRole::Executor,
+            "Compile and format morning AI job preparation tips report",
+            "Create a markdown report and save it as ~/morning_ai_job_preparation_tips_report.md",
+        );
+        assert_eq!(kind, SpecialistKind::ArtifactWriter);
+    }
+
+    #[test]
+    fn specialist_session_id_uses_kind_prefix() {
+        let id = Uuid::parse_str("344ee9c6-a93f-48ef-84bf-ae3f4d68fc5b").unwrap();
+        let session_id = Agent::build_specialist_session_id(SpecialistKind::Research, id);
+        assert_eq!(
+            session_id,
+            "specialist:research:344ee9c6-a93f-48ef-84bf-ae3f4d68fc5b"
+        );
+    }
+
+    #[test]
+    fn specialist_session_id_format_holds_for_every_kind() {
+        let id = Uuid::parse_str("344ee9c6-a93f-48ef-84bf-ae3f4d68fc5b").unwrap();
+        let kinds = [
+            SpecialistKind::TaskLead,
+            SpecialistKind::Executor,
+            SpecialistKind::Research,
+            SpecialistKind::ArtifactWriter,
+            SpecialistKind::Code,
+            SpecialistKind::BrowserVerifier,
+            SpecialistKind::Review,
+            SpecialistKind::CommsDraft,
+            SpecialistKind::Generic,
+        ];
+        for kind in kinds {
+            let session_id = Agent::build_specialist_session_id(kind, id);
+            assert!(
+                session_id.starts_with("specialist:"),
+                "{:?}: missing prefix in {}",
+                kind,
+                session_id
+            );
+            let expected_segment = format!(":{}:", kind.as_str());
+            assert!(
+                session_id.contains(&expected_segment),
+                "{:?}: missing kind segment in {}",
+                kind,
+                session_id
+            );
+            assert!(
+                session_id.ends_with(&id.to_string()),
+                "{:?}: missing uuid suffix in {}",
+                kind,
+                session_id
+            );
+        }
+    }
+
+    #[test]
+    fn specialist_session_ids_are_unique_per_invocation() {
+        let a = Agent::build_specialist_session_id(SpecialistKind::Code, Uuid::new_v4());
+        let b = Agent::build_specialist_session_id(SpecialistKind::Code, Uuid::new_v4());
+        assert_ne!(a, b, "fresh uuids must produce unique session ids");
+    }
+
+    #[test]
+    fn specialist_kind_browser_check_wins_over_code_for_smoke_tests() {
+        let kind = Agent::select_specialist_kind(
+            AgentRole::Executor,
+            "Smoke-check the landing page",
+            "Open the homepage in a browser and run the smoke test",
+        );
+        assert_eq!(kind, SpecialistKind::BrowserVerifier);
+    }
+
+    #[test]
+    fn specialist_kind_code_still_wins_for_cargo_test() {
+        let kind = Agent::select_specialist_kind(
+            AgentRole::Executor,
+            "Fix the broken assertion in math::add",
+            "Run cargo test until the failing case in src/math.rs passes",
+        );
+        assert_eq!(kind, SpecialistKind::Code);
+    }
 
     #[test]
     fn executor_prompt_includes_search_files_preference() {

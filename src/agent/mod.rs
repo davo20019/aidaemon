@@ -2644,6 +2644,7 @@ pub fn spawn_background_task_lead(
                 Some(goal_id.as_str()),
                 None,
                 None,
+                None, // arg_specialist (task lead spawn — not LLM-tool-selectable)
             )
             .await;
 
@@ -2856,6 +2857,7 @@ pub fn spawn_background_task_lead(
                             Some(goal_id.as_str()),
                             Some(task.id.as_str()),
                             None,
+                            None, // arg_specialist (task-lead dispatch — not from LLM tool call)
                         )
                         .await;
 
@@ -3311,6 +3313,7 @@ pub fn spawn_background_task_lead(
                     None, // no goal_id — prevents goal re-entry
                     None,
                     None,
+                    None, // arg_specialist (direct executor fallback — no LLM tool selection)
                 )
                 .await;
 

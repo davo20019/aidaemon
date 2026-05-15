@@ -233,6 +233,12 @@ struct SpawnArgs {
     /// Task ID — when provided by a task lead, the executor tracks activity against this task.
     #[serde(default)]
     task_id: Option<String>,
+    /// Optional specialist profile hint. The parent LLM can pick one of the supported
+    /// kinds (code, browser_verifier, artifact_writer, research, review, comms_draft,
+    /// executor, generic) so the child agent uses the matching profile. Threaded
+    /// through `spawn_child`; Task 12 wires it into kind resolution.
+    #[serde(default)]
+    specialist: Option<String>,
     /// Session ID injected by execute_tool — used for background completion notifications.
     #[serde(default)]
     _session_id: Option<String>,
@@ -309,13 +315,27 @@ impl Tool for SpawnAgentTool {
                     "background": {
                         "type": "boolean",
                         "description": "When true, spawn the sub-agent in the background and return immediately. \
-                            The result will be sent as a message when the sub-agent finishes. \
+                            The result will be delivered through the parent session when the sub-agent finishes. \
                             Use this for long-running tasks where the user doesn't need to wait.",
                         "default": false
                     },
                     "task_id": {
                         "type": "string",
                         "description": "Task ID to associate with this executor (used by task leads to connect executor work to task tracking)"
+                    },
+                    "specialist": {
+                        "type": "string",
+                        "enum": [
+                            "code",
+                            "browser_verifier",
+                            "artifact_writer",
+                            "research",
+                            "review",
+                            "comms_draft",
+                            "executor",
+                            "generic"
+                        ],
+                        "description": "Optional. Pick the specialist profile matching this task. Omit to let the agent infer one from mission/task text."
                     }
                 },
                 "required": ["mission", "task"],
@@ -449,6 +469,7 @@ impl Tool for SpawnAgentTool {
                     goal_id_ref.as_deref(),
                     task_id_ref.as_deref(),
                     args._project_scope.as_deref(),
+                    args.specialist.as_deref(),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -460,6 +481,7 @@ impl Tool for SpawnAgentTool {
         // Background mode: need at least one completion delivery path.
         let hub = self.get_hub();
         let state = self.state.clone();
+        let hub_for_parent_delivery = hub.as_ref().map(Arc::downgrade);
         if hub.is_none() && state.is_none() {
             info!(
                 "Background mode requested but no hub/state notification path is available, falling back to sync"
@@ -476,6 +498,7 @@ impl Tool for SpawnAgentTool {
                     goal_id_ref.as_deref(),
                     task_id_ref.as_deref(),
                     args._project_scope.as_deref(),
+                    args.specialist.as_deref(),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -499,6 +522,7 @@ impl Tool for SpawnAgentTool {
                         goal_id_ref.as_deref(),
                         task_id_ref.as_deref(),
                         args._project_scope.as_deref(),
+                        args.specialist.as_deref(),
                     )
                     .await;
                 if let Some(ref task_id) = executor_task_id {
@@ -523,6 +547,8 @@ impl Tool for SpawnAgentTool {
                 tokio::time::interval(Duration::from_secs(BACKGROUND_PROGRESS_INTERVAL_SECS));
             progress_interval.tick().await; // consume immediate tick
             let timeout_duration = Duration::from_secs(timeout_secs);
+            let arg_specialist_owned: Option<String> = args.specialist.clone();
+            let arg_specialist = arg_specialist_owned.as_deref();
             let mut result_fut = std::pin::pin!(tokio::time::timeout(
                 timeout_duration,
                 agent.spawn_child(
@@ -535,6 +561,7 @@ impl Tool for SpawnAgentTool {
                     goal_id_ref.as_deref(),
                     task_id_ref.as_deref(),
                     args._project_scope.as_deref(),
+                    arg_specialist,
                 ),
             ));
             let result = loop {
@@ -599,16 +626,40 @@ impl Tool for SpawnAgentTool {
                     ),
                 ),
             };
-            deliver_background_notification(
-                hub.as_ref(),
-                state.as_ref(),
-                &notify_goal_id,
-                &session_id,
-                notification_type,
-                &message,
-                "spawn_agent background completion notifier",
-            )
-            .await;
+            let delivered = match agent
+                .deliver_parent_text_result(
+                    hub_for_parent_delivery.as_ref(),
+                    &session_id,
+                    &message,
+                    crate::agent::ParentDeliveryKind::BackgroundSpawnResult,
+                )
+                .await
+            {
+                Ok(outcome) => outcome.sent,
+                Err(e) => {
+                    warn!(
+                        session_id = %session_id,
+                        goal_id = %notify_goal_id,
+                        notification_type = %notification_type,
+                        error = %e,
+                        "spawn_agent background completion notifier: parent delivery failed"
+                    );
+                    false
+                }
+            };
+
+            if !delivered {
+                deliver_background_notification(
+                    None,
+                    state.as_ref(),
+                    &notify_goal_id,
+                    &session_id,
+                    notification_type,
+                    &message,
+                    "spawn_agent background completion notifier",
+                )
+                .await;
+            }
 
             if let Some(task_id) = executor_task_id_for_bg {
                 executor_task_runs.lock().await.remove(&task_id);
@@ -617,7 +668,7 @@ impl Tool for SpawnAgentTool {
 
         Ok(format!(
             "Sub-agent spawned in background for mission: \"{}\". \
-             The result will be sent as a message when it completes.",
+             The result will be delivered through the parent session when it completes.",
             args.mission
         ))
     }
@@ -638,6 +689,7 @@ impl SpawnAgentTool {
         goal_id: Option<&str>,
         task_id: Option<&str>,
         project_scope: Option<&str>,
+        arg_specialist: Option<&str>,
     ) -> anyhow::Result<String> {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
         let result = tokio::time::timeout(
@@ -652,6 +704,7 @@ impl SpawnAgentTool {
                 goal_id,
                 task_id,
                 project_scope,
+                arg_specialist,
             ),
         )
         .await;
@@ -856,5 +909,53 @@ mod tests {
                 && entry.notification_type == "progress"
                 && entry.message.contains("still running")
         }));
+    }
+}
+
+#[cfg(test)]
+mod specialist_arg_tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn schema_props() -> Value {
+        let tool = SpawnAgentTool::new_deferred(8192, 60);
+        let schema = tool.schema();
+        schema
+            .get("parameters")
+            .and_then(|p| p.get("properties"))
+            .cloned()
+            .expect("schema has properties")
+    }
+
+    #[test]
+    fn schema_advertises_specialist_arg_with_enum() {
+        let props = schema_props();
+        let specialist = props
+            .get("specialist")
+            .expect("specialist property declared in schema");
+        let kinds = specialist
+            .get("enum")
+            .and_then(|v| v.as_array())
+            .expect("specialist has enum array");
+        let names: Vec<&str> = kinds.iter().filter_map(|v| v.as_str()).collect();
+        for expected in [
+            "code",
+            "browser_verifier",
+            "artifact_writer",
+            "research",
+            "review",
+            "comms_draft",
+            "executor",
+            "generic",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing {} from enum: {:?}",
+                expected,
+                names
+            );
+        }
+        // task_lead is NOT a parent-LLM-selectable value (role-typed only).
+        assert!(!names.contains(&"task_lead"));
     }
 }

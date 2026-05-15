@@ -753,6 +753,7 @@ async fn test_scheduled_goal_spawned_executor_tool_calls_inherit_trust_from_goal
             Some(goal.id.as_str()),
             Some(child_task.id.as_str()),
             None,
+            None,
         )
         .await
         .unwrap();
