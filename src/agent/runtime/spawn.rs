@@ -1009,7 +1009,7 @@ impl Agent {
     }
 
     /// Build system prompt for a Task Lead agent.
-    fn build_task_lead_prompt(
+    pub(in crate::agent) fn build_task_lead_prompt(
         goal_id: &str,
         goal_description: &str,
         goal_context: Option<&str>,
@@ -1134,7 +1134,7 @@ impl Agent {
         dirs
     }
 
-    fn build_executor_prompt(
+    pub(in crate::agent) fn build_executor_prompt(
         task_description: &str,
         parent_mission: &str,
         depth: usize,

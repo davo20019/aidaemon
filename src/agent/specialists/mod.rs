@@ -9,6 +9,9 @@ mod parse;
 mod registry;
 mod render;
 
+#[cfg(test)]
+mod equivalence_tests;
+
 #[allow(unused_imports)]
 // re-exported for downstream consumers; registry uses super::parse path
 pub use parse::parse_specialist;
