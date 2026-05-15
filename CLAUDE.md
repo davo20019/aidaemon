@@ -262,3 +262,15 @@ cargo run --bin db_probe --features encryption -- --token-hours 24
 ## MCP Tools
 
 - When using chrome-devtools, prefer `take_screenshot` over `take_snapshot` to save tokens. Only use `take_snapshot` when you specifically need element UIDs for interaction (clicking, filling, etc.).
+
+## Specialist Experts System
+- **Storage**: bundled `specialists/<kind>.md` (`include_str!`) + user overrides at `~/.aidaemon/specialists/` (configurable via `config.specialists_override_dir`)
+- **Module**: `src/agent/specialists/` (`mod.rs`, `parse.rs`, `registry.rs`, `render.rs`, `validation.rs`; `cfg(test)` `override_tests.rs`, `equivalence_tests.rs`)
+- **Frontmatter**: kind, description, optional model/tools/max_iterations/tool_budget/timeout_secs
+- **Template vars**: `{{mission}}` `{{task}}` `{{depth}}` `{{max_depth}}` `{{max_iterations}}` `{{goal_id}}` `{{working_dir}}` `{{is_scheduled}}` `{{parent_session_id}}` `{{execution_mode}}`
+- **Migration safety**: byte-equivalence with legacy `build_task_lead_prompt` / `build_executor_prompt` asserted in `src/agent/specialists/equivalence_tests.rs` over 12 fixtures (depth × is_scheduled × has_cli_agent). Legacy fns retained as `#[cfg(test)]` oracle.
+- **Spawn integration**: `spawn_agent` schema gains optional `specialist` arg (8-value enum, `task_lead` excluded). `Agent::resolve_specialist_kind` chooses: role-wins → arg-wins-if-non-task-lead → heuristic fallback.
+- **Tool allowlist**: intersected with the role-pre-filtered tool set via `intersect_tools` (role boundary enforced upstream by the spawn-flow role filter).
+- **Budgets**: `max_iterations` and `timeout_secs` clamped via `clamp_max_iterations`/`clamp_timeout` (timeout cap: `self.timeout_secs` if >0 else 3600).
+- **Telemetry**: spawn `tracing::info!` includes `specialist_source` (`"bundled"` | `"user_override"`).
+- **Defaults**: bundled `task_lead.md` and `executor.md` are byte-for-byte the legacy prompt content (verified by equivalence tests).

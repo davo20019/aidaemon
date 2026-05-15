@@ -1625,6 +1625,10 @@ pub struct SubagentsConfig {
     /// Defaults to 500,000. Set to 0 to disable (unlimited).
     #[serde(default = "default_task_token_budget")]
     pub task_token_budget: Option<u64>,
+    /// Optional directory of user-override specialist `.md` files.
+    /// Default: `~/.aidaemon/specialists/` (resolved at construction time if absent).
+    #[serde(default)]
+    pub specialists_override_dir: Option<PathBuf>,
 }
 
 impl SubagentsConfig {
@@ -1661,6 +1665,7 @@ impl Default for SubagentsConfig {
             iteration_limit: IterationLimitConfig::default(),
             task_timeout_secs: default_task_timeout_secs(),
             task_token_budget: default_task_token_budget(),
+            specialists_override_dir: None,
         }
     }
 }

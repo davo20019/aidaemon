@@ -178,7 +178,7 @@ mod history;
 mod orchestration_phase;
 #[path = "runtime/parent_delivery.rs"]
 mod parent_delivery;
-mod specialists;
+pub(crate) mod specialists;
 pub(crate) use parent_delivery::ParentDeliveryKind;
 #[path = "loop/response_phase.rs"]
 mod response_phase;
@@ -1671,6 +1671,10 @@ pub struct Agent {
     /// bypassed and this budget is used instead.
     #[cfg(test)]
     execution_budget_override: Option<ExecutionBudget>,
+    /// Per-process specialist registry (bundled + user-override `.md` files).
+    /// Loaded once at agent construction and shared with every child agent
+    /// spawned from this hierarchy.
+    pub(crate) specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
 }
 
 /// Blocked path patterns for auto-sent files (mirrors SendFileTool).
@@ -3574,6 +3578,7 @@ impl Agent {
         policy_config: PolicyConfig,
         path_aliases: PathAliasConfig,
         inherited_project_scope: Option<String>,
+        specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
     ) -> Self {
         init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
         let fallback = if let Some(router) = llm_runtime.router() {
@@ -3652,6 +3657,7 @@ impl Agent {
             current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             #[cfg(test)]
             execution_budget_override: None,
+            specialists,
         }
     }
 
@@ -3762,6 +3768,7 @@ impl Agent {
         path_aliases: PathAliasConfig,
         inherited_project_scope: Option<String>,
         root_tools: Option<Vec<Arc<dyn Tool>>>,
+        specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
     ) -> Self {
         let fallback = llm_runtime
             .router()
@@ -3811,6 +3818,7 @@ impl Agent {
             current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             #[cfg(test)]
             execution_budget_override: None,
+            specialists,
         }
     }
 

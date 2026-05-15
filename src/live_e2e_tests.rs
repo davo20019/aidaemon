@@ -144,6 +144,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
         crate::config::PolicyConfig::default(),
         crate::config::PathAliasConfig::default(),
         None,
+        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
     );
 
     let channel = Arc::new(TestChannel::new());
@@ -332,6 +333,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
         crate::config::PolicyConfig::default(),
         crate::config::PathAliasConfig::default(),
         None,
+        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
     );
 
     let channel = Arc::new(TestChannel::new());

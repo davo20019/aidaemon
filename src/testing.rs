@@ -447,6 +447,7 @@ async fn setup_test_agent_internal(
         crate::config::PolicyConfig::default(),
         crate::config::PathAliasConfig::default(),
         None,
+        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
     );
 
     if use_test_executor_mode {
@@ -547,6 +548,7 @@ pub async fn setup_test_agent_with_models(
         crate::config::PolicyConfig::default(),
         crate::config::PathAliasConfig::default(),
         None,
+        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
     );
     // Note: keeps orchestrator mode (depth=0) — used by orchestration tests
 
@@ -632,6 +634,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         crate::config::PolicyConfig::default(),
         crate::config::PathAliasConfig::default(),
         None,
+        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
     );
 
     let channel = Arc::new(TestChannel::new());
@@ -863,6 +866,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         crate::config::PolicyConfig::default(),
         crate::config::PathAliasConfig::default(),
         None,
+        Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
     );
 
     // Set executor mode so tests exercise the execution loop directly

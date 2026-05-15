@@ -241,6 +241,17 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // Goal token registry for cancellation hierarchy
     let goal_token_registry = crate::goal_tokens::GoalTokenRegistry::new();
 
+    // Specialist registry: bundled `.md` files + optional user overrides.
+    // Loaded once at startup and shared across the entire agent hierarchy.
+    let specialists_dir = config
+        .subagents
+        .specialists_override_dir
+        .clone()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".aidaemon").join("specialists")));
+    let specialists = std::sync::Arc::new(crate::agent::specialists::SpecialistRegistry::load(
+        specialists_dir.as_deref(),
+    ));
+
     let agent = Arc::new(Agent::new(
         llm_runtime.clone(),
         state.clone(),
@@ -269,6 +280,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         config.policy.clone(),
         config.path_aliases.clone(),
         None,
+        specialists,
     ));
 
     // Close the loop: give the spawn tool a weak reference to the agent.
@@ -1253,7 +1265,7 @@ fn build_base_system_prompt(config: &AppConfig, skill_names: &[String]) -> Strin
             The sub-agent gets its own reasoning loop with access to all tools. \
             Use this when a task benefits from isolated, focused context. \
             Set `background: true` for long-running tasks — the agent returns immediately and \
-            the result is sent as a message when the sub-agent finishes. \
+            the result is delivered through the parent session when the sub-agent finishes. \
             Sub-agents can nest up to {} levels deep.",
             config.subagents.max_depth
         )

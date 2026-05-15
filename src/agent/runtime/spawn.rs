@@ -441,11 +441,8 @@ impl Agent {
             .flatten()
             .and_then(|g| g.context);
 
-        // TODO(Task 13): move SpecialistRegistry to Agent::new and store as
-        // `Arc<SpecialistRegistry>` field; for now we load per-spawn.
-        let registry = SpecialistRegistry::load(None);
         let system_prompt = Self::compose_task_lead_prompt_from_registry(
-            &registry,
+            &self.specialists,
             goal_id,
             goal_description,
             goal_context.as_deref(),
@@ -823,6 +820,7 @@ impl Agent {
             self.path_aliases.clone(),
             inherited_project_scope,
             root_tools,
+            self.specialists.clone(),
         ));
 
         if let Some(spawn_tool) = spawn_tool {
@@ -947,12 +945,8 @@ impl Agent {
                             self.state.clone(),
                         )));
                     }
-                    // TODO(Task 13): move SpecialistRegistry to Agent::new
-                    // and store as `Arc<SpecialistRegistry>` field; for now we
-                    // load per-spawn.
-                    let registry = SpecialistRegistry::load(None);
                     let prompt = Self::compose_executor_prompt_from_registry(
-                        &registry,
+                        &self.specialists,
                         task,
                         mission,
                         child_depth,
@@ -1092,10 +1086,7 @@ impl Agent {
         // with a warn (see `intersect_tools`). Budget overrides are clamped
         // via `clamp_max_iterations` / `clamp_timeout`.
         //
-        // TODO(Task 13): move the registry to an Agent field so we don't
-        // reload bundled markdown on every spawn.
-        let registry = SpecialistRegistry::load(None);
-        let def = registry.get(specialist_kind);
+        let def = self.specialists.get(specialist_kind);
         let scoped_tools: Vec<Arc<dyn Tool>> = if let Some(declared) = def.tools.as_deref() {
             let mut scoped = tools.to_vec();
             Self::apply_specialist_tool_allowlist(specialist_kind, declared, &mut scoped);
@@ -1133,11 +1124,17 @@ impl Agent {
             );
         }
 
+        let specialist_source = match self.specialists.get(specialist_kind).source {
+            crate::agent::specialists::SpecialistSource::Bundled => "bundled",
+            crate::agent::specialists::SpecialistSource::UserOverride(_) => "user_override",
+        };
+
         info!(
             parent_depth = self.depth,
             child_depth,
             child_session = %child_session,
             specialist_kind = specialist_kind.as_str(),
+            specialist_source,
             mission,
             ?role,
             "Spawning sub-agent"
@@ -1348,12 +1345,17 @@ impl Agent {
             );
             let specialist_kind = SpecialistKind::TaskLead;
             let child_session = Self::build_specialist_session_id(specialist_kind, Uuid::new_v4());
+            let specialist_source = match self.specialists.get(specialist_kind).source {
+                crate::agent::specialists::SpecialistSource::Bundled => "bundled",
+                crate::agent::specialists::SpecialistSource::UserOverride(_) => "user_override",
+            };
 
             info!(
                 parent_depth = self.depth,
                 child_depth,
                 child_session = %child_session,
                 specialist_kind = specialist_kind.as_str(),
+                specialist_source,
                 goal_id,
                 "Spawning task lead"
             );
