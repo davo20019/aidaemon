@@ -11,6 +11,8 @@ mod render;
 
 #[cfg(test)]
 mod equivalence_tests;
+#[cfg(test)]
+mod override_tests;
 
 #[allow(unused_imports)]
 // re-exported for downstream consumers; registry uses super::parse path
