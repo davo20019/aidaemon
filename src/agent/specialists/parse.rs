@@ -29,7 +29,7 @@ pub fn parse_specialist(
     content: &str,
 ) -> anyhow::Result<SpecialistDef> {
     let (frontmatter_str, body) = split_frontmatter(content)?;
-    let raw: RawFrontmatter = serde_yaml::from_str(frontmatter_str)
+    let raw: RawFrontmatter = serde_yaml::from_str(&frontmatter_str)
         .map_err(|e| anyhow::anyhow!("invalid frontmatter YAML: {}", e))?;
 
     let declared_kind = SpecialistKind::from_str(&raw.kind)
@@ -56,7 +56,7 @@ pub fn parse_specialist(
     Ok(SpecialistDef {
         kind: expected_kind,
         description: raw.description,
-        system_prompt_template: body.to_string(),
+        system_prompt_template: body,
         model: raw.model,
         tools: raw.tools,
         max_iterations: raw.max_iterations,
@@ -66,18 +66,22 @@ pub fn parse_specialist(
     })
 }
 
-fn split_frontmatter(content: &str) -> anyhow::Result<(&str, &str)> {
+fn split_frontmatter(content: &str) -> anyhow::Result<(String, String)> {
     let content = content.trim_start_matches('\u{feff}');
-    let rest = content
-        .strip_prefix("---")
-        .ok_or_else(|| anyhow::anyhow!("missing opening `---` frontmatter delimiter"))?
-        .strip_prefix('\n')
-        .ok_or_else(|| anyhow::anyhow!("frontmatter delimiter must be followed by newline"))?;
+    // Normalize CRLF -> LF once so the rest of the logic deals with a single
+    // line-ending convention. Per spec, both endings must be tolerated.
+    let normalized: String = if content.contains("\r\n") {
+        content.replace("\r\n", "\n")
+    } else {
+        content.to_string()
+    };
+    let rest = normalized
+        .strip_prefix("---\n")
+        .ok_or_else(|| anyhow::anyhow!("missing opening `---\\n` frontmatter delimiter"))?;
     let (frontmatter, body) = rest
         .split_once("\n---\n")
-        .or_else(|| rest.split_once("\n---\r\n"))
         .ok_or_else(|| anyhow::anyhow!("missing closing `---` frontmatter delimiter"))?;
-    Ok((frontmatter, body))
+    Ok((frontmatter.to_string(), body.to_string()))
 }
 
 #[cfg(test)]
@@ -146,5 +150,16 @@ timeout_secs: 600\n\
     fn unknown_frontmatter_keys_are_ignored() {
         let content = "---\nkind: code\ndescription: d.\nfuture_field: nope\n---\nBody.\n";
         assert!(parse_specialist(SpecialistKind::Code, content).is_ok());
+    }
+
+    #[test]
+    fn tolerates_crlf_line_endings() {
+        let content = "---\r\nkind: code\r\ndescription: CRLF specialist.\r\n---\r\n\r\nBody for {{mission}}.\r\n";
+        let def = parse_specialist(SpecialistKind::Code, content).expect("CRLF should parse");
+        assert_eq!(def.kind, SpecialistKind::Code);
+        assert_eq!(def.description, "CRLF specialist.");
+        // After CRLF normalization the body retains LF line endings.
+        assert!(def.system_prompt_template.contains("Body for {{mission}}."));
+        assert!(!def.system_prompt_template.contains('\r'));
     }
 }
