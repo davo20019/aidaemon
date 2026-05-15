@@ -7,12 +7,35 @@ use std::sync::Arc;
 
 mod parse;
 mod registry;
+mod render;
 
 #[allow(unused_imports)]
 // re-exported for downstream consumers; registry uses super::parse path
 pub use parse::parse_specialist;
+#[allow(unused_imports)]
+// re-exported for downstream consumers; registry uses super::render path
+pub use render::render_template;
 
-#[allow(dead_code)] // fields read by Tasks 5-8 (template rendering, model/tool/budget selection)
+#[derive(Debug, Default, Clone)]
+#[allow(dead_code)] // consumed by registry.render and Tasks 5-8
+pub struct SpecialistRenderContext {
+    pub mission: String,
+    pub task: String,
+    pub depth: usize,
+    pub max_depth: usize,
+    pub max_iterations: usize,
+    pub goal_id: String,
+    pub working_dir: String,
+    pub is_scheduled: bool,
+    pub parent_session_id: String,
+    /// Pre-rendered execution-mode paragraph used by `task_lead.md`. The
+    /// task-lead prompt has two variants depending on `is_scheduled`; the
+    /// caller picks the right paragraph and passes it here, so the template
+    /// stays a flat string substitution.
+    pub execution_mode: String,
+}
+
+#[allow(dead_code)] // model/tools/budget/timeout fields consumed by Tasks 5-8
 #[derive(Debug, Clone)]
 pub struct SpecialistDef {
     pub kind: SpecialistKind,

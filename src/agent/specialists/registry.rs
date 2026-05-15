@@ -135,6 +135,11 @@ impl SpecialistRegistry {
     pub fn kinds(&self) -> impl Iterator<Item = SpecialistKind> + '_ {
         self.by_kind.keys().copied()
     }
+
+    pub fn render(&self, kind: SpecialistKind, ctx: &super::SpecialistRenderContext) -> String {
+        let def = self.get(kind);
+        super::render::render_template(&def.system_prompt_template, ctx)
+    }
 }
 
 #[cfg(test)]
