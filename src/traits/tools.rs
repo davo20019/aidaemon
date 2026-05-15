@@ -60,7 +60,7 @@ impl SpecialistKind {
         }
     }
 
-    #[allow(dead_code)] // consumed by specialists registry in upcoming tasks
+    #[allow(dead_code)] // consumed by SpecialistRegistry tests; production wiring in Tasks 5-8
     pub fn all() -> &'static [SpecialistKind] {
         &[
             SpecialistKind::TaskLead,

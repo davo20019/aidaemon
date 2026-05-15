@@ -23,7 +23,7 @@ struct RawFrontmatter {
     extra: std::collections::BTreeMap<String, serde_yaml::Value>,
 }
 
-#[allow(dead_code)] // consumed by registry loader in upcoming tasks
+#[allow(dead_code)] // production wiring lands in Tasks 5-8; covered by tests now
 pub fn parse_specialist(
     expected_kind: SpecialistKind,
     content: &str,
@@ -66,6 +66,7 @@ pub fn parse_specialist(
     })
 }
 
+#[allow(dead_code)] // called from parse_specialist; both wired into production in Tasks 5-8
 fn split_frontmatter(content: &str) -> anyhow::Result<(String, String)> {
     let content = content.trim_start_matches('\u{feff}');
     // Normalize CRLF -> LF once so the rest of the logic deals with a single
