@@ -1,16 +1,13 @@
 //! Pure validators for specialist definitions.
 //!
 //! These helpers clamp untrusted/declared specialist parameters into the
-//! ranges enforced by the spawn flow. They are consumed by Task 12's
-//! spawn-flow integration; until then they are dead from production code's
-//! perspective but exercised by unit tests.
+//! ranges enforced by the spawn flow in `agent/runtime/spawn.rs`.
 
 use crate::traits::SpecialistKind;
 use tracing::warn;
 
 /// Intersect a specialist's tool allowlist with the set of tools its role is
 /// permitted to use. Unknown or out-of-scope tools are dropped with a warn.
-#[allow(dead_code)] // consumed by spawn flow in Task 12
 pub fn intersect_tools(
     kind: SpecialistKind,
     declared: &[String],
@@ -43,7 +40,6 @@ pub fn intersect_tools(
 }
 
 /// Clamp a specialist's `max_iterations` into `[1, cap]`.
-#[allow(dead_code)] // consumed by spawn flow in Task 12
 pub fn clamp_max_iterations(kind: SpecialistKind, declared: usize, cap: usize) -> usize {
     if declared == 0 {
         warn!(kind = %kind.as_str(), "specialist max_iterations=0 → clamped to 1");
@@ -62,7 +58,6 @@ pub fn clamp_max_iterations(kind: SpecialistKind, declared: usize, cap: usize) -
 }
 
 /// Clamp a specialist's `timeout_secs` into `[1, cap]`.
-#[allow(dead_code)] // consumed by spawn flow in Task 12
 pub fn clamp_timeout(kind: SpecialistKind, declared: u64, cap: u64) -> u64 {
     if declared == 0 {
         warn!(kind = %kind.as_str(), "specialist timeout_secs=0 → clamped to 1");

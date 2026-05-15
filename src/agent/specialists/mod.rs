@@ -15,15 +15,15 @@ mod equivalence_tests;
 #[cfg(test)]
 mod override_tests;
 
+// Re-exported for downstream consumers and tests. Internal callers (registry)
+// use the `super::parse` / `super::render` paths directly, so these re-exports
+// are currently unused outside the crate's test code.
 #[allow(unused_imports)]
-// re-exported for downstream consumers; registry uses super::parse path
 pub use parse::parse_specialist;
 #[allow(unused_imports)]
-// re-exported for downstream consumers; registry uses super::render path
 pub use render::render_template;
 
 #[derive(Debug, Default, Clone)]
-#[allow(dead_code)] // consumed by registry.render and Tasks 5-8
 pub struct SpecialistRenderContext {
     pub mission: String,
     pub task: String,
@@ -41,7 +41,11 @@ pub struct SpecialistRenderContext {
     pub execution_mode: String,
 }
 
-#[allow(dead_code)] // model/tools/budget/timeout fields consumed by Tasks 5-8
+// `kind`, `description`, and `tool_budget` are parsed from frontmatter and
+// surfaced for completeness / future consumers (logging, schema generation),
+// but the spawn flow currently does not read them. Keep them on the struct
+// so the parsed representation stays faithful to the on-disk schema.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SpecialistDef {
     pub kind: SpecialistKind,
@@ -55,14 +59,14 @@ pub struct SpecialistDef {
     pub source: SpecialistSource,
 }
 
-#[allow(dead_code)] // variants constructed by registry loader; consumed by Tasks 5-8
 #[derive(Debug, Clone)]
 pub enum SpecialistSource {
     Bundled,
-    UserOverride(PathBuf),
+    // `PathBuf` payload is recorded for diagnostics / future logging; current
+    // production callers only discriminate on the variant tag.
+    UserOverride(#[allow(dead_code)] PathBuf),
 }
 
-#[allow(dead_code)] // production consumers wired in Tasks 5-8; tests cover load/get/kinds now
 #[derive(Debug, Default)]
 pub struct SpecialistRegistry {
     by_kind: std::collections::HashMap<SpecialistKind, Arc<SpecialistDef>>,

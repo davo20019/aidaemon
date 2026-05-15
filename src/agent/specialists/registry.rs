@@ -6,7 +6,6 @@ use tracing::warn;
 use super::parse::parse_specialist;
 use super::{SpecialistDef, SpecialistRegistry, SpecialistSource};
 
-#[allow(dead_code)] // production wiring lands in Tasks 5-8; covered by tests now
 const BUNDLED: &[(SpecialistKind, &str)] = &[
     (
         SpecialistKind::TaskLead,
@@ -46,7 +45,6 @@ const BUNDLED: &[(SpecialistKind, &str)] = &[
     ),
 ];
 
-#[allow(dead_code)] // production wiring lands in Tasks 5-8; covered by tests now
 impl SpecialistRegistry {
     pub fn load(user_dir: Option<&Path>) -> Self {
         let mut by_kind = std::collections::HashMap::new();
@@ -132,6 +130,11 @@ impl SpecialistRegistry {
             .unwrap_or_else(|| panic!("specialist registry missing kind: {}", kind.as_str()))
     }
 
+    // Part of the public registry API for completeness (diagnostics,
+    // introspection, future callers). Production code goes through `get` /
+    // `render` for a specific kind; this iterator currently has no
+    // non-test consumers.
+    #[allow(dead_code)]
     pub fn kinds(&self) -> impl Iterator<Item = SpecialistKind> + '_ {
         self.by_kind.keys().copied()
     }

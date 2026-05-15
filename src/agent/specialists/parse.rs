@@ -4,7 +4,6 @@ use tracing::warn;
 
 use super::{SpecialistDef, SpecialistSource};
 
-#[allow(dead_code)] // fields populated by serde; consumed by loader in upcoming tasks
 #[derive(Debug, Deserialize)]
 struct RawFrontmatter {
     kind: String,
@@ -23,7 +22,6 @@ struct RawFrontmatter {
     extra: std::collections::BTreeMap<String, serde_yaml::Value>,
 }
 
-#[allow(dead_code)] // production wiring lands in Tasks 5-8; covered by tests now
 pub fn parse_specialist(
     expected_kind: SpecialistKind,
     content: &str,
@@ -62,11 +60,12 @@ pub fn parse_specialist(
         max_iterations: raw.max_iterations,
         tool_budget: raw.tool_budget,
         timeout_secs: raw.timeout_secs,
-        source: SpecialistSource::Bundled, // default; overridden by loader in Task 3
+        // Default to Bundled; the registry loader rewrites this to
+        // `UserOverride(path)` when the file came from the user override dir.
+        source: SpecialistSource::Bundled,
     })
 }
 
-#[allow(dead_code)] // called from parse_specialist; both wired into production in Tasks 5-8
 fn split_frontmatter(content: &str) -> anyhow::Result<(String, String)> {
     let content = content.trim_start_matches('\u{feff}');
     // Normalize CRLF -> LF once so the rest of the logic deals with a single
