@@ -1,4 +1,7 @@
 use super::*;
+use crate::agent::specialists::{
+    validation as specialist_validation, SpecialistRegistry, SpecialistRenderContext,
+};
 use crate::traits::SpecialistKind;
 
 struct TaskLeadSpec {
@@ -103,6 +106,260 @@ impl Agent {
         format!("specialist:{}:{}", kind.as_str(), id)
     }
 
+    /// Resolve the effective `SpecialistKind` for a spawn given:
+    /// - explicit role (role-typed spawns ignore the arg),
+    /// - optional caller-supplied `arg_specialist` (from `spawn_agent`'s schema),
+    /// - mission + task text (heuristic fallback).
+    ///
+    /// "task_lead" is role-typed and rejected when passed as an arg (the
+    /// `AgentRole::TaskLead` spawn path produces it). Invalid arg values fall
+    /// through to the executor heuristic and produce a warn log.
+    pub(crate) fn resolve_specialist_kind(
+        role: Option<AgentRole>,
+        arg_specialist: Option<&str>,
+        mission: &str,
+        task: &str,
+    ) -> SpecialistKind {
+        if let Some(role) = role {
+            return Self::select_specialist_kind(role, mission, task);
+        }
+        if let Some(s) = arg_specialist {
+            match SpecialistKind::from_str(s) {
+                Some(kind) if kind != SpecialistKind::TaskLead => return kind,
+                Some(_) => {
+                    // Caller passed "task_lead" but that's role-typed only.
+                    warn!(arg = %s, "ignoring 'task_lead' specialist arg; role-typed only");
+                }
+                None => {
+                    warn!(
+                        arg = %s,
+                        "ignoring invalid specialist arg; falling back to heuristic"
+                    );
+                }
+            }
+        }
+        Self::select_specialist_kind(AgentRole::Executor, mission, task)
+    }
+
+    /// Compute the set of tool names a given child role is permitted to use.
+    /// Used to intersect a specialist's declared tool allowlist with the
+    /// hard role boundary so a specialist cannot escape its role scope.
+    fn role_tool_scope_names(role: Option<AgentRole>, all_tools: &[Arc<dyn Tool>]) -> Vec<String> {
+        match role {
+            Some(AgentRole::Executor) => all_tools
+                .iter()
+                .filter(|t| matches!(t.tool_role(), ToolRole::Action | ToolRole::Universal))
+                .map(|t| t.name().to_string())
+                .collect(),
+            Some(AgentRole::TaskLead) => all_tools
+                .iter()
+                .filter(|t| {
+                    matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal)
+                        || t.name() == "spawn_agent"
+                })
+                .map(|t| t.name().to_string())
+                .collect(),
+            Some(AgentRole::Orchestrator) | None => {
+                all_tools.iter().map(|t| t.name().to_string()).collect()
+            }
+        }
+    }
+
+    /// Apply a specialist's declared tool allowlist to the in-flight tool set,
+    /// intersected with the role scope. Tools outside the intersection are
+    /// dropped. Returns the (possibly unchanged) tool set.
+    fn apply_specialist_tool_allowlist(
+        tools: Vec<Arc<dyn Tool>>,
+        declared: &[String],
+        kind: SpecialistKind,
+        role: Option<AgentRole>,
+        full_tools: &[Arc<dyn Tool>],
+    ) -> Vec<Arc<dyn Tool>> {
+        let scope = Self::role_tool_scope_names(role, full_tools);
+        let scope_refs: Vec<&str> = scope.iter().map(|s| s.as_str()).collect();
+        let known_owned: Vec<String> = full_tools.iter().map(|t| t.name().to_string()).collect();
+        let known: Vec<&str> = known_owned.iter().map(|s| s.as_str()).collect();
+        let permitted = specialist_validation::intersect_tools(kind, declared, &scope_refs, &known);
+        tools
+            .into_iter()
+            .filter(|t| permitted.iter().any(|p| p == t.name()))
+            .collect()
+    }
+
+    /// Render the task-lead system prompt using the `SpecialistRegistry` as the
+    /// source of truth for the base template, then append the same dynamic
+    /// sections (Prior Knowledge, CLI Agent Delegation) the legacy builder
+    /// produced. This keeps byte-equivalence with `build_task_lead_prompt`
+    /// when `goal_context=None` and `has_cli_agent=false`.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_task_lead_prompt_from_registry(
+        registry: &SpecialistRegistry,
+        goal_id: &str,
+        goal_description: &str,
+        goal_context: Option<&str>,
+        depth: usize,
+        max_depth: usize,
+        has_cli_agent: bool,
+        is_scheduled: bool,
+    ) -> String {
+        let execution_mode = if is_scheduled {
+            "You have full tool access including `terminal`. For simple steps (single shell commands, \
+             file writes), execute them directly. For complex multi-step work, you may still delegate \
+             to executors via the workflow below.".to_string()
+        } else {
+            "Your primary job is to plan and delegate work via executors or cli_agent. \
+             However, you also have direct access to essential tools (read_file, write_file, \
+             edit_file, terminal, search_files). Use delegation first, but if delegation fails \
+             (cli_agent errors, spawn_agent blocked, executor failures), switch to direct \
+             execution with your own tools rather than retrying broken delegation paths."
+                .to_string()
+        };
+        let ctx = SpecialistRenderContext {
+            mission: goal_description.to_string(),
+            task: String::new(),
+            depth,
+            max_depth,
+            max_iterations: 0,
+            goal_id: goal_id.to_string(),
+            working_dir: String::new(),
+            is_scheduled,
+            parent_session_id: String::new(),
+            execution_mode,
+        };
+        let mut prompt = registry.render(SpecialistKind::TaskLead, &ctx);
+
+        if let Some(ctx_text) = goal_context {
+            prompt.push_str(&format!(
+                "\n\n## Prior Knowledge\n\
+                 The following knowledge was gathered from previous tasks and may be relevant:\n{}",
+                format_goal_context(ctx_text)
+            ));
+        }
+
+        if has_cli_agent {
+            prompt.push_str(
+                "\n\n## CLI Agent Delegation\n\
+                 You have direct access to `cli_agent` (a specialized coding/research agent running on this machine).\n\
+                 Treat `cli_agent` as a delegation surface, not as a reason to skip task structure.\n\
+                 If the work should stay tied to a claimed task with executor results or blocker handling, claim the task and use `spawn_agent`.\n\
+                 Prefer direct `cli_agent` calls for focused execution-heavy work when you do not need aidaemon-only tools in the child.\n\
+                 When calling `cli_agent`, use `action=\"run\"` and include a non-empty `prompt` describing the work.\n\
+                 Pass `working_dir` whenever the task targets a specific repo or directory.\n\
+                 Example: `cli_agent(action=\"run\", prompt=\"Inspect the latest service logs, patch the root cause, run cargo fmt, and run the narrowest relevant tests\", working_dir=\"/absolute/project/path\")`.\n\
+                 Note: If cli_agent fails repeatedly (auth errors, timeouts, environment issues), do NOT keep retrying. Switch to using your direct tools (read_file, write_file, edit_file, terminal) to complete the work yourself.",
+            );
+        }
+
+        prompt
+    }
+
+    /// Render the executor system prompt using the `SpecialistRegistry` as the
+    /// source of truth for the base template, then splice in the same dynamic
+    /// sections (working directory, task contract, cli-agent suffix) the
+    /// legacy builder produced. Keeps byte-equivalence with
+    /// `build_executor_prompt` when all dynamic inputs are empty.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_executor_prompt_from_registry(
+        registry: &SpecialistRegistry,
+        task_description: &str,
+        parent_mission: &str,
+        depth: usize,
+        max_depth: usize,
+        has_cli_agent: bool,
+        task_id: Option<&str>,
+        project_scope: Option<&str>,
+    ) -> String {
+        let mut all_dirs = Self::extract_directory_paths(parent_mission);
+        for dir in Self::extract_directory_paths(task_description) {
+            if !all_dirs.contains(&dir) {
+                all_dirs.push(dir);
+            }
+        }
+
+        // Render the base template (header + body) verbatim from the registry.
+        let ctx = SpecialistRenderContext {
+            mission: parent_mission.to_string(),
+            task: task_description.to_string(),
+            depth,
+            max_depth,
+            max_iterations: 0,
+            goal_id: String::new(),
+            working_dir: String::new(),
+            is_scheduled: false,
+            parent_session_id: String::new(),
+            execution_mode: String::new(),
+        };
+        let base = registry.render(SpecialistKind::Executor, &ctx);
+
+        // Build the dynamic mid-section (working directory + task contract)
+        // that the legacy builder inserts between the sub-agent header and
+        // "## Original User Request".
+        let mut middle = String::new();
+        if !all_dirs.is_empty() {
+            middle.push_str("## WORKING DIRECTORY (CRITICAL)\n");
+            middle.push_str("All files for this task are in: ");
+            middle.push_str(&all_dirs.join(", "));
+            middle.push_str("\n\nYou MUST use absolute paths when calling read_file, edit_file, write_file, search_files.\n");
+            middle.push_str("Examples:\n");
+            for dir in &all_dirs {
+                middle.push_str(&format!(
+                    "- read_file: path=\"{dir}/filename.py\"\n\
+                     - edit_file: path=\"{dir}/filename.py\"\n\
+                     - search_files: path=\"{dir}\"\n"
+                ));
+            }
+            middle.push_str(
+                "Do NOT use relative paths. Do NOT search in the default project directory.\n\n",
+            );
+        }
+
+        if let Some(task_id) = task_id {
+            let handoff = Self::build_executor_handoff(
+                task_id,
+                parent_mission,
+                task_description,
+                &[],
+                project_scope,
+            );
+            middle.push_str(&handoff.render_prompt_section());
+            middle.push_str("\n\n");
+        }
+
+        // Splice `middle` immediately before the "## Original User Request"
+        // section so the result matches the legacy builder layout exactly.
+        let marker = "## Original User Request";
+        let mut prompt = if middle.is_empty() {
+            base.clone()
+        } else if let Some(idx) = base.find(marker) {
+            let (head, tail) = base.split_at(idx);
+            let mut out = String::with_capacity(base.len() + middle.len());
+            out.push_str(head);
+            out.push_str(&middle);
+            out.push_str(tail);
+            out
+        } else {
+            // Defensive: marker should always be present in the bundled
+            // executor template; if it isn't, fall back to base + middle.
+            warn!(
+                "executor template missing '## Original User Request' marker; appending dynamic content"
+            );
+            let mut out = base.clone();
+            out.push_str(&middle);
+            out
+        };
+
+        if has_cli_agent {
+            prompt.push_str(
+                "\n- Delegation mode is active: `terminal`, `browser`, and `run_command` are not available here.\n\
+                 Use direct file tools (`read_file`, `edit_file`, `write_file`, `search_files`) for narrow file work.\n\
+                 Use `cli_agent` for shell/test flows or multi-step coding and research work.\n\
+                 When you use `cli_agent`, always provide `action=\"run\"`, a concrete `prompt`, and `working_dir` when you know the repo path.",
+            );
+        }
+
+        prompt
+    }
+
     fn collect_full_child_tools(&self) -> Vec<Arc<dyn Tool>> {
         self.root_tools
             .as_ref()
@@ -186,7 +443,11 @@ impl Agent {
             .flatten()
             .and_then(|g| g.context);
 
-        let system_prompt = Self::build_task_lead_prompt(
+        // TODO(Task 13): move SpecialistRegistry to Agent::new and store as
+        // `Arc<SpecialistRegistry>` field; for now we load per-spawn.
+        let registry = SpecialistRegistry::load(None);
+        let system_prompt = Self::compose_task_lead_prompt_from_registry(
+            &registry,
             goal_id,
             goal_description,
             goal_context.as_deref(),
@@ -499,6 +760,8 @@ impl Agent {
         root_tools: Option<Vec<Arc<dyn Tool>>>,
         add_spawn_tool: bool,
         inherited_project_scope: Option<String>,
+        max_iterations_override: Option<usize>,
+        timeout_secs_override: Option<u64>,
     ) -> Arc<Agent> {
         let spawn_tool = if add_spawn_tool {
             Some(Arc::new(
@@ -524,6 +787,8 @@ impl Agent {
             }
         };
 
+        let effective_max_iterations = max_iterations_override.unwrap_or(self.max_iterations);
+        let effective_timeout_secs = timeout_secs_override.unwrap_or(self.timeout_secs);
         let child = Arc::new(Agent::with_depth(
             self.llm_runtime.clone(),
             self.state.clone(),
@@ -536,10 +801,10 @@ impl Agent {
             child_depth,
             self.max_depth,
             self.iteration_config.clone(),
-            self.max_iterations,
+            effective_max_iterations,
             self.max_iterations_cap,
             self.max_response_chars,
-            self.timeout_secs,
+            effective_timeout_secs,
             self.max_facts,
             self.task_timeout,
             self.task_token_budget,
@@ -594,9 +859,6 @@ impl Agent {
         inherited_project_scope: Option<&str>,
         arg_specialist: Option<&str>,
     ) -> anyhow::Result<String> {
-        // Task 12 will consume `arg_specialist` for specialist kind resolution.
-        // For now we only thread it through to keep the call sites stable.
-        let _ = arg_specialist;
         if self.depth >= self.max_depth {
             anyhow::bail!(
                 "Cannot spawn sub-agent: max recursion depth ({}) reached",
@@ -646,6 +908,8 @@ impl Agent {
                             channel_ctx,
                             user_role,
                             AgentRole::TaskLead,
+                            Some(AgentRole::TaskLead),
+                            arg_specialist,
                             true,
                             None,
                             Some(goal_id.to_string()),
@@ -685,7 +949,12 @@ impl Agent {
                             self.state.clone(),
                         )));
                     }
-                    let prompt = Self::build_executor_prompt(
+                    // TODO(Task 13): move SpecialistRegistry to Agent::new
+                    // and store as `Arc<SpecialistRegistry>` field; for now we
+                    // load per-spawn.
+                    let registry = SpecialistRegistry::load(None);
+                    let prompt = Self::compose_executor_prompt_from_registry(
+                        &registry,
                         task,
                         mission,
                         child_depth,
@@ -707,6 +976,8 @@ impl Agent {
                             channel_ctx,
                             user_role,
                             role,
+                            Some(role),
+                            arg_specialist,
                             false, // no spawn tool
                             task_id.map(|s| s.to_string()),
                             goal_id.map(|s| s.to_string()),
@@ -777,6 +1048,8 @@ impl Agent {
             channel_ctx,
             user_role,
             effective_role,
+            child_role,
+            arg_specialist,
             can_spawn,
             None,             // task_id (executor activity tracking)
             goal_for_child,   // goal_id (task lead context injection)
@@ -801,6 +1074,8 @@ impl Agent {
         channel_ctx: ChannelContext,
         user_role: UserRole,
         role: AgentRole,
+        original_child_role: Option<AgentRole>,
+        arg_specialist: Option<&str>,
         add_spawn_tool: bool,
         task_id: Option<String>,
         goal_id: Option<String>,
@@ -808,8 +1083,50 @@ impl Agent {
         cancel_token_override: Option<tokio_util::sync::CancellationToken>,
         inherited_project_scope: Option<&str>,
     ) -> anyhow::Result<String> {
-        let specialist_kind = Self::select_specialist_kind(role, mission, task);
+        let specialist_kind =
+            Self::resolve_specialist_kind(original_child_role, arg_specialist, mission, task);
         let child_session = Self::build_specialist_session_id(specialist_kind, Uuid::new_v4());
+
+        // Apply specialist overrides (tool allowlist + budgets) from the
+        // registry. Tools that fall outside the role scope or aren't known
+        // are dropped with a warn (see `intersect_tools`). Budget overrides
+        // are clamped via `clamp_max_iterations` / `clamp_timeout`.
+        //
+        // TODO(Task 13): move the registry to an Agent field so we don't
+        // reload bundled markdown on every spawn.
+        let registry = SpecialistRegistry::load(None);
+        let def = registry.get(specialist_kind);
+        let scoped_tools: Vec<Arc<dyn Tool>> = if let Some(declared) = def.tools.as_deref() {
+            Self::apply_specialist_tool_allowlist(
+                tools.to_vec(),
+                declared,
+                specialist_kind,
+                original_child_role,
+                tools,
+            )
+        } else {
+            tools.to_vec()
+        };
+        let max_iterations_override = def.max_iterations.map(|raw| {
+            specialist_validation::clamp_max_iterations(
+                specialist_kind,
+                raw,
+                self.max_iterations_cap,
+            )
+        });
+        let timeout_secs_override = def.timeout_secs.map(|raw| {
+            specialist_validation::clamp_timeout(specialist_kind, raw, self.timeout_secs.max(1))
+        });
+        if let Some(declared_model) = def.model.as_deref() {
+            // Provider-side model availability checks are deferred (Task 13+).
+            // For now we warn that the override was observed; the spawn keeps
+            // the parent-selected model.
+            warn!(
+                kind = specialist_kind.as_str(),
+                model = declared_model,
+                "specialist model override declared; provider availability check deferred — using parent model"
+            );
+        }
 
         info!(
             parent_depth = self.depth,
@@ -849,7 +1166,7 @@ impl Agent {
                     task_id,
                     mission,
                     task,
-                    tools,
+                    &scoped_tools,
                     inherited_project_scope,
                 );
                 self.prepare_executor_task_handoff(task_id, &handoff, &child_session)
@@ -860,7 +1177,7 @@ impl Agent {
             cancel_token_override.or_else(|| self.cancel_token.as_ref().map(|t| t.child_token()));
         let child = self
             .create_child_agent(
-                tools.to_vec(),
+                scoped_tools,
                 model,
                 system_prompt,
                 child_depth,
@@ -871,6 +1188,8 @@ impl Agent {
                 root_tools,
                 add_spawn_tool,
                 inherited_project_scope.map(ToOwned::to_owned),
+                max_iterations_override,
+                timeout_secs_override,
             )
             .await;
         let result = child
@@ -1070,6 +1389,8 @@ impl Agent {
                     Some(root_tools), // root_tools for Executor inheritance
                     true,
                     None,
+                    None, // max_iterations override (task leads use parent default)
+                    None, // timeout_secs override
                 )
                 .await;
 
@@ -1116,6 +1437,12 @@ impl Agent {
     }
 
     /// Build system prompt for a Task Lead agent.
+    ///
+    /// Retained as the oracle for `specialists::equivalence_tests` and as the
+    /// reference legacy implementation. Production callers now go through
+    /// `compose_task_lead_prompt_from_registry`, which renders the same base
+    /// text from `task_lead.md` and appends the same dynamic sections.
+    #[allow(dead_code)] // test-only oracle; production uses the registry path
     pub(in crate::agent) fn build_task_lead_prompt(
         goal_id: &str,
         goal_description: &str,
@@ -1203,7 +1530,6 @@ impl Agent {
         prompt
     }
 
-    /// Build system prompt for an Executor agent.
     /// Extract absolute directory paths from text (e.g. /tmp/debugme3/, /home/user/project/).
     /// Returns deduplicated list of directory paths found.
     fn extract_directory_paths(text: &str) -> Vec<String> {
@@ -1241,6 +1567,13 @@ impl Agent {
         dirs
     }
 
+    /// Build system prompt for an Executor agent.
+    ///
+    /// Retained as the oracle for `specialists::equivalence_tests` and as the
+    /// reference legacy implementation. Production callers now go through
+    /// `compose_executor_prompt_from_registry`, which renders the same base
+    /// text from `executor.md` and splices in the same dynamic sections.
+    #[allow(dead_code)] // test-only oracle; production uses the registry path
     pub(in crate::agent) fn build_executor_prompt(
         task_description: &str,
         parent_mission: &str,
@@ -1337,6 +1670,52 @@ mod tests {
     use super::Agent;
     use crate::traits::{AgentRole, SpecialistKind};
     use uuid::Uuid;
+
+    #[test]
+    fn specialist_arg_wins_over_heuristic() {
+        let kind = Agent::resolve_specialist_kind(
+            None,
+            Some("research"),
+            "Implement the sorting algorithm in src/sort.rs",
+            "Add a test for the edge case",
+        );
+        assert_eq!(kind, SpecialistKind::Research);
+    }
+
+    #[test]
+    fn invalid_specialist_arg_falls_back_to_heuristic() {
+        let kind = Agent::resolve_specialist_kind(
+            None,
+            Some("not_a_real_kind"),
+            "Implement the sorting algorithm in src/sort.rs",
+            "Add a unit test",
+        );
+        assert_eq!(kind, SpecialistKind::Code);
+    }
+
+    #[test]
+    fn role_typed_spawn_ignores_specialist_arg() {
+        let kind = Agent::resolve_specialist_kind(
+            Some(AgentRole::TaskLead),
+            Some("code"),
+            "any mission",
+            "any task",
+        );
+        assert_eq!(kind, SpecialistKind::TaskLead);
+    }
+
+    #[test]
+    fn task_lead_arg_is_rejected_falling_back_to_heuristic() {
+        // "task_lead" is role-typed only — when passed as an arg (without
+        // explicit role) it must be ignored and the heuristic should run.
+        let kind = Agent::resolve_specialist_kind(
+            None,
+            Some("task_lead"),
+            "Implement the sorting algorithm in src/sort.rs",
+            "Add a unit test",
+        );
+        assert_eq!(kind, SpecialistKind::Code);
+    }
 
     #[test]
     fn specialist_kind_prefers_artifact_writer_for_report_files() {
