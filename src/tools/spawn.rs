@@ -38,6 +38,36 @@ const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 1;
 #[cfg(not(test))]
 const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 20;
 
+/// Fallback description used when the parent `Agent` isn't wired yet
+/// (early bootstrap) or when the registry is empty.
+const STATIC_SPECIALIST_ARG_DESCRIPTION: &str =
+    "Optional. Pick the specialist profile matching this task. \
+     Omit to let the agent infer one from mission/task text.";
+
+/// Format the per-kind `(name, description)` pairs from
+/// `SpecialistRegistry::llm_visible_kinds()` into the multi-line description
+/// surfaced via the `specialist` parameter of `spawn_agent`. Kept as a free
+/// function so tests can exercise the formatter without wiring a full Agent.
+pub(crate) fn format_specialist_arg_description(entries: &[(&'static str, String)]) -> String {
+    if entries.is_empty() {
+        return STATIC_SPECIALIST_ARG_DESCRIPTION.to_string();
+    }
+    let mut s =
+        String::from("Optional. Pick the specialist profile that best matches this task:\n");
+    for (name, description) in entries {
+        s.push_str("- ");
+        s.push_str(name);
+        s.push_str(": ");
+        s.push_str(description);
+        if !description.ends_with('.') {
+            s.push('.');
+        }
+        s.push('\n');
+    }
+    s.push_str("Omit `specialist` to let the agent infer from the mission/task text.");
+    s
+}
+
 impl SpawnAgentTool {
     /// Create a SpawnAgentTool with a known agent reference.
     #[allow(dead_code)]
@@ -98,6 +128,30 @@ impl SpawnAgentTool {
 
     fn get_hub(&self) -> Option<Arc<ChannelHub>> {
         self.hub.get().and_then(|w| w.upgrade())
+    }
+
+    /// Render the `specialist` parameter's description text, pulling each
+    /// kind's frontmatter description from the live `SpecialistRegistry`
+    /// (so user overrides at `~/.aidaemon/specialists/<kind>.md` flow
+    /// through to the LLM-facing schema on next start).
+    ///
+    /// During early bootstrap the parent `Agent` may not yet be wired up
+    /// (the weak ref hasn't been set). In that case we fall back to a
+    /// static description with no per-kind text — the `enum` list still
+    /// constrains the value, so the LLM can still pick a valid kind even
+    /// without descriptions.
+    fn build_specialist_arg_description(&self) -> String {
+        let agent = match self.get_agent() {
+            Ok(a) => a,
+            Err(_) => {
+                warn!(
+                    "spawn_agent schema: parent agent not yet available; falling back to static specialist description"
+                );
+                return STATIC_SPECIALIST_ARG_DESCRIPTION.to_string();
+            }
+        };
+
+        format_specialist_arg_description(&agent.specialists.llm_visible_kinds())
     }
 
     /// Acquire a per-task in-flight lock for executor spawns.
@@ -335,7 +389,7 @@ impl Tool for SpawnAgentTool {
                             "executor",
                             "generic"
                         ],
-                        "description": "Optional. Pick the specialist profile matching this task. Omit to let the agent infer one from mission/task text."
+                        "description": self.build_specialist_arg_description()
                     }
                 },
                 "required": ["mission", "task"],
@@ -957,5 +1011,67 @@ mod specialist_arg_tests {
         }
         // task_lead is NOT a parent-LLM-selectable value (role-typed only).
         assert!(!names.contains(&"task_lead"));
+    }
+
+    #[test]
+    fn format_specialist_arg_description_lists_every_kind_with_text() {
+        let registry = crate::agent::specialists::SpecialistRegistry::load(None);
+        let entries = registry.llm_visible_kinds();
+        let desc = format_specialist_arg_description(&entries);
+
+        // Each non-task_lead kind appears as a `- name:` bullet, and its
+        // bundled frontmatter description text is included verbatim.
+        for kind in [
+            "code",
+            "browser_verifier",
+            "artifact_writer",
+            "research",
+            "review",
+            "comms_draft",
+            "executor",
+            "generic",
+        ] {
+            let marker = format!("- {}:", kind);
+            assert!(
+                desc.contains(&marker),
+                "specialist description missing bullet for {}: {}",
+                kind,
+                desc
+            );
+        }
+
+        // task_lead must NOT appear — it's role-typed, not LLM-selectable.
+        assert!(!desc.contains("- task_lead:"));
+        assert!(!desc.contains("task_lead:"));
+
+        // Spot-check the actual frontmatter descriptions surface through.
+        // (Test asserts the registry's description text reached the formatter.)
+        let code_desc = entries
+            .iter()
+            .find(|(n, _)| *n == "code")
+            .map(|(_, d)| d.clone())
+            .expect("code kind present");
+        assert!(
+            desc.contains(&code_desc),
+            "code description not surfaced: {}",
+            desc
+        );
+
+        // Closing line tells the model omission is allowed.
+        assert!(desc.contains("Omit `specialist`"));
+    }
+
+    #[test]
+    fn schema_falls_back_to_static_description_when_agent_unwired() {
+        let tool = SpawnAgentTool::new_deferred(8192, 60);
+        let schema = tool.schema();
+        let desc = schema
+            .get("parameters")
+            .and_then(|p| p.get("properties"))
+            .and_then(|p| p.get("specialist"))
+            .and_then(|s| s.get("description"))
+            .and_then(|d| d.as_str())
+            .expect("specialist description string");
+        assert_eq!(desc, STATIC_SPECIALIST_ARG_DESCRIPTION);
     }
 }

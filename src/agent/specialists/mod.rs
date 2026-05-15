@@ -71,3 +71,31 @@ pub enum SpecialistSource {
 pub struct SpecialistRegistry {
     by_kind: std::collections::HashMap<SpecialistKind, Arc<SpecialistDef>>,
 }
+
+impl SpecialistRegistry {
+    /// Returns `(kind_as_str, description)` pairs for every registered kind
+    /// EXCEPT `TaskLead`, sorted alphabetically by kind name.
+    ///
+    /// This is the canonical surface the parent LLM sees: the `spawn_agent`
+    /// tool schema and the agent's system prompt both render their
+    /// "Available Specialists" listing from this method, so a single user
+    /// override at `~/.aidaemon/specialists/<kind>.md` automatically updates
+    /// both surfaces on next start.
+    ///
+    /// `TaskLead` is excluded because it's role-typed (the agent assigns it
+    /// internally for plan-and-delegate roles) — the parent LLM cannot pick
+    /// it directly via the `specialist` argument.
+    pub fn llm_visible_kinds(&self) -> Vec<(&'static str, String)> {
+        let mut out: Vec<(&'static str, String)> = SpecialistKind::all()
+            .iter()
+            .filter(|k| **k != SpecialistKind::TaskLead)
+            .filter_map(|k| {
+                self.by_kind
+                    .get(k)
+                    .map(|def| (k.as_str(), def.description.clone()))
+            })
+            .collect();
+        out.sort_by_key(|(name, _)| *name);
+        out
+    }
+}

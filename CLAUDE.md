@@ -270,6 +270,9 @@ cargo run --bin db_probe --features encryption -- --token-hours 24
 - **Template vars**: `{{mission}}` `{{task}}` `{{depth}}` `{{max_depth}}` `{{max_iterations}}` `{{goal_id}}` `{{working_dir}}` `{{is_scheduled}}` `{{parent_session_id}}` `{{execution_mode}}`
 - **Migration safety**: byte-equivalence with legacy `build_task_lead_prompt` / `build_executor_prompt` asserted in `src/agent/specialists/equivalence_tests.rs` over 12 fixtures (depth × is_scheduled × has_cli_agent). Legacy fns retained as `#[cfg(test)]` oracle.
 - **Spawn integration**: `spawn_agent` schema gains optional `specialist` arg (8-value enum, `task_lead` excluded). `Agent::resolve_specialist_kind` chooses: role-wins → arg-wins-if-non-task-lead → heuristic fallback.
+- **LLM discovery**: descriptions surface in two places, both driven from `SpecialistRegistry::llm_visible_kinds()` so user overrides change both surfaces on next start:
+  - `spawn_agent` schema — `specialist` parameter description lists each non-`task_lead` kind + its frontmatter description (built in `src/tools/spawn.rs`).
+  - System prompt — "## Available Specialists" block in `src/agent/runtime/system_prompt.rs`, spliced in before the `## Tools` section of the root agent's prompt.
 - **Tool allowlist**: intersected with the role-pre-filtered tool set via `intersect_tools` (role boundary enforced upstream by the spawn-flow role filter).
 - **Budgets**: `max_iterations` and `timeout_secs` clamped via `clamp_max_iterations`/`clamp_timeout` (timeout cap: `self.timeout_secs` if >0 else 3600).
 - **Telemetry**: spawn `tracing::info!` includes `specialist_source` (`"bundled"` | `"user_override"`).

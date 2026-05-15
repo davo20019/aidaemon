@@ -57,6 +57,46 @@ pub(super) enum ToolLoopPromptStyle {
     Lite,
 }
 
+/// Render the "## Available Specialists" block surfaced in the agent's system
+/// prompt. Mirrors the per-kind list also exposed via the `spawn_agent` tool
+/// schema, so the LLM has two consistent surfaces to discover which specialist
+/// profiles exist and what each one is for.
+///
+/// Driven by the live `SpecialistRegistry` — user overrides at
+/// `~/.aidaemon/specialists/<kind>.md` flow into this block on next start.
+///
+/// `task_lead` is intentionally omitted (role-typed, assigned by the agent,
+/// not parent-LLM-selectable). Returns an empty string only if the registry
+/// is empty, which should never happen by construction; the caller can drop
+/// the section entirely in that case.
+pub(crate) fn build_available_specialists_block(
+    registry: &crate::agent::specialists::SpecialistRegistry,
+) -> String {
+    let entries = registry.llm_visible_kinds();
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let mut s = String::from(
+        "## Available Specialists\n\n\
+         When you delegate work with `spawn_agent`, pick the specialist that best matches the task:\n\n",
+    );
+    for (name, description) in &entries {
+        s.push_str("- `");
+        s.push_str(name);
+        s.push_str("`: ");
+        s.push_str(description);
+        if !description.ends_with('.') {
+            s.push('.');
+        }
+        s.push('\n');
+    }
+    s.push_str(
+        "\nOmit the `specialist` argument to let the agent infer the right kind from the mission/task text.",
+    );
+    s
+}
+
 /// Build a compact prompt for tool-loop iterations after the first turn.
 /// Runtime tool schemas are still sent separately in API tool_defs.
 pub(super) fn build_tool_loop_system_prompt(
@@ -543,7 +583,24 @@ impl Agent {
             // Keep the tool guidance sections intact for the normal tool-enabled
             // loop. Stripping them here leaves the model with tools but no
             // selection guidance.
-            self.system_prompt.clone()
+            //
+            // Inject the "## Available Specialists" block from the live
+            // `SpecialistRegistry` so the LLM has the same per-kind discovery
+            // surface as the `spawn_agent` schema. The block already starts
+            // with its own `## ` heading; we splice it in before the legacy
+            // `## Tools` section so it sits alongside other capability framing.
+            // Suppressed on PublicExternal (minimal prompt above).
+            let specialists_block = build_available_specialists_block(&self.specialists);
+            if specialists_block.is_empty() {
+                self.system_prompt.clone()
+            } else if let Some(idx) = self.system_prompt.find("## Tools") {
+                let (head, tail) = self.system_prompt.split_at(idx);
+                format!("{head}{specialists_block}\n\n{tail}")
+            } else {
+                // No `## Tools` anchor — fall back to appending after the
+                // header so the block is still visible to the LLM.
+                format!("{}\n\n{specialists_block}", self.system_prompt)
+            }
         };
         let mut system_prompt = skills::build_system_prompt_with_memory(
             &base_prompt,
@@ -943,7 +1000,56 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::format_goal_context;
+    use super::{build_available_specialists_block, format_goal_context};
+
+    #[test]
+    fn available_specialists_block_lists_each_non_task_lead_kind() {
+        let registry = crate::agent::specialists::SpecialistRegistry::load(None);
+        let block = build_available_specialists_block(&registry);
+
+        // Section header is present so downstream prompt-shapers can find it.
+        assert!(
+            block.contains("## Available Specialists"),
+            "missing header: {}",
+            block
+        );
+
+        // Every parent-LLM-selectable kind appears as its own bullet.
+        for kind in [
+            "code",
+            "browser_verifier",
+            "artifact_writer",
+            "research",
+            "review",
+            "comms_draft",
+            "executor",
+            "generic",
+        ] {
+            let bullet = format!("- `{}`:", kind);
+            assert!(
+                block.contains(&bullet),
+                "missing bullet for {}: {}",
+                kind,
+                block
+            );
+        }
+
+        // task_lead is role-typed and must NOT appear in the LLM-facing list.
+        assert!(!block.contains("- `task_lead`:"));
+        assert!(!block.contains("`task_lead`"));
+
+        // Sanity: the actual frontmatter description for `code` flowed into
+        // the block (proves it's data-driven, not a static string).
+        let code_def = registry.get(crate::traits::SpecialistKind::Code);
+        assert!(
+            block.contains(&code_def.description),
+            "code description not surfaced: {}",
+            block
+        );
+
+        // Closing line tells the model omission is allowed.
+        assert!(block.contains("Omit the `specialist` argument"));
+    }
 
     #[test]
     fn format_goal_context_includes_recent_messages_and_project_hints() {
