@@ -16,6 +16,67 @@ pub enum AgentRole {
     Executor,
 }
 
+/// Stable specialist profile used to label child-agent sessions and events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SpecialistKind {
+    TaskLead,
+    Executor,
+    Research,
+    ArtifactWriter,
+    Code,
+    BrowserVerifier,
+    Review,
+    CommsDraft,
+    Generic,
+}
+
+impl SpecialistKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpecialistKind::TaskLead => "task_lead",
+            SpecialistKind::Executor => "executor",
+            SpecialistKind::Research => "research",
+            SpecialistKind::ArtifactWriter => "artifact_writer",
+            SpecialistKind::Code => "code",
+            SpecialistKind::BrowserVerifier => "browser_verifier",
+            SpecialistKind::Review => "review",
+            SpecialistKind::CommsDraft => "comms_draft",
+            SpecialistKind::Generic => "generic",
+        }
+    }
+
+    #[allow(dead_code)] // consumed by specialists registry in upcoming tasks
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "task_lead" => Some(SpecialistKind::TaskLead),
+            "executor" => Some(SpecialistKind::Executor),
+            "research" => Some(SpecialistKind::Research),
+            "artifact_writer" => Some(SpecialistKind::ArtifactWriter),
+            "code" => Some(SpecialistKind::Code),
+            "browser_verifier" => Some(SpecialistKind::BrowserVerifier),
+            "review" => Some(SpecialistKind::Review),
+            "comms_draft" => Some(SpecialistKind::CommsDraft),
+            "generic" => Some(SpecialistKind::Generic),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)] // consumed by specialists registry in upcoming tasks
+    pub fn all() -> &'static [SpecialistKind] {
+        &[
+            SpecialistKind::TaskLead,
+            SpecialistKind::Executor,
+            SpecialistKind::Research,
+            SpecialistKind::ArtifactWriter,
+            SpecialistKind::Code,
+            SpecialistKind::BrowserVerifier,
+            SpecialistKind::Review,
+            SpecialistKind::CommsDraft,
+            SpecialistKind::Generic,
+        ]
+    }
+}
+
 /// Categorization of a tool for role-based scoping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRole {
@@ -765,5 +826,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(meta.http_status, Some(201));
+    }
+
+    #[test]
+    fn specialist_kind_from_str_round_trips_for_every_variant() {
+        let kinds = [
+            SpecialistKind::TaskLead,
+            SpecialistKind::Executor,
+            SpecialistKind::Research,
+            SpecialistKind::ArtifactWriter,
+            SpecialistKind::Code,
+            SpecialistKind::BrowserVerifier,
+            SpecialistKind::Review,
+            SpecialistKind::CommsDraft,
+            SpecialistKind::Generic,
+        ];
+        for kind in kinds {
+            let s = kind.as_str();
+            assert_eq!(
+                SpecialistKind::from_str(s),
+                Some(kind),
+                "round-trip for {:?}",
+                kind
+            );
+        }
+        assert_eq!(SpecialistKind::from_str("not_a_kind"), None);
+        assert_eq!(SpecialistKind::from_str(""), None);
+        assert_eq!(SpecialistKind::from_str("CODE"), None);
     }
 }

@@ -176,6 +176,10 @@ mod graceful;
 mod history;
 #[path = "loop/orchestration_phase.rs"]
 mod orchestration_phase;
+#[path = "runtime/parent_delivery.rs"]
+mod parent_delivery;
+mod specialists;
+pub(crate) use parent_delivery::ParentDeliveryKind;
 #[path = "loop/response_phase.rs"]
 mod response_phase;
 pub(in crate::agent) use history::CompletionContract;
@@ -2605,10 +2609,20 @@ pub fn spawn_background_task_lead(
                     }
                 }
 
-                if let Some(hub_weak) = &hub {
-                    if let Some(hub_arc) = hub_weak.upgrade() {
-                        let _ = hub_arc.send_text(&session_id, &msg).await;
-                    }
+                if let Err(err) = agent
+                    .deliver_parent_text_result(
+                        hub.as_ref(),
+                        &session_id,
+                        &msg,
+                        parent_delivery::ParentDeliveryKind::WaitResult,
+                    )
+                    .await
+                {
+                    warn!(
+                        session_id = %session_id,
+                        error = %err,
+                        "Failed to record parent-mediated wait result"
+                    );
                 }
                 return;
             }
@@ -2867,11 +2881,26 @@ pub fn spawn_background_task_lead(
                             };
 
                             if !delivery_text.trim().is_empty() {
-                                if let Some(hub_weak) = &hub {
-                                    if let Some(hub_arc) = hub_weak.upgrade() {
-                                        let _ =
-                                            hub_arc.send_text(&session_id, &delivery_text).await;
-                                        any_executor_results_sent = true;
+                                match agent
+                                    .deliver_parent_text_result(
+                                        hub.as_ref(),
+                                        &session_id,
+                                        &delivery_text,
+                                        parent_delivery::ParentDeliveryKind::ExecutorResult,
+                                    )
+                                    .await
+                                {
+                                    Ok(outcome) => {
+                                        if outcome.sent {
+                                            any_executor_results_sent = true;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            session_id = %session_id,
+                                            error = %err,
+                                            "Failed to record parent-mediated executor result"
+                                        );
                                     }
                                 }
                             }
@@ -3201,10 +3230,20 @@ pub fn spawn_background_task_lead(
             if !any_executor_results_sent {
                 if let Some(response) = task_lead_response.as_ref() {
                     if !is_low_signal_task_lead_reply(response) {
-                        if let Some(hub_weak) = &hub {
-                            if let Some(hub_arc) = hub_weak.upgrade() {
-                                let _ = hub_arc.send_text(&session_id, response).await;
-                            }
+                        if let Err(err) = agent
+                            .deliver_parent_text_result(
+                                hub.as_ref(),
+                                &session_id,
+                                response,
+                                parent_delivery::ParentDeliveryKind::TaskLeadResult,
+                            )
+                            .await
+                        {
+                            warn!(
+                                session_id = %session_id,
+                                error = %err,
+                                "Failed to record parent-mediated task-lead result"
+                            );
                         }
                     }
                 }
@@ -3447,32 +3486,51 @@ pub fn spawn_background_task_lead(
         // Mark goal as notified so heartbeat doesn't double-enqueue
         let _ = state.mark_goal_notified(&goal_id).await;
 
-        // Attempt immediate delivery — if it fails, heartbeat will retry from queue
-        if let Some(hub_weak) = &hub {
-            if let Some(hub_arc) = hub_weak.upgrade() {
-                if hub_arc.send_text(&session_id, &msg).await.is_ok() {
-                    let _ = state.mark_notification_delivered(&notification_id).await;
+        // Attempt immediate delivery — if it fails, heartbeat will retry from queue.
+        match agent
+            .deliver_parent_text_result(
+                hub.as_ref(),
+                &session_id,
+                &msg,
+                parent_delivery::ParentDeliveryKind::GoalNotification,
+            )
+            .await
+        {
+            Ok(outcome) if outcome.sent => {
+                let _ = state.mark_notification_delivered(&notification_id).await;
 
-                    // Auto-send any files referenced in the completion message
-                    let file_paths = extract_file_paths_from_text(&msg);
-                    for path in file_paths {
-                        let filename = std::path::Path::new(&path)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "file".to_string());
-                        let media = crate::types::MediaMessage {
-                            session_id: session_id.clone(),
-                            caption: filename.clone(),
-                            kind: crate::types::MediaKind::Document {
-                                file_path: path.clone(),
-                                filename,
-                            },
-                        };
-                        if let Err(e) = hub_arc.send_media(&session_id, &media).await {
-                            warn!("Failed to auto-send goal file {}: {}", path, e);
+                // Auto-send any files referenced in the completion message
+                let file_paths = extract_file_paths_from_text(&msg);
+                if let Some(hub_weak) = &hub {
+                    if let Some(hub_arc) = hub_weak.upgrade() {
+                        for path in file_paths {
+                            let filename = std::path::Path::new(&path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "file".to_string());
+                            let media = crate::types::MediaMessage {
+                                session_id: session_id.clone(),
+                                caption: filename.clone(),
+                                kind: crate::types::MediaKind::Document {
+                                    file_path: path.clone(),
+                                    filename,
+                                },
+                            };
+                            if let Err(e) = hub_arc.send_media(&session_id, &media).await {
+                                warn!("Failed to auto-send goal file {}: {}", path, e);
+                            }
                         }
                     }
                 }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    session_id = %session_id,
+                    notification_id = %notification_id,
+                    error = %err,
+                    "Failed to record parent-mediated goal notification"
+                );
             }
         }
 
