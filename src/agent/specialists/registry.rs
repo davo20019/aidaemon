@@ -164,4 +164,45 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn every_kind_renders_a_non_empty_prompt_with_canonical_context() {
+        let registry = SpecialistRegistry::load(None);
+        let ctx = super::super::SpecialistRenderContext {
+            mission: "M".to_string(),
+            task: "T".to_string(),
+            depth: 1,
+            max_depth: 4,
+            max_iterations: 12,
+            goal_id: "g1".to_string(),
+            working_dir: "/tmp".to_string(),
+            is_scheduled: false,
+            parent_session_id: "s".to_string(),
+            execution_mode: "exec".to_string(),
+        };
+        for kind in SpecialistKind::all() {
+            let rendered = registry.render(*kind, &ctx);
+            assert!(!rendered.trim().is_empty(), "{:?} rendered empty", kind);
+            // No unresolved placeholders for the variables the registry supports.
+            for placeholder in [
+                "{{mission}}",
+                "{{task}}",
+                "{{depth}}",
+                "{{max_depth}}",
+                "{{max_iterations}}",
+                "{{goal_id}}",
+                "{{working_dir}}",
+                "{{is_scheduled}}",
+                "{{parent_session_id}}",
+                "{{execution_mode}}",
+            ] {
+                assert!(
+                    !rendered.contains(placeholder),
+                    "{:?} left {} unresolved",
+                    kind,
+                    placeholder
+                );
+            }
+        }
+    }
 }
