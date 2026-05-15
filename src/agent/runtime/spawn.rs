@@ -11,6 +11,27 @@ struct TaskLeadSpec {
     input_text: String,
 }
 
+/// Returns the task-lead execution-mode prose for the given `is_scheduled` flag.
+///
+/// This is the single source of truth for the two variants of the task-lead
+/// execution mode paragraph. All three call sites — the legacy
+/// `build_task_lead_prompt` builder, the registry-driven composition helper
+/// `compose_task_lead_prompt_from_registry`, and the equivalence-test fixture
+/// — must agree on this text or the byte-equivalence tests will fail.
+pub(in crate::agent) fn task_lead_execution_mode(is_scheduled: bool) -> &'static str {
+    if is_scheduled {
+        "You have full tool access including `terminal`. For simple steps (single shell commands, \
+         file writes), execute them directly. For complex multi-step work, you may still delegate \
+         to executors via the workflow below."
+    } else {
+        "Your primary job is to plan and delegate work via executors or cli_agent. \
+         However, you also have direct access to essential tools (read_file, write_file, \
+         edit_file, terminal, search_files). Use delegation first, but if delegation fails \
+         (cli_agent errors, spawn_agent blocked, executor failures), switch to direct \
+         execution with your own tools rather than retrying broken delegation paths."
+    }
+}
+
 impl Agent {
     pub(crate) fn select_specialist_kind(
         role: AgentRole,
@@ -141,49 +162,37 @@ impl Agent {
         Self::select_specialist_kind(AgentRole::Executor, mission, task)
     }
 
-    /// Compute the set of tool names a given child role is permitted to use.
-    /// Used to intersect a specialist's declared tool allowlist with the
-    /// hard role boundary so a specialist cannot escape its role scope.
-    fn role_tool_scope_names(role: Option<AgentRole>, all_tools: &[Arc<dyn Tool>]) -> Vec<String> {
-        match role {
-            Some(AgentRole::Executor) => all_tools
-                .iter()
-                .filter(|t| matches!(t.tool_role(), ToolRole::Action | ToolRole::Universal))
-                .map(|t| t.name().to_string())
-                .collect(),
-            Some(AgentRole::TaskLead) => all_tools
-                .iter()
-                .filter(|t| {
-                    matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal)
-                        || t.name() == "spawn_agent"
-                })
-                .map(|t| t.name().to_string())
-                .collect(),
-            Some(AgentRole::Orchestrator) | None => {
-                all_tools.iter().map(|t| t.name().to_string()).collect()
-            }
-        }
-    }
-
-    /// Apply a specialist's declared tool allowlist to the in-flight tool set,
-    /// intersected with the role scope. Tools outside the intersection are
-    /// dropped. Returns the (possibly unchanged) tool set.
+    /// Apply a specialist's declared tool allowlist to the in-flight tool set.
+    ///
+    /// This function is intentionally a simple `declared ∩ available` intersection
+    /// (with the existing `intersect_tools` unknown-tool warning). The role
+    /// boundary (Executor vs. TaskLead vs. Orchestrator) is enforced upstream
+    /// by the caller's pre-filtering of `tools` — by the time we get here,
+    /// `tools` already reflects the role scope, so feeding `tools` as both the
+    /// working set and the `role_scope` parameter to `intersect_tools` is the
+    /// honest expression of that contract (no tautological double-check).
+    ///
+    /// Tools declared by the specialist but not present in `tools` are dropped
+    /// with a warn. An empty `declared` allowlist also produces a warn so
+    /// operators notice that the specialist will have no tools.
     fn apply_specialist_tool_allowlist(
-        tools: Vec<Arc<dyn Tool>>,
-        declared: &[String],
         kind: SpecialistKind,
-        role: Option<AgentRole>,
-        full_tools: &[Arc<dyn Tool>],
-    ) -> Vec<Arc<dyn Tool>> {
-        let scope = Self::role_tool_scope_names(role, full_tools);
-        let scope_refs: Vec<&str> = scope.iter().map(|s| s.as_str()).collect();
-        let known_owned: Vec<String> = full_tools.iter().map(|t| t.name().to_string()).collect();
+        declared: &[String],
+        tools: &mut Vec<Arc<dyn Tool>>,
+    ) {
+        if declared.is_empty() {
+            warn!(
+                kind = %kind.as_str(),
+                "specialist declared an empty tool allowlist — child will have no tools"
+            );
+        }
+        let known_owned: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         let known: Vec<&str> = known_owned.iter().map(|s| s.as_str()).collect();
-        let permitted = specialist_validation::intersect_tools(kind, declared, &scope_refs, &known);
-        tools
-            .into_iter()
-            .filter(|t| permitted.iter().any(|p| p == t.name()))
-            .collect()
+        // Role boundary is enforced upstream by the caller's pre-filtering of
+        // `tools`. Here `role_scope == known`: real enforcement is upstream;
+        // this call only retains declared tools that are still in-flight.
+        let permitted = specialist_validation::intersect_tools(kind, declared, &known, &known);
+        tools.retain(|t| permitted.iter().any(|p| p == t.name()));
     }
 
     /// Render the task-lead system prompt using the `SpecialistRegistry` as the
@@ -192,7 +201,7 @@ impl Agent {
     /// produced. This keeps byte-equivalence with `build_task_lead_prompt`
     /// when `goal_context=None` and `has_cli_agent=false`.
     #[allow(clippy::too_many_arguments)]
-    fn compose_task_lead_prompt_from_registry(
+    pub(in crate::agent) fn compose_task_lead_prompt_from_registry(
         registry: &SpecialistRegistry,
         goal_id: &str,
         goal_description: &str,
@@ -202,18 +211,7 @@ impl Agent {
         has_cli_agent: bool,
         is_scheduled: bool,
     ) -> String {
-        let execution_mode = if is_scheduled {
-            "You have full tool access including `terminal`. For simple steps (single shell commands, \
-             file writes), execute them directly. For complex multi-step work, you may still delegate \
-             to executors via the workflow below.".to_string()
-        } else {
-            "Your primary job is to plan and delegate work via executors or cli_agent. \
-             However, you also have direct access to essential tools (read_file, write_file, \
-             edit_file, terminal, search_files). Use delegation first, but if delegation fails \
-             (cli_agent errors, spawn_agent blocked, executor failures), switch to direct \
-             execution with your own tools rather than retrying broken delegation paths."
-                .to_string()
-        };
+        let execution_mode = task_lead_execution_mode(is_scheduled).to_string();
         let ctx = SpecialistRenderContext {
             mission: goal_description.to_string(),
             task: String::new(),
@@ -259,7 +257,7 @@ impl Agent {
     /// legacy builder produced. Keeps byte-equivalence with
     /// `build_executor_prompt` when all dynamic inputs are empty.
     #[allow(clippy::too_many_arguments)]
-    fn compose_executor_prompt_from_registry(
+    pub(in crate::agent) fn compose_executor_prompt_from_registry(
         registry: &SpecialistRegistry,
         task_description: &str,
         parent_mission: &str,
@@ -1088,22 +1086,20 @@ impl Agent {
         let child_session = Self::build_specialist_session_id(specialist_kind, Uuid::new_v4());
 
         // Apply specialist overrides (tool allowlist + budgets) from the
-        // registry. Tools that fall outside the role scope or aren't known
-        // are dropped with a warn (see `intersect_tools`). Budget overrides
-        // are clamped via `clamp_max_iterations` / `clamp_timeout`.
+        // registry. The role boundary has already been enforced by the
+        // caller's pre-filtering of `tools`; this step further intersects
+        // with the specialist's declared allowlist and drops unknown tools
+        // with a warn (see `intersect_tools`). Budget overrides are clamped
+        // via `clamp_max_iterations` / `clamp_timeout`.
         //
         // TODO(Task 13): move the registry to an Agent field so we don't
         // reload bundled markdown on every spawn.
         let registry = SpecialistRegistry::load(None);
         let def = registry.get(specialist_kind);
         let scoped_tools: Vec<Arc<dyn Tool>> = if let Some(declared) = def.tools.as_deref() {
-            Self::apply_specialist_tool_allowlist(
-                tools.to_vec(),
-                declared,
-                specialist_kind,
-                original_child_role,
-                tools,
-            )
+            let mut scoped = tools.to_vec();
+            Self::apply_specialist_tool_allowlist(specialist_kind, declared, &mut scoped);
+            scoped
         } else {
             tools.to_vec()
         };
@@ -1114,9 +1110,18 @@ impl Agent {
                 self.max_iterations_cap,
             )
         });
-        let timeout_secs_override = def.timeout_secs.map(|raw| {
-            specialist_validation::clamp_timeout(specialist_kind, raw, self.timeout_secs.max(1))
-        });
+        // `self.timeout_secs` is `u64` and defaults to 300, but a config of
+        // `0` is interpreted as "no parent timeout". In that case we still
+        // want a sane absolute ceiling so a specialist can't request an
+        // unbounded timeout; use 1 hour as the implicit cap.
+        let timeout_cap = if self.timeout_secs > 0 {
+            self.timeout_secs
+        } else {
+            3600
+        };
+        let timeout_secs_override = def
+            .timeout_secs
+            .map(|raw| specialist_validation::clamp_timeout(specialist_kind, raw, timeout_cap));
         if let Some(declared_model) = def.model.as_deref() {
             // Provider-side model availability checks are deferred (Task 13+).
             // For now we warn that the override was observed; the spawn keeps
@@ -1452,17 +1457,7 @@ impl Agent {
         has_cli_agent: bool,
         is_scheduled: bool,
     ) -> String {
-        let execution_mode = if is_scheduled {
-            "You have full tool access including `terminal`. For simple steps (single shell commands, \
-             file writes), execute them directly. For complex multi-step work, you may still delegate \
-             to executors via the workflow below."
-        } else {
-            "Your primary job is to plan and delegate work via executors or cli_agent. \
-             However, you also have direct access to essential tools (read_file, write_file, \
-             edit_file, terminal, search_files). Use delegation first, but if delegation fails \
-             (cli_agent errors, spawn_agent blocked, executor failures), switch to direct \
-             execution with your own tools rather than retrying broken delegation paths."
-        };
+        let execution_mode = task_lead_execution_mode(is_scheduled);
 
         let mut prompt = format!(
             "You are a Task Lead managing goal: {goal_id}\n\

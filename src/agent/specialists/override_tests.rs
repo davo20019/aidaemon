@@ -36,7 +36,11 @@ fn override_with_unknown_filename_is_ignored() {
 fn override_with_kind_mismatch_falls_back_to_bundled() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("code.md");
-    fs::write(&path, "---\nkind: research\ndescription: bad.\n---\nBody.\n").unwrap();
+    fs::write(
+        &path,
+        "---\nkind: research\ndescription: bad.\n---\nBody.\n",
+    )
+    .unwrap();
 
     let registry = SpecialistRegistry::load(Some(dir.path()));
     let def = registry.get(SpecialistKind::Code);
@@ -49,6 +53,9 @@ fn missing_override_dir_is_silent() {
         "/tmp/aidaemon-nonexistent-override-dir-for-tests",
     )));
     for kind in SpecialistKind::all() {
-        assert!(matches!(registry.get(*kind).source, SpecialistSource::Bundled));
+        assert!(matches!(
+            registry.get(*kind).source,
+            SpecialistSource::Bundled
+        ));
     }
 }
