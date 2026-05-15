@@ -45,7 +45,6 @@ impl SpecialistKind {
         }
     }
 
-    #[allow(dead_code)] // consumed by specialists registry in upcoming tasks
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "task_lead" => Some(SpecialistKind::TaskLead),
