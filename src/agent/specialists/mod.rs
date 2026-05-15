@@ -8,6 +8,7 @@ use std::sync::Arc;
 mod parse;
 mod registry;
 mod render;
+pub mod validation;
 
 #[cfg(test)]
 mod equivalence_tests;
