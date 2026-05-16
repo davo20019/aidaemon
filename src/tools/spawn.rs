@@ -343,17 +343,25 @@ impl Tool for SpawnAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a sub-agent to handle a focused task autonomously. \
-         The sub-agent has access to all tools and runs its own reasoning loop. \
-         Use this for tasks that benefit from isolated, parallel reasoning."
+        "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work is multi-step \
+         (research → synthesize, code → test, fetch → analyze), matches a named specialist (see the \
+         `specialist` enum: code, browser_verifier, research, review, artifact_writer, comms_draft, ...), \
+         benefits from a fresh context window, or can run in parallel with other work. Do NOT delegate \
+         trivial one-shot reads (a single read_file, a single web_search) — handle those directly. \
+         The sub-agent starts with a fresh context and the same tools, so reference files by path and \
+         do not paste prior tool output."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "spawn_agent",
-            "description": "Spawn a sub-agent to handle a focused task autonomously. \
-                The sub-agent has access to all tools and runs its own reasoning loop. \
-                Use this for complex sub-tasks that benefit from isolated context and focused reasoning.",
+            "description": "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work \
+                is multi-step (research → synthesize, code → test, fetch → analyze), matches a named \
+                specialist (see the `specialist` enum: code, browser_verifier, research, review, \
+                artifact_writer, comms_draft, ...), benefits from a fresh context window, or can run in \
+                parallel with other work. Do NOT delegate trivial one-shot reads (a single read_file, a \
+                single web_search) — handle those directly. The sub-agent starts with a fresh context and \
+                the same tools, so reference files by path and do not paste prior tool output.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -364,7 +372,10 @@ impl Tool for SpawnAgentTool {
                     },
                     "task": {
                         "type": "string",
-                        "description": "The specific task or question the sub-agent should accomplish"
+                        "description": "The specific task or question the sub-agent should accomplish. \
+                            Keep it self-contained but concise: state the goal, success criteria, and any \
+                            non-obvious constraints. Do NOT paste file contents, prior tool output, or \
+                            conversation excerpts — give file paths and let the sub-agent read them itself."
                     },
                     "background": {
                         "type": "boolean",
