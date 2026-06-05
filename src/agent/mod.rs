@@ -167,6 +167,8 @@ mod tool_loop_state;
 
 #[path = "loop/bootstrap_phase.rs"]
 mod bootstrap_phase;
+#[path = "loop/completion_checks.rs"]
+mod completion_checks;
 #[path = "runtime/completion_contract.rs"]
 mod completion_contract;
 #[path = "loop/completion_phase.rs"]
@@ -224,6 +226,8 @@ mod resume;
 mod sliding_window;
 #[path = "runtime/spawn.rs"]
 mod spawn;
+#[path = "loop/stopping_helpers.rs"]
+mod stopping_helpers;
 #[path = "loop/stopping_phase.rs"]
 mod stopping_phase;
 #[path = "loop/stopping_progress.rs"]

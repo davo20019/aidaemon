@@ -42,3 +42,77 @@ pub(super) fn only_final_response_remains(
         total_successful_tool_calls,
     ) && !completion_progress.verification_pending
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::CompletionContract;
+
+    #[test]
+    fn recoverable_tool_snapshot_counts_as_concrete_progress() {
+        let turn_context = TurnContext::default();
+        let completion_progress = CompletionProgress::default();
+
+        assert!(has_any_concrete_execution(
+            &turn_context,
+            &completion_progress,
+            true,
+            0,
+        ));
+        assert!(only_final_response_remains(
+            &turn_context,
+            &completion_progress,
+            true,
+            0,
+        ));
+    }
+
+    #[test]
+    fn successful_tool_calls_count_as_concrete_work() {
+        let turn_context = TurnContext::default();
+        let completion_progress = CompletionProgress::default();
+
+        // No snapshot, no progress, but successful tool calls → concrete work
+        assert!(has_any_concrete_execution(
+            &turn_context,
+            &completion_progress,
+            false,
+            1,
+        ));
+        // Zero successful tool calls and no other progress → not concrete
+        assert!(!has_any_concrete_execution(
+            &turn_context,
+            &completion_progress,
+            false,
+            0,
+        ));
+    }
+
+    #[test]
+    fn verification_pending_prevents_final_response_closeout_even_with_snapshot() {
+        let turn_context = TurnContext {
+            completion_contract: CompletionContract {
+                requires_observation: true,
+                ..CompletionContract::default()
+            },
+            ..TurnContext::default()
+        };
+        let completion_progress = CompletionProgress {
+            verification_pending: true,
+            ..CompletionProgress::default()
+        };
+
+        assert!(has_any_concrete_execution(
+            &turn_context,
+            &completion_progress,
+            true,
+            0,
+        ));
+        assert!(!only_final_response_remains(
+            &turn_context,
+            &completion_progress,
+            true,
+            0,
+        ));
+    }
+}

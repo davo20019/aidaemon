@@ -1,0 +1,1071 @@
+//! Pure helper functions and predicates supporting `run_tool_execution_phase`.
+//!
+//! This module was split out of `run.rs` to keep that file under the size
+//! budget. All items are moved verbatim — no logic changes. Visibility is
+//! `pub(super)` so `run.rs` can call them via `super::run_helpers::*`.
+
+use super::project_dir::{is_recognized_project_root, scope_allows_project_dir};
+use crate::agent::execution_state::{extract_target_hints_from_arguments, StepExecutionPlan};
+use crate::agent::*;
+use crate::traits::{ToolCallSemantics, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind};
+use crate::utils::{truncate_str, truncate_with_note};
+
+const TOOL_COMPLETE_SUMMARY_MAX_CHARS: usize = 140;
+const EXTERNAL_ACTION_ACK_MAX_CHARS: usize = 500;
+
+/// Extract a short error summary line from tool result text.
+pub(super) fn extract_error_summary_line(result_text: &str) -> Option<String> {
+    result_text
+        .lines()
+        .find(|l| {
+            l.contains("API ERROR")
+                || l.contains("Error")
+                || l.contains("error")
+                || l.contains("Forbidden")
+                || l.contains("Unauthorized")
+                || l.contains("BLOCKED")
+        })
+        .map(|l| l.chars().take(200).collect())
+}
+
+pub(super) fn raw_internal_scope_violation(
+    raw_arguments: &str,
+    session_id: &str,
+    resolved_goal_id: Option<&str>,
+) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(raw_arguments).ok()?;
+    let map = parsed.as_object()?;
+
+    if let Some(candidate_session_id) = map.get("_session_id").and_then(|v| v.as_str()) {
+        if candidate_session_id != session_id {
+            return Some(format!(
+                "_session_id mismatch (expected `{}`, got `{}`)",
+                session_id, candidate_session_id
+            ));
+        }
+    }
+
+    if let Some(candidate_goal_id) = map.get("_goal_id").and_then(|v| v.as_str()) {
+        match resolved_goal_id {
+            Some(expected_goal_id) if candidate_goal_id != expected_goal_id => {
+                return Some(format!(
+                    "_goal_id mismatch (expected `{}`, got `{}`)",
+                    expected_goal_id, candidate_goal_id
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "_goal_id `{}` provided but no goal scope is active",
+                    candidate_goal_id
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+pub(super) fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope> {
+    match tool_name {
+        "web_search" | "web_fetch" | "http_request" | "browser" => {
+            Some(ToolSemanticScope::ExternalRemote)
+        }
+        "read_file" | "search_files" | "edit_file" | "write_file" | "terminal"
+        | "project_inspect" => Some(ToolSemanticScope::LocalWorkspace),
+        "read_channel_history" => Some(ToolSemanticScope::ConversationHistory),
+        "remember_fact" | "manage_memories" | "share_memory" => Some(ToolSemanticScope::UserMemory),
+        "scheduled_goals" | "manage_goal_tasks" => Some(ToolSemanticScope::GoalState),
+        "system_info" => Some(ToolSemanticScope::HostLocal),
+        _ => None,
+    }
+}
+
+pub(super) fn semantic_scope_blocks_tool(
+    active_scope: Option<ToolSemanticScope>,
+    tool_scope: Option<ToolSemanticScope>,
+) -> bool {
+    matches!(
+        (active_scope, tool_scope),
+        (
+            Some(ToolSemanticScope::GoalState),
+            Some(ToolSemanticScope::ExternalRemote)
+        )
+    )
+}
+
+pub(super) struct DeterministicToolContractViolation {
+    pub(super) reason: String,
+    pub(super) coaching: String,
+}
+
+pub(super) fn scheduled_goal_runs_missing_goal_id_violation(
+    raw_arguments: &str,
+) -> Option<DeterministicToolContractViolation> {
+    let parsed = serde_json::from_str::<Value>(raw_arguments).ok()?;
+    let map = parsed.as_object()?;
+    let has_goal_id = map
+        .get("goal_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| !v.trim().is_empty());
+    if has_goal_id {
+        None
+    } else {
+        let action = map
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<missing>");
+        Some(DeterministicToolContractViolation {
+            reason: format!(
+                "action `{}` requires `goal_id` for `scheduled_goal_runs`",
+                action
+            ),
+            coaching: "If the user asked to learn/remember/save facts, use `remember_fact`. \
+If they asked about scheduled-goal runs, first get IDs with \
+`manage_memories(action='list_scheduled')`, then call `scheduled_goal_runs` with `goal_id`."
+                .to_string(),
+        })
+    }
+}
+
+pub(super) fn manage_memories_missing_goal_id_violation(
+    raw_arguments: &str,
+) -> Option<DeterministicToolContractViolation> {
+    const ACTIONS_REQUIRING_GOAL_ID: &[&str] = &[
+        "add_schedule",
+        "cancel_scheduled",
+        "pause_scheduled",
+        "resume_scheduled",
+        "retry_scheduled",
+        "diagnose_scheduled",
+    ];
+
+    let parsed = serde_json::from_str::<Value>(raw_arguments).ok()?;
+    let map = parsed.as_object()?;
+    let action = map.get("action").and_then(|v| v.as_str())?;
+    if !ACTIONS_REQUIRING_GOAL_ID.contains(&action) {
+        return None;
+    }
+
+    let has_goal_id = map
+        .get("goal_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| !v.trim().is_empty());
+    if has_goal_id {
+        return None;
+    }
+
+    Some(DeterministicToolContractViolation {
+        reason: format!(
+            "action `{}` requires `goal_id` for `manage_memories`",
+            action
+        ),
+        coaching: "If the user asked about scheduled goals, first get IDs with \
+`manage_memories(action='list_scheduled')`, then retry the intended \
+`manage_memories` action with a concrete `goal_id`."
+            .to_string(),
+    })
+}
+
+pub(super) fn deterministic_tool_contract_violation(
+    tool_name: &str,
+    raw_arguments: &str,
+) -> Option<DeterministicToolContractViolation> {
+    match tool_name {
+        "scheduled_goal_runs" => scheduled_goal_runs_missing_goal_id_violation(raw_arguments),
+        "manage_memories" => manage_memories_missing_goal_id_violation(raw_arguments),
+        _ => None,
+    }
+}
+
+pub(super) fn tool_is_currently_exposed(tool_defs: &[Value], tool_name: &str) -> bool {
+    tool_defs.iter().any(|def| {
+        def.get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(|name| name.as_str())
+            .is_some_and(|exposed_name| exposed_name == tool_name)
+    })
+}
+
+pub(super) fn blocked_for_untrusted_external_reference_message(
+    tool_name: &str,
+    active_skills: &[String],
+) -> String {
+    let scope = if active_skills.is_empty() {
+        "an untrusted external API guide reference".to_string()
+    } else {
+        format!(
+            "untrusted external API guide skill(s): {}",
+            active_skills.join(", ")
+        )
+    };
+    format!(
+        "Blocked: `{}` is unavailable while using {}. \
+Use API/auth tools directly, or ask explicitly for local file or repository inspection if you want me to read local files or inspect the local environment.",
+        tool_name, scope
+    )
+}
+
+pub(super) fn allow_scaffold_parent_dir_for_target(
+    tool_name: &str,
+    allowed_target: &ToolTargetHint,
+    candidate_target: &ToolTargetHint,
+) -> bool {
+    if tool_name != "run_command" {
+        return false;
+    }
+    let Some(scope_path) = crate::tools::fs_utils::validate_path(&allowed_target.value).ok() else {
+        return false;
+    };
+    if scope_path.is_dir() {
+        return false;
+    }
+    let Some(candidate_path) = crate::tools::fs_utils::validate_path(&candidate_target.value).ok()
+    else {
+        return false;
+    };
+    scope_path
+        .parent()
+        .is_some_and(|parent| parent.is_dir() && candidate_path == parent)
+}
+
+pub(super) fn target_hint_allowed_for_step(
+    tool_name: &str,
+    allowed_target: &ToolTargetHint,
+    candidate_target: &ToolTargetHint,
+) -> bool {
+    match (&allowed_target.kind, &candidate_target.kind) {
+        (ToolTargetHintKind::Url, ToolTargetHintKind::Url) => allowed_target
+            .value
+            .eq_ignore_ascii_case(&candidate_target.value),
+        (
+            ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope,
+            ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope,
+        ) => {
+            allowed_target.value == candidate_target.value
+                || scope_allows_project_dir(&allowed_target.value, &candidate_target.value)
+                || allow_scaffold_parent_dir_for_target(tool_name, allowed_target, candidate_target)
+                || is_recognized_project_root(&candidate_target.value)
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn json_contains_string_value(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(candidate) => candidate.eq_ignore_ascii_case(expected),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| json_contains_string_value(item, expected)),
+        Value::Object(map) => map
+            .values()
+            .any(|value| json_contains_string_value(value, expected)),
+        _ => false,
+    }
+}
+
+pub(super) fn linear_intent_step_matches_tool_call(
+    step: &crate::agent::execution_state::LinearIntentStep,
+    tool_name: &str,
+    effective_arguments: &str,
+) -> bool {
+    if !step.tool.eq_ignore_ascii_case(tool_name) {
+        return false;
+    }
+    if step.target.is_empty() {
+        return true;
+    }
+
+    let candidate_targets = extract_target_hints_from_arguments(effective_arguments);
+    if candidate_targets
+        .iter()
+        .any(|target| target.value.eq_ignore_ascii_case(&step.target))
+    {
+        return true;
+    }
+
+    serde_json::from_str::<Value>(effective_arguments)
+        .ok()
+        .is_some_and(|value| json_contains_string_value(&value, &step.target))
+}
+
+pub(super) fn target_scope_violation_for_tool_call(
+    tool_name: &str,
+    effective_arguments: &str,
+    step_plan: &StepExecutionPlan,
+) -> Option<String> {
+    if !step_plan.target_scope.hard_fail_outside_scope
+        || step_plan.target_scope.allowed_targets.is_empty()
+    {
+        return None;
+    }
+
+    let candidate_targets = extract_target_hints_from_arguments(effective_arguments);
+    if candidate_targets.is_empty() {
+        return None;
+    }
+
+    let violations: Vec<String> = candidate_targets
+        .iter()
+        .filter(|candidate_target| {
+            !step_plan
+                .target_scope
+                .allowed_targets
+                .iter()
+                .any(|allowed_target| {
+                    target_hint_allowed_for_step(tool_name, allowed_target, candidate_target)
+                })
+        })
+        .map(|target| target.value.clone())
+        .collect();
+    if violations.is_empty() {
+        None
+    } else {
+        let allowed_targets = step_plan
+            .target_scope
+            .allowed_targets
+            .iter()
+            .map(|target| target.value.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "target scope lock violation (allowed target(s): {}, requested target(s): {})",
+            allowed_targets,
+            violations.join(", ")
+        ))
+    }
+}
+
+pub(super) fn is_hard_policy_tool_budget_reached(
+    total_tool_calls_attempted: usize,
+    policy_tool_budget: usize,
+) -> bool {
+    policy_tool_budget > 0 && total_tool_calls_attempted >= policy_tool_budget
+}
+
+pub(super) fn tool_result_indicates_background_detach(
+    tool_name: &str,
+    result_text: &str,
+    metadata: &crate::traits::ToolCallMetadata,
+) -> bool {
+    let _ = tool_name;
+    if metadata.background_started {
+        return true;
+    }
+    result_text.contains("Moved to background")
+        || result_text.contains("started in background")
+        || result_text.contains("spawned in background")
+}
+
+pub(super) fn build_background_detach_ack(
+    tool_name: &str,
+    result_text: &str,
+    metadata: &crate::traits::ToolCallMetadata,
+) -> String {
+    let default_prefix = match tool_name {
+        "terminal" => "The command is running in the background.",
+        "cli_agent" => "The CLI agent task is running in the background.",
+        "spawn_agent" => "The spawned sub-agent is running in the background.",
+        _ => "The task is running in the background.",
+    };
+    let first_line = crate::traits::first_primary_message_line(result_text, &[])
+        .unwrap_or(default_prefix.to_string());
+    // Use structured tool metadata rather than inferring notification semantics
+    // from rendered tool output text.
+    let notifications_active = metadata.completion_notifications_enabled;
+    if notifications_active {
+        format!(
+            "{} Completion notifications are enabled, and the final result will be sent automatically when it finishes.",
+            first_line
+        )
+    } else {
+        first_line.to_string()
+    }
+}
+
+pub(super) fn run_command_policy_block_requires_terminal(result_text: &str) -> bool {
+    let lower = result_text.to_ascii_lowercase();
+    lower.contains("safe command list")
+        || lower.contains("use 'terminal' for this command")
+        || lower.contains("use `terminal`")
+        || lower.contains("shell operators")
+        || lower.contains("daemonization primitives are blocked in run_command")
+}
+
+pub(super) fn shell_single_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\"'\"'");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+pub(super) fn build_terminal_fallback_arguments_from_run_command(
+    raw_arguments: &str,
+) -> Option<String> {
+    let args = serde_json::from_str::<Value>(raw_arguments).ok()?;
+    let map = args.as_object()?;
+    let command = map.get("command").and_then(|v| v.as_str())?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let working_dir = map
+        .get("working_dir")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let terminal_command = if let Some(dir) = working_dir {
+        format!("cd {} && {}", shell_single_quote(dir), command)
+    } else {
+        command.to_string()
+    };
+    Some(
+        json!({
+            "action": "run",
+            "command": terminal_command,
+        })
+        .to_string(),
+    )
+}
+
+pub(super) fn is_trivial_success_excerpt(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    lower.is_empty()
+        || lower == "ok"
+        || lower == "done"
+        || lower == "success"
+        || lower == "completed"
+        || lower == "completed successfully"
+        || lower == "request completed successfully"
+}
+
+pub(super) fn summarize_completed_tool_result(result_text: &str) -> String {
+    let summary = crate::traits::first_primary_message_line(result_text, &[])
+        .filter(|line| !line.trim().is_empty())
+        .unwrap_or_else(|| "Completed".to_string());
+    truncate_str(summary.trim(), TOOL_COMPLETE_SUMMARY_MAX_CHARS)
+}
+
+pub(super) fn has_nonzero_exit_code(text: &str) -> bool {
+    // Detect "[exit code: N]" where N != 0.
+    if let Some(pos) = text.to_ascii_lowercase().find("[exit code:") {
+        let after = &text[pos + 11..];
+        let code_str: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == ' ')
+            .collect();
+        if let Ok(code) = code_str.trim().parse::<i32>() {
+            return code != 0;
+        }
+    }
+    false
+}
+
+pub(super) fn build_external_action_completion_ack(result_text: &str) -> String {
+    let primary = crate::traits::extract_primary_message_content(result_text, &[]);
+    let excerpt = primary.trim();
+    let has_error = has_nonzero_exit_code(excerpt);
+    let status = if has_error {
+        "The requested action finished with errors."
+    } else {
+        "The requested action completed successfully."
+    };
+    if excerpt.is_empty() || is_trivial_success_excerpt(excerpt) {
+        status.to_string()
+    } else {
+        format!(
+            "{}\n\nLatest result:\n{}",
+            status,
+            truncate_with_note(excerpt, EXTERNAL_ACTION_ACK_MAX_CHARS)
+        )
+    }
+}
+
+pub(super) fn should_build_external_action_ack(result_text: &str) -> bool {
+    let primary = crate::traits::extract_primary_message_content(result_text, &[]);
+    let lower = primary.trim_start().to_ascii_lowercase();
+    !lower.starts_with("request blocked:")
+        && !lower.starts_with("blocked:")
+        && !lower.starts_with("[system] blocked:")
+        && !lower.starts_with("error:")
+        && !lower.starts_with("failed to ")
+}
+
+pub(super) fn tool_result_contains_verifiable_evidence(
+    semantics: &ToolCallSemantics,
+    result_text: &str,
+) -> bool {
+    if !semantics.can_verify_with_result_content() {
+        return false;
+    }
+
+    let primary = crate::traits::extract_primary_message_content(result_text, &[]);
+    let primary = primary.trim();
+    !primary.is_empty()
+        && !matches!(
+            primary.to_ascii_lowercase().as_str(),
+            "ok" | "done" | "success" | "completed" | "completed successfully"
+        )
+}
+
+pub(super) fn normalized_target_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(['.', ',', ';'])
+        .to_ascii_lowercase()
+}
+
+pub(super) fn tool_target_hint_matches_contract_target(
+    target_hint: &ToolTargetHint,
+    contract_target: &VerificationTarget,
+) -> bool {
+    let compatible_kind = matches!(
+        (target_hint.kind, contract_target.kind),
+        (ToolTargetHintKind::Url, VerificationTargetKind::Url)
+            | (ToolTargetHintKind::Path, VerificationTargetKind::Path)
+            | (
+                ToolTargetHintKind::ProjectScope,
+                VerificationTargetKind::ProjectScope
+            )
+            | (
+                ToolTargetHintKind::Path,
+                VerificationTargetKind::ProjectScope
+            )
+            | (
+                ToolTargetHintKind::ProjectScope,
+                VerificationTargetKind::Path
+            )
+    );
+    if !compatible_kind {
+        return false;
+    }
+
+    let hint = normalized_target_value(&target_hint.value);
+    let contract = normalized_target_value(&contract_target.value);
+    if hint.is_empty() || contract.is_empty() {
+        return false;
+    }
+
+    hint == contract || hint.contains(&contract) || contract.contains(&hint)
+}
+
+pub(super) fn verification_target_matches_haystack(
+    target: &VerificationTarget,
+    haystack: &str,
+) -> bool {
+    let haystack = haystack.to_ascii_lowercase();
+    let needle = normalized_target_value(&target.value);
+    if needle.is_empty() {
+        return false;
+    }
+
+    if haystack.contains(&needle) {
+        return true;
+    }
+
+    match target.kind {
+        VerificationTargetKind::ProjectScope | VerificationTargetKind::Path => target
+            .value
+            .rsplit(['/', '\\'])
+            .find(|segment| !segment.is_empty())
+            .map(normalized_target_value)
+            .is_some_and(|tail| !tail.is_empty() && haystack.contains(&tail)),
+        VerificationTargetKind::Url => false,
+    }
+}
+
+pub(super) fn observation_matches_completion_contract(
+    contract: &CompletionContract,
+    semantics: &ToolCallSemantics,
+    raw_arguments: &str,
+    result_text: &str,
+) -> bool {
+    if contract.verification_targets.is_empty() {
+        return true;
+    }
+
+    if semantics.target_hints.iter().any(|hint| {
+        contract
+            .verification_targets
+            .iter()
+            .any(|target| tool_target_hint_matches_contract_target(hint, target))
+    }) {
+        return true;
+    }
+
+    let mut haystacks = vec![
+        raw_arguments.to_string(),
+        crate::traits::extract_primary_message_content(result_text, &[]).to_string(),
+        result_text.to_string(),
+    ];
+    if let Some(command) = extract_command_from_args(raw_arguments) {
+        haystacks.push(command);
+    }
+
+    contract.verification_targets.iter().any(|target| {
+        haystacks
+            .iter()
+            .any(|haystack| verification_target_matches_haystack(target, haystack))
+    })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::execution_state::{
+        default_execution_budget, BudgetTier, ExecutionPersistence, ExecutionState, RetryPolicy,
+    };
+    use crate::traits::ToolCallEffect;
+
+    #[test]
+    fn internal_scope_violation_detects_session_mismatch() {
+        let raw = r#"{"_session_id":"other-session"}"#;
+        let violation = raw_internal_scope_violation(raw, "expected-session", None);
+        assert!(violation.is_some());
+        let message = violation.unwrap_or_default();
+        assert!(message.contains("_session_id mismatch"));
+    }
+
+    #[test]
+    fn internal_scope_violation_detects_goal_mismatch() {
+        let raw = r#"{"_goal_id":"goal-2"}"#;
+        let violation = raw_internal_scope_violation(raw, "s", Some("goal-1"));
+        assert!(violation.is_some());
+        let message = violation.unwrap_or_default();
+        assert!(message.contains("_goal_id mismatch"));
+    }
+
+    #[test]
+    fn deterministic_tool_contract_violation_blocks_scheduled_goal_runs_without_goal_id() {
+        let args = r#"{"action":"run_history"}"#;
+        let violation = deterministic_tool_contract_violation("scheduled_goal_runs", args);
+        assert!(violation.is_some());
+        let violation = violation.expect("violation expected");
+        assert!(violation.reason.contains("requires `goal_id`"));
+        assert!(violation.coaching.contains("remember_fact"));
+    }
+
+    #[test]
+    fn deterministic_tool_contract_violation_allows_scheduled_goal_runs_with_goal_id() {
+        let args = r#"{"action":"run_history","goal_id":"goal-123"}"#;
+        let violation = deterministic_tool_contract_violation("scheduled_goal_runs", args);
+        assert!(violation.is_none());
+    }
+
+    #[test]
+    fn deterministic_tool_contract_violation_blocks_manage_memories_without_goal_id() {
+        let args = r#"{"action":"diagnose_scheduled"}"#;
+        let violation = deterministic_tool_contract_violation("manage_memories", args);
+        assert!(violation.is_some());
+        let violation = violation.expect("violation expected");
+        assert!(violation.reason.contains("requires `goal_id`"));
+        assert!(violation.coaching.contains("list_scheduled"));
+    }
+
+    #[test]
+    fn deterministic_tool_contract_violation_allows_manage_memories_with_goal_id() {
+        let args = r#"{"action":"diagnose_scheduled","goal_id":"goal-123"}"#;
+        let violation = deterministic_tool_contract_violation("manage_memories", args);
+        assert!(violation.is_none());
+    }
+
+    #[test]
+    fn tool_is_currently_exposed_matches_current_tool_defs() {
+        let tool_defs = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "system_info",
+                    "description": "demo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "remember_fact",
+                    "description": "demo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                }
+            }),
+        ];
+
+        assert!(tool_is_currently_exposed(&tool_defs, "system_info"));
+        assert!(!tool_is_currently_exposed(&tool_defs, "cli_agent"));
+    }
+
+    #[test]
+    fn result_content_verification_requires_semantics_opt_in() {
+        let verifyable = ToolCallSemantics::observation()
+            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent);
+        let non_verifyable = ToolCallSemantics::observation();
+        assert!(tool_result_contains_verifiable_evidence(
+            &verifyable,
+            "Latest post title: Scheduled reflection"
+        ));
+        assert!(!tool_result_contains_verifiable_evidence(
+            &non_verifyable,
+            "Latest post title: Scheduled reflection"
+        ));
+    }
+
+    #[test]
+    fn semantics_target_hints_match_contract_targets() {
+        let contract = CompletionContract {
+            requires_observation: true,
+            verification_targets: vec![VerificationTarget {
+                kind: VerificationTargetKind::Url,
+                value: "https://blog.aidaemon.ai".to_string(),
+            }],
+            ..CompletionContract::default()
+        };
+        let semantics = ToolCallSemantics::observation()
+            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent)
+            .with_target_hint(ToolTargetHintKind::Url, "https://blog.aidaemon.ai");
+        assert!(observation_matches_completion_contract(
+            &contract,
+            &semantics,
+            "{}",
+            "Latest post title: Scheduled reflection"
+        ));
+    }
+
+    #[test]
+    fn target_scope_violation_flags_out_of_scope_mutation_path() {
+        let step_plan = StepExecutionPlan {
+            step_id: "step-1".to_string(),
+            description: "Edit a scoped file".to_string(),
+            plan_version: 1,
+            primary_tool: Some("edit_file".to_string()),
+            expected_effect: ToolCallEffect::Mutation,
+            target_scope: TargetScope {
+                allowed_targets: vec![ToolTargetHint::new(
+                    ToolTargetHintKind::ProjectScope,
+                    "/tmp/project-a",
+                )
+                .expect("scope target")],
+                hard_fail_outside_scope: true,
+            },
+            expected_targets: Vec::new(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                allow_tool_invocation_retry: false,
+            },
+            approval_requirement: ApprovalRequirement::NotNeeded,
+            idempotency_key: None,
+        };
+        let args = r#"{"path":"/tmp/project-b/src/main.rs"}"#;
+        let violation = target_scope_violation_for_tool_call("edit_file", args, &step_plan);
+        assert!(violation.is_some());
+    }
+
+    #[test]
+    fn target_scope_violation_skips_non_hard_fail_observation_steps() {
+        let step_plan = StepExecutionPlan {
+            step_id: "step-1".to_string(),
+            description: "Inspect a path".to_string(),
+            plan_version: 1,
+            primary_tool: Some("search_files".to_string()),
+            expected_effect: ToolCallEffect::Observation,
+            target_scope: TargetScope {
+                allowed_targets: vec![ToolTargetHint::new(
+                    ToolTargetHintKind::ProjectScope,
+                    "/tmp/project-a",
+                )
+                .expect("scope target")],
+                hard_fail_outside_scope: false,
+            },
+            expected_targets: Vec::new(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                allow_tool_invocation_retry: true,
+            },
+            approval_requirement: ApprovalRequirement::NotNeeded,
+            idempotency_key: None,
+        };
+        let args = r#"{"path":"/tmp/project-b/src"}"#;
+        let violation = target_scope_violation_for_tool_call("search_files", args, &step_plan);
+        assert!(violation.is_none());
+    }
+
+    #[test]
+    fn run_command_policy_block_requires_terminal_detects_policy_errors() {
+        assert!(run_command_policy_block_requires_terminal(
+            "Error: Command 'npm install' is not in the safe command list for run_command. Use 'terminal' for this command."
+        ));
+        assert!(!run_command_policy_block_requires_terminal(
+            "$ cargo test (exit: 0, 22ms)"
+        ));
+    }
+
+    #[test]
+    fn build_terminal_fallback_arguments_preserves_working_dir() {
+        let args = r#"{"command":"npm create vite@latest whatsapp-site -- --template react","working_dir":"/tmp/my folder"}"#;
+        let terminal_args = build_terminal_fallback_arguments_from_run_command(args)
+            .expect("fallback args expected");
+        let parsed: Value = serde_json::from_str(&terminal_args).expect("valid json");
+        assert_eq!(parsed["action"], "run");
+        assert_eq!(
+            parsed["command"],
+            "cd '/tmp/my folder' && npm create vite@latest whatsapp-site -- --template react"
+        );
+    }
+
+    #[test]
+    fn build_terminal_fallback_arguments_escapes_single_quotes() {
+        let args = r#"{"command":"npm create vite@latest whatsapp-site -- --template react","working_dir":"/tmp/david's projects"}"#;
+        let terminal_args = build_terminal_fallback_arguments_from_run_command(args)
+            .expect("fallback args expected");
+        let parsed: Value = serde_json::from_str(&terminal_args).expect("valid json");
+        assert_eq!(
+            parsed["command"],
+            "cd '/tmp/david'\"'\"'s projects' && npm create vite@latest whatsapp-site -- --template react"
+        );
+    }
+
+    #[test]
+    fn target_scope_violation_allows_run_command_parent_dir_for_new_project_scaffolding() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("projects");
+        std::fs::create_dir_all(&parent).expect("create parent");
+        let target = parent.join("new-site");
+        let step_plan = StepExecutionPlan {
+            step_id: "step-1".to_string(),
+            description: "Scaffold a project".to_string(),
+            plan_version: 1,
+            primary_tool: Some("run_command".to_string()),
+            expected_effect: ToolCallEffect::Mutation,
+            target_scope: TargetScope {
+                allowed_targets: vec![ToolTargetHint::new(
+                    ToolTargetHintKind::ProjectScope,
+                    target.to_string_lossy().to_string(),
+                )
+                .expect("scope target")],
+                hard_fail_outside_scope: true,
+            },
+            expected_targets: Vec::new(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                allow_tool_invocation_retry: false,
+            },
+            approval_requirement: ApprovalRequirement::NotNeeded,
+            idempotency_key: None,
+        };
+        let args = format!(
+            r#"{{"command":"pwd","working_dir":"{}"}}"#,
+            parent.to_string_lossy()
+        );
+        let violation = target_scope_violation_for_tool_call("run_command", &args, &step_plan);
+        assert!(violation.is_none());
+    }
+
+    #[test]
+    fn hard_policy_tool_budget_reached_when_attempts_hit_limit() {
+        assert!(is_hard_policy_tool_budget_reached(6, 6));
+        assert!(is_hard_policy_tool_budget_reached(7, 6));
+        assert!(!is_hard_policy_tool_budget_reached(5, 6));
+        assert!(!is_hard_policy_tool_budget_reached(10, 0));
+    }
+
+    #[test]
+    fn detects_background_detach_markers_for_supported_tools() {
+        let none = crate::traits::ToolCallMetadata::default();
+        let flagged = crate::traits::ToolCallMetadata {
+            background_started: true,
+            ..Default::default()
+        };
+        assert!(tool_result_indicates_background_detach(
+            "terminal",
+            "Process finished normally.",
+            &flagged
+        ));
+        assert!(tool_result_indicates_background_detach(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=123).",
+            &none
+        ));
+        assert!(tool_result_indicates_background_detach(
+            "cli_agent",
+            "CLI agent 'x' started in background (task_id=abc).",
+            &none
+        ));
+        assert!(tool_result_indicates_background_detach(
+            "spawn_agent",
+            "Sub-agent spawned in background for mission: \"...\"",
+            &none
+        ));
+        assert!(tool_result_indicates_background_detach(
+            "web_search",
+            "Moved to background (pid=1)",
+            &none
+        ));
+        assert!(!tool_result_indicates_background_detach(
+            "terminal",
+            "Process finished normally.",
+            &none
+        ));
+    }
+
+    #[test]
+    fn builds_deterministic_background_ack_from_tool_result() {
+        let with_notify = crate::traits::ToolCallMetadata {
+            completion_notifications_enabled: true,
+            ..Default::default()
+        };
+        let without_notify = crate::traits::ToolCallMetadata::default();
+
+        // With notifications enabled — should promise automatic delivery.
+        let ack = build_background_detach_ack(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=123).\n\nCompletion notifications are enabled. The user will be notified when this process finishes.\n\n[SYSTEM] ...",
+            &with_notify,
+        );
+        assert!(ack.contains("Moved to background (pid=123)"));
+        assert!(ack.contains("final result will be sent automatically"));
+
+        // Without notifications — should NOT promise automatic delivery.
+        let ack_no_notify = build_background_detach_ack(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=456).\n\nThis process is task-owned and will be auto-killed when the current task ends.",
+            &without_notify,
+        );
+        assert!(ack_no_notify.contains("Moved to background (pid=456)"));
+        assert!(!ack_no_notify.contains("final result will be sent automatically"));
+    }
+
+    #[test]
+    fn background_ack_uses_structured_notification_metadata_not_text() {
+        let with_notify = crate::traits::ToolCallMetadata {
+            completion_notifications_enabled: true,
+            ..Default::default()
+        };
+        let without_notify = crate::traits::ToolCallMetadata::default();
+
+        let ack = build_background_detach_ack(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=123).",
+            &with_notify,
+        );
+        assert!(ack.contains("final result will be sent automatically"));
+
+        let ack_no_notify = build_background_detach_ack(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=456).\n\nCompletion notifications are enabled. The user will be notified when this process finishes.",
+            &without_notify,
+        );
+        assert!(!ack_no_notify.contains("final result will be sent automatically"));
+    }
+
+    #[test]
+    fn blocked_for_untrusted_external_reference_message_mentions_skill_names() {
+        let message = blocked_for_untrusted_external_reference_message(
+            "read_file",
+            &["widgets-api".to_string(), "linear-api".to_string()],
+        );
+        assert!(message.contains("read_file"));
+        assert!(message.contains("widgets-api"));
+        assert!(message.contains("linear-api"));
+        assert!(message.contains("explicitly for local file or repository inspection"));
+    }
+
+    #[test]
+    fn linear_intent_step_match_requires_declared_target_when_present() {
+        let step = crate::agent::execution_state::LinearIntentStep {
+            step_id: "plan-v1-step-2".to_string(),
+            step_index: 2,
+            tool: "http_request".to_string(),
+            target: "https://api.example.com/tweet-2".to_string(),
+            description: "Post tweet 2".to_string(),
+            tool_calls_on_step: 0,
+            completed: false,
+            completion_evidence: None,
+            last_evaluated_at: None,
+        };
+
+        assert!(!linear_intent_step_matches_tool_call(
+            &step,
+            "http_request",
+            r#"{"url":"https://api.example.com/tweet-3","method":"POST"}"#
+        ));
+        assert!(linear_intent_step_matches_tool_call(
+            &step,
+            "http_request",
+            r#"{"url":"https://api.example.com/tweet-2","method":"POST"}"#
+        ));
+    }
+
+    #[test]
+    fn unmatched_success_does_not_advance_linear_intent_cursor() {
+        let mut execution_state = ExecutionState::new(
+            BudgetTier::None,
+            default_execution_budget(BudgetTier::None),
+            ExecutionPersistence::Ephemeral,
+        );
+        execution_state.install_linear_intent_plan(
+            1,
+            vec![
+                crate::agent::execution_state::LinearIntentStep {
+                    step_id: "plan-v1-step-1".to_string(),
+                    step_index: 1,
+                    tool: "http_request".to_string(),
+                    target: "https://api.example.com/tweet-1".to_string(),
+                    description: "Post tweet 1".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
+                },
+                crate::agent::execution_state::LinearIntentStep {
+                    step_id: "plan-v1-step-2".to_string(),
+                    step_index: 2,
+                    tool: "http_request".to_string(),
+                    target: "https://api.example.com/tweet-2".to_string(),
+                    description: "Post tweet 2".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
+                },
+            ],
+        );
+
+        let planned_step = execution_state
+            .current_linear_intent_step()
+            .filter(|step| {
+                linear_intent_step_matches_tool_call(
+                    step,
+                    "http_request",
+                    r#"{"url":"https://api.example.com/tweet-2","method":"POST"}"#,
+                )
+            })
+            .cloned();
+        if planned_step.is_some() {
+            execution_state.advance_linear_intent_step_after_external_success();
+        }
+
+        assert_eq!(
+            execution_state
+                .current_linear_intent_step()
+                .expect("step should remain active")
+                .step_index,
+            1
+        );
+    }
+}
