@@ -167,6 +167,8 @@ mod tool_loop_state;
 
 #[path = "loop/bootstrap_phase.rs"]
 mod bootstrap_phase;
+#[path = "runtime/completion_contract.rs"]
+mod completion_contract;
 #[path = "loop/completion_phase.rs"]
 mod completion_phase;
 #[path = "runtime/dialogue_state.rs"]
@@ -175,15 +177,23 @@ mod dialogue_state;
 mod direct_return;
 #[path = "loop/fallthrough.rs"]
 mod fallthrough;
+#[path = "runtime/followup.rs"]
+mod followup;
 #[path = "runtime/graceful.rs"]
 mod graceful;
 #[path = "runtime/history.rs"]
 mod history;
+#[path = "runtime/notes.rs"]
+mod notes;
 #[path = "loop/orchestration_phase.rs"]
 mod orchestration_phase;
 #[path = "runtime/parent_delivery.rs"]
 mod parent_delivery;
+#[path = "runtime/project_scope.rs"]
+mod project_scope;
 pub(crate) mod specialists;
+#[path = "runtime/turn_context.rs"]
+mod turn_context;
 pub(crate) use parent_delivery::ParentDeliveryKind;
 #[path = "loop/response_phase.rs"]
 mod response_phase;
