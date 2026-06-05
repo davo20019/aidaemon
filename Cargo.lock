@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon"
-version = "0.9.35"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

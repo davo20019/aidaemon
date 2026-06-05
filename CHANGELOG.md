@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-06-05
+
+### Added
+
+- **Dialogue-state tracking wired in**: the previously uncompiled dialogue-state feature is now live — `DialogueStateStore` trait defined and included in the `StateStore` facade, `dialogue_states` table created by migration, runtime rebuild/record functions compiled, and `part_13_dialogue_state` integration tests included in the suite.
+- **Specialist prompt overhaul**: specialists share a common `_executor_base.md` core with per-kind sections; `spawn_agent` descriptions nudge delegation when work fits a specialist.
+
+### Changed
+
+- **Agent internals decoupled (no user-facing behavior change)** — completion of the architecture campaign started in v0.9.0:
+  - The ~60 loose mutable variables in the agent loop now live in 8 per-concern state structs (`StallTracker`, `FailureLedger`, `RecoveryState`, `BudgetTracker`, `EvidenceLedger`, `ReflectionState`, `PendingDirectives`, `LoopCounters`) composed in a `TurnState`, with per-phase projections.
+  - All nine loop phases (bootstrap, orchestration, message build, LLM, response, completion, stopping, tool prelude, tool execution) are free functions with explicit `Ctx` inputs and `Outcome` results — no more extension-method sprawl on the `Agent` struct (31 `impl Agent` blocks reduced to 13, each justified).
+  - `runtime/history.rs` (4,117 lines) split into `followup`, `completion_contract`, `turn_context`, `project_scope`, and `notes` modules; `agent/mod.rs` shrunk from 4,233 to ~800 lines; no file in `src/agent/` exceeds ~2,000 lines.
+  - Outer ring: deferred cycle-breaking wiring consolidated into `startup/wiring.rs`; new `ApprovalBroker` type replaces the raw approval channel sender threaded through 21 files; Telegram bootstrap-signing and approval rendering extracted from `telegram.rs`; six tools narrowed from the full `StateStore` facade to the specific store sub-trait they use.
+  - Verified behavior-preserving by characterization tests (stall, force-text, completion blocking, truncation recovery, background ack) and an identical 2,294-test green suite at every slice.
+
 ## [0.9.35] - 2026-05-10
 
 ### Changed
