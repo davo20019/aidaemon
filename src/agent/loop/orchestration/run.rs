@@ -77,18 +77,31 @@ impl Agent {
         });
         Some(serde_json::to_string(&ctx).unwrap_or_default())
     }
+}
 
+pub(in crate::agent) async fn run_orchestration_phase(
+    services: &crate::agent::services::AgentServices<'_>,
+    ctx: &mut OrchestrationCtx<'_>,
+) -> anyhow::Result<Option<ResponsePhaseOutcome>> {
+    let agent = services.agent;
+    if let Some(outcome) = agent.maybe_handle_generic_cancel_request(ctx).await? {
+        return Ok(Some(outcome));
+    }
+
+    // Orchestration routing (always-on).
+    let (complexity, _) = classify_intent_complexity(ctx.user_text, ctx.intent_gate);
+    let outcome = agent
+        .route_orchestration_complexity(ctx, complexity)
+        .await?;
+    Ok(Some(outcome))
+}
+
+impl Agent {
     pub(in crate::agent) async fn run_orchestration_phase(
         &self,
         ctx: &mut OrchestrationCtx<'_>,
     ) -> anyhow::Result<Option<ResponsePhaseOutcome>> {
-        if let Some(outcome) = self.maybe_handle_generic_cancel_request(ctx).await? {
-            return Ok(Some(outcome));
-        }
-
-        // Orchestration routing (always-on).
-        let (complexity, _) = classify_intent_complexity(ctx.user_text, ctx.intent_gate);
-        let outcome = self.route_orchestration_complexity(ctx, complexity).await?;
-        Ok(Some(outcome))
+        let services = crate::agent::services::AgentServices::new(self);
+        run_orchestration_phase(&services, ctx).await
     }
 }
