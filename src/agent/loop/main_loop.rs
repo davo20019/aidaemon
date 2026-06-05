@@ -107,16 +107,19 @@ impl Agent {
     ) -> anyhow::Result<String> {
         touch_heartbeat(&heartbeat);
         info!(session_id, "handle_message_impl: starting bootstrap phase");
+        let services = super::services::AgentServices::new(self);
 
-        let bootstrap_outcome = self
-            .run_bootstrap_phase(&BootstrapCtx {
+        let bootstrap_outcome = super::bootstrap_phase::run_bootstrap_phase(
+            &services,
+            &BootstrapCtx {
                 session_id,
                 user_text,
                 status_tx: status_tx.clone(),
                 user_role,
                 channel_ctx: &channel_ctx,
-            })
-            .await?;
+            },
+        )
+        .await?;
         let BootstrapData {
             task_id,
             emitter,
@@ -281,7 +284,6 @@ impl Agent {
                     .unwrap_or(false),
             ),
         };
-        let _services = super::services::AgentServices::new(self);
 
         // Task-start planning call: generate a structured plan before the main loop.
         // Skipped for conversational queries, short messages, and acknowledgments.
@@ -735,8 +737,9 @@ impl Agent {
             let stopping_evidence = turn_state.evidence.for_stopping_phase();
             let stopping_directives = turn_state.directives.for_stopping_phase();
             let stopping_counters = turn_state.counters.for_stopping_phase();
-            let stopping_outcome = self
-                .run_stopping_phase(&mut StoppingPhaseCtx {
+            let stopping_outcome = super::stopping_phase::run_stopping_phase(
+                &services,
+                &mut StoppingPhaseCtx {
                     emitter: &emitter,
                     task_id: &task_id,
                     session_id,
@@ -785,8 +788,9 @@ impl Agent {
                     completion_progress: &mut completion_progress,
                     turn_context: &turn_context,
                     validation_state: stopping_evidence.validation_state,
-                })
-                .await?;
+                },
+            )
+            .await?;
             match stopping_outcome {
                 StoppingPhaseOutcome::ContinueLoop => continue,
                 StoppingPhaseOutcome::Return(result) => return result,
@@ -801,8 +805,9 @@ impl Agent {
                 && !route_failsafe_active
             {
                 let intent_gate = infer_deterministic_orchestration_intent(user_text);
-                if let Some(outcome) = self
-                    .run_orchestration_phase(&mut OrchestrationCtx {
+                if let Some(outcome) = super::orchestration_phase::run_orchestration_phase(
+                    &services,
+                    &mut OrchestrationCtx {
                         emitter: &emitter,
                         task_id: &task_id,
                         session_id,
@@ -828,8 +833,9 @@ impl Agent {
                         status_tx: status_tx.clone(),
                         intent_gate: &intent_gate,
                         turn_context: &turn_context,
-                    })
-                    .await?
+                    },
+                )
+                .await?
                 {
                     match outcome {
                         ResponsePhaseOutcome::ContinueLoop => continue,
@@ -983,23 +989,26 @@ impl Agent {
 
             let message_build_directives = turn_state.directives.for_message_build_phase();
             let message_build_recovery = turn_state.recovery.for_message_build_phase();
-            let MessageBuildData { mut messages } = self
-                .run_message_build_phase(&mut MessageBuildCtx {
-                    session_id,
-                    iteration,
-                    user_text: &llm_user_text,
-                    completed_tool_calls: &learning_ctx.tool_calls,
-                    model: &model,
-                    system_prompt: &system_prompt,
-                    pinned_memories: &pinned_memories,
-                    tool_defs: &tool_defs,
-                    policy_bundle: &policy_bundle,
-                    session_summary: &session_summary,
-                    pending_system_messages: message_build_directives.pending_system_messages,
-                    empty_response_retry_pending: message_build_recovery
-                        .empty_response_retry_pending,
-                    status_tx: &status_tx,
-                })
+            let MessageBuildData { mut messages } =
+                super::message_build_phase::run_message_build_phase(
+                    &services,
+                    &mut MessageBuildCtx {
+                        session_id,
+                        iteration,
+                        user_text: &llm_user_text,
+                        completed_tool_calls: &learning_ctx.tool_calls,
+                        model: &model,
+                        system_prompt: &system_prompt,
+                        pinned_memories: &pinned_memories,
+                        tool_defs: &tool_defs,
+                        policy_bundle: &policy_bundle,
+                        session_summary: &session_summary,
+                        pending_system_messages: message_build_directives.pending_system_messages,
+                        empty_response_retry_pending: message_build_recovery
+                            .empty_response_retry_pending,
+                        status_tx: &status_tx,
+                    },
+                )
                 .await?;
 
             let llm_stall = turn_state.stall.for_llm_phase();
@@ -1008,8 +1017,9 @@ impl Agent {
             let llm_evidence = turn_state.evidence.for_llm_phase();
             let llm_directives = turn_state.directives.for_llm_phase();
             let llm_counters = turn_state.counters.for_llm_phase();
-            let llm_outcome = self
-                .run_llm_phase(&mut LlmPhaseCtx {
+            let llm_outcome = super::llm_phase::run_llm_phase(
+                &services,
+                &mut LlmPhaseCtx {
                     messages: &mut messages,
                     emitter: &emitter,
                     task_id: &task_id,
@@ -1048,8 +1058,9 @@ impl Agent {
                     truncated_text_prefix: llm_recovery.truncated_text_prefix,
                     provider_timeout_ms: llm_budget.provider_timeout_ms,
                     thinking_truncation_count: llm_recovery.thinking_truncation_count,
-                })
-                .await?;
+                },
+            )
+            .await?;
             let mut resp = match llm_outcome {
                 LlmPhaseOutcome::ContinueLoop => {
                     if execution_state.execution_budget_applies() {
@@ -1074,8 +1085,9 @@ impl Agent {
             let response_evidence = turn_state.evidence.for_response_phase();
             let response_directives = turn_state.directives.for_response_phase();
             let response_counters = turn_state.counters.for_response_phase();
-            let response_outcome = self
-                .run_response_phase(&mut ResponsePhaseCtx {
+            let response_outcome = super::response_phase::run_response_phase(
+                &services,
+                &mut ResponsePhaseCtx {
                     resp: &mut resp,
                     emitter: &emitter,
                     task_id: &task_id,
@@ -1122,8 +1134,9 @@ impl Agent {
                     force_text_response: response_recovery.force_text_response,
                     execution_state: &mut execution_state,
                     validation_state: response_evidence.validation_state,
-                })
-                .await?;
+                },
+            )
+            .await?;
             match response_outcome {
                 ResponsePhaseOutcome::ContinueLoop => {
                     if execution_state.execution_budget_applies() {
@@ -1153,8 +1166,9 @@ impl Agent {
             let tool_prelude_recovery = turn_state.recovery.for_tool_prelude_phase();
             let tool_prelude_evidence = turn_state.evidence.for_tool_prelude_phase();
             let tool_prelude_directives = turn_state.directives.for_tool_prelude_phase();
-            let tool_prelude_outcome = self
-                .run_tool_prelude_phase(&mut ToolPreludeCtx {
+            let tool_prelude_outcome = super::tool_prelude_phase::run_tool_prelude_phase(
+                &services,
+                &mut ToolPreludeCtx {
                     resp: &resp,
                     emitter: &emitter,
                     task_id: &task_id,
@@ -1173,8 +1187,9 @@ impl Agent {
                     pending_system_messages: tool_prelude_directives.pending_system_messages,
                     force_text_response: tool_prelude_recovery.force_text_response,
                     turn_context: &turn_context,
-                })
-                .await?;
+                },
+            )
+            .await?;
             match tool_prelude_outcome {
                 ToolPreludeOutcome::ContinueLoop => continue,
                 ToolPreludeOutcome::Return(result) => return result,
@@ -1191,8 +1206,9 @@ impl Agent {
             let tool_execution_reflection = turn_state.reflection.for_tool_execution_phase();
             let tool_execution_directives = turn_state.directives.for_tool_execution_phase();
             let tool_execution_counters = turn_state.counters.for_tool_execution_phase();
-            let tool_execution_outcome = self
-                .run_tool_execution_phase(&mut ToolExecutionCtx {
+            let tool_execution_outcome = super::tool_execution_phase::run_tool_execution_phase(
+                &services,
+                &mut ToolExecutionCtx {
                     resp: &resp,
                     emitter: &emitter,
                     task_id: &task_id,
@@ -1272,8 +1288,9 @@ impl Agent {
                     tool_result_cache: tool_execution_counters.tool_result_cache,
                     execution_state: &mut execution_state,
                     validation_state: tool_execution_evidence.validation_state,
-                })
-                .await?;
+                },
+            )
+            .await?;
             match tool_execution_outcome {
                 ToolExecutionOutcome::Return(result) => return result,
                 ToolExecutionOutcome::NextIteration => {}

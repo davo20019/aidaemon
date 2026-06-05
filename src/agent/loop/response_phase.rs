@@ -61,9 +61,9 @@ pub(super) async fn run_response_phase(
     services: &super::services::AgentServices<'_>,
     ctx: &mut ResponsePhaseCtx<'_>,
 ) -> anyhow::Result<ResponsePhaseOutcome> {
-    let completion_outcome = services
-        .agent
-        .run_completion_phase(&mut CompletionCtx {
+    let completion_outcome = super::completion_phase::run_completion_phase(
+        services,
+        &mut CompletionCtx {
             resp: &mut *ctx.resp,
             emitter: ctx.emitter,
             task_id: ctx.task_id,
@@ -102,21 +102,12 @@ pub(super) async fn run_response_phase(
             force_text_response: &mut *ctx.force_text_response,
             execution_state: &mut *ctx.execution_state,
             validation_state: &mut *ctx.validation_state,
-        })
-        .await?;
+        },
+    )
+    .await?;
     if let Some(outcome) = completion_outcome {
         return Ok(outcome);
     }
 
     Ok(ResponsePhaseOutcome::ProceedToToolExecution)
-}
-
-impl Agent {
-    pub(super) async fn run_response_phase(
-        &self,
-        ctx: &mut ResponsePhaseCtx<'_>,
-    ) -> anyhow::Result<ResponsePhaseOutcome> {
-        let services = super::services::AgentServices::new(self);
-        run_response_phase(&services, ctx).await
-    }
 }

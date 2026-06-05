@@ -617,13 +617,3 @@ pub(in crate::agent) async fn run_bootstrap_phase(
 
     Ok(BootstrapOutcome::Continue(Box::new(data)))
 }
-
-impl Agent {
-    pub(in crate::agent) async fn run_bootstrap_phase(
-        &self,
-        ctx: &BootstrapCtx<'_>,
-    ) -> anyhow::Result<BootstrapOutcome> {
-        let services = crate::agent::services::AgentServices::new(self);
-        run_bootstrap_phase(&services, ctx).await
-    }
-}

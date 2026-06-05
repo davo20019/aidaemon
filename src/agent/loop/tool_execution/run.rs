@@ -2101,16 +2101,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     Ok(ToolExecutionOutcome::NextIteration)
 }
 
-impl Agent {
-    pub(in crate::agent) async fn run_tool_execution_phase(
-        &self,
-        ctx: &mut ToolExecutionCtx<'_>,
-    ) -> anyhow::Result<ToolExecutionOutcome> {
-        let services = crate::agent::services::AgentServices::new(self);
-        run_tool_execution_phase(&services, ctx).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

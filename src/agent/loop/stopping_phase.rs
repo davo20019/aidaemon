@@ -2035,16 +2035,6 @@ pub(super) async fn run_stopping_phase(
     Ok(StoppingPhaseOutcome::Proceed)
 }
 
-impl Agent {
-    pub(super) async fn run_stopping_phase(
-        &self,
-        ctx: &mut StoppingPhaseCtx<'_>,
-    ) -> anyhow::Result<StoppingPhaseOutcome> {
-        let services = super::services::AgentServices::new(self);
-        run_stopping_phase(&services, ctx).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

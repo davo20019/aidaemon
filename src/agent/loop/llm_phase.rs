@@ -950,16 +950,6 @@ pub(super) async fn run_llm_phase(
     Ok(LlmPhaseOutcome::Proceed(resp))
 }
 
-impl Agent {
-    pub(super) async fn run_llm_phase(
-        &self,
-        ctx: &mut LlmPhaseCtx<'_>,
-    ) -> anyhow::Result<LlmPhaseOutcome> {
-        let services = super::services::AgentServices::new(self);
-        run_llm_phase(&services, ctx).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1129,16 +1129,6 @@ pub(super) async fn run_message_build_phase(
     Ok(MessageBuildData { messages })
 }
 
-impl Agent {
-    pub(super) async fn run_message_build_phase(
-        &self,
-        ctx: &mut MessageBuildCtx<'_>,
-    ) -> anyhow::Result<MessageBuildData> {
-        let services = super::services::AgentServices::new(self);
-        run_message_build_phase(&services, ctx).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,11 +1249,12 @@ mod tests {
             status_tx: &status_tx,
         };
 
-        let built = harness
-            .agent
-            .run_message_build_phase(&mut ctx)
-            .await
-            .expect("message build");
+        let built = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx,
+        )
+        .await
+        .expect("message build");
         let serialized = serde_json::to_string(&built.messages).expect("serialize messages");
 
         // Adaptive sliding window keeps all pairs that fit within 30% of the
@@ -1342,11 +1333,12 @@ mod tests {
             status_tx: &status_tx,
         };
 
-        let built = harness
-            .agent
-            .run_message_build_phase(&mut ctx)
-            .await
-            .expect("message build");
+        let built = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx,
+        )
+        .await
+        .expect("message build");
         let serialized = serde_json::to_string(&built.messages).expect("serialize messages");
 
         assert!(
@@ -1435,11 +1427,12 @@ mod tests {
             status_tx: &status_tx,
         };
 
-        let built = harness
-            .agent
-            .run_message_build_phase(&mut ctx)
-            .await
-            .expect("message build");
+        let built = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx,
+        )
+        .await
+        .expect("message build");
         let serialized = serde_json::to_string(&built.messages).expect("serialize messages");
 
         // Old stale messages should NOT be present after idle gap reset.
@@ -1510,11 +1503,12 @@ mod tests {
             status_tx: &status_tx,
         };
 
-        let built = harness
-            .agent
-            .run_message_build_phase(&mut ctx)
-            .await
-            .expect("message build");
+        let built = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx,
+        )
+        .await
+        .expect("message build");
         let serialized = serde_json::to_string(&built.messages).expect("serialize messages");
 
         // Summary should be injected as a system message.

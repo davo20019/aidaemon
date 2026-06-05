@@ -2407,16 +2407,6 @@ pub(super) async fn run_completion_phase(
     Ok(None)
 }
 
-impl Agent {
-    pub(super) async fn run_completion_phase(
-        &self,
-        ctx: &mut CompletionCtx<'_>,
-    ) -> anyhow::Result<Option<ResponsePhaseOutcome>> {
-        let services = super::services::AgentServices::new(self);
-        run_completion_phase(&services, ctx).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{

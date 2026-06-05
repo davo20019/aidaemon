@@ -1230,16 +1230,6 @@ pub(super) async fn run_tool_prelude_phase(
     Ok(ToolPreludeOutcome::Proceed)
 }
 
-impl Agent {
-    pub(super) async fn run_tool_prelude_phase(
-        &self,
-        ctx: &mut ToolPreludeCtx<'_>,
-    ) -> anyhow::Result<ToolPreludeOutcome> {
-        let services = super::services::AgentServices::new(self);
-        run_tool_prelude_phase(&services, ctx).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

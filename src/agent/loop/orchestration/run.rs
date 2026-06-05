@@ -95,13 +95,3 @@ pub(in crate::agent) async fn run_orchestration_phase(
         .await?;
     Ok(Some(outcome))
 }
-
-impl Agent {
-    pub(in crate::agent) async fn run_orchestration_phase(
-        &self,
-        ctx: &mut OrchestrationCtx<'_>,
-    ) -> anyhow::Result<Option<ResponsePhaseOutcome>> {
-        let services = crate::agent::services::AgentServices::new(self);
-        run_orchestration_phase(&services, ctx).await
-    }
-}
