@@ -163,498 +163,487 @@ fn build_execution_checkpoint_message(
     Some(lines.join("\n"))
 }
 
-impl Agent {
-    pub(super) async fn run_message_build_phase(
-        &self,
-        ctx: &mut MessageBuildCtx<'_>,
-    ) -> anyhow::Result<MessageBuildData> {
-        let session_id = ctx.session_id;
-        let iteration = ctx.iteration;
-        let user_text = ctx.user_text;
-        let completed_tool_calls = ctx.completed_tool_calls;
-        let model = ctx.model;
-        let system_prompt = ctx.system_prompt;
-        let pinned_memories = ctx.pinned_memories;
-        let tool_defs = ctx.tool_defs;
-        let policy_bundle = ctx.policy_bundle;
-        let session_summary = ctx.session_summary;
-        let pending_system_messages = &mut *ctx.pending_system_messages;
-        let empty_response_retry_pending = ctx.empty_response_retry_pending;
-        let status_tx = ctx.status_tx;
+pub(super) async fn run_message_build_phase(
+    services: &super::services::AgentServices<'_>,
+    ctx: &mut MessageBuildCtx<'_>,
+) -> anyhow::Result<MessageBuildData> {
+    let agent = services.agent;
+    let session_id = ctx.session_id;
+    let iteration = ctx.iteration;
+    let user_text = ctx.user_text;
+    let completed_tool_calls = ctx.completed_tool_calls;
+    let model = ctx.model;
+    let system_prompt = ctx.system_prompt;
+    let pinned_memories = ctx.pinned_memories;
+    let tool_defs = ctx.tool_defs;
+    let policy_bundle = ctx.policy_bundle;
+    let session_summary = ctx.session_summary;
+    let pending_system_messages = &mut *ctx.pending_system_messages;
+    let empty_response_retry_pending = ctx.empty_response_retry_pending;
+    let status_tx = ctx.status_tx;
 
-        // Fetch recent history from canonical event stream.
-        // Base limit of 40 queries (120 events), scaled up for long-running tasks
-        // so that early tool calls from the current task are not pushed out of the
-        // window by their own later iterations.  Each iteration generates ~3
-        // messages (assistant, tool result(s), sometimes parallel calls), so
-        // iteration*3 covers the current task plus old-pair trimming removes the
-        // rest.  Capped at 120 to avoid loading entire sessions.
-        let history_limit = 40_usize.max(iteration.saturating_mul(3).min(120));
-        let mut recent_history = self.load_recent_history(session_id, history_limit).await?;
+    // Fetch recent history from canonical event stream.
+    // Base limit of 40 queries (120 events), scaled up for long-running tasks
+    // so that early tool calls from the current task are not pushed out of the
+    // window by their own later iterations.  Each iteration generates ~3
+    // messages (assistant, tool result(s), sometimes parallel calls), so
+    // iteration*3 covers the current task plus old-pair trimming removes the
+    // rest.  Capped at 120 to avoid loading entire sessions.
+    let history_limit = 40_usize.max(iteration.saturating_mul(3).min(120));
+    let mut recent_history = agent.load_recent_history(session_id, history_limit).await?;
 
-        // Guarantee the current user message is always present in history.
-        // In sessions with heavy prior tool use, the 120-event window may not
-        // include the current user message (it was just committed). Without it,
-        // last_user_pos=None triggers the safe-collapse fallback which degrades
-        // context quality. Appending it ensures the collapse boundary is always
-        // correctly placed at the current task's user message.
-        // Check if the current user message is ALREADY in history as the LAST user
-        // message. We must check it's the last, not just any match: when the same
-        // prompt is sent multiple times, an old instance with identical text would
-        // falsely satisfy a content-only check. This causes rposition to find the
-        // OLD instance as the collapse boundary, keeping the old attempt's entire
-        // tool chain as "current interaction" — the model then thinks the task is
-        // already done and produces confused responses like "Did you mean to send something?".
-        let last_user_msg = recent_history.iter().rev().find(|m| m.role == "user");
-        let user_msg_present =
-            last_user_msg.is_some_and(|m| m.content.as_deref() == Some(user_text));
-        if !user_msg_present && !user_text.is_empty() {
-            let synthetic_turn_id = self.current_turn_ids.read().await.get(session_id).cloned();
-            recent_history.push(Message {
-                id: format!("synthetic-user-{}", uuid::Uuid::new_v4()),
-                session_id: session_id.to_string(),
-                role: "user".to_string(),
-                content: Some(user_text.to_string()),
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls_json: None,
-                created_at: chrono::Utc::now(),
-                importance: 1.0,
-                turn_id: synthetic_turn_id,
-                ..Message::runtime_defaults()
-            });
-            info!(
-                session_id,
-                iteration, "Injected current user message into history (was outside event window)"
-            );
-        }
-
-        // Merge Pinned + Recent using iterators to avoid cloning the Message structs
-        let mut seen_ids: std::collections::HashSet<&String> = std::collections::HashSet::new();
-
-        // Deduplicated, ordered message list
-        let deduped_msgs: Vec<&Message> = pinned_memories
-            .iter()
-            .chain(recent_history.iter())
-            .filter(|m| seen_ids.insert(&m.id))
-            .collect();
-
-        // Collapse tool intermediates from previous interactions to prevent context bleeding.
-        // Without this, old tool call chains (e.g., manage_people calls from a prior question)
-        // overwhelm the current question's context and confuse the LLM.
-        // Only the current interaction (after the last user message) keeps full tool chains.
-        //
-        // We drop tool-role messages (results) but keep assistant messages even if they
-        // have tool_calls — the JSON conversion below strips orphaned tool_calls and drops
-        // content-less assistant messages automatically. This preserves the assistant's
-        // reasoning text and budget/timeout summaries as context for the next interaction.
-        let identity_preserve_indices: std::collections::HashSet<usize> = deduped_msgs
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, msg)| {
-                let content = msg.content.as_deref()?;
-                if text_relates_to_critical_identity(content) {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .flat_map(|idx| {
-                let start = idx.saturating_sub(1);
-                let end = (idx + 2).min(deduped_msgs.len().saturating_sub(1));
-                start..=end
-            })
-            .collect();
-        // Find the boundary between old and current interactions.
-        //
-        // Primary: match by `turn_id`. Every message written during this
-        // turn was auto-stamped with the same id by `append_message_canonical`,
-        // so the first user-role message with the current turn_id marks the
-        // boundary — no content inference, no race-condition window where the
-        // same text sent twice picks the wrong instance.
-        //
-        // Fallback: content match against `user_text`. Covers messages
-        // persisted before this field existed and any code path that bypasses
-        // the auto-stamping layer.
-        let current_turn_id: Option<String> =
-            self.current_turn_ids.read().await.get(session_id).cloned();
-        let last_user_pos: Option<usize> = current_turn_id
-            .as_deref()
-            .and_then(|tid| {
-                deduped_msgs
-                    .iter()
-                    .position(|m| m.role == "user" && m.turn_id.as_deref() == Some(tid))
-            })
-            .or_else(|| {
-                deduped_msgs
-                    .iter()
-                    .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
-            });
-        if last_user_pos.is_none() {
-            warn!(
-                session_id,
-                iteration,
-                total = deduped_msgs.len(),
-                "Collapse boundary: last_user_pos=None (should be rare after synthetic injection)"
-            );
-        }
-        let pre_collapse_len = deduped_msgs.len();
-        // Find "Prior 1" start: the user message immediately before the boundary.
-        // Tool results in [prior_1_start, boundary) are summarized (not dropped).
-        // Tool results before prior_1_start are dropped entirely (Prior 2+).
-        let prior_1_start: Option<usize> = last_user_pos.and_then(|boundary| {
-            deduped_msgs[..boundary]
-                .iter()
-                .rposition(|m| m.role == "user")
+    // Guarantee the current user message is always present in history.
+    // In sessions with heavy prior tool use, the 120-event window may not
+    // include the current user message (it was just committed). Without it,
+    // last_user_pos=None triggers the safe-collapse fallback which degrades
+    // context quality. Appending it ensures the collapse boundary is always
+    // correctly placed at the current task's user message.
+    // Check if the current user message is ALREADY in history as the LAST user
+    // message. We must check it's the last, not just any match: when the same
+    // prompt is sent multiple times, an old instance with identical text would
+    // falsely satisfy a content-only check. This causes rposition to find the
+    // OLD instance as the collapse boundary, keeping the old attempt's entire
+    // tool chain as "current interaction" — the model then thinks the task is
+    // already done and produces confused responses like "Did you mean to send something?".
+    let last_user_msg = recent_history.iter().rev().find(|m| m.role == "user");
+    let user_msg_present = last_user_msg.is_some_and(|m| m.content.as_deref() == Some(user_text));
+    if !user_msg_present && !user_text.is_empty() {
+        let synthetic_turn_id = agent.current_turn_ids.read().await.get(session_id).cloned();
+        recent_history.push(Message {
+            id: format!("synthetic-user-{}", uuid::Uuid::new_v4()),
+            session_id: session_id.to_string(),
+            role: "user".to_string(),
+            content: Some(user_text.to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: chrono::Utc::now(),
+            importance: 1.0,
+            turn_id: synthetic_turn_id,
+            ..Message::runtime_defaults()
         });
-        // Collect message IDs of tool results in the Prior 1 range for summary
-        // replacement during JSON conversion. We collect IDs (not indices) because
-        // the Vec is rebuilt by the filter below.
-        let prior_1_tool_ids: std::collections::HashSet<String> =
-            if let (Some(p1_start), Some(boundary)) = (prior_1_start, last_user_pos) {
-                deduped_msgs[p1_start..boundary]
-                    .iter()
-                    .filter(|m| m.role == "tool")
-                    .map(|m| m.id.clone())
-                    .collect()
+        info!(
+            session_id,
+            iteration, "Injected current user message into history (was outside event window)"
+        );
+    }
+
+    // Merge Pinned + Recent using iterators to avoid cloning the Message structs
+    let mut seen_ids: std::collections::HashSet<&String> = std::collections::HashSet::new();
+
+    // Deduplicated, ordered message list
+    let deduped_msgs: Vec<&Message> = pinned_memories
+        .iter()
+        .chain(recent_history.iter())
+        .filter(|m| seen_ids.insert(&m.id))
+        .collect();
+
+    // Collapse tool intermediates from previous interactions to prevent context bleeding.
+    // Without this, old tool call chains (e.g., manage_people calls from a prior question)
+    // overwhelm the current question's context and confuse the LLM.
+    // Only the current interaction (after the last user message) keeps full tool chains.
+    //
+    // We drop tool-role messages (results) but keep assistant messages even if they
+    // have tool_calls — the JSON conversion below strips orphaned tool_calls and drops
+    // content-less assistant messages automatically. This preserves the assistant's
+    // reasoning text and budget/timeout summaries as context for the next interaction.
+    let identity_preserve_indices: std::collections::HashSet<usize> = deduped_msgs
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| {
+            let content = msg.content.as_deref()?;
+            if text_relates_to_critical_identity(content) {
+                Some(idx)
             } else {
-                std::collections::HashSet::new()
-            };
-        let deduped_msgs: Vec<&Message> = if let Some(boundary) = last_user_pos {
-            let p1 = prior_1_start.unwrap_or(boundary);
+                None
+            }
+        })
+        .flat_map(|idx| {
+            let start = idx.saturating_sub(1);
+            let end = (idx + 2).min(deduped_msgs.len().saturating_sub(1));
+            start..=end
+        })
+        .collect();
+    // Find the boundary between old and current interactions.
+    //
+    // Primary: match by `turn_id`. Every message written during this
+    // turn was auto-stamped with the same id by `append_message_canonical`,
+    // so the first user-role message with the current turn_id marks the
+    // boundary — no content inference, no race-condition window where the
+    // same text sent twice picks the wrong instance.
+    //
+    // Fallback: content match against `user_text`. Covers messages
+    // persisted before this field existed and any code path that bypasses
+    // the auto-stamping layer.
+    let current_turn_id: Option<String> =
+        agent.current_turn_ids.read().await.get(session_id).cloned();
+    let last_user_pos: Option<usize> = current_turn_id
+        .as_deref()
+        .and_then(|tid| {
             deduped_msgs
-                .into_iter()
-                .enumerate()
-                .filter(|(i, m)| {
-                    if *i >= boundary {
-                        true // current interaction: keep everything
-                    } else if *i >= p1 {
-                        // Prior 1 interaction: keep tool results (they will be
-                        // summarized during JSON conversion), keep everything else
-                        true
-                    } else {
-                        // Prior 2+ interactions: drop tool results only; assistant
-                        // messages survive (orphan stripping handles their
-                        // tool_calls in JSON conversion)
-                        m.role != "tool" || identity_preserve_indices.contains(i)
-                    }
-                })
-                .map(|(_, m)| m)
+                .iter()
+                .position(|m| m.role == "user" && m.turn_id.as_deref() == Some(tid))
+        })
+        .or_else(|| {
+            deduped_msgs
+                .iter()
+                .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
+        });
+    if last_user_pos.is_none() {
+        warn!(
+            session_id,
+            iteration,
+            total = deduped_msgs.len(),
+            "Collapse boundary: last_user_pos=None (should be rare after synthetic injection)"
+        );
+    }
+    let pre_collapse_len = deduped_msgs.len();
+    // Find "Prior 1" start: the user message immediately before the boundary.
+    // Tool results in [prior_1_start, boundary) are summarized (not dropped).
+    // Tool results before prior_1_start are dropped entirely (Prior 2+).
+    let prior_1_start: Option<usize> = last_user_pos.and_then(|boundary| {
+        deduped_msgs[..boundary]
+            .iter()
+            .rposition(|m| m.role == "user")
+    });
+    // Collect message IDs of tool results in the Prior 1 range for summary
+    // replacement during JSON conversion. We collect IDs (not indices) because
+    // the Vec is rebuilt by the filter below.
+    let prior_1_tool_ids: std::collections::HashSet<String> =
+        if let (Some(p1_start), Some(boundary)) = (prior_1_start, last_user_pos) {
+            deduped_msgs[p1_start..boundary]
+                .iter()
+                .filter(|m| m.role == "tool")
+                .map(|m| m.id.clone())
                 .collect()
         } else {
-            // Current user message not in history yet (race condition or history
-            // window too small). Keep the most recent tool results intact — they
-            // are very likely from the CURRENT task's previous iterations.
-            // Collapse only older tool results to prevent context bloat.
-            const KEEP_RECENT_TOOL_RESULTS: usize = 8;
-            let tool_positions: Vec<usize> = deduped_msgs
-                .iter()
-                .enumerate()
-                .filter(|(_, m)| m.role == "tool")
-                .map(|(i, _)| i)
-                .collect();
-            let protect_from = if tool_positions.len() > KEEP_RECENT_TOOL_RESULTS {
-                tool_positions[tool_positions.len() - KEEP_RECENT_TOOL_RESULTS]
-            } else {
-                0
-            };
-            warn!(
+            std::collections::HashSet::new()
+        };
+    let deduped_msgs: Vec<&Message> = if let Some(boundary) = last_user_pos {
+        let p1 = prior_1_start.unwrap_or(boundary);
+        deduped_msgs
+            .into_iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                if *i >= boundary {
+                    true // current interaction: keep everything
+                } else if *i >= p1 {
+                    // Prior 1 interaction: keep tool results (they will be
+                    // summarized during JSON conversion), keep everything else
+                    true
+                } else {
+                    // Prior 2+ interactions: drop tool results only; assistant
+                    // messages survive (orphan stripping handles their
+                    // tool_calls in JSON conversion)
+                    m.role != "tool" || identity_preserve_indices.contains(i)
+                }
+            })
+            .map(|(_, m)| m)
+            .collect()
+    } else {
+        // Current user message not in history yet (race condition or history
+        // window too small). Keep the most recent tool results intact — they
+        // are very likely from the CURRENT task's previous iterations.
+        // Collapse only older tool results to prevent context bloat.
+        const KEEP_RECENT_TOOL_RESULTS: usize = 8;
+        let tool_positions: Vec<usize> = deduped_msgs
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "tool")
+            .map(|(i, _)| i)
+            .collect();
+        let protect_from = if tool_positions.len() > KEEP_RECENT_TOOL_RESULTS {
+            tool_positions[tool_positions.len() - KEEP_RECENT_TOOL_RESULTS]
+        } else {
+            0
+        };
+        warn!(
                 session_id,
                 iteration,
                 total_tool_results = tool_positions.len(),
                 protect_from,
                 "Current user message not in history — using safe collapse (keeping recent tool results)"
             );
+        deduped_msgs
+            .into_iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                // Keep non-tool messages, recent tool results, and identity-critical ones;
+                // collapse old tool results.
+                m.role != "tool" || *i >= protect_from || identity_preserve_indices.contains(i)
+            })
+            .map(|(_, m)| m)
+            .collect()
+    };
+    let collapsed = pre_collapse_len.saturating_sub(deduped_msgs.len());
+    if collapsed > 0 || !prior_1_tool_ids.is_empty() {
+        info!(
+            session_id,
+            dropped = collapsed,
+            summarized = prior_1_tool_ids.len(),
+            "Age-based tool result clearing: dropped Prior 2+ results, summarizing Prior 1 results"
+        );
+    }
+
+    // Identify old-interaction assistant messages for content truncation.
+    // After collapse, recompute the last-user boundary and collect IDs of
+    // assistant messages before it — their full text is stale context.
+    // Exception: the assistant message immediately before the boundary is exempt
+    // from truncation — it typically contains the budget/timeout response with
+    // handoff context (activity summary, files read, commands run) that the next
+    // interaction needs to avoid re-exploring from scratch.
+    // However, when the current message is a clearly NEW task (very different from
+    // the prior user message), the old handoff context is harmful — truncate it too.
+    // Anchor to the current user message by content (not just any last user message).
+    // Without content matching, stray user messages from race conditions can shift
+    // the boundary and cause wrong assistant messages to survive truncation.
+    let collapse_boundary = deduped_msgs
+        .iter()
+        .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
+        .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
+
+    // Adaptive sliding window: keep `window_size` prior conversation pairs.
+    // We compute how many old pairs fit within 30% of the available token
+    // budget. This naturally adapts: large contexts keep more history, small
+    // contexts keep less.
+    let deduped_msgs: Vec<&Message> = if let Some(boundary) = collapse_boundary {
+        use crate::memory::context_window::estimate_tokens;
+
+        // Identify old user-assistant pair boundaries.
+        let old_user_positions: Vec<usize> = deduped_msgs
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| *i < boundary && m.role == "user")
+            .map(|(i, _)| i)
+            .collect();
+
+        if old_user_positions.is_empty() {
             deduped_msgs
+        } else {
+            // Build skeleton token estimates for each old pair.
+            // A "pair" spans from one user message to the next (or to the boundary).
+            let skeleton_pairs: Vec<(usize, usize)> = old_user_positions
+                .iter()
+                .enumerate()
+                .map(|(pair_idx, &user_pos)| {
+                    let pair_end = if pair_idx + 1 < old_user_positions.len() {
+                        old_user_positions[pair_idx + 1]
+                    } else {
+                        boundary
+                    };
+                    let user_tokens =
+                        estimate_tokens(deduped_msgs[user_pos].content.as_deref().unwrap_or(""));
+                    let assistant_tokens: usize = deduped_msgs[user_pos + 1..pair_end]
+                        .iter()
+                        .filter(|m| m.role == "assistant")
+                        .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
+                        .sum();
+                    (user_tokens, assistant_tokens)
+                })
+                .collect();
+
+            // Compute available budget: model context - system prompt - tool defs - pinned memories.
+            let system_tokens = estimate_tokens(system_prompt);
+            let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
+            let tools_tokens = estimate_tokens(&tools_json);
+            let pinned_tokens: usize = pinned_memories
+                .iter()
+                .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
+                .sum();
+            // Use a reasonable default context window (128k tokens).
+            // The exact model budget doesn't matter much — we only use 30% of
+            // the remainder, so over-estimating is safe.
+            let model_budget = 128_000usize;
+            let available_budget =
+                model_budget.saturating_sub(system_tokens + tools_tokens + pinned_tokens);
+
+            let computed_window_size =
+                super::sliding_window::calculate_window_size(&skeleton_pairs, available_budget);
+
+            // Idle gap reset: after 2+ hours of inactivity, don't inject stale
+            // raw messages into the window — they'd appear as if typed seconds ago.
+            // The compaction summary (if available) provides historical context instead.
+            let idle_gap_detected = boundary > 0
+                && deduped_msgs
+                    .get(boundary.saturating_sub(1))
+                    .is_some_and(|m| {
+                        let now = chrono::Utc::now();
+                        now.signed_duration_since(m.created_at).num_seconds() > 7200
+                    });
+            let window_size = if idle_gap_detected {
+                info!(
+                    session_id,
+                    "Idle gap detected (>2h): resetting sliding window to 0"
+                );
+                0
+            } else {
+                computed_window_size
+            };
+
+            // Keep the last `window_size` old pairs + everything at/after boundary.
+            let keep_from = if window_size == 0 {
+                boundary
+            } else if old_user_positions.len() > window_size {
+                old_user_positions[old_user_positions.len() - window_size]
+            } else {
+                0
+            };
+
+            let trimmed: Vec<&Message> = deduped_msgs
                 .into_iter()
                 .enumerate()
-                .filter(|(i, m)| {
-                    // Keep non-tool messages, recent tool results, and identity-critical ones;
-                    // collapse old tool results.
-                    m.role != "tool" || *i >= protect_from || identity_preserve_indices.contains(i)
-                })
+                .filter(|(i, _)| *i >= keep_from || identity_preserve_indices.contains(i))
                 .map(|(_, m)| m)
-                .collect()
-        };
-        let collapsed = pre_collapse_len.saturating_sub(deduped_msgs.len());
-        if collapsed > 0 || !prior_1_tool_ids.is_empty() {
-            info!(
-                session_id,
-                dropped = collapsed,
-                summarized = prior_1_tool_ids.len(),
-                "Age-based tool result clearing: dropped Prior 2+ results, summarizing Prior 1 results"
-            );
+                .collect();
+            if trimmed.len() < pre_collapse_len {
+                info!(
+                    session_id,
+                    old_pairs_trimmed = pre_collapse_len - trimmed.len(),
+                    window_size,
+                    available_budget,
+                    "Adaptive sliding window: trimmed old conversation pairs"
+                );
+            }
+            trimmed
         }
+    } else {
+        deduped_msgs
+    };
 
-        // Identify old-interaction assistant messages for content truncation.
-        // After collapse, recompute the last-user boundary and collect IDs of
-        // assistant messages before it — their full text is stale context.
-        // Exception: the assistant message immediately before the boundary is exempt
-        // from truncation — it typically contains the budget/timeout response with
-        // handoff context (activity summary, files read, commands run) that the next
-        // interaction needs to avoid re-exploring from scratch.
-        // However, when the current message is a clearly NEW task (very different from
-        // the prior user message), the old handoff context is harmful — truncate it too.
-        // Anchor to the current user message by content (not just any last user message).
-        // Without content matching, stray user messages from race conditions can shift
-        // the boundary and cause wrong assistant messages to survive truncation.
-        let collapse_boundary = deduped_msgs
+    // Remove duplicate old user messages that have identical content to the
+    // current user message. When the same prompt is sent multiple times (e.g.,
+    // retrying after a failed response), the old instances with truncated/failed
+    // responses confuse the model into thinking the task was already handled.
+    // Also remove the assistant response immediately following each duplicate.
+    let deduped_msgs: Vec<&Message> = {
+        let boundary = deduped_msgs
             .iter()
             .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
             .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
-
-        // Adaptive sliding window: keep `window_size` prior conversation pairs.
-        // We compute how many old pairs fit within 30% of the available token
-        // budget. This naturally adapts: large contexts keep more history, small
-        // contexts keep less.
-        let deduped_msgs: Vec<&Message> = if let Some(boundary) = collapse_boundary {
-            use crate::memory::context_window::estimate_tokens;
-
-            // Identify old user-assistant pair boundaries.
-            let old_user_positions: Vec<usize> = deduped_msgs
-                .iter()
-                .enumerate()
-                .filter(|(i, m)| *i < boundary && m.role == "user")
-                .map(|(i, _)| i)
-                .collect();
-
-            if old_user_positions.is_empty() {
-                deduped_msgs
-            } else {
-                // Build skeleton token estimates for each old pair.
-                // A "pair" spans from one user message to the next (or to the boundary).
-                let skeleton_pairs: Vec<(usize, usize)> = old_user_positions
-                    .iter()
-                    .enumerate()
-                    .map(|(pair_idx, &user_pos)| {
-                        let pair_end = if pair_idx + 1 < old_user_positions.len() {
-                            old_user_positions[pair_idx + 1]
-                        } else {
-                            boundary
-                        };
-                        let user_tokens = estimate_tokens(
-                            deduped_msgs[user_pos].content.as_deref().unwrap_or(""),
-                        );
-                        let assistant_tokens: usize = deduped_msgs[user_pos + 1..pair_end]
-                            .iter()
-                            .filter(|m| m.role == "assistant")
-                            .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
-                            .sum();
-                        (user_tokens, assistant_tokens)
-                    })
-                    .collect();
-
-                // Compute available budget: model context - system prompt - tool defs - pinned memories.
-                let system_tokens = estimate_tokens(system_prompt);
-                let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
-                let tools_tokens = estimate_tokens(&tools_json);
-                let pinned_tokens: usize = pinned_memories
-                    .iter()
-                    .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
-                    .sum();
-                // Use a reasonable default context window (128k tokens).
-                // The exact model budget doesn't matter much — we only use 30% of
-                // the remainder, so over-estimating is safe.
-                let model_budget = 128_000usize;
-                let available_budget =
-                    model_budget.saturating_sub(system_tokens + tools_tokens + pinned_tokens);
-
-                let computed_window_size =
-                    super::sliding_window::calculate_window_size(&skeleton_pairs, available_budget);
-
-                // Idle gap reset: after 2+ hours of inactivity, don't inject stale
-                // raw messages into the window — they'd appear as if typed seconds ago.
-                // The compaction summary (if available) provides historical context instead.
-                let idle_gap_detected = boundary > 0
-                    && deduped_msgs
-                        .get(boundary.saturating_sub(1))
-                        .is_some_and(|m| {
-                            let now = chrono::Utc::now();
-                            now.signed_duration_since(m.created_at).num_seconds() > 7200
-                        });
-                let window_size = if idle_gap_detected {
-                    info!(
-                        session_id,
-                        "Idle gap detected (>2h): resetting sliding window to 0"
-                    );
-                    0
-                } else {
-                    computed_window_size
-                };
-
-                // Keep the last `window_size` old pairs + everything at/after boundary.
-                let keep_from = if window_size == 0 {
-                    boundary
-                } else if old_user_positions.len() > window_size {
-                    old_user_positions[old_user_positions.len() - window_size]
-                } else {
-                    0
-                };
-
-                let trimmed: Vec<&Message> = deduped_msgs
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i >= keep_from || identity_preserve_indices.contains(i))
-                    .map(|(_, m)| m)
-                    .collect();
-                if trimmed.len() < pre_collapse_len {
-                    info!(
-                        session_id,
-                        old_pairs_trimmed = pre_collapse_len - trimmed.len(),
-                        window_size,
-                        available_budget,
-                        "Adaptive sliding window: trimmed old conversation pairs"
-                    );
-                }
-                trimmed
-            }
-        } else {
-            deduped_msgs
-        };
-
-        // Remove duplicate old user messages that have identical content to the
-        // current user message. When the same prompt is sent multiple times (e.g.,
-        // retrying after a failed response), the old instances with truncated/failed
-        // responses confuse the model into thinking the task was already handled.
-        // Also remove the assistant response immediately following each duplicate.
-        let deduped_msgs: Vec<&Message> = {
-            let boundary = deduped_msgs
-                .iter()
-                .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
-                .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
-            if let Some(boundary) = boundary {
-                let mut skip_indices = std::collections::HashSet::new();
-                for (i, m) in deduped_msgs.iter().enumerate() {
-                    if i < boundary && m.role == "user" && m.content.as_deref() == Some(user_text) {
-                        skip_indices.insert(i);
-                        // Also remove the assistant response immediately after
-                        if i + 1 < boundary && deduped_msgs[i + 1].role == "assistant" {
-                            skip_indices.insert(i + 1);
-                        }
+        if let Some(boundary) = boundary {
+            let mut skip_indices = std::collections::HashSet::new();
+            for (i, m) in deduped_msgs.iter().enumerate() {
+                if i < boundary && m.role == "user" && m.content.as_deref() == Some(user_text) {
+                    skip_indices.insert(i);
+                    // Also remove the assistant response immediately after
+                    if i + 1 < boundary && deduped_msgs[i + 1].role == "assistant" {
+                        skip_indices.insert(i + 1);
                     }
                 }
-                if !skip_indices.is_empty() {
-                    info!(
-                        session_id,
-                        duplicates_removed = skip_indices.len(),
-                        "Removed duplicate old user messages matching current prompt"
-                    );
-                }
-                deduped_msgs
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(i, _)| !skip_indices.contains(i))
-                    .map(|(_, m)| m)
-                    .collect()
-            } else {
-                deduped_msgs
             }
-        };
-
-        let execution_checkpoint = if iteration > 1 {
-            let current_boundary = deduped_msgs
-                .iter()
-                .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
-                .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
-            let current_interaction: Vec<&Message> = current_boundary
-                .map(|boundary| deduped_msgs.iter().skip(boundary).copied().collect())
-                .unwrap_or_default();
-            build_execution_checkpoint_message(
-                user_text,
-                completed_tool_calls,
-                &current_interaction,
-            )
-        } else {
-            None
-        };
-
-        let old_interaction_assistant_ids: std::collections::HashSet<&str> = if let Some(boundary) =
+            if !skip_indices.is_empty() {
+                info!(
+                    session_id,
+                    duplicates_removed = skip_indices.len(),
+                    "Removed duplicate old user messages matching current prompt"
+                );
+            }
             deduped_msgs
-                .iter()
-                .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
-                .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"))
-        {
-            // Find the immediately-prior assistant message (right before boundary).
-            // Always exempt it from truncation: it is the single highest-value
-            // carryover message when the user sends a terse follow-up like "why?".
-            let prior_assistant_id: Option<&str> = (0..boundary)
-                .rev()
-                .find(|&i| deduped_msgs[i].role == "assistant")
-                .map(|i| deduped_msgs[i].id.as_str());
-
-            deduped_msgs
-                .iter()
+                .into_iter()
                 .enumerate()
-                .filter(|(i, m)| {
-                    *i < boundary
-                        && m.role == "assistant"
-                        && Some(m.id.as_str()) != prior_assistant_id
-                        && !m
-                            .content
-                            .as_deref()
-                            .is_some_and(text_relates_to_critical_identity)
-                })
-                .map(|(_, m)| m.id.as_str())
+                .filter(|(i, _)| !skip_indices.contains(i))
+                .map(|(_, m)| m)
                 .collect()
         } else {
-            std::collections::HashSet::new()
-        };
+            deduped_msgs
+        }
+    };
 
-        // Collect tool result ids present in this context window (tool_call_id on tool-role
-        // messages with a non-empty tool name). Used to drop assistant tool_calls that would
-        // otherwise be orphaned.
-        let tool_result_ids: std::collections::HashSet<&str> = deduped_msgs
+    let execution_checkpoint = if iteration > 1 {
+        let current_boundary = deduped_msgs
             .iter()
-            .filter(|m| m.role == "tool" && m.tool_name.as_ref().is_some_and(|n| !n.is_empty()))
-            .filter_map(|m| m.tool_call_id.as_deref())
-            .collect();
+            .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
+            .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
+        let current_interaction: Vec<&Message> = current_boundary
+            .map(|boundary| deduped_msgs.iter().skip(boundary).copied().collect())
+            .unwrap_or_default();
+        build_execution_checkpoint_message(user_text, completed_tool_calls, &current_interaction)
+    } else {
+        None
+    };
 
-        // Build lookup: tool_call_id → (tool_name, arguments_json) from assistant
-        // messages. Used to generate 1-line summaries for Prior 1 tool results.
-        let tool_call_info: std::collections::HashMap<String, (String, String)> =
-            if !prior_1_tool_ids.is_empty() {
-                let mut map = std::collections::HashMap::new();
-                for m in deduped_msgs.iter() {
-                    if m.role == "assistant" {
-                        if let Some(tc_json) = &m.tool_calls_json {
-                            if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
-                                for tc in &tcs {
-                                    map.insert(
-                                        tc.id.clone(),
-                                        (tc.name.clone(), tc.arguments.clone()),
-                                    );
-                                }
+    let old_interaction_assistant_ids: std::collections::HashSet<&str> = if let Some(boundary) =
+        deduped_msgs
+            .iter()
+            .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
+            .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"))
+    {
+        // Find the immediately-prior assistant message (right before boundary).
+        // Always exempt it from truncation: it is the single highest-value
+        // carryover message when the user sends a terse follow-up like "why?".
+        let prior_assistant_id: Option<&str> = (0..boundary)
+            .rev()
+            .find(|&i| deduped_msgs[i].role == "assistant")
+            .map(|i| deduped_msgs[i].id.as_str());
+
+        deduped_msgs
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                *i < boundary
+                    && m.role == "assistant"
+                    && Some(m.id.as_str()) != prior_assistant_id
+                    && !m
+                        .content
+                        .as_deref()
+                        .is_some_and(text_relates_to_critical_identity)
+            })
+            .map(|(_, m)| m.id.as_str())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // Collect tool result ids present in this context window (tool_call_id on tool-role
+    // messages with a non-empty tool name). Used to drop assistant tool_calls that would
+    // otherwise be orphaned.
+    let tool_result_ids: std::collections::HashSet<&str> = deduped_msgs
+        .iter()
+        .filter(|m| m.role == "tool" && m.tool_name.as_ref().is_some_and(|n| !n.is_empty()))
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+
+    // Build lookup: tool_call_id → (tool_name, arguments_json) from assistant
+    // messages. Used to generate 1-line summaries for Prior 1 tool results.
+    let tool_call_info: std::collections::HashMap<String, (String, String)> =
+        if !prior_1_tool_ids.is_empty() {
+            let mut map = std::collections::HashMap::new();
+            for m in deduped_msgs.iter() {
+                if m.role == "assistant" {
+                    if let Some(tc_json) = &m.tool_calls_json {
+                        if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
+                            for tc in &tcs {
+                                map.insert(tc.id.clone(), (tc.name.clone(), tc.arguments.clone()));
                             }
                         }
                     }
                 }
-                map
-            } else {
-                std::collections::HashMap::new()
-            };
+            }
+            map
+        } else {
+            std::collections::HashMap::new()
+        };
 
-        let mut messages: Vec<Value> = deduped_msgs
-            .iter()
-            // Skip tool results with empty/missing tool_name
-            .filter(|m| !(m.role == "tool" && m.tool_name.as_ref().is_none_or(|n| n.is_empty())))
-            .filter_map(|m| {
-                // Truncate stale assistant content from prior interactions.
-                // We only shorten long messages to save tokens — we do NOT
-                // append marker text (e.g. "[prior turn]") because LLMs tend
-                // to echo such markers, producing empty or garbage replies.
-                let is_old_assistant = old_interaction_assistant_ids.contains(m.id.as_str());
+    let mut messages: Vec<Value> = deduped_msgs
+        .iter()
+        // Skip tool results with empty/missing tool_name
+        .filter(|m| !(m.role == "tool" && m.tool_name.as_ref().is_none_or(|n| n.is_empty())))
+        .filter_map(|m| {
+            // Truncate stale assistant content from prior interactions.
+            // We only shorten long messages to save tokens — we do NOT
+            // append marker text (e.g. "[prior turn]") because LLMs tend
+            // to echo such markers, producing empty or garbage replies.
+            let is_old_assistant = old_interaction_assistant_ids.contains(m.id.as_str());
 
-                // Age-based tool result summarization: Prior 1 tool results get
-                // their verbose content replaced with a deterministic 1-line summary.
-                // Exception: identity-critical tool results keep their full content.
-                let is_identity_critical = m
-                    .content
-                    .as_deref()
-                    .is_some_and(text_relates_to_critical_identity);
-                let content = if m.role == "tool"
-                    && prior_1_tool_ids.contains(&m.id)
-                    && !is_identity_critical
-                {
+            // Age-based tool result summarization: Prior 1 tool results get
+            // their verbose content replaced with a deterministic 1-line summary.
+            // Exception: identity-critical tool results keep their full content.
+            let is_identity_critical = m
+                .content
+                .as_deref()
+                .is_some_and(text_relates_to_critical_identity);
+            let content =
+                if m.role == "tool" && prior_1_tool_ids.contains(&m.id) && !is_identity_critical {
                     let tc_id = m.tool_call_id.as_deref().unwrap_or("");
                     let (tool_name, args_json) = tool_call_info
                         .get(tc_id)
@@ -680,466 +669,473 @@ impl Agent {
                     m.content.clone()
                 };
 
-                // Prevent stall/failure responses from accumulating as prompt context.
-                // These messages are user-visible (stored in history) but poison
-                // subsequent turns — the LLM reads its own prior "I failed" messages
-                // and gives up without even trying ("learned helplessness").
-                if m.role == "assistant"
-                    && m.tool_calls_json.is_none()
-                    && content.as_deref().is_some_and(|c| {
-                        let t = c.trim_start();
-                        t.starts_with("I wasn't able to process that request.")
-                            || t.starts_with("I wasn't able to complete this task.")
-                            || t.starts_with(
-                                "I made some progress but wasn't able to fully complete",
-                            )
-                            || t.starts_with("I seem to be stuck on this task.")
-                            || t.starts_with("I've reached my processing limit")
-                            || t.starts_with("This goal hit its daily processing budget")
-                            || t.starts_with("This scheduled goal hit its daily processing budget")
-                            || t.starts_with("This scheduled run hit its per-run processing budget")
-                            || t.starts_with("I sent the requested file(s), but ran into issues")
-                            || t.starts_with(
-                                "I completed the main deliverable but wasn't able to finish",
-                            )
-                    })
-                {
-                    return None;
-                }
+            // Prevent stall/failure responses from accumulating as prompt context.
+            // These messages are user-visible (stored in history) but poison
+            // subsequent turns — the LLM reads its own prior "I failed" messages
+            // and gives up without even trying ("learned helplessness").
+            if m.role == "assistant"
+                && m.tool_calls_json.is_none()
+                && content.as_deref().is_some_and(|c| {
+                    let t = c.trim_start();
+                    t.starts_with("I wasn't able to process that request.")
+                        || t.starts_with("I wasn't able to complete this task.")
+                        || t.starts_with("I made some progress but wasn't able to fully complete")
+                        || t.starts_with("I seem to be stuck on this task.")
+                        || t.starts_with("I've reached my processing limit")
+                        || t.starts_with("This goal hit its daily processing budget")
+                        || t.starts_with("This scheduled goal hit its daily processing budget")
+                        || t.starts_with("This scheduled run hit its per-run processing budget")
+                        || t.starts_with("I sent the requested file(s), but ran into issues")
+                        || t.starts_with(
+                            "I completed the main deliverable but wasn't able to finish",
+                        )
+                })
+            {
+                return None;
+            }
 
-                let mut obj = json!({
-                    "role": m.role,
-                    "content": content,
-                });
-                // For assistant messages with tool_calls, convert from ToolCall struct format
-                // to OpenAI wire format and strip any that lack a matching tool result
-                if let Some(tc_json) = &m.tool_calls_json {
-                    if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
-                        let filtered: Vec<Value> = tcs
-                            .iter()
-                            .filter(|tc| tool_result_ids.contains(tc.id.as_str()))
-                            .map(|tc| {
-                                let mut val = json!({
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.name,
-                                        "arguments": tc.arguments
-                                    }
-                                });
-                                if let Some(ref extra) = tc.extra_content {
-                                    val["extra_content"] = extra.clone();
+            let mut obj = json!({
+                "role": m.role,
+                "content": content,
+            });
+            // For assistant messages with tool_calls, convert from ToolCall struct format
+            // to OpenAI wire format and strip any that lack a matching tool result
+            if let Some(tc_json) = &m.tool_calls_json {
+                if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
+                    let filtered: Vec<Value> = tcs
+                        .iter()
+                        .filter(|tc| tool_result_ids.contains(tc.id.as_str()))
+                        .map(|tc| {
+                            let mut val = json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": tc.arguments
                                 }
-                                val
-                            })
-                            .collect();
-                        if !filtered.is_empty() {
-                            obj["tool_calls"] = json!(filtered);
-                            if m.content.is_none() {
-                                obj["content"] = Value::Null;
+                            });
+                            if let Some(ref extra) = tc.extra_content {
+                                val["extra_content"] = extra.clone();
                             }
-                        } else if m.content.is_none()
-                            || m.content.as_deref().is_some_and(|c| c.trim().is_empty())
-                        {
-                            // Assistant message had tool_calls but all were orphaned,
-                            // and no text content — replace with [Action completed] to
-                            // prevent dangling user messages (completion compulsion bug)
-                            obj["content"] = json!("[Action completed]");
+                            val
+                        })
+                        .collect();
+                    if !filtered.is_empty() {
+                        obj["tool_calls"] = json!(filtered);
+                        if m.content.is_none() {
+                            obj["content"] = Value::Null;
                         }
+                    } else if m.content.is_none()
+                        || m.content.as_deref().is_some_and(|c| c.trim().is_empty())
+                    {
+                        // Assistant message had tool_calls but all were orphaned,
+                        // and no text content — replace with [Action completed] to
+                        // prevent dangling user messages (completion compulsion bug)
+                        obj["content"] = json!("[Action completed]");
                     }
                 }
-                if let Some(name) = &m.tool_name {
-                    if !name.is_empty() {
-                        obj["name"] = json!(name);
-                    }
+            }
+            if let Some(name) = &m.tool_name {
+                if !name.is_empty() {
+                    obj["name"] = json!(name);
                 }
-                if let Some(tcid) = &m.tool_call_id {
-                    obj["tool_call_id"] = json!(tcid);
+            }
+            if let Some(tcid) = &m.tool_call_id {
+                obj["tool_call_id"] = json!(tcid);
+            }
+            Some(obj)
+        })
+        .collect();
+
+    // Final safety: drop any tool-role messages that still lack a "name" field
+    messages.retain(|m| {
+        if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            let has_name = m
+                .get("name")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| !n.is_empty());
+            if !has_name {
+                warn!(
+                    "Dropping tool message with missing/empty name: tool_call_id={:?}",
+                    m.get("tool_call_id")
+                );
+            }
+            has_name
+        } else {
+            true
+        }
+    });
+
+    // Three-pass fixup: merge → drop orphans → merge again.
+    fixup_message_ordering(&mut messages);
+
+    // Ensure the current user message is in the context.
+    // The DB write (append_user_message_with_event) may not yet be visible
+    // to load_recent_history due to a race condition, especially on
+    // iteration 1. It can also be missing on iteration 2 after a
+    // early-iteration `continue` (no messages are stored between iterations,
+    // so the race condition persists). Check all messages on every iteration
+    // to be safe — the content match prevents duplicates.
+    {
+        let has_current_user_msg = messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
+        });
+
+        if !has_current_user_msg {
+            messages.push(json!({
+                "role": "user",
+                "content": user_text,
+            }));
+        }
+    }
+
+    // Task boundary marker: when there are multiple user messages in context
+    // (i.e., multiple independent tasks in the same chat session), inject a
+    // system separator before the current user message so the LLM knows which
+    // task is current. Without this, models confuse old tasks with the new one.
+    // Injected on ALL iterations (not just early ones) because on iteration 3+
+    // old user messages can mislead the model into responding to them instead of
+    // the current task — especially after tool calls push the current user message
+    // further up the context.
+    {
+        let user_positions: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .map(|(i, _)| i)
+            .collect();
+        if user_positions.len() >= 2 {
+            // Find the position of the *current* user message — match by content,
+            // not just "last user message", so we correctly anchor even when
+            // stray user messages from other interactions appear after ours.
+            let current_pos = user_positions
+                .iter()
+                .copied()
+                .rev()
+                .find(|&pos| {
+                    messages[pos].get("content").and_then(|c| c.as_str()) == Some(user_text)
+                })
+                .or_else(|| user_positions.last().copied());
+
+            if let Some(current_pos) = current_pos {
+                let prev_user_content = user_positions
+                    .iter()
+                    .copied()
+                    .filter(|&pos| pos != current_pos)
+                    .rev()
+                    .find_map(|pos| {
+                        messages[pos]
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string())
+                    });
+                // Only inject if a different task exists in context.
+                let has_different_task =
+                    prev_user_content.as_deref() != Some(user_text) && prev_user_content.is_some();
+                if has_different_task {
+                    // Softer marker that tells the LLM which message is current
+                    // without telling it to ignore prior context. The old [TASK BOUNDARY]
+                    // marker aggressively instructed the LLM to ignore prior messages,
+                    // which broke follow-up references like "the ones within 20 miles".
+                    let marker = json!({
+                        "role": "system",
+                        "content": "[Current Task] The message below is the user's current request. \
+                                    Prior messages are conversation history for context."
+                    });
+                    messages.insert(current_pos, marker);
+                    info!(
+                        session_id,
+                        iteration,
+                        user_messages = user_positions.len(),
+                        "Current task marker injected before current user message"
+                    );
                 }
-                Some(obj)
+            }
+        }
+    }
+
+    // Guard against context interleaving: if another user message arrived in
+    // this session while the agent was processing (race condition between task
+    // registration and queuing), it may appear after the current task's tool
+    // chain. Such stray user messages confuse the model into responding to them
+    // instead of the current task. Remove them.
+    {
+        let current_task_pos = messages.iter().rposition(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
+        });
+        if let Some(task_pos) = current_task_pos {
+            // Find the end of the current task's tool chain (last assistant/tool after task_pos)
+            let chain_end = messages
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(i, m)| {
+                    *i > task_pos
+                        && matches!(
+                            m.get("role").and_then(|r| r.as_str()),
+                            Some("assistant") | Some("tool")
+                        )
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(task_pos);
+
+            // Check for user messages after the tool chain
+            let stray_start = chain_end + 1;
+            if stray_start < messages.len() {
+                let stray_count = messages[stray_start..]
+                    .iter()
+                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                    .count();
+                if stray_count > 0 {
+                    messages.truncate(stray_start);
+                    info!(
+                        session_id,
+                        iteration,
+                        stray_user_messages = stray_count,
+                        "Truncated stray messages after current task's tool chain"
+                    );
+                }
+            }
+        }
+    }
+
+    // Collapse repeated tool errors in the current interaction to reduce
+    // context blow-up during retry loops (keep the latest error details).
+    let collapsed_tool_errors = super::loop_utils::collapse_repeated_tool_errors(&mut messages);
+    if collapsed_tool_errors > 0 {
+        info!(
+            session_id,
+            iteration,
+            collapsed_tool_errors,
+            "Collapsed repeated tool errors in current interaction"
+        );
+    }
+
+    // Context window enforcement: trim messages to fit token budget
+    if agent.context_window_config.enabled {
+        let model_budget = crate::memory::context_window::compute_available_budget(
+            model,
+            system_prompt,
+            tool_defs,
+            &agent.context_window_config,
+        );
+        let policy_budget = policy_bundle.policy.context_budget;
+        if agent.policy_config.policy_shadow_mode && !agent.policy_config.policy_enforce {
+            info!(
+                session_id,
+                iteration, model_budget, policy_budget, "Context budget shadow comparison"
+            );
+        }
+        let effective_budget = if agent.policy_config.policy_enforce {
+            // Never exceed the model's budget; policy config can be mis-set.
+            policy_budget.min(model_budget)
+        } else {
+            model_budget
+        };
+        messages = crate::memory::context_window::fit_messages_with_source_quotas(
+            messages,
+            effective_budget,
+            session_summary.as_ref().map(|s| s.summary.as_str()),
+        );
+    }
+
+    // Empty-response recovery: on retry, clear conversational history to avoid
+    // repeatedly sending a poisoned context to the provider (Gemini in particular
+    // can get "stuck" returning empty candidates for a given session history).
+    if empty_response_retry_pending && !is_trigger_session(session_id) {
+        let before = messages.len();
+        messages = build_empty_response_retry_messages(&messages, user_text);
+        info!(
+            session_id,
+            iteration,
+            before,
+            after = messages.len(),
+            "Empty-response recovery: reduced history while preserving immediate parent context"
+        );
+    }
+
+    // Prompt shaping:
+    // - Iterations >1: use compact tool-loop prompt to reduce repeated token overhead.
+    let effective_system_prompt = if iteration > 1 {
+        let style = match policy_bundle.policy.model_profile {
+            ModelProfile::Cheap => ToolLoopPromptStyle::Lite,
+            ModelProfile::Balanced | ModelProfile::Strong => ToolLoopPromptStyle::Standard,
+        };
+        build_tool_loop_system_prompt(system_prompt, style)
+    } else {
+        system_prompt.to_string()
+    };
+
+    messages.insert(
+        0,
+        json!({
+            "role": "system",
+            "content": effective_system_prompt,
+        }),
+    );
+
+    // Inject compaction summary as the second message (after system prompt).
+    // This gives the LLM a condensed overview of earlier conversation turns
+    // that were trimmed by the sliding window, preserving continuity.
+    if let Some(ref summary) = session_summary {
+        if !summary.summary.is_empty() {
+            messages.insert(
+                1,
+                json!({
+                    "role": "system",
+                    "content": format!("[Session Summary]\n{}", summary.summary),
+                }),
+            );
+        }
+    }
+
+    if let Some(checkpoint) = execution_checkpoint {
+        messages.push(json!({
+            "role": "system",
+            "content": checkpoint,
+        }));
+        info!(
+            session_id,
+            iteration, "Injected execution checkpoint for in-progress task continuity"
+        );
+    }
+
+    // Fresh-context isolation: when history is empty or only contains the current
+    // user message (e.g. first message after /clear), inject a boundary marker to
+    // prevent the LLM from drifting toward stale tool-call patterns from pinned
+    // memories or prior context.
+    {
+        let non_system_non_user_count = messages
+            .iter()
+            .filter(|m| {
+                let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                role != "system" && role != "user"
+            })
+            .count();
+        if non_system_non_user_count == 0 {
+            messages.retain(|m| {
+                m.get("role").and_then(|r| r.as_str()) != Some("user")
+                    || m.get("content").and_then(|c| c.as_str()) == Some(user_text)
+            });
+            pending_system_messages.push(SystemDirective::FreshConversationContext);
+        }
+    }
+
+    // System nudges (budget warnings, loop-stop reminders, etc.): inject for a single
+    // LLM call so they influence the model without polluting stored history.
+    for directive in pending_system_messages.drain(..) {
+        messages.push(json!({
+            "role": "system",
+            "content": directive.render(),
+        }));
+    }
+
+    // Empty-response recovery: if the prior iteration produced no text and no tool calls,
+    // inject a system nudge for the next LLM call. (Tool-role nudges are dropped by
+    // message-order fixups because they don't correspond to an assistant tool_call_id.)
+    if empty_response_retry_pending && !is_trigger_session(session_id) {
+        messages.push(json!({
+            "role": "system",
+            "content": SystemDirective::EmptyResponseRetry.render()
+        }));
+    }
+
+    // Emit "Thinking" status for iterations after the first
+    if iteration > 1 {
+        send_status(status_tx, StatusUpdate::Thinking(iteration));
+    }
+
+    // Debug: log message structure and estimated token count
+    {
+        let summary: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                let name = m.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let tc_id = m
+                    .get("tool_call_id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or("");
+                let tc_count = m
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .map_or(0, |a| a.len());
+                if role == "tool" {
+                    format!("tool({},tc_id={})", name, &tc_id[..tc_id.len().min(12)])
+                } else if tc_count > 0 {
+                    format!("{}(tc={})", role, tc_count)
+                } else {
+                    role.to_string()
+                }
             })
             .collect();
 
-        // Final safety: drop any tool-role messages that still lack a "name" field
-        messages.retain(|m| {
-            if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
-                let has_name = m
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .is_some_and(|n| !n.is_empty());
-                if !has_name {
-                    warn!(
-                        "Dropping tool message with missing/empty name: tool_call_id={:?}",
-                        m.get("tool_call_id")
-                    );
-                }
-                has_name
-            } else {
-                true
-            }
-        });
+        // Estimate tokens: ~4 chars per token for English text
+        let messages_json = serde_json::to_string(&messages).unwrap_or_default();
+        let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
+        let est_msg_tokens = messages_json.len() / 4;
+        let est_tool_tokens = tools_json.len() / 4;
+        let est_total_tokens = est_msg_tokens + est_tool_tokens;
+        let est_msg_tokens_u64 = est_msg_tokens as u64;
+        let est_tool_tokens_u64 = est_tool_tokens as u64;
+        let est_total_tokens_u64 = est_total_tokens as u64;
+        let est_tool_share_bps = est_tool_tokens_u64
+            .saturating_mul(10_000)
+            .checked_div(est_total_tokens_u64)
+            .unwrap_or(0);
 
-        // Three-pass fixup: merge → drop orphans → merge again.
-        fixup_message_ordering(&mut messages);
+        // Runtime signal: quantify prompt overhead from tool schemas before each LLM call.
+        POLICY_METRICS
+            .est_input_token_samples
+            .fetch_add(1, Ordering::Relaxed);
+        POLICY_METRICS
+            .est_input_tokens_total
+            .fetch_add(est_total_tokens_u64, Ordering::Relaxed);
+        POLICY_METRICS
+            .est_msg_tokens_total
+            .fetch_add(est_msg_tokens_u64, Ordering::Relaxed);
+        POLICY_METRICS
+            .est_tool_tokens_total
+            .fetch_add(est_tool_tokens_u64, Ordering::Relaxed);
 
-        // Ensure the current user message is in the context.
-        // The DB write (append_user_message_with_event) may not yet be visible
-        // to load_recent_history due to a race condition, especially on
-        // iteration 1. It can also be missing on iteration 2 after a
-        // early-iteration `continue` (no messages are stored between iterations,
-        // so the race condition persists). Check all messages on every iteration
-        // to be safe — the content match prevents duplicates.
-        {
-            let has_current_user_msg = messages.iter().any(|m| {
-                m.get("role").and_then(|r| r.as_str()) == Some("user")
-                    && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
-            });
-
-            if !has_current_user_msg {
-                messages.push(json!({
-                    "role": "user",
-                    "content": user_text,
-                }));
-            }
-        }
-
-        // Task boundary marker: when there are multiple user messages in context
-        // (i.e., multiple independent tasks in the same chat session), inject a
-        // system separator before the current user message so the LLM knows which
-        // task is current. Without this, models confuse old tasks with the new one.
-        // Injected on ALL iterations (not just early ones) because on iteration 3+
-        // old user messages can mislead the model into responding to them instead of
-        // the current task — especially after tool calls push the current user message
-        // further up the context.
-        {
-            let user_positions: Vec<usize> = messages
-                .iter()
-                .enumerate()
-                .filter(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                .map(|(i, _)| i)
-                .collect();
-            if user_positions.len() >= 2 {
-                // Find the position of the *current* user message — match by content,
-                // not just "last user message", so we correctly anchor even when
-                // stray user messages from other interactions appear after ours.
-                let current_pos = user_positions
-                    .iter()
-                    .copied()
-                    .rev()
-                    .find(|&pos| {
-                        messages[pos].get("content").and_then(|c| c.as_str()) == Some(user_text)
-                    })
-                    .or_else(|| user_positions.last().copied());
-
-                if let Some(current_pos) = current_pos {
-                    let prev_user_content = user_positions
-                        .iter()
-                        .copied()
-                        .filter(|&pos| pos != current_pos)
-                        .rev()
-                        .find_map(|pos| {
-                            messages[pos]
-                                .get("content")
-                                .and_then(|c| c.as_str())
-                                .map(|s| s.to_string())
-                        });
-                    // Only inject if a different task exists in context.
-                    let has_different_task = prev_user_content.as_deref() != Some(user_text)
-                        && prev_user_content.is_some();
-                    if has_different_task {
-                        // Softer marker that tells the LLM which message is current
-                        // without telling it to ignore prior context. The old [TASK BOUNDARY]
-                        // marker aggressively instructed the LLM to ignore prior messages,
-                        // which broke follow-up references like "the ones within 20 miles".
-                        let marker = json!({
-                            "role": "system",
-                            "content": "[Current Task] The message below is the user's current request. \
-                                        Prior messages are conversation history for context."
-                        });
-                        messages.insert(current_pos, marker);
-                        info!(
-                            session_id,
-                            iteration,
-                            user_messages = user_positions.len(),
-                            "Current task marker injected before current user message"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Guard against context interleaving: if another user message arrived in
-        // this session while the agent was processing (race condition between task
-        // registration and queuing), it may appear after the current task's tool
-        // chain. Such stray user messages confuse the model into responding to them
-        // instead of the current task. Remove them.
-        {
-            let current_task_pos = messages.iter().rposition(|m| {
-                m.get("role").and_then(|r| r.as_str()) == Some("user")
-                    && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
-            });
-            if let Some(task_pos) = current_task_pos {
-                // Find the end of the current task's tool chain (last assistant/tool after task_pos)
-                let chain_end = messages
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(i, m)| {
-                        *i > task_pos
-                            && matches!(
-                                m.get("role").and_then(|r| r.as_str()),
-                                Some("assistant") | Some("tool")
-                            )
-                    })
-                    .map(|(i, _)| i)
-                    .unwrap_or(task_pos);
-
-                // Check for user messages after the tool chain
-                let stray_start = chain_end + 1;
-                if stray_start < messages.len() {
-                    let stray_count = messages[stray_start..]
-                        .iter()
-                        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                        .count();
-                    if stray_count > 0 {
-                        messages.truncate(stray_start);
-                        info!(
-                            session_id,
-                            iteration,
-                            stray_user_messages = stray_count,
-                            "Truncated stray messages after current task's tool chain"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Collapse repeated tool errors in the current interaction to reduce
-        // context blow-up during retry loops (keep the latest error details).
-        let collapsed_tool_errors = super::loop_utils::collapse_repeated_tool_errors(&mut messages);
-        if collapsed_tool_errors > 0 {
-            info!(
-                session_id,
-                iteration,
-                collapsed_tool_errors,
-                "Collapsed repeated tool errors in current interaction"
-            );
-        }
-
-        // Context window enforcement: trim messages to fit token budget
-        if self.context_window_config.enabled {
-            let model_budget = crate::memory::context_window::compute_available_budget(
-                model,
-                system_prompt,
-                tool_defs,
-                &self.context_window_config,
-            );
-            let policy_budget = policy_bundle.policy.context_budget;
-            if self.policy_config.policy_shadow_mode && !self.policy_config.policy_enforce {
-                info!(
-                    session_id,
-                    iteration, model_budget, policy_budget, "Context budget shadow comparison"
-                );
-            }
-            let effective_budget = if self.policy_config.policy_enforce {
-                // Never exceed the model's budget; policy config can be mis-set.
-                policy_budget.min(model_budget)
-            } else {
-                model_budget
-            };
-            messages = crate::memory::context_window::fit_messages_with_source_quotas(
-                messages,
-                effective_budget,
-                session_summary.as_ref().map(|s| s.summary.as_str()),
-            );
-        }
-
-        // Empty-response recovery: on retry, clear conversational history to avoid
-        // repeatedly sending a poisoned context to the provider (Gemini in particular
-        // can get "stuck" returning empty candidates for a given session history).
-        if empty_response_retry_pending && !is_trigger_session(session_id) {
-            let before = messages.len();
-            messages = build_empty_response_retry_messages(&messages, user_text);
-            info!(
-                session_id,
-                iteration,
-                before,
-                after = messages.len(),
-                "Empty-response recovery: reduced history while preserving immediate parent context"
-            );
-        }
-
-        // Prompt shaping:
-        // - Iterations >1: use compact tool-loop prompt to reduce repeated token overhead.
-        let effective_system_prompt = if iteration > 1 {
-            let style = match policy_bundle.policy.model_profile {
-                ModelProfile::Cheap => ToolLoopPromptStyle::Lite,
-                ModelProfile::Balanced | ModelProfile::Strong => ToolLoopPromptStyle::Standard,
-            };
-            build_tool_loop_system_prompt(system_prompt, style)
-        } else {
-            system_prompt.to_string()
-        };
-
-        messages.insert(
-            0,
-            json!({
-                "role": "system",
-                "content": effective_system_prompt,
-            }),
-        );
-
-        // Inject compaction summary as the second message (after system prompt).
-        // This gives the LLM a condensed overview of earlier conversation turns
-        // that were trimmed by the sliding window, preserving continuity.
-        if let Some(ref summary) = session_summary {
-            if !summary.summary.is_empty() {
-                messages.insert(
-                    1,
-                    json!({
-                        "role": "system",
-                        "content": format!("[Session Summary]\n{}", summary.summary),
-                    }),
-                );
-            }
-        }
-
-        if let Some(checkpoint) = execution_checkpoint {
-            messages.push(json!({
-                "role": "system",
-                "content": checkpoint,
-            }));
-            info!(
-                session_id,
-                iteration, "Injected execution checkpoint for in-progress task continuity"
-            );
-        }
-
-        // Fresh-context isolation: when history is empty or only contains the current
-        // user message (e.g. first message after /clear), inject a boundary marker to
-        // prevent the LLM from drifting toward stale tool-call patterns from pinned
-        // memories or prior context.
-        {
-            let non_system_non_user_count = messages
-                .iter()
-                .filter(|m| {
-                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                    role != "system" && role != "user"
-                })
-                .count();
-            if non_system_non_user_count == 0 {
-                messages.retain(|m| {
-                    m.get("role").and_then(|r| r.as_str()) != Some("user")
-                        || m.get("content").and_then(|c| c.as_str()) == Some(user_text)
-                });
-                pending_system_messages.push(SystemDirective::FreshConversationContext);
-            }
-        }
-
-        // System nudges (budget warnings, loop-stop reminders, etc.): inject for a single
-        // LLM call so they influence the model without polluting stored history.
-        for directive in pending_system_messages.drain(..) {
-            messages.push(json!({
-                "role": "system",
-                "content": directive.render(),
-            }));
-        }
-
-        // Empty-response recovery: if the prior iteration produced no text and no tool calls,
-        // inject a system nudge for the next LLM call. (Tool-role nudges are dropped by
-        // message-order fixups because they don't correspond to an assistant tool_call_id.)
-        if empty_response_retry_pending && !is_trigger_session(session_id) {
-            messages.push(json!({
-                "role": "system",
-                "content": SystemDirective::EmptyResponseRetry.render()
-            }));
-        }
-
-        // Emit "Thinking" status for iterations after the first
-        if iteration > 1 {
-            send_status(status_tx, StatusUpdate::Thinking(iteration));
-        }
-
-        // Debug: log message structure and estimated token count
-        {
-            let summary: Vec<String> = messages
-                .iter()
-                .map(|m| {
-                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-                    let name = m.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let tc_id = m
-                        .get("tool_call_id")
-                        .and_then(|id| id.as_str())
-                        .unwrap_or("");
-                    let tc_count = m
-                        .get("tool_calls")
-                        .and_then(|v| v.as_array())
-                        .map_or(0, |a| a.len());
-                    if role == "tool" {
-                        format!("tool({},tc_id={})", name, &tc_id[..tc_id.len().min(12)])
-                    } else if tc_count > 0 {
-                        format!("{}(tc={})", role, tc_count)
-                    } else {
-                        role.to_string()
-                    }
-                })
-                .collect();
-
-            // Estimate tokens: ~4 chars per token for English text
-            let messages_json = serde_json::to_string(&messages).unwrap_or_default();
-            let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
-            let est_msg_tokens = messages_json.len() / 4;
-            let est_tool_tokens = tools_json.len() / 4;
-            let est_total_tokens = est_msg_tokens + est_tool_tokens;
-            let est_msg_tokens_u64 = est_msg_tokens as u64;
-            let est_tool_tokens_u64 = est_tool_tokens as u64;
-            let est_total_tokens_u64 = est_total_tokens as u64;
-            let est_tool_share_bps = est_tool_tokens_u64
-                .saturating_mul(10_000)
-                .checked_div(est_total_tokens_u64)
-                .unwrap_or(0);
-
-            // Runtime signal: quantify prompt overhead from tool schemas before each LLM call.
+        const HIGH_TOOL_SHARE_BPS: u64 = 3500; // >=35% of input estimate
+        const HIGH_TOOL_TOKENS_ABS: u64 = 1_500; // large absolute tool-schema cost
+        if est_tool_share_bps >= HIGH_TOOL_SHARE_BPS {
             POLICY_METRICS
-                .est_input_token_samples
+                .est_tool_tokens_high_share_total
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        if est_tool_tokens_u64 >= HIGH_TOOL_TOKENS_ABS {
             POLICY_METRICS
-                .est_input_tokens_total
-                .fetch_add(est_total_tokens_u64, Ordering::Relaxed);
-            POLICY_METRICS
-                .est_msg_tokens_total
-                .fetch_add(est_msg_tokens_u64, Ordering::Relaxed);
-            POLICY_METRICS
-                .est_tool_tokens_total
-                .fetch_add(est_tool_tokens_u64, Ordering::Relaxed);
-
-            const HIGH_TOOL_SHARE_BPS: u64 = 3500; // >=35% of input estimate
-            const HIGH_TOOL_TOKENS_ABS: u64 = 1_500; // large absolute tool-schema cost
-            if est_tool_share_bps >= HIGH_TOOL_SHARE_BPS {
-                POLICY_METRICS
-                    .est_tool_tokens_high_share_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if est_tool_tokens_u64 >= HIGH_TOOL_TOKENS_ABS {
-                POLICY_METRICS
-                    .est_tool_tokens_high_abs_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-
-            info!(
-                session_id,
-                iteration,
-                est_input_tokens = est_total_tokens,
-                est_msg_tokens,
-                est_tool_tokens,
-                est_tool_share_pct = est_tool_share_bps as f64 / 100.0,
-                msg_count = messages.len(),
-                msgs = ?summary,
-                "Context before LLM call"
-            );
+                .est_tool_tokens_high_abs_total
+                .fetch_add(1, Ordering::Relaxed);
         }
 
-        Ok(MessageBuildData { messages })
+        info!(
+            session_id,
+            iteration,
+            est_input_tokens = est_total_tokens,
+            est_msg_tokens,
+            est_tool_tokens,
+            est_tool_share_pct = est_tool_share_bps as f64 / 100.0,
+            msg_count = messages.len(),
+            msgs = ?summary,
+            "Context before LLM call"
+        );
+    }
+
+    Ok(MessageBuildData { messages })
+}
+
+impl Agent {
+    pub(super) async fn run_message_build_phase(
+        &self,
+        ctx: &mut MessageBuildCtx<'_>,
+    ) -> anyhow::Result<MessageBuildData> {
+        let services = super::services::AgentServices::new(self);
+        run_message_build_phase(&services, ctx).await
     }
 }
 

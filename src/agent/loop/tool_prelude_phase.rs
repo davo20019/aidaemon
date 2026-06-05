@@ -535,43 +535,46 @@ impl Agent {
         let critique = serde_json::from_str::<CritiqueState>(&raw)?;
         Ok(critique.normalize())
     }
+}
 
-    pub(super) async fn run_tool_prelude_phase(
-        &self,
-        ctx: &mut ToolPreludeCtx<'_>,
-    ) -> anyhow::Result<ToolPreludeOutcome> {
-        let resp = ctx.resp;
-        let emitter = ctx.emitter;
-        let task_id = ctx.task_id;
-        let session_id = ctx.session_id;
-        let model = ctx.model;
-        let llm_provider = ctx.llm_provider.clone();
-        let iteration = ctx.iteration;
-        let task_start = ctx.task_start;
-        let learning_ctx = &mut *ctx.learning_ctx;
-        let evidence_state = ctx.evidence_state;
-        let user_text = ctx.user_text;
-        let policy_bundle = ctx.policy_bundle;
-        let available_capabilities = ctx.available_capabilities;
-        let execution_state = &mut *ctx.execution_state;
-        let validation_state = &mut *ctx.validation_state;
-        let pending_system_messages = &mut *ctx.pending_system_messages;
-        let force_text_response = &mut *ctx.force_text_response;
-        let turn_context = ctx.turn_context;
-        // Persist assistant message with tool calls
-        let assistant_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "assistant".to_string(),
-            content: resp.content.clone(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: Some(serde_json::to_string(&resp.tool_calls)?),
-            created_at: Utc::now(),
-            importance: 0.5,
-            ..Message::runtime_defaults()
-        };
-        self.append_assistant_message_with_event(
+pub(super) async fn run_tool_prelude_phase(
+    services: &super::services::AgentServices<'_>,
+    ctx: &mut ToolPreludeCtx<'_>,
+) -> anyhow::Result<ToolPreludeOutcome> {
+    let agent = services.agent;
+    let resp = ctx.resp;
+    let emitter = ctx.emitter;
+    let task_id = ctx.task_id;
+    let session_id = ctx.session_id;
+    let model = ctx.model;
+    let llm_provider = ctx.llm_provider.clone();
+    let iteration = ctx.iteration;
+    let task_start = ctx.task_start;
+    let learning_ctx = &mut *ctx.learning_ctx;
+    let evidence_state = ctx.evidence_state;
+    let user_text = ctx.user_text;
+    let policy_bundle = ctx.policy_bundle;
+    let available_capabilities = ctx.available_capabilities;
+    let execution_state = &mut *ctx.execution_state;
+    let validation_state = &mut *ctx.validation_state;
+    let pending_system_messages = &mut *ctx.pending_system_messages;
+    let force_text_response = &mut *ctx.force_text_response;
+    let turn_context = ctx.turn_context;
+    // Persist assistant message with tool calls
+    let assistant_msg = Message {
+        id: Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
+        role: "assistant".to_string(),
+        content: resp.content.clone(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls_json: Some(serde_json::to_string(&resp.tool_calls)?),
+        created_at: Utc::now(),
+        importance: 0.5,
+        ..Message::runtime_defaults()
+    };
+    agent
+        .append_assistant_message_with_event(
             emitter,
             &assistant_msg,
             model,
@@ -580,35 +583,36 @@ impl Agent {
         )
         .await?;
 
-        // Intent gate: on first iteration, require narration before tool calls.
-        // Forces the agent to "show its work" so the user can catch misunderstandings.
-        if iteration == 1
-            && self.depth == 0
-            && !resp.tool_calls.is_empty()
-            && resp.content.as_ref().is_none_or(|c| c.trim().len() < 20)
-        {
-            info!(
-                session_id,
-                "Intent gate: requiring narration before tool execution"
-            );
-            for tc in &resp.tool_calls {
-                let result_text = "[SYSTEM] Before executing tools, briefly state what you \
+    // Intent gate: on first iteration, require narration before tool calls.
+    // Forces the agent to "show its work" so the user can catch misunderstandings.
+    if iteration == 1
+        && agent.depth == 0
+        && !resp.tool_calls.is_empty()
+        && resp.content.as_ref().is_none_or(|c| c.trim().len() < 20)
+    {
+        info!(
+            session_id,
+            "Intent gate: requiring narration before tool execution"
+        );
+        for tc in &resp.tool_calls {
+            let result_text = "[SYSTEM] Before executing tools, briefly state what you \
                     understand the user is asking and what you plan to do. \
                     Then re-issue the tool calls."
-                    .to_string();
-                let tool_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "tool".to_string(),
-                    content: Some(result_text),
-                    tool_call_id: Some(tc.id.clone()),
-                    tool_name: Some(tc.name.clone()),
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.3,
-                    ..Message::runtime_defaults()
-                };
-                self.append_tool_message_with_result_event(
+                .to_string();
+            let tool_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "tool".to_string(),
+                content: Some(result_text),
+                tool_call_id: Some(tc.id.clone()),
+                tool_name: Some(tc.name.clone()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.3,
+                ..Message::runtime_defaults()
+            };
+            agent
+                .append_tool_message_with_result_event(
                     emitter,
                     &tool_msg,
                     true,
@@ -617,32 +621,32 @@ impl Agent {
                     Some(task_id),
                 )
                 .await?;
-            }
-            return Ok(ToolPreludeOutcome::ContinueLoop);
         }
+        return Ok(ToolPreludeOutcome::ContinueLoop);
+    }
 
-        if let Some(side_effecting_tool_call) =
-            first_side_effecting_tool_call(self, resp, available_capabilities)
+    if let Some(side_effecting_tool_call) =
+        first_side_effecting_tool_call(agent, resp, available_capabilities)
+    {
+        // Memory tools (remember_fact, manage_memories, manage_people) should
+        // never be redirected to plain-text completion — the agent legitimately
+        // stores information even for conversational requests.
+        let all_side_effecting_are_memory = resp
+            .tool_calls
+            .iter()
+            .filter(|tc| tool_call_is_side_effecting(agent, tc, available_capabilities))
+            .all(|tc| crate::agent::recall_guardrails::is_personal_memory_tool(&tc.name));
+        // Child sessions (spawned TaskLead/Executor) exist to execute actions —
+        // never redirect them to plain-text mode. `sub-` is the legacy prefix
+        // kept for in-flight tasks; new sessions use `specialist:`.
+        let is_child_session =
+            session_id.starts_with("sub-") || session_id.starts_with("specialist:");
+        if !is_child_session
+            && !all_side_effecting_are_memory
+            && turn_prefers_plain_text_completion(turn_context)
         {
-            // Memory tools (remember_fact, manage_memories, manage_people) should
-            // never be redirected to plain-text completion — the agent legitimately
-            // stores information even for conversational requests.
-            let all_side_effecting_are_memory = resp
-                .tool_calls
-                .iter()
-                .filter(|tc| tool_call_is_side_effecting(self, tc, available_capabilities))
-                .all(|tc| crate::agent::recall_guardrails::is_personal_memory_tool(&tc.name));
-            // Child sessions (spawned TaskLead/Executor) exist to execute actions —
-            // never redirect them to plain-text mode. `sub-` is the legacy prefix
-            // kept for in-flight tasks; new sessions use `specialist:`.
-            let is_child_session =
-                session_id.starts_with("sub-") || session_id.starts_with("specialist:");
-            if !is_child_session
-                && !all_side_effecting_are_memory
-                && turn_prefers_plain_text_completion(turn_context)
-            {
-                validation_state.note_replan();
-                learning_ctx.record_replay_note(
+            validation_state.note_replan();
+            learning_ctx.record_replay_note(
                     ReplayNoteCategory::RetryReason,
                     "text_only_tool_drift",
                     format!(
@@ -651,9 +655,10 @@ impl Agent {
                     ),
                     true,
                 );
-                *force_text_response = true;
-                pending_system_messages.push(SystemDirective::ToolModeDisabledPlainText);
-                self.emit_warning_decision_point(
+            *force_text_response = true;
+            pending_system_messages.push(SystemDirective::ToolModeDisabledPlainText);
+            agent
+                .emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -669,7 +674,7 @@ impl Agent {
                     }),
                 )
                 .await;
-                self.inject_prelude_retry_messages(
+            agent.inject_prelude_retry_messages(
                     emitter,
                     session_id,
                     task_id,
@@ -678,13 +683,14 @@ impl Agent {
                         .to_string(),
                 )
                 .await?;
-                return Ok(ToolPreludeOutcome::ContinueLoop);
-            }
+            return Ok(ToolPreludeOutcome::ContinueLoop);
         }
+    }
 
-        if !resp.tool_calls.is_empty() {
-            execution_state.mark_persisted_now();
-            self.emit_decision_point(
+    if !resp.tool_calls.is_empty() {
+        execution_state.mark_persisted_now();
+        agent
+            .emit_decision_point(
                 emitter,
                 task_id,
                 iteration,
@@ -697,51 +703,47 @@ impl Agent {
                 }),
             )
             .await;
-        }
+    }
 
-        let uncertainty_threshold =
-            current_uncertainty_threshold(self.policy_config.uncertainty_clarify_threshold);
-        if self.policy_config.uncertainty_clarify_enforce
-            && policy_bundle.uncertainty_score >= uncertainty_threshold
-        {
-            let has_side_effecting_call = resp
-                .tool_calls
-                .iter()
-                .any(|tc| tool_call_is_side_effecting(self, tc, available_capabilities));
-            if has_side_effecting_call {
-                let clarify = default_clarifying_question(user_text, &[]);
-                POLICY_METRICS
-                    .uncertainty_clarify_total
-                    .fetch_add(1, Ordering::Relaxed);
-                info!(
-                    session_id,
-                    iteration,
-                    uncertainty_score = policy_bundle.uncertainty_score,
-                    threshold = uncertainty_threshold,
-                    clarification = %clarify,
-                    "Uncertainty guard triggered before side-effecting tool execution"
-                );
-                let assistant_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "assistant".to_string(),
-                    content: Some(clarify.clone()),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.5,
-                    ..Message::runtime_defaults()
-                };
-                self.append_assistant_message_with_event(
-                    emitter,
-                    &assistant_msg,
-                    "system",
-                    None,
-                    None,
-                )
+    let uncertainty_threshold =
+        current_uncertainty_threshold(agent.policy_config.uncertainty_clarify_threshold);
+    if agent.policy_config.uncertainty_clarify_enforce
+        && policy_bundle.uncertainty_score >= uncertainty_threshold
+    {
+        let has_side_effecting_call = resp
+            .tool_calls
+            .iter()
+            .any(|tc| tool_call_is_side_effecting(agent, tc, available_capabilities));
+        if has_side_effecting_call {
+            let clarify = default_clarifying_question(user_text, &[]);
+            POLICY_METRICS
+                .uncertainty_clarify_total
+                .fetch_add(1, Ordering::Relaxed);
+            info!(
+                session_id,
+                iteration,
+                uncertainty_score = policy_bundle.uncertainty_score,
+                threshold = uncertainty_threshold,
+                clarification = %clarify,
+                "Uncertainty guard triggered before side-effecting tool execution"
+            );
+            let assistant_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "assistant".to_string(),
+                content: Some(clarify.clone()),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.5,
+                ..Message::runtime_defaults()
+            };
+            agent
+                .append_assistant_message_with_event(emitter, &assistant_msg, "system", None, None)
                 .await?;
-                self.emit_task_end(
+            agent
+                .emit_task_end(
                     emitter,
                     task_id,
                     TaskStatus::Completed,
@@ -752,38 +754,39 @@ impl Agent {
                     Some("Asked clarification due to uncertainty policy.".to_string()),
                 )
                 .await;
-                return Ok(ToolPreludeOutcome::Return(Ok(clarify)));
-            }
+            return Ok(ToolPreludeOutcome::Return(Ok(clarify)));
         }
+    }
 
-        for tc in &resp.tool_calls {
-            if let Some(violation) =
-                assess_pre_execution_evidence_gate(&tc.name, &tc.arguments, evidence_state)
-            {
-                validation_state.record_failure(ValidationFailure::MissingEvidence);
-                validation_state.note_retry(LoopRepetitionReason::MissingEvidence);
-                learning_ctx.record_replay_note(
-                    ReplayNoteCategory::EvidenceGate,
-                    "missing_pre_execution_evidence",
-                    format!(
-                        "Blocked {} until {} evidence exists for {}.",
-                        tc.name,
-                        format!("{:?}", violation.kind).to_ascii_lowercase(),
-                        violation.target.as_deref().unwrap_or("the current target")
-                    ),
-                    true,
-                );
-                learning_ctx.record_replay_note(
-                    ReplayNoteCategory::RetryReason,
-                    "missing_evidence",
-                    format!(
-                        "Retried after evidence gate blocked {} for {}.",
-                        tc.name,
-                        violation.target.as_deref().unwrap_or("the current target")
-                    ),
-                    true,
-                );
-                self.emit_warning_decision_point(
+    for tc in &resp.tool_calls {
+        if let Some(violation) =
+            assess_pre_execution_evidence_gate(&tc.name, &tc.arguments, evidence_state)
+        {
+            validation_state.record_failure(ValidationFailure::MissingEvidence);
+            validation_state.note_retry(LoopRepetitionReason::MissingEvidence);
+            learning_ctx.record_replay_note(
+                ReplayNoteCategory::EvidenceGate,
+                "missing_pre_execution_evidence",
+                format!(
+                    "Blocked {} until {} evidence exists for {}.",
+                    tc.name,
+                    format!("{:?}", violation.kind).to_ascii_lowercase(),
+                    violation.target.as_deref().unwrap_or("the current target")
+                ),
+                true,
+            );
+            learning_ctx.record_replay_note(
+                ReplayNoteCategory::RetryReason,
+                "missing_evidence",
+                format!(
+                    "Retried after evidence gate blocked {} for {}.",
+                    tc.name,
+                    violation.target.as_deref().unwrap_or("the current target")
+                ),
+                true,
+            );
+            agent
+                .emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -799,7 +802,8 @@ impl Agent {
                     }),
                 )
                 .await;
-                self.inject_prelude_retry_messages(
+            agent
+                .inject_prelude_retry_messages(
                     emitter,
                     session_id,
                     task_id,
@@ -810,94 +814,91 @@ impl Agent {
                     ),
                 )
                 .await?;
-                return Ok(ToolPreludeOutcome::ContinueLoop);
-            }
+            return Ok(ToolPreludeOutcome::ContinueLoop);
         }
+    }
 
-        let first_risky_tool_call =
-            first_side_effecting_tool_call(self, resp, available_capabilities).cloned();
-        // Gate: only request the pre-execution plan once per task.
-        // Skip if: (a) a side-effecting tool already completed successfully
-        // (learning_ctx tracks it), OR (b) a plan was already accepted
-        // (current_plan_version is set).  Without check (b), a critique
-        // rejection causes ContinueLoop without executing the tool, so the
-        // learning_ctx guard stays false and the plan is re-requested every
-        // iteration — adding 2 extra LLM calls (plan + critique) per loop.
-        let plan_already_generated = execution_state.current_plan_version.is_some();
-        if self.depth == 0
-            && !plan_already_generated
-            && !has_completed_side_effecting_tool_call(learning_ctx, available_capabilities)
-        {
-            if let Some(first_risky_tool_call) = first_risky_tool_call {
-                let capabilities = available_capabilities
-                    .get(&first_risky_tool_call.name)
-                    .copied()
-                    .unwrap_or_default();
-                let expected_target = extract_target_preview(&first_risky_tool_call.arguments);
+    let first_risky_tool_call =
+        first_side_effecting_tool_call(agent, resp, available_capabilities).cloned();
+    // Gate: only request the pre-execution plan once per task.
+    // Skip if: (a) a side-effecting tool already completed successfully
+    // (learning_ctx tracks it), OR (b) a plan was already accepted
+    // (current_plan_version is set).  Without check (b), a critique
+    // rejection causes ContinueLoop without executing the tool, so the
+    // learning_ctx guard stays false and the plan is re-requested every
+    // iteration — adding 2 extra LLM calls (plan + critique) per loop.
+    let plan_already_generated = execution_state.current_plan_version.is_some();
+    if agent.depth == 0
+        && !plan_already_generated
+        && !has_completed_side_effecting_tool_call(learning_ctx, available_capabilities)
+    {
+        if let Some(first_risky_tool_call) = first_risky_tool_call {
+            let capabilities = available_capabilities
+                .get(&first_risky_tool_call.name)
+                .copied()
+                .unwrap_or_default();
+            let expected_target = extract_target_preview(&first_risky_tool_call.arguments);
 
-                // Pre-execution planning is a system-initiated quality check,
-                // not an agent action. Do not charge it against the execution
-                // budget — the agent should not be penalised for the system's
-                // own safety overhead.
-                match self
-                    .request_pre_execution_plan(
-                        llm_provider,
-                        model,
-                        user_text,
-                        resp.content.as_deref(),
-                        &first_risky_tool_call,
-                        capabilities,
-                    )
-                    .await
-                {
-                    Ok(plan) => match validate_pre_execution_plan(
-                        &plan,
-                        &first_risky_tool_call,
-                        expected_target.as_deref(),
-                    ) {
-                        Ok(()) => {
-                            execution_state.set_plan_version(plan.version);
-                            // Clear any stale plan from previous iterations before
-                            // conditionally installing a new one.
-                            execution_state.active_linear_intent_plan = None;
-                            if !plan.planned_steps.is_empty() {
-                                execution_state.install_linear_intent_plan(
-                                    plan.version,
-                                    plan.planned_steps
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(idx, step)| LinearIntentStep {
-                                            step_id: format!(
-                                                "plan-v{}-step-{}",
-                                                plan.version,
-                                                idx + 1
-                                            ),
-                                            step_index: idx + 1,
-                                            tool: step.tool.clone(),
-                                            target: step.target.clone(),
-                                            description: step.description.clone(),
-                                            tool_calls_on_step: 0,
-                                            completed: false,
-                                            completion_evidence: None,
-                                            last_evaluated_at: None,
-                                        })
-                                        .collect(),
-                                );
-                            }
-                            validation_state.set_plan(plan.version, &plan.success_criteria);
-                            validation_state.clear_loop_repetition_reason();
-                            learning_ctx.record_replay_note(
-                                ReplayNoteCategory::PlanRevision,
-                                "plan_accepted",
-                                format!(
-                                    "Accepted plan v{} for {} targeting {}.",
-                                    plan.version,
-                                    first_risky_tool_call.name,
-                                    expected_target.as_deref().unwrap_or("unspecified target")
-                                ),
-                                false,
+            // Pre-execution planning is a system-initiated quality check,
+            // not an agent action. Do not charge it against the execution
+            // budget — the agent should not be penalised for the system's
+            // own safety overhead.
+            match agent
+                .request_pre_execution_plan(
+                    llm_provider,
+                    model,
+                    user_text,
+                    resp.content.as_deref(),
+                    &first_risky_tool_call,
+                    capabilities,
+                )
+                .await
+            {
+                Ok(plan) => match validate_pre_execution_plan(
+                    &plan,
+                    &first_risky_tool_call,
+                    expected_target.as_deref(),
+                ) {
+                    Ok(()) => {
+                        execution_state.set_plan_version(plan.version);
+                        // Clear any stale plan from previous iterations before
+                        // conditionally installing a new one.
+                        execution_state.active_linear_intent_plan = None;
+                        if !plan.planned_steps.is_empty() {
+                            execution_state.install_linear_intent_plan(
+                                plan.version,
+                                plan.planned_steps
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, step)| LinearIntentStep {
+                                        step_id: format!("plan-v{}-step-{}", plan.version, idx + 1),
+                                        step_index: idx + 1,
+                                        tool: step.tool.clone(),
+                                        target: step.target.clone(),
+                                        description: step.description.clone(),
+                                        tool_calls_on_step: 0,
+                                        completed: false,
+                                        completion_evidence: None,
+                                        last_evaluated_at: None,
+                                    })
+                                    .collect(),
                             );
-                            self.emit_decision_point(
+                        }
+                        validation_state.set_plan(plan.version, &plan.success_criteria);
+                        validation_state.clear_loop_repetition_reason();
+                        learning_ctx.record_replay_note(
+                            ReplayNoteCategory::PlanRevision,
+                            "plan_accepted",
+                            format!(
+                                "Accepted plan v{} for {} targeting {}.",
+                                plan.version,
+                                first_risky_tool_call.name,
+                                expected_target.as_deref().unwrap_or("unspecified target")
+                            ),
+                            false,
+                        );
+                        agent
+                            .emit_decision_point(
                                 emitter,
                                 task_id,
                                 iteration,
@@ -919,46 +920,46 @@ impl Agent {
                             )
                             .await;
 
-                            if should_run_pre_execution_critique(
-                                policy_bundle,
-                                capabilities,
-                                execution_state,
-                            ) {
-                                // Same principle: critique is system-initiated
-                                // quality gating, not agent work. Do not charge
-                                // it against the execution budget.
-                                match self
-                                    .request_pre_execution_critique(
-                                        ctx.llm_provider.clone(),
-                                        model,
-                                        user_text,
-                                        resp.content.as_deref(),
-                                        &first_risky_tool_call,
-                                        &plan,
-                                        evidence_state,
-                                        capabilities,
-                                        expected_target.as_deref(),
-                                    )
-                                    .await
-                                {
-                                    Ok(critique) => {
-                                        match validate_pre_execution_critique(&critique) {
-                                            Ok(())
-                                                if matches!(
-                                                    critique.verdict,
-                                                    CritiqueVerdict::Accept
-                                                ) =>
-                                            {
-                                                learning_ctx.record_replay_note(
-                                                    ReplayNoteCategory::PlanRevision,
-                                                    "critique_accepted",
-                                                    format!(
-                                                        "Critique accepted the first {} step.",
-                                                        first_risky_tool_call.name
-                                                    ),
-                                                    false,
-                                                );
-                                                self.emit_decision_point(
+                        if should_run_pre_execution_critique(
+                            policy_bundle,
+                            capabilities,
+                            execution_state,
+                        ) {
+                            // Same principle: critique is system-initiated
+                            // quality gating, not agent work. Do not charge
+                            // it against the execution budget.
+                            match agent
+                                .request_pre_execution_critique(
+                                    ctx.llm_provider.clone(),
+                                    model,
+                                    user_text,
+                                    resp.content.as_deref(),
+                                    &first_risky_tool_call,
+                                    &plan,
+                                    evidence_state,
+                                    capabilities,
+                                    expected_target.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok(critique) => {
+                                    match validate_pre_execution_critique(&critique) {
+                                        Ok(())
+                                            if matches!(
+                                                critique.verdict,
+                                                CritiqueVerdict::Accept
+                                            ) =>
+                                        {
+                                            learning_ctx.record_replay_note(
+                                                ReplayNoteCategory::PlanRevision,
+                                                "critique_accepted",
+                                                format!(
+                                                    "Critique accepted the first {} step.",
+                                                    first_risky_tool_call.name
+                                                ),
+                                                false,
+                                            );
+                                            agent.emit_decision_point(
                                                 emitter,
                                                 task_id,
                                                 iteration,
@@ -979,42 +980,42 @@ impl Agent {
                                                 }),
                                             )
                                             .await;
-                                            }
-                                            Ok(()) => {
-                                                // Clear stale linear intent plan — rejected
-                                                // critique means the plan that produced it
-                                                // is invalid.
-                                                execution_state.active_linear_intent_plan = None;
-                                                validation_state.record_failure(
-                                                    ValidationFailure::CritiqueRejected,
-                                                );
-                                                validation_state.note_replan_for(
-                                                    LoopRepetitionReason::CritiqueRejected,
-                                                );
-                                                learning_ctx.record_replay_note(
-                                                    ReplayNoteCategory::PlanRevision,
-                                                    "critique_rejected",
-                                                    format!(
-                                                        "Critique rejected the first {} step: {}",
-                                                        first_risky_tool_call.name,
-                                                        if critique.issues.is_empty() {
-                                                            critique.summary.clone()
-                                                        } else {
-                                                            critique.issues.join("; ")
-                                                        }
-                                                    ),
-                                                    true,
-                                                );
-                                                learning_ctx.record_replay_note(
-                                                    ReplayNoteCategory::RetryReason,
-                                                    "critique_rejected",
-                                                    format!(
-                                                        "Replanned because critique rejected {}.",
-                                                        first_risky_tool_call.name
-                                                    ),
-                                                    true,
-                                                );
-                                                self.emit_warning_decision_point(
+                                        }
+                                        Ok(()) => {
+                                            // Clear stale linear intent plan — rejected
+                                            // critique means the plan that produced it
+                                            // is invalid.
+                                            execution_state.active_linear_intent_plan = None;
+                                            validation_state.record_failure(
+                                                ValidationFailure::CritiqueRejected,
+                                            );
+                                            validation_state.note_replan_for(
+                                                LoopRepetitionReason::CritiqueRejected,
+                                            );
+                                            learning_ctx.record_replay_note(
+                                                ReplayNoteCategory::PlanRevision,
+                                                "critique_rejected",
+                                                format!(
+                                                    "Critique rejected the first {} step: {}",
+                                                    first_risky_tool_call.name,
+                                                    if critique.issues.is_empty() {
+                                                        critique.summary.clone()
+                                                    } else {
+                                                        critique.issues.join("; ")
+                                                    }
+                                                ),
+                                                true,
+                                            );
+                                            learning_ctx.record_replay_note(
+                                                ReplayNoteCategory::RetryReason,
+                                                "critique_rejected",
+                                                format!(
+                                                    "Replanned because critique rejected {}.",
+                                                    first_risky_tool_call.name
+                                                ),
+                                                true,
+                                            );
+                                            agent.emit_warning_decision_point(
                                                 emitter,
                                                 task_id,
                                                 iteration,
@@ -1036,8 +1037,8 @@ impl Agent {
                                                 }),
                                             )
                                             .await;
-                                                let issues = critique.issues.join("; ");
-                                                self.inject_prelude_retry_messages(
+                                            let issues = critique.issues.join("; ");
+                                            agent.inject_prelude_retry_messages(
                                                 emitter,
                                                 session_id,
                                                 task_id,
@@ -1055,10 +1056,11 @@ impl Agent {
                                                 ),
                                             )
                                             .await?;
-                                                return Ok(ToolPreludeOutcome::ContinueLoop);
-                                            }
-                                            Err(reason) => {
-                                                self.emit_warning_decision_point(
+                                            return Ok(ToolPreludeOutcome::ContinueLoop);
+                                        }
+                                        Err(reason) => {
+                                            agent
+                                                .emit_warning_decision_point(
                                                     emitter,
                                                     task_id,
                                                     iteration,
@@ -1077,11 +1079,12 @@ impl Agent {
                                                     }),
                                                 )
                                                 .await;
-                                            }
                                         }
                                     }
-                                    Err(error) => {
-                                        self.emit_warning_decision_point(
+                                }
+                                Err(error) => {
+                                    agent
+                                        .emit_warning_decision_point(
                                             emitter,
                                             task_id,
                                             iteration,
@@ -1100,19 +1103,19 @@ impl Agent {
                                             }),
                                         )
                                         .await;
-                                        warn!(
-                                            session_id,
-                                            tool = %first_risky_tool_call.name,
-                                            error = %error,
-                                            "Pre-execution critique pass unavailable; proceeding with existing guards"
-                                        );
-                                    }
+                                    warn!(
+                                        session_id,
+                                        tool = %first_risky_tool_call.name,
+                                        error = %error,
+                                        "Pre-execution critique pass unavailable; proceeding with existing guards"
+                                    );
                                 }
-                            } else if capabilities.high_impact_write
-                                || capabilities.external_side_effect
-                                || capabilities.needs_approval
-                            {
-                                self.emit_warning_decision_point(
+                            }
+                        } else if capabilities.high_impact_write
+                            || capabilities.external_side_effect
+                            || capabilities.needs_approval
+                        {
+                            agent.emit_warning_decision_point(
                                     emitter,
                                     task_id,
                                     iteration,
@@ -1134,12 +1137,12 @@ impl Agent {
                                     }),
                                 )
                                 .await;
-                            }
                         }
-                        Err(reason) => {
-                            validation_state.record_failure(ValidationFailure::PlanRejected);
-                            validation_state.note_replan_for(LoopRepetitionReason::PlanRejected);
-                            learning_ctx.record_replay_note(
+                    }
+                    Err(reason) => {
+                        validation_state.record_failure(ValidationFailure::PlanRejected);
+                        validation_state.note_replan_for(LoopRepetitionReason::PlanRejected);
+                        learning_ctx.record_replay_note(
                                 ReplayNoteCategory::PlanRevision,
                                 "plan_rejected",
                                 format!(
@@ -1148,16 +1151,16 @@ impl Agent {
                                 ),
                                 true,
                             );
-                            learning_ctx.record_replay_note(
-                                ReplayNoteCategory::RetryReason,
-                                "plan_rejected",
-                                format!(
-                                    "Replanned because the first structured plan for {} was invalid.",
-                                    first_risky_tool_call.name
-                                ),
-                                true,
-                            );
-                            self.emit_warning_decision_point(
+                        learning_ctx.record_replay_note(
+                            ReplayNoteCategory::RetryReason,
+                            "plan_rejected",
+                            format!(
+                                "Replanned because the first structured plan for {} was invalid.",
+                                first_risky_tool_call.name
+                            ),
+                            true,
+                        );
+                        agent.emit_warning_decision_point(
                                 emitter,
                                 task_id,
                                 iteration,
@@ -1177,7 +1180,7 @@ impl Agent {
                                 }),
                             )
                             .await;
-                            self.inject_prelude_retry_messages(
+                        agent.inject_prelude_retry_messages(
                                 emitter,
                                 session_id,
                                 task_id,
@@ -1189,11 +1192,12 @@ impl Agent {
                                 ),
                             )
                             .await?;
-                            return Ok(ToolPreludeOutcome::ContinueLoop);
-                        }
-                    },
-                    Err(error) => {
-                        self.emit_warning_decision_point(
+                        return Ok(ToolPreludeOutcome::ContinueLoop);
+                    }
+                },
+                Err(error) => {
+                    agent
+                        .emit_warning_decision_point(
                             emitter,
                             task_id,
                             iteration,
@@ -1212,18 +1216,27 @@ impl Agent {
                             }),
                         )
                         .await;
-                        warn!(
-                            session_id,
-                            tool = %first_risky_tool_call.name,
-                            error = %error,
-                            "Structured pre-execution planning gate unavailable; proceeding with existing guards"
-                        );
-                    }
+                    warn!(
+                        session_id,
+                        tool = %first_risky_tool_call.name,
+                        error = %error,
+                        "Structured pre-execution planning gate unavailable; proceeding with existing guards"
+                    );
                 }
             }
         }
+    }
 
-        Ok(ToolPreludeOutcome::Proceed)
+    Ok(ToolPreludeOutcome::Proceed)
+}
+
+impl Agent {
+    pub(super) async fn run_tool_prelude_phase(
+        &self,
+        ctx: &mut ToolPreludeCtx<'_>,
+    ) -> anyhow::Result<ToolPreludeOutcome> {
+        let services = super::services::AgentServices::new(self);
+        run_tool_prelude_phase(&services, ctx).await
     }
 }
 

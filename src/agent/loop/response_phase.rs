@@ -57,57 +57,66 @@ pub(super) struct ResponsePhaseCtx<'a> {
     pub validation_state: &'a mut ValidationState,
 }
 
+pub(super) async fn run_response_phase(
+    services: &super::services::AgentServices<'_>,
+    ctx: &mut ResponsePhaseCtx<'_>,
+) -> anyhow::Result<ResponsePhaseOutcome> {
+    let completion_outcome = services
+        .agent
+        .run_completion_phase(&mut CompletionCtx {
+            resp: &mut *ctx.resp,
+            emitter: ctx.emitter,
+            task_id: ctx.task_id,
+            session_id: ctx.session_id,
+            user_text: ctx.user_text,
+            iteration: ctx.iteration,
+            task_start: ctx.task_start,
+            learning_ctx: &mut *ctx.learning_ctx,
+            pending_system_messages: &mut *ctx.pending_system_messages,
+            tool_defs: &mut *ctx.tool_defs,
+            base_tool_defs: &mut *ctx.base_tool_defs,
+            available_capabilities: &mut *ctx.available_capabilities,
+            policy_bundle: &mut *ctx.policy_bundle,
+            restrict_to_personal_memory_tools: ctx.restrict_to_personal_memory_tools,
+            llm_provider: ctx.llm_provider.clone(),
+            llm_router: ctx.llm_router.clone(),
+            model: &mut *ctx.model,
+            channel_ctx: ctx.channel_ctx.clone(),
+            user_role: ctx.user_role,
+            total_successful_tool_calls: ctx.total_successful_tool_calls,
+            stall_count: &mut *ctx.stall_count,
+            consecutive_clean_iterations: &mut *ctx.consecutive_clean_iterations,
+            deferred_no_tool_streak: &mut *ctx.deferred_no_tool_streak,
+            deferred_no_tool_model_switches: &mut *ctx.deferred_no_tool_model_switches,
+            fallback_expanded_once: &mut *ctx.fallback_expanded_once,
+            empty_response_retry_used: &mut *ctx.empty_response_retry_used,
+            empty_response_retry_pending: &mut *ctx.empty_response_retry_pending,
+            empty_response_retry_note: &mut *ctx.empty_response_retry_note,
+            identity_prefill_text: &mut *ctx.identity_prefill_text,
+            pending_background_ack: &mut *ctx.pending_background_ack,
+            pending_external_action_ack: &mut *ctx.pending_external_action_ack,
+            require_file_recheck_before_answer: &mut *ctx.require_file_recheck_before_answer,
+            completion_progress: &mut *ctx.completion_progress,
+            turn_context: ctx.turn_context,
+            needs_tools_for_turn: *ctx.needs_tools_for_turn,
+            force_text_response: &mut *ctx.force_text_response,
+            execution_state: &mut *ctx.execution_state,
+            validation_state: &mut *ctx.validation_state,
+        })
+        .await?;
+    if let Some(outcome) = completion_outcome {
+        return Ok(outcome);
+    }
+
+    Ok(ResponsePhaseOutcome::ProceedToToolExecution)
+}
+
 impl Agent {
     pub(super) async fn run_response_phase(
         &self,
         ctx: &mut ResponsePhaseCtx<'_>,
     ) -> anyhow::Result<ResponsePhaseOutcome> {
-        let completion_outcome = self
-            .run_completion_phase(&mut CompletionCtx {
-                resp: &mut *ctx.resp,
-                emitter: ctx.emitter,
-                task_id: ctx.task_id,
-                session_id: ctx.session_id,
-                user_text: ctx.user_text,
-                iteration: ctx.iteration,
-                task_start: ctx.task_start,
-                learning_ctx: &mut *ctx.learning_ctx,
-                pending_system_messages: &mut *ctx.pending_system_messages,
-                tool_defs: &mut *ctx.tool_defs,
-                base_tool_defs: &mut *ctx.base_tool_defs,
-                available_capabilities: &mut *ctx.available_capabilities,
-                policy_bundle: &mut *ctx.policy_bundle,
-                restrict_to_personal_memory_tools: ctx.restrict_to_personal_memory_tools,
-                llm_provider: ctx.llm_provider.clone(),
-                llm_router: ctx.llm_router.clone(),
-                model: &mut *ctx.model,
-                channel_ctx: ctx.channel_ctx.clone(),
-                user_role: ctx.user_role,
-                total_successful_tool_calls: ctx.total_successful_tool_calls,
-                stall_count: &mut *ctx.stall_count,
-                consecutive_clean_iterations: &mut *ctx.consecutive_clean_iterations,
-                deferred_no_tool_streak: &mut *ctx.deferred_no_tool_streak,
-                deferred_no_tool_model_switches: &mut *ctx.deferred_no_tool_model_switches,
-                fallback_expanded_once: &mut *ctx.fallback_expanded_once,
-                empty_response_retry_used: &mut *ctx.empty_response_retry_used,
-                empty_response_retry_pending: &mut *ctx.empty_response_retry_pending,
-                empty_response_retry_note: &mut *ctx.empty_response_retry_note,
-                identity_prefill_text: &mut *ctx.identity_prefill_text,
-                pending_background_ack: &mut *ctx.pending_background_ack,
-                pending_external_action_ack: &mut *ctx.pending_external_action_ack,
-                require_file_recheck_before_answer: &mut *ctx.require_file_recheck_before_answer,
-                completion_progress: &mut *ctx.completion_progress,
-                turn_context: ctx.turn_context,
-                needs_tools_for_turn: *ctx.needs_tools_for_turn,
-                force_text_response: &mut *ctx.force_text_response,
-                execution_state: &mut *ctx.execution_state,
-                validation_state: &mut *ctx.validation_state,
-            })
-            .await?;
-        if let Some(outcome) = completion_outcome {
-            return Ok(outcome);
-        }
-
-        Ok(ResponsePhaseOutcome::ProceedToToolExecution)
+        let services = super::services::AgentServices::new(self);
+        run_response_phase(&services, ctx).await
     }
 }

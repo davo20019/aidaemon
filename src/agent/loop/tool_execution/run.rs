@@ -620,166 +620,163 @@ fn observation_matches_completion_contract(
     })
 }
 
-impl Agent {
-    pub(in crate::agent) async fn run_tool_execution_phase(
-        &self,
-        ctx: &mut ToolExecutionCtx<'_>,
-    ) -> anyhow::Result<ToolExecutionOutcome> {
-        let resp = ctx.resp;
-        let emitter = ctx.emitter;
-        let task_id = ctx.task_id;
-        let session_id = ctx.session_id;
-        let iteration = ctx.iteration;
-        let task_start = ctx.task_start;
-        let learning_ctx = &mut *ctx.learning_ctx;
-        let task_tokens_used = ctx.task_tokens_used;
-        let _user_text = ctx.user_text;
-        let restrict_to_personal_memory_tools = ctx.restrict_to_personal_memory_tools;
-        let active_skill_names = ctx.active_skill_names;
-        let active_untrusted_external_reference_skills =
-            ctx.active_untrusted_external_reference_skills;
-        let restrict_untrusted_external_reference_tools =
-            ctx.restrict_untrusted_external_reference_tools;
-        let is_reaffirmation_challenge_turn = ctx.is_reaffirmation_challenge_turn;
-        let personal_memory_tool_call_cap = ctx.personal_memory_tool_call_cap;
-        let base_tool_defs = ctx.base_tool_defs;
-        let available_capabilities = ctx.available_capabilities;
-        let policy_bundle = ctx.policy_bundle;
-        let status_tx = ctx.status_tx.clone();
-        let channel_ctx = ctx.channel_ctx;
-        let user_role = ctx.user_role;
-        let heartbeat = ctx.heartbeat;
-        let turn_context = ctx.turn_context;
-        let resolved_goal_id = ctx.resolved_goal_id;
-        let evidence_state = &mut *ctx.evidence_state;
-        let validation_state = &mut *ctx.validation_state;
+pub(in crate::agent) async fn run_tool_execution_phase(
+    services: &crate::agent::services::AgentServices<'_>,
+    ctx: &mut ToolExecutionCtx<'_>,
+) -> anyhow::Result<ToolExecutionOutcome> {
+    let agent = services.agent;
+    let resp = ctx.resp;
+    let emitter = ctx.emitter;
+    let task_id = ctx.task_id;
+    let session_id = ctx.session_id;
+    let iteration = ctx.iteration;
+    let task_start = ctx.task_start;
+    let learning_ctx = &mut *ctx.learning_ctx;
+    let task_tokens_used = ctx.task_tokens_used;
+    let _user_text = ctx.user_text;
+    let restrict_to_personal_memory_tools = ctx.restrict_to_personal_memory_tools;
+    let active_skill_names = ctx.active_skill_names;
+    let active_untrusted_external_reference_skills = ctx.active_untrusted_external_reference_skills;
+    let restrict_untrusted_external_reference_tools =
+        ctx.restrict_untrusted_external_reference_tools;
+    let is_reaffirmation_challenge_turn = ctx.is_reaffirmation_challenge_turn;
+    let personal_memory_tool_call_cap = ctx.personal_memory_tool_call_cap;
+    let base_tool_defs = ctx.base_tool_defs;
+    let available_capabilities = ctx.available_capabilities;
+    let policy_bundle = ctx.policy_bundle;
+    let status_tx = ctx.status_tx.clone();
+    let channel_ctx = ctx.channel_ctx;
+    let user_role = ctx.user_role;
+    let heartbeat = ctx.heartbeat;
+    let turn_context = ctx.turn_context;
+    let resolved_goal_id = ctx.resolved_goal_id;
+    let evidence_state = &mut *ctx.evidence_state;
+    let validation_state = &mut *ctx.validation_state;
 
-        let mut tool_defs = std::mem::take(ctx.tool_defs);
-        let mut total_tool_calls_attempted = *ctx.total_tool_calls_attempted;
-        let mut total_successful_tool_calls = *ctx.total_successful_tool_calls;
-        let mut tool_failure_count = std::mem::take(ctx.tool_failure_count);
-        let mut tool_failure_signatures = std::mem::take(ctx.tool_failure_signatures);
-        let mut tool_transient_failure_count = std::mem::take(ctx.tool_transient_failure_count);
-        let mut tool_cooldown_until_iteration = std::mem::take(ctx.tool_cooldown_until_iteration);
-        let mut tool_call_count = std::mem::take(ctx.tool_call_count);
-        let mut personal_memory_tool_calls = *ctx.personal_memory_tool_calls;
-        let mut no_evidence_result_streak = *ctx.no_evidence_result_streak;
-        let mut no_evidence_tools_seen = std::mem::take(ctx.no_evidence_tools_seen);
-        let mut evidence_gain_count = *ctx.evidence_gain_count;
-        let mut pending_error_solution_ids = std::mem::take(ctx.pending_error_solution_ids);
-        let mut tool_error_history = std::mem::take(ctx.tool_error_history);
-        let mut reflection_completed = std::mem::take(ctx.reflection_completed);
-        let mut pending_reflection_recoveries = std::mem::take(ctx.pending_reflection_recoveries);
-        let mut tool_failure_patterns = std::mem::take(ctx.tool_failure_patterns);
-        let mut last_tool_failure = std::mem::take(ctx.last_tool_failure);
-        let mut in_session_learned = std::mem::take(ctx.in_session_learned);
-        let mut unknown_tools = std::mem::take(ctx.unknown_tools);
-        let mut recent_tool_calls = std::mem::take(ctx.recent_tool_calls);
-        let mut consecutive_same_tool = std::mem::take(ctx.consecutive_same_tool);
-        let mut consecutive_same_tool_arg_hashes =
-            std::mem::take(ctx.consecutive_same_tool_arg_hashes);
-        let mut force_text_response = *ctx.force_text_response;
-        let mut pending_system_messages = std::mem::take(ctx.pending_system_messages);
-        let mut recent_tool_names = std::mem::take(ctx.recent_tool_names);
-        let mut successful_send_file_keys = std::mem::take(ctx.successful_send_file_keys);
-        let mut cli_agent_boundary_injected = *ctx.cli_agent_boundary_injected;
-        let mut pending_background_ack = std::mem::take(ctx.pending_background_ack);
-        let mut pending_external_action_ack: Option<String> = None;
-        let mut stall_count = *ctx.stall_count;
-        let mut deferred_no_tool_streak = *ctx.deferred_no_tool_streak;
-        let mut consecutive_clean_iterations = *ctx.consecutive_clean_iterations;
-        let mut fallback_expanded_once = *ctx.fallback_expanded_once;
-        let mut known_project_dir = std::mem::take(ctx.known_project_dir);
-        let mut dirs_with_project_inspect_file_evidence =
-            std::mem::take(ctx.dirs_with_project_inspect_file_evidence);
-        let mut dirs_with_search_no_matches = std::mem::take(ctx.dirs_with_search_no_matches);
-        let mut require_file_recheck_before_answer = *ctx.require_file_recheck_before_answer;
-        let mut completion_progress = ctx.completion_progress.clone();
-        let mut tool_result_cache = std::mem::take(ctx.tool_result_cache);
-        let execution_state = &mut *ctx.execution_state;
+    let mut tool_defs = std::mem::take(ctx.tool_defs);
+    let mut total_tool_calls_attempted = *ctx.total_tool_calls_attempted;
+    let mut total_successful_tool_calls = *ctx.total_successful_tool_calls;
+    let mut tool_failure_count = std::mem::take(ctx.tool_failure_count);
+    let mut tool_failure_signatures = std::mem::take(ctx.tool_failure_signatures);
+    let mut tool_transient_failure_count = std::mem::take(ctx.tool_transient_failure_count);
+    let mut tool_cooldown_until_iteration = std::mem::take(ctx.tool_cooldown_until_iteration);
+    let mut tool_call_count = std::mem::take(ctx.tool_call_count);
+    let mut personal_memory_tool_calls = *ctx.personal_memory_tool_calls;
+    let mut no_evidence_result_streak = *ctx.no_evidence_result_streak;
+    let mut no_evidence_tools_seen = std::mem::take(ctx.no_evidence_tools_seen);
+    let mut evidence_gain_count = *ctx.evidence_gain_count;
+    let mut pending_error_solution_ids = std::mem::take(ctx.pending_error_solution_ids);
+    let mut tool_error_history = std::mem::take(ctx.tool_error_history);
+    let mut reflection_completed = std::mem::take(ctx.reflection_completed);
+    let mut pending_reflection_recoveries = std::mem::take(ctx.pending_reflection_recoveries);
+    let mut tool_failure_patterns = std::mem::take(ctx.tool_failure_patterns);
+    let mut last_tool_failure = std::mem::take(ctx.last_tool_failure);
+    let mut in_session_learned = std::mem::take(ctx.in_session_learned);
+    let mut unknown_tools = std::mem::take(ctx.unknown_tools);
+    let mut recent_tool_calls = std::mem::take(ctx.recent_tool_calls);
+    let mut consecutive_same_tool = std::mem::take(ctx.consecutive_same_tool);
+    let mut consecutive_same_tool_arg_hashes = std::mem::take(ctx.consecutive_same_tool_arg_hashes);
+    let mut force_text_response = *ctx.force_text_response;
+    let mut pending_system_messages = std::mem::take(ctx.pending_system_messages);
+    let mut recent_tool_names = std::mem::take(ctx.recent_tool_names);
+    let mut successful_send_file_keys = std::mem::take(ctx.successful_send_file_keys);
+    let mut cli_agent_boundary_injected = *ctx.cli_agent_boundary_injected;
+    let mut pending_background_ack = std::mem::take(ctx.pending_background_ack);
+    let mut pending_external_action_ack: Option<String> = None;
+    let mut stall_count = *ctx.stall_count;
+    let mut deferred_no_tool_streak = *ctx.deferred_no_tool_streak;
+    let mut consecutive_clean_iterations = *ctx.consecutive_clean_iterations;
+    let mut fallback_expanded_once = *ctx.fallback_expanded_once;
+    let mut known_project_dir = std::mem::take(ctx.known_project_dir);
+    let mut dirs_with_project_inspect_file_evidence =
+        std::mem::take(ctx.dirs_with_project_inspect_file_evidence);
+    let mut dirs_with_search_no_matches = std::mem::take(ctx.dirs_with_search_no_matches);
+    let mut require_file_recheck_before_answer = *ctx.require_file_recheck_before_answer;
+    let mut completion_progress = ctx.completion_progress.clone();
+    let mut tool_result_cache = std::mem::take(ctx.tool_result_cache);
+    let execution_state = &mut *ctx.execution_state;
 
-        macro_rules! commit_state {
-            () => {
-                *ctx.tool_defs = tool_defs;
-                *ctx.total_tool_calls_attempted = total_tool_calls_attempted;
-                *ctx.total_successful_tool_calls = total_successful_tool_calls;
-                *ctx.tool_failure_count = tool_failure_count;
-                *ctx.tool_failure_signatures = tool_failure_signatures;
-                *ctx.tool_transient_failure_count = tool_transient_failure_count;
-                *ctx.tool_cooldown_until_iteration = tool_cooldown_until_iteration;
-                *ctx.tool_call_count = tool_call_count;
-                *ctx.personal_memory_tool_calls = personal_memory_tool_calls;
-                *ctx.no_evidence_result_streak = no_evidence_result_streak;
-                *ctx.no_evidence_tools_seen = no_evidence_tools_seen;
-                *ctx.evidence_gain_count = evidence_gain_count;
-                *ctx.pending_error_solution_ids = pending_error_solution_ids;
-                *ctx.tool_error_history = tool_error_history;
-                *ctx.reflection_completed = reflection_completed;
-                *ctx.pending_reflection_recoveries = pending_reflection_recoveries;
-                *ctx.tool_failure_patterns = tool_failure_patterns;
-                *ctx.last_tool_failure = last_tool_failure;
-                *ctx.in_session_learned = in_session_learned;
-                *ctx.unknown_tools = unknown_tools;
-                *ctx.recent_tool_calls = recent_tool_calls;
-                *ctx.consecutive_same_tool = consecutive_same_tool;
-                *ctx.consecutive_same_tool_arg_hashes = consecutive_same_tool_arg_hashes;
-                *ctx.force_text_response = force_text_response;
-                *ctx.pending_system_messages = pending_system_messages;
-                *ctx.recent_tool_names = recent_tool_names;
-                *ctx.successful_send_file_keys = successful_send_file_keys;
-                *ctx.cli_agent_boundary_injected = cli_agent_boundary_injected;
-                *ctx.pending_background_ack = pending_background_ack;
-                *ctx.pending_external_action_ack = pending_external_action_ack;
-                *ctx.stall_count = stall_count;
-                *ctx.deferred_no_tool_streak = deferred_no_tool_streak;
-                *ctx.consecutive_clean_iterations = consecutive_clean_iterations;
-                *ctx.fallback_expanded_once = fallback_expanded_once;
-                *ctx.known_project_dir = known_project_dir;
-                *ctx.dirs_with_project_inspect_file_evidence =
-                    dirs_with_project_inspect_file_evidence;
-                *ctx.dirs_with_search_no_matches = dirs_with_search_no_matches;
-                *ctx.require_file_recheck_before_answer = require_file_recheck_before_answer;
-                *ctx.completion_progress = completion_progress.clone();
-                *ctx.tool_result_cache = tool_result_cache;
-            };
-        }
+    macro_rules! commit_state {
+        () => {
+            *ctx.tool_defs = tool_defs;
+            *ctx.total_tool_calls_attempted = total_tool_calls_attempted;
+            *ctx.total_successful_tool_calls = total_successful_tool_calls;
+            *ctx.tool_failure_count = tool_failure_count;
+            *ctx.tool_failure_signatures = tool_failure_signatures;
+            *ctx.tool_transient_failure_count = tool_transient_failure_count;
+            *ctx.tool_cooldown_until_iteration = tool_cooldown_until_iteration;
+            *ctx.tool_call_count = tool_call_count;
+            *ctx.personal_memory_tool_calls = personal_memory_tool_calls;
+            *ctx.no_evidence_result_streak = no_evidence_result_streak;
+            *ctx.no_evidence_tools_seen = no_evidence_tools_seen;
+            *ctx.evidence_gain_count = evidence_gain_count;
+            *ctx.pending_error_solution_ids = pending_error_solution_ids;
+            *ctx.tool_error_history = tool_error_history;
+            *ctx.reflection_completed = reflection_completed;
+            *ctx.pending_reflection_recoveries = pending_reflection_recoveries;
+            *ctx.tool_failure_patterns = tool_failure_patterns;
+            *ctx.last_tool_failure = last_tool_failure;
+            *ctx.in_session_learned = in_session_learned;
+            *ctx.unknown_tools = unknown_tools;
+            *ctx.recent_tool_calls = recent_tool_calls;
+            *ctx.consecutive_same_tool = consecutive_same_tool;
+            *ctx.consecutive_same_tool_arg_hashes = consecutive_same_tool_arg_hashes;
+            *ctx.force_text_response = force_text_response;
+            *ctx.pending_system_messages = pending_system_messages;
+            *ctx.recent_tool_names = recent_tool_names;
+            *ctx.successful_send_file_keys = successful_send_file_keys;
+            *ctx.cli_agent_boundary_injected = cli_agent_boundary_injected;
+            *ctx.pending_background_ack = pending_background_ack;
+            *ctx.pending_external_action_ack = pending_external_action_ack;
+            *ctx.stall_count = stall_count;
+            *ctx.deferred_no_tool_streak = deferred_no_tool_streak;
+            *ctx.consecutive_clean_iterations = consecutive_clean_iterations;
+            *ctx.fallback_expanded_once = fallback_expanded_once;
+            *ctx.known_project_dir = known_project_dir;
+            *ctx.dirs_with_project_inspect_file_evidence = dirs_with_project_inspect_file_evidence;
+            *ctx.dirs_with_search_no_matches = dirs_with_search_no_matches;
+            *ctx.require_file_recheck_before_answer = require_file_recheck_before_answer;
+            *ctx.completion_progress = completion_progress.clone();
+            *ctx.tool_result_cache = tool_result_cache;
+        };
+    }
 
-        if known_project_dir.is_none() {
-            known_project_dir =
-                extract_project_dir_hint_with_aliases(_user_text, &self.path_aliases.projects);
-        }
+    if known_project_dir.is_none() {
+        known_project_dir =
+            extract_project_dir_hint_with_aliases(_user_text, &agent.path_aliases.projects);
+    }
 
-        let mut successful_tool_calls = 0;
-        let mut iteration_had_tool_failures = false;
-        let mut hard_block_streak: usize = 0;
-        let active_dialogue_scope = self
-            .state
-            .get_dialogue_state(session_id)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|state| {
-                state
-                    .open_request
-                    .and_then(|request| request.semantic_scope)
-            });
-        info!(
-            session_id,
-            iteration,
-            tool_count = resp.tool_calls.len(),
-            total_successful_tool_calls,
-            "Tool execution phase starting"
-        );
-        super::result_learning::expire_stale_pending_reflection_recoveries(
-            &mut pending_reflection_recoveries,
-            iteration,
-        );
-        for tc in &resp.tool_calls {
-            if let Some(limit) =
-                execution_state.exhausted_limit(task_tokens_used, task_start.elapsed())
-            {
-                force_text_response = true;
-                self.emit_warning_decision_point(
+    let mut successful_tool_calls = 0;
+    let mut iteration_had_tool_failures = false;
+    let mut hard_block_streak: usize = 0;
+    let active_dialogue_scope = agent
+        .state
+        .get_dialogue_state(session_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|state| {
+            state
+                .open_request
+                .and_then(|request| request.semantic_scope)
+        });
+    info!(
+        session_id,
+        iteration,
+        tool_count = resp.tool_calls.len(),
+        total_successful_tool_calls,
+        "Tool execution phase starting"
+    );
+    super::result_learning::expire_stale_pending_reflection_recoveries(
+        &mut pending_reflection_recoveries,
+        iteration,
+    );
+    for tc in &resp.tool_calls {
+        if let Some(limit) = execution_state.exhausted_limit(task_tokens_used, task_start.elapsed())
+        {
+            force_text_response = true;
+            agent
+                .emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -796,19 +793,17 @@ impl Agent {
                     }),
                 )
                 .await;
-                break;
-            }
-            let policy_tool_budget = policy_bundle.policy.tool_budget;
-            if self.policy_config.policy_enforce
-                && is_hard_policy_tool_budget_reached(
-                    total_tool_calls_attempted,
-                    policy_tool_budget,
-                )
-            {
-                force_text_response = true;
-                pending_system_messages
-                    .push(SystemDirective::HardPolicyToolBudgetReached { policy_tool_budget });
-                self.emit_decision_point(
+            break;
+        }
+        let policy_tool_budget = policy_bundle.policy.tool_budget;
+        if agent.policy_config.policy_enforce
+            && is_hard_policy_tool_budget_reached(total_tool_calls_attempted, policy_tool_budget)
+        {
+            force_text_response = true;
+            pending_system_messages
+                .push(SystemDirective::HardPolicyToolBudgetReached { policy_tool_budget });
+            agent
+                .emit_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -825,8 +820,46 @@ impl Agent {
                     }),
                 )
                 .await;
-                let result_text = ToolResultNotice::HardPolicyToolBudgetBlocked {
-                    policy_tool_budget,
+            let result_text = ToolResultNotice::HardPolicyToolBudgetBlocked {
+                policy_tool_budget,
+                tool_name: tc.name.clone(),
+            }
+            .render();
+            let tool_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "tool".to_string(),
+                content: Some(result_text),
+                tool_call_id: Some(tc.id.clone()),
+                tool_name: Some(tc.name.clone()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.2,
+                ..Message::runtime_defaults()
+            };
+            agent
+                .append_tool_message_with_result_event(
+                    emitter,
+                    &tool_msg,
+                    true,
+                    0,
+                    None,
+                    Some(task_id),
+                )
+                .await?;
+            continue;
+        }
+        total_tool_calls_attempted = total_tool_calls_attempted.saturating_add(1);
+        let send_file_key = if tc.name == "send_file" {
+            extract_send_file_dedupe_key_from_args(&tc.arguments)
+        } else {
+            None
+        };
+        let is_personal_memory_tool_call = is_personal_memory_tool(&tc.name);
+
+        if restrict_to_personal_memory_tools {
+            if !is_personal_memory_tool_call {
+                let result_text = ToolResultNotice::PersonalMemoryToolsOnly {
                     tool_name: tc.name.clone(),
                 }
                 .render();
@@ -839,99 +872,28 @@ impl Agent {
                     tool_name: Some(tc.name.clone()),
                     tool_calls_json: None,
                     created_at: Utc::now(),
-                    importance: 0.2,
+                    importance: 0.1,
                     ..Message::runtime_defaults()
                 };
-                self.append_tool_message_with_result_event(
-                    emitter,
-                    &tool_msg,
-                    true,
-                    0,
-                    None,
-                    Some(task_id),
-                )
-                .await?;
+                agent
+                    .append_tool_message_with_result_event(
+                        emitter,
+                        &tool_msg,
+                        true,
+                        0,
+                        None,
+                        Some(task_id),
+                    )
+                    .await?;
                 continue;
             }
-            total_tool_calls_attempted = total_tool_calls_attempted.saturating_add(1);
-            let send_file_key = if tc.name == "send_file" {
-                extract_send_file_dedupe_key_from_args(&tc.arguments)
-            } else {
-                None
-            };
-            let is_personal_memory_tool_call = is_personal_memory_tool(&tc.name);
 
-            if restrict_to_personal_memory_tools {
-                if !is_personal_memory_tool_call {
-                    let result_text = ToolResultNotice::PersonalMemoryToolsOnly {
-                        tool_name: tc.name.clone(),
-                    }
-                    .render();
-                    let tool_msg = Message {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: session_id.to_string(),
-                        role: "tool".to_string(),
-                        content: Some(result_text),
-                        tool_call_id: Some(tc.id.clone()),
-                        tool_name: Some(tc.name.clone()),
-                        tool_calls_json: None,
-                        created_at: Utc::now(),
-                        importance: 0.1,
-                        ..Message::runtime_defaults()
-                    };
-                    self.append_tool_message_with_result_event(
-                        emitter,
-                        &tool_msg,
-                        true,
-                        0,
-                        None,
-                        Some(task_id),
-                    )
-                    .await?;
-                    continue;
-                }
-
-                if personal_memory_tool_calls >= personal_memory_tool_call_cap {
-                    force_text_response = true;
-                    pending_system_messages
-                        .push(SystemDirective::PersonalMemoryRecheckLimitReached);
-                    let result_text =
+            if personal_memory_tool_calls >= personal_memory_tool_call_cap {
+                force_text_response = true;
+                pending_system_messages.push(SystemDirective::PersonalMemoryRecheckLimitReached);
+                let result_text =
                             "Targeted personal-memory re-check limit reached. No further tool calls are allowed for this question."
                                 .to_string();
-                    let tool_msg = Message {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: session_id.to_string(),
-                        role: "tool".to_string(),
-                        content: Some(result_text),
-                        tool_call_id: Some(tc.id.clone()),
-                        tool_name: Some(tc.name.clone()),
-                        tool_calls_json: None,
-                        created_at: Utc::now(),
-                        importance: 0.2,
-                        ..Message::runtime_defaults()
-                    };
-                    self.append_tool_message_with_result_event(
-                        emitter,
-                        &tool_msg,
-                        true,
-                        0,
-                        None,
-                        Some(task_id),
-                    )
-                    .await?;
-                    continue;
-                }
-
-                personal_memory_tool_calls = personal_memory_tool_calls.saturating_add(1);
-            }
-
-            if restrict_untrusted_external_reference_tools
-                && crate::agent::is_untrusted_external_reference_blocked_tool(&tc.name)
-            {
-                let result_text = blocked_for_untrusted_external_reference_message(
-                    &tc.name,
-                    active_untrusted_external_reference_skills,
-                );
                 let tool_msg = Message {
                     id: Uuid::new_v4().to_string(),
                     session_id: session_id.to_string(),
@@ -941,10 +903,46 @@ impl Agent {
                     tool_name: Some(tc.name.clone()),
                     tool_calls_json: None,
                     created_at: Utc::now(),
-                    importance: 0.15,
+                    importance: 0.2,
                     ..Message::runtime_defaults()
                 };
-                self.append_tool_message_with_result_event(
+                agent
+                    .append_tool_message_with_result_event(
+                        emitter,
+                        &tool_msg,
+                        true,
+                        0,
+                        None,
+                        Some(task_id),
+                    )
+                    .await?;
+                continue;
+            }
+
+            personal_memory_tool_calls = personal_memory_tool_calls.saturating_add(1);
+        }
+
+        if restrict_untrusted_external_reference_tools
+            && crate::agent::is_untrusted_external_reference_blocked_tool(&tc.name)
+        {
+            let result_text = blocked_for_untrusted_external_reference_message(
+                &tc.name,
+                active_untrusted_external_reference_skills,
+            );
+            let tool_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "tool".to_string(),
+                content: Some(result_text),
+                tool_call_id: Some(tc.id.clone()),
+                tool_name: Some(tc.name.clone()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.15,
+                ..Message::runtime_defaults()
+            };
+            agent
+                .append_tool_message_with_result_event(
                     emitter,
                     &tool_msg,
                     true,
@@ -953,16 +951,17 @@ impl Agent {
                     Some(task_id),
                 )
                 .await?;
-                iteration_had_tool_failures = true;
-                continue;
-            }
+            iteration_had_tool_failures = true;
+            continue;
+        }
 
-            let tool_is_known_but_hidden = !tool_is_currently_exposed(&tool_defs, &tc.name)
-                && (tool_is_currently_exposed(base_tool_defs, &tc.name)
-                    || self.has_registered_tool(&tc.name));
-            if tool_is_known_but_hidden {
-                *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
-                self.emit_decision_point(
+        let tool_is_known_but_hidden = !tool_is_currently_exposed(&tool_defs, &tc.name)
+            && (tool_is_currently_exposed(base_tool_defs, &tc.name)
+                || agent.has_registered_tool(&tc.name));
+        if tool_is_known_but_hidden {
+            *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+            agent
+                .emit_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -977,23 +976,24 @@ impl Agent {
                     }),
                 )
                 .await;
-                let result_text = ToolResultNotice::ToolNotCurrentlyExposed {
-                    tool_name: tc.name.clone(),
-                }
-                .render();
-                let tool_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "tool".to_string(),
-                    content: Some(result_text),
-                    tool_call_id: Some(tc.id.clone()),
-                    tool_name: Some(tc.name.clone()),
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.15,
-                    ..Message::runtime_defaults()
-                };
-                self.append_tool_message_with_result_event(
+            let result_text = ToolResultNotice::ToolNotCurrentlyExposed {
+                tool_name: tc.name.clone(),
+            }
+            .render();
+            let tool_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "tool".to_string(),
+                content: Some(result_text),
+                tool_call_id: Some(tc.id.clone()),
+                tool_name: Some(tc.name.clone()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.15,
+                ..Message::runtime_defaults()
+            };
+            agent
+                .append_tool_message_with_result_event(
                     emitter,
                     &tool_msg,
                     true,
@@ -1002,44 +1002,45 @@ impl Agent {
                     Some(task_id),
                 )
                 .await?;
-                iteration_had_tool_failures = true;
-                continue;
-            }
+            iteration_had_tool_failures = true;
+            continue;
+        }
 
-            let tool_semantic_scope = self
-                .tools
-                .iter()
-                .find(|tool| tool.name() == tc.name && tool.is_available())
-                .and_then(|tool| {
-                    tool.semantic_affordances()
-                        .map(|affordances| affordances.scope)
-                })
-                .or_else(|| fallback_tool_semantic_scope(&tc.name));
-            if semantic_scope_blocks_tool(active_dialogue_scope, tool_semantic_scope) {
-                *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
-                let active_scope = active_dialogue_scope
-                    .map(|scope| format!("{scope:?}"))
-                    .unwrap_or_else(|| "unknown".to_string());
-                let tool_scope = tool_semantic_scope
-                    .map(|scope| format!("{scope:?}"))
-                    .unwrap_or_else(|| "unknown".to_string());
-                let result_text = format!(
+        let tool_semantic_scope = agent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == tc.name && tool.is_available())
+            .and_then(|tool| {
+                tool.semantic_affordances()
+                    .map(|affordances| affordances.scope)
+            })
+            .or_else(|| fallback_tool_semantic_scope(&tc.name));
+        if semantic_scope_blocks_tool(active_dialogue_scope, tool_semantic_scope) {
+            *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+            let active_scope = active_dialogue_scope
+                .map(|scope| format!("{scope:?}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            let tool_scope = tool_semantic_scope
+                .map(|scope| format!("{scope:?}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            let result_text = format!(
                     "[SYSTEM] Semantic scope blocked `{}`: active request scope is {}, but the tool scope is {}. Continue with tools that match the active request.",
                     tc.name, active_scope, tool_scope
                 );
-                let tool_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "tool".to_string(),
-                    content: Some(result_text.clone()),
-                    tool_call_id: Some(tc.id.clone()),
-                    tool_name: Some(tc.name.clone()),
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.2,
-                    ..Message::runtime_defaults()
-                };
-                self.append_tool_message_with_result_event(
+            let tool_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "tool".to_string(),
+                content: Some(result_text.clone()),
+                tool_call_id: Some(tc.id.clone()),
+                tool_name: Some(tc.name.clone()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.2,
+                ..Message::runtime_defaults()
+            };
+            agent
+                .append_tool_message_with_result_event(
                     emitter,
                     &tool_msg,
                     true,
@@ -1048,7 +1049,8 @@ impl Agent {
                     Some(task_id),
                 )
                 .await?;
-                self.emit_warning_decision_point(
+            agent
+                .emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -1065,81 +1067,82 @@ impl Agent {
                     }),
                 )
                 .await;
-                iteration_had_tool_failures = true;
-                continue;
-            }
+            iteration_had_tool_failures = true;
+            continue;
+        }
 
-            let mut effective_arguments = tc.arguments.clone();
-            let mut injected_project_dir: Option<String> = None;
-            if let Some(explicit_dir) = project_dir_from_tool_args(&tc.name, &effective_arguments) {
-                known_project_dir = Some(explicit_dir);
-            }
-            if let Some((updated_args, injected)) = maybe_inject_project_dir_into_tool_args(
-                &tc.name,
-                &effective_arguments,
-                known_project_dir.as_deref(),
-            ) {
-                effective_arguments = updated_args;
-                injected_project_dir = Some(injected);
-                // Do NOT update known_project_dir from the injection result.
-                // resolve_injected_working_dir may fall back to a parent directory
-                // when the target doesn't exist yet (new project creation), which
-                // downgrades known_project_dir from the correct target (e.g.
-                // ai-news-hub-2026) to the parent (e.g. ~/projects).  Subsequent
-                // tool calls then latch onto an unrelated existing project inside
-                // that parent.  known_project_dir should only be updated from the
-                // model's explicit tool arguments (line 894) or from tool result
-                // learning (project_inspect / search_files).
-            }
-            let attempted_required_file_recheck = require_file_recheck_before_answer
-                && is_file_recheck_tool(&tc.name)
-                && tool_call_includes_project_path(&tc.name, &effective_arguments);
+        let mut effective_arguments = tc.arguments.clone();
+        let mut injected_project_dir: Option<String> = None;
+        if let Some(explicit_dir) = project_dir_from_tool_args(&tc.name, &effective_arguments) {
+            known_project_dir = Some(explicit_dir);
+        }
+        if let Some((updated_args, injected)) = maybe_inject_project_dir_into_tool_args(
+            &tc.name,
+            &effective_arguments,
+            known_project_dir.as_deref(),
+        ) {
+            effective_arguments = updated_args;
+            injected_project_dir = Some(injected);
+            // Do NOT update known_project_dir from the injection result.
+            // resolve_injected_working_dir may fall back to a parent directory
+            // when the target doesn't exist yet (new project creation), which
+            // downgrades known_project_dir from the correct target (e.g.
+            // ai-news-hub-2026) to the parent (e.g. ~/projects).  Subsequent
+            // tool calls then latch onto an unrelated existing project inside
+            // that parent.  known_project_dir should only be updated from the
+            // model's explicit tool arguments (line 894) or from tool result
+            // learning (project_inspect / search_files).
+        }
+        let attempted_required_file_recheck = require_file_recheck_before_answer
+            && is_file_recheck_tool(&tc.name)
+            && tool_call_includes_project_path(&tc.name, &effective_arguments);
 
-            let internal_scope_violation =
-                raw_internal_scope_violation(&tc.arguments, session_id, resolved_goal_id);
-            // Scope-lock enforcement: only use `primary_project_scope` which is
-            // extracted from the user's explicit text (via resolve_turn_context).
-            // Do NOT fall back to `known_project_dir` — it is inferred from
-            // tool call results and can lock to the wrong project if the LLM's
-            // first tool call targets an incorrect directory (e.g. history
-            // context pollution causing a cd into an unrelated project).
-            // `known_project_dir` is still used for directory injection into
-            // tool arguments (see maybe_inject_project_dir_into_tool_args).
-            let allowed_project_scope = (!turn_context.allow_multi_project_scope)
-                .then_some(turn_context.primary_project_scope.as_deref())
-                .flatten();
-            let call_semantics = self
-                .tools
-                .iter()
-                .find(|tool| tool.name() == tc.name && tool.is_available())
-                .map(|tool| tool.call_semantics(&effective_arguments))
-                .unwrap_or_default();
-            let tool_caps = available_capabilities
-                .get(&tc.name)
-                .copied()
-                .unwrap_or_default();
-            let step_plan = compile_step_execution_plan(
-                &execution_state.execution_id,
-                execution_state.current_plan_version.unwrap_or(1),
-                iteration,
-                &tc.id,
-                &tc.name,
-                &effective_arguments,
-                &call_semantics,
-                tool_caps,
-                allowed_project_scope,
-            );
-            execution_state.begin_step(step_plan.clone());
-            if matches!(
-                step_plan.approval_requirement,
-                ApprovalRequirement::Required { .. }
-            ) || call_semantics.mutates_state()
-                || tool_caps.external_side_effect
-            {
-                execution_state.promote_persistence(ExecutionPersistence::Durable);
-            }
-            execution_state.mark_persisted_now();
-            self.emit_decision_point(
+        let internal_scope_violation =
+            raw_internal_scope_violation(&tc.arguments, session_id, resolved_goal_id);
+        // Scope-lock enforcement: only use `primary_project_scope` which is
+        // extracted from the user's explicit text (via resolve_turn_context).
+        // Do NOT fall back to `known_project_dir` — it is inferred from
+        // tool call results and can lock to the wrong project if the LLM's
+        // first tool call targets an incorrect directory (e.g. history
+        // context pollution causing a cd into an unrelated project).
+        // `known_project_dir` is still used for directory injection into
+        // tool arguments (see maybe_inject_project_dir_into_tool_args).
+        let allowed_project_scope = (!turn_context.allow_multi_project_scope)
+            .then_some(turn_context.primary_project_scope.as_deref())
+            .flatten();
+        let call_semantics = agent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == tc.name && tool.is_available())
+            .map(|tool| tool.call_semantics(&effective_arguments))
+            .unwrap_or_default();
+        let tool_caps = available_capabilities
+            .get(&tc.name)
+            .copied()
+            .unwrap_or_default();
+        let step_plan = compile_step_execution_plan(
+            &execution_state.execution_id,
+            execution_state.current_plan_version.unwrap_or(1),
+            iteration,
+            &tc.id,
+            &tc.name,
+            &effective_arguments,
+            &call_semantics,
+            tool_caps,
+            allowed_project_scope,
+        );
+        execution_state.begin_step(step_plan.clone());
+        if matches!(
+            step_plan.approval_requirement,
+            ApprovalRequirement::Required { .. }
+        ) || call_semantics.mutates_state()
+            || tool_caps.external_side_effect
+        {
+            execution_state.promote_persistence(ExecutionPersistence::Durable);
+        }
+        execution_state.mark_persisted_now();
+        agent
+            .emit_decision_point(
                 emitter,
                 task_id,
                 iteration,
@@ -1153,31 +1156,32 @@ impl Agent {
                 }),
             )
             .await;
-            let step_scope_violation =
-                target_scope_violation_for_tool_call(&tc.name, &effective_arguments, &step_plan);
-            if let Some(scope_reason) = internal_scope_violation.or(step_scope_violation) {
-                POLICY_METRICS
-                    .cross_scope_blocked_total
-                    .fetch_add(1, Ordering::Relaxed);
-                *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
-                let result_text = ToolResultNotice::ScopeLockBlockedResult {
-                    tool_name: tc.name.clone(),
-                    reason: scope_reason.clone(),
-                }
-                .render();
-                let tool_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "tool".to_string(),
-                    content: Some(result_text.clone()),
-                    tool_call_id: Some(tc.id.clone()),
-                    tool_name: Some(tc.name.clone()),
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.2,
-                    ..Message::runtime_defaults()
-                };
-                self.append_tool_message_with_result_event(
+        let step_scope_violation =
+            target_scope_violation_for_tool_call(&tc.name, &effective_arguments, &step_plan);
+        if let Some(scope_reason) = internal_scope_violation.or(step_scope_violation) {
+            POLICY_METRICS
+                .cross_scope_blocked_total
+                .fetch_add(1, Ordering::Relaxed);
+            *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+            let result_text = ToolResultNotice::ScopeLockBlockedResult {
+                tool_name: tc.name.clone(),
+                reason: scope_reason.clone(),
+            }
+            .render();
+            let tool_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "tool".to_string(),
+                content: Some(result_text.clone()),
+                tool_call_id: Some(tc.id.clone()),
+                tool_name: Some(tc.name.clone()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.2,
+                ..Message::runtime_defaults()
+            };
+            agent
+                .append_tool_message_with_result_event(
                     emitter,
                     &tool_msg,
                     true,
@@ -1186,31 +1190,32 @@ impl Agent {
                     Some(task_id),
                 )
                 .await?;
-                validation_state.record_failure(ValidationFailure::ScopeViolation);
-                validation_state.note_replan();
-                learning_ctx.record_replay_note(
-                    ReplayNoteCategory::ValidationFailure,
-                    "target_scope_violation",
-                    format!(
-                        "Blocked {} because the requested target fell outside the compiled step scope.",
-                        tc.name
-                    ),
-                    true,
-                );
-                learning_ctx.record_replay_note(
-                    ReplayNoteCategory::RetryReason,
-                    "replan_required",
-                    format!(
-                        "Replanned because {} attempted to act outside the allowed target scope.",
-                        tc.name
-                    ),
-                    true,
-                );
-                pending_system_messages.push(SystemDirective::ScopeLockBlocked {
-                    tool_name: tc.name.clone(),
-                    reason: scope_reason,
-                });
-                self.emit_warning_decision_point(
+            validation_state.record_failure(ValidationFailure::ScopeViolation);
+            validation_state.note_replan();
+            learning_ctx.record_replay_note(
+                ReplayNoteCategory::ValidationFailure,
+                "target_scope_violation",
+                format!(
+                    "Blocked {} because the requested target fell outside the compiled step scope.",
+                    tc.name
+                ),
+                true,
+            );
+            learning_ctx.record_replay_note(
+                ReplayNoteCategory::RetryReason,
+                "replan_required",
+                format!(
+                    "Replanned because {} attempted to act outside the allowed target scope.",
+                    tc.name
+                ),
+                true,
+            );
+            pending_system_messages.push(SystemDirective::ScopeLockBlocked {
+                tool_name: tc.name.clone(),
+                reason: scope_reason,
+            });
+            agent
+                .emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -1226,34 +1231,35 @@ impl Agent {
                     }),
                 )
                 .await;
-                execution_state.complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
-                execution_state.mark_persisted_now();
-                iteration_had_tool_failures = true;
-                continue;
-            }
+            execution_state.complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
+            execution_state.mark_persisted_now();
+            iteration_had_tool_failures = true;
+            continue;
+        }
 
-            if let Some(contract_violation) =
-                deterministic_tool_contract_violation(&tc.name, &effective_arguments)
-            {
-                *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
-                let result_text = ToolResultNotice::DeterministicArgumentContractBlocked {
-                    tool_name: tc.name.clone(),
-                    reason: contract_violation.reason.clone(),
-                }
-                .render();
-                let tool_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "tool".to_string(),
-                    content: Some(result_text.clone()),
-                    tool_call_id: Some(tc.id.clone()),
-                    tool_name: Some(tc.name.clone()),
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.2,
-                    ..Message::runtime_defaults()
-                };
-                self.append_tool_message_with_result_event(
+        if let Some(contract_violation) =
+            deterministic_tool_contract_violation(&tc.name, &effective_arguments)
+        {
+            *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+            let result_text = ToolResultNotice::DeterministicArgumentContractBlocked {
+                tool_name: tc.name.clone(),
+                reason: contract_violation.reason.clone(),
+            }
+            .render();
+            let tool_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "tool".to_string(),
+                content: Some(result_text.clone()),
+                tool_call_id: Some(tc.id.clone()),
+                tool_name: Some(tc.name.clone()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.2,
+                ..Message::runtime_defaults()
+            };
+            agent
+                .append_tool_message_with_result_event(
                     emitter,
                     &tool_msg,
                     true,
@@ -1262,30 +1268,31 @@ impl Agent {
                     Some(task_id),
                 )
                 .await?;
-                pending_system_messages.push(SystemDirective::ArgumentContractBlocked {
-                    tool_name: tc.name.clone(),
-                    reason: contract_violation.reason.to_string(),
-                    coaching: contract_violation.coaching.to_string(),
-                });
-                learning_ctx.record_replay_note(
-                    ReplayNoteCategory::ValidationFailure,
-                    "tool_contract_violation",
-                    format!(
-                        "Blocked {} because its arguments violated a deterministic contract: {}.",
-                        tc.name, contract_violation.reason
-                    ),
-                    true,
-                );
-                learning_ctx.record_replay_note(
-                    ReplayNoteCategory::RetryReason,
-                    "retry_step",
-                    format!(
-                        "Retried locally after deterministic contract failure on {}.",
-                        tc.name
-                    ),
-                    true,
-                );
-                self.emit_warning_decision_point(
+            pending_system_messages.push(SystemDirective::ArgumentContractBlocked {
+                tool_name: tc.name.clone(),
+                reason: contract_violation.reason.to_string(),
+                coaching: contract_violation.coaching.to_string(),
+            });
+            learning_ctx.record_replay_note(
+                ReplayNoteCategory::ValidationFailure,
+                "tool_contract_violation",
+                format!(
+                    "Blocked {} because its arguments violated a deterministic contract: {}.",
+                    tc.name, contract_violation.reason
+                ),
+                true,
+            );
+            learning_ctx.record_replay_note(
+                ReplayNoteCategory::RetryReason,
+                "retry_step",
+                format!(
+                    "Retried locally after deterministic contract failure on {}.",
+                    tc.name
+                ),
+                true,
+            );
+            agent
+                .emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -1301,393 +1308,389 @@ impl Agent {
                     }),
                 )
                 .await;
-                execution_state.complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
-                execution_state.mark_persisted_now();
-                iteration_had_tool_failures = true;
-                continue;
-            }
-            match self
-                .maybe_block_tool_by_budget(
-                    tc,
-                    &mut ToolBudgetBlockCtx {
-                        emitter,
-                        task_id,
-                        session_id,
-                        iteration,
-                        tool_failure_count: &tool_failure_count,
-                        tool_transient_failure_count: &tool_transient_failure_count,
-                        tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
-                        tool_call_count: &tool_call_count,
-                        unknown_tools: &unknown_tools,
-                    },
-                )
-                .await?
-            {
-                ToolBlockKind::NotBlocked => {}
-                ToolBlockKind::Cooldown => {
-                    // Cooldown blocks are temporary — the tool will be available
-                    // again in a few iterations. Do NOT set force_text_response;
-                    // let the agent try other tools or wait for cooldown to expire.
-                    continue;
-                }
-                ToolBlockKind::HardBlock => {
-                    // A specific tool hit its limit (semantic failures, call
-                    // count, etc.). Track consecutive hard-blocks so we can
-                    // distinguish "model hit web_search limit but should still
-                    // use write_file" from "model keeps retrying the same blocked
-                    // tool every iteration."
-                    hard_block_streak += 1;
-                    if hard_block_streak >= 3 {
-                        // Model is stuck retrying blocked tools — force text.
-                        force_text_response = true;
-                        pending_system_messages.push(SystemDirective::HardToolLimitReached);
-                    } else {
-                        // First/second block — tell the model this tool is done
-                        // but other tools are still available.
-                        pending_system_messages.push(SystemDirective::SpecificToolBlocked {
-                            tool_name: tc.name.clone(),
-                        });
-                    }
-                    continue;
-                }
-            }
-            // Budget/unknown-tool blocks are deterministic hard gates.
-            // They must run BEFORE loop-pattern guards so blocked calls
-            // do not inflate repetitive/same-tool counters and trigger
-            // false "agent is looping" failures.
-            if let Some(guard_outcome) = self
-                .maybe_handle_loop_pattern_guards(
-                    tc,
+            execution_state.complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
+            execution_state.mark_persisted_now();
+            iteration_had_tool_failures = true;
+            continue;
+        }
+        match agent
+            .maybe_block_tool_by_budget(
+                tc,
+                &mut ToolBudgetBlockCtx {
                     emitter,
                     task_id,
                     session_id,
                     iteration,
-                    task_start,
-                    task_tokens_used,
-                    learning_ctx,
-                    &mut recent_tool_calls,
-                    &mut recent_tool_names,
-                    &mut consecutive_same_tool,
-                    &mut consecutive_same_tool_arg_hashes,
-                    &tool_result_cache,
-                )
-                .await?
-            {
-                match guard_outcome {
-                    LoopPatternGuardOutcome::ContinueLoop => {
-                        continue;
-                    }
-                    LoopPatternGuardOutcome::Return(outcome) => {
-                        // Plan-aware stall override: when a plan exists and the
-                        // model is stuck exploring, don't kill the task. Instead,
-                        // force-advance the plan step. The next main loop
-                        // iteration will inject the updated plan with [DONE] on
-                        // the stalled step and [CURRENT] on the next step.
-                        if let Some(ref mut plan) = execution_state.active_linear_intent_plan {
-                            if !plan.all_steps_complete() {
-                                plan.complete_current_step_with_evidence(
-                                    "Force-advanced: stall detected".to_string(),
-                                );
-                                tracing::info!(
-                                    session_id,
-                                    advanced_step = plan.current_step_cursor - 1,
-                                    "Plan step force-advanced due to stall detection — \
-                                     returning to main loop for next iteration"
-                                );
-                                // Return NextIteration so the main loop runs the
-                                // re-planner and re-injects the updated plan.
-                                commit_state!();
-                                return Ok(ToolExecutionOutcome::NextIteration);
-                            }
-                        }
-                        commit_state!();
-                        return Ok(outcome);
-                    }
-                }
-            }
-            if self
-                .maybe_handle_duplicate_send_file_noop(
-                    tc,
-                    &mut DuplicateSendFileNoopCtx {
-                        send_file_key: send_file_key.as_ref(),
-                        successful_send_file_keys: &successful_send_file_keys,
-                        session_id,
-                        iteration,
-                        effective_arguments: &effective_arguments,
-                        force_text_response: &mut force_text_response,
-                        pending_system_messages: &mut pending_system_messages,
-                        successful_tool_calls: &mut successful_tool_calls,
-                        total_successful_tool_calls: &mut total_successful_tool_calls,
-                        tool_call_count: &mut tool_call_count,
-                        learning_ctx,
-                        emitter,
-                        task_id,
-                        policy_bundle,
-                    },
-                )
-                .await?
-            {
+                    tool_failure_count: &tool_failure_count,
+                    tool_transient_failure_count: &tool_transient_failure_count,
+                    tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
+                    tool_call_count: &tool_call_count,
+                    unknown_tools: &unknown_tools,
+                },
+            )
+            .await?
+        {
+            ToolBlockKind::NotBlocked => {}
+            ToolBlockKind::Cooldown => {
+                // Cooldown blocks are temporary — the tool will be available
+                // again in a few iterations. Do NOT set force_text_response;
+                // let the agent try other tools or wait for cooldown to expire.
                 continue;
             }
-
-            let io = self
-                .execute_tool_call_io(
-                    tc,
-                    &ToolExecutionIoCtx {
-                        effective_arguments: &effective_arguments,
-                        idempotency_key: execution_state
-                            .current_step
-                            .as_ref()
-                            .and_then(|step| step.idempotency_key.as_deref()),
-                        injected_project_dir: injected_project_dir.as_deref(),
-                        project_scope: allowed_project_scope,
-                        session_id,
-                        task_id,
-                        status_tx: &status_tx,
-                        channel_ctx,
-                        user_role,
-                        heartbeat,
-                        emitter,
-                        policy_bundle,
-                    },
-                )
-                .await;
-            execution_state.record_tool_call();
-            execution_state.mark_persisted_now();
-            let mut result_text = io.result_text;
-            let mut tool_duration_ms = io.tool_duration_ms;
-            let mut result_metadata = io.result_metadata;
-            if tc.name == "run_command" && run_command_policy_block_requires_terminal(&result_text)
-            {
-                if let Some(terminal_args) =
-                    build_terminal_fallback_arguments_from_run_command(&effective_arguments)
-                {
-                    let fallback_started = Instant::now();
-                    let terminal_result = self
-                        .execute_tool_with_watchdog_outcome(
-                            "terminal",
-                            &terminal_args,
-                            &tool_exec::ToolExecCtx {
+            ToolBlockKind::HardBlock => {
+                // A specific tool hit its limit (semantic failures, call
+                // count, etc.). Track consecutive hard-blocks so we can
+                // distinguish "model hit web_search limit but should still
+                // use write_file" from "model keeps retrying the same blocked
+                // tool every iteration."
+                hard_block_streak += 1;
+                if hard_block_streak >= 3 {
+                    // Model is stuck retrying blocked tools — force text.
+                    force_text_response = true;
+                    pending_system_messages.push(SystemDirective::HardToolLimitReached);
+                } else {
+                    // First/second block — tell the model this tool is done
+                    // but other tools are still available.
+                    pending_system_messages.push(SystemDirective::SpecificToolBlocked {
+                        tool_name: tc.name.clone(),
+                    });
+                }
+                continue;
+            }
+        }
+        // Budget/unknown-tool blocks are deterministic hard gates.
+        // They must run BEFORE loop-pattern guards so blocked calls
+        // do not inflate repetitive/same-tool counters and trigger
+        // false "agent is looping" failures.
+        if let Some(guard_outcome) = agent
+            .maybe_handle_loop_pattern_guards(
+                tc,
+                emitter,
+                task_id,
+                session_id,
+                iteration,
+                task_start,
+                task_tokens_used,
+                learning_ctx,
+                &mut recent_tool_calls,
+                &mut recent_tool_names,
+                &mut consecutive_same_tool,
+                &mut consecutive_same_tool_arg_hashes,
+                &tool_result_cache,
+            )
+            .await?
+        {
+            match guard_outcome {
+                LoopPatternGuardOutcome::ContinueLoop => {
+                    continue;
+                }
+                LoopPatternGuardOutcome::Return(outcome) => {
+                    // Plan-aware stall override: when a plan exists and the
+                    // model is stuck exploring, don't kill the task. Instead,
+                    // force-advance the plan step. The next main loop
+                    // iteration will inject the updated plan with [DONE] on
+                    // the stalled step and [CURRENT] on the next step.
+                    if let Some(ref mut plan) = execution_state.active_linear_intent_plan {
+                        if !plan.all_steps_complete() {
+                            plan.complete_current_step_with_evidence(
+                                "Force-advanced: stall detected".to_string(),
+                            );
+                            tracing::info!(
                                 session_id,
-                                task_id: Some(task_id),
-                                status_tx: status_tx.clone(),
-                                channel_visibility: channel_ctx.visibility,
-                                channel_id: channel_ctx.channel_id.as_deref(),
-                                project_scope: allowed_project_scope,
-                                trusted: channel_ctx.trusted,
-                                user_role,
-                            },
-                        )
-                        .await;
-                    let fallback_duration =
-                        fallback_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                    tool_duration_ms = tool_duration_ms.saturating_add(fallback_duration);
-                    let fallback_note = ToolResultNotice::RunCommandPolicyAutoRoutedToTerminal;
-                    result_text = match terminal_result {
-                        Ok(outcome) => {
-                            result_metadata = outcome.metadata;
-                            format!("{}\n\n{}", outcome.output, fallback_note.render())
+                                advanced_step = plan.current_step_cursor - 1,
+                                "Plan step force-advanced due to stall detection — \
+                                     returning to main loop for next iteration"
+                            );
+                            // Return NextIteration so the main loop runs the
+                            // re-planner and re-injects the updated plan.
+                            commit_state!();
+                            return Ok(ToolExecutionOutcome::NextIteration);
                         }
-                        Err(e) => {
-                            result_metadata.transport_error = Some(e.to_string());
-                            format!("Error: {}\n\n{}", e, fallback_note.render())
-                        }
-                    };
-                    if self.context_window_config.enabled {
-                        result_text = crate::memory::context_window::compress_tool_result(
-                            "terminal",
-                            &result_text,
-                            self.context_window_config.max_tool_result_chars,
-                        );
                     }
+                    commit_state!();
+                    return Ok(outcome);
                 }
             }
-            let background_detached =
-                tool_result_indicates_background_detach(&tc.name, &result_text, &result_metadata);
-
-            if background_detached {
-                pending_background_ack = Some(build_background_detach_ack(
-                    &tc.name,
-                    &result_text,
-                    &result_metadata,
-                ));
-                force_text_response = true;
-                let notifications_active = result_metadata.completion_notifications_enabled;
-                let system_msg = SystemDirective::BackgroundHandoff {
-                    notifications_active,
-                };
-                pending_system_messages.push(system_msg.clone());
-                result_text = format!("{}\n\n{}", result_text, system_msg.render());
-            }
-
-            // Track total calls per tool
-            *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
-
-            // Cache successful read_file/search_files results so the repetitive
-            // redirect can replay them instead of sending a generic "BLOCKED"
-            // message.  This solves the lost-context problem: when context
-            // truncation drops earlier read results, the model re-reads the same
-            // file, gets redirected, and receives the cached content + coaching
-            // to write fixes instead of reading again.
-            if matches!(tc.name.as_str(), "read_file" | "search_files") {
-                let cache_hash = hash_tool_call(&tc.name, &tc.arguments);
-                // Cap cached content at 8KB to avoid bloating the redirect msg
-                let max_cache_chars = 8000;
-                let primary_result_text =
-                    crate::traits::extract_primary_message_content(&result_text, &[]);
-                if primary_result_text.len() <= max_cache_chars
-                    && !result_text.starts_with("Error")
-                    && !crate::traits::message_content_is_structural_only(&result_text, &[])
-                {
-                    tool_result_cache.insert(cache_hash, primary_result_text.into_owned());
-                } else if primary_result_text.len() > max_cache_chars {
-                    // Store a truncated version rather than nothing
-                    let mut boundary = max_cache_chars;
-                    while boundary > 0 && !primary_result_text.is_char_boundary(boundary) {
-                        boundary -= 1;
-                    }
-                    tool_result_cache.insert(
-                        cache_hash,
-                        format!(
-                            "{}…\n[truncated — {} total chars]",
-                            &primary_result_text[..boundary],
-                            primary_result_text.len()
-                        ),
-                    );
-                }
-                // Bound the cache size to prevent unbounded growth
-                const MAX_CACHE_ENTRIES: usize = 20;
-                if tool_result_cache.len() > MAX_CACHE_ENTRIES {
-                    // Remove the oldest entry (arbitrary, but bounded)
-                    if let Some(key) = tool_result_cache.keys().next().copied() {
-                        tool_result_cache.remove(&key);
-                    }
-                }
-            }
-
-            // Track tool failures across iterations using structured detection
-            // (prefixes, JSON error payloads, HTTP statuses, non-zero exit codes).
-            let failure_class = classify_tool_result_failure_with_context(
-                &tc.name,
-                &result_text,
-                Some(&effective_arguments),
-                Some(&result_metadata),
-            );
-            let execution_failure_kind = classify_execution_failure_kind(
-                &tc.name,
-                &result_text,
-                Some(&effective_arguments),
-                Some(&result_metadata),
-                false,
-            );
-            let is_error = failure_class.is_some();
-
-            // Track tool call for learning — mark failures so activity summaries
-            // don't claim files were written when writes actually failed.
-            let tool_summary = format!(
-                "{}({})",
-                tc.name,
-                summarize_tool_args(&tc.name, &effective_arguments)
-            );
-            if is_error {
-                learning_ctx
-                    .tool_calls
-                    .push(format!("{} [FAILED]", tool_summary));
-            } else {
-                learning_ctx.tool_calls.push(tool_summary.clone());
-            }
-            execution_state.complete_current_step(classify_step_execution_outcome(
-                is_error,
-                background_detached,
-            ));
-            execution_state.mark_persisted_now();
-            match execution_failure_kind {
-                Some(ExecutionFailureKind::ToolContractFailure)
-                | Some(ExecutionFailureKind::ToolInvocationFailure) => {
-                    validation_state.note_retry(LoopRepetitionReason::RetryStep);
-                    learning_ctx.record_replay_note(
-                        ReplayNoteCategory::RetryReason,
-                        "retry_step",
-                        format!(
-                            "Retried {} locally after {:?}.",
-                            tc.name, execution_failure_kind
-                        ),
-                        true,
-                    );
-                }
-                Some(ExecutionFailureKind::EnvironmentFailure)
-                | Some(ExecutionFailureKind::LogicFailure) => {
-                    validation_state.note_replan();
-                    learning_ctx.record_replay_note(
-                        ReplayNoteCategory::RetryReason,
-                        "replan_required",
-                        format!(
-                            "Replanned after {:?} on {}.",
-                            execution_failure_kind, tc.name
-                        ),
-                        true,
-                    );
-                }
-                None => {
-                    validation_state.clear_loop_repetition_reason();
-                }
-            }
-
-            // Record structured outcome in the ledger
-            {
-                let caps = available_capabilities
-                    .get(&tc.name)
-                    .copied()
-                    .unwrap_or_default();
-                let is_external_mutation =
-                    caps.external_side_effect && result_metadata.semantics.mutates_state();
-                let error_summary = if is_error {
-                    extract_error_summary_line(&result_text)
-                } else {
-                    None
-                };
-                let planned_step = if is_external_mutation {
-                    execution_state
-                        .current_linear_intent_step()
-                        .filter(|step| {
-                            linear_intent_step_matches_tool_call(
-                                step,
-                                &tc.name,
-                                &effective_arguments,
-                            )
-                        })
-                        .cloned()
-                } else {
-                    None
-                };
-                let expected_step_count = execution_state
-                    .active_linear_intent_plan
-                    .as_ref()
-                    .map(|plan| plan.steps.len());
-                let plan_version = execution_state
-                    .active_linear_intent_plan
-                    .as_ref()
-                    .map(|plan| plan.plan_version);
-                execution_state.record_outcome(OutcomeEntry {
-                    tool_name: tc.name.clone(),
-                    success: !is_error,
-                    http_status: result_metadata.http_status,
-                    is_external_mutation,
-                    error_summary,
+        }
+        if agent
+            .maybe_handle_duplicate_send_file_noop(
+                tc,
+                &mut DuplicateSendFileNoopCtx {
+                    send_file_key: send_file_key.as_ref(),
+                    successful_send_file_keys: &successful_send_file_keys,
+                    session_id,
                     iteration,
-                    plan_version,
-                    planned_step_id: planned_step.as_ref().map(|s| s.step_id.clone()),
-                    planned_step_index: planned_step.as_ref().map(|s| s.step_index),
-                    planned_step_description: planned_step.as_ref().map(|s| s.description.clone()),
-                    expected_step_count,
-                });
-                // Advance linear intent step pointer on successful external mutation
-                if !is_error && planned_step.is_some() {
-                    execution_state.advance_linear_intent_step_after_external_success();
+                    effective_arguments: &effective_arguments,
+                    force_text_response: &mut force_text_response,
+                    pending_system_messages: &mut pending_system_messages,
+                    successful_tool_calls: &mut successful_tool_calls,
+                    total_successful_tool_calls: &mut total_successful_tool_calls,
+                    tool_call_count: &mut tool_call_count,
+                    learning_ctx,
+                    emitter,
+                    task_id,
+                    policy_bundle,
+                },
+            )
+            .await?
+        {
+            continue;
+        }
+
+        let io = agent
+            .execute_tool_call_io(
+                tc,
+                &ToolExecutionIoCtx {
+                    effective_arguments: &effective_arguments,
+                    idempotency_key: execution_state
+                        .current_step
+                        .as_ref()
+                        .and_then(|step| step.idempotency_key.as_deref()),
+                    injected_project_dir: injected_project_dir.as_deref(),
+                    project_scope: allowed_project_scope,
+                    session_id,
+                    task_id,
+                    status_tx: &status_tx,
+                    channel_ctx,
+                    user_role,
+                    heartbeat,
+                    emitter,
+                    policy_bundle,
+                },
+            )
+            .await;
+        execution_state.record_tool_call();
+        execution_state.mark_persisted_now();
+        let mut result_text = io.result_text;
+        let mut tool_duration_ms = io.tool_duration_ms;
+        let mut result_metadata = io.result_metadata;
+        if tc.name == "run_command" && run_command_policy_block_requires_terminal(&result_text) {
+            if let Some(terminal_args) =
+                build_terminal_fallback_arguments_from_run_command(&effective_arguments)
+            {
+                let fallback_started = Instant::now();
+                let terminal_result = agent
+                    .execute_tool_with_watchdog_outcome(
+                        "terminal",
+                        &terminal_args,
+                        &tool_exec::ToolExecCtx {
+                            session_id,
+                            task_id: Some(task_id),
+                            status_tx: status_tx.clone(),
+                            channel_visibility: channel_ctx.visibility,
+                            channel_id: channel_ctx.channel_id.as_deref(),
+                            project_scope: allowed_project_scope,
+                            trusted: channel_ctx.trusted,
+                            user_role,
+                        },
+                    )
+                    .await;
+                let fallback_duration =
+                    fallback_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                tool_duration_ms = tool_duration_ms.saturating_add(fallback_duration);
+                let fallback_note = ToolResultNotice::RunCommandPolicyAutoRoutedToTerminal;
+                result_text = match terminal_result {
+                    Ok(outcome) => {
+                        result_metadata = outcome.metadata;
+                        format!("{}\n\n{}", outcome.output, fallback_note.render())
+                    }
+                    Err(e) => {
+                        result_metadata.transport_error = Some(e.to_string());
+                        format!("Error: {}\n\n{}", e, fallback_note.render())
+                    }
+                };
+                if agent.context_window_config.enabled {
+                    result_text = crate::memory::context_window::compress_tool_result(
+                        "terminal",
+                        &result_text,
+                        agent.context_window_config.max_tool_result_chars,
+                    );
                 }
             }
+        }
+        let background_detached =
+            tool_result_indicates_background_detach(&tc.name, &result_text, &result_metadata);
 
-            self.emit_decision_point(
+        if background_detached {
+            pending_background_ack = Some(build_background_detach_ack(
+                &tc.name,
+                &result_text,
+                &result_metadata,
+            ));
+            force_text_response = true;
+            let notifications_active = result_metadata.completion_notifications_enabled;
+            let system_msg = SystemDirective::BackgroundHandoff {
+                notifications_active,
+            };
+            pending_system_messages.push(system_msg.clone());
+            result_text = format!("{}\n\n{}", result_text, system_msg.render());
+        }
+
+        // Track total calls per tool
+        *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+
+        // Cache successful read_file/search_files results so the repetitive
+        // redirect can replay them instead of sending a generic "BLOCKED"
+        // message.  This solves the lost-context problem: when context
+        // truncation drops earlier read results, the model re-reads the same
+        // file, gets redirected, and receives the cached content + coaching
+        // to write fixes instead of reading again.
+        if matches!(tc.name.as_str(), "read_file" | "search_files") {
+            let cache_hash = hash_tool_call(&tc.name, &tc.arguments);
+            // Cap cached content at 8KB to avoid bloating the redirect msg
+            let max_cache_chars = 8000;
+            let primary_result_text =
+                crate::traits::extract_primary_message_content(&result_text, &[]);
+            if primary_result_text.len() <= max_cache_chars
+                && !result_text.starts_with("Error")
+                && !crate::traits::message_content_is_structural_only(&result_text, &[])
+            {
+                tool_result_cache.insert(cache_hash, primary_result_text.into_owned());
+            } else if primary_result_text.len() > max_cache_chars {
+                // Store a truncated version rather than nothing
+                let mut boundary = max_cache_chars;
+                while boundary > 0 && !primary_result_text.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                tool_result_cache.insert(
+                    cache_hash,
+                    format!(
+                        "{}…\n[truncated — {} total chars]",
+                        &primary_result_text[..boundary],
+                        primary_result_text.len()
+                    ),
+                );
+            }
+            // Bound the cache size to prevent unbounded growth
+            const MAX_CACHE_ENTRIES: usize = 20;
+            if tool_result_cache.len() > MAX_CACHE_ENTRIES {
+                // Remove the oldest entry (arbitrary, but bounded)
+                if let Some(key) = tool_result_cache.keys().next().copied() {
+                    tool_result_cache.remove(&key);
+                }
+            }
+        }
+
+        // Track tool failures across iterations using structured detection
+        // (prefixes, JSON error payloads, HTTP statuses, non-zero exit codes).
+        let failure_class = classify_tool_result_failure_with_context(
+            &tc.name,
+            &result_text,
+            Some(&effective_arguments),
+            Some(&result_metadata),
+        );
+        let execution_failure_kind = classify_execution_failure_kind(
+            &tc.name,
+            &result_text,
+            Some(&effective_arguments),
+            Some(&result_metadata),
+            false,
+        );
+        let is_error = failure_class.is_some();
+
+        // Track tool call for learning — mark failures so activity summaries
+        // don't claim files were written when writes actually failed.
+        let tool_summary = format!(
+            "{}({})",
+            tc.name,
+            summarize_tool_args(&tc.name, &effective_arguments)
+        );
+        if is_error {
+            learning_ctx
+                .tool_calls
+                .push(format!("{} [FAILED]", tool_summary));
+        } else {
+            learning_ctx.tool_calls.push(tool_summary.clone());
+        }
+        execution_state.complete_current_step(classify_step_execution_outcome(
+            is_error,
+            background_detached,
+        ));
+        execution_state.mark_persisted_now();
+        match execution_failure_kind {
+            Some(ExecutionFailureKind::ToolContractFailure)
+            | Some(ExecutionFailureKind::ToolInvocationFailure) => {
+                validation_state.note_retry(LoopRepetitionReason::RetryStep);
+                learning_ctx.record_replay_note(
+                    ReplayNoteCategory::RetryReason,
+                    "retry_step",
+                    format!(
+                        "Retried {} locally after {:?}.",
+                        tc.name, execution_failure_kind
+                    ),
+                    true,
+                );
+            }
+            Some(ExecutionFailureKind::EnvironmentFailure)
+            | Some(ExecutionFailureKind::LogicFailure) => {
+                validation_state.note_replan();
+                learning_ctx.record_replay_note(
+                    ReplayNoteCategory::RetryReason,
+                    "replan_required",
+                    format!(
+                        "Replanned after {:?} on {}.",
+                        execution_failure_kind, tc.name
+                    ),
+                    true,
+                );
+            }
+            None => {
+                validation_state.clear_loop_repetition_reason();
+            }
+        }
+
+        // Record structured outcome in the ledger
+        {
+            let caps = available_capabilities
+                .get(&tc.name)
+                .copied()
+                .unwrap_or_default();
+            let is_external_mutation =
+                caps.external_side_effect && result_metadata.semantics.mutates_state();
+            let error_summary = if is_error {
+                extract_error_summary_line(&result_text)
+            } else {
+                None
+            };
+            let planned_step = if is_external_mutation {
+                execution_state
+                    .current_linear_intent_step()
+                    .filter(|step| {
+                        linear_intent_step_matches_tool_call(step, &tc.name, &effective_arguments)
+                    })
+                    .cloned()
+            } else {
+                None
+            };
+            let expected_step_count = execution_state
+                .active_linear_intent_plan
+                .as_ref()
+                .map(|plan| plan.steps.len());
+            let plan_version = execution_state
+                .active_linear_intent_plan
+                .as_ref()
+                .map(|plan| plan.plan_version);
+            execution_state.record_outcome(OutcomeEntry {
+                tool_name: tc.name.clone(),
+                success: !is_error,
+                http_status: result_metadata.http_status,
+                is_external_mutation,
+                error_summary,
+                iteration,
+                plan_version,
+                planned_step_id: planned_step.as_ref().map(|s| s.step_id.clone()),
+                planned_step_index: planned_step.as_ref().map(|s| s.step_index),
+                planned_step_description: planned_step.as_ref().map(|s| s.description.clone()),
+                expected_step_count,
+            });
+            // Advance linear intent step pointer on successful external mutation
+            if !is_error && planned_step.is_some() {
+                execution_state.advance_linear_intent_step_after_external_success();
+            }
+        }
+
+        agent
+            .emit_decision_point(
                 emitter,
                 task_id,
                 iteration,
@@ -1703,18 +1706,18 @@ impl Agent {
                 }),
             )
             .await;
-            info!(
-                session_id,
-                iteration,
-                tool = %tc.name,
-                is_error,
-                execution_failure_kind = ?execution_failure_kind,
-                result_len = result_text.len(),
-                result_preview = &result_text.chars().take(80).collect::<String>() as &str,
-                "Tool execution completed"
-            );
-            if let Some(execution_failure_kind) = execution_failure_kind {
-                self.emit_warning_decision_point(
+        info!(
+            session_id,
+            iteration,
+            tool = %tc.name,
+            is_error,
+            execution_failure_kind = ?execution_failure_kind,
+            result_len = result_text.len(),
+            result_preview = &result_text.chars().take(80).collect::<String>() as &str,
+            "Tool execution completed"
+        );
+        if let Some(execution_failure_kind) = execution_failure_kind {
+            agent.emit_warning_decision_point(
                     emitter,
                     task_id,
                     iteration,
@@ -1738,218 +1741,217 @@ impl Agent {
                     }),
                 )
                 .await;
-            }
+        }
 
-            let learning_env = ResultLearningEnv {
-                attempted_required_file_recheck,
-                send_file_key,
-                restrict_to_personal_memory_tools,
-                is_reaffirmation_challenge_turn,
-                session_id,
-                task_id,
-                emitter,
-                task_start,
-                iteration,
-                tool_arguments: &effective_arguments,
-                tool_summary: &tool_summary,
-            };
-            let mut learning_state = ResultLearningState {
-                learning_ctx,
-                no_evidence_result_streak: &mut no_evidence_result_streak,
-                iteration_had_tool_failures: &mut iteration_had_tool_failures,
-                no_evidence_tools_seen: &mut no_evidence_tools_seen,
-                evidence_gain_count: &mut evidence_gain_count,
-                unknown_tools: &mut unknown_tools,
-                tool_failure_count: &mut tool_failure_count,
-                tool_failure_signatures: &mut tool_failure_signatures,
-                tool_transient_failure_count: &mut tool_transient_failure_count,
-                tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
-                pending_error_solution_ids: &mut pending_error_solution_ids,
-                tool_error_history: &mut tool_error_history,
-                pending_reflection_recoveries: &mut pending_reflection_recoveries,
-                tool_failure_patterns: &mut tool_failure_patterns,
-                last_tool_failure: &mut last_tool_failure,
-                in_session_learned: &mut in_session_learned,
-                force_text_response: &mut force_text_response,
-                pending_system_messages: &mut pending_system_messages,
-                successful_tool_calls: &mut successful_tool_calls,
-                total_successful_tool_calls: &mut total_successful_tool_calls,
-                successful_send_file_keys: &mut successful_send_file_keys,
-                cli_agent_boundary_injected: &mut cli_agent_boundary_injected,
-                recent_tool_calls: &mut recent_tool_calls,
-                consecutive_same_tool: &mut consecutive_same_tool,
-                consecutive_same_tool_arg_hashes: &mut consecutive_same_tool_arg_hashes,
-                recent_tool_names: &mut recent_tool_names,
-                require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
-                known_project_dir: &mut known_project_dir,
-                dirs_with_project_inspect_file_evidence:
-                    &mut dirs_with_project_inspect_file_evidence,
-                dirs_with_search_no_matches: &mut dirs_with_search_no_matches,
-            };
-            let learning_outcome = self
-                .apply_result_learning(
-                    tc,
-                    &mut result_text,
-                    is_error,
-                    failure_class,
-                    execution_failure_kind,
-                    &learning_env,
-                    &mut learning_state,
-                )
-                .await?;
-            if let Some(outcome) = learning_outcome.control_flow {
-                commit_state!();
-                return Ok(outcome);
-            }
-            if let Some(failure) = learning_outcome.semantic_failure.as_ref() {
-                if let Some(diagnosis) = self
-                    .maybe_trigger_reflection(
-                        &tc.name,
-                        &effective_arguments,
-                        failure,
-                        _user_text,
-                        active_skill_names,
-                        &tool_error_history,
-                        &mut reflection_completed,
-                        session_id,
-                    )
-                    .await
-                {
-                    let failure_key = (tc.name.clone(), failure.signature.clone());
-                    pending_system_messages.push(SystemDirective::ReflectionDiagnosis {
-                        tool_name: tc.name.clone(),
-                        root_cause: diagnosis.root_cause.clone(),
-                        recommended_action: diagnosis.recommended_action.clone(),
-                    });
-                    if let Some(draft) = diagnosis.learning {
-                        if let Some(solution_id) =
-                            super::reflection::store_reflection_learning(&self.state, draft).await
-                        {
-                            pending_reflection_recoveries.insert(
-                                tc.name.clone(),
-                                super::reflection::PendingReflectionRecovery {
-                                    signature: failure_key.1,
-                                    solution_ids: vec![solution_id],
-                                    verify_on_iteration: iteration.saturating_add(1),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-
-            if !is_error {
-                // Each successful tool execution extends the budget so
-                // productive multi-step runs are never artificially stopped.
-                execution_state.extend_budget_on_progress();
-
-                send_status(
-                    &status_tx,
-                    StatusUpdate::ToolComplete {
-                        name: tc.name.clone(),
-                        summary: summarize_completed_tool_result(&result_text),
-                    },
-                );
-                let caps = available_capabilities
-                    .get(&tc.name)
-                    .copied()
-                    .unwrap_or_default();
-                let semantics = &result_metadata.semantics;
-                let evidence_count_before = evidence_state.records.len();
-                record_successful_tool_evidence(
-                    evidence_state,
+        let learning_env = ResultLearningEnv {
+            attempted_required_file_recheck,
+            send_file_key,
+            restrict_to_personal_memory_tools,
+            is_reaffirmation_challenge_turn,
+            session_id,
+            task_id,
+            emitter,
+            task_start,
+            iteration,
+            tool_arguments: &effective_arguments,
+            tool_summary: &tool_summary,
+        };
+        let mut learning_state = ResultLearningState {
+            learning_ctx,
+            no_evidence_result_streak: &mut no_evidence_result_streak,
+            iteration_had_tool_failures: &mut iteration_had_tool_failures,
+            no_evidence_tools_seen: &mut no_evidence_tools_seen,
+            evidence_gain_count: &mut evidence_gain_count,
+            unknown_tools: &mut unknown_tools,
+            tool_failure_count: &mut tool_failure_count,
+            tool_failure_signatures: &mut tool_failure_signatures,
+            tool_transient_failure_count: &mut tool_transient_failure_count,
+            tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
+            pending_error_solution_ids: &mut pending_error_solution_ids,
+            tool_error_history: &mut tool_error_history,
+            pending_reflection_recoveries: &mut pending_reflection_recoveries,
+            tool_failure_patterns: &mut tool_failure_patterns,
+            last_tool_failure: &mut last_tool_failure,
+            in_session_learned: &mut in_session_learned,
+            force_text_response: &mut force_text_response,
+            pending_system_messages: &mut pending_system_messages,
+            successful_tool_calls: &mut successful_tool_calls,
+            total_successful_tool_calls: &mut total_successful_tool_calls,
+            successful_send_file_keys: &mut successful_send_file_keys,
+            cli_agent_boundary_injected: &mut cli_agent_boundary_injected,
+            recent_tool_calls: &mut recent_tool_calls,
+            consecutive_same_tool: &mut consecutive_same_tool,
+            consecutive_same_tool_arg_hashes: &mut consecutive_same_tool_arg_hashes,
+            recent_tool_names: &mut recent_tool_names,
+            require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
+            known_project_dir: &mut known_project_dir,
+            dirs_with_project_inspect_file_evidence: &mut dirs_with_project_inspect_file_evidence,
+            dirs_with_search_no_matches: &mut dirs_with_search_no_matches,
+        };
+        let learning_outcome = agent
+            .apply_result_learning(
+                tc,
+                &mut result_text,
+                is_error,
+                failure_class,
+                execution_failure_kind,
+                &learning_env,
+                &mut learning_state,
+            )
+            .await?;
+        if let Some(outcome) = learning_outcome.control_flow {
+            commit_state!();
+            return Ok(outcome);
+        }
+        if let Some(failure) = learning_outcome.semantic_failure.as_ref() {
+            if let Some(diagnosis) = agent
+                .maybe_trigger_reflection(
                     &tc.name,
                     &effective_arguments,
-                    semantics,
-                );
-                let action_target = step_plan
-                    .expected_targets
-                    .first()
-                    .or_else(|| step_plan.target_scope.allowed_targets.first())
-                    .map(|target| target.value.clone());
-                validation_state.record_action(
-                    Some(&tc.name),
-                    action_target,
-                    evidence_state.records.len() > evidence_count_before,
-                );
-                validation_state.clear_loop_repetition_reason();
-                if semantics.mutates_state() {
-                    completion_progress.mark_mutation(&turn_context.completion_contract);
-                    // Track external mutation success for the completion gate
-                    if caps.external_side_effect {
-                        completion_progress.mark_successful_external_mutation();
+                    failure,
+                    _user_text,
+                    active_skill_names,
+                    &tool_error_history,
+                    &mut reflection_completed,
+                    session_id,
+                )
+                .await
+            {
+                let failure_key = (tc.name.clone(), failure.signature.clone());
+                pending_system_messages.push(SystemDirective::ReflectionDiagnosis {
+                    tool_name: tc.name.clone(),
+                    root_cause: diagnosis.root_cause.clone(),
+                    recommended_action: diagnosis.recommended_action.clone(),
+                });
+                if let Some(draft) = diagnosis.learning {
+                    if let Some(solution_id) =
+                        super::reflection::store_reflection_learning(&agent.state, draft).await
+                    {
+                        pending_reflection_recoveries.insert(
+                            tc.name.clone(),
+                            super::reflection::PendingReflectionRecovery {
+                                signature: failure_key.1,
+                                solution_ids: vec![solution_id],
+                                verify_on_iteration: iteration.saturating_add(1),
+                            },
+                        );
                     }
                 }
-                if semantics.observes_state() {
-                    let can_verify =
-                        tool_result_contains_verifiable_evidence(semantics, &result_text);
-                    let matched_contract = observation_matches_completion_contract(
-                        &turn_context.completion_contract,
-                        semantics,
-                        &effective_arguments,
-                        &result_text,
-                    );
-                    completion_progress.mark_observation(
-                        &turn_context.completion_contract,
-                        can_verify && matched_contract,
-                    );
-                }
-                // send_file success means the artifact was delivered to the
-                // user — this IS verification.  Clear the pending flag so the
-                // completion gate doesn't block a perfectly successful task.
-                if tc.name == "send_file" && completion_progress.verification_pending {
-                    completion_progress.verification_pending = false;
-                    completion_progress.verification_count =
-                        completion_progress.verification_count.saturating_add(1);
-                    info!(
-                        session_id,
-                        iteration, "send_file success cleared verification_pending"
-                    );
-                }
-                if completion_progress.verification_pending {
-                    pending_external_action_ack = None;
-                } else if !background_detached
-                    && semantics.mutates_state()
-                    && caps.external_side_effect
-                    && should_build_external_action_ack(&result_text)
-                {
-                    pending_external_action_ack =
-                        Some(build_external_action_completion_ack(&result_text));
-                }
-            } else {
-                pending_external_action_ack = None;
-                // Track failed external mutations — arms the completion gate
-                let caps = available_capabilities
-                    .get(&tc.name)
-                    .copied()
-                    .unwrap_or_default();
-                if caps.external_side_effect && result_metadata.semantics.mutates_state() {
-                    completion_progress.mark_failed_external_mutation();
-                    // Inject directive so the LLM cannot ignore the failure
-                    let error_hint = extract_error_summary_line(&result_text)
-                        .unwrap_or_else(|| "request failed".to_string());
-                    pending_system_messages.push(SystemDirective::ExternalMutationFailed {
-                        tool_name: tc.name.clone(),
-                        status_code: result_metadata.http_status,
-                        error_hint,
-                    });
-                }
-                if matches!(
-                    execution_state.last_outcome,
-                    Some(StepExecutionOutcome::NonrecoverableFailure)
-                ) {
-                    validation_state.record_failure(ValidationFailure::NonrecoverableFailure);
+            }
+        }
+
+        if !is_error {
+            // Each successful tool execution extends the budget so
+            // productive multi-step runs are never artificially stopped.
+            execution_state.extend_budget_on_progress();
+
+            send_status(
+                &status_tx,
+                StatusUpdate::ToolComplete {
+                    name: tc.name.clone(),
+                    summary: summarize_completed_tool_result(&result_text),
+                },
+            );
+            let caps = available_capabilities
+                .get(&tc.name)
+                .copied()
+                .unwrap_or_default();
+            let semantics = &result_metadata.semantics;
+            let evidence_count_before = evidence_state.records.len();
+            record_successful_tool_evidence(
+                evidence_state,
+                &tc.name,
+                &effective_arguments,
+                semantics,
+            );
+            let action_target = step_plan
+                .expected_targets
+                .first()
+                .or_else(|| step_plan.target_scope.allowed_targets.first())
+                .map(|target| target.value.clone());
+            validation_state.record_action(
+                Some(&tc.name),
+                action_target,
+                evidence_state.records.len() > evidence_count_before,
+            );
+            validation_state.clear_loop_repetition_reason();
+            if semantics.mutates_state() {
+                completion_progress.mark_mutation(&turn_context.completion_contract);
+                // Track external mutation success for the completion gate
+                if caps.external_side_effect {
+                    completion_progress.mark_successful_external_mutation();
                 }
             }
+            if semantics.observes_state() {
+                let can_verify = tool_result_contains_verifiable_evidence(semantics, &result_text);
+                let matched_contract = observation_matches_completion_contract(
+                    &turn_context.completion_contract,
+                    semantics,
+                    &effective_arguments,
+                    &result_text,
+                );
+                completion_progress.mark_observation(
+                    &turn_context.completion_contract,
+                    can_verify && matched_contract,
+                );
+            }
+            // send_file success means the artifact was delivered to the
+            // user — this IS verification.  Clear the pending flag so the
+            // completion gate doesn't block a perfectly successful task.
+            if tc.name == "send_file" && completion_progress.verification_pending {
+                completion_progress.verification_pending = false;
+                completion_progress.verification_count =
+                    completion_progress.verification_count.saturating_add(1);
+                info!(
+                    session_id,
+                    iteration, "send_file success cleared verification_pending"
+                );
+            }
+            if completion_progress.verification_pending {
+                pending_external_action_ack = None;
+            } else if !background_detached
+                && semantics.mutates_state()
+                && caps.external_side_effect
+                && should_build_external_action_ack(&result_text)
+            {
+                pending_external_action_ack =
+                    Some(build_external_action_completion_ack(&result_text));
+            }
+        } else {
+            pending_external_action_ack = None;
+            // Track failed external mutations — arms the completion gate
+            let caps = available_capabilities
+                .get(&tc.name)
+                .copied()
+                .unwrap_or_default();
+            if caps.external_side_effect && result_metadata.semantics.mutates_state() {
+                completion_progress.mark_failed_external_mutation();
+                // Inject directive so the LLM cannot ignore the failure
+                let error_hint = extract_error_summary_line(&result_text)
+                    .unwrap_or_else(|| "request failed".to_string());
+                pending_system_messages.push(SystemDirective::ExternalMutationFailed {
+                    tool_name: tc.name.clone(),
+                    status_code: result_metadata.http_status,
+                    error_hint,
+                });
+            }
+            if matches!(
+                execution_state.last_outcome,
+                Some(StepExecutionOutcome::NonrecoverableFailure)
+            ) {
+                validation_state.record_failure(ValidationFailure::NonrecoverableFailure);
+            }
+        }
 
-            let tool_msg = Message {
-                content: Some(result_text.clone()),
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                importance: 0.3, // Tool outputs default to lower importance
-                ..Message::new_runtime(Uuid::new_v4().to_string(), session_id, "tool")
-            };
-            self.append_tool_message_with_result_event(
+        let tool_msg = Message {
+            content: Some(result_text.clone()),
+            tool_call_id: Some(tc.id.clone()),
+            tool_name: Some(tc.name.clone()),
+            importance: 0.3, // Tool outputs default to lower importance
+            ..Message::new_runtime(Uuid::new_v4().to_string(), session_id, "tool")
+        };
+        agent
+            .append_tool_message_with_result_event(
                 emitter,
                 &tool_msg,
                 !is_error,
@@ -1963,37 +1965,33 @@ impl Agent {
             )
             .await?;
 
-            let direct_response = if !is_error
-                && self.depth == 0
-                && resp.tool_calls.len() == 1
-                && !background_detached
-            {
-                result_metadata.direct_response.clone()
-            } else {
-                None
+        let direct_response = if !is_error
+            && agent.depth == 0
+            && resp.tool_calls.len() == 1
+            && !background_detached
+        {
+            result_metadata.direct_response.clone()
+        } else {
+            None
+        };
+        if let Some(reply) = direct_response {
+            let assistant_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "assistant".to_string(),
+                content: Some(reply.clone()),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.5,
+                ..Message::runtime_defaults()
             };
-            if let Some(reply) = direct_response {
-                let assistant_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "assistant".to_string(),
-                    content: Some(reply.clone()),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.5,
-                    ..Message::runtime_defaults()
-                };
-                self.append_assistant_message_with_event(
-                    emitter,
-                    &assistant_msg,
-                    "system",
-                    None,
-                    None,
-                )
+            agent
+                .append_assistant_message_with_event(emitter, &assistant_msg, "system", None, None)
                 .await?;
-                self.emit_task_end(
+            agent
+                .emit_task_end(
                     emitter,
                     task_id,
                     TaskStatus::Completed,
@@ -2005,103 +2003,111 @@ impl Agent {
                 )
                 .await;
 
-                learning_ctx.completed_naturally = true;
-                let learning_ctx_for_task = learning_ctx.clone();
-                let state = self.state.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await
-                    {
-                        warn!("Learning failed: {}", e);
-                    }
-                });
-
-                commit_state!();
-                return Ok(ToolExecutionOutcome::Return(Ok(reply)));
-            }
-
-            // Emit Error event if tool failed
-            if is_error {
-                let _ = emitter
-                    .emit(
-                        EventType::Error,
-                        ErrorData::tool_error(
-                            tc.name.clone(),
-                            result_text.clone(),
-                            Some(task_id.to_string()),
-                        ),
-                    )
-                    .await;
-            }
-
-            // Log tool activity for executor agents
-            if let Some(ref tid) = self.task_id {
-                let activity = TaskActivity {
-                    id: 0,
-                    task_id: tid.clone(),
-                    activity_type: "tool_call".to_string(),
-                    tool_name: Some(tc.name.clone()),
-                    tool_args: Some(effective_arguments.chars().take(1000).collect()),
-                    result: Some(result_text.chars().take(2000).collect()),
-                    success: Some(!is_error),
-                    tokens_used: None,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                };
-                if let Err(e) = self.state.log_task_activity(&activity).await {
-                    warn!(task_id = %tid, error = %e, "Failed to log task activity");
+            learning_ctx.completed_naturally = true;
+            let learning_ctx_for_task = learning_ctx.clone();
+            let state = agent.state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
+                    warn!("Learning failed: {}", e);
                 }
-            }
+            });
 
-            if background_detached {
-                info!(
-                    session_id,
-                    iteration,
-                    tool = %tc.name,
-                    "Background task detached; ending tool execution phase early and forcing text response"
-                );
-                break;
+            commit_state!();
+            return Ok(ToolExecutionOutcome::Return(Ok(reply)));
+        }
+
+        // Emit Error event if tool failed
+        if is_error {
+            let _ = emitter
+                .emit(
+                    EventType::Error,
+                    ErrorData::tool_error(
+                        tc.name.clone(),
+                        result_text.clone(),
+                        Some(task_id.to_string()),
+                    ),
+                )
+                .await;
+        }
+
+        // Log tool activity for executor agents
+        if let Some(ref tid) = agent.task_id {
+            let activity = TaskActivity {
+                id: 0,
+                task_id: tid.clone(),
+                activity_type: "tool_call".to_string(),
+                tool_name: Some(tc.name.clone()),
+                tool_args: Some(effective_arguments.chars().take(1000).collect()),
+                result: Some(result_text.chars().take(2000).collect()),
+                success: Some(!is_error),
+                tokens_used: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(e) = agent.state.log_task_activity(&activity).await {
+                warn!(task_id = %tid, error = %e, "Failed to log task activity");
             }
         }
 
-        info!(
-            session_id,
-            iteration,
-            successful_tool_calls,
-            iteration_had_tool_failures,
-            total_successful_tool_calls,
-            stall_count,
-            "Tool execution phase completed, entering post-loop"
-        );
-
-        self.apply_post_tool_iteration_controls(
-            super::post_loop::PostToolIterationInputs {
+        if background_detached {
+            info!(
                 session_id,
                 iteration,
-                task_tokens_used,
-                successful_tool_calls,
-                iteration_had_tool_failures,
-                restrict_to_personal_memory_tools,
-                base_tool_defs,
-                available_capabilities,
-                policy_bundle,
-                total_tool_calls_attempted,
-                has_active_goal: resolved_goal_id.is_some(),
-                completed_tool_calls: &learning_ctx.tool_calls,
-                recent_tool_names: &recent_tool_names,
-                user_text: _user_text,
-            },
-            super::post_loop::PostToolIterationState {
-                total_successful_tool_calls: &mut total_successful_tool_calls,
-                force_text_response: &mut force_text_response,
-                pending_system_messages: &mut pending_system_messages,
-                tool_defs: &mut tool_defs,
-                stall_count: &mut stall_count,
-                deferred_no_tool_streak: &mut deferred_no_tool_streak,
-                consecutive_clean_iterations: &mut consecutive_clean_iterations,
-                fallback_expanded_once: &mut fallback_expanded_once,
-            },
-        );
-        commit_state!();
-        Ok(ToolExecutionOutcome::NextIteration)
+                tool = %tc.name,
+                "Background task detached; ending tool execution phase early and forcing text response"
+            );
+            break;
+        }
+    }
+
+    info!(
+        session_id,
+        iteration,
+        successful_tool_calls,
+        iteration_had_tool_failures,
+        total_successful_tool_calls,
+        stall_count,
+        "Tool execution phase completed, entering post-loop"
+    );
+
+    agent.apply_post_tool_iteration_controls(
+        super::post_loop::PostToolIterationInputs {
+            session_id,
+            iteration,
+            task_tokens_used,
+            successful_tool_calls,
+            iteration_had_tool_failures,
+            restrict_to_personal_memory_tools,
+            base_tool_defs,
+            available_capabilities,
+            policy_bundle,
+            total_tool_calls_attempted,
+            has_active_goal: resolved_goal_id.is_some(),
+            completed_tool_calls: &learning_ctx.tool_calls,
+            recent_tool_names: &recent_tool_names,
+            user_text: _user_text,
+        },
+        super::post_loop::PostToolIterationState {
+            total_successful_tool_calls: &mut total_successful_tool_calls,
+            force_text_response: &mut force_text_response,
+            pending_system_messages: &mut pending_system_messages,
+            tool_defs: &mut tool_defs,
+            stall_count: &mut stall_count,
+            deferred_no_tool_streak: &mut deferred_no_tool_streak,
+            consecutive_clean_iterations: &mut consecutive_clean_iterations,
+            fallback_expanded_once: &mut fallback_expanded_once,
+        },
+    );
+    commit_state!();
+    Ok(ToolExecutionOutcome::NextIteration)
+}
+
+impl Agent {
+    pub(in crate::agent) async fn run_tool_execution_phase(
+        &self,
+        ctx: &mut ToolExecutionCtx<'_>,
+    ) -> anyhow::Result<ToolExecutionOutcome> {
+        let services = crate::agent::services::AgentServices::new(self);
+        run_tool_execution_phase(&services, ctx).await
     }
 }
 
