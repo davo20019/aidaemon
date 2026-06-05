@@ -9,19 +9,19 @@ use tracing::warn;
 
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
-use crate::traits::{StateStore, Tool, ToolCapabilities};
+use crate::traits::{FactStore, Tool, ToolCapabilities};
 use crate::types::{ApprovalResponse, FactPrivacy};
 
 /// Timeout for approval requests (5 minutes).
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
 
 pub struct ShareMemoryTool {
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn FactStore>,
     approval_tx: mpsc::Sender<ApprovalRequest>,
 }
 
 impl ShareMemoryTool {
-    pub fn new(state: Arc<dyn StateStore>, approval_tx: mpsc::Sender<ApprovalRequest>) -> Self {
+    pub fn new(state: Arc<dyn FactStore>, approval_tx: mpsc::Sender<ApprovalRequest>) -> Self {
         Self { state, approval_tx }
     }
 

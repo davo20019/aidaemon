@@ -6,3 +6,4 @@ pub mod provider_router;
 pub mod skills;
 pub mod stores;
 pub mod tools;
+pub mod wiring;

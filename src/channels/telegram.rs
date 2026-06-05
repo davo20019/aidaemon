@@ -6,13 +6,8 @@ use std::sync::{Arc, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use once_cell::sync::Lazy;
-use rand::rngs::OsRng;
-use rand::RngCore;
 use regex::Regex;
-use sha2::Sha256;
 use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -29,6 +24,11 @@ use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{
     build_help_text, html_escape, markdown_to_telegram_html, sanitize_filename, split_message,
     strip_latex,
+};
+use super::telegram_approval_render as approval_render;
+use super::telegram_bootstrap_signing::{
+    random_terminal_bootstrap_nonce, sign_terminal_tenant_bot_bootstrap_proof,
+    terminal_tenant_bot_bootstrap_url,
 };
 use crate::agent::Agent;
 use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, SessionMap};
@@ -110,51 +110,11 @@ const TELEGRAM_EXPANDABLE_WRAPPER_LEN: usize = "<blockquote expandable></blockqu
 const TELEGRAM_WEBAPP_TYPE_AGENT_MESSAGE: &str = "aidaemon.telegram.agent_message.v1";
 const TELEGRAM_WEBAPP_TYPE_CONTINUE_COMPUTER: &str = "aidaemon.telegram.open_on_computer.v1";
 const TELEGRAM_WEBAPP_MAX_TEXT_CHARS: usize = 2_000;
-const TERMINAL_TENANT_BOT_BOOTSTRAP_DEVICE_ID: &str = "tenant-bot-bootstrap";
 static LOW_LATENCY_RESTART_SCHEDULED: AtomicBool = AtomicBool::new(false);
-type HmacSha256 = Hmac<Sha256>;
 
 enum TelegramWebAppAction {
     AgentMessage(String),
     ContinueOnComputer { relay_session_id: Option<String> },
-}
-
-fn random_terminal_bootstrap_nonce(num_bytes: usize) -> String {
-    let mut bytes = vec![0u8; num_bytes.max(1)];
-    OsRng.fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn terminal_tenant_bot_bootstrap_signing_input(user_id: u64, ts: i64, nonce: &str) -> String {
-    format!(
-        "v1\nuser_id={}\ndevice_id={}\nts={}\nnonce={}",
-        user_id, TERMINAL_TENANT_BOT_BOOTSTRAP_DEVICE_ID, ts, nonce
-    )
-}
-
-fn sign_terminal_tenant_bot_bootstrap_proof(
-    bot_token: &str,
-    user_id: u64,
-    ts: i64,
-    nonce: &str,
-) -> Result<String, String> {
-    let input = terminal_tenant_bot_bootstrap_signing_input(user_id, ts, nonce);
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(bot_token.as_bytes())
-        .map_err(|_| "invalid HMAC key".to_string())?;
-    mac.update(input.as_bytes());
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
-}
-
-fn terminal_tenant_bot_bootstrap_url(terminal_web_app_url: &str) -> Result<reqwest::Url, String> {
-    let mut url = reqwest::Url::parse(terminal_web_app_url.trim())
-        .map_err(|err| format!("invalid terminal web app URL: {}", err))?;
-    if url.scheme() != "https" {
-        return Err("terminal web app URL must use HTTPS".to_string());
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-    url.set_path("/v1/tenant/bot-token/bootstrap");
-    Ok(url)
 }
 
 /// All commands available in the Telegram channel (shared + Telegram-specific).
@@ -5239,81 +5199,18 @@ impl Channel for TelegramChannel {
         // - Default mode: Critical gets [Once, Session, Deny], others get [Once, Always, Deny]
         // - Cautious mode: All get [Once, Session, Deny]
         // - YOLO mode: All get [Once, Always, Deny]
-        let use_session_button = match permission_mode {
-            PermissionMode::Cautious => true,
-            PermissionMode::Default => risk_level >= RiskLevel::Critical,
-            PermissionMode::Yolo => false,
-        };
+        let use_session_button =
+            approval_render::approval_use_session_button(permission_mode, risk_level);
 
-        let keyboard = if use_session_button {
-            InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback(
-                    "Allow Once",
-                    format!("approve:once:{}", approval_id),
-                ),
-                InlineKeyboardButton::callback(
-                    "Allow Session",
-                    format!("approve:session:{}", approval_id),
-                ),
-                InlineKeyboardButton::callback("Deny", format!("approve:deny:{}", approval_id)),
-            ]])
-        } else {
-            InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback(
-                    "Allow Once",
-                    format!("approve:once:{}", approval_id),
-                ),
-                InlineKeyboardButton::callback(
-                    "Allow Always",
-                    format!("approve:always:{}", approval_id),
-                ),
-                InlineKeyboardButton::callback("Deny", format!("approve:deny:{}", approval_id)),
-            ]])
-        };
+        let keyboard = approval_render::build_approval_keyboard(&approval_id, use_session_button);
 
-        // Truncate command display to fit Telegram's 4096 char limit.
-        // Reserve ~200 chars for risk label, warnings, buttons, and footer.
-        const MAX_CMD_DISPLAY: usize = 3600;
-        let display_cmd = if command.len() > MAX_CMD_DISPLAY {
-            let end = crate::utils::floor_char_boundary(command, MAX_CMD_DISPLAY);
-            format!(
-                "{}...\n[truncated — {} chars total]",
-                &command[..end],
-                command.len()
-            )
-        } else {
-            command.to_string()
-        };
-        let escaped_cmd = html_escape(&display_cmd);
-
-        // Build message with risk info
-        let (risk_icon, risk_label) = match risk_level {
-            RiskLevel::Safe => ("ℹ️", "New command"),
-            RiskLevel::Medium => ("⚠️", "Medium risk"),
-            RiskLevel::High => ("🔶", "High risk"),
-            RiskLevel::Critical => ("🚨", "Critical risk"),
-        };
-
-        let mut text = format!(
-            "{} <b>{}</b>\n\n<code>{}</code>",
-            risk_icon, risk_label, escaped_cmd
+        let text = approval_render::build_approval_message_text(
+            command,
+            risk_level,
+            warnings,
+            use_session_button,
+            short_id,
         );
-
-        if !warnings.is_empty() {
-            text.push('\n');
-            for warning in warnings {
-                text.push_str(&format!("\n• {}", html_escape(warning)));
-            }
-        }
-
-        // Add explanation based on which button is shown
-        if use_session_button {
-            text.push_str("\n\n<i>\"Allow Session\" approves this command type until restart.</i>");
-        } else {
-            text.push_str("\n\n<i>\"Allow Always\" permanently approves this command type.</i>");
-        }
-
-        text.push_str(&format!("\n\n<i>[{}]</i>", short_id));
 
         match self
             .bot
@@ -5377,22 +5274,10 @@ impl Channel for TelegramChannel {
             pending.insert(approval_id.clone(), response_tx);
         }
 
-        let keyboard = InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback("Confirm ✅", format!("goal:confirm:{}", approval_id)),
-            InlineKeyboardButton::callback("Cancel ❌", format!("goal:cancel:{}", approval_id)),
-        ]]);
+        let keyboard = approval_render::build_goal_confirmation_keyboard(&approval_id);
 
-        let escaped_desc = html_escape(goal_description);
-        let mut text = format!(
-            "📅 <b>Confirm scheduled goal</b>\n\n<code>{}</code>",
-            escaped_desc
-        );
-
-        for detail in details {
-            text.push_str(&format!("\n• {}", html_escape(detail)));
-        }
-
-        text.push_str(&format!("\n\n<i>[{}]</i>", short_id));
+        let text =
+            approval_render::build_goal_confirmation_text(goal_description, details, short_id);
 
         match self
             .bot
@@ -5877,30 +5762,6 @@ mod tests {
         let text = "Low-latency webhook config applied (local config only).\nBackup: config.toml.lowlatency.bak\n";
         let stripped = TelegramChannel::strip_low_latency_next_steps(text);
         assert_eq!(stripped, text);
-    }
-
-    #[test]
-    fn terminal_tenant_bot_bootstrap_url_targets_worker_endpoint() {
-        let url = terminal_tenant_bot_bootstrap_url(
-            "https://terminal.aidaemon.ai/app?tgWebAppData=abc#fragment",
-        )
-        .unwrap();
-        assert_eq!(
-            url.as_str(),
-            "https://terminal.aidaemon.ai/v1/tenant/bot-token/bootstrap"
-        );
-    }
-
-    #[test]
-    fn terminal_tenant_bot_bootstrap_signature_is_stable() {
-        let sig = sign_terminal_tenant_bot_bootstrap_proof(
-            "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd",
-            301753035,
-            1_700_000_000,
-            "deadbeefcafebabe",
-        )
-        .unwrap();
-        assert_eq!(sig, "wdb3Oj1hWbvz373tj4nBZrudZKP_nFsmf8LZvWMwvOo");
     }
 
     #[tokio::test]

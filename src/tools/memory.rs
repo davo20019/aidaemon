@@ -5,17 +5,17 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use crate::traits::{StateStore, Tool, ToolCapabilities, ToolRole};
+use crate::traits::{FactStore, Tool, ToolCapabilities, ToolRole};
 use crate::types::FactPrivacy;
 
 pub struct RememberFactTool {
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn FactStore>,
     /// Current channel_id set by the agent before tool execution.
     pub(crate) current_channel_id: Arc<RwLock<Option<String>>>,
 }
 
 impl RememberFactTool {
-    pub fn new(state: Arc<dyn StateStore>) -> Self {
+    pub fn new(state: Arc<dyn FactStore>) -> Self {
         Self {
             state,
             current_channel_id: Arc::new(RwLock::new(None)),

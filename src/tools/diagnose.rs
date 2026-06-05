@@ -13,13 +13,13 @@ use crate::events::{
 };
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::tools::sanitize::redact_secrets;
-use crate::traits::{ProviderResponse, StateStore, Tool, ToolCapabilities};
+use crate::traits::{ProviderResponse, TokenUsageStore, Tool, ToolCapabilities};
 use crate::utils::truncate_str;
 
 pub struct DiagnoseTool {
     event_store: Arc<EventStore>,
     #[allow(dead_code)]
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn TokenUsageStore>,
     llm_runtime: SharedLlmRuntime,
     max_events: usize,
     include_raw_args: bool,
@@ -58,7 +58,7 @@ struct ExecutionReplaySummary {
 impl DiagnoseTool {
     pub fn new(
         event_store: Arc<EventStore>,
-        state: Arc<dyn StateStore>,
+        state: Arc<dyn TokenUsageStore>,
         llm_runtime: SharedLlmRuntime,
         max_events: usize,
         include_raw_args: bool,
@@ -1957,7 +1957,7 @@ mod tests {
         );
         DiagnoseTool::new(
             event_store,
-            state as Arc<dyn StateStore>,
+            state as Arc<dyn TokenUsageStore>,
             llm_runtime,
             200,
             false,

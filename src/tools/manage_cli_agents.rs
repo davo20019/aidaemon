@@ -9,19 +9,19 @@ use tracing::info;
 use crate::tools::cli_agent::CliAgentTool;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
-use crate::traits::{StateStore, Tool, ToolCapabilities};
+use crate::traits::{DynamicCliAgentStore, Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 pub struct ManageCliAgentsTool {
     cli_tool: Arc<CliAgentTool>,
-    state: Arc<dyn StateStore>,
+    state: Arc<dyn DynamicCliAgentStore>,
     approval_tx: mpsc::Sender<ApprovalRequest>,
 }
 
 impl ManageCliAgentsTool {
     pub fn new(
         cli_tool: Arc<CliAgentTool>,
-        state: Arc<dyn StateStore>,
+        state: Arc<dyn DynamicCliAgentStore>,
         approval_tx: mpsc::Sender<ApprovalRequest>,
     ) -> Self {
         Self {

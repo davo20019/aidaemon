@@ -237,13 +237,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         specialists,
     ));
 
-    // Close the loop: give the spawn tool a weak reference to the agent.
-    if let Some(ref st) = spawn_tool {
-        st.set_agent(Arc::downgrade(&agent));
-    }
-
-    // Give the agent a weak self-reference for background task spawning.
-    agent.set_self_ref(Arc::downgrade(&agent)).await;
+    // Close the deferred Agent ↔ SpawnAgentTool + agent self-reference cycles.
+    crate::startup::wiring::wire_agent_cycles(&agent, spawn_tool.as_ref()).await;
 
     // 8. Event bus for triggers
     let (event_tx, event_rx) = triggers::event_bus(queue_policy.trigger_event_capacity);
@@ -307,25 +302,15 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             .with_queue_policy(queue_policy.clone()),
     );
 
-    // Give the spawn tool a reference to the hub for background mode notifications.
-    if let Some(st) = spawn_tool {
-        st.set_hub(Arc::downgrade(&hub));
-    }
-
-    // Give terminal a reference to the hub so background command progress/completion
-    // can be delivered immediately (not only via heartbeat queue polling).
-    // Also give it a weak agent reference so background completions can re-engage
-    // the agent loop to process the output and continue the original task.
-    if let Some(tt) = terminal_tool {
-        tt.set_hub(Arc::downgrade(&hub));
-        tt.set_agent(Arc::downgrade(&agent));
-    }
-    if let Some(cat) = cli_agent_tool {
-        cat.set_hub(Arc::downgrade(&hub));
-    }
-
-    // Give the agent a reference to the hub for background task notifications.
-    agent.set_hub(Arc::downgrade(&hub)).await;
+    // Close the deferred tools/agent ↔ ChannelHub cycles now that the hub exists.
+    crate::startup::wiring::wire_hub_cycles(
+        &agent,
+        &hub,
+        spawn_tool,
+        terminal_tool,
+        cli_agent_tool,
+    )
+    .await;
 
     // Start the heartbeat coordinator now that hub and agent are available.
     start_heartbeat_coordinator(heartbeat_opt, &hub, &agent);

@@ -13,7 +13,7 @@ use crate::oauth::SharedHttpProfiles;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::http_request::HttpRequestTool;
 use crate::tools::terminal::ApprovalRequest;
-use crate::traits::{StateStore, Tool, ToolCapabilities};
+use crate::traits::{OAuthStore, Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 const MAX_VERIFY_TIMEOUT_SECS: u64 = 60;
@@ -62,7 +62,7 @@ pub struct ManageHttpAuthTool {
     config_path: PathBuf,
     profiles: SharedHttpProfiles,
     approval_tx: mpsc::Sender<ApprovalRequest>,
-    state_store: Arc<dyn StateStore>,
+    state_store: Arc<dyn OAuthStore>,
 }
 
 impl ManageHttpAuthTool {
@@ -70,7 +70,7 @@ impl ManageHttpAuthTool {
         config_path: PathBuf,
         profiles: SharedHttpProfiles,
         approval_tx: mpsc::Sender<ApprovalRequest>,
-        state_store: Arc<dyn StateStore>,
+        state_store: Arc<dyn OAuthStore>,
     ) -> Self {
         Self {
             config_path,
@@ -1215,7 +1215,7 @@ mod tests {
             config_path,
             profiles,
             approval_tx,
-            state as Arc<dyn StateStore>,
+            state as Arc<dyn OAuthStore>,
         ))
     }
 

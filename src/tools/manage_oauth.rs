@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use crate::config::{AppConfig, OAuthProviderConfig};
 use crate::oauth::{OAuthGateway, OAuthType};
-use crate::traits::{StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCapabilities};
+use crate::traits::{OAuthStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCapabilities};
 use crate::types::{ApprovalResponse, StatusUpdate};
 
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
@@ -35,7 +35,7 @@ struct ManageOAuthArgs {
 
 pub struct ManageOAuthTool {
     gateway: OAuthGateway,
-    state_store: Arc<dyn StateStore>,
+    state_store: Arc<dyn OAuthStore>,
     config_path: PathBuf,
     approval_tx: mpsc::Sender<ApprovalRequest>,
 }
@@ -43,7 +43,7 @@ pub struct ManageOAuthTool {
 impl ManageOAuthTool {
     pub fn new(
         gateway: OAuthGateway,
-        state_store: Arc<dyn StateStore>,
+        state_store: Arc<dyn OAuthStore>,
         config_path: PathBuf,
         approval_tx: mpsc::Sender<ApprovalRequest>,
     ) -> Self {
@@ -1057,6 +1057,7 @@ impl Tool for ManageOAuthTool {
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
+    use crate::traits::StateStore;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1103,7 +1104,7 @@ mod tests {
         Ok((
             ManageOAuthTool::new(
                 gateway.clone(),
-                state as Arc<dyn StateStore>,
+                state as Arc<dyn OAuthStore>,
                 config_path,
                 approval_tx,
             ),
