@@ -1,12 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::config::AppConfig;
 use crate::state::SqliteStateStore;
-use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 use crate::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
 use crate::traits::store_prelude::*;
 use crate::traits::Tool;
@@ -17,7 +16,7 @@ pub async fn register_skills_tools(
     http_profiles: crate::oauth::SharedHttpProfiles,
     state: Arc<SqliteStateStore>,
     tools: &mut Vec<Arc<dyn Tool>>,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
 ) -> anyhow::Result<Option<PathBuf>> {
     if !config.skills.enabled {
         info!("Skills system disabled");

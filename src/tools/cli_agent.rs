@@ -26,6 +26,7 @@ use crate::channels::ChannelHub;
 use crate::config::CliAgentsConfig;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 use crate::traits::{
     DynamicCliAgent, ModelProvider, StateStore, Tool, ToolCapabilities, ToolTargetHint,
     ToolTargetHintKind,
@@ -252,7 +253,7 @@ pub struct CliAgentTool {
     default_max_output: usize,
     max_concurrent: usize,
     concurrency_limiter: Arc<Semaphore>,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
     hub: OnceLock<Weak<ChannelHub>>,
 }
 
@@ -521,7 +522,7 @@ impl CliAgentTool {
         config: CliAgentsConfig,
         state: Arc<dyn StateStore>,
         llm_runtime: SharedLlmRuntime,
-        approval_tx: mpsc::Sender<ApprovalRequest>,
+        approval_tx: ApprovalBroker,
     ) -> Self {
         let default_timeout = Duration::from_secs(config.timeout_secs);
         let default_max_output = config.max_output_chars;
@@ -3190,7 +3191,8 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -3244,7 +3246,8 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -4224,7 +4227,8 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         // Config with echo as a custom tool
         let mut tools = HashMap::new();
@@ -4278,7 +4282,8 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools = HashMap::new();
         tools.insert(
@@ -4333,7 +4338,8 @@ mod tests {
         );
         let state_clone = state.clone();
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -4402,7 +4408,8 @@ mod tests {
         );
         let state_clone = state.clone();
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(
@@ -4556,7 +4563,8 @@ mod tests {
             .unwrap(),
         );
         let provider = Arc::new(MockProvider::new());
-        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = ApprovalBroker::new(approval_tx_raw);
 
         let mut tools_map = HashMap::new();
         tools_map.insert(

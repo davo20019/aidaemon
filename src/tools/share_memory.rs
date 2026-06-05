@@ -4,11 +4,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 use crate::traits::{FactStore, Tool, ToolCapabilities};
 use crate::types::{ApprovalResponse, FactPrivacy};
 
@@ -17,11 +17,11 @@ const APPROVAL_TIMEOUT_SECS: u64 = 300;
 
 pub struct ShareMemoryTool {
     state: Arc<dyn FactStore>,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
 }
 
 impl ShareMemoryTool {
-    pub fn new(state: Arc<dyn FactStore>, approval_tx: mpsc::Sender<ApprovalRequest>) -> Self {
+    pub fn new(state: Arc<dyn FactStore>, approval_tx: ApprovalBroker) -> Self {
         Self { state, approval_tx }
     }
 

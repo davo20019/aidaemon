@@ -5,7 +5,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::{AppConfig, HttpAuthProfile, HttpAuthType};
@@ -13,6 +12,7 @@ use crate::oauth::SharedHttpProfiles;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::http_request::HttpRequestTool;
 use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 use crate::traits::{OAuthStore, Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
@@ -61,7 +61,7 @@ impl ManualProfileResolution {
 pub struct ManageHttpAuthTool {
     config_path: PathBuf,
     profiles: SharedHttpProfiles,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
     state_store: Arc<dyn OAuthStore>,
 }
 
@@ -69,7 +69,7 @@ impl ManageHttpAuthTool {
     pub fn new(
         config_path: PathBuf,
         profiles: SharedHttpProfiles,
-        approval_tx: mpsc::Sender<ApprovalRequest>,
+        approval_tx: ApprovalBroker,
         state_store: Arc<dyn OAuthStore>,
     ) -> Self {
         Self {
@@ -1205,7 +1205,8 @@ mod tests {
         let db_path = db_file.path().display().to_string();
         let embedding_service = Arc::new(EmbeddingService::new()?);
         let state = Arc::new(SqliteStateStore::new(&db_path, 32, None, embedding_service).await?);
-        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(4);
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(4);
+        let approval_tx = ApprovalBroker::new(approval_tx);
         tokio::spawn(async move {
             while let Some(request) = approval_rx.recv().await {
                 let _ = request.response_tx.send(ApprovalResponse::AllowOnce);

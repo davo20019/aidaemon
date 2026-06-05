@@ -1,3 +1,4 @@
+pub mod approval;
 #[cfg(feature = "browser")]
 pub mod browser;
 #[cfg(feature = "slack")]
@@ -23,6 +24,7 @@ mod tool_trace;
 pub mod web_fetch;
 mod web_search;
 
+pub use approval::ApprovalBroker;
 #[cfg(feature = "browser")]
 pub use browser::BrowserTool;
 #[cfg(feature = "slack")]

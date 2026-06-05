@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::mcp::McpRegistry;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 use crate::traits::{Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
@@ -15,11 +15,11 @@ const ALLOWED_COMMANDS: &[&str] = &["npx", "uvx", "node", "python", "python3"];
 
 pub struct ManageMcpTool {
     registry: McpRegistry,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
 }
 
 impl ManageMcpTool {
-    pub fn new(registry: McpRegistry, approval_tx: mpsc::Sender<ApprovalRequest>) -> Self {
+    pub fn new(registry: McpRegistry, approval_tx: ApprovalBroker) -> Self {
         Self {
             registry,
             approval_tx,

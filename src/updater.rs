@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::channels::ChannelHub;
 use crate::config::{UpdateConfig, UpdateMode};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 use crate::types::ApprovalResponse;
 
 const REPO_OWNER: &str = "davo20019";
@@ -25,7 +25,7 @@ pub struct Updater {
     config: UpdateConfig,
     hub: Arc<ChannelHub>,
     notify_session_ids: Vec<String>,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
 }
 
 impl Updater {
@@ -33,7 +33,7 @@ impl Updater {
         config: UpdateConfig,
         hub: Arc<ChannelHub>,
         notify_session_ids: Vec<String>,
-        approval_tx: mpsc::Sender<ApprovalRequest>,
+        approval_tx: ApprovalBroker,
     ) -> Self {
         Self {
             config,

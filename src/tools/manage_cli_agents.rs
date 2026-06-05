@@ -3,26 +3,26 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::tools::cli_agent::CliAgentTool;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 use crate::traits::{DynamicCliAgentStore, Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 pub struct ManageCliAgentsTool {
     cli_tool: Arc<CliAgentTool>,
     state: Arc<dyn DynamicCliAgentStore>,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
 }
 
 impl ManageCliAgentsTool {
     pub fn new(
         cli_tool: Arc<CliAgentTool>,
         state: Arc<dyn DynamicCliAgentStore>,
-        approval_tx: mpsc::Sender<ApprovalRequest>,
+        approval_tx: ApprovalBroker,
     ) -> Self {
         Self {
             cli_tool,

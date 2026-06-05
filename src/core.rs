@@ -413,7 +413,7 @@ pub async fn run_migrations_only(
 
 struct ToolSetup {
     tools: Vec<Arc<dyn Tool>>,
-    approval_tx: mpsc::Sender<crate::tools::terminal::ApprovalRequest>,
+    approval_tx: crate::tools::ApprovalBroker,
     approval_rx: mpsc::Receiver<crate::tools::terminal::ApprovalRequest>,
     media_rx: mpsc::Receiver<crate::types::MediaMessage>,
     terminal_tool: Option<Arc<crate::tools::TerminalTool>>,

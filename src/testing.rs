@@ -792,6 +792,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
 
     // Approval channel
     let (approval_tx, approval_rx) = mpsc::channel(16);
+    let approval_tx = crate::tools::ApprovalBroker::new(approval_tx);
 
     // TerminalTool in Yolo mode — auto-approves everything
     let terminal_tool = Arc::new(

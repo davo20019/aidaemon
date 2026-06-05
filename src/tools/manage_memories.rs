@@ -4,15 +4,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 
 use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 use crate::traits::{StateStore, Tool, ToolCapabilities};
 use crate::types::{ApprovalKind, FactPrivacy};
 
 pub struct ManageMemoriesTool {
     state: Arc<dyn StateStore>,
-    approval_tx: Option<mpsc::Sender<ApprovalRequest>>,
+    approval_tx: Option<ApprovalBroker>,
 }
 
 impl ManageMemoriesTool {
@@ -23,7 +23,7 @@ impl ManageMemoriesTool {
         }
     }
 
-    pub fn with_approval_tx(mut self, tx: mpsc::Sender<ApprovalRequest>) -> Self {
+    pub fn with_approval_tx(mut self, tx: ApprovalBroker) -> Self {
         self.approval_tx = Some(tx);
         self
     }

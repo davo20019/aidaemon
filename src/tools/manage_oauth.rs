@@ -15,6 +15,7 @@ use crate::types::{ApprovalResponse, StatusUpdate};
 
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 
 #[derive(Deserialize, Default)]
 struct ManageOAuthArgs {
@@ -37,7 +38,7 @@ pub struct ManageOAuthTool {
     gateway: OAuthGateway,
     state_store: Arc<dyn OAuthStore>,
     config_path: PathBuf,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
 }
 
 impl ManageOAuthTool {
@@ -45,7 +46,7 @@ impl ManageOAuthTool {
         gateway: OAuthGateway,
         state_store: Arc<dyn OAuthStore>,
         config_path: PathBuf,
-        approval_tx: mpsc::Sender<ApprovalRequest>,
+        approval_tx: ApprovalBroker,
     ) -> Self {
         Self {
             gateway,
@@ -1096,6 +1097,7 @@ mod tests {
             "http://localhost:8080".to_string(),
         );
         let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(4);
+        let approval_tx = ApprovalBroker::new(approval_tx);
         tokio::spawn(async move {
             while let Some(request) = approval_rx.recv().await {
                 let _ = request.response_tx.send(ApprovalResponse::AllowOnce);

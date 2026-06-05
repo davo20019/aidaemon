@@ -8,7 +8,6 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::oauth::SharedHttpProfiles;
@@ -18,13 +17,14 @@ use crate::tools::http_request::HttpRequestTool;
 use crate::tools::skill_registry::{self, RegistryEntry};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::{build_browser_client, validate_url_for_ssrf};
+use crate::tools::ApprovalBroker;
 use crate::traits::{StateStore, Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
 pub struct ManageSkillsTool {
     skills_dir: PathBuf,
     state: Arc<dyn StateStore>,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
     client: reqwest::Client,
     http_profiles: Option<SharedHttpProfiles>,
     /// Configured registry URLs for browse/install.
@@ -177,7 +177,7 @@ impl ManageSkillsTool {
     pub fn new(
         skills_dir: PathBuf,
         state: Arc<dyn StateStore>,
-        approval_tx: mpsc::Sender<ApprovalRequest>,
+        approval_tx: ApprovalBroker,
     ) -> Self {
         Self {
             skills_dir,
@@ -3286,6 +3286,7 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::tools::terminal::ApprovalRequest;
+    use crate::tools::ApprovalBroker;
     use crate::traits::store_prelude::*;
     use crate::traits::SkillDraft;
     use serde_json::json;
@@ -3303,6 +3304,7 @@ mod tests {
         std::mem::forget(db_file);
 
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(4);
+        let approval_tx = ApprovalBroker::new(approval_tx);
         let tool = ManageSkillsTool::new(
             skills_dir.path().to_path_buf(),
             sqlite_state.clone() as Arc<dyn StateStore>,
@@ -3330,6 +3332,7 @@ mod tests {
         std::mem::forget(db_file);
 
         let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(4);
+        let approval_tx = ApprovalBroker::new(approval_tx);
         let tool = ManageSkillsTool::new(
             skills_dir.path().to_path_buf(),
             sqlite_state.clone() as Arc<dyn StateStore>,

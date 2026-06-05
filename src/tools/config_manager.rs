@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::AppConfig;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 use crate::traits::{Tool, ToolCapabilities};
 use crate::types::ApprovalResponse;
 
@@ -247,7 +247,7 @@ impl ResolvedProviderSelection {
 
 pub struct ConfigManagerTool {
     config_path: PathBuf,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
 }
 
 /// Set file permissions to owner-only read/write (0600) on Unix.
@@ -266,7 +266,7 @@ fn set_owner_only_permissions(_path: &Path) {
 }
 
 impl ConfigManagerTool {
-    pub fn new(config_path: PathBuf, approval_tx: mpsc::Sender<ApprovalRequest>) -> Self {
+    pub fn new(config_path: PathBuf, approval_tx: ApprovalBroker) -> Self {
         Self {
             config_path,
             approval_tx,
@@ -1678,7 +1678,10 @@ mod tests {
 
     fn test_tool() -> ConfigManagerTool {
         let (tx, _rx) = mpsc::channel(1);
-        ConfigManagerTool::new(PathBuf::from("/tmp/nonexistent-config.toml"), tx)
+        ConfigManagerTool::new(
+            PathBuf::from("/tmp/nonexistent-config.toml"),
+            ApprovalBroker::new(tx),
+        )
     }
 
     fn write_temp_config(contents: &str) -> (TempDir, PathBuf) {
@@ -1695,7 +1698,7 @@ mod tests {
                 let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
             }
         });
-        ConfigManagerTool::new(config_path, tx)
+        ConfigManagerTool::new(config_path, ApprovalBroker::new(tx))
     }
 
     #[test]

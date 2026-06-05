@@ -84,6 +84,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     let event_store = Arc::new(EventStore::new(pool.clone()).await?);
     // Approval channel + TerminalTool
     let (approval_tx, approval_rx) = mpsc::channel(16);
+    let approval_tx = crate::tools::ApprovalBroker::new(approval_tx);
     let terminal_tool = Arc::new(
         TerminalTool::new(
             vec!["*".to_string()],
@@ -274,6 +275,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
     let event_store = Arc::new(EventStore::new(pool.clone()).await?);
     let (approval_tx, approval_rx) = mpsc::channel(16);
+    let approval_tx = crate::tools::ApprovalBroker::new(approval_tx);
     let terminal_tool = Arc::new(
         TerminalTool::new(
             vec!["*".to_string()],

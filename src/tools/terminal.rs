@@ -92,7 +92,7 @@ pub struct TerminalTool {
     session_approved: Arc<RwLock<HashSet<String>>>,
     /// Permission persistence mode
     permission_mode: PermissionMode,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: super::ApprovalBroker,
     running: Arc<Mutex<HashMap<u32, RunningProcess>>>,
     running_by_dedupe_key: Arc<Mutex<HashMap<String, u32>>>,
     task_processes: Arc<Mutex<HashMap<String, HashSet<u32>>>>,
@@ -458,7 +458,7 @@ fn format_output(stdout: &str, stderr: &str, max_chars: usize) -> String {
 impl TerminalTool {
     pub async fn new(
         allowed_prefixes: Vec<String>,
-        approval_tx: mpsc::Sender<ApprovalRequest>,
+        approval_tx: super::ApprovalBroker,
         initial_timeout_secs: u64,
         max_output_chars: usize,
         permission_mode: PermissionMode,
@@ -2402,7 +2402,8 @@ mod tests {
                 .unwrap(),
         );
         let pool = state.pool();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -2439,7 +2440,8 @@ mod tests {
                 .unwrap(),
         );
         let pool = state.pool();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -2597,7 +2599,8 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -2622,7 +2625,8 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -2646,7 +2650,8 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -2679,7 +2684,8 @@ mod tests {
                 .unwrap(),
         );
         let pool = state.pool();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -2730,7 +2736,8 @@ mod tests {
                 .unwrap(),
         );
         let pool = state.pool();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -2797,7 +2804,8 @@ mod tests {
                 .unwrap(),
         );
         let pool = state.pool();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -2843,7 +2851,8 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -2880,7 +2889,8 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -2928,7 +2938,8 @@ mod tests {
                 .unwrap(),
         );
         let pool = state.pool();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -2994,7 +3005,8 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -3039,7 +3051,8 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+        let (approval_tx_raw, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -3092,7 +3105,8 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, mut approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -3143,7 +3157,8 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -3182,7 +3197,8 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         let tool = TerminalTool::new(
             vec!["*".to_string()],
             approval_tx,
@@ -3276,7 +3292,8 @@ mod tests {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_url = format!("sqlite:{}", db_file.path().display());
         let pool = SqlitePool::connect(&db_url).await.unwrap();
-        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
         // Empty permanent prefix list — only session approvals exist.
         let tool =
             TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;

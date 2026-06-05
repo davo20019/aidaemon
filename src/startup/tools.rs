@@ -12,6 +12,7 @@ use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
 use crate::state::SqliteStateStore;
 use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 #[cfg(feature = "browser")]
 use crate::tools::BrowserTool;
 #[cfg(feature = "slack")]
@@ -31,7 +32,7 @@ use crate::types::MediaMessage;
 
 pub struct BaseToolsBundle {
     pub tools: Vec<Arc<dyn Tool>>,
-    pub approval_tx: mpsc::Sender<ApprovalRequest>,
+    pub approval_tx: ApprovalBroker,
     pub approval_rx: mpsc::Receiver<ApprovalRequest>,
     pub media_tx: mpsc::Sender<MediaMessage>,
     pub media_rx: mpsc::Receiver<MediaMessage>,
@@ -380,6 +381,7 @@ pub async fn build_base_tools(
     media_queue_capacity: usize,
 ) -> anyhow::Result<BaseToolsBundle> {
     let (approval_tx, approval_rx) = mpsc::channel(approval_queue_capacity);
+    let approval_tx = ApprovalBroker::new(approval_tx);
     let (media_tx, media_rx) = mpsc::channel::<MediaMessage>(media_queue_capacity);
 
     let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(BASE_TOOL_REGISTRY.len());
@@ -428,7 +430,7 @@ pub async fn register_optional_tools(
     event_store: Arc<EventStore>,
     llm_runtime: SharedLlmRuntime,
     health_store: Option<Arc<HealthProbeStore>>,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
     media_tx: mpsc::Sender<MediaMessage>,
 ) -> anyhow::Result<OptionalToolsOutcome> {
     let inbox_dir = shellexpand::tilde(&config.files.inbox_dir).to_string();
@@ -543,7 +545,7 @@ pub async fn register_runtime_tools(
     http_profiles: crate::oauth::SharedHttpProfiles,
     state: Arc<SqliteStateStore>,
     mcp_registry: McpRegistry,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
 ) -> anyhow::Result<RuntimeToolsOutcome> {
     validate_runtime_manifest(RUNTIME_TOOL_MANIFEST)?;
 
@@ -613,7 +615,7 @@ async fn register_runtime_tool_by_id(
     config_path: &Path,
     state: Arc<SqliteStateStore>,
     mcp_registry: McpRegistry,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
     http_profiles: crate::oauth::SharedHttpProfiles,
     http_request_tool: &mut Option<Arc<HttpRequestTool>>,
     spawn_tool: &mut Option<Arc<SpawnAgentTool>>,
@@ -739,7 +741,7 @@ async fn build_base_tool(
     config_path: &Path,
     state: Arc<SqliteStateStore>,
     event_store: Arc<EventStore>,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
 ) -> anyhow::Result<BuiltBaseTool> {
     let built = match tool_id {
         BaseToolId::SystemInfo => BuiltBaseTool {

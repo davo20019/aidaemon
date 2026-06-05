@@ -3,10 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
-
+use crate::tools::ApprovalBroker;
 use crate::tools::manage_memories::ManageMemoriesTool;
-use crate::tools::terminal::ApprovalRequest;
 use crate::traits::{
     StateStore, Tool, ToolCallSemantics, ToolCapabilities, ToolSemanticAffordances,
     ToolSemanticFacet, ToolSemanticScope, ToolVerificationMode,
@@ -44,7 +42,7 @@ impl ScheduledGoalsTool {
         }
     }
 
-    pub fn with_approval_tx(mut self, tx: mpsc::Sender<ApprovalRequest>) -> Self {
+    pub fn with_approval_tx(mut self, tx: ApprovalBroker) -> Self {
         self.inner = self.inner.with_approval_tx(tx);
         self
     }

