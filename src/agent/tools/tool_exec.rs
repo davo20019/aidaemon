@@ -38,7 +38,7 @@ impl Agent {
         if name == "cli_agent" {
             return self.execute_tool_outcome(name, arguments, ctx).await;
         }
-        if let Some(timeout_dur) = self.llm_call_timeout {
+        if let Some(timeout_dur) = self.limits.llm_call_timeout {
             match tokio::time::timeout(timeout_dur, self.execute_tool_outcome(name, arguments, ctx))
                 .await
             {
@@ -129,7 +129,7 @@ impl Agent {
                 // Inject goal context for tools that need it (e.g. spawn_agent, cli_agent, terminal).
                 //
                 // `cli_agent` uses this to route async/timeout notifications to the *origin* session
-                // (goal.session_id), since sub-agent sessions ("sub-...") are not routable.
+                // (goal.session_id), since internal child-agent sessions are not routable.
                 //
                 // `terminal` uses this for the same reason when commands move to background.
                 if matches!(name, "spawn_agent" | "cli_agent" | "terminal") {

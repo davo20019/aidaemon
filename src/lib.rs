@@ -646,79 +646,6 @@ fn launch_terminal_agent(agent: &str, raw_args: &[String]) -> anyhow::Result<()>
     }
 }
 
-#[cfg(test)]
-mod cli_alias_tests {
-    use super::*;
-
-    #[test]
-    fn parse_terminal_agent_launch_args_accepts_cwd_and_flags_with_delimiter() {
-        let args = vec![
-            "~/projects/aidaemon".to_string(),
-            "--".to_string(),
-            "--dangerously-skip-permissions".to_string(),
-            "--chrome".to_string(),
-        ];
-        let (cwd, flags) = parse_terminal_agent_launch_args(&args).expect("parse");
-        assert_eq!(
-            cwd,
-            Some(PathBuf::from(
-                shellexpand::tilde("~/projects/aidaemon").into_owned()
-            ))
-        );
-        assert_eq!(
-            flags,
-            vec![
-                "--dangerously-skip-permissions".to_string(),
-                "--chrome".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_terminal_agent_launch_args_accepts_flag_only_invocation() {
-        let args = vec!["--model".to_string(), "gpt-5".to_string()];
-        let (cwd, flags) = parse_terminal_agent_launch_args(&args).expect("parse");
-        assert_eq!(cwd, None);
-        assert_eq!(flags, vec!["--model".to_string(), "gpt-5".to_string()]);
-    }
-
-    #[test]
-    fn normalize_terminal_agent_name_is_case_insensitive() {
-        assert_eq!(normalize_terminal_agent_name("CoDeX"), Some("codex"));
-        assert_eq!(normalize_terminal_agent_name("claude"), Some("claude"));
-        assert_eq!(normalize_terminal_agent_name("nope"), None);
-    }
-
-    #[test]
-    fn normalize_terminal_agent_permission_aliases_rewrites_claude_allow_flag() {
-        let args = vec![
-            "--allow-dangerously-skip-permissions".to_string(),
-            "--model".to_string(),
-            "sonnet".to_string(),
-        ];
-        let (normalized, rewrote) =
-            normalize_terminal_agent_permission_aliases(Some("claude"), args);
-        assert!(rewrote);
-        assert_eq!(
-            normalized,
-            vec![
-                "--dangerously-skip-permissions".to_string(),
-                "--model".to_string(),
-                "sonnet".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn normalize_terminal_agent_permission_aliases_leaves_other_agents_unchanged() {
-        let args = vec!["--allow-dangerously-skip-permissions".to_string()];
-        let (normalized, rewrote) =
-            normalize_terminal_agent_permission_aliases(Some("codex"), args.clone());
-        assert!(!rewrote);
-        assert_eq!(normalized, args);
-    }
-}
-
 #[cfg(feature = "browser")]
 fn find_chrome_binary() -> Option<String> {
     #[cfg(target_os = "macos")]
@@ -843,4 +770,77 @@ fn handle_keychain_command(args: &[String]) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_alias_tests {
+    use super::*;
+
+    #[test]
+    fn parse_terminal_agent_launch_args_accepts_cwd_and_flags_with_delimiter() {
+        let args = vec![
+            "~/projects/aidaemon".to_string(),
+            "--".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--chrome".to_string(),
+        ];
+        let (cwd, flags) = parse_terminal_agent_launch_args(&args).expect("parse");
+        assert_eq!(
+            cwd,
+            Some(PathBuf::from(
+                shellexpand::tilde("~/projects/aidaemon").into_owned()
+            ))
+        );
+        assert_eq!(
+            flags,
+            vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--chrome".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_terminal_agent_launch_args_accepts_flag_only_invocation() {
+        let args = vec!["--model".to_string(), "gpt-5".to_string()];
+        let (cwd, flags) = parse_terminal_agent_launch_args(&args).expect("parse");
+        assert_eq!(cwd, None);
+        assert_eq!(flags, vec!["--model".to_string(), "gpt-5".to_string()]);
+    }
+
+    #[test]
+    fn normalize_terminal_agent_name_is_case_insensitive() {
+        assert_eq!(normalize_terminal_agent_name("CoDeX"), Some("codex"));
+        assert_eq!(normalize_terminal_agent_name("claude"), Some("claude"));
+        assert_eq!(normalize_terminal_agent_name("nope"), None);
+    }
+
+    #[test]
+    fn normalize_terminal_agent_permission_aliases_rewrites_claude_allow_flag() {
+        let args = vec![
+            "--allow-dangerously-skip-permissions".to_string(),
+            "--model".to_string(),
+            "sonnet".to_string(),
+        ];
+        let (normalized, rewrote) =
+            normalize_terminal_agent_permission_aliases(Some("claude"), args);
+        assert!(rewrote);
+        assert_eq!(
+            normalized,
+            vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_terminal_agent_permission_aliases_leaves_other_agents_unchanged() {
+        let args = vec!["--allow-dangerously-skip-permissions".to_string()];
+        let (normalized, rewrote) =
+            normalize_terminal_agent_permission_aliases(Some("codex"), args.clone());
+        assert!(!rewrote);
+        assert_eq!(normalized, args);
+    }
 }

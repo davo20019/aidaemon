@@ -695,14 +695,16 @@ impl TerminalTool {
             return Err(anyhow::anyhow!("Approval channel closed: {}", send_err));
         }
 
-        // Sub-agents (session IDs starting with "sub-") get a short timeout
+        // Sub-agents get a short timeout
         // since they can't reliably receive user approval through the channel hub.
         // They should use safe tools (edit_file, write_file) instead of risky terminal commands.
-        let timeout_secs = if session_id.starts_with("sub-") {
-            10
-        } else {
-            300
-        };
+        // `sub-` is the legacy prefix; new child sessions use `specialist:`.
+        let timeout_secs =
+            if session_id.starts_with("sub-") || session_id.starts_with("specialist:") {
+                10
+            } else {
+                300
+            };
         let response: ApprovalResponse =
             match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), response_rx)
                 .await

@@ -1009,7 +1009,7 @@ mod tests {
     fn test_display_tool_call_survives_sanitization() {
         use crate::tools::sanitize::sanitize_user_facing_reply;
 
-        let tool_calls = vec![
+        let tool_calls = [
             "manage_memories(search)",
             "manage_memories(list_scheduled)",
             "search_files(twitter|schedule|cancelled|removed)",

@@ -858,6 +858,14 @@ pub(super) fn merge_consecutive_messages(messages: &mut Vec<Value>) {
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
+            if curr_role == "user"
+                && !prev_content.is_empty()
+                && !curr_content.is_empty()
+                && prev_content != curr_content
+            {
+                i += 1;
+                continue;
+            }
             let merged = if prev_content.is_empty() {
                 curr_content
             } else if curr_content.is_empty() {

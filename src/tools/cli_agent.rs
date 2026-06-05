@@ -3012,7 +3012,7 @@ impl Tool for CliAgentTool {
 
         let action = args.action.as_deref().unwrap_or("run");
 
-        // Default to the caller session (often a sub-agent session like "sub-...").
+        // Default to the caller session (often an internal child-agent session).
         // If this CLI agent is running in the context of an orchestration goal,
         // route background notifications and cancel_all scoping to the *origin*
         // session_id (goal.session_id), which is routable via the ChannelHub.

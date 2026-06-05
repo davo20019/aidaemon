@@ -6,6 +6,7 @@
 
 mod channels;
 mod conversation;
+mod dialogue;
 mod dynamic;
 mod goals;
 mod memory;
@@ -19,6 +20,10 @@ pub use channels::{Channel, ChannelCapabilities};
 pub use conversation::{
     extract_primary_message_content, first_primary_message_line, infer_message_annotations,
     message_content_is_structural_only, ConversationSummary, Message, MessageAnnotation, ToolCall,
+};
+pub use dialogue::{
+    ActiveTaskRef, ActiveTaskStatus, AssistantTurnKind, AssistantTurnSummary, DialogueState,
+    OpenQuestion, OpenRequest, OpenRequestStatus, QuestionKind, UserTurnKind, UserTurnSummary,
 };
 pub use dynamic::{
     CliAgentInvocation, DynamicBot, DynamicCliAgent, DynamicMcpServer, DynamicSkill,
@@ -38,8 +43,9 @@ pub use provider::{
 };
 #[allow(unused_imports)]
 pub use tools::{
-    AgentRole, Tool, ToolCallEffect, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
-    ToolCapabilities, ToolRole, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+    AgentRole, SpecialistKind, Tool, ToolCallEffect, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolRole, ToolSemanticAffordances, ToolSemanticFacet,
+    ToolSemanticScope, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
 };
 pub use trigger_event::TriggerEvent;
 
@@ -53,10 +59,11 @@ pub use state_store::*;
 pub mod store_prelude {
     #![allow(unused_imports)]
     pub use super::{
-        ConversationSummaryStore, DynamicBotStore, DynamicCliAgentStore, DynamicMcpServerStore,
-        EpisodeStore, FactStore, GoalStore, HealthCheckStore, LearningStore, MessageStore,
-        NotificationStore, OAuthStore, PeopleStore, SessionChannelStore, SettingsStore, SkillStore,
-        StateStore, TokenUsageStore,
+        ConversationSummaryStore, DialogueStateStore, DynamicBotStore, DynamicCliAgentStore,
+        DynamicMcpServerStore, EpisodeStore, FactStore, GoalBudgetStore, GoalNotificationStore,
+        GoalScheduleStore, GoalStore, HealthCheckStore, LearningStore, MessageStore,
+        NotificationStore, OAuthStore, PeopleStore, ScheduledRunStore, SessionChannelStore,
+        SettingsStore, SkillStore, StateStore, TaskDispatchStore, TaskStore, TokenUsageStore,
     };
 }
 

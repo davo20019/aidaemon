@@ -1028,6 +1028,10 @@ impl Agent {
                 })
                 .count();
             if non_system_non_user_count == 0 {
+                messages.retain(|m| {
+                    m.get("role").and_then(|r| r.as_str()) != Some("user")
+                        || m.get("content").and_then(|c| c.as_str()) == Some(user_text)
+                });
                 pending_system_messages.push(SystemDirective::FreshConversationContext);
             }
         }

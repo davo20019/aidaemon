@@ -113,6 +113,7 @@ dependencies = [
  "shell-words",
  "shellexpand",
  "sqlx",
+ "strum",
  "teloxide",
  "tempfile",
  "tikv-jemallocator",

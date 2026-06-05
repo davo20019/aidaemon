@@ -665,7 +665,13 @@ impl Tool for ManageMemoriesTool {
                     ._channel_visibility
                     .as_deref()
                     .is_some_and(|v| v.eq_ignore_ascii_case("internal"));
-                if is_internal_visibility || session_id.starts_with("sub-") {
+                // `sub-` is the legacy child-session prefix (replaced by
+                // `specialist:`); accept both so an in-flight legacy session
+                // can't bypass this guard.
+                if is_internal_visibility
+                    || session_id.starts_with("sub-")
+                    || session_id.starts_with("specialist:")
+                {
                     return Ok("Cannot create scheduled goals from within internal scheduled-task execution. Execute the task directly instead.".to_string());
                 }
 

@@ -108,7 +108,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     let llm_runtime = SharedLlmRuntime::new(
         provider.clone(),
         router_from_models(config.provider.models.clone()),
-        config.provider.kind.clone(),
+        config.provider.kind,
         model.clone(),
     );
 
@@ -298,7 +298,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
     let llm_runtime = SharedLlmRuntime::new(
         provider.clone(),
         router_from_models(config.provider.models.clone()),
-        config.provider.kind.clone(),
+        config.provider.kind,
         model.clone(),
     );
 

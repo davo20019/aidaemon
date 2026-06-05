@@ -632,10 +632,12 @@ impl Agent {
                 .iter()
                 .filter(|tc| tool_call_is_side_effecting(self, tc, available_capabilities))
                 .all(|tc| crate::agent::recall_guardrails::is_personal_memory_tool(&tc.name));
-            // Sub-sessions (spawned TaskLead/Executor) exist to execute actions —
-            // never redirect them to plain-text mode.
-            let is_sub_session = session_id.starts_with("sub-");
-            if !is_sub_session
+            // Child sessions (spawned TaskLead/Executor) exist to execute actions —
+            // never redirect them to plain-text mode. `sub-` is the legacy prefix
+            // kept for in-flight tasks; new sessions use `specialist:`.
+            let is_child_session =
+                session_id.starts_with("sub-") || session_id.starts_with("specialist:");
+            if !is_child_session
                 && !all_side_effecting_are_memory
                 && turn_prefers_plain_text_completion(turn_context)
             {

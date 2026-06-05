@@ -1051,6 +1051,10 @@ impl Tool for ManageOAuthTool {
 }
 
 #[cfg(test)]
+// These tests serialize global env-var mutation via a shared lock; the guard
+// must intentionally span `.await` points to keep parallel tests isolated, so
+// `clippy::await_holding_lock` is a false positive for this pattern.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1270,6 +1274,10 @@ allowed_domains = ["api.linear.app"]
 
     #[tokio::test]
     async fn describe_provider_surfaces_localhost_callback_warning() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+
         let config_file = NamedTempFile::new().unwrap();
         write_minimal_config(config_file.path());
         let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
@@ -1281,6 +1289,8 @@ allowed_domains = ["api.linear.app"]
             .call(r#"{"action":"describe_provider","service":"twitter"}"#)
             .await
             .unwrap();
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
 
         assert!(result.contains("callback_url: http://localhost:8080/oauth/callback"));
         assert!(result.contains("same machine running aidaemon"));

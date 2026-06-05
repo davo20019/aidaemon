@@ -6354,6 +6354,10 @@ fn run_local_attach_interactive(
 }
 
 #[cfg(test)]
+// `Nonce::from_slice` (re-exported via aes-gcm's generic-array 0.x) is
+// deprecated pending the generic-array 1.x upgrade, which is a dependency-tree
+// change out of scope here. Allow it for these crypto round-trip tests only.
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use tempfile::tempdir;

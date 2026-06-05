@@ -79,7 +79,10 @@ pub(crate) fn build_available_specialists_block(
 
     let mut s = String::from(
         "## Available Specialists\n\n\
-         When you delegate work with `spawn_agent`, pick the specialist that best matches the task:\n\n",
+         When you delegate work with `spawn_agent`, pick the specialist that best matches the task. \
+         Sub-agents run in an isolated context window with the same tools you have, so keep the `mission` \
+         and `task` brief minimal — reference files by path rather than pasting contents, and skip prior \
+         tool output or conversation history the sub-agent does not need:\n\n",
     );
     for (name, description) in &entries {
         s.push_str("- `");
@@ -312,7 +315,7 @@ impl Agent {
             .state
             .get_relevant_facts_for_channel(
                 user_text,
-                self.max_facts,
+                self.limits.max_facts,
                 channel_ctx.channel_id.as_deref(),
                 channel_ctx.visibility,
             )
@@ -607,7 +610,7 @@ impl Agent {
             &skills_snapshot,
             &active_skills,
             &memory_context,
-            self.max_facts,
+            self.limits.max_facts,
             if suggestions.is_empty() {
                 None
             } else {

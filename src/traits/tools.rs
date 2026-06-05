@@ -154,6 +154,49 @@ impl ToolTargetHint {
     }
 }
 
+/// High-level domain a tool can inspect or mutate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSemanticScope {
+    GoalState,
+    UserMemory,
+    ConversationHistory,
+    ExternalRemote,
+    LocalWorkspace,
+    HostLocal,
+}
+
+/// Fine-grained semantic capability advertised by a tool.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSemanticFacet {
+    GoalState,
+}
+
+/// Structured semantic affordances for matching tools to contextual requests.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolSemanticAffordances {
+    pub scope: ToolSemanticScope,
+    #[serde(default)]
+    pub facets: Vec<ToolSemanticFacet>,
+}
+
+#[allow(dead_code)]
+impl ToolSemanticAffordances {
+    pub fn new(scope: ToolSemanticScope, facets: &[ToolSemanticFacet]) -> Self {
+        Self {
+            scope,
+            facets: facets.to_vec(),
+        }
+    }
+
+    pub fn supports(&self, facet: ToolSemanticFacet) -> bool {
+        self.facets.contains(&facet)
+    }
+}
+
 /// Structured completion semantics for a specific tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ToolCallSemantics {
@@ -618,6 +661,12 @@ pub trait Tool: Send + Sync {
             arguments,
             self.capabilities(),
         )
+    }
+
+    /// Semantic domains this tool can answer or affect.
+    #[allow(dead_code)]
+    fn semantic_affordances(&self) -> Option<ToolSemanticAffordances> {
+        None
     }
 
     /// Whether this tool is currently operational.

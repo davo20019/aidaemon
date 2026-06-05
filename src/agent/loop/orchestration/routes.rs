@@ -1581,7 +1581,7 @@ mod tests {
 
     #[test]
     fn delegation_filter_requires_cli_agent_in_defs() {
-        let defs = vec![
+        let defs = [
             json!({"function":{"name":"terminal"}}),
             json!({"function":{"name":"run_command"}}),
             json!({"function":{"name":"web_search"}}),

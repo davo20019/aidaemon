@@ -157,6 +157,9 @@ use loop_utils::{
 mod post_task;
 use post_task::LearningContext;
 pub(in crate::agent) use post_task::ReplayNoteCategory;
+#[allow(dead_code, unused_imports)]
+#[path = "loop/state/mod.rs"]
+mod loop_state;
 #[path = "loop/stopping_conditions.rs"]
 mod stopping_conditions;
 #[path = "loop/tool_loop_state.rs"]
@@ -166,6 +169,8 @@ mod tool_loop_state;
 mod bootstrap_phase;
 #[path = "loop/completion_phase.rs"]
 mod completion_phase;
+#[path = "runtime/dialogue_state.rs"]
+mod dialogue_state;
 #[path = "loop/direct_return.rs"]
 mod direct_return;
 #[path = "loop/fallthrough.rs"]
@@ -182,6 +187,8 @@ pub(crate) mod specialists;
 pub(crate) use parent_delivery::ParentDeliveryKind;
 #[path = "loop/response_phase.rs"]
 mod response_phase;
+#[path = "loop/services.rs"]
+mod services;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
@@ -209,6 +216,8 @@ mod sliding_window;
 mod spawn;
 #[path = "loop/stopping_phase.rs"]
 mod stopping_phase;
+#[path = "loop/stopping_progress.rs"]
+mod stopping_progress;
 #[path = "loop/system_directives.rs"]
 mod system_directives;
 #[path = "runtime/system_prompt.rs"]
@@ -1593,32 +1602,10 @@ pub struct Agent {
     skill_cache: skills::SkillCache,
     /// Current recursion depth (0 = root agent).
     depth: usize,
-    /// Maximum allowed recursion depth for sub-agent spawning.
-    max_depth: usize,
-    /// Iteration limit configuration (unlimited, soft, or hard limits).
-    iteration_config: IterationLimitConfig,
-    /// Legacy: Maximum agentic loop iterations per invocation (for backward compat).
-    #[allow(dead_code)]
-    max_iterations: usize,
-    /// Legacy: Hard cap on iterations (for backward compat).
-    #[allow(dead_code)]
-    max_iterations_cap: usize,
-    /// Max chars for sub-agent response truncation.
-    max_response_chars: usize,
-    /// Timeout in seconds for sub-agent execution.
-    timeout_secs: u64,
-    /// Maximum number of facts to inject into the system prompt.
-    max_facts: usize,
+    /// Static limits, budgets, and timeout settings.
+    limits: AgentLimits,
     /// When true, the user has manually set a model via /model — skip auto-routing.
     model_override: RwLock<bool>,
-    /// Optional daily token budget — rejects LLM calls when exceeded.
-    daily_token_budget: Option<u64>,
-    /// Per-LLM-call timeout (watchdog). None disables the timeout.
-    llm_call_timeout: Option<Duration>,
-    /// Optional task timeout - maximum time per task.
-    task_timeout: Option<Duration>,
-    /// Optional token budget per task.
-    task_token_budget: Option<u64>,
     /// Path verification tracker — gates file-modifying commands on unverified paths.
     /// None for sub-agents (they inherit parent context).
     verification_tracker: Option<Arc<VerificationTracker>>,
@@ -1675,6 +1662,38 @@ pub struct Agent {
     /// Loaded once at agent construction and shared with every child agent
     /// spawned from this hierarchy.
     pub(crate) specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
+}
+
+struct AgentLimits {
+    max_depth: usize,
+    iteration_config: IterationLimitConfig,
+    #[allow(dead_code)]
+    max_iterations: usize,
+    #[allow(dead_code)]
+    max_iterations_cap: usize,
+    max_response_chars: usize,
+    timeout_secs: u64,
+    max_facts: usize,
+    daily_token_budget: Option<u64>,
+    llm_call_timeout: Option<Duration>,
+    task_timeout: Option<Duration>,
+    task_token_budget: Option<u64>,
+}
+
+impl AgentLimits {
+    /// Absolute timeout ceiling (seconds) a spawned specialist may request.
+    ///
+    /// `timeout_secs` defaults to 300, but a configured `0` means "no parent
+    /// timeout"; in that case we still impose a 1-hour implicit cap so a
+    /// specialist cannot request an unbounded timeout. Encapsulating this here
+    /// keeps the `> 0` guard in one place instead of inline at each call site.
+    fn timeout_cap(&self) -> u64 {
+        if self.timeout_secs > 0 {
+            self.timeout_secs
+        } else {
+            3600
+        }
+    }
 }
 
 /// Blocked path patterns for auto-sent files (mirrors SendFileTool).
@@ -3625,18 +3644,20 @@ impl Agent {
             skill_cache: skills::SkillCache::new(skills_dir.clone()),
             skills_dir,
             depth: 0,
-            max_depth,
-            iteration_config,
-            max_iterations,
-            max_iterations_cap,
-            max_response_chars,
-            timeout_secs,
-            max_facts,
+            limits: AgentLimits {
+                max_depth,
+                iteration_config,
+                max_iterations,
+                max_iterations_cap,
+                max_response_chars,
+                timeout_secs,
+                max_facts,
+                daily_token_budget,
+                llm_call_timeout: llm_call_timeout_secs.map(Duration::from_secs),
+                task_timeout: task_timeout_secs.map(Duration::from_secs),
+                task_token_budget,
+            },
             model_override: RwLock::new(false),
-            daily_token_budget,
-            llm_call_timeout: llm_call_timeout_secs.map(Duration::from_secs),
-            task_timeout: task_timeout_secs.map(Duration::from_secs),
-            task_token_budget,
             verification_tracker: Some(Arc::new(VerificationTracker::new())),
             mcp_registry,
             role: AgentRole::Orchestrator,
@@ -3685,7 +3706,7 @@ impl Agent {
 
     #[cfg(test)]
     pub fn set_test_task_token_budget(&mut self, budget: Option<u64>) {
-        self.task_token_budget = budget;
+        self.limits.task_token_budget = budget;
     }
 
     #[cfg(test)]
@@ -3695,18 +3716,18 @@ impl Agent {
 
     #[cfg(test)]
     pub fn set_test_daily_token_budget(&mut self, budget: Option<u64>) {
-        self.daily_token_budget = budget;
+        self.limits.daily_token_budget = budget;
     }
 
     #[cfg(test)]
     pub fn set_test_iteration_config(&mut self, config: IterationLimitConfig) {
-        self.iteration_config = config;
+        self.limits.iteration_config = config;
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn set_test_task_timeout(&mut self, timeout: Option<Duration>) {
-        self.task_timeout = timeout;
+        self.limits.task_timeout = timeout;
     }
 
     #[cfg(test)]
@@ -3786,18 +3807,20 @@ impl Agent {
             skill_cache: skills::SkillCache::new(skills_dir.clone()),
             skills_dir,
             depth,
-            max_depth,
-            iteration_config,
-            max_iterations,
-            max_iterations_cap,
-            max_response_chars,
-            timeout_secs,
-            max_facts,
+            limits: AgentLimits {
+                max_depth,
+                iteration_config,
+                max_iterations,
+                max_iterations_cap,
+                max_response_chars,
+                timeout_secs,
+                max_facts,
+                daily_token_budget: None,
+                llm_call_timeout,
+                task_timeout,
+                task_token_budget,
+            },
             model_override: RwLock::new(false),
-            daily_token_budget: None,
-            llm_call_timeout,
-            task_timeout,
-            task_token_budget,
             verification_tracker,
             mcp_registry,
             role,
@@ -3840,7 +3863,7 @@ impl Agent {
 
     /// Maximum recursion depth allowed.
     pub fn max_depth(&self) -> usize {
-        self.max_depth
+        self.limits.max_depth
     }
 
     /// Role for this agent instance.
@@ -3901,7 +3924,7 @@ impl Agent {
     /// Maximum agentic loop iterations per invocation.
     #[allow(dead_code)]
     pub fn max_iterations(&self) -> usize {
-        self.max_iterations
+        self.limits.max_iterations
     }
 
     /// Maximum number of retries for transient LLM errors.

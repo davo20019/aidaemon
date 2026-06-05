@@ -204,8 +204,12 @@ fn dedupe_sessions(sessions: Vec<String>) -> Vec<String> {
 }
 
 fn is_internal_session(session_id: &str) -> bool {
+    // `sub-` is the legacy child-session prefix; nothing constructs it anymore
+    // (replaced by `specialist:`), but DBs from older releases may still hold
+    // rows keyed by it. Keep recognition until those rows have aged out.
     session_id.starts_with("background:")
         || session_id.starts_with("sub-")
+        || session_id.starts_with("specialist:")
         || session_id.starts_with("scheduled_")
         || session_id == "system"
 }

@@ -908,6 +908,10 @@ fn urlencoded(s: &str) -> String {
 }
 
 #[cfg(test)]
+// These tests serialize global env-var mutation via `ENV_LOCK`; the guard must
+// intentionally span `.await` points to keep parallel tests isolated, so
+// `clippy::await_holding_lock` is a false positive for this pattern.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1135,7 +1139,7 @@ mod tests {
                 Some("authorization_code")
             );
             assert_eq!(form.get("code").map(String::as_str), Some("auth-code"));
-            assert!(form.get("code_verifier").is_some());
+            assert!(form.contains_key("code_verifier"));
             Json(serde_json::json!({
                 "access_token": "restart-safe-token",
                 "refresh_token": "refresh-123",

@@ -1175,6 +1175,10 @@ impl Tool for ManageHttpAuthTool {
 }
 
 #[cfg(test)]
+// These tests serialize global env-var mutation via a shared lock; the guard
+// must intentionally span `.await` points to keep parallel tests isolated, so
+// `clippy::await_holding_lock` is a false positive for this pattern.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use once_cell::sync::Lazy;

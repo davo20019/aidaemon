@@ -152,11 +152,11 @@ impl Tool for ScheduledGoalsTool {
         }
     }
 
-    fn semantic_affordances(&self) -> ToolSemanticAffordances {
-        ToolSemanticAffordances::new(
+    fn semantic_affordances(&self) -> Option<ToolSemanticAffordances> {
+        Some(ToolSemanticAffordances::new(
             ToolSemanticScope::GoalState,
             &[ToolSemanticFacet::GoalState],
-        )
+        ))
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -214,6 +214,7 @@ mod tests {
     async fn affordances_are_goal_state() {
         let tool = ScheduledGoalsTool::new(setup_state().await);
         let affordances = tool.semantic_affordances();
+        let affordances = affordances.expect("scheduled_goals should advertise affordances");
         assert_eq!(affordances.scope, ToolSemanticScope::GoalState);
         assert!(affordances.supports(ToolSemanticFacet::GoalState));
     }

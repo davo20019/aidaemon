@@ -954,6 +954,17 @@ impl Agent {
                 },
             )
             .await;
+        if let Err(err) = self
+            .record_dialogue_task_end(emitter.session_id(), task_id, status)
+            .await
+        {
+            warn!(
+                session_id = emitter.session_id(),
+                task_id,
+                error = %err,
+                "Failed to record dialogue task end"
+            );
+        }
         self.run_task_end_tool_hooks(task_id, emitter.session_id())
             .await;
     }

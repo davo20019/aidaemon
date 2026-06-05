@@ -132,7 +132,7 @@ async fn test_personal_recall_turn_routes_at_least_primary_model() {
     );
     let calls = harness.provider.call_log.lock().await;
     assert!(
-        calls.len() >= 1,
+        !calls.is_empty(),
         "Execution loop should make at least one LLM call"
     );
     assert_eq!(
@@ -383,7 +383,7 @@ async fn test_deferred_action_after_tool_progress_does_not_complete_task() {
     // INTENT_GATE) and mutation-contract nudges.
     let call_count = harness.provider.call_count().await;
     assert!(
-        call_count >= 4 && call_count <= 7,
+        (4..=7).contains(&call_count),
         "Expected 4-7 LLM calls, got {}",
         call_count
     );

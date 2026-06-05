@@ -13,7 +13,7 @@ use crate::agent::execution_state::{
 };
 use crate::agent::recall_guardrails::is_personal_memory_tool;
 use crate::agent::*;
-use crate::traits::{ToolCallSemantics, ToolTargetHint, ToolTargetHintKind};
+use crate::traits::{ToolCallSemantics, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind};
 use crate::utils::{truncate_str, truncate_with_note};
 
 const TOOL_COMPLETE_SUMMARY_MAX_CHARS: usize = 140;
@@ -70,6 +70,34 @@ fn raw_internal_scope_violation(
     }
 
     None
+}
+
+fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope> {
+    match tool_name {
+        "web_search" | "web_fetch" | "http_request" | "browser" => {
+            Some(ToolSemanticScope::ExternalRemote)
+        }
+        "read_file" | "search_files" | "edit_file" | "write_file" | "terminal"
+        | "project_inspect" => Some(ToolSemanticScope::LocalWorkspace),
+        "read_channel_history" => Some(ToolSemanticScope::ConversationHistory),
+        "remember_fact" | "manage_memories" | "share_memory" => Some(ToolSemanticScope::UserMemory),
+        "scheduled_goals" | "manage_goal_tasks" => Some(ToolSemanticScope::GoalState),
+        "system_info" => Some(ToolSemanticScope::HostLocal),
+        _ => None,
+    }
+}
+
+fn semantic_scope_blocks_tool(
+    active_scope: Option<ToolSemanticScope>,
+    tool_scope: Option<ToolSemanticScope>,
+) -> bool {
+    matches!(
+        (active_scope, tool_scope),
+        (
+            Some(ToolSemanticScope::GoalState),
+            Some(ToolSemanticScope::ExternalRemote)
+        )
+    )
 }
 
 struct DeterministicToolContractViolation {
@@ -724,6 +752,17 @@ impl Agent {
         let mut successful_tool_calls = 0;
         let mut iteration_had_tool_failures = false;
         let mut hard_block_streak: usize = 0;
+        let active_dialogue_scope = self
+            .state
+            .get_dialogue_state(session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|state| {
+                state
+                    .open_request
+                    .and_then(|request| request.semantic_scope)
+            });
         info!(
             session_id,
             iteration,
@@ -963,6 +1002,69 @@ impl Agent {
                     Some(task_id),
                 )
                 .await?;
+                iteration_had_tool_failures = true;
+                continue;
+            }
+
+            let tool_semantic_scope = self
+                .tools
+                .iter()
+                .find(|tool| tool.name() == tc.name && tool.is_available())
+                .and_then(|tool| {
+                    tool.semantic_affordances()
+                        .map(|affordances| affordances.scope)
+                })
+                .or_else(|| fallback_tool_semantic_scope(&tc.name));
+            if semantic_scope_blocks_tool(active_dialogue_scope, tool_semantic_scope) {
+                *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+                let active_scope = active_dialogue_scope
+                    .map(|scope| format!("{scope:?}"))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let tool_scope = tool_semantic_scope
+                    .map(|scope| format!("{scope:?}"))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let result_text = format!(
+                    "[SYSTEM] Semantic scope blocked `{}`: active request scope is {}, but the tool scope is {}. Continue with tools that match the active request.",
+                    tc.name, active_scope, tool_scope
+                );
+                let tool_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "tool".to_string(),
+                    content: Some(result_text.clone()),
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_name: Some(tc.name.clone()),
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.2,
+                    ..Message::runtime_defaults()
+                };
+                self.append_tool_message_with_result_event(
+                    emitter,
+                    &tool_msg,
+                    true,
+                    0,
+                    None,
+                    Some(task_id),
+                )
+                .await?;
+                self.emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::ExecutionFailureClassification,
+                    format!(
+                        "Blocked {} because it did not match dialogue scope",
+                        tc.name
+                    ),
+                    json!({
+                        "condition": "dialogue_semantic_scope_violation",
+                        "tool": tc.name,
+                        "active_scope": active_scope,
+                        "tool_scope": tool_scope,
+                    }),
+                )
+                .await;
                 iteration_had_tool_failures = true;
                 continue;
             }

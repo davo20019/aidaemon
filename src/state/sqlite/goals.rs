@@ -1,4 +1,5 @@
 use super::*;
+use crate::traits::GoalNotificationStore;
 
 #[async_trait]
 impl crate::traits::GoalStore for SqliteStateStore {
@@ -466,7 +467,10 @@ impl crate::traits::GoalStore for SqliteStateStore {
 
         Ok(result.rows_affected() > 0)
     }
+}
 
+#[async_trait]
+impl crate::traits::TaskStore for SqliteStateStore {
     async fn create_task(&self, task: &Task) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO tasks (id, goal_id, description, status, priority, task_order,
@@ -680,7 +684,10 @@ impl crate::traits::GoalStore for SqliteStateStore {
             })
             .collect())
     }
+}
 
+#[async_trait]
+impl crate::traits::GoalScheduleStore for SqliteStateStore {
     async fn create_goal_schedule(&self, schedule: &GoalSchedule) -> anyhow::Result<()> {
         if schedule.tz != "local" {
             anyhow::bail!(
@@ -947,7 +954,10 @@ impl crate::traits::GoalStore for SqliteStateStore {
             })
             .collect())
     }
+}
 
+#[async_trait]
+impl crate::traits::GoalBudgetStore for SqliteStateStore {
     async fn reset_daily_token_budgets(&self) -> anyhow::Result<u64> {
         let result = sqlx::query(
             "UPDATE goals
@@ -1028,7 +1038,10 @@ impl crate::traits::GoalStore for SqliteStateStore {
             tokens_used_today: r.get("tokens_used_today"),
         }))
     }
+}
 
+#[async_trait]
+impl crate::traits::ScheduledRunStore for SqliteStateStore {
     async fn upsert_scheduled_run_state(&self, state: &ScheduledRunState) -> anyhow::Result<()> {
         let health_json = serde_json::to_string(&state.health)?;
         sqlx::query(
@@ -1094,7 +1107,10 @@ impl crate::traits::GoalStore for SqliteStateStore {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+}
 
+#[async_trait]
+impl crate::traits::TaskDispatchStore for SqliteStateStore {
     async fn get_pending_tasks_by_priority(&self, limit: i64) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
             "SELECT t.id, t.goal_id, t.description, t.status, t.priority, t.task_order,
@@ -1237,7 +1253,10 @@ impl crate::traits::GoalStore for SqliteStateStore {
         .await?;
         Ok(result.rows_affected() > 0)
     }
+}
 
+#[async_trait]
+impl crate::traits::GoalNotificationStore for SqliteStateStore {
     async fn count_active_evergreen_goals(&self) -> anyhow::Result<i64> {
         let row = sqlx::query(
             "SELECT COUNT(*) as cnt FROM goals

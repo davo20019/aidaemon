@@ -372,11 +372,12 @@ impl Agent {
         // prevents hung provider calls from blocking the agent loop forever.
         const DEFAULT_LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360);
         let effective_llm_timeout = if pending_external_action_ack.is_some() {
-            self.llm_call_timeout
+            self.limits
+                .llm_call_timeout
                 .map(|timeout| timeout.min(timeout_after_external_action))
                 .unwrap_or(timeout_after_external_action)
         } else {
-            self.llm_call_timeout.unwrap_or(DEFAULT_LLM_TIMEOUT)
+            self.limits.llm_call_timeout.unwrap_or(DEFAULT_LLM_TIMEOUT)
         };
         let timeout_dur = effective_llm_timeout;
         let mut resp = match tokio::time::timeout(

@@ -72,6 +72,14 @@ impl Agent {
                 },
             )
             .await;
+        if let Err(err) = self.record_dialogue_task_start(session_id, &task_id).await {
+            warn!(
+                session_id,
+                task_id,
+                error = %err,
+                "Failed to record dialogue task start"
+            );
+        }
 
         // 1. Persist the user message
         //

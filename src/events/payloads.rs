@@ -480,6 +480,9 @@ pub enum ErrorType {
 pub struct SubAgentSpawnData {
     /// Session ID of the child agent
     pub child_session_id: String,
+    /// Stable specialist profile assigned to the child agent
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specialist_kind: Option<String>,
     /// Mission description for the sub-agent
     pub mission: String,
     /// Specific task assigned
@@ -496,6 +499,9 @@ pub struct SubAgentSpawnData {
 pub struct SubAgentCompleteData {
     /// Session ID of the child agent
     pub child_session_id: String,
+    /// Stable specialist profile assigned to the child agent
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specialist_kind: Option<String>,
     /// Whether the sub-agent succeeded
     pub success: bool,
     /// Brief summary of the result

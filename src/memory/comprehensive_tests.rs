@@ -485,7 +485,7 @@ async fn test_channel_scoped_fact_isolation_deep() {
     // Note: upsert_fact doesn't check channel_id for matching — it matches by category+key.
     // So the second upsert will supersede the first regardless of channel.
     // This is a design assumption test.
-    assert!(active.len() >= 1, "At least one active fact should exist");
+    assert!(!active.is_empty(), "At least one active fact should exist");
 }
 
 /// Verify Global facts are accessible from any context.

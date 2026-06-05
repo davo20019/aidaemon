@@ -208,6 +208,17 @@ impl Agent {
                 },
             )
             .await;
+        if let Err(err) = self
+            .record_dialogue_task_end(session_id, &checkpoint.task_id, TaskStatus::Failed)
+            .await
+        {
+            warn!(
+                session_id,
+                task_id = %checkpoint.task_id,
+                error = %err,
+                "Failed to record dialogue task end for stale checkpoint"
+            );
+        }
         self.run_task_end_tool_hooks(&checkpoint.task_id, session_id)
             .await;
     }

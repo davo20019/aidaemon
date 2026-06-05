@@ -4,11 +4,13 @@ use crate::testing::{
     MockProvider,
 };
 use crate::traits::{
-    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, Tool, ToolCall, ToolChoiceMode,
+    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, Tool, ToolCall, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolChoiceMode, ToolTargetHintKind, ToolVerificationMode,
 };
-use crate::types::{ChannelContext, UserRole};
+use crate::types::{ChannelContext, StatusUpdate, UserRole};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -264,6 +266,426 @@ impl Tool for MockProjectInspectTool {
             path
         ))
     }
+}
+
+struct CountingSendFileTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for CountingSendFileTool {
+    fn name(&self) -> &str {
+        "send_file"
+    }
+
+    fn description(&self) -> &str {
+        "Mock send_file tool for force-text characterization"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "send_file",
+            "description": "Mock send file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "caption": {"type": "string"}
+                },
+                "required": ["file_path"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok("File sent successfully.".to_string())
+    }
+}
+
+struct BackgroundDetachTool;
+
+#[async_trait]
+impl Tool for BackgroundDetachTool {
+    fn name(&self) -> &str {
+        "background_task"
+    }
+
+    fn description(&self) -> &str {
+        "Mock tool that detaches work to the background"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "background_task",
+            "description": "Mock background detach",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job": {"type": "string"}
+                },
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok("Background job started.".to_string())
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let _ = (arguments, status_tx);
+        Ok(ToolCallOutcome {
+            output: "Background job started.".to_string(),
+            metadata: ToolCallMetadata {
+                background_started: true,
+                detached: true,
+                completion_notifications_enabled: true,
+                ..ToolCallMetadata::default()
+            },
+        })
+    }
+}
+
+struct MockRemoteMutationTool;
+
+#[async_trait]
+impl Tool for MockRemoteMutationTool {
+    fn name(&self) -> &str {
+        "update_remote"
+    }
+
+    fn description(&self) -> &str {
+        "Mock tool that updates a remote URL"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "update_remote",
+            "description": "Mock remote update",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"}
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+        let url = args["url"].as_str().unwrap_or("https://example.com/status");
+        Ok(format!("Updated {}", url))
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+        let url = args["url"].as_str().unwrap_or("https://example.com/status");
+        ToolCallSemantics::mutation().with_target_hint(ToolTargetHintKind::Url, url)
+    }
+}
+
+struct MockRemoteObservationTool;
+
+#[async_trait]
+impl Tool for MockRemoteObservationTool {
+    fn name(&self) -> &str {
+        "check_remote"
+    }
+
+    fn description(&self) -> &str {
+        "Mock tool that checks a remote URL"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "check_remote",
+            "description": "Mock remote check",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"}
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+        let url = args["url"].as_str().unwrap_or("https://example.com/status");
+        Ok(format!("Verified {} shows the updated status.", url))
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+        let url = args["url"].as_str().unwrap_or("https://example.com/status");
+        ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent)
+            .with_target_hint(ToolTargetHintKind::Url, url)
+    }
+}
+
+#[tokio::test]
+async fn force_text_characterization_strips_tools_after_duplicate_send_file() {
+    let send_file_args =
+        r#"{"file_path":"/tmp/aidaemon-characterization.pdf","caption":"Characterization"}"#;
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("send_file", send_file_args),
+        MockProvider::tool_call_response("send_file", send_file_args),
+        MockProvider::tool_call_response("send_file", send_file_args),
+        MockProvider::text_response("Done. I already sent the file."),
+    ]);
+    let send_file_calls = Arc::new(AtomicUsize::new(0));
+
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![Arc::new(CountingSendFileTool {
+            calls: send_file_calls.clone(),
+        }) as Arc<dyn Tool>],
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "force_text_characterization",
+            "Send me the characterization PDF",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "Done. I already sent the file.");
+    assert_eq!(
+        send_file_calls.load(Ordering::SeqCst),
+        1,
+        "duplicate send_file calls should be suppressed before force-text closeout"
+    );
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert!(
+        call_log.last().is_some_and(|call| call.tools.is_empty()),
+        "force-text closeout should strip tools on the final LLM call: {:?}",
+        call_log.last().map(|call| &call.tools)
+    );
+}
+
+#[tokio::test]
+async fn verification_characterization_blocks_completion_until_matching_observation() {
+    let url = "https://example.com/status";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("update_remote", &json!({"url": url}).to_string()),
+        MockProvider::text_response("Updated it."),
+        MockProvider::tool_call_response("check_remote", &json!({"url": url}).to_string()),
+        MockProvider::text_response("Updated and verified the status page."),
+    ]);
+
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![
+            Arc::new(MockRemoteMutationTool) as Arc<dyn Tool>,
+            Arc::new(MockRemoteObservationTool) as Arc<dyn Tool>,
+        ],
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "verification_characterization",
+            &format!("Update {} and verify it.", url),
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "Updated and verified the status page.");
+    assert_eq!(
+        harness.provider.call_count().await,
+        4,
+        "the premature final text should be blocked so the verification tool can run"
+    );
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert!(
+        call_log.iter().any(|call| {
+            call.messages.iter().any(|message| {
+                message.get("role").and_then(|v| v.as_str()) == Some("system")
+                    && message
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|content| {
+                            content.contains("final verification step")
+                                || content.contains("verification")
+                        })
+            })
+        }),
+        "verification guard should inject a verification-required system directive"
+    );
+}
+
+#[tokio::test]
+async fn stall_characterization_stops_repeated_unknown_tool_before_final_text() {
+    let mut responses = Vec::new();
+    for attempt in 1..=7 {
+        responses.push({
+            let mut resp = MockProvider::tool_call_response("unknown_stall_tool", "{}");
+            resp.content = Some(format!("I'll retry the same tool, attempt {}.", attempt));
+            resp
+        });
+    }
+    responses.push(MockProvider::text_response("This should not be reached."));
+    let provider = MockProvider::with_responses(responses);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    let reply = harness
+        .agent
+        .handle_message(
+            "stall_characterization",
+            "Use the unavailable stall tool",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !reply.contains("This should not be reached"),
+        "stall detection should stop repeated unknown-tool attempts before the scripted final text"
+    );
+    assert!(
+        harness.provider.call_count().await < 8,
+        "stall detection should stop early; provider calls: {}",
+        harness.provider.call_count().await
+    );
+}
+
+#[tokio::test]
+async fn truncation_characterization_reassembles_mid_sentence_text_continuation() {
+    let prefix = format!(
+        "{} ",
+        std::iter::repeat_n("partial", 205)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let continuation = "and the final sentence is complete.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(&prefix),
+        MockProvider::text_response(continuation),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    let reply = harness
+        .agent
+        .handle_message(
+            "truncation_characterization",
+            "Draft a long status update",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, format!("{}{}", prefix, continuation));
+    assert_eq!(
+        harness.provider.call_count().await,
+        2,
+        "truncated first response should trigger exactly one continuation pass"
+    );
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert!(
+        call_log.last().is_some_and(|call| {
+            call.messages.iter().any(|message| {
+                message.get("role").and_then(|v| v.as_str()) == Some("system")
+                    && message
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|content| {
+                            content.contains("previous text response was cut off mid-sentence")
+                                && content.contains("Continue your response")
+                        })
+            })
+        }),
+        "continuation pass should include the truncation recovery directive"
+    );
+}
+
+#[tokio::test]
+async fn background_ack_characterization_forces_text_with_handoff_directive() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("background_task", r#"{"job":"long-running"}"#),
+        MockProvider::text_response("This model text should be ignored."),
+    ]);
+
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![Arc::new(BackgroundDetachTool) as Arc<dyn Tool>],
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "background_ack_characterization",
+            "Start a long running background job",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "This model text should be ignored.");
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(
+        call_log.len(),
+        2,
+        "background detach currently runs one forced text summary pass after the tool call"
+    );
+    assert!(
+        call_log.last().is_some_and(|call| call.tools.is_empty()),
+        "background detach should strip tools on the forced text pass"
+    );
+    assert!(
+        call_log.last().is_some_and(|call| {
+            call.messages.iter().any(|message| {
+                message.get("role").and_then(|v| v.as_str()) == Some("system")
+                    && message
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|content| {
+                            content.contains("A background task is now running")
+                                && content.contains("completion notifications are enabled")
+                        })
+            })
+        }),
+        "background detach should carry a handoff directive into the forced text pass"
+    );
 }
 
 #[tokio::test]

@@ -691,6 +691,28 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // --- Dialogue state projection ---
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS dialogue_states (
+            session_id TEXT PRIMARY KEY,
+            state_json TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            active_task_id TEXT,
+            open_request_status TEXT,
+            awaiting_user_reply INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_dialogue_states_active_task ON dialogue_states(active_task_id)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_dialogue_states_open_request_status ON dialogue_states(open_request_status)")
+        .execute(pool)
+        .await?;
+
     // Migrate legacy message rows into canonical events and remove the table.
     migrate_legacy_messages_to_events(pool).await?;
 

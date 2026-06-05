@@ -1,8 +1,21 @@
 use super::SpecialistRenderContext;
 
+/// Shared executor frame included via `{{executor_base}}` in every
+/// executor-flavored specialist .md (executor, code, research, review,
+/// comms_draft, browser_verifier, artifact_writer, generic). Carries the
+/// sub-agent header, mission/task headings, and the discipline rules so each
+/// kind file only contains its role-specific tagline.
+///
+/// The file is intentionally body-only (no YAML frontmatter) and is NOT
+/// loaded by the registry; it is spliced in by `render_template` before any
+/// other placeholder substitution so the base's own `{{mission}}`/`{{task}}`/
+/// `{{depth}}` markers resolve normally.
+const EXECUTOR_BASE: &str = include_str!("../../../specialists/_executor_base.md");
+
 pub fn render_template(template: &str, ctx: &SpecialistRenderContext) -> String {
     let bools = |b: bool| if b { "true" } else { "false" };
     template
+        .replace("{{executor_base}}", EXECUTOR_BASE)
         .replace("{{mission}}", &ctx.mission)
         .replace("{{task}}", &ctx.task)
         .replace("{{depth}}", &ctx.depth.to_string())

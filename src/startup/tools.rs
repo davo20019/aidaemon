@@ -49,7 +49,7 @@ pub struct RuntimeToolsOutcome {
     pub oauth_gateway: Option<crate::oauth::OAuthGateway>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumCount, strum::EnumIter)]
 enum BaseToolId {
     SystemInfo,
     Terminal,
@@ -75,61 +75,103 @@ enum BaseToolId {
     ServiceStatus,
 }
 
-impl BaseToolId {
-    fn name(self) -> &'static str {
-        match self {
-            BaseToolId::SystemInfo => "system_info",
-            BaseToolId::Terminal => "terminal",
-            BaseToolId::RememberFact => "remember_fact",
-            BaseToolId::ShareMemory => "share_memory",
-            BaseToolId::ManageMemories => "manage_memories",
-            BaseToolId::ScheduledGoalRuns => "scheduled_goal_runs",
-            BaseToolId::GoalTrace => "goal_trace",
-            BaseToolId::ToolTrace => "tool_trace",
-            BaseToolId::PolicyMetrics => "policy_metrics",
-            BaseToolId::ConfigManager => "manage_config",
-            BaseToolId::WebFetch => "web_fetch",
-            BaseToolId::WebSearch => "web_search",
-            BaseToolId::ReadFile => "read_file",
-            BaseToolId::WriteFile => "write_file",
-            BaseToolId::EditFile => "edit_file",
-            BaseToolId::SearchFiles => "search_files",
-            BaseToolId::ProjectInspect => "project_inspect",
-            BaseToolId::RunCommand => "run_command",
-            BaseToolId::GitInfo => "git_info",
-            BaseToolId::GitCommit => "git_commit",
-            BaseToolId::CheckEnvironment => "check_environment",
-            BaseToolId::ServiceStatus => "service_status",
-        }
-    }
+struct BaseToolSpec {
+    id: BaseToolId,
+    name: &'static str,
 }
 
-const BASE_TOOL_MANIFEST: &[BaseToolId] = &[
-    BaseToolId::SystemInfo,
-    BaseToolId::Terminal,
-    BaseToolId::RememberFact,
-    BaseToolId::ShareMemory,
-    BaseToolId::ManageMemories,
-    BaseToolId::ScheduledGoalRuns,
-    BaseToolId::GoalTrace,
-    BaseToolId::ToolTrace,
-    BaseToolId::PolicyMetrics,
-    BaseToolId::ConfigManager,
-    BaseToolId::WebFetch,
-    BaseToolId::WebSearch,
-    BaseToolId::ReadFile,
-    BaseToolId::WriteFile,
-    BaseToolId::EditFile,
-    BaseToolId::SearchFiles,
-    BaseToolId::ProjectInspect,
-    BaseToolId::RunCommand,
-    BaseToolId::GitInfo,
-    BaseToolId::GitCommit,
-    BaseToolId::CheckEnvironment,
-    BaseToolId::ServiceStatus,
+const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
+    BaseToolSpec {
+        id: BaseToolId::SystemInfo,
+        name: "system_info",
+    },
+    BaseToolSpec {
+        id: BaseToolId::Terminal,
+        name: "terminal",
+    },
+    BaseToolSpec {
+        id: BaseToolId::RememberFact,
+        name: "remember_fact",
+    },
+    BaseToolSpec {
+        id: BaseToolId::ShareMemory,
+        name: "share_memory",
+    },
+    BaseToolSpec {
+        id: BaseToolId::ManageMemories,
+        name: "manage_memories",
+    },
+    BaseToolSpec {
+        id: BaseToolId::ScheduledGoalRuns,
+        name: "scheduled_goal_runs",
+    },
+    BaseToolSpec {
+        id: BaseToolId::GoalTrace,
+        name: "goal_trace",
+    },
+    BaseToolSpec {
+        id: BaseToolId::ToolTrace,
+        name: "tool_trace",
+    },
+    BaseToolSpec {
+        id: BaseToolId::PolicyMetrics,
+        name: "policy_metrics",
+    },
+    BaseToolSpec {
+        id: BaseToolId::ConfigManager,
+        name: "manage_config",
+    },
+    BaseToolSpec {
+        id: BaseToolId::WebFetch,
+        name: "web_fetch",
+    },
+    BaseToolSpec {
+        id: BaseToolId::WebSearch,
+        name: "web_search",
+    },
+    BaseToolSpec {
+        id: BaseToolId::ReadFile,
+        name: "read_file",
+    },
+    BaseToolSpec {
+        id: BaseToolId::WriteFile,
+        name: "write_file",
+    },
+    BaseToolSpec {
+        id: BaseToolId::EditFile,
+        name: "edit_file",
+    },
+    BaseToolSpec {
+        id: BaseToolId::SearchFiles,
+        name: "search_files",
+    },
+    BaseToolSpec {
+        id: BaseToolId::ProjectInspect,
+        name: "project_inspect",
+    },
+    BaseToolSpec {
+        id: BaseToolId::RunCommand,
+        name: "run_command",
+    },
+    BaseToolSpec {
+        id: BaseToolId::GitInfo,
+        name: "git_info",
+    },
+    BaseToolSpec {
+        id: BaseToolId::GitCommit,
+        name: "git_commit",
+    },
+    BaseToolSpec {
+        id: BaseToolId::CheckEnvironment,
+        name: "check_environment",
+    },
+    BaseToolSpec {
+        id: BaseToolId::ServiceStatus,
+        name: "service_status",
+    },
 ];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumCount, strum::EnumIter)]
 enum OptionalToolId {
     Diagnose,
     #[cfg(feature = "browser")]
@@ -141,33 +183,69 @@ enum OptionalToolId {
     SlackChannelHistory,
 }
 
-impl OptionalToolId {
-    fn name(self) -> &'static str {
-        match self {
-            OptionalToolId::Diagnose => "diagnose",
-            #[cfg(feature = "browser")]
-            OptionalToolId::Browser => "browser",
-            OptionalToolId::SendFile => "send_file",
-            OptionalToolId::CliAgents => "cli_agents",
-            OptionalToolId::HealthProbe => "health_probe",
-            #[cfg(feature = "slack")]
-            OptionalToolId::SlackChannelHistory => "read_channel_history",
-        }
-    }
+struct OptionalToolSpec {
+    id: OptionalToolId,
+    name: &'static str,
+    enabled_if: fn(&AppConfig) -> bool,
 }
 
-const OPTIONAL_TOOL_MANIFEST: &[OptionalToolId] = &[
-    OptionalToolId::Diagnose,
+fn optional_enabled_diagnostics(config: &AppConfig) -> bool {
+    config.diagnostics.enabled
+}
+
+#[cfg(feature = "browser")]
+fn optional_enabled_browser(config: &AppConfig) -> bool {
+    config.browser.enabled
+}
+
+fn optional_enabled_files(config: &AppConfig) -> bool {
+    config.files.enabled
+}
+
+fn optional_enabled_cli_agents(config: &AppConfig) -> bool {
+    config.cli_agents.enabled
+}
+
+fn optional_enabled_always(_: &AppConfig) -> bool {
+    true
+}
+
+const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
+    OptionalToolSpec {
+        id: OptionalToolId::Diagnose,
+        name: "diagnose",
+        enabled_if: optional_enabled_diagnostics,
+    },
     #[cfg(feature = "browser")]
-    OptionalToolId::Browser,
-    OptionalToolId::SendFile,
-    OptionalToolId::CliAgents,
-    OptionalToolId::HealthProbe,
+    OptionalToolSpec {
+        id: OptionalToolId::Browser,
+        name: "browser",
+        enabled_if: optional_enabled_browser,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::SendFile,
+        name: "send_file",
+        enabled_if: optional_enabled_files,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::CliAgents,
+        name: "cli_agents",
+        enabled_if: optional_enabled_cli_agents,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::HealthProbe,
+        name: "health_probe",
+        enabled_if: optional_enabled_always,
+    },
     #[cfg(feature = "slack")]
-    OptionalToolId::SlackChannelHistory,
+    OptionalToolSpec {
+        id: OptionalToolId::SlackChannelHistory,
+        name: "read_channel_history",
+        enabled_if: optional_enabled_always,
+    },
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumCount, strum::EnumIter)]
 enum RuntimeToolId {
     ManageMcp,
     ManagePeople,
@@ -178,30 +256,11 @@ enum RuntimeToolId {
     SpawnAgent,
 }
 
-impl RuntimeToolId {
-    fn name(self) -> &'static str {
-        match self {
-            RuntimeToolId::ManageMcp => "manage_mcp",
-            RuntimeToolId::ManagePeople => "manage_people",
-            RuntimeToolId::HttpRequest => "http_request",
-            RuntimeToolId::ManageHttpAuth => "manage_http_auth",
-            RuntimeToolId::ManageOauth => "manage_oauth",
-            RuntimeToolId::ManageApi => "manage_api",
-            RuntimeToolId::SpawnAgent => "spawn_agent",
-        }
-    }
-}
-
 struct RuntimeToolSpec {
     id: RuntimeToolId,
+    name: &'static str,
     enabled_if: fn(&AppConfig) -> bool,
     depends_on: &'static [RuntimeToolId],
-}
-
-impl RuntimeToolSpec {
-    fn name(&self) -> &'static str {
-        self.id.name()
-    }
 }
 
 fn runtime_enabled_always(_: &AppConfig) -> bool {
@@ -223,40 +282,55 @@ fn runtime_enabled_spawn(config: &AppConfig) -> bool {
 const RUNTIME_TOOL_MANIFEST: &[RuntimeToolSpec] = &[
     RuntimeToolSpec {
         id: RuntimeToolId::ManageMcp,
+        name: "manage_mcp",
         enabled_if: runtime_enabled_always,
         depends_on: &[],
     },
     RuntimeToolSpec {
         id: RuntimeToolId::ManagePeople,
+        name: "manage_people",
         enabled_if: runtime_enabled_always,
         depends_on: &[],
     },
     RuntimeToolSpec {
         id: RuntimeToolId::HttpRequest,
+        name: "http_request",
         enabled_if: runtime_enabled_http_request,
         depends_on: &[],
     },
     RuntimeToolSpec {
         id: RuntimeToolId::ManageHttpAuth,
+        name: "manage_http_auth",
         enabled_if: runtime_enabled_always,
         depends_on: &[RuntimeToolId::HttpRequest],
     },
     RuntimeToolSpec {
         id: RuntimeToolId::ManageOauth,
+        name: "manage_oauth",
         enabled_if: runtime_enabled_oauth,
         depends_on: &[RuntimeToolId::HttpRequest],
     },
     RuntimeToolSpec {
         id: RuntimeToolId::ManageApi,
+        name: "manage_api",
         enabled_if: runtime_enabled_always,
         depends_on: &[RuntimeToolId::HttpRequest, RuntimeToolId::ManageOauth],
     },
     RuntimeToolSpec {
         id: RuntimeToolId::SpawnAgent,
+        name: "spawn_agent",
         enabled_if: runtime_enabled_spawn,
         depends_on: &[],
     },
 ];
+
+fn runtime_tool_name(manifest: &[RuntimeToolSpec], id: RuntimeToolId) -> &'static str {
+    manifest
+        .iter()
+        .find(|spec| spec.id == id)
+        .map(|spec| spec.name)
+        .unwrap_or("<unknown>")
+}
 
 fn validate_runtime_manifest(manifest: &[RuntimeToolSpec]) -> anyhow::Result<()> {
     let mut seen_ids: HashSet<RuntimeToolId> = HashSet::new();
@@ -265,12 +339,12 @@ fn validate_runtime_manifest(manifest: &[RuntimeToolSpec]) -> anyhow::Result<()>
         anyhow::ensure!(
             seen_ids.insert(spec.id),
             "runtime manifest is invalid: duplicate tool id {}",
-            spec.name()
+            spec.name
         );
         anyhow::ensure!(
-            seen_names.insert(spec.name()),
+            seen_names.insert(spec.name),
             "runtime manifest is invalid: duplicate tool name {}",
-            spec.name()
+            spec.name
         );
     }
 
@@ -281,14 +355,14 @@ fn validate_runtime_manifest(manifest: &[RuntimeToolSpec]) -> anyhow::Result<()>
             anyhow::ensure!(
                 defined_ids.contains(dep),
                 "runtime manifest is invalid: tool {} declares unknown dependency {}",
-                spec.name(),
-                dep.name()
+                spec.name,
+                runtime_tool_name(manifest, *dep)
             );
             anyhow::ensure!(
                 declared.contains(dep),
                 "runtime manifest is invalid: tool {} depends on {} but dependency appears after it",
-                spec.name(),
-                dep.name()
+                spec.name,
+                runtime_tool_name(manifest, *dep)
             );
         }
         declared.insert(spec.id);
@@ -308,12 +382,12 @@ pub async fn build_base_tools(
     let (approval_tx, approval_rx) = mpsc::channel(approval_queue_capacity);
     let (media_tx, media_rx) = mpsc::channel::<MediaMessage>(media_queue_capacity);
 
-    let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(BASE_TOOL_MANIFEST.len());
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(BASE_TOOL_REGISTRY.len());
     let mut terminal_tool: Option<Arc<TerminalTool>> = None;
 
-    for tool_id in BASE_TOOL_MANIFEST {
+    for spec in BASE_TOOL_REGISTRY {
         let built = build_base_tool(
-            *tool_id,
+            spec.id,
             config,
             &config_path,
             state.clone(),
@@ -322,7 +396,7 @@ pub async fn build_base_tools(
         )
         .await?;
         info!(
-            tool = tool_id.name(),
+            tool = spec.name,
             "Registered base tool from startup manifest"
         );
         if terminal_tool.is_none() {
@@ -361,12 +435,14 @@ pub async fn register_optional_tools(
     let mut has_cli_agents = false;
     let mut cli_agent_tool: Option<Arc<CliAgentTool>> = None;
 
-    for tool_id in OPTIONAL_TOOL_MANIFEST {
-        match tool_id {
+    for spec in OPTIONAL_TOOL_REGISTRY {
+        if !(spec.enabled_if)(config) {
+            continue;
+        }
+
+        let tools_before = tools.len();
+        match spec.id {
             OptionalToolId::Diagnose => {
-                if !config.diagnostics.enabled {
-                    continue;
-                }
                 tools.push(Arc::new(DiagnoseTool::new(
                     event_store.clone(),
                     state.clone(),
@@ -377,18 +453,12 @@ pub async fn register_optional_tools(
             }
             #[cfg(feature = "browser")]
             OptionalToolId::Browser => {
-                if !config.browser.enabled {
-                    continue;
-                }
                 tools.push(Arc::new(BrowserTool::new(
                     config.browser.clone(),
                     media_tx.clone(),
                 )));
             }
             OptionalToolId::SendFile => {
-                if !config.files.enabled {
-                    continue;
-                }
                 std::fs::create_dir_all(&inbox_dir)?;
                 tools.push(Arc::new(SendFileTool::new(
                     media_tx.clone(),
@@ -397,9 +467,6 @@ pub async fn register_optional_tools(
                 )));
             }
             OptionalToolId::CliAgents => {
-                if !config.cli_agents.enabled {
-                    continue;
-                }
                 let cli_tool = CliAgentTool::discover(
                     config.cli_agents.clone(),
                     state.clone(),
@@ -449,10 +516,17 @@ pub async fn register_optional_tools(
             }
         }
 
-        info!(
-            tool = tool_id.name(),
-            "Registered optional tool from startup manifest"
-        );
+        // Log the tools actually pushed this iteration by their real schema
+        // names. The `CliAgents` arm registers two tools (cli_agent +
+        // manage_cli_agents), and the early-`continue` arms register none, so
+        // reporting `spec.name` (a config-group pseudo-name) would mislead.
+        for tool in &tools[tools_before..] {
+            info!(
+                group = spec.name,
+                tool = tool.name(),
+                "Registered optional tool from startup manifest"
+            );
+        }
     }
 
     Ok(OptionalToolsOutcome {
@@ -482,7 +556,7 @@ pub async fn register_runtime_tools(
     for spec in RUNTIME_TOOL_MANIFEST {
         if !(spec.enabled_if)(config) {
             info!(
-                tool = spec.name(),
+                tool = spec.name,
                 "Skipped runtime tool from startup manifest (condition disabled)"
             );
             continue;
@@ -492,11 +566,11 @@ pub async fn register_runtime_tools(
             .depends_on
             .iter()
             .filter(|dep| !registered_runtime_tools.contains(dep))
-            .map(|dep| dep.name())
+            .map(|dep| runtime_tool_name(RUNTIME_TOOL_MANIFEST, *dep))
             .collect();
         if !missing_dependencies.is_empty() {
             info!(
-                tool = spec.name(),
+                tool = spec.name,
                 missing_dependencies = ?missing_dependencies,
                 "Skipped runtime tool from startup manifest (dependencies not satisfied)"
             );
@@ -519,8 +593,8 @@ pub async fn register_runtime_tools(
         .await?;
         registered_runtime_tools.insert(spec.id);
         info!(
-            tool = spec.name(),
-            dependencies = ?spec.depends_on.iter().map(|dep| dep.name()).collect::<Vec<_>>(),
+            tool = spec.name,
+            dependencies = ?spec.depends_on.iter().map(|dep| runtime_tool_name(RUNTIME_TOOL_MANIFEST, *dep)).collect::<Vec<_>>(),
             "Registered runtime tool from startup manifest"
         );
     }
@@ -835,7 +909,7 @@ mod tests {
         let llm_runtime = SharedLlmRuntime::new(
             model_provider,
             router_from_models(config.provider.models.clone()),
-            config.provider.kind.clone(),
+            config.provider.kind,
             config.provider.models.primary.clone(),
         );
         let _optional = register_optional_tools(
@@ -874,11 +948,85 @@ mod tests {
     #[test]
     fn manifest_has_unique_tool_names() {
         let mut seen = HashSet::new();
-        for tool in BASE_TOOL_MANIFEST {
+        for tool in BASE_TOOL_REGISTRY {
             assert!(
-                seen.insert(tool.name()),
+                seen.insert(tool.name),
                 "duplicate tool name in manifest: {}",
-                tool.name()
+                tool.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn base_tool_registry_names_match_built_schema_names() {
+        let schemas = build_tool_schemas_for_contract_validation(false, false, false)
+            .await
+            .unwrap();
+        let built_base_names: Vec<&str> = schemas
+            .iter()
+            .take(BASE_TOOL_REGISTRY.len())
+            .map(|schema| {
+                schema["function"]["name"]
+                    .as_str()
+                    .expect("built tool schema should expose a function name")
+            })
+            .collect();
+        let registry_names: Vec<&str> = BASE_TOOL_REGISTRY.iter().map(|tool| tool.name).collect();
+
+        assert_eq!(built_base_names, registry_names);
+    }
+
+    // Completeness guards: every enum variant MUST have a registry entry.
+    // Without these, adding a `BaseToolId`/`OptionalToolId`/`RuntimeToolId`
+    // variant (plus its construction match arm) but forgetting the registry
+    // entry compiles cleanly and passes the name tests — the tool is silently
+    // never registered. The `EnumCount`/`EnumIter` derives make the registry's
+    // completeness checkable: a new variant bumps `COUNT` and these fail until
+    // the registry is updated.
+    #[test]
+    fn base_registry_covers_every_variant() {
+        use strum::{EnumCount, IntoEnumIterator};
+        assert_eq!(
+            BASE_TOOL_REGISTRY.len(),
+            BaseToolId::COUNT,
+            "BASE_TOOL_REGISTRY is missing an entry for a BaseToolId variant"
+        );
+        for id in BaseToolId::iter() {
+            assert!(
+                BASE_TOOL_REGISTRY.iter().any(|spec| spec.id == id),
+                "BaseToolId::{id:?} has no BASE_TOOL_REGISTRY entry (silently unregistered)"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_registry_covers_every_variant() {
+        use strum::{EnumCount, IntoEnumIterator};
+        assert_eq!(
+            OPTIONAL_TOOL_REGISTRY.len(),
+            OptionalToolId::COUNT,
+            "OPTIONAL_TOOL_REGISTRY is missing an entry for an OptionalToolId variant"
+        );
+        for id in OptionalToolId::iter() {
+            assert!(
+                OPTIONAL_TOOL_REGISTRY.iter().any(|spec| spec.id == id),
+                "OptionalToolId::{id:?} has no OPTIONAL_TOOL_REGISTRY entry (silently unregistered)"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_registry_covers_every_variant() {
+        use strum::{EnumCount, IntoEnumIterator};
+        assert_eq!(
+            RUNTIME_TOOL_MANIFEST.len(),
+            RuntimeToolId::COUNT,
+            "RUNTIME_TOOL_MANIFEST is missing an entry for a RuntimeToolId variant"
+        );
+        for id in RuntimeToolId::iter() {
+            assert!(
+                RUNTIME_TOOL_MANIFEST.iter().any(|spec| spec.id == id),
+                "RuntimeToolId::{id:?} has no RUNTIME_TOOL_MANIFEST entry (silently unregistered)"
             );
         }
     }
@@ -886,11 +1034,11 @@ mod tests {
     #[test]
     fn optional_manifest_has_unique_tool_names() {
         let mut seen = HashSet::new();
-        for tool in OPTIONAL_TOOL_MANIFEST {
+        for tool in OPTIONAL_TOOL_REGISTRY {
             assert!(
-                seen.insert(tool.name()),
+                seen.insert(tool.name),
                 "duplicate optional tool name in manifest: {}",
-                tool.name()
+                tool.name
             );
         }
     }
@@ -900,19 +1048,16 @@ mod tests {
         let mut seen = HashSet::new();
         for tool in RUNTIME_TOOL_MANIFEST {
             assert!(
-                seen.insert(tool.name()),
+                seen.insert(tool.name),
                 "duplicate runtime tool name in manifest: {}",
-                tool.name()
+                tool.name
             );
         }
     }
 
     #[test]
     fn runtime_manifest_matches_expected_pipeline_order() {
-        let names: Vec<&'static str> = RUNTIME_TOOL_MANIFEST
-            .iter()
-            .map(|tool| tool.name())
-            .collect();
+        let names: Vec<&'static str> = RUNTIME_TOOL_MANIFEST.iter().map(|tool| tool.name).collect();
         assert_eq!(
             names,
             vec![
@@ -935,8 +1080,8 @@ mod tests {
                 assert!(
                     seen.contains(dep),
                     "runtime tool {} depends on {} but dependency appears after it",
-                    spec.name(),
-                    dep.name()
+                    spec.name,
+                    runtime_tool_name(RUNTIME_TOOL_MANIFEST, *dep)
                 );
             }
             seen.insert(spec.id);
@@ -953,11 +1098,13 @@ mod tests {
         let manifest = [
             RuntimeToolSpec {
                 id: RuntimeToolId::ManageMcp,
+                name: "manage_mcp",
                 enabled_if: runtime_enabled_always,
                 depends_on: &[],
             },
             RuntimeToolSpec {
                 id: RuntimeToolId::ManageMcp,
+                name: "manage_mcp_duplicate",
                 enabled_if: runtime_enabled_always,
                 depends_on: &[],
             },
@@ -972,6 +1119,7 @@ mod tests {
     fn runtime_manifest_validator_rejects_unknown_dependencies() {
         let manifest = [RuntimeToolSpec {
             id: RuntimeToolId::ManageOauth,
+            name: "manage_oauth",
             enabled_if: runtime_enabled_always,
             depends_on: &[RuntimeToolId::HttpRequest],
         }];
@@ -986,11 +1134,13 @@ mod tests {
         let manifest = [
             RuntimeToolSpec {
                 id: RuntimeToolId::ManageOauth,
+                name: "manage_oauth",
                 enabled_if: runtime_enabled_always,
                 depends_on: &[RuntimeToolId::HttpRequest],
             },
             RuntimeToolSpec {
                 id: RuntimeToolId::HttpRequest,
+                name: "http_request",
                 enabled_if: runtime_enabled_always,
                 depends_on: &[],
             },

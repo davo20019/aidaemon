@@ -255,10 +255,14 @@ impl Agent {
     /// source of truth for the base template, then splice in the same dynamic
     /// sections (working directory, task contract, cli-agent suffix) the
     /// legacy builder produced. Keeps byte-equivalence with
-    /// `build_executor_prompt` when all dynamic inputs are empty.
+    /// `build_executor_prompt` when `specialist_kind == Executor` and all
+    /// dynamic inputs are empty. Other kinds render their own .md (which
+    /// includes the shared `{{executor_base}}` partial plus a kind-specific
+    /// tagline), so the child sees a role-appropriate prompt.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::agent) fn compose_executor_prompt_from_registry(
         registry: &SpecialistRegistry,
+        specialist_kind: SpecialistKind,
         task_description: &str,
         parent_mission: &str,
         depth: usize,
@@ -287,7 +291,7 @@ impl Agent {
             parent_session_id: String::new(),
             execution_mode: String::new(),
         };
-        let base = registry.render(SpecialistKind::Executor, &ctx);
+        let base = registry.render(specialist_kind, &ctx);
 
         // Build the dynamic mid-section (working directory + task contract)
         // that the legacy builder inserts between the sub-agent header and
@@ -447,7 +451,7 @@ impl Agent {
             goal_description,
             goal_context.as_deref(),
             child_depth,
-            self.max_depth,
+            self.limits.max_depth,
             has_cli_agent,
             is_scheduled,
         );
@@ -761,8 +765,8 @@ impl Agent {
         let spawn_tool = if add_spawn_tool {
             Some(Arc::new(
                 crate::tools::spawn::SpawnAgentTool::new_deferred(
-                    self.max_response_chars,
-                    self.timeout_secs,
+                    self.limits.max_response_chars,
+                    self.limits.timeout_secs,
                 )
                 .with_state(self.state.clone()),
             ))
@@ -782,8 +786,9 @@ impl Agent {
             }
         };
 
-        let effective_max_iterations = max_iterations_override.unwrap_or(self.max_iterations);
-        let effective_timeout_secs = timeout_secs_override.unwrap_or(self.timeout_secs);
+        let effective_max_iterations =
+            max_iterations_override.unwrap_or(self.limits.max_iterations);
+        let effective_timeout_secs = timeout_secs_override.unwrap_or(self.limits.timeout_secs);
         let child = Arc::new(Agent::with_depth(
             self.llm_runtime.clone(),
             self.state.clone(),
@@ -794,16 +799,16 @@ impl Agent {
             self.config_path.clone(),
             self.skills_dir.clone(),
             child_depth,
-            self.max_depth,
-            self.iteration_config.clone(),
+            self.limits.max_depth,
+            self.limits.iteration_config.clone(),
             effective_max_iterations,
-            self.max_iterations_cap,
-            self.max_response_chars,
+            self.limits.max_iterations_cap,
+            self.limits.max_response_chars,
             effective_timeout_secs,
-            self.max_facts,
-            self.task_timeout,
-            self.task_token_budget,
-            self.llm_call_timeout,
+            self.limits.max_facts,
+            self.limits.task_timeout,
+            self.limits.task_token_budget,
+            self.limits.llm_call_timeout,
             self.mcp_registry.clone(),
             self.verification_tracker.clone(),
             role,
@@ -855,10 +860,10 @@ impl Agent {
         inherited_project_scope: Option<&str>,
         arg_specialist: Option<&str>,
     ) -> anyhow::Result<String> {
-        if self.depth >= self.max_depth {
+        if self.depth >= self.limits.max_depth {
             anyhow::bail!(
                 "Cannot spawn sub-agent: max recursion depth ({}) reached",
-                self.max_depth
+                self.limits.max_depth
             );
         }
 
@@ -945,12 +950,25 @@ impl Agent {
                             self.state.clone(),
                         )));
                     }
+                    // Resolve the specialist kind here so the prompt reflects
+                    // the role-specific tagline (Code/Research/Review/etc.)
+                    // instead of always rendering the generic Executor body.
+                    // `spawn_child_inner` resolves the same kind again from the
+                    // same inputs for tool/budget application — both calls are
+                    // idempotent.
+                    let specialist_kind = Self::resolve_specialist_kind(
+                        Some(AgentRole::Executor),
+                        arg_specialist,
+                        mission,
+                        task,
+                    );
                     let prompt = Self::compose_executor_prompt_from_registry(
                         &self.specialists,
+                        specialist_kind,
                         task,
                         mission,
                         child_depth,
-                        self.max_depth,
+                        self.limits.max_depth,
                         effective_delegation_mode,
                         task_id,
                         inherited_project_scope,
@@ -981,7 +999,7 @@ impl Agent {
                 }
                 AgentRole::Orchestrator => {
                     // Orchestrator: full loop with spawn available (unless at max depth)
-                    let at_max_depth = child_depth >= self.max_depth;
+                    let at_max_depth = child_depth >= self.limits.max_depth;
                     let depth_note = if at_max_depth {
                         "\nYou are at the maximum sub-agent depth. You CANNOT spawn further sub-agents; \
                         the `spawn_agent` tool is not available to you. Complete the task directly."
@@ -994,14 +1012,14 @@ impl Agent {
                         **Mission:** {}\n\n\
                         Focus exclusively on this mission. Be concise. Return your findings/results \
                         directly — they will be consumed by the parent agent.{}",
-                        self.system_prompt, child_depth, self.max_depth, mission, depth_note
+                        self.system_prompt, child_depth, self.limits.max_depth, mission, depth_note
                     );
                     (full_tools, prompt, None)
                 }
             }
         } else {
             // Legacy behavior: no role scoping
-            let at_max_depth = child_depth >= self.max_depth;
+            let at_max_depth = child_depth >= self.limits.max_depth;
             let depth_note = if at_max_depth {
                 "\nYou are at the maximum sub-agent depth. You CANNOT spawn further sub-agents; \
                 the `spawn_agent` tool is not available to you. Complete the task directly."
@@ -1014,13 +1032,14 @@ impl Agent {
                 **Mission:** {}\n\n\
                 Focus exclusively on this mission. Be concise. Return your findings/results \
                 directly — they will be consumed by the parent agent.{}",
-                self.system_prompt, child_depth, self.max_depth, mission, depth_note
+                self.system_prompt, child_depth, self.limits.max_depth, mission, depth_note
             );
             (full_tools, prompt, None)
         };
 
         let effective_role = child_role.unwrap_or(AgentRole::Orchestrator);
-        let can_spawn = child_depth < self.max_depth && effective_role != AgentRole::Executor;
+        let can_spawn =
+            child_depth < self.limits.max_depth && effective_role != AgentRole::Executor;
 
         // For TaskLead, pass goal_id; other roles get no goal context injection.
         let goal_for_child = if effective_role == AgentRole::TaskLead {
@@ -1098,18 +1117,10 @@ impl Agent {
             specialist_validation::clamp_max_iterations(
                 specialist_kind,
                 raw,
-                self.max_iterations_cap,
+                self.limits.max_iterations_cap,
             )
         });
-        // `self.timeout_secs` is `u64` and defaults to 300, but a config of
-        // `0` is interpreted as "no parent timeout". In that case we still
-        // want a sane absolute ceiling so a specialist can't request an
-        // unbounded timeout; use 1 hour as the implicit cap.
-        let timeout_cap = if self.timeout_secs > 0 {
-            self.timeout_secs
-        } else {
-            3600
-        };
+        let timeout_cap = self.limits.timeout_cap();
         let timeout_secs_override = def
             .timeout_secs
             .map(|raw| specialist_validation::clamp_timeout(specialist_kind, raw, timeout_cap));
@@ -1313,10 +1324,10 @@ impl Agent {
             let goal_id = &goal_id;
             let goal_description = &goal_description;
             let user_text = &user_text;
-            if self.depth >= self.max_depth {
+            if self.depth >= self.limits.max_depth {
                 anyhow::bail!(
                     "Cannot spawn task lead: max recursion depth ({}) reached",
-                    self.max_depth
+                    self.limits.max_depth
                 );
             }
 

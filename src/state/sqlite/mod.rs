@@ -1518,6 +1518,7 @@ fn days_until_date(value: &str, today: chrono::NaiveDate) -> Option<i64> {
 }
 
 mod conversation_summary;
+mod dialogue_state;
 mod dynamic_bots;
 mod dynamic_cli_agents;
 mod dynamic_mcp;

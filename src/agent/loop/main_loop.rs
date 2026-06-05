@@ -4,9 +4,7 @@ use super::message_build_phase::{MessageBuildCtx, MessageBuildData};
 use super::orchestration_phase::OrchestrationCtx;
 use super::response_phase::{ResponsePhaseCtx, ResponsePhaseOutcome};
 use super::stopping_phase::{StoppingPhaseCtx, StoppingPhaseOutcome};
-use super::tool_execution_phase::{
-    PendingReflectionRecovery, ToolErrorEntry, ToolExecutionCtx, ToolExecutionOutcome,
-};
+use super::tool_execution_phase::{ToolExecutionCtx, ToolExecutionOutcome};
 use super::tool_prelude_phase::{ToolPreludeCtx, ToolPreludeOutcome};
 use super::*;
 
@@ -159,6 +157,28 @@ impl Agent {
             .iter()
             .map(|reason| reason.as_code())
             .collect();
+        let llm_user_text = if turn_context.followup_mode == Some(FollowupMode::Followup) {
+            match self.state.get_dialogue_state(session_id).await {
+                Ok(Some(dialogue_state)) => dialogue_state
+                    .open_request
+                    .as_ref()
+                    .map(|request| request.text.trim())
+                    .filter(|original| {
+                        !original.is_empty() && !original.eq_ignore_ascii_case(user_text.trim())
+                    })
+                    .map(|original| {
+                        format!(
+                            "Original request:\n{}\n\nFollow-up:\n{}",
+                            original,
+                            user_text.trim()
+                        )
+                    })
+                    .unwrap_or_else(|| user_text.to_string()),
+                Ok(None) | Err(_) => user_text.to_string(),
+            }
+        } else {
+            user_text.to_string()
+        };
         let mut completion_progress = CompletionProgress::new(&turn_context.completion_contract);
         let (execution_budget_tier, execution_budget_route, execution_budget) =
             select_initial_execution_budget(user_text, &turn_context, self.depth, self.role);
@@ -216,24 +236,52 @@ impl Agent {
         // 3. Agentic loop — runs until natural completion or safety limits
         let task_start = Instant::now();
         let mut last_progress_summary = Instant::now();
-        let mut iteration: usize = 0;
-        let mut stall_count: usize = 0;
-        let mut deferred_no_tool_streak: usize = 0;
-        let mut deferred_no_tool_model_switches: usize = 0;
-        let mut total_successful_tool_calls: usize = 0;
-        let mut total_tool_calls_attempted: usize = 0;
-        let mut task_tokens_used: u64 = 0;
-        let mut tool_failure_count: HashMap<String, usize> = HashMap::new();
-        let mut tool_failure_signatures: HashMap<(String, String), usize> = HashMap::new();
-        let mut tool_transient_failure_count: HashMap<String, usize> = HashMap::new();
-        let mut tool_cooldown_until_iteration: HashMap<String, usize> = HashMap::new();
-        let mut tool_call_count: HashMap<String, usize> = HashMap::new();
-        let mut personal_memory_tool_calls: usize = 0;
-        let mut no_evidence_result_streak: usize = 0;
-        let mut no_evidence_tools_seen: HashSet<String> = HashSet::new();
-        let mut evidence_gain_count: usize = 0;
-        let mut evidence_state = EvidenceState::default();
-        let mut validation_state = ValidationState::default();
+        const MAX_FORCE_TEXT_ITERATIONS: usize = 3;
+        const MAX_BUDGET_EXTENSIONS: usize = 3;
+        const HARD_TOKEN_CAP: i64 = 2_000_000;
+        const SCHEDULED_MAX_BUDGET_EXTENSIONS: usize = 12;
+        const SCHEDULED_HARD_TOKEN_CAP: i64 = 20_000_000;
+
+        let iteration_limits = match &self.limits.iteration_config {
+            IterationLimitConfig::Unlimited => super::loop_state::IterationLimitSettings {
+                hard_cap: Some(HARD_ITERATION_CAP),
+                soft_threshold: None,
+                soft_warn_at: None,
+            },
+            IterationLimitConfig::Soft { threshold, warn_at } => {
+                super::loop_state::IterationLimitSettings {
+                    hard_cap: Some(HARD_ITERATION_CAP),
+                    soft_threshold: Some(*threshold),
+                    soft_warn_at: Some(*warn_at),
+                }
+            }
+            IterationLimitConfig::Hard { initial: _, cap } => {
+                super::loop_state::IterationLimitSettings {
+                    hard_cap: Some(*cap),
+                    soft_threshold: None,
+                    soft_warn_at: None,
+                }
+            }
+        };
+        let mut turn_state = super::loop_state::TurnState {
+            stall: super::loop_state::StallTracker::with_recent_capacity(RECENT_CALLS_WINDOW),
+            failures: super::loop_state::FailureLedger::default(),
+            recovery: super::loop_state::RecoveryState::default(),
+            budget: super::loop_state::BudgetTracker::new(
+                self.limits.task_token_budget,
+                self.limits.daily_token_budget,
+                iteration_limits,
+            ),
+            evidence: super::loop_state::EvidenceLedger::default(),
+            reflection: super::loop_state::ReflectionState::default(),
+            directives: super::loop_state::PendingDirectives::default(),
+            counters: super::loop_state::LoopCounters::new(
+                infer_intent_gate(user_text, "")
+                    .needs_tools
+                    .unwrap_or(false),
+            ),
+        };
+        let _services = super::services::AgentServices::new(self);
 
         // Task-start planning call: generate a structured plan before the main loop.
         // Skipped for conversational queries, short messages, and acknowledgments.
@@ -306,7 +354,10 @@ impl Agent {
                     execution_state.install_linear_intent_plan(1, linear_steps);
 
                     if !plan.success_criteria.is_empty() {
-                        validation_state.set_plan(1, &plan.success_criteria);
+                        turn_state
+                            .evidence
+                            .validation_state_mut()
+                            .set_plan(1, &plan.success_criteria);
                     }
 
                     execution_state.promote_budget_for_plan(step_count);
@@ -321,45 +372,10 @@ impl Agent {
             }
         }
 
-        // Track which error solutions were injected so we can credit them on recovery.
-        let mut pending_error_solution_ids: Vec<i64> = Vec::new();
-        let mut tool_error_history: HashMap<(String, String), Vec<ToolErrorEntry>> = HashMap::new();
-        let mut reflection_completed: HashSet<(String, String)> = HashSet::new();
-        let mut pending_reflection_recoveries: HashMap<String, PendingReflectionRecovery> =
-            HashMap::new();
-        // In-session error learning: track repeated failures by (tool, normalized error pattern).
-        let mut tool_failure_patterns: HashMap<(String, String), usize> = HashMap::new();
-        let mut last_tool_failure: Option<(String, String)> = None;
-        let mut in_session_learned: HashSet<(String, String)> = HashSet::new();
-        let mut unknown_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut recent_tool_calls: VecDeque<u64> = VecDeque::with_capacity(RECENT_CALLS_WINDOW);
-        // Tracks consecutive calls to the same tool name, plus the set of
-        // unique argument hashes seen during the streak.  When every call in
-        // the streak has unique args the agent is likely making progress (e.g.
-        // running different terminal commands), so we only trigger the stall
-        // guard when the ratio of unique args is low.
-        let mut consecutive_same_tool: (String, usize) = (String::new(), 0);
-        let mut consecutive_same_tool_arg_hashes: HashSet<u64> = HashSet::new();
-        let mut soft_limit_warned = false;
-        // Force-stop flag: when true, strip tools from next LLM call to force
-        // a text response. Activated after too many tool calls without settling.
-        let mut force_text_response = false;
-        // Safety net: count consecutive iterations where force_text_response was
-        // active.  After MAX_FORCE_TEXT_ITERATIONS the loop hard-returns the last
-        // text regardless of completion/consultant analysis.
-        let mut force_text_iterations: usize = 0;
-        const MAX_FORCE_TEXT_ITERATIONS: usize = 3;
-        let mut budget_warning_sent = false;
-        let mut effective_task_budget = self.task_token_budget;
-        let mut effective_daily_budget = self.daily_token_budget;
-        let mut budget_extensions_count: usize = 0;
-        const MAX_BUDGET_EXTENSIONS: usize = 3;
-        const HARD_TOKEN_CAP: i64 = 2_000_000;
-        const SCHEDULED_MAX_BUDGET_EXTENSIONS: usize = 12;
-        const SCHEDULED_HARD_TOKEN_CAP: i64 = 20_000_000;
-        let mut pending_system_messages: Vec<SystemDirective> = Vec::new();
         if route_failsafe_active {
-            pending_system_messages.push(SystemDirective::RouteFailsafeActive);
+            turn_state
+                .directives
+                .push_system_message(SystemDirective::RouteFailsafeActive);
         }
         let has_recent_tool_context = turn_context
             .recent_messages
@@ -369,71 +385,19 @@ impl Agent {
             && (turn_context.followup_mode != Some(FollowupMode::NewTask)
                 || has_recent_tool_context)
         {
-            pending_system_messages.push(SystemDirective::EvidenceGroundingRequired);
+            turn_state
+                .directives
+                .push_system_message(SystemDirective::EvidenceGroundingRequired);
         }
-        // Track recent tool names for alternating pattern detection (A-B-A-B cycles)
-        let mut recent_tool_names: VecDeque<String> = VecDeque::new();
-        // Cache of last successful tool results (keyed by call hash).
-        // When the repetitive redirect fires for read_file/search_files, we
-        // replay the cached content so the model retains data lost to context
-        // truncation instead of getting a generic "BLOCKED" message.
-        let mut tool_result_cache: HashMap<u64, String> = HashMap::new();
-        // Mid-loop adaptation and fallback expansion controls.
-        let mut last_escalation_iteration: Option<usize> = None;
-        let mut consecutive_clean_iterations: usize = 0;
-        let mut fallback_expanded_once = false;
-        // One-shot recovery for empty execution responses (no text + no tool calls).
-        let mut empty_response_retry_used = false;
-        let mut empty_response_retry_pending = false;
-        let mut empty_response_retry_note: Option<String> = None;
-        // Accumulated text from a truncated text response; prepended on next iteration.
-        let mut truncated_text_prefix: Option<String> = None;
-        // Counts consecutive LLM calls truncated with all tokens on thinking;
-        // the next call uses escalating recovery (low → off → force text).
-        let mut thinking_truncation_count: u8 = 0;
-        // Cumulative ms lost to LLM provider timeouts (excluded from wall-clock budget).
-        let mut provider_timeout_ms: u64 = 0;
-        // Idempotency guard for send_file within a single task execution.
-        let mut successful_send_file_keys: HashSet<String> = HashSet::new();
-        // Inject cli_agent completion nudges at most once per phase
-        // (consecutive cli_agent completions), then reset after a
-        // successful non-cli_agent tool call.
-        let mut cli_agent_boundary_injected = false;
-        // Deterministic top-level acknowledgement when a tool detaches to background.
-        let mut pending_background_ack: Option<String> = None;
-        // Deterministic fallback acknowledgement when a successful external write
-        // completes but the follow-up LLM summary stalls.
-        let mut pending_external_action_ack: Option<String> = None;
-        // Track identity-attack prefill so we can prepend it to the final reply.
-        let mut identity_prefill_text: Option<String> = None;
         // Best-effort project directory hint (seeded from user text, refined by tool calls).
-        let mut known_project_dir = turn_context.primary_project_scope.clone().or_else(|| {
+        if let Some(known_project_dir) = turn_context.primary_project_scope.clone().or_else(|| {
             super::tool_execution_phase::extract_project_dir_hint_with_aliases(
                 user_text,
                 &self.path_aliases.projects,
             )
-        });
-        // Cross-iteration directory evidence tracking for contradiction detection.
-        let mut dirs_with_project_inspect_file_evidence: HashSet<String> = HashSet::new();
-        let mut dirs_with_search_no_matches: HashSet<String> = HashSet::new();
-        // When true, the assistant must run at least one file re-check before finalizing text.
-        let mut require_file_recheck_before_answer = false;
-        // Deterministic tool-required state is driven by the request itself, not
-        // by route-drift fail-safe mode. Fail-safe can force a stronger model and
-        // stricter routing posture without turning plain-text tasks into
-        // pseudo-execution tasks.
-        let mut needs_tools_for_turn = infer_intent_gate(user_text, "")
-            .needs_tools
-            .unwrap_or(false);
-
-        // Determine iteration limit behavior
-        let (mut hard_cap, mut soft_threshold, mut soft_warn_at) = match &self.iteration_config {
-            IterationLimitConfig::Unlimited => (Some(HARD_ITERATION_CAP), None, None),
-            IterationLimitConfig::Soft { threshold, warn_at } => {
-                (Some(HARD_ITERATION_CAP), Some(*threshold), Some(*warn_at))
-            }
-            IterationLimitConfig::Hard { initial: _, cap } => (Some(*cap), None, None),
-        };
+        }) {
+            turn_state.evidence.set_known_project_dir(known_project_dir);
+        }
 
         // Resolve goal_id once for per-goal token budget enforcement.
         // Executors currently carry only task_id, so we may need to lookup goal_id via task.
@@ -493,9 +457,7 @@ impl Agent {
             None
         };
         if is_scheduled_goal {
-            hard_cap = None;
-            soft_threshold = None;
-            soft_warn_at = None;
+            turn_state.budget.disable_iteration_limits();
             if let Some(registry) = self.goal_token_registry.as_ref() {
                 if let Some(goal_id) = resolved_goal_id.as_deref() {
                     if is_root_scheduled_run {
@@ -577,17 +539,15 @@ impl Agent {
             if let Some(per_check_budget) =
                 scheduled_goal_budget_per_check.and_then(|v| u64::try_from(v).ok())
             {
-                effective_task_budget = Some(
-                    effective_task_budget
-                        .map(|budget| budget.max(per_check_budget))
-                        .unwrap_or(per_check_budget),
-                );
+                turn_state
+                    .budget
+                    .raise_effective_task_budget_to(per_check_budget);
             }
         }
         let effective_task_timeout = if is_scheduled_goal {
             None
         } else {
-            self.task_timeout
+            self.limits.task_timeout
         };
         let max_budget_extensions = if is_scheduled_goal {
             SCHEDULED_MAX_BUDGET_EXTENSIONS
@@ -612,7 +572,7 @@ impl Agent {
         };
 
         loop {
-            iteration += 1;
+            let iteration = turn_state.counters.advance_iteration();
             touch_heartbeat(&heartbeat);
 
             // Check for cancellation (cascades via token hierarchy)
@@ -687,8 +647,8 @@ impl Agent {
             // consecutive iterations, hard-return whatever the LLM last produced.
             // This prevents infinite force-text loops where the response/completion
             // phase keeps deciding to continue despite having no tools.
-            if force_text_response {
-                force_text_iterations += 1;
+            if turn_state.recovery.force_text_response() {
+                let force_text_iterations = turn_state.recovery.record_force_text_iteration();
                 if force_text_iterations > MAX_FORCE_TEXT_ITERATIONS {
                     warn!(
                         session_id,
@@ -729,7 +689,7 @@ impl Agent {
                         TaskStatus::Completed,
                         task_start,
                         iteration,
-                        task_tokens_used as usize,
+                        turn_state.budget.task_tokens_used() as usize,
                         None,
                         Some(fallback.clone()),
                     )
@@ -737,7 +697,7 @@ impl Agent {
                     return Ok(fallback);
                 }
             } else {
-                force_text_iterations = 0;
+                turn_state.recovery.reset_force_text_iterations();
             }
 
             info!(
@@ -768,6 +728,13 @@ impl Agent {
                 )
                 .await;
 
+            let stopping_stall = turn_state.stall.for_stopping_phase();
+            let stopping_failures = turn_state.failures.for_stopping_phase();
+            let stopping_recovery = turn_state.recovery.for_stopping_phase();
+            let stopping_budget = turn_state.budget.for_stopping_phase();
+            let stopping_evidence = turn_state.evidence.for_stopping_phase();
+            let stopping_directives = turn_state.directives.for_stopping_phase();
+            let stopping_counters = turn_state.counters.for_stopping_phase();
             let stopping_outcome = self
                 .run_stopping_phase(&mut StoppingPhaseCtx {
                     emitter: &emitter,
@@ -776,47 +743,48 @@ impl Agent {
                     iteration,
                     task_start,
                     learning_ctx: &mut learning_ctx,
-                    hard_cap,
+                    hard_cap: stopping_budget.hard_cap,
                     effective_task_timeout,
-                    task_tokens_used,
-                    effective_task_budget: &mut effective_task_budget,
-                    budget_warning_sent: &mut budget_warning_sent,
-                    pending_system_messages: &mut pending_system_messages,
-                    budget_extensions_count: &mut budget_extensions_count,
+                    task_tokens_used: stopping_budget.task_tokens_used,
+                    effective_task_budget: stopping_budget.effective_task_budget,
+                    budget_warning_sent: stopping_budget.budget_warning_sent,
+                    pending_system_messages: stopping_directives.pending_system_messages,
+                    budget_extensions_count: stopping_budget.budget_extensions_count,
                     user_role,
-                    evidence_gain_count,
-                    stall_count,
-                    deferred_no_tool_streak,
-                    consecutive_same_tool: &consecutive_same_tool,
-                    consecutive_same_tool_arg_hashes: &consecutive_same_tool_arg_hashes,
-                    total_successful_tool_calls,
-                    pending_background_ack: &mut pending_background_ack,
+                    evidence_gain_count: stopping_evidence.evidence_gain_count,
+                    stall_count: stopping_stall.stall_count,
+                    deferred_no_tool_streak: stopping_counters.deferred_no_tool_streak,
+                    consecutive_same_tool: stopping_stall.consecutive_same_tool,
+                    consecutive_same_tool_arg_hashes: stopping_stall
+                        .consecutive_same_tool_arg_hashes,
+                    total_successful_tool_calls: stopping_counters.total_successful_tool_calls,
+                    pending_background_ack: stopping_directives.pending_background_ack,
                     status_tx: &status_tx,
                     resolved_goal_id: &resolved_goal_id,
                     is_scheduled_goal,
-                    effective_daily_budget: &mut effective_daily_budget,
+                    effective_daily_budget: stopping_budget.effective_daily_budget,
                     effective_goal_daily_budget: &mut effective_goal_daily_budget,
-                    successful_send_file_keys: &successful_send_file_keys,
+                    successful_send_file_keys: stopping_counters.successful_send_file_keys,
                     model: &mut model,
-                    soft_threshold,
-                    soft_warn_at,
-                    soft_limit_warned: &mut soft_limit_warned,
+                    soft_threshold: stopping_budget.soft_threshold,
+                    soft_warn_at: stopping_budget.soft_warn_at,
+                    soft_limit_warned: stopping_budget.soft_limit_warned,
                     last_progress_summary: &mut last_progress_summary,
-                    tool_failure_count: &tool_failure_count,
+                    tool_failure_count: stopping_failures.tool_failure_count,
                     session_summary: &mut session_summary,
                     policy_bundle: &mut policy_bundle,
                     user_text,
                     available_capabilities: &available_capabilities,
                     llm_router: &llm_router,
-                    last_escalation_iteration: &mut last_escalation_iteration,
-                    consecutive_clean_iterations: &mut consecutive_clean_iterations,
+                    last_escalation_iteration: stopping_stall.last_escalation_iteration,
+                    consecutive_clean_iterations: stopping_stall.consecutive_clean_iterations,
                     max_budget_extensions,
                     hard_token_cap,
                     execution_state: &mut execution_state,
-                    force_text_response: &mut force_text_response,
+                    force_text_response: stopping_recovery.force_text_response,
                     completion_progress: &mut completion_progress,
                     turn_context: &turn_context,
-                    validation_state: &mut validation_state,
+                    validation_state: stopping_evidence.validation_state,
                 })
                 .await?;
             match stopping_outcome {
@@ -841,8 +809,11 @@ impl Agent {
                         user_text,
                         iteration,
                         task_start,
-                        task_tokens_used,
-                        pending_system_messages: &mut pending_system_messages,
+                        task_tokens_used: turn_state.budget.task_tokens_used(),
+                        pending_system_messages: turn_state
+                            .directives
+                            .for_message_build_phase()
+                            .pending_system_messages,
                         tool_defs: &mut tool_defs,
                         base_tool_defs: &mut base_tool_defs,
                         available_capabilities: &mut available_capabilities,
@@ -872,7 +843,9 @@ impl Agent {
             if let Some(ref plan) = execution_state.active_linear_intent_plan {
                 if !plan.steps.is_empty() {
                     let plan_text = plan.format_with_progress();
-                    pending_system_messages.push(SystemDirective::TaskPlanContext(plan_text));
+                    turn_state
+                        .directives
+                        .push_system_message(SystemDirective::TaskPlanContext(plan_text));
                 }
             }
 
@@ -1008,11 +981,13 @@ impl Agent {
                 }
             }
 
+            let message_build_directives = turn_state.directives.for_message_build_phase();
+            let message_build_recovery = turn_state.recovery.for_message_build_phase();
             let MessageBuildData { mut messages } = self
                 .run_message_build_phase(&mut MessageBuildCtx {
                     session_id,
                     iteration,
-                    user_text,
+                    user_text: &llm_user_text,
                     completed_tool_calls: &learning_ctx.tool_calls,
                     model: &model,
                     system_prompt: &system_prompt,
@@ -1020,12 +995,19 @@ impl Agent {
                     tool_defs: &tool_defs,
                     policy_bundle: &policy_bundle,
                     session_summary: &session_summary,
-                    pending_system_messages: &mut pending_system_messages,
-                    empty_response_retry_pending,
+                    pending_system_messages: message_build_directives.pending_system_messages,
+                    empty_response_retry_pending: message_build_recovery
+                        .empty_response_retry_pending,
                     status_tx: &status_tx,
                 })
                 .await?;
 
+            let llm_stall = turn_state.stall.for_llm_phase();
+            let llm_recovery = turn_state.recovery.for_llm_phase();
+            let llm_budget = turn_state.budget.for_llm_phase();
+            let llm_evidence = turn_state.evidence.for_llm_phase();
+            let llm_directives = turn_state.directives.for_llm_phase();
+            let llm_counters = turn_state.counters.for_llm_phase();
             let llm_outcome = self
                 .run_llm_phase(&mut LlmPhaseCtx {
                     messages: &mut messages,
@@ -1034,11 +1016,11 @@ impl Agent {
                     session_id,
                     user_text,
                     iteration,
-                    force_text_response,
+                    force_text_response: llm_recovery.force_text_response,
                     task_start,
-                    task_tokens_used: &mut task_tokens_used,
+                    task_tokens_used: llm_budget.task_tokens_used,
                     learning_ctx: &mut learning_ctx,
-                    pending_system_messages: &mut pending_system_messages,
+                    pending_system_messages: llm_directives.pending_system_messages,
                     llm_provider: llm_provider.clone(),
                     llm_router: llm_router.clone(),
                     model: &model,
@@ -1048,24 +1030,24 @@ impl Agent {
                     resolved_goal_id: &resolved_goal_id,
                     is_scheduled_goal,
                     effective_goal_daily_budget: &mut effective_goal_daily_budget,
-                    budget_extensions_count: &mut budget_extensions_count,
-                    evidence_gain_count,
-                    stall_count: &mut stall_count,
-                    consecutive_same_tool: &consecutive_same_tool,
-                    consecutive_same_tool_arg_hashes: &consecutive_same_tool_arg_hashes,
-                    total_successful_tool_calls,
-                    pending_external_action_ack: &mut pending_external_action_ack,
+                    budget_extensions_count: llm_budget.budget_extensions_count,
+                    evidence_gain_count: llm_evidence.evidence_gain_count,
+                    stall_count: llm_stall.stall_count,
+                    consecutive_same_tool: llm_stall.consecutive_same_tool,
+                    consecutive_same_tool_arg_hashes: llm_stall.consecutive_same_tool_arg_hashes,
+                    total_successful_tool_calls: llm_counters.total_successful_tool_calls,
+                    pending_external_action_ack: llm_directives.pending_external_action_ack,
                     heartbeat: &heartbeat,
-                    empty_response_retry_pending: &mut empty_response_retry_pending,
-                    empty_response_retry_note: &mut empty_response_retry_note,
-                    identity_prefill_text: &mut identity_prefill_text,
-                    deferred_no_tool_streak,
-                    tools_required_for_turn: needs_tools_for_turn,
+                    empty_response_retry_pending: llm_recovery.empty_response_retry_pending,
+                    empty_response_retry_note: llm_recovery.empty_response_retry_note,
+                    identity_prefill_text: llm_directives.identity_prefill_text,
+                    deferred_no_tool_streak: llm_counters.deferred_no_tool_streak,
+                    tools_required_for_turn: llm_counters.tools_required_for_turn,
                     max_budget_extensions,
                     hard_token_cap,
-                    truncated_text_prefix: &mut truncated_text_prefix,
-                    provider_timeout_ms: &mut provider_timeout_ms,
-                    thinking_truncation_count: &mut thinking_truncation_count,
+                    truncated_text_prefix: llm_recovery.truncated_text_prefix,
+                    provider_timeout_ms: llm_budget.provider_timeout_ms,
+                    thinking_truncation_count: llm_recovery.thinking_truncation_count,
                 })
                 .await?;
             let mut resp = match llm_outcome {
@@ -1075,7 +1057,7 @@ impl Agent {
                     }
                     // Propagate accumulated timeout to execution state so
                     // wall-clock budget excludes provider-caused delays.
-                    execution_state.provider_timeout_ms = provider_timeout_ms;
+                    execution_state.provider_timeout_ms = turn_state.budget.provider_timeout_ms();
                     continue;
                 }
                 LlmPhaseOutcome::Return(result) => {
@@ -1087,6 +1069,11 @@ impl Agent {
                 LlmPhaseOutcome::Proceed(resp) => resp,
             };
 
+            let response_stall = turn_state.stall.for_response_phase();
+            let response_recovery = turn_state.recovery.for_response_phase();
+            let response_evidence = turn_state.evidence.for_response_phase();
+            let response_directives = turn_state.directives.for_response_phase();
+            let response_counters = turn_state.counters.for_response_phase();
             let response_outcome = self
                 .run_response_phase(&mut ResponsePhaseCtx {
                     resp: &mut resp,
@@ -1096,9 +1083,9 @@ impl Agent {
                     user_text,
                     iteration,
                     task_start,
-                    task_tokens_used,
+                    task_tokens_used: turn_state.budget.task_tokens_used(),
                     learning_ctx: &mut learning_ctx,
-                    pending_system_messages: &mut pending_system_messages,
+                    pending_system_messages: response_directives.pending_system_messages,
                     tool_defs: &mut tool_defs,
                     base_tool_defs: &mut base_tool_defs,
                     available_capabilities: &mut available_capabilities,
@@ -1114,25 +1101,27 @@ impl Agent {
                     user_role,
                     channel_ctx: channel_ctx.clone(),
                     status_tx: status_tx.clone(),
-                    total_successful_tool_calls,
-                    stall_count: &mut stall_count,
-                    consecutive_clean_iterations: &mut consecutive_clean_iterations,
-                    deferred_no_tool_streak: &mut deferred_no_tool_streak,
-                    deferred_no_tool_model_switches: &mut deferred_no_tool_model_switches,
-                    fallback_expanded_once: &mut fallback_expanded_once,
-                    empty_response_retry_used: &mut empty_response_retry_used,
-                    empty_response_retry_pending: &mut empty_response_retry_pending,
-                    empty_response_retry_note: &mut empty_response_retry_note,
-                    identity_prefill_text: &mut identity_prefill_text,
-                    pending_background_ack: &mut pending_background_ack,
-                    pending_external_action_ack: &mut pending_external_action_ack,
-                    require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
+                    total_successful_tool_calls: response_counters.total_successful_tool_calls,
+                    stall_count: response_stall.stall_count,
+                    consecutive_clean_iterations: response_stall.consecutive_clean_iterations,
+                    deferred_no_tool_streak: response_counters.deferred_no_tool_streak,
+                    deferred_no_tool_model_switches: response_counters
+                        .deferred_no_tool_model_switches,
+                    fallback_expanded_once: response_recovery.fallback_expanded_once,
+                    empty_response_retry_used: response_recovery.empty_response_retry_used,
+                    empty_response_retry_pending: response_recovery.empty_response_retry_pending,
+                    empty_response_retry_note: response_recovery.empty_response_retry_note,
+                    identity_prefill_text: response_directives.identity_prefill_text,
+                    pending_background_ack: response_directives.pending_background_ack,
+                    pending_external_action_ack: response_directives.pending_external_action_ack,
+                    require_file_recheck_before_answer: response_evidence
+                        .require_file_recheck_before_answer,
                     completion_progress: &mut completion_progress,
                     turn_context: &turn_context,
-                    needs_tools_for_turn: &mut needs_tools_for_turn,
-                    force_text_response: &mut force_text_response,
+                    needs_tools_for_turn: response_counters.needs_tools_for_turn,
+                    force_text_response: response_recovery.force_text_response,
                     execution_state: &mut execution_state,
-                    validation_state: &mut validation_state,
+                    validation_state: response_evidence.validation_state,
                 })
                 .await?;
             match response_outcome {
@@ -1150,8 +1139,10 @@ impl Agent {
                 }
                 ResponsePhaseOutcome::ProceedToToolExecution => {
                     if !resp.tool_calls.is_empty() && !execution_state.execution_budget_applies() {
-                        execution_state
-                            .activate_budget_envelope(task_tokens_used, task_start.elapsed());
+                        execution_state.activate_budget_envelope(
+                            turn_state.budget.task_tokens_used(),
+                            task_start.elapsed(),
+                        );
                     }
                     if !resp.tool_calls.is_empty() || execution_state.execution_budget_applies() {
                         execution_state.record_llm_call();
@@ -1159,6 +1150,9 @@ impl Agent {
                 }
             }
             // === EXECUTE TOOL CALLS ===
+            let tool_prelude_recovery = turn_state.recovery.for_tool_prelude_phase();
+            let tool_prelude_evidence = turn_state.evidence.for_tool_prelude_phase();
+            let tool_prelude_directives = turn_state.directives.for_tool_prelude_phase();
             let tool_prelude_outcome = self
                 .run_tool_prelude_phase(&mut ToolPreludeCtx {
                     resp: &resp,
@@ -1170,14 +1164,14 @@ impl Agent {
                     iteration,
                     task_start,
                     learning_ctx: &mut learning_ctx,
-                    evidence_state: &evidence_state,
+                    evidence_state: tool_prelude_evidence.evidence_state,
                     user_text,
                     policy_bundle: &policy_bundle,
                     available_capabilities: &available_capabilities,
                     execution_state: &mut execution_state,
-                    validation_state: &mut validation_state,
-                    pending_system_messages: &mut pending_system_messages,
-                    force_text_response: &mut force_text_response,
+                    validation_state: tool_prelude_evidence.validation_state,
+                    pending_system_messages: tool_prelude_directives.pending_system_messages,
+                    force_text_response: tool_prelude_recovery.force_text_response,
                     turn_context: &turn_context,
                 })
                 .await?;
@@ -1190,6 +1184,13 @@ impl Agent {
             // Capture baseline for tracking tool calls per plan step
             let tool_calls_before_execution = learning_ctx.tool_calls.len();
 
+            let tool_execution_stall = turn_state.stall.for_tool_execution_phase();
+            let tool_execution_failures = turn_state.failures.for_tool_execution_phase();
+            let tool_execution_recovery = turn_state.recovery.for_tool_execution_phase();
+            let tool_execution_evidence = turn_state.evidence.for_tool_execution_phase();
+            let tool_execution_reflection = turn_state.reflection.for_tool_execution_phase();
+            let tool_execution_directives = turn_state.directives.for_tool_execution_phase();
+            let tool_execution_counters = turn_state.counters.for_tool_execution_phase();
             let tool_execution_outcome = self
                 .run_tool_execution_phase(&mut ToolExecutionCtx {
                     resp: &resp,
@@ -1199,7 +1200,7 @@ impl Agent {
                     iteration,
                     task_start,
                     learning_ctx: &mut learning_ctx,
-                    task_tokens_used,
+                    task_tokens_used: turn_state.budget.task_tokens_used(),
                     user_text,
                     restrict_to_personal_memory_tools,
                     active_skill_names: &active_skill_names,
@@ -1216,51 +1217,61 @@ impl Agent {
                     user_role,
                     heartbeat: &heartbeat,
                     tool_defs: &mut tool_defs,
-                    total_tool_calls_attempted: &mut total_tool_calls_attempted,
-                    total_successful_tool_calls: &mut total_successful_tool_calls,
-                    tool_failure_count: &mut tool_failure_count,
-                    tool_failure_signatures: &mut tool_failure_signatures,
-                    tool_transient_failure_count: &mut tool_transient_failure_count,
-                    tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
-                    tool_call_count: &mut tool_call_count,
-                    personal_memory_tool_calls: &mut personal_memory_tool_calls,
-                    no_evidence_result_streak: &mut no_evidence_result_streak,
-                    no_evidence_tools_seen: &mut no_evidence_tools_seen,
-                    evidence_gain_count: &mut evidence_gain_count,
-                    pending_error_solution_ids: &mut pending_error_solution_ids,
-                    tool_error_history: &mut tool_error_history,
-                    reflection_completed: &mut reflection_completed,
-                    pending_reflection_recoveries: &mut pending_reflection_recoveries,
-                    tool_failure_patterns: &mut tool_failure_patterns,
-                    last_tool_failure: &mut last_tool_failure,
-                    in_session_learned: &mut in_session_learned,
-                    unknown_tools: &mut unknown_tools,
-                    recent_tool_calls: &mut recent_tool_calls,
-                    consecutive_same_tool: &mut consecutive_same_tool,
-                    consecutive_same_tool_arg_hashes: &mut consecutive_same_tool_arg_hashes,
-                    force_text_response: &mut force_text_response,
-                    pending_system_messages: &mut pending_system_messages,
-                    recent_tool_names: &mut recent_tool_names,
-                    successful_send_file_keys: &mut successful_send_file_keys,
-                    cli_agent_boundary_injected: &mut cli_agent_boundary_injected,
-                    evidence_state: &mut evidence_state,
-                    pending_background_ack: &mut pending_background_ack,
-                    pending_external_action_ack: &mut pending_external_action_ack,
-                    stall_count: &mut stall_count,
-                    deferred_no_tool_streak: &mut deferred_no_tool_streak,
-                    consecutive_clean_iterations: &mut consecutive_clean_iterations,
-                    fallback_expanded_once: &mut fallback_expanded_once,
-                    known_project_dir: &mut known_project_dir,
-                    dirs_with_project_inspect_file_evidence:
-                        &mut dirs_with_project_inspect_file_evidence,
-                    dirs_with_search_no_matches: &mut dirs_with_search_no_matches,
-                    require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
+                    total_tool_calls_attempted: tool_execution_counters.total_tool_calls_attempted,
+                    total_successful_tool_calls: tool_execution_counters
+                        .total_successful_tool_calls,
+                    tool_failure_count: tool_execution_failures.tool_failure_count,
+                    tool_failure_signatures: tool_execution_failures.tool_failure_signatures,
+                    tool_transient_failure_count: tool_execution_failures
+                        .tool_transient_failure_count,
+                    tool_cooldown_until_iteration: tool_execution_failures
+                        .tool_cooldown_until_iteration,
+                    tool_call_count: tool_execution_counters.tool_call_count,
+                    personal_memory_tool_calls: tool_execution_counters.personal_memory_tool_calls,
+                    no_evidence_result_streak: tool_execution_evidence.no_evidence_result_streak,
+                    no_evidence_tools_seen: tool_execution_evidence.no_evidence_tools_seen,
+                    evidence_gain_count: tool_execution_evidence.evidence_gain_count,
+                    pending_error_solution_ids: tool_execution_reflection
+                        .pending_error_solution_ids,
+                    tool_error_history: tool_execution_failures.tool_error_history,
+                    reflection_completed: tool_execution_reflection.reflection_completed,
+                    pending_reflection_recoveries: tool_execution_reflection
+                        .pending_reflection_recoveries,
+                    tool_failure_patterns: tool_execution_failures.tool_failure_patterns,
+                    last_tool_failure: tool_execution_failures.last_tool_failure,
+                    in_session_learned: tool_execution_reflection.in_session_learned,
+                    unknown_tools: tool_execution_failures.unknown_tools,
+                    recent_tool_calls: tool_execution_stall.recent_tool_calls,
+                    consecutive_same_tool: tool_execution_stall.consecutive_same_tool,
+                    consecutive_same_tool_arg_hashes: tool_execution_stall
+                        .consecutive_same_tool_arg_hashes,
+                    force_text_response: tool_execution_recovery.force_text_response,
+                    pending_system_messages: tool_execution_directives.pending_system_messages,
+                    recent_tool_names: tool_execution_stall.recent_tool_names,
+                    successful_send_file_keys: tool_execution_counters.successful_send_file_keys,
+                    cli_agent_boundary_injected: tool_execution_directives
+                        .cli_agent_boundary_injected,
+                    evidence_state: tool_execution_evidence.evidence_state,
+                    pending_background_ack: tool_execution_directives.pending_background_ack,
+                    pending_external_action_ack: tool_execution_directives
+                        .pending_external_action_ack,
+                    stall_count: tool_execution_stall.stall_count,
+                    deferred_no_tool_streak: tool_execution_counters.deferred_no_tool_streak,
+                    consecutive_clean_iterations: tool_execution_stall.consecutive_clean_iterations,
+                    fallback_expanded_once: tool_execution_recovery.fallback_expanded_once,
+                    known_project_dir: tool_execution_evidence.known_project_dir,
+                    dirs_with_project_inspect_file_evidence: tool_execution_evidence
+                        .dirs_with_project_inspect_file_evidence,
+                    dirs_with_search_no_matches: tool_execution_evidence
+                        .dirs_with_search_no_matches,
+                    require_file_recheck_before_answer: tool_execution_evidence
+                        .require_file_recheck_before_answer,
                     completion_progress: &mut completion_progress,
                     turn_context: &turn_context,
                     resolved_goal_id: resolved_goal_id.as_deref(),
-                    tool_result_cache: &mut tool_result_cache,
+                    tool_result_cache: tool_execution_counters.tool_result_cache,
                     execution_state: &mut execution_state,
-                    validation_state: &mut validation_state,
+                    validation_state: tool_execution_evidence.validation_state,
                 })
                 .await?;
             match tool_execution_outcome {

@@ -97,7 +97,7 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
         .await
         .expect("setup test harness");
     harness.agent.tools.push(Arc::new(SlowTool));
-    harness.agent.llm_call_timeout = Some(Duration::from_millis(30));
+    harness.agent.limits.llm_call_timeout = Some(Duration::from_millis(30));
 
     let result = harness
         .agent
@@ -131,7 +131,7 @@ async fn execute_tool_watchdog_skips_cli_agent() {
         .await
         .expect("setup test harness");
     harness.agent.tools.push(Arc::new(SlowCliAgentTool));
-    harness.agent.llm_call_timeout = Some(Duration::from_millis(30));
+    harness.agent.limits.llm_call_timeout = Some(Duration::from_millis(30));
 
     let result = harness
         .agent
@@ -162,7 +162,7 @@ async fn execute_tool_watchdog_allows_fast_tool() {
         .expect("setup test harness");
     // system_info runs multiple subprocesses; allow a bit of slack to avoid
     // flakiness on slower/loaded machines.
-    harness.agent.llm_call_timeout = Some(Duration::from_secs(5));
+    harness.agent.limits.llm_call_timeout = Some(Duration::from_secs(5));
 
     let result = harness
         .agent

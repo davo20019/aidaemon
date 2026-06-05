@@ -32,6 +32,20 @@ pub trait MessageStore: Send + Sync {
     async fn clear_session(&self, session_id: &str) -> anyhow::Result<()>;
 }
 
+/// Durable projection of a session's open request/question state.
+#[async_trait]
+pub trait DialogueStateStore: Send + Sync {
+    async fn get_dialogue_state(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<super::DialogueState>>;
+
+    async fn upsert_dialogue_state(&self, state: &super::DialogueState) -> anyhow::Result<()>;
+
+    #[allow(dead_code)]
+    async fn delete_dialogue_state(&self, session_id: &str) -> anyhow::Result<()>;
+}
+
 /// Layer-2 facts storage and retrieval (including privacy + channel provenance).
 #[async_trait]
 pub trait FactStore: Send + Sync {
@@ -655,7 +669,10 @@ pub trait OAuthStore: Send + Sync {
     }
 }
 
-/// Goal persistence (goals/tasks, schedules, and dispatch bookkeeping).
+/// Goal lifecycle and confirmation-flow persistence. Task, schedule, budget,
+/// scheduled-run, dispatch, and notification concerns live in the sibling
+/// traits: [`TaskStore`], [`GoalScheduleStore`], [`GoalBudgetStore`],
+/// [`ScheduledRunStore`], [`TaskDispatchStore`], and [`GoalNotificationStore`].
 #[async_trait]
 pub trait GoalStore: Send + Sync {
     /// Create a new goal.
@@ -715,7 +732,11 @@ pub trait GoalStore: Send + Sync {
     async fn activate_goal(&self, _goal_id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
+}
 
+/// Task persistence and task activity logs.
+#[async_trait]
+pub trait TaskStore: Send + Sync {
     /// Create a new task within a goal.
     #[allow(dead_code)] // Used in Phase 2
     async fn create_task(&self, _task: &super::Task) -> anyhow::Result<()> {
@@ -765,7 +786,11 @@ pub trait GoalStore: Send + Sync {
     ) -> anyhow::Result<Vec<super::TaskActivity>> {
         Ok(vec![])
     }
+}
 
+/// Goal schedule and scheduled-run persistence.
+#[async_trait]
+pub trait GoalScheduleStore: Send + Sync {
     /// Create a new schedule for a goal.
     async fn create_goal_schedule(&self, _schedule: &super::GoalSchedule) -> anyhow::Result<()> {
         Ok(())
@@ -817,7 +842,11 @@ pub trait GoalStore: Send + Sync {
     async fn get_scheduled_goals(&self) -> anyhow::Result<Vec<super::Goal>> {
         Ok(vec![])
     }
+}
 
+/// Goal token budget persistence and accounting.
+#[async_trait]
+pub trait GoalBudgetStore: Send + Sync {
     /// Reset tokens_used_today to 0 for all active goals.
     async fn reset_daily_token_budgets(&self) -> anyhow::Result<u64> {
         Ok(0)
@@ -845,7 +874,11 @@ pub trait GoalStore: Send + Sync {
     ) -> anyhow::Result<Option<super::GoalTokenBudgetStatus>> {
         Ok(None)
     }
+}
 
+/// Scheduled run runtime-state persistence.
+#[async_trait]
+pub trait ScheduledRunStore: Send + Sync {
     /// Persist runtime state for an active scheduled run.
     async fn upsert_scheduled_run_state(
         &self,
@@ -866,7 +899,11 @@ pub trait GoalStore: Send + Sync {
     async fn delete_scheduled_run_state(&self, _goal_id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
+}
 
+/// Task dispatch bookkeeping for executor scheduling and recovery.
+#[async_trait]
+pub trait TaskDispatchStore: Send + Sync {
     /// Get pending tasks ordered by priority, filtering out those with unmet dependencies.
     async fn get_pending_tasks_by_priority(&self, _limit: i64) -> anyhow::Result<Vec<super::Task>> {
         Ok(vec![])
@@ -887,7 +924,11 @@ pub trait GoalStore: Send + Sync {
     async fn mark_task_interrupted(&self, _task_id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
+}
 
+/// Goal lifecycle cleanup and user notification bookkeeping.
+#[async_trait]
+pub trait GoalNotificationStore: Send + Sync {
     /// Count active evergreen (continuous) goals.
     async fn count_active_evergreen_goals(&self) -> anyhow::Result<i64> {
         Ok(0)
@@ -983,6 +1024,7 @@ pub trait StateStore:
     Send
     + Sync
     + MessageStore
+    + DialogueStateStore
     + FactStore
     + EpisodeStore
     + TokenUsageStore
@@ -996,6 +1038,12 @@ pub trait StateStore:
     + PeopleStore
     + OAuthStore
     + GoalStore
+    + TaskStore
+    + GoalScheduleStore
+    + GoalBudgetStore
+    + ScheduledRunStore
+    + TaskDispatchStore
+    + GoalNotificationStore
     + ConversationSummaryStore
     + HealthCheckStore
     + NotificationStore
@@ -1006,6 +1054,7 @@ impl<T> StateStore for T where
     T: Send
         + Sync
         + MessageStore
+        + DialogueStateStore
         + FactStore
         + EpisodeStore
         + TokenUsageStore
@@ -1019,6 +1068,12 @@ impl<T> StateStore for T where
         + PeopleStore
         + OAuthStore
         + GoalStore
+        + TaskStore
+        + GoalScheduleStore
+        + GoalBudgetStore
+        + ScheduledRunStore
+        + TaskDispatchStore
+        + GoalNotificationStore
         + ConversationSummaryStore
         + HealthCheckStore
         + NotificationStore

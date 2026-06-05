@@ -196,21 +196,25 @@ impl ManagePeopleTool {
         use chrono::NaiveDate;
         let trimmed = value.trim();
 
-        if let Ok(d) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-            let this_year = today.with_month(d.month())?.with_day(d.day())?;
+        // Build the anniversary date directly from (current year, month, day)
+        // rather than mutating `today`. Mutating `today` breaks when today's
+        // day-of-month (e.g. the 31st) does not exist in the target month
+        // (e.g. June), causing `with_month` to return None for valid dates.
+        let anniversary_days = |month: u32, day: u32| -> Option<i64> {
+            let this_year = NaiveDate::from_ymd_opt(today.year(), month, day)?;
             let diff = (this_year - today).num_days();
-            return Some(if diff < 0 { diff + 365 } else { diff });
+            Some(if diff < 0 { diff + 365 } else { diff })
+        };
+
+        if let Ok(d) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+            return anniversary_days(d.month(), d.day());
         }
 
         if let Ok(d) = NaiveDate::parse_from_str(&format!("2000-{}", trimmed), "%Y-%m-%d") {
-            let this_year = today.with_month(d.month())?.with_day(d.day())?;
-            let diff = (this_year - today).num_days();
-            return Some(if diff < 0 { diff + 365 } else { diff });
+            return anniversary_days(d.month(), d.day());
         }
         if let Ok(d) = NaiveDate::parse_from_str(&format!("2000/{}", trimmed), "%Y/%m/%d") {
-            let this_year = today.with_month(d.month())?.with_day(d.day())?;
-            let diff = (this_year - today).num_days();
-            return Some(if diff < 0 { diff + 365 } else { diff });
+            return anniversary_days(d.month(), d.day());
         }
 
         let months = [
@@ -232,9 +236,7 @@ impl ManagePeopleTool {
             if let Some(rest) = lower.strip_prefix(name) {
                 let rest = rest.trim().trim_start_matches([',', ' ']);
                 if let Ok(day) = rest.parse::<u32>() {
-                    let this_year = today.with_month(*num)?.with_day(day)?;
-                    let diff = (this_year - today).num_days();
-                    return Some(if diff < 0 { diff + 365 } else { diff });
+                    return anniversary_days(*num, day);
                 }
             }
         }

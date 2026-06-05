@@ -217,7 +217,7 @@ fn find_previous_turns(
     (prev_assistant, prev_user)
 }
 
-fn assistant_message_looks_like_clarifying_question(message: &str) -> bool {
+pub(super) fn assistant_message_looks_like_clarifying_question(message: &str) -> bool {
     let trimmed = message.trim();
     if !trimmed.contains('?') {
         return false;
@@ -242,7 +242,7 @@ fn assistant_message_looks_like_clarifying_question(message: &str) -> bool {
     clarifying_markers.iter().any(|m| lower.contains(m))
 }
 
-fn looks_like_explicit_task_switch(lower_text: &str) -> bool {
+pub(super) fn looks_like_explicit_task_switch(lower_text: &str) -> bool {
     lower_text.starts_with("new task")
         || lower_text.starts_with("different task")
         || lower_text.starts_with("instead ")
@@ -301,7 +301,7 @@ fn has_strong_followup_indicators(lower_text: &str) -> bool {
     recency_refs.iter().any(|r| lower_text.contains(r))
 }
 
-fn looks_like_context_dependent_followup_question(lower_text: &str) -> bool {
+pub(super) fn looks_like_context_dependent_followup_question(lower_text: &str) -> bool {
     if !looks_like_question_request(lower_text) || lower_text.chars().count() > 160 {
         return false;
     }
@@ -384,7 +384,7 @@ fn looks_like_context_dependent_followup_question(lower_text: &str) -> bool {
 /// Detect messages that explicitly reference a prior unanswered request:
 /// "You didn't respond my question", "answer my question", "you ignored my request".
 /// These are meta-commentary about the prior interaction and must keep context.
-fn looks_like_unanswered_request_reference(lower: &str) -> bool {
+pub(super) fn looks_like_unanswered_request_reference(lower: &str) -> bool {
     if lower.chars().count() > 120 {
         return false;
     }
@@ -465,7 +465,7 @@ fn looks_like_artifact_inspection_request(lower_text: &str) -> bool {
     )
 }
 
-fn looks_like_standalone_goal_request(lower_text: &str) -> bool {
+pub(super) fn looks_like_standalone_goal_request(lower_text: &str) -> bool {
     let word_count = lower_text.split_whitespace().count();
     if word_count < 8 {
         return false;
@@ -592,7 +592,7 @@ fn payload_has_self_contained_detail(text: &str) -> bool {
     meaningful_tokens >= 3
 }
 
-fn looks_like_self_contained_mutation_request(current: &str, lower_text: &str) -> bool {
+pub(super) fn looks_like_self_contained_mutation_request(current: &str, lower_text: &str) -> bool {
     let trimmed = current.trim();
     if trimmed.is_empty() || trimmed.split_whitespace().count() < 6 {
         return false;
@@ -630,7 +630,7 @@ fn looks_like_self_contained_mutation_request(current: &str, lower_text: &str) -
     has_structured_target && payload_has_self_contained_detail(trimmed)
 }
 
-fn looks_like_short_command_request(current: &str) -> bool {
+pub(super) fn looks_like_short_command_request(current: &str) -> bool {
     let trimmed = current.trim();
     if trimmed.is_empty() || trimmed.ends_with('?') {
         return false;
@@ -1236,7 +1236,7 @@ fn infer_completion_task_kind(signals: &CompletionSignals) -> CompletionTaskKind
     CompletionTaskKind::Conversational
 }
 
-fn infer_completion_contract(text: &str, alias_roots: &[String]) -> CompletionContract {
+pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> CompletionContract {
     let lower = text.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return CompletionContract::default();
@@ -2204,6 +2204,22 @@ impl Agent {
             .await
     }
 
+    pub(crate) async fn record_parent_visible_result_note(
+        &self,
+        session_id: &str,
+        prefix: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+
+        let summary = format!("{}:\n\n{}", prefix, trimmed);
+        self.record_auxiliary_assistant_note(session_id, &summary)
+            .await
+    }
+
     pub(super) async fn build_turn_context_from_recent_history(
         &self,
         session_id: &str,
@@ -2412,6 +2428,8 @@ impl Agent {
             .await?;
         self.append_message_canonical(normalized_msg.as_ref())
             .await?;
+        self.record_dialogue_user_message(&normalized_msg.session_id, normalized_msg.as_ref())
+            .await?;
         Ok(())
     }
 
@@ -2455,6 +2473,8 @@ impl Agent {
             )
             .await?;
         self.append_message_canonical(normalized_msg.as_ref())
+            .await?;
+        self.record_dialogue_assistant_message(&normalized_msg.session_id, normalized_msg.as_ref())
             .await?;
         Ok(())
     }
@@ -3662,6 +3682,112 @@ mod tests {
                         content.contains("terminal: pytest | AssertionError: expected 1 but got 2")
                     })
         }));
+    }
+
+    #[tokio::test]
+    async fn parent_text_result_delivery_records_parent_visible_text() {
+        use super::super::parent_delivery::ParentDeliveryKind;
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("setup harness");
+        let session_id = "telegram:test_bot:301753035";
+        let delivered = "Goal completed:\n\nCreated ~/morning_ai_job_preparation_tips_report.md";
+
+        let outcome = harness
+            .agent
+            .deliver_parent_text_result(
+                None,
+                session_id,
+                delivered,
+                ParentDeliveryKind::GoalNotification,
+            )
+            .await
+            .expect("parent delivery result");
+
+        assert!(outcome.recorded);
+        assert!(!outcome.sent);
+
+        let history = harness
+            .state
+            .get_history(session_id, 10)
+            .await
+            .expect("load history");
+
+        assert!(
+            history.iter().any(|msg| {
+                msg.role == "assistant"
+                    && msg
+                        .content
+                        .as_deref()
+                        .is_some_and(|content| content.contains(delivered))
+            }),
+            "parent delivery should preserve visible text in parent history: {:?}",
+            history
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_text_result_does_not_record_on_dropped_hub() {
+        use super::super::parent_delivery::ParentDeliveryKind;
+        use crate::channels::{ChannelHub, SessionMap};
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Weak};
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("setup harness");
+        let session_id = "telegram:test_bot:301753036";
+        let delivered = "Result that should not be recorded when hub is dropped";
+
+        // Build a Weak that cannot upgrade by dropping the strong Arc first.
+        let weak_hub: Weak<ChannelHub> = {
+            let session_map: SessionMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+            let hub = Arc::new(ChannelHub::new(Vec::new(), session_map));
+            let weak = Arc::downgrade(&hub);
+            drop(hub);
+            weak
+        };
+        assert!(weak_hub.upgrade().is_none(), "weak hub must be dead");
+
+        let outcome = harness
+            .agent
+            .deliver_parent_text_result(
+                Some(&weak_hub),
+                session_id,
+                delivered,
+                ParentDeliveryKind::ExecutorResult,
+            )
+            .await
+            .expect("parent delivery result");
+
+        assert!(!outcome.sent);
+        assert!(
+            !outcome.recorded,
+            "must not record when hub upgrade fails — queue retry owns delivery"
+        );
+
+        let history = harness
+            .state
+            .get_history(session_id, 10)
+            .await
+            .expect("load history");
+
+        assert!(
+            !history.iter().any(|msg| {
+                msg.role == "assistant"
+                    && msg
+                        .content
+                        .as_deref()
+                        .is_some_and(|content| content.contains(delivered))
+            }),
+            "dropped-hub delivery must not leave a parent-visible note: {:?}",
+            history
+        );
     }
 
     #[tokio::test]

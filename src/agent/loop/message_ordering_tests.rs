@@ -65,7 +65,7 @@ fn assert_no_consecutive_same_role(messages: &[Value]) {
             .get("role")
             .and_then(|r| r.as_str())
             .unwrap_or("");
-        if (curr == "assistant" || curr == "user") && prev == curr {
+        if curr == "assistant" && prev == curr {
             panic!(
                 "Consecutive same-role messages at index {}-{}: role={}",
                 i - 1,
@@ -74,6 +74,20 @@ fn assert_no_consecutive_same_role(messages: &[Value]) {
             );
         }
     }
+}
+
+#[test]
+fn test_distinct_consecutive_user_messages_remain_separate() {
+    let mut msgs = vec![
+        json!({"role": "user", "content": "old failed topic"}),
+        json!({"role": "user", "content": "fresh request"}),
+    ];
+
+    fixup_message_ordering(&mut msgs);
+
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["content"], "old failed topic");
+    assert_eq!(msgs[1]["content"], "fresh request");
 }
 
 /// Helper: assert the first non-system message is NOT a tool message.

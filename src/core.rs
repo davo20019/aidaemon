@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
 use crate::agent::Agent;
@@ -22,7 +22,7 @@ use crate::startup::{
 use crate::state::SqliteStateStore;
 use crate::tasks::TaskRegistry;
 use crate::traits::store_prelude::*;
-use crate::traits::Goal;
+use crate::traits::{Goal, Tool};
 use crate::triggers::{self, TriggerManager};
 
 const LEGACY_KNOWLEDGE_MAINTENANCE_GOAL_DESC: &str =
@@ -146,75 +146,29 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         embedding_service.clone(),
     );
 
-    let startup_tools::BaseToolsBundle {
-        mut tools,
+    let ToolSetup {
+        tools,
         approval_tx,
         approval_rx,
-        media_tx,
         media_rx,
         terminal_tool,
-    } = startup_tools::build_base_tools(
-        &config,
-        config_path.clone(),
-        state.clone(),
-        event_store.clone(),
-        queue_policy.approval_capacity,
-        queue_policy.media_capacity,
-    )
-    .await?;
-    let startup_tools::OptionalToolsOutcome {
-        has_cli_agents: _has_cli_agents,
+        spawn_tool,
+        oauth_gateway,
+        mcp_registry,
+        skills_dir,
         inbox_dir,
         cli_agent_tool,
-    } = startup_tools::register_optional_tools(
-        &mut tools,
+    } = setup_tools_phase(
         &config,
+        &config_path,
         state.clone(),
         event_store.clone(),
         llm_runtime.clone(),
         health_store.clone(),
-        approval_tx.clone(),
-        media_tx.clone(),
+        queue_policy.approval_capacity,
+        queue_policy.media_capacity,
     )
     .await?;
-
-    // 5. MCP registry (static from config + dynamic from DB)
-    let mcp_registry = startup_mcp::setup_mcp_registry(&config, state.clone()).await?;
-    let http_profiles: crate::oauth::SharedHttpProfiles =
-        Arc::new(tokio::sync::RwLock::new(config.http_auth.clone()));
-
-    // 6. Skills (filesystem as single source of truth)
-    let skills_dir = startup_skills::register_skills_tools(
-        &config,
-        &config_path,
-        http_profiles.clone(),
-        state.clone(),
-        &mut tools,
-        approval_tx.clone(),
-    )
-    .await?;
-
-    let startup_tools::RuntimeToolsOutcome {
-        spawn_tool,
-        oauth_gateway,
-    } = startup_tools::register_runtime_tools(
-        &mut tools,
-        &config,
-        &config_path,
-        http_profiles,
-        state.clone(),
-        mcp_registry.clone(),
-        approval_tx.clone(),
-    )
-    .await?;
-
-    for tool in &tools {
-        info!(
-            name = tool.name(),
-            desc = tool.description(),
-            "Registered tool"
-        );
-    }
 
     // 7. Agent (with deferred spawn tool wiring to break the circular dep)
     let skill_names: Vec<String> = if let Some(ref dir) = skills_dir {
@@ -470,6 +424,115 @@ pub async fn run_migrations_only(
     maybe_run_legacy_system_maintenance_goal_migration(state).await;
 
     Ok(())
+}
+
+struct ToolSetup {
+    tools: Vec<Arc<dyn Tool>>,
+    approval_tx: mpsc::Sender<crate::tools::terminal::ApprovalRequest>,
+    approval_rx: mpsc::Receiver<crate::tools::terminal::ApprovalRequest>,
+    media_rx: mpsc::Receiver<crate::types::MediaMessage>,
+    terminal_tool: Option<Arc<crate::tools::TerminalTool>>,
+    spawn_tool: Option<Arc<crate::tools::SpawnAgentTool>>,
+    oauth_gateway: Option<crate::oauth::OAuthGateway>,
+    mcp_registry: crate::mcp::McpRegistry,
+    skills_dir: Option<std::path::PathBuf>,
+    inbox_dir: String,
+    cli_agent_tool: Option<Arc<crate::tools::CliAgentTool>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn setup_tools_phase(
+    config: &AppConfig,
+    config_path: &std::path::Path,
+    state: Arc<SqliteStateStore>,
+    event_store: Arc<crate::events::EventStore>,
+    llm_runtime: SharedLlmRuntime,
+    health_store: Option<Arc<crate::health::HealthProbeStore>>,
+    approval_capacity: usize,
+    media_capacity: usize,
+) -> anyhow::Result<ToolSetup> {
+    let startup_tools::BaseToolsBundle {
+        mut tools,
+        approval_tx,
+        approval_rx,
+        media_tx,
+        media_rx,
+        terminal_tool,
+    } = startup_tools::build_base_tools(
+        config,
+        config_path.to_path_buf(),
+        state.clone(),
+        event_store.clone(),
+        approval_capacity,
+        media_capacity,
+    )
+    .await?;
+
+    let startup_tools::OptionalToolsOutcome {
+        has_cli_agents: _has_cli_agents,
+        inbox_dir,
+        cli_agent_tool,
+    } = startup_tools::register_optional_tools(
+        &mut tools,
+        config,
+        state.clone(),
+        event_store,
+        llm_runtime.clone(),
+        health_store,
+        approval_tx.clone(),
+        media_tx.clone(),
+    )
+    .await?;
+
+    let mcp_registry = startup_mcp::setup_mcp_registry(config, state.clone()).await?;
+    let http_profiles: crate::oauth::SharedHttpProfiles =
+        Arc::new(tokio::sync::RwLock::new(config.http_auth.clone()));
+
+    let skills_dir = startup_skills::register_skills_tools(
+        config,
+        config_path,
+        http_profiles.clone(),
+        state.clone(),
+        &mut tools,
+        approval_tx.clone(),
+    )
+    .await?;
+
+    let startup_tools::RuntimeToolsOutcome {
+        spawn_tool,
+        oauth_gateway,
+    } = startup_tools::register_runtime_tools(
+        &mut tools,
+        config,
+        config_path,
+        http_profiles,
+        state,
+        mcp_registry.clone(),
+        approval_tx.clone(),
+    )
+    .await?;
+
+    for tool in &tools {
+        info!(
+            name = tool.name(),
+            desc = tool.description(),
+            "Registered tool"
+        );
+    }
+
+    Ok(ToolSetup {
+        tools,
+        approval_tx,
+        approval_rx,
+        media_rx,
+        terminal_tool,
+        spawn_tool,
+        oauth_gateway,
+        mcp_registry,
+        skills_dir,
+        inbox_dir,
+        cli_agent_tool,
+    })
 }
 
 struct HeartbeatSetup {
@@ -1264,6 +1327,9 @@ fn build_base_system_prompt(config: &AppConfig, skill_names: &[String]) -> Strin
             `task` (the specific question or job), and optional `background` (boolean, default false). \
             The sub-agent gets its own reasoning loop with access to all tools. \
             Use this when a task benefits from isolated, focused context. \
+            Keep `mission` and `task` minimal — the sub-agent starts fresh with the same tools you have, \
+            so reference files by path instead of pasting their contents, and omit prior tool output or \
+            conversation history the sub-agent does not strictly need. \
             Set `background: true` for long-running tasks — the agent returns immediately and \
             the result is delivered through the parent session when the sub-agent finishes. \
             Sub-agents can nest up to {} levels deep.",
