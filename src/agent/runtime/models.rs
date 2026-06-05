@@ -1,5 +1,6 @@
 use super::*;
 
+// impl-Agent justification: model selection and provider reload over model/fallback_model/model_override.
 impl Agent {
     /// Get the current model name.
     pub async fn current_model(&self) -> String {

@@ -19,7 +19,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let channel_ctx = ctx.channel_ctx.clone();
     info!(session_id, "Bootstrap phase started");
     let resume_checkpoint = if is_resume_request(user_text) {
-        match agent.build_resume_checkpoint(session_id).await {
+        match crate::agent::resume::build_resume_checkpoint(agent, session_id).await {
             Ok(checkpoint) => checkpoint,
             Err(e) => {
                 warn!(
@@ -39,9 +39,10 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let task_id = Uuid::new_v4().to_string();
 
     if let Some(checkpoint) = resume_checkpoint.as_ref() {
-        agent
-            .mark_task_interrupted_for_resume(session_id, checkpoint, &task_id)
-            .await;
+        crate::agent::resume::mark_task_interrupted_for_resume(
+            agent, session_id, checkpoint, &task_id,
+        )
+        .await;
         info!(
             session_id,
             resumed_task_id = %checkpoint.task_id,
@@ -73,7 +74,9 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             },
         )
         .await;
-    if let Err(err) = agent.record_dialogue_task_start(session_id, &task_id).await {
+    if let Err(err) =
+        crate::agent::dialogue_state::record_dialogue_task_start(agent, session_id, &task_id).await
+    {
         warn!(
             session_id,
             task_id,
@@ -113,60 +116,62 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         .append_user_message_with_event(&emitter, &user_msg, user_role, &channel_ctx, false)
         .await?;
 
-    if let Some(reply) = agent
-        .maybe_handle_stop_command(
-            session_id,
-            user_text,
-            user_role,
-            &channel_ctx,
-            status_tx.clone(),
-            &task_id,
-            &emitter,
-        )
-        .await?
+    if let Some(reply) = super::shortcuts::maybe_handle_stop_command(
+        agent,
+        session_id,
+        user_text,
+        user_role,
+        &channel_ctx,
+        status_tx.clone(),
+        &task_id,
+        &emitter,
+    )
+    .await?
     {
         return Ok(BootstrapOutcome::Return(Ok(reply)));
     }
 
     // Explicit mid-task pivots ("wait stop... actually ... instead") should
     // cancel stale in-flight work but continue handling the new instruction.
-    agent
-        .maybe_cancel_work_for_mid_task_pivot(
-            session_id,
-            user_text,
-            user_role,
-            &channel_ctx,
-            status_tx.clone(),
-            &task_id,
-        )
-        .await;
+    super::shortcuts::maybe_cancel_work_for_mid_task_pivot(
+        agent,
+        session_id,
+        user_text,
+        user_role,
+        &channel_ctx,
+        status_tx.clone(),
+        &task_id,
+    )
+    .await;
 
-    if let Some(reply) = agent
-        .maybe_handle_pending_goal_confirmation(
-            session_id, user_text, user_role, &task_id, &emitter,
-        )
-        .await?
+    if let Some(reply) = super::shortcuts::maybe_handle_pending_goal_confirmation(
+        agent, session_id, user_text, user_role, &task_id, &emitter,
+    )
+    .await?
     {
         return Ok(BootstrapOutcome::Return(Ok(reply)));
     }
 
-    if let Some(reply) = agent
-        .maybe_handle_non_resolving_confirmation_shortcut(session_id, user_text, &task_id, &emitter)
-        .await?
+    if let Some(reply) = super::shortcuts::maybe_handle_non_resolving_confirmation_shortcut(
+        agent, session_id, user_text, &task_id, &emitter,
+    )
+    .await?
     {
         return Ok(BootstrapOutcome::Return(Ok(reply)));
     }
 
-    if let Some(reply) = agent
-        .maybe_handle_trivial_ack_shortcut(session_id, user_text, &task_id, &emitter)
-        .await?
+    if let Some(reply) = super::shortcuts::maybe_handle_trivial_ack_shortcut(
+        agent, session_id, user_text, &task_id, &emitter,
+    )
+    .await?
     {
         return Ok(BootstrapOutcome::Return(Ok(reply)));
     }
 
-    if let Some(reply) = agent
-        .maybe_handle_time_query_shortcut(session_id, user_text, &task_id, &emitter)
-        .await?
+    if let Some(reply) = super::shortcuts::maybe_handle_time_query_shortcut(
+        agent, session_id, user_text, &task_id, &emitter,
+    )
+    .await?
     {
         return Ok(BootstrapOutcome::Return(Ok(reply)));
     }
@@ -228,9 +233,15 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 });
             }
             let reply = deterministic_reply_for_critical_query(query, &summary);
-            let reply = agent
-                .emit_bootstrap_direct_reply(&emitter, &task_id, session_id, Instant::now(), &reply)
-                .await?;
+            let reply = super::shortcuts::emit_bootstrap_direct_reply(
+                agent,
+                &emitter,
+                &task_id,
+                session_id,
+                Instant::now(),
+                &reply,
+            )
+            .await?;
             return Ok(BootstrapOutcome::Return(Ok(reply)));
         }
     }

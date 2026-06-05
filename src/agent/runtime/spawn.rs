@@ -32,6 +32,7 @@ pub(in crate::agent) fn task_lead_execution_mode(is_scheduled: bool) -> &'static
     }
 }
 
+// impl-Agent justification: sub-agent spawning over specialists/limits/depth/role.
 impl Agent {
     pub(crate) fn select_specialist_kind(
         role: AgentRole,

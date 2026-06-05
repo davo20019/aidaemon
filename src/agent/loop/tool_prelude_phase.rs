@@ -378,163 +378,153 @@ fn should_run_pre_execution_critique(
         || policy_bundle.uncertainty_score >= 0.45
 }
 
-impl Agent {
-    async fn inject_prelude_retry_messages(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        session_id: &str,
-        task_id: &str,
-        tool_calls: &[ToolCall],
-        result_text: String,
-    ) -> anyhow::Result<()> {
-        for tc in tool_calls {
-            let tool_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
-                role: "tool".to_string(),
-                content: Some(result_text.clone()),
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                tool_calls_json: None,
-                created_at: Utc::now(),
-                importance: 0.3,
-                ..Message::runtime_defaults()
-            };
-            self.append_tool_message_with_result_event(
-                emitter,
-                &tool_msg,
-                true,
-                0,
-                None,
-                Some(task_id),
+async fn inject_prelude_retry_messages(
+    agent: &Agent,
+    emitter: &crate::events::EventEmitter,
+    session_id: &str,
+    task_id: &str,
+    tool_calls: &[ToolCall],
+    result_text: String,
+) -> anyhow::Result<()> {
+    for tc in tool_calls {
+        let tool_msg = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: "tool".to_string(),
+            content: Some(result_text.clone()),
+            tool_call_id: Some(tc.id.clone()),
+            tool_name: Some(tc.name.clone()),
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.3,
+            ..Message::runtime_defaults()
+        };
+        agent
+            .append_tool_message_with_result_event(emitter, &tool_msg, true, 0, None, Some(task_id))
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn request_pre_execution_plan(
+    llm_provider: Arc<dyn ModelProvider>,
+    model: &str,
+    user_text: &str,
+    assistant_narration: Option<&str>,
+    tool_call: &ToolCall,
+    capabilities: ToolCapabilities,
+) -> anyhow::Result<PlanState> {
+    let target = extract_target_preview(&tool_call.arguments).unwrap_or_default();
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "Return only JSON matching the schema. Produce a minimal pre-execution plan for the first risky tool action before execution. The first_action.tool must exactly match the proposed tool call name."
+        }),
+        json!({
+            "role": "user",
+            "content": format!(
+                "User request:\n{user_text}\n\nAssistant narration before execution:\n{}\n\nProposed risky tool call:\n{}\n\nReturn a minimal plan for this immediate action. Keep success criteria concrete and short. Mark requires_verification=true for this risky action.",
+                assistant_narration
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("<none>"),
+                serde_json::to_string_pretty(&json!({
+                    "tool": tool_call.name,
+                    "target_hint": target,
+                    "arguments": summarize_tool_arguments(&tool_call.arguments),
+                    "capabilities": {
+                        "read_only": capabilities.read_only,
+                        "external_side_effect": capabilities.external_side_effect,
+                        "needs_approval": capabilities.needs_approval,
+                        "idempotent": capabilities.idempotent,
+                        "high_impact_write": capabilities.high_impact_write,
+                    }
+                }))
+                .unwrap_or_else(|_| tool_call.arguments.clone())
             )
-            .await?;
-        }
+        }),
+    ];
+    let options = ChatOptions {
+        response_mode: crate::traits::ResponseMode::JsonSchema {
+            name: "pre_execution_plan_v1".to_string(),
+            schema: pre_execution_plan_schema_json(),
+            strict: true,
+        },
+        tool_choice: ToolChoiceMode::None,
+        ..ChatOptions::default()
+    };
+    let response = llm_provider
+        .chat_with_options(model, &messages, &[], &options)
+        .await?;
+    let raw = response
+        .content
+        .ok_or_else(|| anyhow::anyhow!("pre-execution planning response was empty"))?;
+    let plan = serde_json::from_str::<PlanState>(&raw)?;
+    Ok(plan.normalize())
+}
 
-        Ok(())
-    }
-
-    async fn request_pre_execution_plan(
-        &self,
-        llm_provider: Arc<dyn ModelProvider>,
-        model: &str,
-        user_text: &str,
-        assistant_narration: Option<&str>,
-        tool_call: &ToolCall,
-        capabilities: ToolCapabilities,
-    ) -> anyhow::Result<PlanState> {
-        let target = extract_target_preview(&tool_call.arguments).unwrap_or_default();
-        let messages = vec![
-            json!({
-                "role": "system",
-                "content": "Return only JSON matching the schema. Produce a minimal pre-execution plan for the first risky tool action before execution. The first_action.tool must exactly match the proposed tool call name."
-            }),
-            json!({
-                "role": "user",
-                "content": format!(
-                    "User request:\n{user_text}\n\nAssistant narration before execution:\n{}\n\nProposed risky tool call:\n{}\n\nReturn a minimal plan for this immediate action. Keep success criteria concrete and short. Mark requires_verification=true for this risky action.",
-                    assistant_narration
-                        .map(str::trim)
-                        .filter(|text| !text.is_empty())
-                        .unwrap_or("<none>"),
-                    serde_json::to_string_pretty(&json!({
-                        "tool": tool_call.name,
-                        "target_hint": target,
-                        "arguments": summarize_tool_arguments(&tool_call.arguments),
-                        "capabilities": {
-                            "read_only": capabilities.read_only,
-                            "external_side_effect": capabilities.external_side_effect,
-                            "needs_approval": capabilities.needs_approval,
-                            "idempotent": capabilities.idempotent,
-                            "high_impact_write": capabilities.high_impact_write,
-                        }
-                    }))
-                    .unwrap_or_else(|_| tool_call.arguments.clone())
-                )
-            }),
-        ];
-        let options = ChatOptions {
-            response_mode: crate::traits::ResponseMode::JsonSchema {
-                name: "pre_execution_plan_v1".to_string(),
-                schema: pre_execution_plan_schema_json(),
-                strict: true,
-            },
-            tool_choice: ToolChoiceMode::None,
-            ..ChatOptions::default()
-        };
-        let response = llm_provider
-            .chat_with_options(model, &messages, &[], &options)
-            .await?;
-        let raw = response
-            .content
-            .ok_or_else(|| anyhow::anyhow!("pre-execution planning response was empty"))?;
-        let plan = serde_json::from_str::<PlanState>(&raw)?;
-        Ok(plan.normalize())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn request_pre_execution_critique(
-        &self,
-        llm_provider: Arc<dyn ModelProvider>,
-        model: &str,
-        user_text: &str,
-        assistant_narration: Option<&str>,
-        tool_call: &ToolCall,
-        plan: &PlanState,
-        evidence_state: &EvidenceState,
-        capabilities: ToolCapabilities,
-        expected_target: Option<&str>,
-    ) -> anyhow::Result<CritiqueState> {
-        let messages = vec![
-            json!({
-                "role": "system",
-                "content": "Return only JSON matching the schema. You are a brief critique pass for a risky first tool action. Focus only on concrete issues in these categories: wrong target, missing evidence, unverifiable success criteria, unsafe first action. Use verdict=replan only when one of those issues is specific and blocking."
-            }),
-            json!({
-                "role": "user",
-                "content": format!(
-                    "User request:\n{user_text}\n\nAssistant narration before execution:\n{}\n\nProposed risky tool call:\n{}\n\nPlan under review:\n{}\n\nCurrent evidence snapshot:\n{}\n\nOnly flag concrete blockers. Do not ask for generic caution.",
-                    assistant_narration
-                        .map(str::trim)
-                        .filter(|text| !text.is_empty())
-                        .unwrap_or("<none>"),
-                    serde_json::to_string_pretty(&json!({
-                        "tool": tool_call.name,
-                        "target_hint": expected_target,
-                        "arguments": summarize_tool_arguments(&tool_call.arguments),
-                        "capabilities": {
-                            "read_only": capabilities.read_only,
-                            "external_side_effect": capabilities.external_side_effect,
-                            "needs_approval": capabilities.needs_approval,
-                            "idempotent": capabilities.idempotent,
-                            "high_impact_write": capabilities.high_impact_write,
-                        }
-                    }))
-                    .unwrap_or_else(|_| tool_call.arguments.clone()),
-                    serde_json::to_string_pretty(plan).unwrap_or_else(|_| "<plan unavailable>".to_string()),
-                    serde_json::to_string_pretty(&summarize_evidence_state(evidence_state))
-                        .unwrap_or_else(|_| "<evidence unavailable>".to_string()),
-                )
-            }),
-        ];
-        let options = ChatOptions {
-            response_mode: crate::traits::ResponseMode::JsonSchema {
-                name: "pre_execution_critique_v1".to_string(),
-                schema: pre_execution_critique_schema_json(),
-                strict: true,
-            },
-            tool_choice: ToolChoiceMode::None,
-            ..ChatOptions::default()
-        };
-        let response = llm_provider
-            .chat_with_options(model, &messages, &[], &options)
-            .await?;
-        let raw = response
-            .content
-            .ok_or_else(|| anyhow::anyhow!("pre-execution critique response was empty"))?;
-        let critique = serde_json::from_str::<CritiqueState>(&raw)?;
-        Ok(critique.normalize())
-    }
+#[allow(clippy::too_many_arguments)]
+async fn request_pre_execution_critique(
+    llm_provider: Arc<dyn ModelProvider>,
+    model: &str,
+    user_text: &str,
+    assistant_narration: Option<&str>,
+    tool_call: &ToolCall,
+    plan: &PlanState,
+    evidence_state: &EvidenceState,
+    capabilities: ToolCapabilities,
+    expected_target: Option<&str>,
+) -> anyhow::Result<CritiqueState> {
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "Return only JSON matching the schema. You are a brief critique pass for a risky first tool action. Focus only on concrete issues in these categories: wrong target, missing evidence, unverifiable success criteria, unsafe first action. Use verdict=replan only when one of those issues is specific and blocking."
+        }),
+        json!({
+            "role": "user",
+            "content": format!(
+                "User request:\n{user_text}\n\nAssistant narration before execution:\n{}\n\nProposed risky tool call:\n{}\n\nPlan under review:\n{}\n\nCurrent evidence snapshot:\n{}\n\nOnly flag concrete blockers. Do not ask for generic caution.",
+                assistant_narration
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("<none>"),
+                serde_json::to_string_pretty(&json!({
+                    "tool": tool_call.name,
+                    "target_hint": expected_target,
+                    "arguments": summarize_tool_arguments(&tool_call.arguments),
+                    "capabilities": {
+                        "read_only": capabilities.read_only,
+                        "external_side_effect": capabilities.external_side_effect,
+                        "needs_approval": capabilities.needs_approval,
+                        "idempotent": capabilities.idempotent,
+                        "high_impact_write": capabilities.high_impact_write,
+                    }
+                }))
+                .unwrap_or_else(|_| tool_call.arguments.clone()),
+                serde_json::to_string_pretty(plan).unwrap_or_else(|_| "<plan unavailable>".to_string()),
+                serde_json::to_string_pretty(&summarize_evidence_state(evidence_state))
+                    .unwrap_or_else(|_| "<evidence unavailable>".to_string()),
+            )
+        }),
+    ];
+    let options = ChatOptions {
+        response_mode: crate::traits::ResponseMode::JsonSchema {
+            name: "pre_execution_critique_v1".to_string(),
+            schema: pre_execution_critique_schema_json(),
+            strict: true,
+        },
+        tool_choice: ToolChoiceMode::None,
+        ..ChatOptions::default()
+    };
+    let response = llm_provider
+        .chat_with_options(model, &messages, &[], &options)
+        .await?;
+    let raw = response
+        .content
+        .ok_or_else(|| anyhow::anyhow!("pre-execution critique response was empty"))?;
+    let critique = serde_json::from_str::<CritiqueState>(&raw)?;
+    Ok(critique.normalize())
 }
 
 pub(super) async fn run_tool_prelude_phase(
@@ -674,7 +664,8 @@ pub(super) async fn run_tool_prelude_phase(
                     }),
                 )
                 .await;
-            agent.inject_prelude_retry_messages(
+            inject_prelude_retry_messages(
+                agent,
                     emitter,
                     session_id,
                     task_id,
@@ -802,18 +793,18 @@ pub(super) async fn run_tool_prelude_phase(
                     }),
                 )
                 .await;
-            agent
-                .inject_prelude_retry_messages(
-                    emitter,
-                    session_id,
-                    task_id,
-                    &resp.tool_calls,
-                    format!(
-                        "[SYSTEM] Evidence gate blocked this tool call. {} {}",
-                        violation.reason, violation.coaching
-                    ),
-                )
-                .await?;
+            inject_prelude_retry_messages(
+                agent,
+                emitter,
+                session_id,
+                task_id,
+                &resp.tool_calls,
+                format!(
+                    "[SYSTEM] Evidence gate blocked this tool call. {} {}",
+                    violation.reason, violation.coaching
+                ),
+            )
+            .await?;
             return Ok(ToolPreludeOutcome::ContinueLoop);
         }
     }
@@ -843,16 +834,15 @@ pub(super) async fn run_tool_prelude_phase(
             // not an agent action. Do not charge it against the execution
             // budget — the agent should not be penalised for the system's
             // own safety overhead.
-            match agent
-                .request_pre_execution_plan(
-                    llm_provider,
-                    model,
-                    user_text,
-                    resp.content.as_deref(),
-                    &first_risky_tool_call,
-                    capabilities,
-                )
-                .await
+            match request_pre_execution_plan(
+                llm_provider,
+                model,
+                user_text,
+                resp.content.as_deref(),
+                &first_risky_tool_call,
+                capabilities,
+            )
+            .await
             {
                 Ok(plan) => match validate_pre_execution_plan(
                     &plan,
@@ -928,19 +918,18 @@ pub(super) async fn run_tool_prelude_phase(
                             // Same principle: critique is system-initiated
                             // quality gating, not agent work. Do not charge
                             // it against the execution budget.
-                            match agent
-                                .request_pre_execution_critique(
-                                    ctx.llm_provider.clone(),
-                                    model,
-                                    user_text,
-                                    resp.content.as_deref(),
-                                    &first_risky_tool_call,
-                                    &plan,
-                                    evidence_state,
-                                    capabilities,
-                                    expected_target.as_deref(),
-                                )
-                                .await
+                            match request_pre_execution_critique(
+                                ctx.llm_provider.clone(),
+                                model,
+                                user_text,
+                                resp.content.as_deref(),
+                                &first_risky_tool_call,
+                                &plan,
+                                evidence_state,
+                                capabilities,
+                                expected_target.as_deref(),
+                            )
+                            .await
                             {
                                 Ok(critique) => {
                                     match validate_pre_execution_critique(&critique) {
@@ -1038,7 +1027,8 @@ pub(super) async fn run_tool_prelude_phase(
                                             )
                                             .await;
                                             let issues = critique.issues.join("; ");
-                                            agent.inject_prelude_retry_messages(
+                                            inject_prelude_retry_messages(
+                agent,
                                                 emitter,
                                                 session_id,
                                                 task_id,
@@ -1180,7 +1170,8 @@ pub(super) async fn run_tool_prelude_phase(
                                 }),
                             )
                             .await;
-                        agent.inject_prelude_retry_messages(
+                        inject_prelude_retry_messages(
+                agent,
                                 emitter,
                                 session_id,
                                 task_id,

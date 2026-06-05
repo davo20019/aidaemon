@@ -66,6 +66,7 @@ pub(super) enum ScheduledRunBudgetControlOutcome {
     },
 }
 
+// impl-Agent justification: graceful shutdown, budget progress, and task-end hooks over state/event_store.
 impl Agent {
     pub(super) fn has_meaningful_budget_progress(
         evidence_gain_count: usize,
@@ -954,9 +955,13 @@ impl Agent {
                 },
             )
             .await;
-        if let Err(err) = self
-            .record_dialogue_task_end(emitter.session_id(), task_id, status)
-            .await
+        if let Err(err) = super::dialogue_state::record_dialogue_task_end(
+            self,
+            emitter.session_id(),
+            task_id,
+            status,
+        )
+        .await
         {
             warn!(
                 session_id = emitter.session_id(),

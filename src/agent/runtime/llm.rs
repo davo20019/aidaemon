@@ -10,6 +10,7 @@ fn malformed_reason_label(
     }
 }
 
+// impl-Agent justification: LLM call recovery and fallback cascade over llm_runtime/model/billing_failed_models.
 impl Agent {
     /// Pick a fallback model, skipping `failed_model` and any models in the `exclude` list.
     /// Tries stored fallback first, then cycles through router ordered models

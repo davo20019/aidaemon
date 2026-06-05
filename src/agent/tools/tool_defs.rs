@@ -34,6 +34,7 @@ fn validate_required_fields_contract(parameters: &Value) -> Result<(), String> {
     Ok(())
 }
 
+// impl-Agent justification: tool definition assembly and lookup over tools/mcp_registry/skill_cache/role.
 impl Agent {
     pub(crate) fn validate_tool_definition_contract(def: &Value) -> Result<(), String> {
         let func = def

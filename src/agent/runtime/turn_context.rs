@@ -189,6 +189,7 @@ fn extract_recent_parent_messages(history: &[Message], max_messages: usize) -> V
     rows_rev
 }
 
+// impl-Agent justification: history I/O (append_*/load_*) and turn-context building over state/event_store — shared service for all phases.
 impl Agent {
     pub(super) async fn build_turn_context_from_recent_history(
         &self,
@@ -398,8 +399,12 @@ impl Agent {
             .await?;
         self.append_message_canonical(normalized_msg.as_ref())
             .await?;
-        self.record_dialogue_user_message(&normalized_msg.session_id, normalized_msg.as_ref())
-            .await?;
+        super::dialogue_state::record_dialogue_user_message(
+            self,
+            &normalized_msg.session_id,
+            normalized_msg.as_ref(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -444,8 +449,12 @@ impl Agent {
             .await?;
         self.append_message_canonical(normalized_msg.as_ref())
             .await?;
-        self.record_dialogue_assistant_message(&normalized_msg.session_id, normalized_msg.as_ref())
-            .await?;
+        super::dialogue_state::record_dialogue_assistant_message(
+            self,
+            &normalized_msg.session_id,
+            normalized_msg.as_ref(),
+        )
+        .await?;
         Ok(())
     }
 

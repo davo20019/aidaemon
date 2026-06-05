@@ -105,34 +105,35 @@ pub(super) struct LlmPhaseCtx<'a> {
     pub thinking_truncation_count: &'a mut u8,
 }
 
-impl Agent {
-    #[allow(clippy::too_many_arguments)]
-    async fn finalize_external_action_timeout_ack(
-        &self,
-        emitter: &crate::events::EventEmitter,
-        task_id: &str,
-        session_id: &str,
-        iteration: usize,
-        task_start: Instant,
-        learning_ctx: &mut LearningContext,
-        model: &str,
-        reply: String,
-    ) -> anyhow::Result<String> {
-        let assistant_msg = Message {
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            role: "assistant".to_string(),
-            content: Some(reply.clone()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls_json: None,
-            created_at: Utc::now(),
-            importance: 0.5,
-            ..Message::runtime_defaults()
-        };
-        self.append_assistant_message_with_event(emitter, &assistant_msg, model, None, None)
-            .await?;
-        self.emit_task_end(
+#[allow(clippy::too_many_arguments)]
+async fn finalize_external_action_timeout_ack(
+    agent: &Agent,
+    emitter: &crate::events::EventEmitter,
+    task_id: &str,
+    session_id: &str,
+    iteration: usize,
+    task_start: Instant,
+    learning_ctx: &mut LearningContext,
+    model: &str,
+    reply: String,
+) -> anyhow::Result<String> {
+    let assistant_msg = Message {
+        id: Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
+        role: "assistant".to_string(),
+        content: Some(reply.clone()),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls_json: None,
+        created_at: Utc::now(),
+        importance: 0.5,
+        ..Message::runtime_defaults()
+    };
+    agent
+        .append_assistant_message_with_event(emitter, &assistant_msg, model, None, None)
+        .await?;
+    agent
+        .emit_task_end(
             emitter,
             task_id,
             TaskStatus::Completed,
@@ -144,17 +145,16 @@ impl Agent {
         )
         .await;
 
-        learning_ctx.completed_naturally = true;
-        let learning_ctx_for_task = learning_ctx.clone();
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
-                warn!("Learning failed: {}", e);
-            }
-        });
+    learning_ctx.completed_naturally = true;
+    let learning_ctx_for_task = learning_ctx.clone();
+    let state = agent.state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
+            warn!("Learning failed: {}", e);
+        }
+    });
 
-        Ok(reply)
-    }
+    Ok(reply)
 }
 
 pub(super) async fn run_llm_phase(
@@ -435,19 +435,18 @@ pub(super) async fn run_llm_phase(
                     timeout_secs = timeout_dur.as_secs(),
                     "Returning deterministic completion after post-action LLM timeout"
                 );
-                let result = services
-                    .agent
-                    .finalize_external_action_timeout_ack(
-                        emitter,
-                        task_id,
-                        session_id,
-                        iteration,
-                        task_start,
-                        learning_ctx,
-                        model,
-                        reply,
-                    )
-                    .await;
+                let result = finalize_external_action_timeout_ack(
+                    services.agent,
+                    emitter,
+                    task_id,
+                    session_id,
+                    iteration,
+                    task_start,
+                    learning_ctx,
+                    model,
+                    reply,
+                )
+                .await;
                 return Ok(LlmPhaseOutcome::Return(result));
             }
             *stall_count += 1;

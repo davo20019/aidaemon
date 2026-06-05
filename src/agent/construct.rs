@@ -25,6 +25,7 @@ use crate::traits::{AgentRole, StateStore, Tool};
 use super::execution_state::ExecutionBudget;
 use super::{init_policy_tunables_once, Agent, AgentLimits};
 
+// impl-Agent justification: constructor, with_depth, and test setters — the only place Agent fields are wired.
 impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub fn new(

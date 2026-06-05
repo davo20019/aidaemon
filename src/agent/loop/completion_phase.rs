@@ -49,7 +49,7 @@ fn build_force_text_deferred_completion_reply(
     _tool_call_count: usize,
 ) -> Option<String> {
     if candidate.tool_name == "send_file" {
-        return Some(Agent::send_file_completion_reply().to_string());
+        return Some(super::stopping_phase::send_file_completion_reply().to_string());
     }
 
     // read_file should not block completion recovery — the file content is
@@ -325,7 +325,7 @@ fn build_completion_fallback_reply(
 ) -> String {
     if let Some(candidate) = candidate_allowed_for_completion_fallback(candidate, tool_call_count) {
         if candidate.tool_name == "send_file" {
-            return Agent::send_file_completion_reply().to_string();
+            return super::stopping_phase::send_file_completion_reply().to_string();
         }
         if let Some(reply) = build_tool_output_completion_reply(
             &candidate.tool_name,
@@ -963,7 +963,7 @@ pub(super) async fn run_completion_phase(
                 .any(|call| call.starts_with("send_file("))
             && (reply.trim().is_empty() || is_low_signal_task_lead_reply(&reply))
         {
-            reply = Agent::send_file_completion_reply().to_string();
+            reply = super::stopping_phase::send_file_completion_reply().to_string();
             info!(
                 session_id,
                 iteration, "Force-text send_file completion upgraded to shared closeout"
@@ -1169,7 +1169,7 @@ pub(super) async fn run_completion_phase(
                 latest_task_tool_result_for_completion(agent, session_id, task_id, 2500).await;
             if let Some(candidate) = candidate.as_ref() {
                 if candidate.tool_name == "send_file" {
-                    reply = Agent::send_file_completion_reply().to_string();
+                    reply = super::stopping_phase::send_file_completion_reply().to_string();
                     recovered = true;
                 } else if let Some(tool_reply) = build_tool_output_completion_reply(
                     &candidate.tool_name,
@@ -1228,7 +1228,7 @@ pub(super) async fn run_completion_phase(
                     &candidate.tool_output,
                 );
                 if candidate.tool_name == "send_file" {
-                    reply = Agent::send_file_completion_reply().to_string();
+                    reply = super::stopping_phase::send_file_completion_reply().to_string();
                     recovered = true;
                     info!(
                         session_id,
@@ -1378,7 +1378,7 @@ pub(super) async fn run_completion_phase(
                 .iter()
                 .any(|call| call.starts_with("send_file("))
         {
-            reply = Agent::send_file_completion_reply().to_string();
+            reply = super::stopping_phase::send_file_completion_reply().to_string();
             info!(
                 session_id,
                 iteration, "Recovered empty force-text completion with shared send_file closeout"

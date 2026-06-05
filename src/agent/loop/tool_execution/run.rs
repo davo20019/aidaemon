@@ -1313,22 +1313,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             iteration_had_tool_failures = true;
             continue;
         }
-        match agent
-            .maybe_block_tool_by_budget(
-                tc,
-                &mut ToolBudgetBlockCtx {
-                    emitter,
-                    task_id,
-                    session_id,
-                    iteration,
-                    tool_failure_count: &tool_failure_count,
-                    tool_transient_failure_count: &tool_transient_failure_count,
-                    tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
-                    tool_call_count: &tool_call_count,
-                    unknown_tools: &unknown_tools,
-                },
-            )
-            .await?
+        match super::budget_blocking::maybe_block_tool_by_budget(
+            agent,
+            tc,
+            &mut ToolBudgetBlockCtx {
+                emitter,
+                task_id,
+                session_id,
+                iteration,
+                tool_failure_count: &tool_failure_count,
+                tool_transient_failure_count: &tool_transient_failure_count,
+                tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
+                tool_call_count: &tool_call_count,
+                unknown_tools: &unknown_tools,
+            },
+        )
+        .await?
         {
             ToolBlockKind::NotBlocked => {}
             ToolBlockKind::Cooldown => {
@@ -1362,23 +1362,23 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         // They must run BEFORE loop-pattern guards so blocked calls
         // do not inflate repetitive/same-tool counters and trigger
         // false "agent is looping" failures.
-        if let Some(guard_outcome) = agent
-            .maybe_handle_loop_pattern_guards(
-                tc,
-                emitter,
-                task_id,
-                session_id,
-                iteration,
-                task_start,
-                task_tokens_used,
-                learning_ctx,
-                &mut recent_tool_calls,
-                &mut recent_tool_names,
-                &mut consecutive_same_tool,
-                &mut consecutive_same_tool_arg_hashes,
-                &tool_result_cache,
-            )
-            .await?
+        if let Some(guard_outcome) = super::guards::maybe_handle_loop_pattern_guards(
+            agent,
+            tc,
+            emitter,
+            task_id,
+            session_id,
+            iteration,
+            task_start,
+            task_tokens_used,
+            learning_ctx,
+            &mut recent_tool_calls,
+            &mut recent_tool_names,
+            &mut consecutive_same_tool,
+            &mut consecutive_same_tool_arg_hashes,
+            &tool_result_cache,
+        )
+        .await?
         {
             match guard_outcome {
                 LoopPatternGuardOutcome::ContinueLoop => {
@@ -1412,53 +1412,53 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 }
             }
         }
-        if agent
-            .maybe_handle_duplicate_send_file_noop(
-                tc,
-                &mut DuplicateSendFileNoopCtx {
-                    send_file_key: send_file_key.as_ref(),
-                    successful_send_file_keys: &successful_send_file_keys,
-                    session_id,
-                    iteration,
-                    effective_arguments: &effective_arguments,
-                    force_text_response: &mut force_text_response,
-                    pending_system_messages: &mut pending_system_messages,
-                    successful_tool_calls: &mut successful_tool_calls,
-                    total_successful_tool_calls: &mut total_successful_tool_calls,
-                    tool_call_count: &mut tool_call_count,
-                    learning_ctx,
-                    emitter,
-                    task_id,
-                    policy_bundle,
-                },
-            )
-            .await?
+        if super::budget_blocking::maybe_handle_duplicate_send_file_noop(
+            agent,
+            tc,
+            &mut DuplicateSendFileNoopCtx {
+                send_file_key: send_file_key.as_ref(),
+                successful_send_file_keys: &successful_send_file_keys,
+                session_id,
+                iteration,
+                effective_arguments: &effective_arguments,
+                force_text_response: &mut force_text_response,
+                pending_system_messages: &mut pending_system_messages,
+                successful_tool_calls: &mut successful_tool_calls,
+                total_successful_tool_calls: &mut total_successful_tool_calls,
+                tool_call_count: &mut tool_call_count,
+                learning_ctx,
+                emitter,
+                task_id,
+                policy_bundle,
+            },
+        )
+        .await?
         {
             continue;
         }
 
-        let io = agent
-            .execute_tool_call_io(
-                tc,
-                &ToolExecutionIoCtx {
-                    effective_arguments: &effective_arguments,
-                    idempotency_key: execution_state
-                        .current_step
-                        .as_ref()
-                        .and_then(|step| step.idempotency_key.as_deref()),
-                    injected_project_dir: injected_project_dir.as_deref(),
-                    project_scope: allowed_project_scope,
-                    session_id,
-                    task_id,
-                    status_tx: &status_tx,
-                    channel_ctx,
-                    user_role,
-                    heartbeat,
-                    emitter,
-                    policy_bundle,
-                },
-            )
-            .await;
+        let io = super::execution_io::execute_tool_call_io(
+            agent,
+            tc,
+            &ToolExecutionIoCtx {
+                effective_arguments: &effective_arguments,
+                idempotency_key: execution_state
+                    .current_step
+                    .as_ref()
+                    .and_then(|step| step.idempotency_key.as_deref()),
+                injected_project_dir: injected_project_dir.as_deref(),
+                project_scope: allowed_project_scope,
+                session_id,
+                task_id,
+                status_tx: &status_tx,
+                channel_ctx,
+                user_role,
+                heartbeat,
+                emitter,
+                policy_bundle,
+            },
+        )
+        .await;
         execution_state.record_tool_call();
         execution_state.mark_persisted_now();
         let mut result_text = io.result_text;
@@ -1788,34 +1788,34 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             dirs_with_project_inspect_file_evidence: &mut dirs_with_project_inspect_file_evidence,
             dirs_with_search_no_matches: &mut dirs_with_search_no_matches,
         };
-        let learning_outcome = agent
-            .apply_result_learning(
-                tc,
-                &mut result_text,
-                is_error,
-                failure_class,
-                execution_failure_kind,
-                &learning_env,
-                &mut learning_state,
-            )
-            .await?;
+        let learning_outcome = super::result_learning::apply_result_learning(
+            agent,
+            tc,
+            &mut result_text,
+            is_error,
+            failure_class,
+            execution_failure_kind,
+            &learning_env,
+            &mut learning_state,
+        )
+        .await?;
         if let Some(outcome) = learning_outcome.control_flow {
             commit_state!();
             return Ok(outcome);
         }
         if let Some(failure) = learning_outcome.semantic_failure.as_ref() {
-            if let Some(diagnosis) = agent
-                .maybe_trigger_reflection(
-                    &tc.name,
-                    &effective_arguments,
-                    failure,
-                    _user_text,
-                    active_skill_names,
-                    &tool_error_history,
-                    &mut reflection_completed,
-                    session_id,
-                )
-                .await
+            if let Some(diagnosis) = super::reflection::maybe_trigger_reflection(
+                agent,
+                &tc.name,
+                &effective_arguments,
+                failure,
+                _user_text,
+                active_skill_names,
+                &tool_error_history,
+                &mut reflection_completed,
+                session_id,
+            )
+            .await
             {
                 let failure_key = (tc.name.clone(), failure.signature.clone());
                 pending_system_messages.push(SystemDirective::ReflectionDiagnosis {
@@ -2069,7 +2069,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         "Tool execution phase completed, entering post-loop"
     );
 
-    agent.apply_post_tool_iteration_controls(
+    super::post_loop::apply_post_tool_iteration_controls(
+        agent,
         super::post_loop::PostToolIterationInputs {
             session_id,
             iteration,

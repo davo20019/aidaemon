@@ -142,9 +142,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
         .await
         .unwrap();
 
-    let checkpoint = harness
-        .agent
-        .build_resume_checkpoint(session_id)
+    let checkpoint = crate::agent::resume::build_resume_checkpoint(&harness.agent, session_id)
         .await
         .unwrap()
         .expect("expected resume checkpoint");

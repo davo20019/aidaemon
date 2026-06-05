@@ -558,141 +558,142 @@ fn apply_task_end(
     state.touch();
 }
 
-impl Agent {
-    pub(super) async fn get_or_rebuild_dialogue_state(&self, session_id: &str) -> DialogueState {
-        match self.state.get_dialogue_state(session_id).await {
-            Ok(Some(state)) if state.schema_version == DialogueState::SCHEMA_VERSION => state,
-            Ok(_) | Err(_) => {
-                let rebuilt = self.rebuild_dialogue_state_from_events(session_id).await;
-                if let Err(err) = self.state.upsert_dialogue_state(&rebuilt).await {
-                    tracing::warn!(
-                        session_id,
-                        error = %err,
-                        "Failed to persist rebuilt dialogue state"
-                    );
-                }
-                rebuilt
+pub(in crate::agent) async fn get_or_rebuild_dialogue_state(
+    agent: &Agent,
+    session_id: &str,
+) -> DialogueState {
+    match agent.state.get_dialogue_state(session_id).await {
+        Ok(Some(state)) if state.schema_version == DialogueState::SCHEMA_VERSION => state,
+        Ok(_) | Err(_) => {
+            let rebuilt = rebuild_dialogue_state_from_events(agent, session_id).await;
+            if let Err(err) = agent.state.upsert_dialogue_state(&rebuilt).await {
+                tracing::warn!(
+                    session_id,
+                    error = %err,
+                    "Failed to persist rebuilt dialogue state"
+                );
             }
+            rebuilt
         }
     }
+}
 
-    async fn rebuild_dialogue_state_from_events(&self, session_id: &str) -> DialogueState {
-        let mut state = DialogueState::new(session_id);
-        let events = self
-            .event_store
-            .query_recent_events(session_id, 200)
-            .await
-            .unwrap_or_default();
+async fn rebuild_dialogue_state_from_events(agent: &Agent, session_id: &str) -> DialogueState {
+    let mut state = DialogueState::new(session_id);
+    let events = agent
+        .event_store
+        .query_recent_events(session_id, 200)
+        .await
+        .unwrap_or_default();
 
-        for event in events {
-            match event.event_type {
-                EventType::TaskStart => {
-                    if let Ok(data) = event.parse_data::<TaskStartData>() {
-                        apply_task_start(&mut state, &data.task_id, event.created_at);
-                    }
+    for event in events {
+        match event.event_type {
+            EventType::TaskStart => {
+                if let Ok(data) = event.parse_data::<TaskStartData>() {
+                    apply_task_start(&mut state, &data.task_id, event.created_at);
                 }
-                EventType::UserMessage => {
-                    if let Ok(data) = event.parse_data::<UserMessageData>() {
-                        apply_user_message(
+            }
+            EventType::UserMessage => {
+                if let Ok(data) = event.parse_data::<UserMessageData>() {
+                    apply_user_message(
+                        &mut state,
+                        data.message_id.as_deref().unwrap_or_default(),
+                        &data.content,
+                        &agent.path_aliases.projects,
+                        event.created_at,
+                    );
+                }
+            }
+            EventType::AssistantResponse => {
+                if let Ok(data) = event.parse_data::<AssistantResponseData>() {
+                    let raw = data.content.unwrap_or_default();
+                    let primary = extract_primary_message_content(&raw, &data.annotations);
+                    if !primary.trim().is_empty()
+                        && data
+                            .tool_calls
+                            .as_ref()
+                            .is_none_or(|calls| calls.is_empty())
+                    {
+                        apply_assistant_message(
                             &mut state,
                             data.message_id.as_deref().unwrap_or_default(),
-                            &data.content,
-                            &self.path_aliases.projects,
+                            &primary,
                             event.created_at,
                         );
                     }
                 }
-                EventType::AssistantResponse => {
-                    if let Ok(data) = event.parse_data::<AssistantResponseData>() {
-                        let raw = data.content.unwrap_or_default();
-                        let primary = extract_primary_message_content(&raw, &data.annotations);
-                        if !primary.trim().is_empty()
-                            && data
-                                .tool_calls
-                                .as_ref()
-                                .is_none_or(|calls| calls.is_empty())
-                        {
-                            apply_assistant_message(
-                                &mut state,
-                                data.message_id.as_deref().unwrap_or_default(),
-                                &primary,
-                                event.created_at,
-                            );
-                        }
-                    }
-                }
-                EventType::TaskEnd => {
-                    if let Ok(data) = event.parse_data::<TaskEndData>() {
-                        apply_task_end(&mut state, &data.task_id, data.status, event.created_at);
-                    }
-                }
-                _ => {}
             }
+            EventType::TaskEnd => {
+                if let Ok(data) = event.parse_data::<TaskEndData>() {
+                    apply_task_end(&mut state, &data.task_id, data.status, event.created_at);
+                }
+            }
+            _ => {}
         }
-
-        state
     }
 
-    pub(super) async fn record_dialogue_task_start(
-        &self,
-        session_id: &str,
-        task_id: &str,
-    ) -> anyhow::Result<()> {
-        let mut state = self.get_or_rebuild_dialogue_state(session_id).await;
-        apply_task_start(&mut state, task_id, Utc::now());
-        self.state.upsert_dialogue_state(&state).await
+    state
+}
+
+pub(in crate::agent) async fn record_dialogue_task_start(
+    agent: &Agent,
+    session_id: &str,
+    task_id: &str,
+) -> anyhow::Result<()> {
+    let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
+    apply_task_start(&mut state, task_id, Utc::now());
+    agent.state.upsert_dialogue_state(&state).await
+}
+
+pub(in crate::agent) async fn record_dialogue_user_message(
+    agent: &Agent,
+    session_id: &str,
+    message: &Message,
+) -> anyhow::Result<()> {
+    let Some(content) = message.primary_content() else {
+        return Ok(());
+    };
+    let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
+    apply_user_message(
+        &mut state,
+        &message.id,
+        &content,
+        &agent.path_aliases.projects,
+        message.created_at,
+    );
+    agent.state.upsert_dialogue_state(&state).await
+}
+
+pub(in crate::agent) async fn record_dialogue_assistant_message(
+    agent: &Agent,
+    session_id: &str,
+    message: &Message,
+) -> anyhow::Result<()> {
+    if message.tool_calls_json.is_some() {
+        return Ok(());
+    }
+    let Some(content) = message.content.as_deref() else {
+        return Ok(());
+    };
+    let primary = extract_primary_message_content(content, &message.effective_annotations());
+    if primary.trim().is_empty() {
+        return Ok(());
     }
 
-    pub(super) async fn record_dialogue_user_message(
-        &self,
-        session_id: &str,
-        message: &Message,
-    ) -> anyhow::Result<()> {
-        let Some(content) = message.primary_content() else {
-            return Ok(());
-        };
-        let mut state = self.get_or_rebuild_dialogue_state(session_id).await;
-        apply_user_message(
-            &mut state,
-            &message.id,
-            &content,
-            &self.path_aliases.projects,
-            message.created_at,
-        );
-        self.state.upsert_dialogue_state(&state).await
-    }
+    let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
+    apply_assistant_message(&mut state, &message.id, &primary, message.created_at);
+    agent.state.upsert_dialogue_state(&state).await
+}
 
-    pub(super) async fn record_dialogue_assistant_message(
-        &self,
-        session_id: &str,
-        message: &Message,
-    ) -> anyhow::Result<()> {
-        if message.tool_calls_json.is_some() {
-            return Ok(());
-        }
-        let Some(content) = message.content.as_deref() else {
-            return Ok(());
-        };
-        let primary = extract_primary_message_content(content, &message.effective_annotations());
-        if primary.trim().is_empty() {
-            return Ok(());
-        }
-
-        let mut state = self.get_or_rebuild_dialogue_state(session_id).await;
-        apply_assistant_message(&mut state, &message.id, &primary, message.created_at);
-        self.state.upsert_dialogue_state(&state).await
-    }
-
-    pub(super) async fn record_dialogue_task_end(
-        &self,
-        session_id: &str,
-        task_id: &str,
-        status: TaskStatus,
-    ) -> anyhow::Result<()> {
-        let mut state = self.get_or_rebuild_dialogue_state(session_id).await;
-        apply_task_end(&mut state, task_id, status, Utc::now());
-        self.state.upsert_dialogue_state(&state).await
-    }
+pub(in crate::agent) async fn record_dialogue_task_end(
+    agent: &Agent,
+    session_id: &str,
+    task_id: &str,
+    status: TaskStatus,
+) -> anyhow::Result<()> {
+    let mut state = get_or_rebuild_dialogue_state(agent, session_id).await;
+    apply_task_end(&mut state, task_id, status, Utc::now());
+    agent.state.upsert_dialogue_state(&state).await
 }
 
 #[cfg(test)]

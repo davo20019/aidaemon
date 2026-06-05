@@ -6,6 +6,7 @@
 
 use super::*;
 
+// impl-Agent justification: cross-subsystem note API — called from channels/hub.rs and telegram.rs via Arc<Agent>.
 impl Agent {
     pub(crate) async fn record_auxiliary_assistant_note(
         &self,

@@ -423,6 +423,7 @@ pub use background_task_lead::spawn_background_task_lead;
 #[path = "construct.rs"]
 mod construct;
 
+// impl-Agent justification: public entry surface (handle_message, hub/self-ref wiring, role/depth accessors, goal cancellation) — Agent's API to channels and core.
 impl Agent {
     /// Set the ChannelHub reference (called after hub creation in core.rs).
     pub async fn set_hub(&self, hub: Weak<ChannelHub>) {

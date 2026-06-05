@@ -201,6 +201,7 @@ pub(super) fn format_goal_context(ctx_json: &str) -> String {
     }
 }
 
+// impl-Agent justification: system prompt construction over system_prompt and config fields.
 impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn build_system_prompt_for_message(

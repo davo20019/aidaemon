@@ -11,6 +11,7 @@ pub(super) struct ToolExecCtx<'a> {
     pub user_role: UserRole,
 }
 
+// impl-Agent justification: tool dispatch with watchdog over tools/state/event_store/verification_tracker.
 impl Agent {
     pub(super) async fn execute_tool_with_watchdog(
         &self,

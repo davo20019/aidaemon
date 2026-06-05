@@ -90,6 +90,7 @@ fn infer_deterministic_orchestration_intent(user_text: &str) -> IntentGateDecisi
     intent_gate
 }
 
+// impl-Agent justification: handle_message_impl drives the turn lifecycle and owns TurnState construction.
 impl Agent {
     /// Run the agentic loop for a user message in the given session.
     /// Returns the final assistant text response.
@@ -658,12 +659,14 @@ impl Agent {
                         force_text_iterations,
                         "Force-text safety net: exceeded max consecutive force-text iterations, hard-stopping"
                     );
-                    let fallback = self
-                        .latest_non_system_tool_output_excerpt(session_id, 2000)
-                        .await
-                        .unwrap_or_else(|| {
-                            "I ran into a processing limit. Please try again or rephrase your request.".to_string()
-                        });
+                    let fallback = super::stopping_phase::latest_non_system_tool_output_excerpt(
+                        self, session_id, 2000,
+                    )
+                    .await
+                    .unwrap_or_else(|| {
+                        "I ran into a processing limit. Please try again or rephrase your request."
+                            .to_string()
+                    });
                     let assistant_msg = Message {
                         id: Uuid::new_v4().to_string(),
                         session_id: session_id.to_string(),

@@ -273,113 +273,110 @@ fn parse_reflection_response(
     })
 }
 
-impl Agent {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn maybe_trigger_reflection(
-        &self,
-        tool_name: &str,
-        tool_arguments: &str,
-        failure: &SemanticFailureInfo,
-        user_task: &str,
-        active_skill_names: &[String],
-        tool_error_history: &HashMap<(String, String), Vec<ToolErrorEntry>>,
-        reflection_completed: &mut HashSet<(String, String)>,
-        session_id: &str,
-    ) -> Option<ReflectionDiagnosis> {
-        if failure.count != 2 {
-            return None;
-        }
-
-        let key = (tool_name.to_string(), failure.signature.clone());
-        if reflection_completed.contains(&key) {
-            return None;
-        }
-        reflection_completed.insert(key.clone());
-
-        let error_history = tool_error_history.get(&key)?.clone();
-        if error_history.len() < 2 {
-            return None;
-        }
-
-        let skills_snapshot = self.skill_cache.get();
-        let active_skills: Vec<&crate::skills::Skill> = active_skill_names
-            .iter()
-            .filter_map(|name| crate::skills::find_skill_by_name(&skills_snapshot, name))
-            .collect();
-        let relevant_skill_excerpt =
-            find_relevant_skill_excerpt(&active_skills, tool_name, tool_arguments);
-        let prompt = build_reflection_prompt(
-            tool_name,
-            &failure.signature,
-            &error_history,
-            user_task,
-            relevant_skill_excerpt.as_deref(),
-        );
-
-        let runtime_snapshot = self.llm_runtime.snapshot();
-        let provider = runtime_snapshot.provider();
-        let model = runtime_snapshot
-            .router()
-            .map(|router| router.default_model().to_string())
-            .unwrap_or_else(|| runtime_snapshot.primary_model());
-        let messages = vec![
-            json!({
-                "role": "system",
-                "content": "You are a failure analysis system. Respond with the requested plain-text fields only."
-            }),
-            json!({
-                "role": "user",
-                "content": prompt
-            }),
-        ];
-
-        let response =
-            match tokio::time::timeout(REFLECTION_TIMEOUT, provider.chat(&model, &messages, &[]))
-                .await
-            {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => {
-                    warn!(
-                        tool = %tool_name,
-                        signature = %failure.signature,
-                        error = %error,
-                        "Reflection LLM call failed"
-                    );
-                    return None;
-                }
-                Err(_) => {
-                    warn!(
-                        tool = %tool_name,
-                        signature = %failure.signature,
-                        "Reflection LLM call timed out"
-                    );
-                    return None;
-                }
-            };
-
-        if let Some(usage) = &response.usage {
-            let _ = self.state.record_token_usage(session_id, usage).await;
-        }
-
-        let response_text = response
-            .content
-            .as_deref()
-            .or(response.thinking.as_deref())?;
-        let diagnosis = parse_reflection_response(
-            response_text,
-            tool_name,
-            &failure.signature,
-            reflection_learning_domain(tool_name, tool_arguments),
-        );
-        if diagnosis.is_none() {
-            warn!(
-                tool = %tool_name,
-                signature = %failure.signature,
-                "Reflection response could not be parsed"
-            );
-        }
-        diagnosis
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn maybe_trigger_reflection(
+    agent: &Agent,
+    tool_name: &str,
+    tool_arguments: &str,
+    failure: &SemanticFailureInfo,
+    user_task: &str,
+    active_skill_names: &[String],
+    tool_error_history: &HashMap<(String, String), Vec<ToolErrorEntry>>,
+    reflection_completed: &mut HashSet<(String, String)>,
+    session_id: &str,
+) -> Option<ReflectionDiagnosis> {
+    if failure.count != 2 {
+        return None;
     }
+
+    let key = (tool_name.to_string(), failure.signature.clone());
+    if reflection_completed.contains(&key) {
+        return None;
+    }
+    reflection_completed.insert(key.clone());
+
+    let error_history = tool_error_history.get(&key)?.clone();
+    if error_history.len() < 2 {
+        return None;
+    }
+
+    let skills_snapshot = agent.skill_cache.get();
+    let active_skills: Vec<&crate::skills::Skill> = active_skill_names
+        .iter()
+        .filter_map(|name| crate::skills::find_skill_by_name(&skills_snapshot, name))
+        .collect();
+    let relevant_skill_excerpt =
+        find_relevant_skill_excerpt(&active_skills, tool_name, tool_arguments);
+    let prompt = build_reflection_prompt(
+        tool_name,
+        &failure.signature,
+        &error_history,
+        user_task,
+        relevant_skill_excerpt.as_deref(),
+    );
+
+    let runtime_snapshot = agent.llm_runtime.snapshot();
+    let provider = runtime_snapshot.provider();
+    let model = runtime_snapshot
+        .router()
+        .map(|router| router.default_model().to_string())
+        .unwrap_or_else(|| runtime_snapshot.primary_model());
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "You are a failure analysis system. Respond with the requested plain-text fields only."
+        }),
+        json!({
+            "role": "user",
+            "content": prompt
+        }),
+    ];
+
+    let response =
+        match tokio::time::timeout(REFLECTION_TIMEOUT, provider.chat(&model, &messages, &[])).await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                warn!(
+                    tool = %tool_name,
+                    signature = %failure.signature,
+                    error = %error,
+                    "Reflection LLM call failed"
+                );
+                return None;
+            }
+            Err(_) => {
+                warn!(
+                    tool = %tool_name,
+                    signature = %failure.signature,
+                    "Reflection LLM call timed out"
+                );
+                return None;
+            }
+        };
+
+    if let Some(usage) = &response.usage {
+        let _ = agent.state.record_token_usage(session_id, usage).await;
+    }
+
+    let response_text = response
+        .content
+        .as_deref()
+        .or(response.thinking.as_deref())?;
+    let diagnosis = parse_reflection_response(
+        response_text,
+        tool_name,
+        &failure.signature,
+        reflection_learning_domain(tool_name, tool_arguments),
+    );
+    if diagnosis.is_none() {
+        warn!(
+            tool = %tool_name,
+            signature = %failure.signature,
+            "Reflection response could not be parsed"
+        );
+    }
+    diagnosis
 }
 
 pub(super) async fn store_reflection_learning(
@@ -589,60 +586,57 @@ mod tests {
         );
 
         let mut reflection_completed = HashSet::new();
-        let first = harness
-            .agent
-            .maybe_trigger_reflection(
-                "http_request",
-                r#"{"url":"https://api.example.com/v1"}"#,
-                &SemanticFailureInfo {
-                    signature: "http 404 not found".to_string(),
-                    count: 1,
-                },
-                "Check the example API",
-                &[],
-                &tool_error_history,
-                &mut reflection_completed,
-                "test-session",
-            )
-            .await;
+        let first = maybe_trigger_reflection(
+            &harness.agent,
+            "http_request",
+            r#"{"url":"https://api.example.com/v1"}"#,
+            &SemanticFailureInfo {
+                signature: "http 404 not found".to_string(),
+                count: 1,
+            },
+            "Check the example API",
+            &[],
+            &tool_error_history,
+            &mut reflection_completed,
+            "test-session",
+        )
+        .await;
         assert!(first.is_none());
         assert_eq!(harness.provider.call_count().await, 0);
 
-        let diagnosis = harness
-            .agent
-            .maybe_trigger_reflection(
-                "http_request",
-                r#"{"url":"https://api.example.com/v1"}"#,
-                &SemanticFailureInfo {
-                    signature: "http 404 not found".to_string(),
-                    count: 2,
-                },
-                "Check the example API",
-                &[],
-                &tool_error_history,
-                &mut reflection_completed,
-                "test-session",
-            )
-            .await;
+        let diagnosis = maybe_trigger_reflection(
+            &harness.agent,
+            "http_request",
+            r#"{"url":"https://api.example.com/v1"}"#,
+            &SemanticFailureInfo {
+                signature: "http 404 not found".to_string(),
+                count: 2,
+            },
+            "Check the example API",
+            &[],
+            &tool_error_history,
+            &mut reflection_completed,
+            "test-session",
+        )
+        .await;
         assert!(diagnosis.is_some());
         assert_eq!(harness.provider.call_count().await, 1);
 
-        let second = harness
-            .agent
-            .maybe_trigger_reflection(
-                "http_request",
-                r#"{"url":"https://api.example.com/v1"}"#,
-                &SemanticFailureInfo {
-                    signature: "http 404 not found".to_string(),
-                    count: 2,
-                },
-                "Check the example API",
-                &[],
-                &tool_error_history,
-                &mut reflection_completed,
-                "test-session",
-            )
-            .await;
+        let second = maybe_trigger_reflection(
+            &harness.agent,
+            "http_request",
+            r#"{"url":"https://api.example.com/v1"}"#,
+            &SemanticFailureInfo {
+                signature: "http 404 not found".to_string(),
+                count: 2,
+            },
+            "Check the example API",
+            &[],
+            &tool_error_history,
+            &mut reflection_completed,
+            "test-session",
+        )
+        .await;
         assert!(second.is_none());
         assert_eq!(harness.provider.call_count().await, 1);
     }

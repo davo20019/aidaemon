@@ -45,6 +45,7 @@ pub(crate) struct ParentDeliveryOutcome {
     pub recorded: bool,
 }
 
+// impl-Agent justification: parent-result delivery via hub — called cross-subsystem on task completion.
 impl Agent {
     pub(crate) async fn deliver_parent_text_result(
         &self,
