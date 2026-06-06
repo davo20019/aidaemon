@@ -1,5 +1,8 @@
 # Sliding-Window Hysteresis Design
 
+**Status:** Draft — Phase 0 approved for implementation; Phase 1 gated on the
+Phase 0 attribution result. Last revised 2026-06-06.
+
 ## Goal
 
 Stop the history region of the prompt from being rewritten between LLM calls,
@@ -32,11 +35,20 @@ attributed:
   fetched history (they bypass `keep_from`)
 - pre-boundary content mutation without `keep_from` movement: Prior-1 tool
   result summarization, old-assistant truncation
-  (`MAX_OLD_ASSISTANT_CONTENT_CHARS`), repeated tool-error collapse, and
-  execution checkpoint insertion
+  (`MAX_OLD_ASSISTANT_CONTENT_CHARS`), and repeated tool-error collapse.
+  (The execution checkpoint is appended after the boundary and cannot flip
+  `prefix_hash_pre_boundary`; it is tracked as tail growth, not listed here.)
 - the `[Current Task]` boundary marker moving between turns
 - session-summary churn at message index one
 - tool-schema refitting changing serialized tool definitions
+- **message-zero (system prompt) churn**: message zero embeds a per-minute
+  UTC timestamp and an injected session-context block
+  (`system_prompt.rs:757`), so `prefix_hash_system` changes at least once a
+  minute regardless of the history region. This is a prerequisite, not a
+  Phase 1 target: the anchor pins the history trim and cannot stabilize
+  message zero. The cache-stable-system-prompt work must land first, and
+  Phase 0 must confirm `prefix_hash_system` is stable across the evaluated
+  calls before the anchor can extend reuse past it.
 
 This design therefore has two phases. Phase 1 ships only after Phase 0
 attributes the churn, and only the parts that the evidence supports.
@@ -76,12 +88,29 @@ Add build-phase and provider-call instrumentation behind normal
    summarization and old-assistant truncation), `[Current Task]` marker
    insertion, repeated tool-error collapse, history fitting
    (`fit_messages_with_source_quotas`), session-summary insertion, and
-   execution checkpoint insertion — each instrumented separately so a
+   execution checkpoint insertion (the checkpoint sits after the boundary —
+   its stage hash tracks tail growth for completeness, never pre-boundary
+   attribution) — each instrumented separately so a
    stable `keep_from` with an unstable `prefix_hash_pre_boundary` is
    attributed to content mutation, not misread as window trim. The marker
    is inserted before history fitting and the summary after it; the stage
-   list reflects that. Intermediate stages use prompt-equivalent complete
+   list reflects that. Note there are **two distinct summary insertion
+   points**: history fitting itself can insert a
+   `[Conversation summary: …]` near index one during fitting
+   (`context_window.rs:301`), and message build inserts `[Session Summary]`
+   at index one after system-prompt insertion
+   (`message_build_phase.rs:1002`). Instrument both; hooking only the later
+   one mis-attributes fitting-stage summary churn. Intermediate stages use prompt-equivalent complete
    message objects, not role-and-content-only projections.
+   Mutators that run *after* message build — empty-response recovery,
+   message-zero system insertion, and the `llm_phase` security-message
+   injection / force-text tool selection — are not separately stage-hashed;
+   they are reflected in the final provider-call fingerprint (item 1). If a
+   break is observed there with all build stage hashes stable, it is
+   attributed to this post-build region by elimination, and the `force_text`
+   tag disambiguates the force-text case. Add a dedicated hash around the
+   security-injection step only if elimination proves insufficient during
+   the run.
 3. **Window-decision log** (`info!`) in message build, where persisted
    `Message` metadata is still available. Fields: current `turn_id`,
    boundary message id, oldest fetched persisted message id, oldest kept
@@ -106,12 +135,29 @@ Add build-phase and provider-call instrumentation behind normal
    user-message text — the boundary is matched by content, and duplicate
    `user_text` across turns mis-identifies it and pollutes the hashes.
 
-Phase 0 exit criterion: proceed to Phase 1 anchor work only if attributed
-`keep_from` movement and/or identity-preserve drift account for at least
-half of the large re-evaluations in the attribution run (or the majority of
-blocks where `reused_prefix` sits at the measured system-prompt boundary).
-If the dominant cause is something else (marker, summary, schema refit),
-design for that instead — do not ship the anchor on spec faith.
+Phase 0 exit criterion. All three conditions must hold to proceed to Phase 1
+anchor work:
+
+1. **System-prompt stability gate.** `prefix_hash_system` is constant across
+   the calls being evaluated. If it churns (per-minute timestamp,
+   session-context injection), message zero breaks the prefix before the
+   history region and the anchor cannot help — fix system-prompt churn first
+   and re-run attribution.
+2. **Cause attribution.** Attributed `keep_from` movement *alone* accounts
+   for at least half of the large re-evaluations in the attribution run (or
+   the majority of blocks where `reused_prefix` sits at the system-prompt
+   boundary). Identity-preserve drift does **not** count toward this
+   threshold: those entries bypass `keep_from` by design and Phase 1 does
+   not fix them (see anchor semantics below), so attributing the gate to
+   drift would authorize an anchor that does not address the measured cause.
+   Drift is measured separately and may motivate a distinct follow-up.
+3. **Sample floor.** The run observed at least 20 large requests (evaluated
+   ≥ 20% of prompt); below that the attribution percentage is not
+   statistically meaningful and the run must be extended.
+
+If the dominant cause is something else (identity drift, marker, summary,
+content mutation, schema refit), design for that instead — do not ship the
+anchor on spec faith.
 
 ## Phase 1 — Per-session window anchor (conditional on Phase 0)
 
@@ -133,7 +179,11 @@ State: `window_anchors: Arc<RwLock<HashMap<String, AnchorState>>>` on
 - `cap_tokens = available_budget * WINDOW_ENTRY_BUDGET_PCT / 100` computed
   at establishment time, compared against the skeleton token sum of the
   anchored pairs (token sum, never pair count)
-- validity fields: the model name, a hash of the base system prompt, a
+- validity fields: the model name, a hash of the **base system prompt**
+  (the stable configuration-derived prompt only — explicitly excluding the
+  per-minute timestamp, session-context block, and any other per-turn
+  section; hashing the fully rendered dynamic prompt would mismatch every
+  turn and force a `config_changed` re-anchor on every build), a
   hash of the sorted tool-name set, a hash of pinned-memory ids and contents,
   the enforced policy context budget, and the **resolved total model context
   budget** (the `model_context_budget` result — a per-model budget or
@@ -186,8 +236,10 @@ duplicate removal, and the idle-gap reset are otherwise unchanged:
    and `keep_from` is the boundary — today's existing behavior. Remove any
    existing anchor and do not create a new one; the current-boundary message
    is never used as an anchor. No loop, no panic.
-5. **Anchor-aware final fitting.** Final context fitting must not silently
-   remove messages from the anchored pre-boundary region. If the current
+5. **Anchor-aware history fitting.** History fitting
+   (`fit_messages_with_source_quotas` — distinct from the final tool-defs
+   refit, which never drops messages) must not silently remove messages
+   from the anchored pre-boundary region. If the current
    effective message budget (including policy enforcement and current tool
    definitions) cannot preserve that region, report
    `reason="budget_pressure"`, recompute once at the 15% target, and rerun
@@ -197,12 +249,28 @@ duplicate removal, and the idle-gap reset are otherwise unchanged:
    This is the only permitted one-build retry; it prevents tool-schema
    growth or policy-budget shrink from silently defeating the stored anchor.
 
-   *Implementation note — protected-range mapping.* The fitter receives
-   JSON messages without persisted ids, and this mapping is the riskiest
-   implementation step: track `oldest_kept_msg_id` through the build; after
-   all transforms, resolve it to a contiguous protected index range
-   `[protect_from..boundary_pos)` in the final vec, and extend the fitter
-   API to accept that explicit protected range rather than inferring it.
+   *Implementation note — protected-range mapping (riskiest step).* The
+   converted JSON messages carry no persisted id (`message_build_phase.rs:725`
+   emits `{role, content, ...}` only), so there is nothing to "resolve"
+   against after conversion. The build must therefore carry an explicit
+   provenance channel: a parallel `Vec<Option<String>>` of source message
+   ids (`Message.id` is a String UUID) aligned 1:1 with the message vec
+   (`None` for synthetic/injected entries — marker, fitting-stage summary,
+   injected current-user copy), maintained in lockstep through every
+   transform that inserts, removes, or reorders messages **up to history
+   fitting**. The range is derived **immediately before
+   `fit_messages_with_source_quotas`** — the only stage that drops history
+   messages under budget pressure — by scanning the sidecar for the slot
+   whose id equals `oldest_kept_msg_id`, and passed to the fitter as an
+   explicit `[protect_from..boundary_pos)` range; the fitter never infers
+   it. Resolving "after all transforms" is impossible: system-prompt
+   insertion, the build's summary insertion, the checkpoint, and directives
+   all run *after* fitting — they shift indices but only insert, never
+   remove pre-boundary history, so the sidecar does not need to extend past
+   the fitting call. A unit test must assert the sidecar stays aligned
+   (same length, same order) from fetch through the fitting call;
+   misalignment silently protects the wrong range and is the primary
+   failure mode of this step.
 
 Re-anchor logs, including `budget_pressure`, carry structured fields:
 `session_id`, `reason`,
@@ -225,7 +293,10 @@ enough that cross-turn pinning is not throttled, small enough to bound the
 risk of the content-only token estimator under-counting many tiny pairs,
 whose role/template framing it ignores). Re-anchor paths still apply the
 existing `min(5, fit)` rule when computing a new window, matching today's
-behavior at establishment time.
+behavior at establishment time. Consequence to accept: an anchored window
+that grew toward 40 pairs collapses to ≤5 on the re-anchor — one large cache
+break at re-anchor time, which is the intended hysteresis (rare deep cut)
+rather than the per-turn churn it replaces.
 
 ### Anchor semantics under downstream transforms
 
@@ -233,10 +304,10 @@ The anchor primarily pins where the window trim cuts. Downstream transforms
 — duplicate removal, message-order fixups, empty-response recovery,
 fresh-context isolation, and the `[Current Task]` marker — may still alter
 the serialized prefix without changing that trim decision; they are accepted
-cache boundaries that the Phase 0 fingerprint log makes attributable. Final
-context fitting is different: it may alter unanchored tail content, but it
-must emit `budget_pressure` rather than silently remove any message from the
-anchored pre-boundary region. In particular:
+cache boundaries that the Phase 0 fingerprint log makes attributable. History
+fitting (`fit_messages_with_source_quotas`) is different: it may alter
+unanchored tail content, but it must emit `budget_pressure` rather than
+silently remove any message from the anchored pre-boundary region. In particular:
 
 - `identity_preserve_indices` entries below `keep_from` bypass the trim and
   can drift with the fetch window. Phase 0 measures how often; if it is a
@@ -260,14 +331,18 @@ anchored pre-boundary region. In particular:
   single-session attribution run.
 - Phase 1 (conditional): per-session anchor with cap snapshot, deep
   re-anchor on overflow, structural cap 40 on the anchored path, anchor
-  preservation during final fitting, and anchor cleanup on idle gap and
-  session clear.
+  preservation during final fitting (with the provenance sidecar), and
+  anchor cleanup on idle gap and session clear.
+- Prerequisite, out of scope here: stabilizing message zero
+  (cache-stable-system-prompt work). Phase 1 does not begin until
+  `prefix_hash_system` is confirmed stable in the Phase 0 run.
 - Leave history fetching, age-based collapse, duplicate removal, session
   summaries, tool-schema fitting, and the `[Current Task]` marker unchanged.
 
 ## Tests
 
-A shared helper makes the hash tests deterministic and is the same code the
+A shared helper (new module `src/agent/loop/prefix_fingerprint.rs`) makes the
+hash tests deterministic and is the same code the
 provider-call fingerprint uses:
 `canonical_prefix(messages, user_text) ->
 (hash_system, hash_pre_boundary, boundary_pos)`. It canonicalizes complete
@@ -286,6 +361,9 @@ Phase 0:
   or `tool_call_id` field changes even if role and content are unchanged.
 - Window-decision diagnostics emit persisted boundary/oldest-kept ids without
   requiring those internal fields to be sent to the provider.
+- Force-text iterations emit `force_text=true` with an empty
+  `tool_defs_hash`; a normal iteration emits `force_text=false` — the tag is
+  what lets attribution analyze these separately.
 
 Phase 1:
 - Multi-iteration, same turn: builds at iteration 1 and 2 with tool results
@@ -299,9 +377,15 @@ Phase 1:
   snapshot makes overflow independent of refits) unless final fitting would
   remove an anchored pre-boundary message, in which case
   `reason="budget_pressure"` re-anchors once.
-- Validity-field mismatch (model name, tool-set hash, pinned-memory hash, or
-  enforced policy budget changed) re-anchors with
-  `reason="config_changed"`.
+- Validity-field mismatch (model name, tool-set hash, pinned-memory hash,
+  enforced policy budget, **or resolved `model_context_budget`** changed)
+  re-anchors with `reason="config_changed"` at the 30% rule (not the 15%
+  deep cut). A per-model or default-budget config change with an unchanged
+  model name still invalidates the snapshot.
+- Provenance sidecar stays aligned (equal length, same order) with the
+  message vec across the full transform pipeline; the protected range
+  derived from `oldest_kept_msg_id` covers exactly the anchored
+  pre-boundary region.
 - Event-window slide, both cases: (a) anchor id still fetched but at a
   shifted index — resolves by id, `keep_from` holds at that message;
   (b) oldest pairs dropped from fetch while the anchor id remains — the
