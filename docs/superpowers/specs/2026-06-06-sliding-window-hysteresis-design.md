@@ -54,7 +54,8 @@ attributed:
   timestamp and session-context block for cache purposes — implementers
   must not treat the existing cache-stable change as sufficient for exit
   criterion 1. Phase 0 must confirm `prefix_hash_system` is stable across
-  the evaluated calls before the anchor can extend reuse past it.
+  within-task consecutive calls (the scope of exit criterion 1) before the
+  anchor can extend reuse past it.
 
 This design therefore has two phases. Phase 1 ships only after Phase 0
 attributes the churn, and only the parts that the evidence supports.
@@ -156,7 +157,7 @@ anchor work:
    fail criterion 1 unless cross-turn cache extension is brought into
    Phase 1 scope.
 2. **Cause attribution.** Attributed `keep_from` movement *alone* accounts
-   for at least half of the large re-evaluations in the attribution run (or
+   for at least half of the cache-break requests in the attribution run (or
    the majority of blocks where `reused_prefix` sits at the system-prompt
    boundary). Identity-preserve drift does **not** count toward this
    threshold: those entries bypass `keep_from` by design and Phase 1 does
@@ -180,6 +181,16 @@ oldest normally retained pair-starting user message. Identity-preserve
 bypasses may still include older messages and are logged separately. The
 anchor persists across iterations and across user turns in the same session.
 It moves only when forced, and cuts deep when it does (hysteresis).
+
+Phase 1's claimed and evaluated cache benefit is **within-task** — matching
+exit criterion 1's scope. Cross-turn persistence is retained as **dormant
+behavior**: it costs nothing, keeps the trim boundary (and therefore window
+content) stable across turns, and avoids per-turn re-trim churn, but it
+cannot deliver cross-turn cache extension while message zero recompiles per
+turn (timestamp, session context). If a future cross-turn message-zero
+freeze lands (its own spec), the dormant persistence activates without
+further anchor changes; until then, cross-turn tests verify the mechanism
+(anchor retention), not a cache claim.
 
 State: `window_anchors: Arc<RwLock<HashMap<String, AnchorState>>>` on
 `Agent`, keyed by session id. `AnchorState` holds:
@@ -237,7 +248,7 @@ and get independent anchors. The build phase reaches the map through
 `AgentServices`; `MessageBuildCtx` is unchanged.
 
 Build-phase flow changes the `keep_from` computation and adds an
-anchor-preservation contract to final context fitting. Age-based collapse,
+anchor-preservation contract to history fitting. Age-based collapse,
 duplicate removal, and the idle-gap reset are otherwise unchanged:
 
 1. **Anchored path.** If the session has an anchor, its validity fields
@@ -351,11 +362,12 @@ silently remove any message from the anchored pre-boundary region. In particular
 - The `[Current Task]` marker moves to the newest user message each turn,
   breaking the prefix near the tail of the previous turn. That break is
   bounded (hundreds of tokens re-evaluated, not the whole history) and
-  acceptable; cross-turn anchoring still prevents the expensive head
-  breaks when the session summary and pinned prefix are unchanged. The
-  cross-turn benefit is therefore conditional: "stable historical region,
-  bounded tail break," not byte-identical prefix extension. Summary or
-  pinned-memory churn remains an earlier cache boundary and is measured
+  acceptable; cross-turn anchoring prevents the expensive head breaks only
+  when message zero, the session summary, and the pinned prefix are all
+  unchanged — the dormant-behavior condition stated at the top of Phase 1.
+  The cross-turn benefit is therefore conditional: "stable historical
+  region, bounded tail break," not byte-identical prefix extension. Summary
+  or pinned-memory churn remains an earlier cache boundary and is measured
   separately.
 
 ## Scope
@@ -365,13 +377,14 @@ silently remove any message from the anchored pre-boundary region. In particular
   single-session attribution run.
 - Phase 1 (conditional): per-session anchor with cap snapshot, deep
   re-anchor on overflow, structural cap 40 on the anchored path, anchor
-  preservation during final fitting (with the provenance sidecar), and
+  preservation during history fitting (with the provenance sidecar), and
   anchor cleanup on idle gap and session clear.
 - Prerequisite, out of scope here: stabilizing message zero. The existing
   cache-stable-system-prompt work covers within-task stability; cross-turn
   stability may require additional work (freezing the timestamp and
   session-context block), which would be its own spec. Phase 1 does not
-  begin until `prefix_hash_system` is confirmed stable in the Phase 0 run.
+  begin until `prefix_hash_system` is confirmed stable across within-task
+  consecutive calls in the Phase 0 run (the scope of exit criterion 1).
 - Leave history fetching, age-based collapse, duplicate removal, session
   summaries, tool-schema fitting, and the `[Current Task]` marker unchanged.
 
@@ -406,7 +419,8 @@ Phase 1:
   appended and identical `user_text` produce the same oldest-kept message id
   and identical `canonical_prefix` hash (not just equal `keep_from`).
 - Cross-turn: turn N+1 build keeps the anchor from turn N when within cap
-  (validates the 5-pair-cap bypass).
+  (validates the 5-pair-cap bypass) — a mechanism test for the dormant
+  persistence, not a cross-turn cache-benefit claim.
 - Overflow: anchored pairs exceeding the cap snapshot re-anchor to the 15%
   target and update the stored anchor.
 - Tool-budget shrink without message growth does NOT re-anchor (cap
@@ -418,7 +432,8 @@ Phase 1:
 - Rendered system-prompt token estimate drifting beyond the ±10% band
   (relative to `system_prompt_token_estimate_at_establishment`) re-anchors
   with `reason="config_changed"`; drift within the band does not.
-- Validity-field mismatch (model name, tool-set hash, pinned-memory hash,
+- Validity-field mismatch (model name, original-tool-definitions hash,
+  pinned-memory hash,
   enforced policy budget, **or resolved `model_context_budget`** changed)
   re-anchors with `reason="config_changed"` at the 30% rule (not the 15%
   deep cut). A per-model or default-budget config change with an unchanged
