@@ -148,7 +148,13 @@ anchor work:
    the calls being evaluated. If it churns (per-minute timestamp,
    session-context injection), message zero breaks the prefix before the
    history region and the anchor cannot help — fix system-prompt churn first
-   and re-run attribution.
+   and re-run attribution. Criterion 1 is evaluated on **within-task
+   consecutive calls** (same `user_text`, iteration ≥ 2), where bootstrap's
+   once-per-task compile makes stability achievable today. Multi-turn turns
+   are included for criterion 2 attribution and other cause breakdowns; a
+   cross-turn `prefix_hash_system` flip is recorded separately and does not
+   fail criterion 1 unless cross-turn cache extension is brought into
+   Phase 1 scope.
 2. **Cause attribution.** Attributed `keep_from` movement *alone* accounts
    for at least half of the large re-evaluations in the attribution run (or
    the majority of blocks where `reused_prefix` sits at the system-prompt
@@ -194,9 +200,15 @@ State: `window_anchors: Arc<RwLock<HashMap<String, AnchorState>>>` on
   turn and force a `config_changed` re-anchor on every build), the
   **rendered system-prompt token estimate with a ±10% tolerance band**
   (dynamic sections excluded from the hash can still grow enough to make
-  `cap_tokens` stale; a shift beyond the band invalidates the snapshot
+  `cap_tokens` stale; a shift beyond the band — measured relative to the
+  estimate stored at establishment time — invalidates the snapshot
   without re-anchoring on every small session-context fluctuation), a
-  hash of the sorted tool-name set, a hash of pinned-memory ids and contents,
+  hash of the **original (pre-fit) tool definitions** — full schemas as
+  registered, name-sorted, NOT the effective post-compaction set, which
+  `fit_tool_definitions_to_budget` reshapes as messages grow and would
+  re-anchor on every refit — so schema, description, and parameter changes
+  under stable tool names invalidate the snapshot instead of leaking
+  through to `budget_pressure`, a hash of pinned-memory ids and contents,
   the enforced policy context budget, and the **resolved total model context
   budget** (the `model_context_budget` result — a per-model budget or
   default-budget config change with an unchanged model name must also
@@ -209,6 +221,8 @@ State: `window_anchors: Arc<RwLock<HashMap<String, AnchorState>>>` on
   and is not treated as an anchor-state model change. A changed system
   prompt, tool set, or pinned-memory prefix breaks the serialized prefix
   anyway, so re-anchoring adds no further cache loss.
+- `system_prompt_token_estimate_at_establishment` — the stored baseline the
+  ±10% band is measured against.
 - `last_used_at`, used for opportunistic cleanup of entries not touched for
   more than two hours.
 
@@ -279,9 +293,11 @@ duplicate removal, and the idle-gap reset are otherwise unchanged:
    in that slot's id list. The range is derived **immediately before
    `fit_messages_with_source_quotas`** — the only stage that drops history
    messages under budget pressure — by scanning the sidecar for the slot
-   whose id equals `oldest_kept_msg_id`, and passed to the fitter as an
-   explicit `[protect_from..boundary_pos)` range; the fitter never infers
-   it. Resolving "after all transforms" is impossible: system-prompt
+   whose id list contains `oldest_kept_msg_id`, and passed to the fitter as
+   an explicit `[protect_from..boundary_pos)` range; the fitter never infers
+   it. `fixup_message_ordering` also *drops* messages (orphaned tool
+   results, empty assistants — `loop_utils.rs:1312-1373`); drops remove the
+   corresponding sidecar slot, keeping alignment, just as merges union it. Resolving "after all transforms" is impossible: system-prompt
    insertion, the build's summary insertion, the checkpoint, and directives
    all run *after* fitting — they shift indices but only insert, never
    remove pre-boundary history, so the sidecar does not need to extend past
@@ -394,9 +410,14 @@ Phase 1:
 - Overflow: anchored pairs exceeding the cap snapshot re-anchor to the 15%
   target and update the stored anchor.
 - Tool-budget shrink without message growth does NOT re-anchor (cap
-  snapshot makes overflow independent of refits) unless final fitting would
-  remove an anchored pre-boundary message, in which case
-  `reason="budget_pressure"` re-anchors once.
+  snapshot makes overflow independent of refits) unless history fitting
+  would remove an anchored pre-boundary message, in which case
+  `reason="budget_pressure"` re-anchors once. Tool-schema **compaction**
+  (same registered schemas, smaller effective set) does not flip the
+  validity hash; a change to the registered schemas themselves does.
+- Rendered system-prompt token estimate drifting beyond the ±10% band
+  (relative to `system_prompt_token_estimate_at_establishment`) re-anchors
+  with `reason="config_changed"`; drift within the band does not.
 - Validity-field mismatch (model name, tool-set hash, pinned-memory hash,
   enforced policy budget, **or resolved `model_context_budget`** changed)
   re-anchors with `reason="config_changed"` at the 30% rule (not the 15%
