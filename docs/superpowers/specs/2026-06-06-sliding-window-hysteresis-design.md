@@ -308,7 +308,9 @@ duplicate removal, and the idle-gap reset are otherwise unchanged:
    an explicit `[protect_from..boundary_pos)` range; the fitter never infers
    it. `fixup_message_ordering` also *drops* messages (orphaned tool
    results, empty assistants — `loop_utils.rs:1312-1373`); drops remove the
-   corresponding sidecar slot, keeping alignment, just as merges union it. Resolving "after all transforms" is impossible: system-prompt
+   corresponding sidecar slot, keeping alignment, just as merges union it.
+
+   Resolving "after all transforms" is impossible: system-prompt
    insertion, the build's summary insertion, the checkpoint, and directives
    all run *after* fitting — they shift indices but only insert, never
    remove pre-boundary history, so the sidecar does not need to extend past
