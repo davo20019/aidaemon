@@ -43,12 +43,18 @@ attributed:
 - tool-schema refitting changing serialized tool definitions
 - **message-zero (system prompt) churn**: message zero embeds a per-minute
   UTC timestamp and an injected session-context block
-  (`system_prompt.rs:757`), so `prefix_hash_system` changes at least once a
-  minute regardless of the history region. This is a prerequisite, not a
+  (`system_prompt.rs:757`). The prompt is compiled once per task
+  (`bootstrap/run.rs:550`), so message zero is stable across iterations
+  *within* a task; across turns it changes whenever the minute ticks over
+  or the recompiled session context differs. This is a prerequisite, not a
   Phase 1 target: the anchor pins the history trim and cannot stabilize
-  message zero. The cache-stable-system-prompt work must land first, and
-  Phase 0 must confirm `prefix_hash_system` is stable across the evaluated
-  calls before the anchor can extend reuse past it.
+  message zero. The already-specced cache-stable-system-prompt work covers
+  within-task stability only; cross-turn stability (which the anchor's
+  cross-turn benefit depends on) may additionally require freezing the
+  timestamp and session-context block for cache purposes — implementers
+  must not treat the existing cache-stable change as sufficient for exit
+  criterion 1. Phase 0 must confirm `prefix_hash_system` is stable across
+  the evaluated calls before the anchor can extend reuse past it.
 
 This design therefore has two phases. Phase 1 ships only after Phase 0
 attributes the churn, and only the parts that the evidence supports.
@@ -151,9 +157,11 @@ anchor work:
    not fix them (see anchor semantics below), so attributing the gate to
    drift would authorize an anchor that does not address the measured cause.
    Drift is measured separately and may motivate a distinct follow-up.
-3. **Sample floor.** The run observed at least 20 large requests (evaluated
-   ≥ 20% of prompt); below that the attribution percentage is not
-   statistically meaningful and the run must be extended.
+3. **Sample floor.** The run observed at least 20 **cache-break requests**
+   (prompt above 5,000 tokens AND evaluated ≥ 20% of prompt — distinct from
+   "large requests", which refers to prompt size alone); below that the
+   attribution percentage is not statistically meaningful and the run must
+   be extended.
 
 If the dominant cause is something else (identity drift, marker, summary,
 content mutation, schema refit), design for that instead — do not ship the
@@ -183,7 +191,11 @@ State: `window_anchors: Arc<RwLock<HashMap<String, AnchorState>>>` on
   (the stable configuration-derived prompt only — explicitly excluding the
   per-minute timestamp, session-context block, and any other per-turn
   section; hashing the fully rendered dynamic prompt would mismatch every
-  turn and force a `config_changed` re-anchor on every build), a
+  turn and force a `config_changed` re-anchor on every build), the
+  **rendered system-prompt token estimate with a ±10% tolerance band**
+  (dynamic sections excluded from the hash can still grow enough to make
+  `cap_tokens` stale; a shift beyond the band invalidates the snapshot
+  without re-anchoring on every small session-context fluctuation), a
   hash of the sorted tool-name set, a hash of pinned-memory ids and contents,
   the enforced policy context budget, and the **resolved total model context
   budget** (the `model_context_budget` result — a per-model budget or
@@ -253,12 +265,18 @@ duplicate removal, and the idle-gap reset are otherwise unchanged:
    converted JSON messages carry no persisted id (`message_build_phase.rs:725`
    emits `{role, content, ...}` only), so there is nothing to "resolve"
    against after conversion. The build must therefore carry an explicit
-   provenance channel: a parallel `Vec<Option<String>>` of source message
-   ids (`Message.id` is a String UUID) aligned 1:1 with the message vec
-   (`None` for synthetic/injected entries — marker, fitting-stage summary,
-   injected current-user copy), maintained in lockstep through every
-   transform that inserts, removes, or reorders messages **up to history
-   fitting**. The range is derived **immediately before
+   provenance channel: a parallel `Vec<Vec<String>>` of source message ids
+   (`Message.id` is a String UUID) aligned 1:1 with the message vec (an
+   empty vec for synthetic/injected entries — marker, fitting-stage
+   summary, injected current-user copy), maintained in lockstep through
+   every transform that inserts, removes, or reorders messages **up to
+   history fitting**. The element type is a vec, not an `Option`, because
+   `fixup_message_ordering` (`message_build_phase.rs:798`) merges
+   consecutive same-role messages (`merge_consecutive_messages`,
+   `loop_utils.rs:834`) inside this range — a merge unions the two slots'
+   id lists into the surviving slot, so provenance survives 2-into-1
+   collapses. The anchor id is "present" in a slot if it appears anywhere
+   in that slot's id list. The range is derived **immediately before
    `fit_messages_with_source_quotas`** — the only stage that drops history
    messages under budget pressure — by scanning the sidecar for the slot
    whose id equals `oldest_kept_msg_id`, and passed to the fitter as an
@@ -333,9 +351,11 @@ silently remove any message from the anchored pre-boundary region. In particular
   re-anchor on overflow, structural cap 40 on the anchored path, anchor
   preservation during final fitting (with the provenance sidecar), and
   anchor cleanup on idle gap and session clear.
-- Prerequisite, out of scope here: stabilizing message zero
-  (cache-stable-system-prompt work). Phase 1 does not begin until
-  `prefix_hash_system` is confirmed stable in the Phase 0 run.
+- Prerequisite, out of scope here: stabilizing message zero. The existing
+  cache-stable-system-prompt work covers within-task stability; cross-turn
+  stability may require additional work (freezing the timestamp and
+  session-context block), which would be its own spec. Phase 1 does not
+  begin until `prefix_hash_system` is confirmed stable in the Phase 0 run.
 - Leave history fetching, age-based collapse, duplicate removal, session
   summaries, tool-schema fitting, and the `[Current Task]` marker unchanged.
 
@@ -383,9 +403,10 @@ Phase 1:
   deep cut). A per-model or default-budget config change with an unchanged
   model name still invalidates the snapshot.
 - Provenance sidecar stays aligned (equal length, same order) with the
-  message vec across the full transform pipeline; the protected range
-  derived from `oldest_kept_msg_id` covers exactly the anchored
-  pre-boundary region.
+  message vec **from fetch through the fitting call**, including across a
+  `fixup_message_ordering` merge (union-on-merge: the merged slot carries
+  both id lists); the protected range derived from `oldest_kept_msg_id`
+  covers exactly the anchored pre-boundary region.
 - Event-window slide, both cases: (a) anchor id still fetched but at a
   shifted index — resolves by id, `keep_from` holds at that message;
   (b) oldest pairs dropped from fetch while the anchor id remains — the
@@ -403,7 +424,7 @@ Phase 1:
   idle-gap test to assert map state).
 - `Agent::clear_session` removes the session's anchor, and opportunistic TTL
   pruning removes untouched entries older than two hours.
-- Final fitting either preserves every anchored pre-boundary message or
+- History fitting either preserves every anchored pre-boundary message or
   emits `budget_pressure`; it never silently drops part of the anchored
   region.
 - No window-trim log line on the anchored path.
