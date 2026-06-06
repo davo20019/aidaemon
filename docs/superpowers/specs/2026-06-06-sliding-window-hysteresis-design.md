@@ -1,6 +1,6 @@
 # Sliding-Window Hysteresis Design
 
-**Status:** Draft — Phase 0 approved for implementation; Phase 1 gated on the
+**Status:** Phase 0 approved for implementation; Phase 1 gated on the
 Phase 0 attribution result. Last revised 2026-06-06.
 
 ## Goal
@@ -362,13 +362,14 @@ silently remove any message from the anchored pre-boundary region. In particular
 - The `[Current Task]` marker moves to the newest user message each turn,
   breaking the prefix near the tail of the previous turn. That break is
   bounded (hundreds of tokens re-evaluated, not the whole history) and
-  acceptable; cross-turn anchoring prevents the expensive head breaks only
-  when message zero, the session summary, and the pinned prefix are all
-  unchanged — the dormant-behavior condition stated at the top of Phase 1.
-  The cross-turn benefit is therefore conditional: "stable historical
-  region, bounded tail break," not byte-identical prefix extension. Summary
-  or pinned-memory churn remains an earlier cache boundary and is measured
-  separately.
+  acceptable. Today, message zero recompiles each turn, so cross-turn
+  anchoring delivers no cache benefit (dormant behavior, per the top of
+  Phase 1). Once cross-turn message-zero stabilization lands, it will
+  prevent the expensive head breaks whenever the session summary and pinned
+  prefix are also unchanged — a future, conditional benefit: "stable
+  historical region, bounded tail break," not byte-identical prefix
+  extension. Summary or pinned-memory churn remains an earlier cache
+  boundary and is measured separately.
 
 ## Scope
 
@@ -432,8 +433,8 @@ Phase 1:
 - Rendered system-prompt token estimate drifting beyond the ±10% band
   (relative to `system_prompt_token_estimate_at_establishment`) re-anchors
   with `reason="config_changed"`; drift within the band does not.
-- Validity-field mismatch (model name, original-tool-definitions hash,
-  pinned-memory hash,
+- Validity-field mismatch (model name, base-system-prompt hash,
+  original-tool-definitions hash, pinned-memory hash,
   enforced policy budget, **or resolved `model_context_budget`** changed)
   re-anchors with `reason="config_changed"` at the 30% rule (not the 15%
   deep cut). A per-model or default-budget config change with an unchanged
@@ -469,7 +470,7 @@ Phase 1:
 
 ## Evaluation
 
-Phase 0 attribution is the primary evaluation: every large re-evaluation in
+Phase 0 attribution is the primary evaluation: every cache-break request in
 the controlled single-session run must be matched to a named cause via the
 fingerprint logs. `scripts/cache-eval.sh` supplies the llama.cpp side; its
 `task` ids are server-internal, so the join is by log order within the
