@@ -1163,10 +1163,13 @@ pub(super) async fn run_message_build_phase(
     // Context window enforcement: trim messages to fit token budget
     if agent.context_window_config.enabled {
         // Reserve for BOTH message zero (core) and the task context tail.
-        let combined_system = format!("{}\n{}", core_prompt, task_context_tail);
-        let model_budget = crate::memory::context_window::compute_available_budget(
+        // Use the additive idiom (matching the sliding-window estimate at :554)
+        // to avoid a throwaway String allocation.
+        let system_tokens = crate::memory::context_window::estimate_tokens(core_prompt)
+            + crate::memory::context_window::estimate_tokens(task_context_tail);
+        let model_budget = crate::memory::context_window::compute_available_budget_precomputed(
             model,
-            &combined_system,
+            system_tokens,
             tool_defs,
             &agent.context_window_config,
         );
@@ -1332,12 +1335,14 @@ pub(super) async fn run_message_build_phase(
         }));
     }
 
+    // Serialize messages once; reused for final-enforcement token count, debug logging,
+    // and the final est_input_tokens. Messages are not mutated after this point.
+    let messages_json = serde_json::to_string(&messages).unwrap_or_default();
+
     // Final enforcement must happen after every prompt component has been inserted.
     // Earlier trimming cannot account for execution checkpoints and one-shot directives.
     if agent.context_window_config.enabled {
-        let message_tokens = crate::memory::context_window::estimate_tokens(
-            &serde_json::to_string(&messages).unwrap_or_default(),
-        );
+        let message_tokens = crate::memory::context_window::estimate_tokens(&messages_json);
         let final_tool_budget = total_context_budget.saturating_sub(
             message_tokens + RESPONSE_RESERVE_TOKENS + TOKEN_ESTIMATE_SAFETY_MARGIN,
         );
@@ -1397,7 +1402,6 @@ pub(super) async fn run_message_build_phase(
             .collect();
 
         // Estimate tokens: ~4 chars per token for English text
-        let messages_json = serde_json::to_string(&messages).unwrap_or_default();
         let est_msg_tokens = messages_json.len() / 4;
         let est_tool_tokens =
             crate::memory::context_window::estimate_tool_definition_tokens(tool_defs);
@@ -1460,7 +1464,6 @@ pub(super) async fn run_message_build_phase(
     Agent::sort_tool_definitions_by_name(&mut effective_tool_defs);
 
     let est_input_tokens = {
-        let messages_json = serde_json::to_string(&messages).unwrap_or_default();
         let est_msg_tokens = messages_json.len() / 4;
         let est_tool_tokens =
             crate::memory::context_window::estimate_tool_definition_tokens(&effective_tool_defs);

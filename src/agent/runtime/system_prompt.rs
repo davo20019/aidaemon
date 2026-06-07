@@ -1021,7 +1021,7 @@ impl Agent {
         }
 
         if let Some(name) = sender_name {
-            tail.push_str(&format!("\n[Current speaker: {}]", name));
+            tail.push_str(&format!("\n\n[Current speaker: {}]", name));
         }
 
         // Session summary (volatile): MOVED here from the build-stage index-1

@@ -186,7 +186,6 @@ impl Agent {
     /// Non-owners receive tools based on role (no tool access), so the roster is
     /// empty for any non-`Owner` role — matching the `tools_allowed_for_user`
     /// gate in bootstrap.
-    #[allow(dead_code)] // consumed by Task 4 core assembly / Task 7
     pub(super) fn session_static_tool_roster(
         &self,
         user_role: UserRole,
@@ -227,7 +226,6 @@ impl Agent {
     ///
     /// Sort keys (name, serialized bytes) are computed ONCE per element so
     /// serialization cost is O(n), not O(n log n).
-    #[allow(dead_code)] // consumed by Task 6 payload assembly
     pub(super) fn sort_tool_definitions_by_name(defs: &mut Vec<Value>) {
         // Compute each element's sort key exactly once, then sort by key.
         let mut keyed: Vec<(String, String, Value)> = defs

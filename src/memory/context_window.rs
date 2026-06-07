@@ -144,19 +144,35 @@ pub fn fit_tool_definitions_to_budget(tool_defs: &[Value], budget_tokens: usize)
 ///
 /// Subtracts system prompt, tool definitions, and response reserve from the model's
 /// total context budget (looked up from config or defaulting to `default_budget`).
+/// Use [`compute_available_budget`] when you have the full prompt string, or inline
+/// the additive pattern when you have pre-computed per-component token counts.
+pub const CONTEXT_RESPONSE_RESERVE_TOKENS: usize = 1536;
+
+/// Compute the available message budget given a pre-computed system-token count.
+/// Prefer this over [`compute_available_budget`] when the system prompt is split
+/// into components whose token counts are already known (avoids a String allocation).
+pub fn compute_available_budget_precomputed(
+    model: &str,
+    system_tokens: usize,
+    tool_defs: &[Value],
+    config: &ContextWindowConfig,
+) -> usize {
+    let total_budget = model_context_budget(model, config);
+    let tools_tokens = estimate_tool_definition_tokens(tool_defs);
+    total_budget.saturating_sub(system_tokens + tools_tokens + CONTEXT_RESPONSE_RESERVE_TOKENS)
+}
+
+/// Convenience wrapper: computes the system-token count from the combined prompt
+/// string. Use [`compute_available_budget_precomputed`] when components are already
+/// computed separately to avoid an extra allocation.
+#[allow(dead_code)]
 pub fn compute_available_budget(
     model: &str,
     system_prompt: &str,
     tool_defs: &[Value],
     config: &ContextWindowConfig,
 ) -> usize {
-    let total_budget = model_context_budget(model, config);
-
-    let system_tokens = estimate_tokens(system_prompt);
-    let tools_tokens = estimate_tool_definition_tokens(tool_defs);
-    let response_reserve = 1536;
-
-    total_budget.saturating_sub(system_tokens + tools_tokens + response_reserve)
+    compute_available_budget_precomputed(model, estimate_tokens(system_prompt), tool_defs, config)
 }
 
 /// Fit conversation messages into a token budget.
