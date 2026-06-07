@@ -376,8 +376,12 @@ def attribute(call, prev):
     if both_have_archived:
         archived_stable = archived_cur == archived_prev
         tail_changed = tail_cur != tail_prev
-        if archived_stable and tail_changed:
+        both_tail_nonempty = bool(tail_cur) and bool(tail_prev)
+        if archived_stable and tail_changed and both_tail_nonempty:
             # Tail-only flip: volatile per-turn context rotated as expected.
+            # Requires both tail values non-empty — a disappearing or newly
+            # appearing tail (one side empty) could mask a builder regression
+            # and must fall through to the normal cause ladder instead.
             # This must NOT fall through to pre_boundary_changed_unattributed.
             changes.append("tail_only")
             return "tail_replacement (expected)", changes, False
@@ -938,6 +942,37 @@ def self_test():
         f"old-log compat: expected 'pre_boundary_changed_unattributed', got {cause_a3!r}"
     )
 
+    # Test A3b: archived stable + tail_prev non-empty + tail_cur empty
+    # (tail disappeared) — must NOT classify as tail_replacement (expected).
+    # A disappearing tail could signal a builder regression; fall through to the
+    # normal cause ladder (pre_boundary_changed_unattributed here).
+    c_tail_disappear_prev = {
+        "hash_system": "sysW",
+        "hash_pre_boundary": "preW_v1",
+        "prefix_hash_archived": "archW",
+        "tail_hash": "tailW_v1",     # non-empty tail before
+        "tool_defs_hash": "td1",
+        "session_summary_hash": "ss1",
+        "force_text": False,
+        "window": None,
+        "stages": {},
+    }
+    c_tail_disappear_cur = {
+        "hash_system": "sysW",
+        "hash_pre_boundary": "preW_v2",
+        "prefix_hash_archived": "archW",   # archived stable
+        "tail_hash": "",                   # tail disappeared
+        "tool_defs_hash": "td1",
+        "session_summary_hash": "ss1",
+        "force_text": False,
+        "window": None,
+        "stages": {},
+    }
+    cause_a3b, _, _ = attribute(c_tail_disappear_cur, c_tail_disappear_prev)
+    assert cause_a3b != "tail_replacement (expected)", (
+        f"tail disappearance: must NOT be 'tail_replacement (expected)', got {cause_a3b!r}"
+    )
+
     # Test A4: tail-only flip does NOT count toward pre_boundary_changed_unattributed
     # in a full analyze() run.  Build a minimal 3-call sequence:
     #   call 0: baseline (no prior)
@@ -999,27 +1034,19 @@ def self_test():
     assert res_pa["n_tail_only_flips"] == 1, (
         f"expected 1 tail-only flip, got {res_pa['n_tail_only_flips']}"
     )
-    # tail_replacement must NOT be counted in attributable_breaks for criterion 2.
-    # Both call 1 and call 2 are breaks; only call 2 (archived flip) is attributable
-    # in the traditional sense (not tail_replacement).  Criterion 2 tracks
-    # keep_from_alone breaks — tail_replacement is a separate category.
-    tail_in_attributable = any(
-        e["primary_cause"] == "tail_replacement (expected)"
-        and e in [res_pa["joined"][i] for i in range(len(res_pa["joined"]))]
-        for e in res_pa["joined"]
-        if e["primary_cause"] == "tail_replacement (expected)"
-    )
-    # tail_replacement should appear in n_attributable_breaks (it's attributable),
-    # but keep_from_alone is False so it never inflates keep_from_pct.
     assert not j_pa[1]["keep_from_alone"], "tail_replacement must not set keep_from_alone"
+    # tail-only breaks inflate the attributable denominator (by design) but not the numerator
+    assert res_pa["n_attributable_breaks"] == 2  # call 1 (tail) + call 2 (archived)
+    assert res_pa["keep_from_pct"] == 0.0  # no keep_from_alone breaks in this run
 
     # Verify report includes the tail-only flips line.
     report_text = report(res_pa, [])
     assert "tail-only flips (expected):" in report_text, (
         "report must include 'tail-only flips (expected):' summary line"
     )
-    assert "1" in report_text.split("tail-only flips (expected):")[1][:10], (
-        "tail-only flips count must appear in report"
+    count_str = report_text.split("tail-only flips (expected):")[1].strip().split()[0]
+    assert count_str == "1", (
+        f"tail-only flips count must be '1' in report, got {count_str!r}"
     )
 
     print(report(res, []))
