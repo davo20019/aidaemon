@@ -141,10 +141,37 @@ mod tests {
 
     #[test]
     fn aggregate_hash_is_hash_of_component_hashes() {
-        // Pin the construction so a future field addition cannot silently
-        // bypass component attribution.
+        // Non-tautological: build the expected aggregate INDEPENDENTLY of the
+        // production code path, then assert equality with aggregate_hash().
+        //
+        // The aggregate is defined as hash_canonical(JSON array of component
+        // hashes in fixed declaration order). We replicate that construction
+        // here so that (a) a silently-dropped field changes the entry count
+        // check, and (b) a reordering or wrong primitive changes the digest.
         let a = test_core_inputs();
         let ch = a.component_hashes();
-        assert_eq!(a.aggregate_hash(), ch.aggregate());
+
+        // Assert the entry count equals the fixed constant so adding a field
+        // without a corresponding entry causes this test to diverge.
+        assert_eq!(
+            ch.entries.len(),
+            ComponentHashes::COMPONENT_COUNT,
+            "entry count must match COMPONENT_COUNT; add a new entry when adding a field"
+        );
+
+        // Reconstruct the aggregate independently: JSON array of the
+        // individual hash strings in declaration order, then hash_canonical.
+        let hash_strings: Vec<serde_json::Value> = ch
+            .entries
+            .iter()
+            .map(|(_, h)| serde_json::Value::String(h.clone()))
+            .collect();
+        let expected = hash_canonical(&serde_json::Value::Array(hash_strings));
+
+        assert_eq!(
+            a.aggregate_hash(),
+            expected,
+            "aggregate_hash must equal hash_canonical(JSON array of component hashes)"
+        );
     }
 }

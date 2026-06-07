@@ -224,13 +224,24 @@ impl Agent {
     /// bytes as a deterministic tie-breaker. Consumed by Task 6 payload assembly
     /// (both after bootstrap assembly and on the final effective provider
     /// subset) to enforce a stable provider tool-array ordering.
+    ///
+    /// Sort keys (name, serialized bytes) are computed ONCE per element so
+    /// serialization cost is O(n), not O(n log n).
     #[allow(dead_code)] // consumed by Task 6 payload assembly
-    pub(super) fn sort_tool_definitions_by_name(defs: &mut [Value]) {
-        defs.sort_by(|a, b| {
-            let an = Self::tool_name_from_definition(a).unwrap_or("");
-            let bn = Self::tool_name_from_definition(b).unwrap_or("");
-            an.cmp(bn).then_with(|| a.to_string().cmp(&b.to_string()))
-        });
+    pub(super) fn sort_tool_definitions_by_name(defs: &mut Vec<Value>) {
+        // Compute each element's sort key exactly once, then sort by key.
+        let mut keyed: Vec<(String, String, Value)> = defs
+            .drain(..)
+            .map(|d| {
+                let name = Self::tool_name_from_definition(&d)
+                    .unwrap_or("")
+                    .to_string();
+                let serialized = d.to_string();
+                (name, serialized, d)
+            })
+            .collect();
+        keyed.sort_by(|(an, as_, _), (bn, bs, _)| an.cmp(bn).then_with(|| as_.cmp(bs)));
+        defs.extend(keyed.into_iter().map(|(_, _, d)| d));
     }
 
     fn request_requires_connected_api_setup_tools(user_message: &str) -> bool {
@@ -588,7 +599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_static_roster_is_query_independent_and_sorted() {
+    async fn session_static_roster_is_deterministic_and_sorted() {
         let t1 = Arc::new(MockTool::new("zebra_tool", "z", "ok")) as Arc<dyn Tool>;
         let t2 = Arc::new(MockTool::new("alpha_tool", "a", "ok")) as Arc<dyn Tool>;
         let harness =
@@ -602,7 +613,7 @@ mod tests {
         let roster_b = harness
             .agent
             .session_static_tool_roster(UserRole::Owner, ChannelVisibility::Private);
-        // Query-independent: identical regardless of any user message.
+        // Deterministic: identical output on repeated calls (function takes no query).
         assert_eq!(roster_a, roster_b);
 
         let names: Vec<&str> = roster_a.iter().map(|(n, _)| n.as_str()).collect();
