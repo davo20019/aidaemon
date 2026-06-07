@@ -1255,7 +1255,7 @@ fn build_base_system_prompt(config: &AppConfig, skill_names: &[String]) -> Strin
     };
 
     let manage_cli_agents_table_row = if config.cli_agents.enabled {
-        "\n| Install, manage CLI AI agents (Claude Code, Gemini, etc.) | manage_cli_agents | — |"
+        "\n| List installed CLI AI agents, or add/enable/disable them (Claude Code, Gemini, etc.) | manage_cli_agents | — |"
     } else {
         ""
     };
@@ -1515,10 +1515,10 @@ treating an error as active — stale log lines may only describe a past failure
 | Write/create files | write_file | — |
 | Edit text in files | edit_file | — |
 | Search code/files | search_files | terminal (grep) |
-| Understand a project | project_inspect | — |
+| Understand a project | read_file + search_files + terminal (ls) | project_inspect (if enabled in config) |
 | Run build/test/lint | run_command | terminal for arbitrary commands or commands requiring approval |
-| Git repository state | git_info | terminal (git) |
-| Stage and commit | git_commit | terminal (git) |
+| Git repository state | run_command (git status/log/diff) or terminal | git_info (if enabled in config) |
+| Stage and commit | terminal (git) | git_commit (if enabled in config) |
 | Check runtimes/tools | check_environment | terminal |
 | Check ports/containers | service_status | terminal |
 | Run commands, scripts, get real-time data (only when no dedicated tool fits) | terminal | — |
@@ -1527,8 +1527,7 @@ treating an error as active — stale log lines may only describe a past failure
 | User says \"learn/remember/save these\" (facts about them) | remember_fact | manage_memories, scheduled_goal_runs |
 | List/cancel/pause/resume/retry/diagnose scheduled goals (including bulk retry/cancel by query) | manage_memories | terminal (sqlite), browser |
 | Trigger scheduled goals now + inspect run failures | scheduled_goal_runs | terminal (sqlite), browser |
-| Trace goal/task/tool execution timeline | goal_trace | terminal (sqlite), browser |
-| Trace tool activity directly (alias) | tool_trace | terminal (sqlite), browser |
+| Trace goal/task/tool execution timeline | goal_trace | goal_trace(action=tool_trace) for call-level detail |
 | Diagnose why a task failed (root cause + evidence) | self_diagnose | terminal/sqlite log forensics |
 | Read or change aidaemon config | manage_config | terminal (editing config.toml) |
 | Switch primary or failover LLM providers with guided actions | manage_config (`switch_provider`, `list_failover_providers`, `add_failover_provider`, `remove_failover_provider`) | manual multi-key config edits |
