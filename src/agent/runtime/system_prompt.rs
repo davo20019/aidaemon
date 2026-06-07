@@ -586,7 +586,28 @@ impl Agent {
                 .collect(),
             channel_rules,
         );
-        let core_prompt_bytes = core_prompt::render_core_prompt(&core_inputs);
+        // Pillar A Task 7: per-session core cache. On a HIT (aggregate hash
+        // unchanged since this session's last task) the rendered bytes are reused
+        // VERBATIM with no re-render; on a MISS we render, log which component
+        // changed, and replace the entry. The cache decision is a pure helper so
+        // the component-naming and query-independence are unit-tested without a
+        // full agent (see core_prompt.rs tests). We hold the write lock across
+        // the (cheap, sync) decision — this path runs once per task.
+        let core_prompt_bytes = {
+            let mut cache = self.core_prompts.write().await;
+            let decision = core_prompt::core_cache_decision(cache.get(session_id), &core_inputs);
+            if !decision.hit {
+                info!(
+                    session_id = %session_id,
+                    component = %decision.changed.join(","),
+                    "Core prompt invalidated"
+                );
+                if let Some(entry) = decision.updated_entry {
+                    cache.insert(session_id.to_string(), entry);
+                }
+            }
+            decision.bytes
+        };
         if critical_fact_summary.assistant_name.is_none() {
             critical_fact_summary.assistant_name =
                 infer_assistant_name_from_prompt(&core_prompt_bytes);

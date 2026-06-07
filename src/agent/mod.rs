@@ -159,7 +159,9 @@ mod post_task;
 mod task_outcome;
 use post_task::LearningContext;
 pub(in crate::agent) use post_task::ReplayNoteCategory;
-pub(in crate::agent) use task_outcome::{response_has_user_value, TaskOutcomeDerivation};
+pub(in crate::agent) use task_outcome::{
+    response_has_user_value, response_looks_like_plain_text_tool_call, TaskOutcomeDerivation,
+};
 #[allow(dead_code, unused_imports)]
 #[path = "loop/state/mod.rs"]
 mod loop_state;
@@ -305,6 +307,13 @@ pub use agent_helpers::{send_status, touch_heartbeat};
 /// `message_build_phase` to emit an explicit boundary-movement event.
 type WindowBoundaryMemory = Arc<tokio::sync::RwLock<HashMap<String, (usize, Option<String>)>>>;
 
+/// Pillar A per-session core-prompt cache: `session_id` → last rendered
+/// [`core_prompt::CachedCore`]. On a HIT (aggregate hash unchanged) the cached
+/// bytes are reused verbatim with no re-render; on a MISS the changed
+/// component(s) are logged (`Core prompt invalidated component=...`) and the
+/// entry is replaced. In-memory, lost on restart.
+type CorePromptCache = Arc<tokio::sync::RwLock<HashMap<String, core_prompt::CachedCore>>>;
+
 pub struct Agent {
     llm_runtime: SharedLlmRuntime,
     state: Arc<dyn StateStore>,
@@ -385,6 +394,10 @@ pub struct Agent {
     /// Loaded once at agent construction and shared with every child agent
     /// spawned from this hierarchy.
     pub(crate) specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
+    /// Pillar A per-session core-prompt cache (Task 7). Keyed by `session_id`;
+    /// reuses rendered core bytes verbatim across tasks when the session-static
+    /// inputs are unchanged, and logs the changed component on invalidation.
+    core_prompts: CorePromptCache,
 }
 
 struct AgentLimits {

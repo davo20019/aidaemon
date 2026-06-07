@@ -572,6 +572,14 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // Returns the session-static CORE bytes (message zero) and the per-task
     // volatile TAIL separately so the assembler can place them at message 0 and
     // boundary − 1 respectively.
+    //
+    // Pillar A Task 7 (per-task core-cache hook): the per-session core cache lives
+    // INSIDE `build_system_prompt_for_message` (it is `&self` on Agent and reads
+    // `self.core_prompts` directly — no signature change). On a cache HIT the
+    // returned `core_prompt_bytes` are reused verbatim with no re-render; on a
+    // MISS a `Core prompt invalidated component=...` line is logged there. Option
+    // (b) in the plan — chosen for the smaller diff since assemble + render already
+    // co-locate at that call site.
     let (core_prompt_bytes, task_context_tail, active_skill_names) = agent
         .build_system_prompt_for_message(
             &emitter,
