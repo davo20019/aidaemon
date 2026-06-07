@@ -281,6 +281,24 @@ impl AnthropicNativeProvider {
 
         body
     }
+
+    fn parse_usage(data: &Value, model: &str) -> Option<TokenUsage> {
+        data.get("usage").and_then(|u| {
+            Some(TokenUsage {
+                input_tokens: u.get("input_tokens")?.as_u64()? as u32,
+                output_tokens: u.get("output_tokens")?.as_u64()? as u32,
+                cached_input_tokens: u
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|tokens| tokens.min(u32::MAX as u64) as u32),
+                cache_creation_input_tokens: u
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|tokens| tokens.min(u32::MAX as u64) as u32),
+                model: model.to_string(),
+            })
+        })
+    }
 }
 
 #[async_trait]
@@ -401,13 +419,7 @@ impl ModelProvider for AnthropicNativeProvider {
             }
         }
 
-        let usage = data.get("usage").and_then(|u| {
-            Some(TokenUsage {
-                input_tokens: u.get("input_tokens")?.as_u64()? as u32,
-                output_tokens: u.get("output_tokens")?.as_u64()? as u32,
-                model: model.to_string(),
-            })
-        });
+        let usage = Self::parse_usage(&data, model);
 
         Ok(ProviderResponse {
             content: if final_text.is_empty() {
@@ -566,6 +578,24 @@ mod tests {
         assert_eq!(content[1]["id"], "call_123");
         assert_eq!(content[1]["name"], "get_time");
         assert_eq!(content[1]["input"]["timezone"], "UTC");
+    }
+
+    #[test]
+    fn test_parse_usage_extracts_cache_read_and_creation_tokens() {
+        let payload = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 70,
+                "cache_creation_input_tokens": 12
+            }
+        });
+
+        let usage =
+            AnthropicNativeProvider::parse_usage(&payload, "claude-sonnet-4-5").expect("usage");
+        assert_eq!(usage.cached_input_tokens, Some(70));
+        assert_eq!(usage.cache_creation_input_tokens, Some(12));
+        assert_eq!(usage.fresh_input_tokens(), Some(30));
     }
 
     #[test]
@@ -817,5 +847,53 @@ mod tests {
     #[test]
     fn test_normalize_tool_name_trims_whitespace() {
         assert_eq!(normalize_tool_name(" terminal "), "terminal");
+    }
+
+    // ---- Pillar A: provider-conversion determinism (Task 8) ----
+
+    /// Per spec §Testing, cross-turn cache-prefix assertions DO NOT apply to the
+    /// Anthropic adapter — it legitimately hoists system messages to a top-level
+    /// `system` field and merges adjacent same-role messages. The invariant that
+    /// DOES apply is determinism: the same logical input twice must yield
+    /// byte-identical serialized bodies (the conversion is a pure function).
+    #[test]
+    fn test_pillar_a_anthropic_body_is_deterministic() {
+        let p = provider();
+        // A sequence that exercises system hoist + adjacent-role merge so the
+        // determinism guarantee covers the reshaping path, not just a trivial body.
+        let messages = vec![
+            json!({"role":"system","content":"core prompt"}),
+            json!({"role":"user","content":"first ask"}),
+            json!({
+                "role":"assistant",
+                "content":"calling tool",
+                "tool_calls":[{
+                    "id":"call_1",
+                    "function":{"name":"search_files","arguments":"{\"path\":\".\"}"}
+                }]
+            }),
+            json!({"role":"tool","tool_call_id":"call_1","content":"result one"}),
+            json!({"role":"tool","tool_call_id":"call_1","content":"result two"}),
+            json!({"role":"system","content":"tail directive"}),
+            json!({"role":"user","content":"second ask"}),
+        ];
+        let tools = vec![openai_tool("a_tool"), openai_tool("b_tool")];
+        let options = ChatOptions::default();
+
+        let body_a =
+            p.build_request_body("claude-3-5-sonnet-20241022", &messages, &tools, &options);
+        let body_b =
+            p.build_request_body("claude-3-5-sonnet-20241022", &messages, &tools, &options);
+
+        assert_eq!(
+            serde_json::to_string(&body_a).unwrap(),
+            serde_json::to_string(&body_b).unwrap(),
+            "Anthropic body conversion must be a pure function (identical bytes for identical input)"
+        );
+        // Sanity: the reshaping path actually ran (system hoisted, tool results merged).
+        assert!(
+            body_a.get("system").is_some(),
+            "system should be hoisted to top-level for Anthropic"
+        );
     }
 }

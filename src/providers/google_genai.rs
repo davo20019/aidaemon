@@ -467,6 +467,11 @@ impl GoogleGenAiProvider {
             Some(TokenUsage {
                 input_tokens: u.get("promptTokenCount")?.as_u64()? as u32,
                 output_tokens: u.get("candidatesTokenCount")?.as_u64()? as u32,
+                cached_input_tokens: u
+                    .get("cachedContentTokenCount")
+                    .and_then(Value::as_u64)
+                    .map(|tokens| tokens.min(u32::MAX as u64) as u32),
+                cache_creation_input_tokens: None,
                 model: model.to_string(),
             })
         });
@@ -1378,6 +1383,33 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_response_extracts_cached_content_tokens() {
+        let p = provider();
+        let gemini_response = json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "Done"}]
+                }
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "cachedContentTokenCount": 70,
+                "candidatesTokenCount": 5
+            }
+        });
+
+        let parsed = p
+            .parse_response(&gemini_response, "gemini-2.5-flash")
+            .unwrap();
+        let usage = parsed.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_input_tokens, Some(70));
+        assert_eq!(usage.fresh_input_tokens(), Some(30));
+    }
+
+    #[test]
     fn test_parse_response_empty_parts_adds_response_note() {
         let p = provider();
         let gemini_response = json!({
@@ -1440,6 +1472,59 @@ mod tests {
     #[test]
     fn test_normalize_tool_name_trims_whitespace() {
         assert_eq!(normalize_tool_name(" terminal "), "terminal");
+    }
+
+    // ---- Pillar A: provider-conversion determinism (Task 8) ----
+
+    /// Per spec §Testing, cross-turn cache-prefix assertions DO NOT apply to the
+    /// Gemini adapter — it maps messages to `contents` (user/model roles) with a
+    /// separate top-level `systemInstruction`, legitimately reshaping the input.
+    /// The invariant that DOES apply is determinism: the same logical input twice
+    /// must yield byte-identical serialized bodies (a pure function).
+    #[test]
+    fn test_pillar_a_google_body_is_deterministic() {
+        let p = provider();
+        // Full conversion path: convert_messages (system hoist → systemInstruction,
+        // user/assistant/tool → contents) then build_request_body.
+        let messages = vec![
+            json!({"role":"system","content":"core prompt"}),
+            json!({"role":"user","content":"first ask"}),
+            json!({
+                "role":"assistant",
+                "content":"calling tool",
+                "tool_calls":[{
+                    "id":"call_1",
+                    "function":{"name":"search_files","arguments":"{\"path\":\".\"}"}
+                }]
+            }),
+            json!({"role":"tool","tool_call_id":"call_1","name":"search_files","content":"{\"ok\":true}"}),
+            json!({"role":"system","content":"tail directive"}),
+            json!({"role":"user","content":"second ask"}),
+        ];
+        let tools = vec![openai_tool(
+            "search_files",
+            json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        )];
+        let options = ChatOptions::default();
+
+        let convert = |p: &GoogleGenAiProvider| {
+            let (sys, contents) = p.convert_messages(&messages);
+            let (body, _, _, _) = p.build_request_body(sys, contents, &tools, &options);
+            serde_json::to_string(&body).unwrap()
+        };
+
+        let body_a = convert(&p);
+        let body_b = convert(&p);
+        assert_eq!(
+            body_a, body_b,
+            "Gemini body conversion must be a pure function (identical bytes for identical input)"
+        );
+        // Sanity: the reshaping path actually ran (system hoisted to systemInstruction).
+        let parsed: Value = serde_json::from_str(&body_a).unwrap();
+        assert!(
+            parsed.get("system_instruction").is_some(),
+            "system should be hoisted to systemInstruction for Gemini"
+        );
     }
 
     /// Recursively check that no object in `value` contains an `additionalProperties` key.

@@ -177,6 +177,21 @@ impl OpenAiCompatibleProvider {
         Ok(models)
     }
 
+    fn cached_input_tokens_from_usage(usage: &Value) -> Option<u32> {
+        usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                usage
+                    .get("input_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(Value::as_u64)
+            })
+            .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64))
+            .map(|tokens| tokens.min(u32::MAX as u64) as u32)
+    }
+
     fn cloudflare_models_fallback_url(&self) -> String {
         if self.base_url.ends_with("/compat") {
             format!("{}/v1/models", self.base_url)
@@ -235,10 +250,16 @@ impl OpenAiCompatibleProvider {
                     });
                 }
             }
-        } else if !matches!(options.tool_choice, ToolChoiceMode::Auto) {
+        } else if !matches!(
+            options.tool_choice,
+            ToolChoiceMode::Auto | ToolChoiceMode::None
+        ) {
+            // `None` with no tools is a no-op by definition (aux JSON-schema
+            // calls pass it explicitly) — only Required/Specific indicate a
+            // real caller bug worth warning about.
             warn!(
                 tool_choice = ?options.tool_choice,
-                "Ignoring non-auto tool_choice because no tools were provided"
+                "Ignoring tool_choice that requires tools because no tools were provided"
             );
         }
 
@@ -439,6 +460,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
             Some(TokenUsage {
                 input_tokens: u.get("prompt_tokens")?.as_u64()? as u32,
                 output_tokens: u.get("completion_tokens")?.as_u64()? as u32,
+                cached_input_tokens: Self::cached_input_tokens_from_usage(u),
+                cache_creation_input_tokens: None,
                 model: model.to_string(),
             })
         });
@@ -693,6 +716,172 @@ mod tests {
 
         assert!(body.get("tool_choice").is_none());
         assert_eq!(body["response_format"]["type"], "json_object");
+    }
+
+    // ---- Pillar A: provider-conversion order-preservation & determinism (Task 8) ----
+
+    /// Pillar A tail-at-boundary design requires the OpenAI adapter to emit
+    /// system messages INLINE, in source order — never hoisted to a top-level
+    /// field, never merged with adjacent system messages. Feed the canonical
+    /// `[system(core), assistant, user, system(tail), user]` sequence and assert
+    /// the emitted `messages` array preserves count, order, and roles exactly.
+    #[test]
+    fn test_pillar_a_openai_preserves_message_count_order_and_roles() {
+        let provider = OpenAiCompatibleProvider::new("https://api.openai.com/v1", "test-key")
+            .expect("provider should initialize");
+        let messages = vec![
+            json!({"role":"system","content":"core prompt"}),
+            json!({"role":"assistant","content":"prior turn"}),
+            json!({"role":"user","content":"first ask"}),
+            json!({"role":"system","content":"tail directive"}),
+            json!({"role":"user","content":"second ask"}),
+        ];
+
+        let body =
+            provider.build_request_body("gpt-4o-mini", &messages, &[], &ChatOptions::default());
+
+        let out = body["messages"].as_array().expect("messages array");
+        // Count preserved — no merge/hoist drops a message.
+        assert_eq!(out.len(), messages.len(), "message count must be preserved");
+        // Order + roles preserved element-for-element; system stays INLINE.
+        let expected_roles = ["system", "assistant", "user", "system", "user"];
+        for (i, expected_role) in expected_roles.iter().enumerate() {
+            assert_eq!(
+                out[i]["role"], *expected_role,
+                "role at index {i} must be preserved inline (no hoist/merge)"
+            );
+        }
+        // The two system messages remain distinct and in place — not merged.
+        assert_eq!(out[0]["content"], "core prompt");
+        assert_eq!(out[3]["content"], "tail directive");
+        // No top-level `system` field — OpenAI keeps system inline.
+        assert!(
+            body.get("system").is_none(),
+            "OpenAI adapter must not hoist system to a top-level field"
+        );
+    }
+
+    /// Cache-prefix stability at the adapter boundary: converting `seq` and
+    /// `seq + [tool exchange]` yields message arrays whose first `len(seq)`
+    /// elements are byte-identical (a tool exchange appended after the prefix
+    /// does not perturb the prefix).
+    #[test]
+    fn test_pillar_a_openai_prefix_stable_when_tool_exchange_appended() {
+        let provider = OpenAiCompatibleProvider::new("https://api.openai.com/v1", "test-key")
+            .expect("provider should initialize");
+        let seq = vec![
+            json!({"role":"system","content":"core prompt"}),
+            json!({"role":"assistant","content":"prior turn"}),
+            json!({"role":"user","content":"first ask"}),
+            json!({"role":"system","content":"tail directive"}),
+            json!({"role":"user","content":"second ask"}),
+        ];
+        let mut seq_extended = seq.clone();
+        seq_extended.push(json!({
+            "role": "assistant",
+            "content": "calling tool",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "search_files", "arguments": "{}" }
+            }]
+        }));
+        seq_extended.push(json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "tool output"
+        }));
+
+        let body_a = provider.build_request_body("gpt-4o-mini", &seq, &[], &ChatOptions::default());
+        let body_b =
+            provider.build_request_body("gpt-4o-mini", &seq_extended, &[], &ChatOptions::default());
+
+        let arr_a = body_a["messages"].as_array().expect("messages array");
+        let arr_b = body_b["messages"].as_array().expect("messages array");
+        assert_eq!(arr_b.len(), arr_a.len() + 2);
+        // First len(seq) elements byte-identical (compare serialized prefix).
+        for i in 0..seq.len() {
+            assert_eq!(
+                serde_json::to_string(&arr_a[i]).unwrap(),
+                serde_json::to_string(&arr_b[i]).unwrap(),
+                "prefix element {i} must be byte-identical when a tool exchange is appended"
+            );
+        }
+    }
+
+    /// Tool-array emission order (Step 3): the adapter is a faithful passthrough.
+    /// It emits `body["tools"]` in the EXACT incoming order — it does NOT sort.
+    /// Sorting is upstream's responsibility (Task 6); the adapter must preserve
+    /// whatever order it receives so `tool_defs_hash` flips only on membership
+    /// change, never on a re-sort at the boundary.
+    #[test]
+    fn test_pillar_a_openai_tools_array_preserves_incoming_order() {
+        let provider = OpenAiCompatibleProvider::new("https://api.openai.com/v1", "test-key")
+            .expect("provider should initialize");
+        let messages = vec![json!({"role":"user","content":"do it"})];
+        let tool = |name: &str| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": format!("tool {name}"),
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })
+        };
+
+        // Already name-sorted incoming order → emitted in that exact order.
+        let sorted = vec![tool("a_tool"), tool("b_tool"), tool("c_tool")];
+        let body =
+            provider.build_request_body("gpt-4o-mini", &messages, &sorted, &ChatOptions::default());
+        let emitted: Vec<&str> = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            emitted,
+            ["a_tool", "b_tool", "c_tool"],
+            "adapter must emit tools in incoming (already-sorted) order"
+        );
+
+        // Scrambled incoming order → emitted in that SAME scrambled order,
+        // proving the adapter does NOT sort (passthrough only).
+        let scrambled = vec![tool("c_tool"), tool("a_tool"), tool("b_tool")];
+        let body_scrambled = provider.build_request_body(
+            "gpt-4o-mini",
+            &messages,
+            &scrambled,
+            &ChatOptions::default(),
+        );
+        let emitted_scrambled: Vec<&str> = body_scrambled["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            emitted_scrambled,
+            ["c_tool", "a_tool", "b_tool"],
+            "adapter must NOT reorder/sort tools — it is a faithful passthrough"
+        );
+    }
+
+    #[test]
+    fn test_cached_input_tokens_from_openai_usage_details() {
+        let usage = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {
+                "cached_tokens": 75
+            }
+        });
+
+        assert_eq!(
+            OpenAiCompatibleProvider::cached_input_tokens_from_usage(&usage),
+            Some(75)
+        );
     }
 
     #[test]
