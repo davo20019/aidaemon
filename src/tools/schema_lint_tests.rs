@@ -26,12 +26,6 @@ fn tool_source_files() -> Vec<PathBuf> {
     files
 }
 
-fn schema_segment(source: &str) -> Option<&str> {
-    let (_, after_schema_start) = source.split_once("fn schema(&self) -> Value {")?;
-    let (segment, _) = after_schema_start.split_once("async fn call(")?;
-    Some(segment)
-}
-
 /// Returns the full source region covering schema-related definitions:
 /// the inline `fn schema` body plus any private helper such as
 /// `fn <tool>_schema() -> Value` that the method may delegate to.
@@ -43,7 +37,7 @@ fn schema_source_region(source: &str) -> Option<&str> {
     let start = if let Some(pos) = source.find("_schema() -> Value {") {
         // Walk back to the `fn ` keyword
         let prefix = &source[..pos];
-        prefix.rfind("fn ").map(|fn_pos| fn_pos).unwrap_or(0)
+        prefix.rfind("fn ").unwrap_or(0)
     } else {
         // No helper — fall through to schema_segment
         let (_, after) = source.split_once("fn schema(&self) -> Value {")?;
@@ -98,7 +92,7 @@ fn schema_payload_budget_stays_bounded() {
     let mut total = 0usize;
     for file in tool_source_files() {
         let source = fs::read_to_string(&file).expect("read tool source");
-        let segment = schema_segment(&source)
+        let segment = schema_source_region(&source)
             .unwrap_or_else(|| panic!("Could not locate schema segment in {}", file.display()));
         total += segment.len();
         assert!(
