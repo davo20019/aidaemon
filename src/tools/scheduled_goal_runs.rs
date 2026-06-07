@@ -266,7 +266,7 @@ impl ScheduledGoalRunsTool {
 
         if hints.is_empty() {
             hints.push(
-                "No obvious failure signature found. Use goal_trace(tool_trace) to inspect exact tool-call errors.",
+                "No obvious failure signature found. Use goal_trace(action='tool_trace') to inspect exact tool-call errors.",
             );
         }
         hints
@@ -641,6 +641,44 @@ struct ScheduledGoalRunsArgs {
     _user_role: Option<String>,
 }
 
+fn scheduled_goal_runs_schema() -> Value {
+    json!({
+        "name": "scheduled_goal_runs",
+        "description": "Trigger and inspect scheduled-goal runs. ONLY for scheduled goals; NOT for storing facts.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["run_now", "run_history", "last_failure", "unblock_hints", "set_budget"]
+                },
+                "goal_id": {
+                    "type": "string",
+                    "description": "Goal ID (full or prefix)"
+                },
+                "schedule_id": {
+                    "type": "string",
+                    "description": "Schedule ID; run_now consumes one-shot schedules"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max runs (run_history; default 10, max 50)"
+                },
+                "budget_per_check": {
+                    "type": "integer",
+                    "description": "Per-check token budget (set_budget)"
+                },
+                "budget_daily": {
+                    "type": "integer",
+                    "description": "Daily token budget (set_budget)"
+                }
+            },
+            "required": ["action", "goal_id"],
+            "additionalProperties": false
+        }
+    })
+}
+
 #[async_trait]
 impl Tool for ScheduledGoalRunsTool {
     fn name(&self) -> &str {
@@ -652,42 +690,7 @@ impl Tool for ScheduledGoalRunsTool {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "name": "scheduled_goal_runs",
-            "description": "Run scheduled goals now and inspect execution diagnostics. Use this instead of terminal/sqlite for scheduled-goal run forensics. ONLY for recurring/scheduled goals; NOT for learning or storing facts.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["run_now", "run_history", "last_failure", "unblock_hints", "set_budget"],
-                        "description": "Action to perform. All actions require goal_id."
-                    },
-                    "goal_id": {
-                        "type": "string",
-                        "description": "Scheduled goal ID (full or unique prefix)"
-                    },
-                    "schedule_id": {
-                        "type": "string",
-                        "description": "Optional schedule ID. For one-shot schedules, run_now can consume a specific schedule when provided."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max runs to show for run_history (default 10, max 50)"
-                    },
-                    "budget_per_check": {
-                        "type": "integer",
-                        "description": "New per-check budget (tokens). Only used for set_budget."
-                    },
-                    "budget_daily": {
-                        "type": "integer",
-                        "description": "New daily budget (tokens). Only used for set_budget."
-                    }
-                },
-                "required": ["action", "goal_id"],
-                "additionalProperties": false
-            }
-        })
+        scheduled_goal_runs_schema()
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -1095,5 +1098,21 @@ mod tests {
         let updated = state.get_goal(&goal_id).await.unwrap().unwrap();
         assert_eq!(updated.budget_per_check, Some(200));
         assert_eq!(updated.budget_daily, Some(100));
+    }
+
+    #[test]
+    fn schema_fits_payload_budget() {
+        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
+        // admin-tool schemas ride in EVERY provider call; this ceiling is the
+        // per-tool payload budget. If you trip this assert by adding features,
+        // compress the description text — do not raise the ceiling without
+        // updating the Pillar C implementation plan.
+        let bytes = serde_json::to_string(&scheduled_goal_runs_schema())
+            .unwrap()
+            .len();
+        assert!(
+            bytes <= 800,
+            "scheduled_goal_runs schema is {bytes} bytes, budget is 800"
+        );
     }
 }

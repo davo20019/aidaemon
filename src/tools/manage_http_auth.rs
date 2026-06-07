@@ -1035,6 +1035,39 @@ impl ManageHttpAuthTool {
     }
 }
 
+fn manage_http_auth_schema() -> Value {
+    json!({
+        "name": "manage_http_auth",
+        "description": "HTTP auth profile CRUD. No secrets in chat—use keychain command. Run verify after upsert/rotate to refresh runtime auth.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "describe", "upsert", "remove", "verify"]
+                },
+                "profile": { "type": "string" },
+                "auth_type": {
+                    "type": "string",
+                    "enum": ["oauth1a", "bearer", "header", "basic"]
+                },
+                "allowed_domains": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "header_name": { "type": "string", "description": "header auth" },
+                "username": { "type": "string", "description": "basic auth" },
+                "user_id": { "type": "string" },
+                "url": { "type": "string", "description": "verify URL (GET/HEAD)" },
+                "method": { "type": "string", "enum": ["GET", "HEAD"] },
+                "timeout_secs": { "type": "integer" }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
 #[async_trait]
 impl Tool for ManageHttpAuthTool {
     fn name(&self) -> &str {
@@ -1046,61 +1079,7 @@ impl Tool for ManageHttpAuthTool {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "name": "manage_http_auth",
-            "description": "Create, inspect, verify, and remove manual HTTP auth profiles (API key/token/basic/header/OAuth1a). Never ask the user to paste secrets into chat — give the exact keychain command. After secrets are stored or rotated, run verify before the first live call to refresh runtime auth without a restart.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["list", "describe", "upsert", "remove", "verify"],
-                        "description": "Action"
-                    },
-                    "profile": {
-                        "type": "string",
-                        "description": "Profile name"
-                    },
-                    "auth_type": {
-                        "type": "string",
-                        "enum": ["oauth1a", "bearer", "header", "basic"],
-                        "description": "Auth type for upsert"
-                    },
-                    "allowed_domains": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Allowed API domains"
-                    },
-                    "header_name": {
-                        "type": "string",
-                        "description": "Required for header auth"
-                    },
-                    "username": {
-                        "type": "string",
-                        "description": "Required for basic auth"
-                    },
-                    "user_id": {
-                        "type": "string",
-                        "description": "Optional OAuth1a user/account id"
-                    },
-                    "url": {
-                        "type": "string",
-                        "description": "Optional safe verify URL"
-                    },
-                    "method": {
-                        "type": "string",
-                        "enum": ["GET", "HEAD"],
-                        "description": "Verify method"
-                    },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "description": "Verify timeout"
-                    }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }
-        })
+        manage_http_auth_schema()
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -1313,5 +1292,21 @@ allowed_domains = ["api.example.com"]
         let runtime = profiles.read().await;
         let profile = runtime.get("demo").expect("runtime profile inserted");
         assert_eq!(profile.token.as_deref(), Some("secret-demo-token"));
+    }
+
+    #[test]
+    fn schema_fits_payload_budget() {
+        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
+        // admin-tool schemas ride in EVERY provider call; this ceiling is the
+        // per-tool payload budget. If you trip this assert by adding features,
+        // compress the description text — do not raise the ceiling without
+        // updating the Pillar C implementation plan.
+        let bytes = serde_json::to_string(&manage_http_auth_schema())
+            .unwrap()
+            .len();
+        assert!(
+            bytes <= 800,
+            "manage_http_auth schema is {bytes} bytes, budget is 800"
+        );
     }
 }

@@ -383,6 +383,48 @@ struct GoalTraceArgs {
     max_activities_per_task: Option<usize>,
 }
 
+fn goal_trace_schema() -> Value {
+    json!({
+        "name": "goal_trace",
+        "description": "Goal/task traces and tool-call timelines. Omit goal_id for recent-goal list.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["goal_trace", "tool_trace"]
+                },
+                "goal_id": {
+                    "type": "string",
+                    "description": "Goal ID. Required for goal_trace; optional for tool_trace with task_id"
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Task ID (tool_trace)"
+                },
+                "tool_name": {
+                    "type": "string",
+                    "description": "Tool filter (tool_trace)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events; default 30, max 200"
+                },
+                "max_tasks": {
+                    "type": "integer",
+                    "description": "Max tasks; default 20, max 100"
+                },
+                "max_activities_per_task": {
+                    "type": "integer",
+                    "description": "Max per task; default 6, max 20"
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
 #[async_trait]
 impl Tool for GoalTraceTool {
     fn name(&self) -> &str {
@@ -394,46 +436,7 @@ impl Tool for GoalTraceTool {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "name": "goal_trace",
-            "description": "Execution observability for goals and tools. Use this for task/tool forensics. If goal_id is omitted, it returns a recent-goal summary.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["goal_trace", "tool_trace"],
-                        "description": "Trace view type"
-                    },
-                    "goal_id": {
-                        "type": "string",
-                        "description": "Goal ID (full or unique prefix). Required for goal_trace, optional for tool_trace when task_id is provided."
-                    },
-                    "task_id": {
-                        "type": "string",
-                        "description": "Task ID for task-scoped tool trace"
-                    },
-                    "tool_name": {
-                        "type": "string",
-                        "description": "Optional tool name filter for tool_trace"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max events for tool_trace (default 30, max 200)"
-                    },
-                    "max_tasks": {
-                        "type": "integer",
-                        "description": "Max tasks to include in goal_trace (default 20, max 100)"
-                    },
-                    "max_activities_per_task": {
-                        "type": "integer",
-                        "description": "Max activity points per task in goal_trace (default 6, max 20)"
-                    }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }
-        })
+        goal_trace_schema()
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -701,5 +704,19 @@ mod tests {
 
         assert!(result.contains("Goal Trace (Recent Goals)"));
         assert!(result.contains("Collect deployment diagnostics"));
+    }
+
+    #[test]
+    fn schema_fits_payload_budget() {
+        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
+        // admin-tool schemas ride in EVERY provider call; this ceiling is the
+        // per-tool payload budget. If you trip this assert by adding features,
+        // compress the description text — do not raise the ceiling without
+        // updating the Pillar C implementation plan.
+        let bytes = serde_json::to_string(&goal_trace_schema()).unwrap().len();
+        assert!(
+            bytes <= 800,
+            "goal_trace schema is {bytes} bytes, budget is 800"
+        );
     }
 }
