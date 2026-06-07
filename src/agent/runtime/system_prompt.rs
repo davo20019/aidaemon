@@ -21,42 +21,6 @@ fn infer_assistant_name_from_prompt(prompt: &str) -> Option<String> {
     None
 }
 
-/// Remove a top-level markdown section and its body (until next "## " heading).
-pub(super) fn strip_markdown_section(prompt: &str, heading: &str) -> String {
-    let mut out = String::with_capacity(prompt.len());
-    let mut skipping = false;
-
-    for line in prompt.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("## ") {
-            if trimmed.trim_end() == heading {
-                skipping = true;
-                continue;
-            }
-            if skipping {
-                skipping = false;
-            }
-        }
-
-        if !skipping {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(line);
-        }
-    }
-
-    out
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ToolLoopPromptStyle {
-    /// Keep concise tool-selection guidance, strip verbose tool docs.
-    Standard,
-    /// Strip both tool-selection guidance and verbose tool docs.
-    Lite,
-}
-
 /// Render the "## Available Specialists" block surfaced in the agent's system
 /// prompt. Mirrors the per-kind list also exposed via the `spawn_agent` tool
 /// schema, so the LLM has two consistent surfaces to discover which specialist
@@ -69,6 +33,12 @@ pub(super) enum ToolLoopPromptStyle {
 /// not parent-LLM-selectable). Returns an empty string only if the registry
 /// is empty, which should never happen by construction; the caller can drop
 /// the section entirely in that case.
+///
+/// As of Pillar A Task 4 the production splice is performed by
+/// `core_prompt::render_core_prompt` (via `render_specialists_block`) over the
+/// pre-extracted `llm_visible_kinds()` pairs; this registry-driven variant is
+/// retained as the test oracle for that block's byte format.
+#[cfg(test)]
 pub(crate) fn build_available_specialists_block(
     registry: &crate::agent::specialists::SpecialistRegistry,
 ) -> String {
@@ -98,21 +68,6 @@ pub(crate) fn build_available_specialists_block(
         "\nOmit the `specialist` argument to let the agent infer the right kind from the mission/task text.",
     );
     s
-}
-
-/// Build a compact prompt for tool-loop iterations after the first turn.
-/// Runtime tool schemas are still sent separately in API tool_defs.
-pub(super) fn build_tool_loop_system_prompt(
-    system_prompt: &str,
-    style: ToolLoopPromptStyle,
-) -> String {
-    let without_tools = strip_markdown_section(system_prompt, "## Tools");
-    match style {
-        ToolLoopPromptStyle::Standard => without_tools,
-        ToolLoopPromptStyle::Lite => {
-            strip_markdown_section(&without_tools, "## Tool Selection Guide")
-        }
-    }
 }
 
 /// Format goal context JSON into human-readable text for the task lead prompt.
@@ -578,34 +533,40 @@ impl Agent {
         // For PublicExternal channels, use a minimal system prompt that does not
         // expose internal architecture, tool documentation, config structure, or
         // slash commands. The full system prompt is only for trusted channels.
-        let base_prompt = if channel_ctx.visibility == ChannelVisibility::PublicExternal {
+        //
+        // The CORE static prefix (persona/base + the "## Available Specialists"
+        // block spliced before `## Tools`) is now produced by the pure
+        // `render_core_prompt` over `assemble_core_inputs`. For byte-identity at
+        // this task, `channel_rules`/`skills_catalog` are passed EMPTY — those
+        // sections are still emitted by their existing inline sites below — so
+        // the rendered core equals the legacy `base_prompt` byte-for-byte.
+        // Tasks 6/7 call the same assembler with the full snapshots.
+        let persona = if channel_ctx.visibility == ChannelVisibility::PublicExternal {
             "You are a helpful AI assistant. Answer questions, have friendly conversations, \
              and share publicly available information. Do not reveal any internal details \
              about your configuration, tools, or architecture."
                 .to_string()
         } else {
-            // Keep the tool guidance sections intact for the normal tool-enabled
-            // loop. Stripping them here leaves the model with tools but no
-            // selection guidance.
-            //
-            // Inject the "## Available Specialists" block from the live
-            // `SpecialistRegistry` so the LLM has the same per-kind discovery
-            // surface as the `spawn_agent` schema. The block already starts
-            // with its own `## ` heading; we splice it in before the legacy
-            // `## Tools` section so it sits alongside other capability framing.
-            // Suppressed on PublicExternal (minimal prompt above).
-            let specialists_block = build_available_specialists_block(&self.specialists);
-            if specialists_block.is_empty() {
-                self.system_prompt.clone()
-            } else if let Some(idx) = self.system_prompt.find("## Tools") {
-                let (head, tail) = self.system_prompt.split_at(idx);
-                format!("{head}{specialists_block}\n\n{tail}")
-            } else {
-                // No `## Tools` anchor — fall back to appending after the
-                // header so the block is still visible to the LLM.
-                format!("{}\n\n{specialists_block}", self.system_prompt)
-            }
+            self.system_prompt.clone()
         };
+        let core_inputs = core_prompt::assemble_core_inputs(
+            user_role,
+            channel_ctx,
+            persona,
+            // tool_roster is not emitted into the core prose (the `## Tools`
+            // selection guide lives in the persona; the canonical name-sorted
+            // tool ARRAY is bound at the provider boundary in Task 8).
+            self.session_static_tool_roster(user_role, channel_ctx.visibility),
+            // skills_catalog/channel_rules empty for byte-identity this task.
+            Vec::new(),
+            self.specialists
+                .llm_visible_kinds()
+                .into_iter()
+                .map(|(name, desc)| (name.to_string(), desc))
+                .collect(),
+            String::new(),
+        );
+        let base_prompt = core_prompt::render_core_prompt(&core_inputs);
         let mut system_prompt = skills::build_system_prompt_with_memory(
             &base_prompt,
             &skills_snapshot,
@@ -675,7 +636,9 @@ impl Agent {
                     .as_deref()
                     .map(|n| format!(" \"{}\"", n))
                     .unwrap_or_default();
-                let history_hint = if channel_ctx.platform == "slack" {
+                let history_hint = if channel_ctx.platform == "slack"
+                    && self.has_registered_tool("read_channel_history")
+                {
                     "\n- IMPORTANT: Your conversation history only contains messages sent directly to you. \
                      When the user asks about \"the conversation\", \"what was discussed\", \"takeaways\", \
                      or anything about channel activity, you MUST use the read_channel_history tool to \
@@ -701,7 +664,9 @@ impl Agent {
                     .as_deref()
                     .map(|n| format!(" \"{}\"", n))
                     .unwrap_or_default();
-                let history_hint = if channel_ctx.platform == "slack" {
+                let history_hint = if channel_ctx.platform == "slack"
+                    && self.has_registered_tool("read_channel_history")
+                {
                     "\n- IMPORTANT: Your conversation history only contains messages sent directly to you. \
                      When the user asks about \"the conversation\", \"what was discussed\", \"takeaways\", \
                      or anything about channel activity, you MUST use the read_channel_history tool to \
@@ -855,7 +820,7 @@ impl Agent {
              [Recall Priority]\n\
              For questions about recent conversation (for example: \"what did I just ask\", \"what were the last 3 things\", \"summarize our chat\"), use the conversation history already in context FIRST.\n\
              Do NOT jump to goal/task forensics tools for simple recall.\n\
-             Use `goal_trace` / `tool_trace` when the user asks about execution history, logs, task timelines, tool failures, retries, \
+             Use `goal_trace` when the user asks about execution history, logs, task timelines, tool failures, retries, \
              what happened with a previous task, or anything about database/DB logs.\n\
              \n\
              [Self-Inspection]\n\
@@ -863,8 +828,7 @@ impl Agent {
              to locate or open database files. Your database is encrypted and not accessible via terminal.\n\
              Instead, use your built-in tools for self-inspection:\n\
              - `manage_memories` (search/list) — for stored facts, preferences, personal goals, scheduled tasks\n\
-             - `goal_trace` — for execution logs, task history, what happened during previous runs\n\
-             - `tool_trace` — for tool-call-level details of past executions\n\
+             - `goal_trace` — execution forensics: `action: \"goal_trace\"` for task timelines; `action: \"tool_trace\"` for per-tool call details\n\
              When the user asks to \"check the logs\", \"look in the DB\", \"what happened with X task\", or similar, \
              use these tools — never try to find raw database files.",
             system_prompt
@@ -1005,6 +969,56 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::{build_available_specialists_block, format_goal_context};
+
+    /// Byte-identity guard for Pillar A Task 4: the production CORE base prompt
+    /// is now produced by `render_core_prompt` over `assemble_core_inputs`, with
+    /// `channel_rules`/`skills_catalog` empty. Its output MUST equal the legacy
+    /// `base_prompt` construction (persona + the `## Available Specialists` block
+    /// spliced before `## Tools`) byte-for-byte. This pins the invariant that
+    /// `build_system_prompt_for_message`'s emitted bytes are unchanged.
+    #[test]
+    fn render_core_prompt_matches_legacy_base_prompt_construction() {
+        use crate::agent::core_prompt::{assemble_core_inputs, render_core_prompt};
+        use crate::types::{ChannelContext, UserRole};
+
+        let registry = crate::agent::specialists::SpecialistRegistry::load(None);
+
+        // A persona stand-in that contains a `## Tools` anchor, mirroring the
+        // real `self.system_prompt`.
+        let persona = "You are aidaemon.\n\n## Behavior\nBe helpful.\n\n## Tools\nUse them.";
+
+        // --- legacy construction (non-public path) ---
+        let specialists_block = build_available_specialists_block(&registry);
+        let legacy = if specialists_block.is_empty() {
+            persona.to_string()
+        } else if let Some(idx) = persona.find("## Tools") {
+            let (head, tail) = persona.split_at(idx);
+            format!("{head}{specialists_block}\n\n{tail}")
+        } else {
+            format!("{persona}\n\n{specialists_block}")
+        };
+
+        // --- new construction via the assembler + pure renderer ---
+        let core_inputs = assemble_core_inputs(
+            UserRole::Owner,
+            &ChannelContext::private("test"),
+            persona.to_string(),
+            Vec::new(),
+            Vec::new(),
+            registry
+                .llm_visible_kinds()
+                .into_iter()
+                .map(|(n, d)| (n.to_string(), d))
+                .collect(),
+            String::new(),
+        );
+        let rendered = render_core_prompt(&core_inputs);
+
+        assert_eq!(
+            rendered, legacy,
+            "render_core_prompt must reproduce the legacy base_prompt byte-for-byte"
+        );
+    }
 
     #[test]
     fn available_specialists_block_lists_each_non_task_lead_kind() {

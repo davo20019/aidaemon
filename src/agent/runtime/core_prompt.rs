@@ -6,6 +6,7 @@
 //! iteration, or env-dependent formatting.
 
 use crate::agent::prefix_fingerprint::hash_canonical;
+use crate::types::ChannelVisibility;
 use serde_json::json;
 
 /// Session-static inputs to the core (cacheable) prompt prefix. Each field maps
@@ -101,6 +102,146 @@ impl CoreInputs {
     }
 }
 
+/// Render the "## Available Specialists" block from a name-sorted list of
+/// `(kind, description)` pairs. Byte-equivalent to the registry-driven
+/// `build_available_specialists_block` in system_prompt.rs, but pure over the
+/// pre-extracted pairs so it can live in `render_core_prompt`.
+///
+/// Returns an empty string when `entries` is empty (caller drops the section).
+fn render_specialists_block(entries: &[(String, String)]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "## Available Specialists\n\n\
+         When you delegate work with `spawn_agent`, pick the specialist that best matches the task. \
+         Sub-agents run in an isolated context window with the same tools you have, so keep the `mission` \
+         and `task` brief minimal — reference files by path rather than pasting contents, and skip prior \
+         tool output or conversation history the sub-agent does not need:\n\n",
+    );
+    for (name, description) in entries {
+        s.push_str("- `");
+        s.push_str(name);
+        s.push_str("`: ");
+        s.push_str(description);
+        if !description.ends_with('.') {
+            s.push('.');
+        }
+        s.push('\n');
+    }
+    s.push_str(
+        "\nOmit the `specialist` argument to let the agent infer the right kind from the mission/task text.",
+    );
+    s
+}
+
+/// Render the session-static CORE prompt prefix from [`CoreInputs`].
+///
+/// PURE + SYNCHRONOUS by contract: no clock, no I/O, no async, no map
+/// iteration. Unordered collections (`specialists`, `skills_catalog`) are sorted
+/// by name BEFORE emission so the rendered bytes are emission-order-stable.
+/// `tool_roster` is NOT emitted here — the canonical name-sorted order binds the
+/// PROVIDER TOOL ARRAY (Task 8), not this prose; the `## Tools` selection guide
+/// lives inside `base_template`.
+///
+/// Emission order (canonical core layout): `base_template`, then the
+/// `## Available Specialists` block spliced before the base template's `## Tools`
+/// anchor (appended after the base when no anchor exists — mirrors the legacy
+/// splice), then `channel_rules`, then the `## Available Skills` availability
+/// catalog. Empty optional sections are dropped entirely.
+///
+/// Byte-identity note (Task 4): in the production call site the
+/// `channel_rules`/`skills_catalog` fields are deliberately left EMPTY (those
+/// sections are still emitted by their existing inline sites this task), so the
+/// rendered core equals the legacy `base_prompt` byte-for-byte. The golden tests
+/// drive the full layout with all sections populated.
+pub(crate) fn render_core_prompt(inputs: &CoreInputs) -> String {
+    let mut specialists = inputs.specialists.clone();
+    specialists.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let specialists_block = render_specialists_block(&specialists);
+
+    // base_template + specialists splice (before `## Tools`, else appended) —
+    // mirrors the legacy build site in build_system_prompt_for_message.
+    let mut out = if specialists_block.is_empty() {
+        inputs.base_template.clone()
+    } else if let Some(idx) = inputs.base_template.find("## Tools") {
+        let (head, tail) = inputs.base_template.split_at(idx);
+        format!("{head}{specialists_block}\n\n{tail}")
+    } else {
+        format!("{}\n\n{specialists_block}", inputs.base_template)
+    };
+
+    if !inputs.channel_rules.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&inputs.channel_rules);
+    }
+
+    if !inputs.skills_catalog.is_empty() {
+        let mut skills_catalog = inputs.skills_catalog.clone();
+        skills_catalog.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        out.push_str("\n\n## Available Skills\n");
+        for (name, description, _enabled) in &skills_catalog {
+            out.push_str(&format!("- **{}**: {}\n", name, description));
+        }
+    }
+
+    out
+}
+
+/// Assemble [`CoreInputs`] from the session-static values available where
+/// `build_system_prompt_for_message` runs. Single shared assembler — Tasks 6/7
+/// call this same function with the real `channel_rules`/`skills_catalog`
+/// snapshots; the Task-4 production site passes them empty so the rendered core
+/// stays byte-identical to the legacy `base_prompt` (those sections are still
+/// emitted by their existing inline sites this task).
+///
+/// Explicit stable inputs by contract — NOT `&BootstrapData` (which is built
+/// AFTER the prompt-build site and so does not exist at the call site).
+///
+/// Pure/sync: callers pre-fetch any async snapshots (skill registry read,
+/// specialist registry read) and pass them in.
+///
+/// | Field | Source |
+/// |---|---|
+/// | `base_template` | role/mode base prompt (`persona`) — minimal on PublicExternal |
+/// | `tool_roster` | `session_static_tool_roster` accessor |
+/// | `skills_catalog` | active skill registry snapshot (name, one-line desc, enabled) |
+/// | `specialists` | `SpecialistRegistry::llm_visible_kinds()` |
+/// | `channel_rules` | channel/privacy rule set for the session's visibility class |
+/// | `persona` | persona/identity config (== `base_template` source) |
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_core_inputs(
+    user_role: crate::types::UserRole,
+    channel_ctx: &crate::types::ChannelContext,
+    persona: String,
+    tool_roster: Vec<(String, String)>,
+    skills_catalog: Vec<(String, String, bool)>,
+    specialists: Vec<(String, String)>,
+    channel_rules: String,
+) -> CoreInputs {
+    // Specialists are role-typed and never surfaced on the minimal PublicExternal
+    // prompt (legacy build site suppresses the splice there).
+    let specialists = if channel_ctx.visibility == ChannelVisibility::PublicExternal {
+        Vec::new()
+    } else {
+        specialists
+    };
+    // Non-owner roles have no tool access (matches `session_static_tool_roster`).
+    let tool_roster = if user_role != crate::types::UserRole::Owner {
+        Vec::new()
+    } else {
+        tool_roster
+    };
+    CoreInputs {
+        base_template: persona.clone(),
+        tool_roster,
+        skills_catalog,
+        specialists,
+        channel_rules,
+        persona,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_core_inputs() -> CoreInputs {
     CoreInputs {
@@ -110,7 +251,7 @@ pub(crate) fn test_core_inputs() -> CoreInputs {
             ("s2".into(), "d2".into(), true),
             ("s1".into(), "d1".into(), true),
         ],
-        specialists: vec![("x".into(), "dx".into())],
+        specialists: vec![("x".into(), "dx".into()), ("a".into(), "da".into())],
         channel_rules: "R".into(),
         persona: "P".into(),
     }
@@ -119,6 +260,36 @@ pub(crate) fn test_core_inputs() -> CoreInputs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
+
+    #[test]
+    fn core_prompt_renders_identically_for_identical_inputs() {
+        let inputs = test_core_inputs();
+        let a = render_core_prompt(&inputs);
+        let b = render_core_prompt(&inputs);
+        assert_eq!(a, b, "core render must be deterministic");
+        assert!(
+            !a.contains("[Current Date & Time]"),
+            "timestamp belongs to the tail"
+        );
+        assert!(!a.contains(TASK_CONTEXT_TAIL_MARKER));
+    }
+
+    #[test]
+    fn core_prompt_is_order_insensitive_for_unordered_inputs() {
+        // Determinism of the core BYTES under input reordering. Reorder the
+        // unordered collections the core actually emits (skills catalog,
+        // specialists); rendered bytes must not change.
+        // NOTE: per spec §Pillar A the name-sorted canonical order binds the
+        // PROVIDER TOOL ARRAY, not the `## Tools` prose (which is a selection
+        // guide needing only determinism). So tool-array emission order is
+        // asserted at the provider boundary in Task 8, NOT here.
+        let mut inputs = test_core_inputs();
+        let a = render_core_prompt(&inputs);
+        inputs.skills_catalog.reverse();
+        inputs.specialists.reverse();
+        assert_eq!(a, render_core_prompt(&inputs));
+    }
 
     #[test]
     fn component_hash_is_order_insensitive_for_unordered_inputs() {
