@@ -1038,7 +1038,7 @@ impl ManageHttpAuthTool {
 fn manage_http_auth_schema() -> Value {
     json!({
         "name": "manage_http_auth",
-        "description": "HTTP auth profile CRUD. No secrets in chat—use keychain command. Run verify after upsert/rotate to refresh runtime auth.",
+        "description": "HTTP auth CRUD. No secrets in chat—keychain. verify after upsert/rotate refreshes runtime auth.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1052,13 +1052,14 @@ fn manage_http_auth_schema() -> Value {
                     "enum": ["oauth1a", "bearer", "header", "basic"]
                 },
                 "allowed_domains": {
+                    "description": "Hosts allowed to receive this profile's credentials",
                     "type": "array",
                     "items": { "type": "string" }
                 },
                 "header_name": { "type": "string", "description": "header auth" },
-                "username": { "type": "string", "description": "basic auth" },
+                "username": { "type": "string", "description": "basic" },
                 "user_id": { "type": "string" },
-                "url": { "type": "string", "description": "verify URL (GET/HEAD)" },
+                "url": { "type": "string" },
                 "method": { "type": "string", "enum": ["GET", "HEAD"] },
                 "timeout_secs": { "type": "integer" }
             },
