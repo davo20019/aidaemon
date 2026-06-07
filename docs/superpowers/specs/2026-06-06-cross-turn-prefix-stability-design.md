@@ -43,9 +43,11 @@ slide that mutates collapse inputs mid-task.
    Prior-1/Prior-2 ladder as the budget mechanism.
 5. The render cache is an optimization and an assertion mechanism, not the
    source of truth. Debug/test builds re-render and assert byte equality.
-6. Exit criteria are measured with the Phase 0 instrumentation, which stays
-   untouched. Absolute thresholds are set **after** the first instrumented
-   re-run (see §Exit criteria).
+6. Exit criteria are measured with the Phase 0 instrumentation, which is
+   **extended, never redefined**: existing fields keep their semantics
+   (additions in §Observability — `tail_hash`, `prefix_hash_archived`;
+   `session_summary_hash` retires by reporting empty). Absolute thresholds
+   are set **after** the first instrumented re-run (see §Exit criteria).
 
 ## Payload layout
 
@@ -419,15 +421,17 @@ invariant-1/2 guarantees to test-only properties. The provider-call
 fingerprint therefore gains two fields:
 
 - `tail_hash` — the tail message located by its deterministic marker and
-  hashed separately;
+  hashed separately. The marker is a shared constant between the tail
+  builder and `prefix_fingerprint.rs` (the plan defines it, e.g.
+  `TASK_CONTEXT_TAIL_MARKER`), the same arrangement that keeps
+  `SESSION_SUMMARY_MARKER` from drifting today;
 - `prefix_hash_archived` — the pre-boundary region **excluding** the tail.
 
 `prefix_hash_pre_boundary` keeps its existing semantics for cross-phase
 comparability. The live diagnosis rule becomes: a `prefix_hash_archived`
-flip without a matching eviction (`Window decision`) or `Prefix mutation`
-line is an archived-region bug; a tail-only flip is expected. Diffing
-`AIDAEMON_DUMP_LLM_REQUESTS` output remains the exception path, not the
-routine one.
+flip without a matching eviction (`Window decision`), `Prefix mutation`
+line, or render-cache `fp_mismatch` (late write into an archived turn) is
+an archived-region bug; a tail-only flip is expected.
 
 The `session_summary_hash` index-1 special case retires when the summary
 moves into the tail: the field reports empty, and the summary participates
@@ -438,10 +442,11 @@ After this phase, a `prefix_hash_system` cross-turn flip without a matching
 `Core prompt invalidated` line is a bug by definition.
 
 `AIDAEMON_DUMP_LLM_REQUESTS` complements the fingerprints: the hashes say
-*that* a region flipped; the request dump says *which bytes*. Diffing
-consecutive dumped requests is the expected diagnosis path for any
-unattributed flip (it is how the turn 1→2 skill-toggle churn was found),
-and the body-level integration assertions in §Testing can reuse the same
+*that* a region flipped; the request dump says *which bytes*. The routine
+path is hash attribution via the rules above; diffing consecutive dumped
+requests is the diagnosis path for any flip the hashes leave
+**unattributed** (it is how the turn 1→2 skill-toggle churn was found).
+The body-level integration assertions in §Testing can reuse the same
 serialization.
 
 ## Testing
@@ -492,9 +497,17 @@ serialization.
 2. Live re-run: criterion 1 (within-task system stability) stays PASS;
    every cross-turn `prefix_hash_system` flip pairs with a logged
    `Core prompt invalidated` line; and every `prefix_hash_archived` flip
-   pairs with a logged eviction (`Window decision`) or `Prefix mutation`
-   line. Tail-only flips (`tail_hash` changed, `prefix_hash_archived`
-   stable) are expected and pass.
+   pairs with a logged eviction (`Window decision`), `Prefix mutation`
+   line, or render-cache `fp_mismatch` (late write into an archived turn —
+   spec-compliant per §Fetch edge cases). Tail-only flips (`tail_hash`
+   changed, `prefix_hash_archived` stable) are expected and pass. `tool_defs_hash` is cross-turn stable for
+   the whole run except the single one-time break at the Pillar C baseline
+   (the tool roster is a core input; any other flip is a per-turn-gating
+   regression, per the §Pillar A anti-pattern). **Force-text turns are
+   excluded from the cross-turn pass/fail metrics:** tool defs are absent
+   from those requests by design, so their `tool_defs_hash` and
+   `prefix_hash_system` legitimately differ; `cache-attribution.py` tags and
+   skips them rather than scoring them as flips.
 3. Baselines are sequenced with Pillar C: the Phase 0 baseline (~22.3k
    median payload, ~22.3k median turn-start re-eval) applies to Pillar C
    only. **After Pillar C lands, a fresh attribution re-run establishes the
