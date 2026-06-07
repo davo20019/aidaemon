@@ -78,7 +78,13 @@ Turn N final payload:  `core → archived[..N-1] → tail[N] → current[N]`
 Turn N+1 first payload: `core → archived[..N-1, N] → tail[N+1] → current[N+1]`
 
 Divergence necessarily occurs where `tail[N]` is replaced by `archived[N]`.
-The promised invariants are:
+
+Throughout these invariants, "prefix" and "byte-identical" refer to the
+**ordered prompt/message representation after adapter conversion** (and,
+ultimately, the rendered chat-template/token sequence the server compares) —
+never to serialized JSON request bodies, which cannot be prefix-extensions
+of each other by construction (closing delimiters move). The promised
+invariants are:
 
 1. **Core + archived turns through N-1 are byte-identical** between turn N's
    final payload and turn N+1's first payload (absent a logged core
@@ -209,11 +215,17 @@ the only fetch parameter; nothing slides unless the anchor moves.
 **Anchor initialization (no anchor in memory — first build of a session, or
 after daemon restart):** walk turns backward from the most recent,
 accumulating provider-equivalent estimated tokens per archived rendering,
-and stop at the last whole turn that fits within the **60% low-water mark**
-of the context budget; that turn becomes the anchor. The walk is a bounded,
-paged query (never an unbounded session load), and the same low-water rule
-used by eviction governs it, so a restart lands on the same anchor a
-long-running daemon would have converged to.
+and stop at the last whole turn that fits within the **archived-region
+budget** (defined under §Eviction: the low-water fraction of what remains
+after non-evictable reservations); that turn becomes the anchor. The walk is
+a bounded, paged query, never an unbounded session load.
+
+Reconstruction is **not** exact: a running session legitimately grows from
+the low-water mark toward the eviction threshold without moving its anchor,
+so a restart that rebuilds to low-water lands on a deeper anchor than the
+pre-restart one. This phase explicitly accepts **one boundary change (one
+full re-prefill) per daemon restart per session**. Persisting the anchor is
+the named upgrade path if restart warmness later matters (see Out of scope).
 
 Edge cases (defined, not discovered):
 
@@ -238,13 +250,15 @@ Edge cases (defined, not discovered):
   - the user message text survives **in full**;
   - the final assistant reply survives, truncated by the existing
     deterministic rule (`MAX_OLD_ASSISTANT_CONTENT_CHARS`). **Selection
-    rule:** the final reply is the last assistant-role record in the turn's
-    sequence with non-empty content — tool-call-bearing assistant records
-    contribute only their content (tool_calls stripped by the existing
-    orphan rule); recovery retries and checkpoints are assistant/system
-    records earlier in the sequence and lose by position; a turn whose last
-    assistant record has empty content (tool-only or crashed turn) renders
-    the deterministic `[task interrupted]`/no-reply placeholder;
+    rule:** the **last assistant-role record with non-empty content** wins,
+    regardless of any later empty assistant record. Tool-call-bearing
+    assistant records contribute only their content (tool_calls stripped by
+    the existing orphan rule); recovery retries and checkpoints lose by
+    position. If **no** assistant record in the turn has non-empty content,
+    the placeholder depends on turn completion status: a turn with a
+    completion record (successful tool-only turn) renders the deterministic
+    `[completed: N tool steps, no text reply]`; a turn without one
+    (crashed/interrupted) renders `[task interrupted]`;
   - tool results survive as deterministic summaries;
   - messages matching the identity-critical detector
     (`text_relates_to_critical_identity`) survive **verbatim** — identity
@@ -281,12 +295,28 @@ per session, in-memory.
 
 ### Eviction
 
-When the estimated payload exceeds the context budget: evict oldest whole
-turns until the estimate is at or below a low-water mark (60% of budget),
-advance the anchor, and log through the existing `Window decision` line.
-Estimation uses **provider-equivalent serialized renderings** (token
-estimates over the final rendered JSON content) with a safety margin (10%),
-not raw message lengths. Eviction is the only operation that rewrites the
+Budgeting is computed over the **evictable region only**. The
+archived-region budget is:
+
+```
+archived_budget = (context_budget
+                   − core − tool definitions − task tail estimate
+                   − current-turn reserve − output reserve)
+                  × (1 − safety_margin)
+low_water = 60% of archived_budget
+```
+
+When the archived-region estimate exceeds `archived_budget`: evict oldest
+whole turns until at or below `low_water`, advance the anchor, and log
+through the existing `Window decision` line. Estimation uses
+**provider-equivalent serialized renderings** (token estimates over the
+final rendered content) with a 10% safety margin, not raw message lengths.
+
+**Degenerate case:** if the non-evictable region alone meets or exceeds the
+context budget, the payload carries **zero archived turns** (current turn +
+core + tail only), a `warn!` names the overflowing components, and any
+further reduction (tail compaction, schema slimming) is a Pillar C concern —
+the eviction mechanism never truncates inside a turn. Eviction is the only operation that rewrites the
 prefix head; it is rare and deep by construction. The anchor is in-memory;
 persisting it is deferred unless warm-across-restart behavior becomes a
 requirement.
@@ -348,20 +378,32 @@ serialization.
   single-component change → correct `component` named); `render_turn`
   golden-byte tests per mode including incomplete-turn and identity-critical
   fixtures; cache fp/version/mode mismatch behavior.
-- **Integration — prefix assertions run on canonical serialized request
-  bodies, not internal message Vecs.** Internal-message comparisons cannot
-  prove byte stability: prefix reuse depends on the request body after
-  adapter conversion, and `anthropic_native` merges adjacent roles and
-  hoists every system message. Each adapter's request builder is exercised
-  directly (unit seam over the body-construction function), and the
-  cross-iteration/cross-turn invariants are asserted on those bodies:
-  1. within a task, iteration k+1's body is a strict prefix extension of
-     iteration k's (mutation-free path), and each mutator path emits its
-     `Prefix mutation` line instead;
-  2. across two turns, core + archived[..N-1] is byte-identical in the
-     bodies and archived[N] is byte-stable in a third turn;
-  3. storing a fact between turns changes the tail region only (core bytes
-     identical);
+- **Integration — what "prefix" is asserted on.** A serialized JSON body
+  can never be a strict byte-prefix extension of a shorter one (arrays and
+  objects close with delimiters; appending a message rewrites the suffix),
+  so full-body byte-prefix assertions are wrong by construction. The
+  prefix invariants are asserted over the **provider's ordered
+  prompt/message representation after adapter conversion** — element-wise
+  equality of the converted message sequence (and, for llama.cpp where
+  available, the rendered chat-template/token sequence). Full serialized
+  bodies are tested **only for determinism** (same logical input →
+  identical bytes). Each adapter's request builder is exercised directly
+  (unit seam over the body-construction function).
+
+  Cross-turn cache-prefix assertions apply **only to the
+  OpenAI-compatible/llama.cpp adapter** — `anthropic_native` and
+  `google_genai` hoist system content (including the task tail) into
+  top-level parameters, so a changed tail legitimately rewrites their
+  payload head every turn; for those two, only deterministic conversion is
+  asserted (cache wins there are out of scope, per §Pillar A).
+
+  1. within a task, iteration k+1's converted message sequence extends
+     iteration k's element-wise (mutation-free path), and each mutator path
+     emits its `Prefix mutation` line instead;
+  2. across two turns (OpenAI-compatible adapter), core + archived[..N-1]
+     elements are identical and archived[N] is stable in a third turn;
+  3. storing a fact between turns changes the tail element only (core
+     element identical);
   4. a skills-catalog change between turns produces exactly one
      `Core prompt invalidated component=skills` and new core bytes;
   5. per-adapter determinism: same logical messages → identical serialized
