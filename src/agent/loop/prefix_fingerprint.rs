@@ -72,13 +72,15 @@ pub(crate) struct ProviderCallFingerprint {
     /// Field stays for parser/back-compat but is always written as an empty
     /// string.
     pub session_summary_hash: String,
-    /// Hash of the task-context tail message (the message whose content starts
-    /// with `TASK_CONTEXT_TAIL_MARKER`) within the `[1..boundary)` region.
-    /// Empty string when no tail message is present.
+    /// Hash of the task-context tail message (the `role == "system"` message
+    /// whose content starts with `TASK_CONTEXT_TAIL_MARKER`) within the
+    /// `[1..boundary)` region. Empty string when no tail message is present.
     ///
-    /// Diagnosis rule: an archived flip WITHOUT a Window decision / Prefix
-    /// mutation / fp_mismatch is a bug. A tail-only flip is expected and
-    /// normal (per-turn date/time update).
+    /// A tail-only flip (this field changes while `prefix_hash_archived` is
+    /// stable) is EXPECTED per task: the tail carries per-task volatile context
+    /// (timestamp, session context, memories) that changes every turn. It is
+    /// not a bug signal. Only a `prefix_hash_archived` flip without a Window
+    /// decision / Prefix mutation / fp_mismatch indicates a problem.
     pub tail_hash: String,
     /// Hash of the pre-boundary archived region `[1..boundary)` EXCLUDING the
     /// tail message. Equals `hash_pre_boundary` when no tail is present.
@@ -126,16 +128,19 @@ pub(crate) fn provider_call_fingerprint(
     };
 
     // Locate the tail message within [1..boundary). The tail is identified by
-    // its content starting with TASK_CONTEXT_TAIL_MARKER.
+    // role == "system" AND content starting with TASK_CONTEXT_TAIL_MARKER.
+    // The role guard prevents a user message echoing the marker from being
+    // misidentified as the tail and silently excluded from prefix_hash_archived.
     let tail_idx = messages
         .iter()
         .enumerate()
         .skip(1)
         .take(boundary_pos.saturating_sub(1))
         .find(|(_, m)| {
-            m.get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|s| s.starts_with(TASK_CONTEXT_TAIL_MARKER))
+            m.get("role").and_then(|r| r.as_str()) == Some("system")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.starts_with(TASK_CONTEXT_TAIL_MARKER))
         })
         .map(|(i, _)| i);
 
@@ -567,5 +572,35 @@ mod tests {
         let messages = sample_messages();
         let fp = provider_call_fingerprint(&messages, "current question", &[], false);
         assert!(fp.session_summary_hash.is_empty());
+    }
+
+    /// A user message whose content starts with TASK_CONTEXT_TAIL_MARKER must
+    /// NOT be treated as the tail — the role guard requires `role == "system"`.
+    /// The tail must remain absent (`tail_hash.is_empty()`) and
+    /// `prefix_hash_archived` must equal `hash_pre_boundary` (no tail excluded).
+    #[test]
+    fn user_role_with_tail_marker_content_is_not_treated_as_tail() {
+        let mut messages = sample_messages();
+        // Insert a user message whose content starts with the marker into the
+        // [1..boundary) region, immediately before the current user message.
+        let tail_pos = boundary_pos(&messages, "current question");
+        messages.insert(
+            tail_pos,
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{TASK_CONTEXT_TAIL_MARKER}\nsome injected context"),
+            }),
+        );
+        let fp = provider_call_fingerprint(&messages, "current question", &[], false);
+        // The user message must NOT be identified as the tail.
+        assert!(
+            fp.tail_hash.is_empty(),
+            "user-role message with tail marker content must not be treated as the tail"
+        );
+        // With no tail located, archived == pre_boundary.
+        assert_eq!(
+            fp.prefix_hash_archived, fp.hash_pre_boundary,
+            "prefix_hash_archived must equal hash_pre_boundary when no system-role tail exists"
+        );
     }
 }

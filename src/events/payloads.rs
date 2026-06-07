@@ -239,12 +239,15 @@ pub struct LlmCallData {
     /// parser/back-compat so older event rows can still be deserialized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_summary_hash: Option<String>,
-    /// Hash of the task-context tail message (`[Task Context]` marker) within
-    /// the `[1..boundary)` region. `None`/empty when no tail is present.
+    /// Hash of the task-context tail message (the `role == "system"` message
+    /// whose content starts with `[Task Context]`) within the `[1..boundary)`
+    /// region. `None`/empty when no tail is present.
     ///
-    /// Diagnosis rule: `prefix_hash_archived` flipping WITHOUT a Window
-    /// decision / Prefix mutation / fp_mismatch = bug; tail-only flip =
-    /// expected (per-turn date/time update in the tail).
+    /// A tail-only flip (this field changes while `prefix_hash_archived` is
+    /// stable) is EXPECTED per task: the tail carries per-task volatile context
+    /// (timestamp, session context, memories) that changes every turn. It is
+    /// not a bug signal. Only a `prefix_hash_archived` flip without a Window
+    /// decision / Prefix mutation / fp_mismatch indicates a problem.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_hash: Option<String>,
     /// Hash of the pre-boundary archived region `[1..boundary)` EXCLUDING the
