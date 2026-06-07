@@ -103,6 +103,11 @@ pub(super) struct LlmPhaseCtx<'a> {
     /// 1 → reasoning_effort = "low", 2 → disable reasoning entirely,
     /// 3+ → force text with no tools and no reasoning.
     pub thinking_truncation_count: &'a mut u8,
+    /// Estimated input tokens computed by the message-build phase, for
+    /// est-vs-actual drift telemetry in the emitted `LlmCall` event.
+    pub est_input_tokens: u32,
+    /// Wall-clock duration of the message-build phase for this iteration, in ms.
+    pub build_ms: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -199,6 +204,8 @@ pub(super) async fn run_llm_phase(
     let truncated_text_prefix = &mut *ctx.truncated_text_prefix;
     let provider_timeout_ms = &mut *ctx.provider_timeout_ms;
     let thinking_truncation_count = &mut *ctx.thinking_truncation_count;
+    let est_input_tokens = ctx.est_input_tokens;
+    let build_ms = ctx.build_ms;
     let timeout_after_external_action = Duration::from_secs(90);
 
     // Identity manipulation detection: if the user's message contains obvious
@@ -290,18 +297,20 @@ pub(super) async fn run_llm_phase(
         }
     }
 
-    // Force-text: after too many tool calls, strip tools to force a response.
-    let effective_tools: &[Value] = if force_text_response {
+    // Force-text: after too many tool calls, force a plain-text response.
+    // The tool DEFINITIONS stay in the payload (they are rendered into the
+    // prompt prefix; removing them breaks server-side prefix-cache reuse) —
+    // calling is disabled via tool_choice=none below, and any tool calls the
+    // model still emits are dropped by the hard force-text guard further down.
+    let effective_tools: &[Value] = effective_tools_for_call(force_text_response, tool_defs);
+    if force_text_response {
         info!(
             session_id,
             iteration,
             total_successful_tool_calls,
-            "Force-text mode: stripping tools to force a response"
+            "Force-text mode: requiring plain text via tool_choice=none (tool defs retained for prefix stability)"
         );
-        &[]
-    } else {
-        tool_defs
-    };
+    }
     let mut llm_options = ChatOptions::default();
     // Escalating recovery for thinking-model truncation.
     // Count tracks how many consecutive iterations were truncated with all
@@ -387,6 +396,66 @@ pub(super) async fn run_llm_phase(
             .unwrap_or(DEFAULT_LLM_TIMEOUT)
     };
     let timeout_dur = effective_llm_timeout;
+
+    // Phase 0 observability — prefix fingerprint of the final provider payload.
+    // Emitted once per LLM phase, here (after security-message injection and
+    // force-text tool selection), so it reflects exactly the bytes sent on the
+    // normal successful primary attempt. Region sub-hashes let attribution
+    // pinpoint which part of the prompt churned and broke llama.cpp prefix
+    // reuse. Hashes never carry raw content. See `prefix_fingerprint.rs`.
+    let prefix_fp = super::prefix_fingerprint::provider_call_fingerprint(
+        messages,
+        user_text,
+        effective_tools,
+        force_text_response,
+    );
+    {
+        info!(
+            session_id,
+            iteration,
+            prefix_hash_system = %prefix_fp.hash_system,
+            prefix_hash_pre_boundary = %prefix_fp.hash_pre_boundary,
+            boundary_pos = prefix_fp.boundary_pos,
+            message_count = prefix_fp.message_count,
+            tool_defs_hash = %prefix_fp.tool_defs_hash,
+            session_summary_hash = %prefix_fp.session_summary_hash,
+            force_text = prefix_fp.force_text,
+            "Provider-call prefix fingerprint"
+        );
+    }
+
+    // Opt-in debug dump of the exact provider payload (AIDAEMON_DUMP_LLM_REQUESTS).
+    // Placed here, alongside the prefix fingerprint, so the dumped bytes are the
+    // same finalized payload the fingerprint hashed. See `request_dump.rs`.
+    if let Some(dump_dir) = super::request_dump::dump_dir_from_env(
+        std::env::var("AIDAEMON_DUMP_LLM_REQUESTS").ok().as_deref(),
+    ) {
+        match super::request_dump::write_request_dump(
+            &dump_dir,
+            session_id,
+            iteration,
+            model,
+            messages,
+            effective_tools,
+            force_text_response,
+        ) {
+            Ok(path) => info!(
+                session_id,
+                iteration,
+                path = %path.display(),
+                "Dumped LLM request payload"
+            ),
+            Err(e) => warn!(
+                session_id,
+                iteration,
+                error = %e,
+                "Failed to dump LLM request payload"
+            ),
+        }
+    }
+
+    let mut llm_telemetry = LlmCallTelemetry::default();
+    let llm_call_start = Instant::now();
     let mut resp = match tokio::time::timeout(
         timeout_dur,
         services.agent.call_llm_with_recovery(
@@ -396,6 +465,7 @@ pub(super) async fn run_llm_phase(
             messages,
             effective_tools,
             &llm_options,
+            &mut llm_telemetry,
         ),
     )
     .await
@@ -454,6 +524,71 @@ pub(super) async fn run_llm_phase(
         }
     };
     touch_heartbeat(heartbeat);
+
+    // Per-call observability: latency, actual-vs-estimated tokens, and fallback
+    // metadata. Persisted as an `LlmCall` event so the request can be fully
+    // reconstructed (with timing) via db_probe / the dashboard.
+    let llm_latency_ms = llm_call_start.elapsed().as_millis() as u64;
+    {
+        let (in_tok, out_tok, cached_input_tokens, cache_creation_input_tokens, fresh_input_tokens) =
+            resp.usage
+                .as_ref()
+                .map(|u| {
+                    (
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.cached_input_tokens,
+                        u.cache_creation_input_tokens,
+                        u.fresh_input_tokens(),
+                    )
+                })
+                .unwrap_or((0, 0, None, None, None));
+        let final_model = if llm_telemetry.final_model.is_empty() {
+            model.to_string()
+        } else {
+            llm_telemetry.final_model.clone()
+        };
+        info!(
+            session_id,
+            iteration,
+            latency_ms = llm_latency_ms,
+            build_ms,
+            model,
+            final_model = %final_model,
+            fell_back = llm_telemetry.fell_back,
+            attempts = llm_telemetry.attempts,
+            "LLM call completed"
+        );
+        let _ = emitter
+            .emit(
+                EventType::LlmCall,
+                LlmCallData {
+                    task_id: task_id.to_string(),
+                    iteration: iteration as u32,
+                    model: model.to_string(),
+                    final_model: Some(final_model),
+                    fell_back: llm_telemetry.fell_back,
+                    attempts: llm_telemetry.attempts,
+                    latency_ms: llm_latency_ms,
+                    input_tokens: in_tok,
+                    output_tokens: out_tok,
+                    cached_input_tokens,
+                    cache_creation_input_tokens,
+                    fresh_input_tokens,
+                    est_input_tokens: Some(est_input_tokens),
+                    tool_calls_count: resp.tool_calls.len() as u32,
+                    build_ms: Some(build_ms),
+                    prefix_hash_system: Some(prefix_fp.hash_system.clone()),
+                    prefix_hash_pre_boundary: Some(prefix_fp.hash_pre_boundary.clone()),
+                    tool_defs_hash: Some(prefix_fp.tool_defs_hash.clone()),
+                    session_summary_hash: Some(prefix_fp.session_summary_hash.clone()),
+                    boundary_pos: Some(prefix_fp.boundary_pos),
+                    message_count: Some(prefix_fp.message_count),
+                    force_text: prefix_fp.force_text,
+                },
+            )
+            .await;
+    }
 
     let llm_text_closeout_candidate = resp.tool_calls.is_empty()
         && resp
@@ -927,8 +1062,8 @@ pub(super) async fn run_llm_phase(
         }
     }
 
-    // Hard force-text mode: if the model still emits tool calls after
-    // tools were stripped, ignore those calls and require plain text.
+    // Hard force-text mode: if the model still emits tool calls despite
+    // tool_choice=none, ignore those calls and require plain text.
     if force_text_response && !resp.tool_calls.is_empty() {
         let dropped = resp.tool_calls.len();
         warn!(
@@ -949,9 +1084,45 @@ pub(super) async fn run_llm_phase(
     Ok(LlmPhaseOutcome::Proceed(resp))
 }
 
+/// Tool definitions to include in a provider call.
+///
+/// Force-text mode intentionally returns the SAME definitions instead of an
+/// empty slice: tool defs are rendered into the prompt prefix by chat
+/// templates, so stripping them changes the prompt bytes and breaks
+/// server-side prefix-cache reuse (full ~23k-token re-prefills were measured
+/// and attributed to `tool_defs_refit` in the 2026-06-06 Phase 0 run).
+/// Calling is disabled via `tool_choice=none`; stray tool calls are dropped
+/// by the hard force-text guard after the response arrives.
+fn effective_tools_for_call(force_text_response: bool, tool_defs: &[Value]) -> &[Value] {
+    // Deliberately ignored — and load-bearing. The cross-turn prefix
+    // stability spec's force-text invariant ("tool_defs_hash and the
+    // rendered prefix stay stable across a force-text turn") depends on
+    // this function returning the full roster in BOTH modes. Do NOT "wire
+    // up" this flag to strip definitions in force-text: that silently
+    // reintroduces the tool_defs_refit cache break and fails exit
+    // criterion 2 of 2026-06-06-cross-turn-prefix-stability-design.md.
+    // The flag stays in the signature so every call site names the mode
+    // decision, and `force_text_keeps_tool_defs_for_prefix_stability`
+    // pins the behavior.
+    let _ = force_text_response;
+    tool_defs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn force_text_keeps_tool_defs_for_prefix_stability() {
+        // Tool definitions are rendered into the llama prompt prefix.
+        // Force-text must disable calling via tool_choice=none, NOT by
+        // stripping the defs — stripping changes the rendered prompt and
+        // breaks server-side prefix-cache reuse (measured 2026-06-06:
+        // full ~23k-token re-prefills attributed to tool_defs_refit).
+        let tools = vec![serde_json::json!({"name": "t1"})];
+        assert_eq!(effective_tools_for_call(true, &tools), tools.as_slice());
+        assert_eq!(effective_tools_for_call(false, &tools), tools.as_slice());
+    }
 
     #[test]
     fn overlap_detects_duplicate_response() {

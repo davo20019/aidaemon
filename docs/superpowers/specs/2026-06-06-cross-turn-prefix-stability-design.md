@@ -166,13 +166,17 @@ the log line: `Core prompt invalidated component=<name>`.
 
 **Canonical order is the emission order, not just the hash order.** The same
 name-sorted tool roster that feeds the hash must be the order in which tools
-are emitted into the provider payload's tool array (and into any `## Tools`
-prose). If the hash sorts by name but emission preserves source order, a
-source-order change leaves the aggregate core hash unchanged while flipping
-`tool_defs_hash` and the rendered prefix — a cache break with no
-`Core prompt invalidated` line, which exit criterion 2 would then read as a
-bug. Canonicalization is therefore a property of the rendered output, asserted
-by the golden-byte tests, not an internal-only step before hashing.
+are emitted into the provider payload's **tool array**. If the hash sorts by
+name but emission preserves source order, a source-order change leaves the
+aggregate core hash unchanged while flipping `tool_defs_hash` and the
+rendered prefix — a cache break with no `Core prompt invalidated` line,
+which exit criterion 2 would then read as a bug. Canonicalization is
+therefore a property of the rendered output, asserted by the golden-byte
+tests, not an internal-only step before hashing. The `## Tools` prose is
+**not** bound to the name-sorted order: it lives inside the core and needs
+only determinism (covered by the core golden-byte hash), so Pillar C's
+selection guide is free to group tools logically (file tools together,
+memory tools together).
 
 **Anti-pattern — per-turn dynamic tool gating.** Selecting the tool roster
 per message (MCP-trigger style, or any query-dependent gating) makes the
@@ -268,10 +272,12 @@ phase therefore requires:
     turn; a late write's id is large, so it deterministically sorts last
     inside its turn — exactly its append position. This needs no new storage
     (it is the existing row id).
-  - `turn_seq` = the `events.id` of the turn's first event (its user
-    message), used to order and range whole turns. This is a **cross-row
-    value** — a message's `turn_seq` lives on a *different* row (the turn's
-    user event, reached via `turn_id`) — so it **cannot** be produced by a
+  - `turn_seq` = the **lowest `events.id` in the turn**, used to order and
+    range whole turns. (Not "the user message's id": scheduled goal
+    dispatches and background re-engagement turns do not start with a user
+    message.) This is a **cross-row value** — a message's `turn_seq` lives
+    on a *different* row (the turn's first event row, reached via
+    `turn_id`) — so it **cannot** be produced by a
     SQLite expression index over the message row. The design requires it
     materialized: either denormalized onto every event row at write time
     (stamp the turn's start id when the row is inserted) or a
@@ -475,7 +481,7 @@ fingerprint therefore gains two fields:
 `prefix_hash_pre_boundary` keeps its existing semantics for cross-phase
 comparability. The live diagnosis rule becomes: a `prefix_hash_archived`
 flip without a matching eviction (`Window decision`), `Prefix mutation`
-line, or render-cache `fp_mismatch` (late write into an archived turn) is
+line, or render-cache `fp_mismatch` (late write or late completion record into an archived turn) is
 an archived-region bug; a tail-only flip is expected.
 
 The `session_summary_hash` index-1 special case retires when the summary
@@ -543,7 +549,7 @@ serialization.
    every cross-turn `prefix_hash_system` flip pairs with a logged
    `Core prompt invalidated` line; and every `prefix_hash_archived` flip
    pairs with a logged eviction (`Window decision`), `Prefix mutation`
-   line, or render-cache `fp_mismatch` (late write into an archived turn —
+   line, or render-cache `fp_mismatch` (late write or late completion record into an archived turn —
    spec-compliant per §Fetch edge cases). Tail-only flips (`tail_hash`
    changed, `prefix_hash_archived` stable) are expected and pass.
    `tool_defs_hash` is cross-turn stable **within every attribution run**;
