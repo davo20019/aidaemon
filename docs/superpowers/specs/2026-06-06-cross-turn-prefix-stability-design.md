@@ -122,9 +122,15 @@ invariants are:
    (`collapse_repeated_tool_errors`), history-fitting overflow trimming, and
    the empty-response retry rebuild. Each must emit
    `Prefix mutation reason=<mechanism>` when it fires so every stable-region
-   re-evaluation is attributable. (History-fitting overflow should become
-   rare: whole-turn eviction at the low-water mark leaves headroom the
-   per-iteration fitter previously had to create.)
+   re-evaluation is attributable. **History-fitting is scoped to the
+   current-turn region only.** Fitting that trims, drops, or summarizes an
+   archived turn is forbidden by construction: archived turns are
+   whole-turn-evicted at the anchor (§Eviction), and eviction never reaches
+   inside a turn, so an archived rendering can only change via a logged
+   `content_fp` mismatch (invariant 2), never via fitting. Whole-turn
+   eviction at the low-water mark also leaves the current-turn headroom the
+   per-iteration fitter previously had to manufacture, so current-region
+   fitting itself becomes rare.
 4. **Turn-start re-evaluation is bounded by the prior task's tail + current
    region** (archived[N] + tail[N+1] + new user message), not by an assumed
    constant. The bound is measured, then a threshold is set.
@@ -185,6 +191,22 @@ task today), session context block, session summary, query-ranked relevant
 facts/procedures, matched skill content, people/current-speaker context,
 resume checkpoint. Storing a fact, creating an episode, or matching a skill
 never invalidates the core.
+
+**Single summary insertion point.** Two summary paths exist today: the
+build-stage `[Session Summary]` at index one
+(`message_build_phase.rs:1230`) and the fit-stage `[Conversation summary: …]`
+near index one (`fit_messages_with_source_quotas`,
+`context_window.rs:200,310`). The session summary is part of the task tail
+and lives there only — the **fit-stage insertion is deleted**. Left in place
+it injects `[Conversation summary]` into the archived-turns region near index
+one and silently defeats Pillar A's tail stability. `fit_messages_*` retains
+its message-fitting role for the current-turn region (see §Pillar B
+eviction / invariant 3) but no longer takes or emits a summary argument.
+
+**Resume checkpoint is a move, not a copy.** It is injected into the core
+system prompt today (`system_prompt.rs:768`); this phase relocates it to the
+tail. Flagged so a later pass does not "optimize" it back into core, which
+would make the core per-resume-state and defeat Pillar A.
 
 ### Provider serialization requirement
 
@@ -401,7 +423,7 @@ fingerprint therefore gains two fields:
 - `prefix_hash_archived` — the pre-boundary region **excluding** the tail.
 
 `prefix_hash_pre_boundary` keeps its existing semantics for cross-phase
-comparability. The live diagnosis rule becomes: an `prefix_hash_archived`
+comparability. The live diagnosis rule becomes: a `prefix_hash_archived`
 flip without a matching eviction (`Window decision`) or `Prefix mutation`
 line is an archived-region bug; a tail-only flip is expected. Diffing
 `AIDAEMON_DUMP_LLM_REQUESTS` output remains the exception path, not the
