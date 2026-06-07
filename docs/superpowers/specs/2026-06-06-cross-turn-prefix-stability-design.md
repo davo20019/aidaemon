@@ -164,6 +164,16 @@ collection) and hashed separately; the aggregate hash is the hash of the
 component hashes. On mismatch, the changed component is named factually in
 the log line: `Core prompt invalidated component=<name>`.
 
+**Canonical order is the emission order, not just the hash order.** The same
+name-sorted tool roster that feeds the hash must be the order in which tools
+are emitted into the provider payload's tool array (and into any `## Tools`
+prose). If the hash sorts by name but emission preserves source order, a
+source-order change leaves the aggregate core hash unchanged while flipping
+`tool_defs_hash` and the rendered prefix — a cache break with no
+`Core prompt invalidated` line, which exit criterion 2 would then read as a
+bug. Canonicalization is therefore a property of the rendered output, asserted
+by the golden-byte tests, not an internal-only step before hashing.
+
 **Anti-pattern — per-turn dynamic tool gating.** Selecting the tool roster
 per message (MCP-trigger style, or any query-dependent gating) makes the
 roster a per-turn input and invalidates the core every turn — the
@@ -235,14 +245,35 @@ turn-keyed fetch cannot be built on hydrated events as they stand. This
 phase therefore requires:
 
 - `turn_id` added to the canonical conversation event payloads
-  (user message, assistant response, tool call/result) and propagated
-  through projection/hydration into `Message.turn_id`;
-- a single **canonical monotonic sequence** for ordering: the event store's
-  insertion sequence, propagated through hydration. Timestamps are forbidden
-  as an ordering key anywhere in the fetch or render path (event queries
-  that currently order by timestamp are migrated for this path). The
-  sequence is unique, so no tie-breaking rule is needed; the plan names the
-  concrete column and adds the supporting index
+  (user message, assistant response, tool call/result) **and to the
+  task-completion record** (`EventType::TaskEnd`) and propagated through
+  projection/hydration into `Message.turn_id`. The completion record must be
+  turn-attributable because the archived render's terminal-state distinction
+  (`[completed: N tool steps, no text reply]` vs `[task interrupted]`,
+  §Rendering) is derived from whether the turn has a completion record —
+  without `turn_id` on it the renderer cannot tell the two apart.
+- **Completion status is an explicit render input, not just a flag.** The
+  per-turn render input carries a `terminal_state ∈ {completed,
+  interrupted}` field derived from the completion record, and `content_fp`
+  (§Render cache) includes it. Otherwise a tool-only turn that later acquires
+  a completion record (or a crash that never does) would render differently
+  while hashing identically — a stale-cache hazard precisely in the
+  no-text-reply case where the message set alone is ambiguous.
+- a single **canonical monotonic sequence** for ordering, derived from the
+  event store's existing insertion id (`events.id`; no new atomic counter):
+  - `turn_seq` = the insertion id of the turn's first event (its user
+    message), carried on every message of that turn (a late write inherits
+    its turn's `turn_seq` via `turn_id`, so it groups and ranges with that
+    turn, not at the session tail);
+  - `msg_seq` = the message's own insertion id, which orders messages
+    **within** a turn; a late write's id is large, so it deterministically
+    sorts last inside its turn — exactly its append position.
+
+  Timestamps are forbidden as an ordering key anywhere in the fetch or render
+  path (event queries that currently order by timestamp are migrated for this
+  path). Insertion ids are unique, so no tie-breaking rule is needed; whether
+  `turn_seq`/`msg_seq` are persisted columns or expressed as an indexed
+  projection over `events.id` is a plan decision, but the supporting index is
   `(session_id, turn_seq, msg_seq)`.
 - **Migration/fallback:** events written before `turn_id` existed hydrate
   with `turn_id = NULL` and fall under the legacy rule below (excluded from
@@ -326,7 +357,9 @@ per session, in-memory.
 - `content_fp` is the hash of the **canonical serialization of the complete
   ordered render input** — every message in sequence order with all fields
   (role, content, tool_name, tool_call_id, tool_calls_json, annotations,
-  and the sequence position itself). The only excluded fields are an
+  and the sequence position itself), **plus the turn's `terminal_state`**
+  (§prerequisite) so the no-text-reply completed/interrupted distinction is
+  captured. The only excluded fields are an
   explicit denylist of never-rendered fields (`embedding`, `importance`,
   `created_at`; finalized in the plan). `Message.id` is never rendered
   either but is deliberately **retained** in the fingerprint: it is
@@ -500,14 +533,19 @@ serialization.
    pairs with a logged eviction (`Window decision`), `Prefix mutation`
    line, or render-cache `fp_mismatch` (late write into an archived turn —
    spec-compliant per §Fetch edge cases). Tail-only flips (`tail_hash`
-   changed, `prefix_hash_archived` stable) are expected and pass. `tool_defs_hash` is cross-turn stable for
-   the whole run except the single one-time break at the Pillar C baseline
-   (the tool roster is a core input; any other flip is a per-turn-gating
-   regression, per the §Pillar A anti-pattern). **Force-text turns are
-   excluded from the cross-turn pass/fail metrics:** tool defs are absent
-   from those requests by design, so their `tool_defs_hash` and
-   `prefix_hash_system` legitimately differ; `cache-attribution.py` tags and
-   skips them rather than scoring them as flips.
+   changed, `prefix_hash_archived` stable) are expected and pass.
+   `tool_defs_hash` is cross-turn stable **within every attribution run**;
+   the only sanctioned change is the Pillar C deployment itself, which lands
+   **between** runs, so no run ever contains the break and
+   `cache-attribution.py` must not tolerate an in-run flip (the tool roster
+   is a core input; any in-run flip is a per-turn-gating regression, per the
+   §Pillar A anti-pattern). **Force-text turns are not a special case on the primary
+   adapter:** force-text retains the tool definitions in the payload and only
+   disables calling via `tool_choice=none` (`llm_phase.rs:300`,
+   "tool defs retained for prefix stability"), so `tool_defs_hash` and the
+   rendered prefix stay stable across a force-text turn. (`anthropic_native`
+   strips tool defs when `tool_choice=none`, but cross-turn cache assertions
+   do not apply to that adapter — §Testing.)
 3. Baselines are sequenced with Pillar C: the Phase 0 baseline (~22.3k
    median payload, ~22.3k median turn-start re-eval) applies to Pillar C
    only. **After Pillar C lands, a fresh attribution re-run establishes the
