@@ -129,6 +129,14 @@ collection) and hashed separately; the aggregate hash is the hash of the
 component hashes. On mismatch, the changed component is named factually in
 the log line: `Core prompt invalidated component=<name>`.
 
+**Anti-pattern — per-turn dynamic tool gating.** Selecting the tool roster
+per message (MCP-trigger style, or any query-dependent gating) makes the
+roster a per-turn input and invalidates the core every turn — the
+`component=tool_roster` log would expose it, but it structurally defeats
+Pillar A. The compatible shape is a **static-but-smaller roster** (Pillar C
+slims descriptions; membership stays stable per session). Future payload
+passes must not reintroduce per-turn roster variance.
+
 `build_core_prompt` must be deterministic: no timestamps, no randomized or
 map-iteration ordering, no environment-dependent formatting. This is
 enforced by golden-byte tests and by the debug re-render assertion (§Pillar
@@ -283,6 +291,36 @@ prefix head; it is rare and deep by construction. The anchor is in-memory;
 persisting it is deferred unless warm-across-restart behavior becomes a
 requirement.
 
+## Pillar C — payload reduction
+
+Stability (Pillars A/B) makes re-evaluation rare; this pillar makes every
+remaining evaluation — and the steady-state context load — smaller. Measured
+composition of the ~23k payload includes ~9.7k of tool schemas and ~4.5k of
+`## Tools` prose that substantially restates them, plus ~3.9k of verbose
+descriptions across ~10 rarely-used `manage_*` admin tools.
+
+1. **Dedupe `## Tools` prose against the schemas.** The prose shrinks to a
+   brief selection guide (when to reach for which tool, cross-tool rules);
+   schemas remain the single source of truth for per-tool semantics.
+2. **Slim the fat `manage_*` schema descriptions** to the same density as
+   the frequently-used tools.
+
+Target: ~23k → ~16–17k per call. Side effects this enables elsewhere in the
+design: real headroom under the 28k policy budget (the near-zero slack today
+is what drives history-fitting and eviction pressure), so the 60% low-water
+mark and the "eviction is rare and deep" property hold with margin.
+
+**Behavioral guard (this is the only pillar that can change model
+behavior):** tool-selection quality on small local models depends on this
+prose. The reduction ships behind the existing tool-selection integration
+suite plus a short live smoke (representative tasks exercising terminal,
+file tools, memory tools, web tools), and the prose is reduced to a guide —
+not removed.
+
+**Sequencing:** Pillar C lands **first**. It is small, independent, causes a
+single one-time `tool_defs_hash` break, and re-baselines payload size before
+the stability work measures itself — avoiding mid-phase attribution noise.
+
 ## Observability
 
 Phase 0 instrumentation is untouched — it is the measurement harness for
@@ -296,6 +334,13 @@ this phase. New lines:
 
 After this phase, a `prefix_hash_system` cross-turn flip without a matching
 `Core prompt invalidated` line is a bug by definition.
+
+`AIDAEMON_DUMP_LLM_REQUESTS` complements the fingerprints: the hashes say
+*that* a region flipped; the request dump says *which bytes*. Diffing
+consecutive dumped requests is the expected diagnosis path for any
+unattributed flip (it is how the turn 1→2 skill-toggle churn was found),
+and the body-level integration assertions in §Testing can reuse the same
+serialization.
 
 ## Testing
 
@@ -338,6 +383,9 @@ After this phase, a `prefix_hash_system` cross-turn flip without a matching
    tokens of a ~22k payload), not a pass/fail gate: the first valid
    instrumented re-run establishes the measured bound, and the regression
    threshold used for gating thereafter is set from that measurement.
+4. Pillar C: median per-call payload at or below ~17k tokens, with the
+   tool-selection integration suite green and the live smoke showing no
+   tool-selection regressions.
 
 ## Out of scope
 
